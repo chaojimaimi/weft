@@ -1,0 +1,16 @@
+# Rust
+target/
+target-rust/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+
+# Warp original git (if any)
+.orig-git/
