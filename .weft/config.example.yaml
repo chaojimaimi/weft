@@ -1,0 +1,23 @@
+# Weft 配置文件
+# 纯本地终端运行时设置
+
+# 语言模型端点
+# llm_endpoint:
+#   name: "Zhipu GLM"
+#   base_url: "https://open.bigmodel.cn/api/paas/v4"
+#   model: "glm-4-flash"
+#   api_key: ""
+
+# 或 DeepSeek
+# llm_endpoint:
+#   name: "DeepSeek"
+#   base_url: "https://api.deepseek.com/v1"
+#   model: "deepseek-chat"
+#   api_key: ""
+
+# 或本地 Ollama
+# llm_endpoint:
+#   name: "Ollama"
+#   base_url: "http://localhost:11434/v1"
+#   model: "llama3"
+#   api_key: ""

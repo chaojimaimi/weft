@@ -1,0 +1,8 @@
+# Weft 示例工作流：Git 快速提交
+name: "Git Quick Commit"
+description: "stage all、commit 并 push"
+steps:
+  - command: "git add -A"
+  - command: "git commit -m \"${message}\""
+    description: "提交信息"
+  - command: "git push"

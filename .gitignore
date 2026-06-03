@@ -1,0 +1,26 @@
+# Rust
+target/
+target-rust/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn
+
+# Warp original git (if any)
+.orig-git/
+
+# Weft runtime data (user-specific, not committed)
+.weft/skills/
+.weft/workflows/
+.weft/history/
+
+# Old Warp runtime artifacts (not for Weft)
+.warp/
+.warpindexingignore
+.warp*
