@@ -1,0 +1,18 @@
+# Build
+/target
+**/target/
+
+# IDE / Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code (local config, not project-level)
+.claude/
