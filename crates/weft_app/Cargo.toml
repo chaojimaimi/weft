@@ -1,0 +1,24 @@
+[package]
+name = "weft_app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+weft_core = { path = "../weft_core" }
+metal.workspace = true
+objc2.workspace = true
+objc2-metal.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+objc2-quartz-core.workspace = true
+winit.workspace = true
+core-graphics-types.workspace = true
+font-kit.workspace = true
+pathfinder_geometry.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossbeam-channel.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+
+[dev-dependencies]

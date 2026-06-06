@@ -206,6 +206,14 @@ impl Pty {
         self.event_rx.recv().await
     }
 
+    /// Try to receive the next PTY event without blocking.
+    /// Returns `Err` if no event is available.
+    pub fn try_recv(&mut self) -> Result<PtyEvent> {
+        self.event_rx
+            .try_recv()
+            .map_err(|_| PtyError::Read(io::Error::new(io::ErrorKind::WouldBlock, "no data available")))
+    }
+
     /// Check if the child process is still alive.
     pub fn is_alive(&self) -> bool {
         // Send signal 0 to check if process exists.

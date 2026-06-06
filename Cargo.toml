@@ -25,6 +25,7 @@ winit = "0.30"
 # Fonts
 font-kit = "0.14"
 rustybuzz = "0.20"
+pathfinder_geometry = "0.5"
 
 # Common
 bitflags = "2"
@@ -35,3 +36,4 @@ crossbeam-channel = "0.5"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+core-graphics-types = "0.1"
