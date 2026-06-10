@@ -15,6 +15,9 @@ bitflags! {
         const HIDDEN        = 0x0080;
         const DIRTY         = 0x0200;
         const WIDE_SPACER   = 0x0400;
+        const CURSOR        = 0x0800;
+        const SELECTION     = 0x1000;
+        const HYPERLINK     = 0x2000;
     }
 }
 
@@ -85,9 +88,12 @@ impl Cell {
 
 /// Terminal row with dirty tracking.
 /// `dirty_occ` tracks the last modified cell index for efficient rendering.
+#[derive(Clone)]
 pub struct Row {
     pub cells: Vec<Cell>,
     pub dirty_occ: usize,
+    /// Whether this row has been wrapped from the previous line.
+    pub wrapped: bool,
 }
 
 impl Row {
@@ -95,6 +101,7 @@ impl Row {
         Self {
             cells: vec![Cell::default(); cols],
             dirty_occ: 0,
+            wrapped: false,
         }
     }
 
@@ -139,6 +146,151 @@ impl Default for Cursor {
     }
 }
 
+/// Cursor style (DECSCUSR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStyle {
+    /// Blinking block █
+    BlinkingBlock,
+    /// Steady block █
+    Block,
+    /// Blinking underline _
+    BlinkingUnderline,
+    /// Steady underline _
+    Underline,
+    /// Blinking bar |
+    BlinkingBar,
+    /// Steady bar |
+    Bar,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        Self::Block
+    }
+}
+
+/// Scrollback buffer (ring buffer).
+/// Stores rows that have scrolled off the top of the viewport.
+pub struct Scrollback {
+    /// Ring buffer of rows.
+    buffer: Vec<Row>,
+    /// Maximum number of lines (configurable).
+    max_lines: usize,
+    /// Head pointer (next write position).
+    head: usize,
+    /// Current number of occupied lines.
+    len: usize,
+}
+
+impl Scrollback {
+    pub fn new(max_lines: usize) -> Self {
+        Self {
+            buffer: Vec::with_capacity(max_lines),
+            max_lines,
+            head: 0,
+            len: 0,
+        }
+    }
+
+    /// Push a row into the scrollback buffer.
+    pub fn push(&mut self, row: Row) {
+        if self.max_lines == 0 {
+            return;
+        }
+        if self.len < self.max_lines {
+            self.buffer.push(row);
+            self.len += 1;
+            self.head = self.len % self.max_lines;
+        } else {
+            self.buffer[self.head] = row;
+            self.head = (self.head + 1) % self.max_lines;
+        }
+    }
+
+    /// Pop the most recent row from scrollback (LIFO for scroll-up undo).
+    pub fn pop(&mut self) -> Option<Row> {
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        if self.len < self.buffer.len() {
+            // Still within the Vec, just pop
+            self.head = self.len % self.max_lines;
+            self.buffer.pop()
+        } else {
+            // Ring buffer wrap-around case
+            let idx = if self.head == 0 {
+                self.max_lines - 1
+            } else {
+                self.head - 1
+            };
+            self.head = idx;
+            // Swap out the row
+            let cols = self.buffer[idx].cells.len();
+            Some(std::mem::replace(&mut self.buffer[idx], Row::new(cols)))
+        }
+    }
+
+    /// Number of lines in scrollback.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get a row from scrollback by index (0 = oldest, len-1 = newest).
+    pub fn get(&self, index: usize) -> Option<&Row> {
+        if index >= self.len {
+            return None;
+        }
+        let start = if self.len < self.max_lines {
+            0
+        } else {
+            self.head
+        };
+        let actual = (start + index) % self.max_lines.min(self.buffer.len());
+        self.buffer.get(actual)
+    }
+
+    /// Resize the scrollback buffer.
+    pub fn resize(&mut self, new_max: usize, cols: usize) {
+        if new_max == self.max_lines {
+            return;
+        }
+        if new_max == 0 {
+            self.buffer.clear();
+            self.len = 0;
+            self.head = 0;
+            self.max_lines = 0;
+            return;
+        }
+
+        // Collect rows in order (oldest first)
+        let mut rows: Vec<Row> = Vec::with_capacity(new_max);
+        for i in 0..self.len.min(new_max) {
+            if let Some(row) = self.get(i) {
+                rows.push(row.clone());
+            }
+        }
+        // Pad with empty rows if needed
+        while rows.len() < new_max.min(self.len) {
+            rows.push(Row::new(cols));
+        }
+
+        self.buffer = rows;
+        self.len = self.buffer.len();
+        self.head = self.len % new_max;
+        self.max_lines = new_max;
+    }
+
+    /// Update maximum lines (without discarding data if growing).
+    pub fn set_max_lines(&mut self, max_lines: usize, cols: usize) {
+        self.resize(max_lines, cols);
+    }
+}
+
 /// Terminal grid: visible viewport + scrollback buffer.
 pub struct Grid {
     pub viewport: Vec<Row>,
@@ -150,10 +302,18 @@ pub struct Grid {
     scroll_bottom: usize,
     /// Tab stop positions (true = tab stop, false = no stop).
     tabstops: Vec<bool>,
+    /// Scrollback buffer for lines scrolled off the top.
+    pub scrollback: Scrollback,
+    /// Current scroll offset (0 = no scroll, >0 = viewing history).
+    pub scroll_offset: usize,
 }
 
 impl Grid {
     pub fn new(rows: usize, cols: usize) -> Self {
+        Self::with_scrollback(rows, cols, 10000)
+    }
+
+    pub fn with_scrollback(rows: usize, cols: usize, scrollback_lines: usize) -> Self {
         let scroll_bottom = rows.saturating_sub(1);
         let tabstops = Self::init_tabstops(cols);
         Self {
@@ -165,6 +325,8 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom,
             tabstops,
+            scrollback: Scrollback::new(scrollback_lines),
+            scroll_offset: 0,
         }
     }
 
@@ -198,6 +360,9 @@ impl Grid {
         bg: Color,
         flags: CellFlags,
     ) {
+        // Reset scroll offset on new output
+        self.scroll_offset = 0;
+
         // Handle deferred wrap before writing
         if self.cursor.wrap_pending {
             self.cursor.wrap_pending = false;
@@ -206,6 +371,10 @@ impl Grid {
                 self.scroll_up(1);
             } else if self.cursor.row < self.num_rows - 1 {
                 self.cursor.row += 1;
+            }
+            // Mark the row as wrapped
+            if self.cursor.row > 0 {
+                self.viewport[self.cursor.row - 1].wrapped = true;
             }
         }
 
@@ -226,6 +395,10 @@ impl Grid {
                 self.scroll_up(1);
             } else if self.cursor.row < self.num_rows - 1 {
                 self.cursor.row += 1;
+            }
+            // Mark the row as wrapped
+            if self.cursor.row > 0 {
+                self.viewport[self.cursor.row - 1].wrapped = true;
             }
             // Recalculate row/col after wrap
             return self.write_char_with_attrs(ch, fg, bg, flags);
@@ -459,6 +632,14 @@ impl Grid {
         // Note: does NOT reset cursor position (VT behavior)
     }
 
+    /// Clear scrollback buffer (CSI 3 J).
+    pub fn clear_scrollback(&mut self) {
+        let cols = self.num_cols;
+        self.scrollback = Scrollback::new(10000);
+        self.scroll_offset = 0;
+        let _ = (cols, ); // suppress unused warning
+    }
+
     /// Clear line from cursor to end (CSI 0 K).
     pub fn clear_line_right(&mut self) {
         let row = self.cursor.row;
@@ -505,18 +686,33 @@ impl Grid {
     // ── Scrolling ────────────────────────────────────────────────
 
     /// Scroll the scroll region up by n lines.
+    /// Lines scrolled off the top go into the scrollback buffer.
     pub fn scroll_up(&mut self, n: usize) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
 
         if n > bottom - top {
-            // Clear the entire scroll region
+            // Push all rows in the scroll region into scrollback
             for i in top..=bottom {
-                self.viewport[i] = Row::new(self.num_cols);
+                self.scrollback.push(std::mem::replace(
+                    &mut self.viewport[i],
+                    Row::new(self.num_cols),
+                ));
             }
             return;
         }
 
+        // Push top rows into scrollback (only if scrolling the main viewport)
+        if top == 0 {
+            for i in 0..n {
+                self.scrollback.push(std::mem::replace(
+                    &mut self.viewport[i],
+                    Row::new(self.num_cols),
+                ));
+            }
+        }
+
+        // Shift rows up
         for i in top..=(bottom - n) {
             self.viewport[i] = std::mem::replace(&mut self.viewport[i + n], Row::new(self.num_cols));
         }
@@ -563,6 +759,39 @@ impl Grid {
     pub fn reset_scroll_region(&mut self) {
         self.scroll_top = 0;
         self.scroll_bottom = self.num_rows - 1;
+    }
+
+    // ── Scrollback navigation ────────────────────────────────────
+
+    /// Scroll viewport up (view older history).
+    pub fn scroll_up_history(&mut self, lines: usize) {
+        let available = self.scrollback.len().saturating_sub(self.scroll_offset);
+        self.scroll_offset = (self.scroll_offset + lines).min(available);
+    }
+
+    /// Scroll viewport down (view newer content).
+    pub fn scroll_down_history(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    /// Scroll to the very top of history.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_offset = self.scrollback.len();
+    }
+
+    /// Scroll to the bottom (current output).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// Check if we're viewing history (scrolled up).
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_offset > 0
+    }
+
+    /// Get the total number of scrollback lines.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
     }
 
     // ── Character insertion/deletion ─────────────────────────────
@@ -703,8 +932,92 @@ impl Grid {
     // ── Resize / reset ───────────────────────────────────────────
 
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
-        // TODO: proper resize with content preservation
-        *self = Self::new(new_rows, new_cols);
+        if new_rows == self.num_rows && new_cols == self.num_cols {
+            return;
+        }
+
+        // Collect all content: scrollback (oldest) + viewport (newest)
+        let mut all_rows: Vec<Row> = Vec::new();
+
+        // Add scrollback rows
+        for i in 0..self.scrollback.len() {
+            if let Some(row) = self.scrollback.get(i) {
+                all_rows.push(row.clone());
+            }
+        }
+
+        // Add viewport rows
+        for row in self.viewport.drain(..) {
+            all_rows.push(row);
+        }
+
+        // Re-wrap rows to new column width
+        let mut wrapped_rows: Vec<Row> = Vec::new();
+        for row in all_rows {
+            let mut current = Row::new(new_cols);
+            current.wrapped = false;
+            let mut col = 0;
+
+            for cell in row.cells {
+                if col >= new_cols {
+                    current.wrapped = true;
+                    wrapped_rows.push(current);
+                    current = Row::new(new_cols);
+                    col = 0;
+                }
+
+                // Skip wide spacers from old layout
+                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+
+                if col < new_cols {
+                    current.cells[col] = cell.clone();
+                    current.mark_dirty(col);
+
+                    if cell.width == CellWidth::Full && col + 1 < new_cols {
+                        current.cells[col + 1].character = ' ';
+                        current.cells[col + 1].flags = CellFlags::WIDE_SPACER;
+                        current.cells[col + 1].width = CellWidth::Half;
+                        current.mark_dirty(col + 1);
+                    }
+
+                    col += cell.width as usize;
+                }
+            }
+            wrapped_rows.push(current);
+        }
+
+        // Split into scrollback and viewport
+        let total = wrapped_rows.len();
+        if total <= new_rows {
+            // All content fits in viewport
+            self.viewport = wrapped_rows;
+            while self.viewport.len() < new_rows {
+                self.viewport.push(Row::new(new_cols));
+            }
+            self.scrollback = Scrollback::new(self.scrollback.max_lines);
+        } else {
+            // Put overflow into scrollback
+            let scrollback_count = total - new_rows;
+            self.scrollback = Scrollback::new(self.scrollback.max_lines);
+            for row in wrapped_rows[..scrollback_count].iter() {
+                self.scrollback.push(row.clone());
+            }
+            self.viewport = wrapped_rows[scrollback_count..].to_vec();
+        }
+
+        self.num_rows = new_rows;
+        self.num_cols = new_cols;
+        self.scroll_bottom = new_rows.saturating_sub(1);
+        self.scroll_top = 0;
+        self.tabstops = Self::init_tabstops(new_cols);
+        self.scroll_offset = 0;
+
+        // Clamp cursor
+        self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
+        self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
+        self.cursor.wrap_pending = false;
     }
 
     /// Clear the entire screen and reset cursor.
@@ -783,6 +1096,51 @@ mod tests {
     }
 
     #[test]
+    fn scroll_up_stores_in_scrollback() {
+        let mut grid = Grid::with_scrollback(5, 4, 100);
+        for i in 0..5 {
+            grid.viewport[i].cells[0].character =
+                char::from_digit(i as u32 + 1, 10).unwrap();
+        }
+        grid.cursor.row = 4;
+        grid.newline();
+        // Row '1' should be in scrollback
+        assert_eq!(grid.scrollback.len(), 1);
+        assert_eq!(grid.scrollback.get(0).unwrap().cells[0].character, '1');
+    }
+
+    #[test]
+    fn scrollback_navigation() {
+        let mut grid = Grid::with_scrollback(5, 4, 100);
+        // Fill and scroll many lines
+        for i in 0..20 {
+            grid.viewport[grid.cursor.row].cells[0].character =
+                char::from_digit((i % 10) as u32, 10).unwrap_or('X');
+            grid.cursor.row = 4;
+            grid.newline();
+        }
+
+        let sb_len = grid.scrollback.len();
+        assert!(sb_len > 0, "should have scrollback entries");
+
+        // Scroll up
+        grid.scroll_up_history(3);
+        assert_eq!(grid.scroll_offset, 3);
+
+        // Scroll down
+        grid.scroll_down_history(1);
+        assert_eq!(grid.scroll_offset, 2);
+
+        // Scroll to bottom
+        grid.scroll_to_bottom();
+        assert_eq!(grid.scroll_offset, 0);
+
+        // Scroll to top
+        grid.scroll_to_top();
+        assert_eq!(grid.scroll_offset, sb_len);
+    }
+
+    #[test]
     fn clear_resets_all_cells() {
         let mut grid = Grid::new(2, 4);
         grid.write_char('X');
@@ -791,8 +1149,6 @@ mod tests {
         assert_eq!(grid.cursor.row, 0);
         assert_eq!(grid.cursor.col, 0);
     }
-
-    // ── New method tests ─────────────────────────────────────────
 
     #[test]
     fn move_up_clamps_at_zero() {
@@ -853,7 +1209,6 @@ mod tests {
     #[test]
     fn clear_screen_below_clears_from_cursor() {
         let mut grid = Grid::new(5, 5);
-        // Fill all cells
         for r in 0..5 {
             for c in 0..5 {
                 grid.viewport[r].cells[c].character = 'X';
@@ -862,13 +1217,10 @@ mod tests {
         grid.cursor.row = 2;
         grid.cursor.col = 2;
         grid.clear_screen_below();
-        // Above cursor row unchanged
         assert_eq!(grid.cell(0, 0).character, 'X');
         assert_eq!(grid.cell(1, 0).character, 'X');
-        // Current row: 0..2 unchanged, 2.. cleared
         assert_eq!(grid.cell(2, 1).character, 'X');
         assert_eq!(grid.cell(2, 2).character, ' ');
-        // Below cursor row cleared
         assert_eq!(grid.cell(3, 0).character, ' ');
         assert_eq!(grid.cell(4, 4).character, ' ');
     }
@@ -884,13 +1236,10 @@ mod tests {
         grid.cursor.row = 2;
         grid.cursor.col = 2;
         grid.clear_screen_above();
-        // Above cursor row cleared
         assert_eq!(grid.cell(0, 0).character, ' ');
         assert_eq!(grid.cell(1, 4).character, ' ');
-        // Current row: 0..=2 cleared, 3.. unchanged
         assert_eq!(grid.cell(2, 2).character, ' ');
         assert_eq!(grid.cell(2, 3).character, 'X');
-        // Below cursor row unchanged
         assert_eq!(grid.cell(3, 0).character, 'X');
     }
 
@@ -928,9 +1277,9 @@ mod tests {
                 char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.scroll_down(1);
-        assert_eq!(grid.cell(0, 0).character, ' '); // new blank row
-        assert_eq!(grid.cell(1, 0).character, '1'); // shifted down
-        assert_eq!(grid.cell(4, 0).character, '4'); // old row 5 gone
+        assert_eq!(grid.cell(0, 0).character, ' ');
+        assert_eq!(grid.cell(1, 0).character, '1');
+        assert_eq!(grid.cell(4, 0).character, '4');
     }
 
     #[test]
@@ -948,9 +1297,8 @@ mod tests {
     #[test]
     fn set_scroll_region_bounds() {
         let mut grid = Grid::new(24, 80);
-        grid.set_scroll_region(5, 20); // 1-based
+        grid.set_scroll_region(5, 20);
         assert_eq!(grid.scroll_region(), (4, 19));
-        // Cursor resets to home
         assert_eq!(grid.cursor.row, 0);
         assert_eq!(grid.cursor.col, 0);
     }
@@ -964,8 +1312,8 @@ mod tests {
         grid.cursor.col = 1;
         grid.insert_blank(1);
         assert_eq!(grid.cell(0, 0).character, 'A');
-        assert_eq!(grid.cell(0, 1).character, ' '); // inserted blank
-        assert_eq!(grid.cell(0, 2).character, 'B'); // shifted right
+        assert_eq!(grid.cell(0, 1).character, ' ');
+        assert_eq!(grid.cell(0, 2).character, 'B');
     }
 
     #[test]
@@ -977,8 +1325,8 @@ mod tests {
         grid.cursor.col = 1;
         grid.delete_chars(1);
         assert_eq!(grid.cell(0, 0).character, 'A');
-        assert_eq!(grid.cell(0, 1).character, 'C'); // shifted left
-        assert_eq!(grid.cell(0, 4).character, ' '); // vacated
+        assert_eq!(grid.cell(0, 1).character, 'C');
+        assert_eq!(grid.cell(0, 4).character, ' ');
     }
 
     #[test]
@@ -990,7 +1338,6 @@ mod tests {
         }
         grid.cursor.row = 4;
         grid.index();
-        // Should scroll up, row 0 content gone
         assert_eq!(grid.cell(0, 0).character, '2');
         assert_eq!(grid.cell(4, 0).character, ' ');
     }
@@ -1004,9 +1351,8 @@ mod tests {
         }
         grid.cursor.row = 0;
         grid.reverse_index();
-        // Should scroll down, row 0 is blank
         assert_eq!(grid.cell(0, 0).character, ' ');
-        assert_eq!(grid.cell(1, 0).character, '1'); // shifted down
+        assert_eq!(grid.cell(1, 0).character, '1');
     }
 
     #[test]
@@ -1047,7 +1393,7 @@ mod tests {
         grid.backspace();
         grid.backspace();
         grid.backspace();
-        grid.backspace(); // already at 0
+        grid.backspace();
         assert_eq!(grid.cursor.col, 0);
     }
 
@@ -1072,8 +1418,8 @@ mod tests {
         grid.cursor.col = 1;
         grid.erase_chars(2);
         assert_eq!(grid.cell(0, 0).character, '1');
-        assert_eq!(grid.cell(0, 1).character, ' '); // erased
-        assert_eq!(grid.cell(0, 2).character, ' '); // erased
+        assert_eq!(grid.cell(0, 1).character, ' ');
+        assert_eq!(grid.cell(0, 2).character, ' ');
         assert_eq!(grid.cell(0, 3).character, '4');
     }
 
@@ -1085,5 +1431,48 @@ mod tests {
         assert!(grid.tabstops[16]);
         assert!(!grid.tabstops[1]);
         assert!(!grid.tabstops[7]);
+    }
+
+    #[test]
+    fn resize_preserves_content() {
+        let mut grid = Grid::with_scrollback(5, 5, 100);
+        for c in 0..5 {
+            grid.viewport[0].cells[c].character = char::from_digit(c as u32 + 1, 10).unwrap();
+        }
+        grid.resize(5, 10);
+        assert_eq!(grid.num_cols, 10);
+        assert_eq!(grid.cell(0, 0).character, '1');
+        assert_eq!(grid.cell(0, 4).character, '5');
+    }
+
+    #[test]
+    fn scrollback_ring_buffer_overflow() {
+        let mut grid = Grid::with_scrollback(3, 4, 5);
+        // Scroll more lines than scrollback can hold
+        for i in 0..10 {
+            grid.viewport[2].cells[0].character =
+                char::from_digit(i as u32 % 10, 10).unwrap_or('X');
+            grid.cursor.row = 2;
+            grid.newline();
+        }
+        // Scrollback should be capped at 5
+        assert_eq!(grid.scrollback.len(), 5);
+    }
+
+    #[test]
+    fn write_output_resets_scroll_offset() {
+        let mut grid = Grid::with_scrollback(5, 4, 100);
+        // Scroll up into history
+        for i in 0..10 {
+            grid.viewport[4].cells[0].character =
+                char::from_digit(i as u32 % 10, 10).unwrap_or('X');
+            grid.cursor.row = 4;
+            grid.newline();
+        }
+        grid.scroll_up_history(3);
+        assert_eq!(grid.scroll_offset, 3);
+        // Writing new output should reset scroll offset
+        grid.write_char_with_attrs('A', Color::DEFAULT_FG, Color::DEFAULT_BG, CellFlags::empty());
+        assert_eq!(grid.scroll_offset, 0);
     }
 }

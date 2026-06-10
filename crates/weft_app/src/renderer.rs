@@ -4,6 +4,7 @@ use core_graphics_types::geometry::CGSize;
 use metal::{
     CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
     MTLResourceOptions, MTLStoreAction, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
+    SamplerDescriptor,
 };
 use objc2::msg_send;
 use tracing::info;
@@ -11,7 +12,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
-use weft_core::grid::CellFlags;
+use weft_core::grid::{CellFlags, CursorStyle, CellWidth};
+use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
 /// Metal GPU renderer: draws the terminal Grid to screen.
@@ -21,6 +23,7 @@ pub struct MetalRenderer {
     queue: metal::CommandQueue,
     layer: MetalLayer,
     pipeline: metal::RenderPipelineState,
+    sampler: metal::SamplerState,
     atlas: GlyphAtlas,
     viewport: (f32, f32),
 }
@@ -34,22 +37,37 @@ impl MetalRenderer {
 
         let scale = window.scale_factor();
         let size = window.inner_size();
-        let vp_w = size.width as f32 * scale as f32;
-        let vp_h = size.height as f32 * scale as f32;
 
-        // Build glyph atlas
+        // Use logical points for viewport (divide physical pixels by scale)
+        let vp_w = size.width as f32 / scale as f32;
+        let vp_h = size.height as f32 / scale as f32;
+
+        // Build glyph atlas with CJK support
         let atlas = GlyphAtlas::new(&device, 14.0, scale);
 
-        // Compile shaders
+        info!(
+            "Window: {}x{} physical ({}x scale), viewport: {}x{} logical, atlas cells: {}x{}",
+            size.width, size.height, scale,
+            vp_w, vp_h,
+            atlas.cell_width, atlas.cell_height
+        );
+
+        // Compile shaders with DEBUGGING MODE
+        // Change DEBUG_MODE to 0-5 to test different rendering paths
+        // 0 = normal texture rendering
+        // 1 = solid red (test if fragment shader runs)
+        // 2 = texture alpha as white (test if texture sampling works)
+        // 3 = position as color (test if vertices pass position)
+        // 4 = UV as color (test if vertices pass UVs)
+        // 5 = background color only
         let source = r#"#include <metal_stdlib>
 using namespace metal;
 
-struct TextVertex {
-    float2 position;
-    float2 tex_coord;
-    float4 fg_color;
-    float4 bg_color;
-};
+    struct TextVertex {
+        float4 position_tex;  // xy = position, zw = tex_coord
+        float4 fg_color;
+        float4 bg_color;
+    };
 
 struct TextVertexOut {
     float4 position [[position]];
@@ -67,11 +85,14 @@ vertex TextVertexOut text_vertex(
     TextVertexOut out;
     TextVertex in = vertices[vid];
 
-    float2 clip = (in.position / viewport_size) * 2.0 - 1.0;
+    float2 position = in.position_tex.xy;
+    float2 tex_coord = in.position_tex.zw;
+
+    float2 clip = (position / viewport_size) * 2.0 - 1.0;
     clip.y = -clip.y;
 
     out.position = float4(clip, 0.0, 1.0);
-    out.tex_coord = in.tex_coord;
+    out.tex_coord = tex_coord;
     out.fg_color = in.fg_color;
     out.bg_color = in.bg_color;
     out.is_bg = 0.0;
@@ -83,10 +104,41 @@ fragment float4 text_fragment(
     texture2d<float> atlas [[texture(0)]],
     sampler atlas_sampler [[sampler(0)]]
 ) {
-    float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
-    float4 fg = in.fg_color * mask;
-    float4 bg = in.bg_color * (1.0 - mask);
-    return float4(fg.rgb + bg.rgb, fg.a + bg.a);
+    // DEBUG MODE: Set to 0-5 to test different rendering paths
+    // 0 = normal texture rendering (production)
+    const int DEBUG_MODE = 0;
+
+    if (DEBUG_MODE == 1) {
+        // Solid red - if we see this, fragment shader is executing
+        return float4(1.0, 0.0, 0.0, 1.0);
+    }
+    else if (DEBUG_MODE == 2) {
+        // Texture alpha as white - tests if texture sampling works
+        // DEBUG: Also show UV as color to verify tex_coord
+        float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
+        float4 uv_color = float4(in.tex_coord.x, in.tex_coord.y, 0.0, 1.0);
+        return mix(uv_color, float4(mask, mask, mask, 1.0), 0.5);
+    }
+    else if (DEBUG_MODE == 3) {
+        // Position as color - tests if vertices pass position correctly
+        float2 pos = (in.position.xy + 1.0) * 0.5;
+        return float4(pos.x, pos.y, 0.0, 1.0);
+    }
+    else if (DEBUG_MODE == 4) {
+        // UV as color - tests if vertices pass UVs correctly
+        return float4(in.tex_coord.x, in.tex_coord.y, 0.0, 1.0);
+    }
+    else if (DEBUG_MODE == 5) {
+        // Background color only
+        return in.bg_color;
+    }
+    else {
+        // DEBUG_MODE 0: Normal rendering
+        float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
+        float4 color = mix(in.bg_color, in.fg_color, mask);
+        color.a = 1.0;
+        return color;
+    }
 }
 "#;
 
@@ -102,18 +154,25 @@ fragment float4 text_fragment(
         pipeline_desc.set_fragment_function(Some(&fragment_fn));
         let color_att = pipeline_desc.color_attachments().object_at(0).unwrap();
         color_att.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        color_att.set_blending_enabled(true);
+        color_att.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_att.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        color_att.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        color_att.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
         let pipeline = device
             .new_render_pipeline_state(&pipeline_desc)
             .expect("Failed to create render pipeline");
 
         // Create and configure Metal layer
+        // IMPORTANT: drawable_size must be in PHYSICAL PIXELS, not logical points
+        // Metal uses the actual backing store size for rendering
         let layer = MetalLayer::new();
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         layer.set_presents_with_transaction(false);
         layer.set_maximum_drawable_count(3);
-        layer.set_drawable_size(CGSize::new(vp_w as f64, vp_h as f64));
+        layer.set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
 
         unsafe {
             attach_layer_to_nsview(&layer, window);
@@ -128,11 +187,25 @@ fragment float4 text_fragment(
             atlas.cell_height
         );
 
+        // Create sampler for glyph atlas texture
+        let sampler_desc = SamplerDescriptor::new();
+        sampler_desc.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler_desc.set_mag_filter(metal::MTLSamplerMinMagFilter::Linear);
+        sampler_desc.set_mip_filter(metal::MTLSamplerMipFilter::NotMipmapped);
+        sampler_desc.set_address_mode_r(metal::MTLSamplerAddressMode::ClampToEdge);
+        sampler_desc.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
+        sampler_desc.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
+        let sampler = device.new_sampler(&sampler_desc);
+
+        // Debug: check if texture has non-zero pixels
+        atlas.debug_check_texture();
+
         Self {
             device,
             queue,
             layer,
             pipeline,
+            sampler,
             atlas,
             viewport: (vp_w, vp_h),
         }
@@ -140,11 +213,13 @@ fragment float4 text_fragment(
 
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
         let scale = window.scale_factor();
-        let vp_w = size.width as f32 * scale as f32;
-        let vp_h = size.height as f32 * scale as f32;
+        // Use logical points for viewport calculations
+        let vp_w = size.width as f32 / scale as f32;
+        let vp_h = size.height as f32 / scale as f32;
         self.viewport = (vp_w, vp_h);
+        // IMPORTANT: drawable_size must be in PHYSICAL PIXELS
         self.layer
-            .set_drawable_size(CGSize::new(vp_w as f64, vp_h as f64));
+            .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
         window.request_redraw();
     }
 
@@ -159,7 +234,7 @@ fragment float4 text_fragment(
     }
 
     /// Draw the terminal Grid to screen.
-    pub fn draw(&self, terminal: &Terminal) {
+    pub fn draw(&self, terminal: &Terminal, selection: &SelectionHandler, cursor_blink_on: bool) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,
@@ -169,16 +244,33 @@ fragment float4 text_fragment(
         let cursor = &grid.cursor;
 
         // Build vertex data from Grid cells
-        let vertices = self.build_grid_vertices(grid, cursor);
+        let vertices = self.build_grid_vertices(grid, cursor, selection, terminal.cursor_visible && cursor_blink_on, terminal.cursor_style);
+
+        // Debug: log first row characters and verify vertex data
+        let first_row: String = (0..grid.num_cols.min(20))
+            .map(|c| grid.cell(0, c).character)
+            .collect();
+
+        // Log first few vertex values to verify data structure
+        tracing::info!(
+            "Drawing {} vertices ({}x{} grid, viewport {}x{}), first row: '{}', cursor at ({},{})",
+            vertices.len() / 12, grid.num_rows, grid.num_cols,
+            self.viewport.0, self.viewport.1, first_row, cursor.row, cursor.col
+        );
+        if vertices.len() >= 24 {
+            tracing::info!(
+                "First triangle vertices: pos=({:.1},{:.1}), uv=({:.2},{:.2}), fg=({:.2},{:.2},{:.2},{:.2}), bg=({:.2},{:.2},{:.2},{:.2})",
+                vertices[0], vertices[1], vertices[2], vertices[3], vertices[4], vertices[5], vertices[6], vertices[7], vertices[8], vertices[9], vertices[10], vertices[11]
+            );
+        }
 
         if vertices.is_empty() {
-            // Nothing to draw, just clear
             let pass_desc = RenderPassDescriptor::new();
             let color_att = pass_desc.color_attachments().object_at(0).unwrap();
             color_att.set_texture(Some(drawable.texture()));
             color_att.set_load_action(MTLLoadAction::Clear);
             color_att.set_store_action(MTLStoreAction::Store);
-            color_att.set_clear_color(MTLClearColor::new(0.12, 0.12, 0.14, 1.0));
+            color_att.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
 
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_render_command_encoder(pass_desc);
@@ -210,7 +302,7 @@ fragment float4 text_fragment(
         color_att.set_texture(Some(drawable.texture()));
         color_att.set_load_action(MTLLoadAction::Clear);
         color_att.set_store_action(MTLStoreAction::Store);
-        color_att.set_clear_color(MTLClearColor::new(0.12, 0.12, 0.14, 1.0));
+        color_att.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
 
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
@@ -218,10 +310,20 @@ fragment float4 text_fragment(
         encoder.set_render_pipeline_state(&self.pipeline);
         encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
         encoder.set_vertex_buffer(1, Some(&vp_buffer), 0);
-        encoder.set_fragment_texture(0, Some(self.atlas.texture()));
+        
+        let tex = self.atlas.texture();
+        tracing::debug!("Binding texture width={}, height={}", 
+            tex.width(), tex.height());
+        encoder.set_fragment_texture(0, Some(tex));
+        encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-        let vertex_count = vertices.len() / 12; // 12 floats per vertex
-        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
+        let vertex_count = vertices.len() / 12;
+        tracing::info!("Drawing: vertices.len()={}, vertex_count={}", vertices.len(), vertex_count);
+        if vertex_count > 0 {
+            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
+        } else {
+            tracing::warn!("vertex_count is 0, skipping draw_primitives");
+        }
         encoder.end_encoding();
 
         command_buffer.present_drawable(drawable);
@@ -229,30 +331,33 @@ fragment float4 text_fragment(
     }
 
     /// Build vertex buffer from the terminal Grid.
-    ///
-    /// Each cell = 1 quad = 6 vertices. Each vertex has:
-    ///   position(2) + tex_coord(2) + fg_color(4) + bg_color(4) = 12 floats
-    /// Wait, the shader uses 10 floats (pos2 + uv2 + fg4 + bg4) but we have
-    /// fg and bg separate. Let me use 10 floats: pos(2) + uv(2) + fg(4) + bg(4).
     fn build_grid_vertices(
         &self,
         grid: &weft_core::grid::Grid,
         cursor: &weft_core::grid::Cursor,
+        selection: &SelectionHandler,
+        show_cursor: bool,
+        cursor_style: CursorStyle,
     ) -> Vec<f32> {
-        let cw = self.atlas.cell_width as f32;
-        let ch = self.atlas.cell_height as f32;
+        // Calculate logical cell size from viewport to ensure exact coverage
+        let cw = self.viewport.0 / grid.num_cols as f32;
+        let ch = self.viewport.1 / grid.num_rows as f32;
         let num_rows = grid.num_rows;
         let num_cols = grid.num_cols;
 
-        let mut vertices = Vec::with_capacity(num_rows * num_cols * 72); // 6 verts * 12 floats
+        let mut vertices = Vec::with_capacity(num_rows * num_cols * 72);
 
         // Default colors
         let default_fg = [0.9, 0.9, 0.9, 1.0];
         let default_bg = [0.12, 0.12, 0.14, 1.0];
 
-        // Cursor color (bright green)
-        let cursor_color = [0.2, 0.8, 0.4, 1.0];
+        // Cursor color (white, standard terminal cursor)
+        let cursor_color = [1.0, 1.0, 1.0, 1.0];
 
+        // Selection highlight color (semi-transparent blue)
+        let selection_bg = [0.2, 0.4, 0.8, 0.4];
+
+        let mut first_non_space_logged = false;
         for row in 0..num_rows {
             for col in 0..num_cols {
                 let cell = grid.cell(row, col);
@@ -270,7 +375,10 @@ fragment float4 text_fragment(
                 let bg = color_to_normalized(cell.bg, default_bg);
 
                 // Check if this is the cursor position
-                let is_cursor = row == cursor.row && col == cursor.col;
+                let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
+
+                // Check if this cell is in the selection
+                let is_selected = selection.selection.as_ref().map_or(false, |sel| sel.contains(row, col));
 
                 // Look up glyph UV
                 let ch_char = if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
@@ -284,33 +392,55 @@ fragment float4 text_fragment(
                     let (uw, vh) = glyph.uv_size;
                     (u, v, u + uw, v + vh)
                 } else {
-                    // Space: use a blank region in the atlas (character 32)
+                    // Character not in atlas — use space
                     let (u, v) = self.atlas.get(' ').map(|g| g.uv_origin).unwrap_or((0.0, 0.0));
                     let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
                     (u, v, u + uw, v + vh)
                 };
 
-                // Override fg for cursor cell
+                // Debug: log first non-space cell
+                if !first_non_space_logged && cell.character != ' ' {
+                    first_non_space_logged = true;
+                    tracing::info!("First non-space cell at ({},{}): char='{}', UV=({:.3},{:.3})-({:.3},{:.3}), pos=({:.1},{:.1}), fg={:?}, bg={:?}",
+                        row, col, cell.character, u0, v0, u1, v1, x, y, cell.fg, cell.bg);
+                }
+
+                // Override colors for cursor
                 let final_fg = if is_cursor {
-                    cursor_color
+                    if cursor_style == CursorStyle::Block {
+                        [0.0, 0.0, 0.0, 1.0] // Black text on cursor block
+                    } else {
+                        cursor_color
+                    }
                 } else {
                     fg
                 };
 
-                // Draw cursor as colored block when on cursor position and cell is empty
-                let final_bg = if is_cursor && ch_char == ' ' {
+                let final_bg = if is_cursor && cursor_style == CursorStyle::Block {
                     cursor_color
+                } else if is_selected {
+                    selection_bg
+                } else if is_cursor && (cursor_style == CursorStyle::Bar || cursor_style == CursorStyle::BlinkingBar) {
+                    // Bar cursor: only highlight the left 2 pixels
+                    // We'll draw the full cell with normal bg, then overlay bar later
+                    bg
                 } else {
                     bg
                 };
 
+                // Determine cell width for rendering
+                let cell_render_width = if cell.width == CellWidth::Full && col + 1 < num_cols {
+                    cw * 2.0
+                } else {
+                    cw
+                };
+
                 let x0 = x;
                 let y0 = y;
-                let x1 = x + cw;
+                let x1 = x + cell_render_width;
                 let y1 = y + ch;
 
                 // Two triangles: TL-BL-BR, TL-BR-TR
-                // Each vertex: pos(2) + uv(2) + fg_color(4) + bg_color(4) = 12 floats
                 let quad: [[f32; 12]; 6] = [
                     [x0, y0, u0, v0, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
                     [x0, y1, u0, v1, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
@@ -323,6 +453,42 @@ fragment float4 text_fragment(
                 for vertex in &quad {
                     vertices.extend_from_slice(vertex);
                 }
+
+                // Draw bar/underline cursor overlay
+                if is_cursor && show_cursor {
+                    match cursor_style {
+                        CursorStyle::Bar | CursorStyle::BlinkingBar => {
+                            let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
+                            let bar_w = bar_w.max(1.0).min(cw * 0.15);
+                            let quad: [[f32; 12]; 6] = [
+                                [x0, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0 + bar_w, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0 + bar_w, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0 + bar_w, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                            ];
+                            for vertex in &quad {
+                                vertices.extend_from_slice(vertex);
+                            }
+                        }
+                        CursorStyle::Underline | CursorStyle::BlinkingUnderline => {
+                            let line_h = 2.0;
+                            let quad: [[f32; 12]; 6] = [
+                                [x0, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x1, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x0, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x1, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [x1, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                            ];
+                            for vertex in &quad {
+                                vertices.extend_from_slice(vertex);
+                            }
+                        }
+                        _ => {} // Block cursor handled above
+                    }
+                }
             }
         }
 
@@ -332,7 +498,6 @@ fragment float4 text_fragment(
 
 /// Convert a grid Color to normalized RGBA floats.
 fn color_to_normalized(color: weft_core::grid::Color, default: [f32; 4]) -> [f32; 4] {
-    // Check if it's the default color (meaning "use theme default")
     if color.r == 0 && color.g == 0 && color.b == 0 && color.a == 0 {
         return default;
     }
@@ -345,9 +510,6 @@ fn color_to_normalized(color: weft_core::grid::Color, default: [f32; 4]) -> [f32
 }
 
 /// Attach a Metal layer to the winit window's NSView.
-///
-/// # Safety
-/// Caller must ensure `window` is a valid macOS window with an AppKit NSView.
 unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window) {
     let handle = window.window_handle().expect("Failed to get window handle");
     let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {

@@ -3,7 +3,8 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
-use crate::grid::{CellFlags, CellWidth, Color, Grid};
+use crate::grid::{CellFlags, CellWidth, Color, CursorStyle, Grid};
+use crate::input::MouseProtocol;
 
 /// Current text attributes applied to newly printed characters.
 /// Updated by SGR (CSI m) sequences, consumed by `print()`.
@@ -50,6 +51,12 @@ pub struct Terminal {
     pub bracketed_paste: bool,
     /// Origin mode (DECOM, CSI ?6h/l).
     origin_mode: bool,
+    /// Cursor visibility (DECTCEM, CSI ?25h/l).
+    pub cursor_visible: bool,
+    /// Cursor style (DECSCUSR, CSI <n> q).
+    pub cursor_style: CursorStyle,
+    /// Mouse protocol mode.
+    pub mouse_protocol: MouseProtocol,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
 }
@@ -65,6 +72,9 @@ impl Terminal {
             app_cursor_keys: false,
             bracketed_paste: false,
             origin_mode: false,
+            cursor_visible: true,
+            cursor_style: CursorStyle::Block,
+            mouse_protocol: MouseProtocol::Off,
             palette: Self::init_palette(),
         }
     }
@@ -274,7 +284,13 @@ impl Terminal {
         match mode {
             1 => self.app_cursor_keys = set,    // DECCKM
             6 => self.origin_mode = set,        // DECOM
+            7 => { /* DECAWM — auto wrap mode, always on */ }
+            25 => self.cursor_visible = set,    // DECTCEM — cursor show/hide
             2004 => self.bracketed_paste = set, // Bracketed paste
+            9 => self.mouse_protocol = if set { MouseProtocol::X10 } else { MouseProtocol::Off },
+            1000 => self.mouse_protocol = if set { MouseProtocol::Normal } else { MouseProtocol::Off },
+            1002 => self.mouse_protocol = if set { MouseProtocol::ButtonEvent } else { MouseProtocol::Off },
+            1003 => self.mouse_protocol = if set { MouseProtocol::AnyEvent } else { MouseProtocol::Off },
             _ => tracing::trace!(mode, set, "unhandled DEC private mode"),
         }
     }
@@ -450,6 +466,7 @@ impl vte::Perform for Terminal {
                     0 => self.grid.clear_screen_below(),
                     1 => self.grid.clear_screen_above(),
                     2 => self.grid.clear_screen_all(),
+                    3 => self.grid.clear_scrollback(),
                     _ => {}
                 }
             }
@@ -515,6 +532,24 @@ impl vte::Perform for Terminal {
                     0 => self.grid.clear_tabstop(),
                     3 => self.grid.clear_all_tabstops(),
                     _ => {}
+                }
+            }
+
+            // Cursor style (DECSCUSR — CSI <n> q)
+            'q' => {
+                if intermediates.is_empty() {
+                    // Only handle as DECSCUSR if it looks like "CSI N q"
+                    // (not a regular CSI q which is rare)
+                    let style = param(params, 0, 0);
+                    self.cursor_style = match style {
+                        0 | 1 => CursorStyle::BlinkingBlock,
+                        2 => CursorStyle::Block,
+                        3 => CursorStyle::BlinkingUnderline,
+                        4 => CursorStyle::Underline,
+                        5 => CursorStyle::BlinkingBar,
+                        6 => CursorStyle::Bar,
+                        _ => CursorStyle::Block,
+                    };
                 }
             }
 

@@ -1,6 +1,6 @@
-//! Keyboard input encoding for terminal emulators.
+//! Keyboard and mouse input encoding for terminal emulators.
 //!
-//! Translates abstract key events into VT100/VT220 escape sequences
+//! Translates abstract key/mouse events into VT100/VT220 escape sequences
 //! that can be sent to the PTY for the shell to interpret.
 
 use bitflags::bitflags;
@@ -55,18 +55,55 @@ pub enum KeyCode {
     Numpad(char),
 }
 
+/// Mouse button for terminal events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+/// Mouse action type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Move,
+}
+
+/// SGR mouse protocol mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// No mouse protocol — mouse events not forwarded to PTY.
+    Off,
+    /// X10 mode: report on button press only (CSI M).
+    X10,
+    /// Normal tracking: report button press/release (CSI M).
+    Normal,
+    /// Button-event tracking: report press/release + motion with button held.
+    ButtonEvent,
+    /// Any-event tracking: report all mouse events.
+    AnyEvent,
+}
+
 /// Encodes keyboard input into VT escape sequences for the PTY.
 pub struct InputHandler {
     /// Whether to use application cursor key mode (DECCKM).
     /// When true, arrow keys send SS3 sequences (ESC O A/B/C/D).
     /// When false, arrow keys send CSI sequences (ESC [ A/B/C/D).
     pub app_cursor_keys: bool,
+    /// Current mouse protocol mode.
+    pub mouse_protocol: MouseProtocol,
+    /// Mouse coordinate origin (0 or 1 based, SGR uses 1-based).
+    mouse_coord_base: u8,
 }
 
 impl InputHandler {
     pub fn new() -> Self {
         Self {
             app_cursor_keys: false,
+            mouse_protocol: MouseProtocol::Off,
+            mouse_coord_base: 1, // SGR uses 1-based
         }
     }
 
@@ -91,6 +128,120 @@ impl InputHandler {
             KeyCode::F(n) => self.encode_function_key(n, mods),
             KeyCode::Numpad(c) => vec![c as u8],
         }
+    }
+
+    /// Encode a mouse event using SGR mouse protocol.
+    /// Returns bytes to send to PTY, or None if mouse protocol is off.
+    pub fn encode_mouse(
+        &self,
+        button: MouseButton,
+        action: MouseAction,
+        col: usize,
+        row: usize,
+        mods: Modifiers,
+    ) -> Option<Vec<u8>> {
+        if self.mouse_protocol == MouseProtocol::Off {
+            return None;
+        }
+
+        // SGR mouse mode: CSI < Pb ; Px ; Py M (press) / m (release)
+        let btn_code = match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        };
+
+        // Add modifier bits
+        let mut pb = btn_code;
+        if mods.contains(Modifiers::SHIFT) {
+            pb |= 4;
+        }
+        if mods.contains(Modifiers::ALT) {
+            pb |= 8;
+        }
+        if mods.contains(Modifiers::CONTROL) {
+            pb |= 16;
+        }
+
+        // Motion flag
+        if action == MouseAction::Move {
+            pb |= 32;
+        }
+
+        let suffix = match action {
+            MouseAction::Press => 'M',
+            MouseAction::Release => 'm',
+            MouseAction::Move => {
+                // Only send move events in ButtonEvent or AnyEvent mode
+                match self.mouse_protocol {
+                    MouseProtocol::ButtonEvent | MouseProtocol::AnyEvent => 'M',
+                    _ => return None,
+                }
+            }
+        };
+
+        let px = col + self.mouse_coord_base as usize;
+        let py = row + self.mouse_coord_base as usize;
+
+        Some(format!("\x1b[<{pb};{px};{py}{suffix}").into_bytes())
+    }
+
+    /// Set the mouse protocol mode (from DEC private mode sequences).
+    pub fn set_mouse_protocol(&mut self, mode: MouseProtocol) {
+        self.mouse_protocol = mode;
+    }
+
+    /// Handle DEC private mode set/reset for mouse protocols.
+    /// Returns true if the mode was handled.
+    pub fn handle_mouse_mode(&mut self, mode: u16, set: bool) -> bool {
+        let new_mode = if set {
+            match mode {
+                9 => Some(MouseProtocol::X10),
+                1000 => Some(MouseProtocol::Normal),
+                1002 => Some(MouseProtocol::ButtonEvent),
+                1003 => Some(MouseProtocol::AnyEvent),
+                _ => None,
+            }
+        } else {
+            // Resetting any mouse mode turns it off
+            match mode {
+                9 | 1000 | 1002 | 1003 => Some(MouseProtocol::Off),
+                _ => None,
+            }
+        };
+
+        if let Some(m) = new_mode {
+            self.mouse_protocol = m;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Encode scroll wheel events.
+    pub fn encode_scroll(&self, up: bool, col: usize, row: usize, mods: Modifiers) -> Option<Vec<u8>> {
+        if self.mouse_protocol == MouseProtocol::Off {
+            return None;
+        }
+
+        // Scroll wheel: button 4 (up) or 5 (down) in SGR mode
+        let btn_code = if up { 64 } else { 65 }; // bit 6 set for scroll
+
+        let mut pb = btn_code;
+        if mods.contains(Modifiers::SHIFT) {
+            pb |= 4;
+        }
+        if mods.contains(Modifiers::ALT) {
+            pb |= 8;
+        }
+        if mods.contains(Modifiers::CONTROL) {
+            pb |= 16;
+        }
+
+        let px = col + self.mouse_coord_base as usize;
+        let py = row + self.mouse_coord_base as usize;
+
+        Some(format!("\x1b[<{pb};{px};{py}M").into_bytes())
     }
 
     fn encode_char(&self, c: char, mods: Modifiers) -> Vec<u8> {
@@ -153,9 +304,6 @@ impl InputHandler {
     }
 
     fn encode_backspace(&self, mods: Modifiers) -> Vec<u8> {
-        // Ctrl+Backspace often sends DEL (0x7F), plain Backspace sends BS (0x08)
-        // or DEL depending on terminal config. We follow modern convention:
-        // plain = DEL, Ctrl = DEL.
         if mods.contains(Modifiers::ALT) {
             vec![0x1B, 0x7F]
         } else {
@@ -172,9 +320,6 @@ impl InputHandler {
     }
 
     /// Encode arrow keys.
-    /// Normal mode: CSI A/B/C/D
-    /// Application mode: SS3 A/B/C/D (ESC O A/B/C/D)
-    /// With modifiers: CSI 1;modifier A/B/C/D
     fn encode_arrow(&self, dir: char, mods: Modifiers) -> Vec<u8> {
         let has_mods = mods.intersects(Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL);
 
@@ -205,10 +350,6 @@ impl InputHandler {
     }
 
     fn encode_page(&self, suffix: char, _mods: Modifiers) -> Vec<u8> {
-        // Page Up: CSI 5~  or  CSI 5;modifier ~
-        // Page Down: CSI 6~  or  CSI 6;modifier ~
-        // For simplicity, use unmodified form for now.
-        // modifier support can be added later.
         format!("\x1b[{suffix}").into_bytes()
     }
 
@@ -221,7 +362,7 @@ impl InputHandler {
                     let m = self.modifier_code(mods);
                     format!("\x1b[1;{m}P").into_bytes()
                 } else {
-                    b"\x1bOP".to_vec() // SS3 P
+                    b"\x1bOP".to_vec()
                 }
             }
             2 => {
@@ -249,7 +390,6 @@ impl InputHandler {
                 }
             }
             5..=10 => {
-                // F5–F10: CSI 15~ through CSI 21~ (with gaps)
                 let codes = [15u8, 17, 18, 19, 20, 21];
                 let code = codes[n as usize - 5];
                 if has_mods {
@@ -260,7 +400,6 @@ impl InputHandler {
                 }
             }
             11..=12 => {
-                // F11–F12: CSI 23~ through CSI 24~
                 let code = 23 + (n - 11);
                 if has_mods {
                     let m = self.modifier_code(mods);
@@ -269,13 +408,10 @@ impl InputHandler {
                     format!("\x1b[{code}~").into_bytes()
                 }
             }
-            _ => Vec::new(), // Unsupported function key
+            _ => Vec::new(),
         }
     }
 
-    /// CSI param-based keys (Home/End/Insert/Delete) with optional modifiers.
-    /// Without modifiers: CSI <n> ~
-    /// With modifiers: CSI <n> ; <mod> ~
     fn encode_csi_tilde_or_mod(&self, code: u8, mods: Modifiers) -> Vec<u8> {
         let has_mods = mods.intersects(Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL);
         if has_mods {
@@ -286,22 +422,19 @@ impl InputHandler {
         }
     }
 
-    /// Map modifier flags to the VT220 modifier code used in CSI sequences.
-    /// 1=Shift, 2=Alt, 3=Shift+Alt, 4=Ctrl, 5=Shift+Ctrl,
-    /// 6=Alt+Ctrl, 7=Shift+Alt+Ctrl, 8=Meta (same as Alt).
     fn modifier_code(&self, mods: Modifiers) -> u8 {
         let shift = mods.contains(Modifiers::SHIFT) as u8;
         let alt = mods.contains(Modifiers::ALT) as u8;
         let ctrl = mods.contains(Modifiers::CONTROL) as u8;
         match (shift, alt, ctrl) {
-            (0, 0, 0) => 1, // no mods (shouldn't be called, but safe default)
-            (1, 0, 0) => 2, // Shift
-            (0, 1, 0) => 3, // Alt
-            (1, 1, 0) => 4, // Shift+Alt
-            (0, 0, 1) => 5, // Ctrl
-            (1, 0, 1) => 6, // Shift+Ctrl
-            (0, 1, 1) => 7, // Alt+Ctrl
-            (1, 1, 1) => 8, // Shift+Alt+Ctrl
+            (0, 0, 0) => 1,
+            (1, 0, 0) => 2,
+            (0, 1, 0) => 3,
+            (1, 1, 0) => 4,
+            (0, 0, 1) => 5,
+            (1, 0, 1) => 6,
+            (0, 1, 1) => 7,
+            (1, 1, 1) => 8,
             _ => 1,
         }
     }
@@ -310,6 +443,27 @@ impl InputHandler {
 impl Default for InputHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Encode bracketed paste start/end sequences.
+pub fn bracketed_paste_start() -> Vec<u8> {
+    b"\x1b[200~".to_vec()
+}
+
+pub fn bracketed_paste_end() -> Vec<u8> {
+    b"\x1b[201~".to_vec()
+}
+
+/// Wrap text for bracketed paste mode.
+pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut bytes = bracketed_paste_start();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend(bracketed_paste_end());
+        bytes
+    } else {
+        text.as_bytes().to_vec()
     }
 }
 
@@ -387,7 +541,6 @@ mod tests {
 
     #[test]
     fn ctrl_uppercase() {
-        // Ctrl+Shift+A should also produce ctrl code
         assert_eq!(
             handler().encode_key(KeyCode::Char('A'), Modifiers::CONTROL),
             b"\x01"
@@ -557,5 +710,73 @@ mod tests {
     #[test]
     fn numpad_digit() {
         assert_eq!(handler().encode_key(KeyCode::Numpad('5'), Modifiers::empty()), b"5");
+    }
+
+    // ── Mouse protocol ────────────────────────────────────────────
+
+    #[test]
+    fn mouse_off_returns_none() {
+        let h = handler();
+        assert!(h.encode_mouse(MouseButton::Left, MouseAction::Press, 5, 10, Modifiers::empty()).is_none());
+    }
+
+    #[test]
+    fn mouse_sgr_left_press() {
+        let mut h = handler();
+        h.mouse_protocol = MouseProtocol::Normal;
+        let bytes = h.encode_mouse(MouseButton::Left, MouseAction::Press, 5, 10, Modifiers::empty());
+        assert!(bytes.is_some());
+        let bytes = bytes.unwrap();
+        // SGR: ESC[<0;6;11M (1-based coords)
+        assert!(bytes.starts_with(b"\x1b[<0;6;11M"));
+    }
+
+    #[test]
+    fn mouse_sgr_release() {
+        let mut h = handler();
+        h.mouse_protocol = MouseProtocol::Normal;
+        let bytes = h.encode_mouse(MouseButton::Left, MouseAction::Release, 5, 10, Modifiers::empty());
+        assert!(bytes.is_some());
+        let bytes = bytes.unwrap();
+        // Release ends with 'm' (lowercase)
+        assert!(bytes.ends_with(b"m"));
+    }
+
+    #[test]
+    fn mouse_scroll() {
+        let mut h = handler();
+        h.mouse_protocol = MouseProtocol::Normal;
+        let bytes = h.encode_scroll(true, 5, 10, Modifiers::empty());
+        assert!(bytes.is_some());
+        let bytes = bytes.unwrap();
+        // Scroll up: button 64
+        assert!(bytes.starts_with(b"\x1b[<64;"));
+    }
+
+    #[test]
+    fn mouse_mode_handling() {
+        let mut h = handler();
+        assert!(h.handle_mouse_mode(1000, true));
+        assert_eq!(h.mouse_protocol, MouseProtocol::Normal);
+        assert!(h.handle_mouse_mode(1002, true));
+        assert_eq!(h.mouse_protocol, MouseProtocol::ButtonEvent);
+        assert!(h.handle_mouse_mode(1000, false));
+        assert_eq!(h.mouse_protocol, MouseProtocol::Off);
+    }
+
+    // ── Bracketed paste ───────────────────────────────────────────
+
+    #[test]
+    fn bracketed_paste_wrapping() {
+        let bytes = encode_paste("hello", true);
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert!(bytes.windows(5).any(|w| w == b"hello"));
+    }
+
+    #[test]
+    fn unbracketed_paste() {
+        let bytes = encode_paste("hello", false);
+        assert_eq!(bytes, b"hello");
     }
 }

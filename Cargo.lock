@@ -1904,6 +1904,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "weft_core",
  "winit",
 ]
