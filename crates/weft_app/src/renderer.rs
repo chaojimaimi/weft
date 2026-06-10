@@ -3,8 +3,8 @@
 use core_graphics_types::geometry::CGSize;
 use metal::{
     CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLResourceOptions, MTLStoreAction, MetalLayer, RenderPassDescriptor, RenderPipelineDescriptor,
-    SamplerDescriptor,
+    MTLResourceOptions, MTLStoreAction, MTLVertexFormat, MetalLayer, RenderPassDescriptor,
+    RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
 };
 use objc2::msg_send;
 use tracing::info;
@@ -63,10 +63,10 @@ impl MetalRenderer {
         let source = r#"#include <metal_stdlib>
 using namespace metal;
 
-    struct TextVertex {
-        float4 position_tex;  // xy = position, zw = tex_coord
-        float4 fg_color;
-        float4 bg_color;
+    struct TextVertexIn {
+        float4 position_tex [[attribute(0)]];  // xy = position, zw = tex_coord
+        float4 fg_color [[attribute(1)]];
+        float4 bg_color [[attribute(2)]];
     };
 
 struct TextVertexOut {
@@ -78,23 +78,24 @@ struct TextVertexOut {
 };
 
 vertex TextVertexOut text_vertex(
-    constant TextVertex* vertices [[buffer(0)]],
-    uint vid [[vertex_id]],
+    TextVertexIn vin [[stage_in]],
     constant float2& viewport_size [[buffer(1)]]
 ) {
     TextVertexOut out;
-    TextVertex in = vertices[vid];
 
-    float2 position = in.position_tex.xy;
-    float2 tex_coord = in.position_tex.zw;
+    float2 position = vin.position_tex.xy;
+    float2 tex_coord = vin.position_tex.zw;
 
+    // Map logical pixels (origin top-left) to clip space. The CAMetalLayer on this
+    // NSView composites with an extra vertical flip, so we sample each glyph's V
+    // inverted (swapped in build_grid_vertices) to keep letters upright on screen.
     float2 clip = (position / viewport_size) * 2.0 - 1.0;
     clip.y = -clip.y;
 
     out.position = float4(clip, 0.0, 1.0);
     out.tex_coord = tex_coord;
-    out.fg_color = in.fg_color;
-    out.bg_color = in.bg_color;
+    out.fg_color = vin.fg_color;
+    out.bg_color = vin.bg_color;
     out.is_bg = 0.0;
     return out;
 }
@@ -104,41 +105,11 @@ fragment float4 text_fragment(
     texture2d<float> atlas [[texture(0)]],
     sampler atlas_sampler [[sampler(0)]]
 ) {
-    // DEBUG MODE: Set to 0-5 to test different rendering paths
-    // 0 = normal texture rendering (production)
-    const int DEBUG_MODE = 0;
-
-    if (DEBUG_MODE == 1) {
-        // Solid red - if we see this, fragment shader is executing
-        return float4(1.0, 0.0, 0.0, 1.0);
-    }
-    else if (DEBUG_MODE == 2) {
-        // Texture alpha as white - tests if texture sampling works
-        // DEBUG: Also show UV as color to verify tex_coord
-        float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
-        float4 uv_color = float4(in.tex_coord.x, in.tex_coord.y, 0.0, 1.0);
-        return mix(uv_color, float4(mask, mask, mask, 1.0), 0.5);
-    }
-    else if (DEBUG_MODE == 3) {
-        // Position as color - tests if vertices pass position correctly
-        float2 pos = (in.position.xy + 1.0) * 0.5;
-        return float4(pos.x, pos.y, 0.0, 1.0);
-    }
-    else if (DEBUG_MODE == 4) {
-        // UV as color - tests if vertices pass UVs correctly
-        return float4(in.tex_coord.x, in.tex_coord.y, 0.0, 1.0);
-    }
-    else if (DEBUG_MODE == 5) {
-        // Background color only
-        return in.bg_color;
-    }
-    else {
-        // DEBUG_MODE 0: Normal rendering
-        float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
-        float4 color = mix(in.bg_color, in.fg_color, mask);
-        color.a = 1.0;
-        return color;
-    }
+    // Sample the glyph mask from the R8 atlas and blend fg over bg.
+    float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
+    float4 color = mix(in.bg_color, in.fg_color, mask);
+    color.a = 1.0;
+    return color;
 }
 "#;
 
@@ -150,6 +121,28 @@ fragment float4 text_fragment(
         let fragment_fn = library.get_function("text_fragment", None).unwrap();
 
         let pipeline_desc = RenderPipelineDescriptor::new();
+
+        // Explicit vertex descriptor: the vertex buffer packs 3 float4 attributes
+        // (position_tex, fg_color, bg_color) per vertex at stride 48. The vertex
+        // shader uses [[stage_in]] attribute pulling, which requires this descriptor
+        // (manual buffer indexing without one produced scrambled vertex data).
+        let vertex_desc = VertexDescriptor::new();
+        let attrs = vertex_desc.attributes();
+        let attr0 = attrs.object_at(0).unwrap();
+        attr0.set_format(MTLVertexFormat::Float4);
+        attr0.set_buffer_index(0);
+        attr0.set_offset(0);
+        let attr1 = attrs.object_at(1).unwrap();
+        attr1.set_format(MTLVertexFormat::Float4);
+        attr1.set_buffer_index(0);
+        attr1.set_offset(16);
+        let attr2 = attrs.object_at(2).unwrap();
+        attr2.set_format(MTLVertexFormat::Float4);
+        attr2.set_buffer_index(0);
+        attr2.set_offset(32);
+        vertex_desc.layouts().object_at(0).unwrap().set_stride(48);
+        pipeline_desc.set_vertex_descriptor(Some(&vertex_desc));
+
         pipeline_desc.set_vertex_function(Some(&vertex_fn));
         pipeline_desc.set_fragment_function(Some(&fragment_fn));
         let color_att = pipeline_desc.color_attachments().object_at(0).unwrap();
@@ -175,7 +168,7 @@ fragment float4 text_fragment(
         layer.set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
 
         unsafe {
-            attach_layer_to_nsview(&layer, window);
+            attach_layer_to_nsview(&layer, window, scale);
         }
 
         info!(
@@ -196,9 +189,6 @@ fragment float4 text_fragment(
         sampler_desc.set_address_mode_s(metal::MTLSamplerAddressMode::ClampToEdge);
         sampler_desc.set_address_mode_t(metal::MTLSamplerAddressMode::ClampToEdge);
         let sampler = device.new_sampler(&sampler_desc);
-
-        // Debug: check if texture has non-zero pixels
-        atlas.debug_check_texture();
 
         Self {
             device,
@@ -247,23 +237,6 @@ fragment float4 text_fragment(
         let vertices = self.build_grid_vertices(grid, cursor, selection, terminal.cursor_visible && cursor_blink_on, terminal.cursor_style);
 
         // Debug: log first row characters and verify vertex data
-        let first_row: String = (0..grid.num_cols.min(20))
-            .map(|c| grid.cell(0, c).character)
-            .collect();
-
-        // Log first few vertex values to verify data structure
-        tracing::info!(
-            "Drawing {} vertices ({}x{} grid, viewport {}x{}), first row: '{}', cursor at ({},{})",
-            vertices.len() / 12, grid.num_rows, grid.num_cols,
-            self.viewport.0, self.viewport.1, first_row, cursor.row, cursor.col
-        );
-        if vertices.len() >= 24 {
-            tracing::info!(
-                "First triangle vertices: pos=({:.1},{:.1}), uv=({:.2},{:.2}), fg=({:.2},{:.2},{:.2},{:.2}), bg=({:.2},{:.2},{:.2},{:.2})",
-                vertices[0], vertices[1], vertices[2], vertices[3], vertices[4], vertices[5], vertices[6], vertices[7], vertices[8], vertices[9], vertices[10], vertices[11]
-            );
-        }
-
         if vertices.is_empty() {
             let pass_desc = RenderPassDescriptor::new();
             let color_att = pass_desc.color_attachments().object_at(0).unwrap();
@@ -312,17 +285,12 @@ fragment float4 text_fragment(
         encoder.set_vertex_buffer(1, Some(&vp_buffer), 0);
         
         let tex = self.atlas.texture();
-        tracing::debug!("Binding texture width={}, height={}", 
-            tex.width(), tex.height());
         encoder.set_fragment_texture(0, Some(tex));
         encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
         let vertex_count = vertices.len() / 12;
-        tracing::info!("Drawing: vertices.len()={}, vertex_count={}", vertices.len(), vertex_count);
         if vertex_count > 0 {
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
-        } else {
-            tracing::warn!("vertex_count is 0, skipping draw_primitives");
         }
         encoder.end_encoding();
 
@@ -357,7 +325,6 @@ fragment float4 text_fragment(
         // Selection highlight color (semi-transparent blue)
         let selection_bg = [0.2, 0.4, 0.8, 0.4];
 
-        let mut first_non_space_logged = false;
         for row in 0..num_rows {
             for col in 0..num_cols {
                 let cell = grid.cell(row, col);
@@ -397,13 +364,9 @@ fragment float4 text_fragment(
                     let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
                     (u, v, u + uw, v + vh)
                 };
-
-                // Debug: log first non-space cell
-                if !first_non_space_logged && cell.character != ' ' {
-                    first_non_space_logged = true;
-                    tracing::info!("First non-space cell at ({},{}): char='{}', UV=({:.3},{:.3})-({:.3},{:.3}), pos=({:.1},{:.1}), fg={:?}, bg={:?}",
-                        row, col, cell.character, u0, v0, u1, v1, x, y, cell.fg, cell.bg);
-                }
+                // Swap V to compensate for the CAMetalLayer's vertical flip: keep the
+                // glyph upright on screen while clip.y maps row 0 to the top.
+                let (v0, v1) = (v1, v0);
 
                 // Override colors for cursor
                 let final_fg = if is_cursor {
@@ -510,7 +473,7 @@ fn color_to_normalized(color: weft_core::grid::Color, default: [f32; 4]) -> [f32
 }
 
 /// Attach a Metal layer to the winit window's NSView.
-unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window) {
+unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window, scale: f64) {
     let handle = window.window_handle().expect("Failed to get window handle");
     let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
         panic!("Weft requires macOS (AppKit)");
@@ -522,4 +485,11 @@ unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window) {
 
     let _: () = msg_send![ns_view, setWantsLayer: true];
     let _: () = msg_send![ns_view, setLayer: layer_ptr];
+    // Retina: the backing store (drawable) is physical pixels; tell the layer its
+    // contents are at the window scale so it isn't displayed at the wrong density.
+    let _: () = msg_send![layer_ptr, setContentsScale: scale];
+    // Metal renders with a top-left origin (framebuffer row 0 = top). The vertex
+    // shader already maps logical-top → clip-top, so the drawable is upright; do NOT
+    // set geometryFlipped (it would composite the framebuffer upside-down).
+    let _: () = msg_send![layer_ptr, setGeometryFlipped: false];
 }

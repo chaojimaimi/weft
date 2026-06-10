@@ -314,7 +314,7 @@ impl vte::Perform for Terminal {
             let (_, bottom) = self.grid.scroll_region();
             if self.grid.cursor.row == bottom {
                 self.grid.scroll_up(1);
-            } else {
+            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
         }
@@ -336,7 +336,7 @@ impl vte::Perform for Terminal {
             let (_, bottom) = self.grid.scroll_region();
             if self.grid.cursor.row == bottom {
                 self.grid.scroll_up(1);
-            } else {
+            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
             // Write on new line
@@ -848,6 +848,27 @@ mod tests {
         t.grid_mut().cursor.row = 3;
         t.process(b"\x1bM");
         assert_eq!(t.grid().cursor.row, 2);
+    }
+
+    #[test]
+    fn print_wrap_at_bottom_row_stays_in_bounds() {
+        // Regression: the deferred-wrap path in print() did `cursor.row += 1`
+        // without a `num_rows - 1` guard. With a scroll region whose bottom is
+        // not the last row, wrapping on the last row indexed past the viewport
+        // (panic: index == len). The fix clamps like grid.rs does.
+        let mut t = Terminal::new(3, 5);
+        // Scroll region bottom = row index 1 (NOT the last row index 2).
+        t.grid_mut().set_scroll_region(1, 2); // 1-based → top 0, bottom 1; resets cursor
+        t.grid_mut().cursor.row = 2; // last row, outside the scroll region
+        t.grid_mut().cursor.col = 4; // last column
+        t.grid_mut().cursor.wrap_pending = true;
+        t.process(b"x"); // triggers the deferred-wrap path
+        assert!(
+            t.grid().cursor.row < t.grid().num_rows,
+            "cursor row {} escaped the viewport of {} rows",
+            t.grid().cursor.row,
+            t.grid().num_rows
+        );
     }
 
     // ── Scroll ───────────────────────────────────────────────────

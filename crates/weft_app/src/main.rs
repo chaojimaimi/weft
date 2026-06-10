@@ -12,7 +12,6 @@ use weft_core::input::{
 };
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::{GridPos, SelectionHandler, SelectionMode};
-use weft_core::shell;
 use weft_core::vt::Terminal;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -88,14 +87,11 @@ impl App {
             }
         };
 
-        // Inject shell integration hook
-        if let Some(injection) = shell::format_injection_command(&shell) {
-            // Small delay to let shell initialize
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if let Err(e) = pty.write_sync(injection.as_bytes()) {
-                warn!("Failed to inject shell hook: {e}");
-            }
-        }
+        // Shell integration hook injection is intentionally NOT done here. Injecting
+        // the OSC 133 hook via PTY stdin into an *interactive* shell echoes the hook
+        // source (and a buggy `eval '<multi-line>'` form drops zsh into a `quote>`
+        // continuation). v0.3 will provide integration via an env var the user's rc
+        // file sources instead. See shell::format_injection_command for the WIP form.
 
         self.terminal = Some(Terminal::new(rows, cols));
         self.pty = Some(pty);
@@ -559,15 +555,14 @@ impl ApplicationHandler for App {
                 if let (Some(renderer), Some(window), Some(terminal)) =
                     (&mut self.renderer, &self.window, &mut self.terminal)
                 {
-                    let scale = window.scale_factor();
-                    let cell_w_logical =
-                        renderer.cell_width() as f64 / scale;
-                    let cell_h_logical =
-                        renderer.cell_height() as f64 / scale;
+                    // cell_width()/cell_height() are in physical pixels (rasterized at the
+                    // window scale); physical_size is also physical pixels. Divide in
+                    // consistent units — mixing physical size with a logical cell size
+                    // (cell / scale) double-counts the scale factor and over-sizes the grid 2×.
                     let new_cols =
-                        (physical_size.width as f64 / cell_w_logical) as usize;
+                        (physical_size.width as f64 / renderer.cell_width() as f64) as usize;
                     let new_rows =
-                        (physical_size.height as f64 / cell_h_logical) as usize;
+                        (physical_size.height as f64 / renderer.cell_height() as f64) as usize;
 
                     if new_cols > 0 && new_rows > 0 {
                         terminal.resize(new_rows, new_cols);
@@ -590,6 +585,15 @@ impl ApplicationHandler for App {
                 {
                     renderer.draw(terminal, &self.selection_handler, self.cursor_blink_on);
                 }
+
+                // Keep the render loop alive: pump_pty/process_messages above only
+                // request a redraw when PTY data is sitting in the channel *at poll
+                // time, but the shell echoes keystrokes asynchronously, after the
+                // redraw triggered by the key. Without this, the screen freezes until
+                // the next mouse/keyboard event ("must click to see output").
+                // TODO: replace this vsync busy-loop with an EventLoopProxy wake from
+                // the PTY reader thread for power efficiency.
+                self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed && !event.repeat {

@@ -277,22 +277,6 @@ impl GlyphAtlas {
         &self.texture
     }
 
-    /// Debug: check if texture has non-zero pixels.
-    pub fn debug_check_texture(&self) {
-        let w = self.atlas_w as usize;
-        let h = self.atlas_h as usize;
-        let mut pixels = vec![0u8; w * h];
-        
-        let region = MTLRegion {
-            origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-            size: metal::MTLSize { width: w as u64, height: h as u64, depth: 1 },
-        };
-        
-        // Note: get_bytes might not be available in all metal-rs versions
-        // For now, just log that we're checking
-        tracing::info!("Texture debug check: atlas has {} cached glyphs", self.cache.len());
-    }
-
     /// Rasterize a glyph and place it in the atlas buffer.
     fn rasterize_and_place(
         font: &Font,
@@ -347,24 +331,18 @@ impl GlyphAtlas {
             // So:  y_canvas = ascent_px - y_glyph
             // i.e. transform:  (x, y) → (x, ascent_px - y)
             //
-            // More generally, to center the glyph in the cell:
-            //   glyph_h  = ascent_px - descent_px   (descent_px is negative)
-            //   top_pad  = (cell_h - glyph_h) / 2
-            //   translate_y = ascent_px + top_pad
-
-            let units_per_em = font.metrics().units_per_em as f32;
-            let scale = scaled_size / units_per_em;
-            let ascent_px = font.metrics().ascent as f32 * scale;
-            let descent_px = font.metrics().descent as f32 * scale; // negative
-            let glyph_h = (ascent_px - descent_px).max(1.0);
-            let top_pad = ((cell_h as f32) - glyph_h).max(0.0) / 2.0;
-            let translate_y = ascent_px + top_pad;
-
-            // Transform:  x' = x,  y' = translate_y - y
-            // In pathfinder_geometry:  T*S  means apply S first, then T.
-            //   S = from_scale(1, -1)        →  (x, y) → (x, -y)
-            //   T = from_translation(0, t_y)  →  (x, -y) → (x, -y + t_y)
-            let transform = Transform2F::from_translation(Vector2F::new(0.0, translate_y))
+            // font-kit's core_text backend rasterizes glyphs in a Y-up space; the
+            // canvas is Y-down, so a Y-flip is required to render them upright. The
+            // backend positions the baseline itself — do NOT add a translation, or the
+            // ascent gets double-counted and glyphs are pushed below the cell (clipping
+            // their tops → unreadable fragments). Verified via the transform_probe test:
+            // scale(1,-1) yields full-height upright glyphs (e.g. 'M' ink rows [0,20]).
+            // Shift down by the descent depth so descenders sit inside the cell; the
+            // CAMetalLayer flips vertically, so this lifts the glyph off the screen-cell
+            // bottom and stops the next row's opaque background from clipping descenders.
+            let upem = font.metrics().units_per_em as f32;
+            let descent_px = (font.metrics().descent as f32).abs() * (scaled_size / upem);
+            let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
                 * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
 
             let result = font.rasterize_glyph(
@@ -379,8 +357,8 @@ impl GlyphAtlas {
             if result.is_ok() {
                 let non_zero = canvas.pixels.iter().filter(|&&p| p > 0).count();
                 tracing::debug!(
-                    "Rasterized '{}': canvas {}x{}, stride={}, non-zero in canvas={}, translate_y={:.1}",
-                    ch, glyph_w, cell_h, canvas.stride, non_zero, translate_y
+                    "Rasterized '{}': canvas {}x{}, stride={}, non-zero in canvas={}",
+                    ch, glyph_w, cell_h, canvas.stride, non_zero
                 );
 
                 // Blit glyph pixels into atlas buffer
@@ -479,6 +457,8 @@ impl GlyphAtlas {
             width as u64,
         );
     }
+
+
 }
 
 /// Check if a character is an emoji.
@@ -495,4 +475,95 @@ fn is_emoji_char(ch: char) -> bool {
         '\u{2600}'..='\u{26FF}'   | // Misc symbols
         '\u{2700}'..='\u{27BF}'     // Dingbats
     )
+}
+
+#[cfg(test)]
+mod transform_probe {
+    //! Device-free diagnostic: rasterize glyphs under candidate transforms and
+    //! print exact ink bounding boxes, to calibrate the rasterize transform.
+    use super::*;
+    use font_kit::canvas::{Format, RasterizationOptions};
+    use font_kit::hinting::HintingOptions;
+
+    fn ink_bbox(c: &Canvas) -> (i32, i32, usize) {
+        let mut min_r = i32::MAX;
+        let mut max_r = i32::MIN;
+        let mut n = 0usize;
+        for y in 0..c.size.y() {
+            for x in 0..c.size.x() {
+                if c.pixels[(y as usize * c.stride) + x as usize] > 0 {
+                    n += 1;
+                    min_r = min_r.min(y);
+                    max_r = max_r.max(y);
+                }
+            }
+        }
+        if n == 0 {
+            (0, 0, 0)
+        } else {
+            (min_r, max_r, n)
+        }
+    }
+
+    fn raster(font: &Font, ch: char, scaled: f32, cw: i32, ch_h: i32, t: Transform2F) -> Canvas {
+        let gid = font.glyph_for_char(ch).unwrap();
+        let mut canvas = Canvas::new(Vector2I::new(cw, ch_h), Format::A8);
+        let _ = font.rasterize_glyph(
+            &mut canvas,
+            gid,
+            scaled,
+            t,
+            HintingOptions::None,
+            RasterizationOptions::GrayscaleAa,
+        );
+        canvas
+    }
+
+    #[test]
+    fn probe_transforms() {
+        let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
+        let scaled = 28.0f32;
+        let (cw, ch_h) = (17i32, 34i32);
+        let upem = font.metrics().units_per_em as f32;
+        let ascent = font.metrics().ascent as f32;
+        let descent = font.metrics().descent as f32;
+        let scale_px = scaled / upem;
+        let ascent_px = ascent * scale_px;
+        let descent_px = descent * scale_px;
+        let glyph_h = ascent_px - descent_px;
+        let top_pad = (ch_h as f32 - glyph_h).max(0.0) / 2.0;
+        eprintln!(
+            "metrics upem={} ascent={} descent={} scale_px={:.4} ascent_px={:.1} descent_px={:.1} glyph_h={:.1} top_pad={:.1}",
+            upem, ascent, descent, scale_px, ascent_px, descent_px, glyph_h, top_pad
+        );
+
+        // Production transform: Y-flip only (no translation). Regression guard for
+        // the bug where adding translate(0, ascent_px) clipped every glyph's top,
+        // leaving only a bottom fragment (ink rows ~[25,33] instead of the full glyph).
+        let prod_transform = Transform2F::from_scale(Vector2F::new(1.0, -1.0));
+
+        for &probe_ch in &['M', 'a', 'g'] {
+            let c = raster(&font, probe_ch, scaled, cw, ch_h, prod_transform);
+            let (min_row, max_row, count) = ink_bbox(&c);
+            eprintln!(
+                "  '{}' under scale(1,-1): ink rows [{},{}] count={}",
+                probe_ch, min_row, max_row, count
+            );
+            // The clipped-bug produced ink only in the bottom ~8 rows (min_row >= 25).
+            // A full upright glyph must start near the top of the cell.
+            assert!(
+                count > 50,
+                "'{}' produced almost no ink (count={}); rasterization is broken",
+                probe_ch,
+                count
+            );
+            assert!(
+                min_row <= 8,
+                "'{}' ink starts at row {} — top is clipped (the ascent-translation bug). \
+                 Expected the glyph to start near the top of the cell.",
+                probe_ch,
+                min_row
+            );
+        }
+    }
 }

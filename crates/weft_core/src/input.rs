@@ -264,11 +264,36 @@ impl InputHandler {
         // Normal printable character
         let mut char_buf = [0u8; 4];
         let s = if mods.contains(Modifiers::SHIFT) {
-            // Shift only affects case for letters
-            if c.is_ascii_lowercase() {
-                c.to_ascii_uppercase().encode_utf8(&mut char_buf)
-            } else {
-                c.encode_utf8(&mut char_buf)
+            let shifted = match c {
+                c if c.is_ascii_lowercase() => Some(c.to_ascii_uppercase()),
+                // US keyboard shifted symbols (Shift only changes case for letters
+                // otherwise — without this map, Shift+`/4/- etc. emit the base char).
+                '`' => Some('~'),
+                '1' => Some('!'),
+                '2' => Some('@'),
+                '3' => Some('#'),
+                '4' => Some('$'),
+                '5' => Some('%'),
+                '6' => Some('^'),
+                '7' => Some('&'),
+                '8' => Some('*'),
+                '9' => Some('('),
+                '0' => Some(')'),
+                '-' => Some('_'),
+                '=' => Some('+'),
+                '[' => Some('{'),
+                ']' => Some('}'),
+                '\\' => Some('|'),
+                ';' => Some(':'),
+                '\'' => Some('"'),
+                ',' => Some('<'),
+                '.' => Some('>'),
+                '/' => Some('?'),
+                _ => None,
+            };
+            match shifted {
+                Some(sc) => sc.encode_utf8(&mut char_buf),
+                None => c.encode_utf8(&mut char_buf),
             }
         } else {
             c.encode_utf8(&mut char_buf)
@@ -496,6 +521,16 @@ mod tests {
             handler().encode_key(KeyCode::Char('a'), Modifiers::SHIFT),
             b"A"
         );
+    }
+
+    #[test]
+    fn shift_symbols() {
+        // Regression: Shift+symbol must yield the shifted char, not the base char.
+        assert_eq!(handler().encode_key(KeyCode::Char('`'), Modifiers::SHIFT), b"~");
+        assert_eq!(handler().encode_key(KeyCode::Char('4'), Modifiers::SHIFT), b"$");
+        assert_eq!(handler().encode_key(KeyCode::Char('-'), Modifiers::SHIFT), b"_");
+        assert_eq!(handler().encode_key(KeyCode::Char('['), Modifiers::SHIFT), b"{");
+        assert_eq!(handler().encode_key(KeyCode::Char('/'), Modifiers::SHIFT), b"?");
     }
 
     #[test]
