@@ -142,7 +142,7 @@ fragment float4 text_fragment(
         attr2.set_buffer_index(0);
         attr2.set_offset(32);
         vertex_desc.layouts().object_at(0).unwrap().set_stride(48);
-        pipeline_desc.set_vertex_descriptor(Some(&vertex_desc));
+        pipeline_desc.set_vertex_descriptor(Some(vertex_desc));
 
         pipeline_desc.set_vertex_function(Some(&vertex_fn));
         pipeline_desc.set_fragment_function(Some(&fragment_fn));
@@ -238,14 +238,22 @@ fragment float4 text_fragment(
         let grid = terminal.grid();
         let cursor = &grid.cursor;
 
-        // Ensure every character currently on screen has an atlas entry
-        // (rasterize CJK / any char not in the pre-built ASCII cache on demand).
-        for row in 0..grid.num_rows {
-            for col in 0..grid.num_cols {
-                let ch = grid.cell(row, col).character;
-                if ch != '\0' && ch != ' ' {
-                    self.atlas.get_or_rasterize(ch);
+        // Collect unique on-screen characters not yet in the atlas, then
+        // rasterize each exactly once. This avoids O(R*C) hash lookups per
+        // frame — after warm-up the set is almost always empty.
+        {
+            use std::collections::HashSet;
+            let mut missing = HashSet::new();
+            for row in 0..grid.num_rows {
+                for col in 0..grid.num_cols {
+                    let ch = grid.cell(row, col).character;
+                    if ch != '\0' && ch != ' ' && self.atlas.get(ch).is_none() {
+                        missing.insert(ch);
+                    }
                 }
+            }
+            for ch in &missing {
+                self.atlas.get_or_rasterize(*ch);
             }
         }
 
@@ -363,7 +371,7 @@ fragment float4 text_fragment(
                 let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
 
                 // Check if this cell is in the selection
-                let is_selected = selection.selection.as_ref().map_or(false, |sel| sel.contains(row, col));
+                let is_selected = selection.selection.as_ref().is_some_and(|sel| sel.contains(row, col));
 
                 // Look up glyph UV
                 let ch_char = if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {

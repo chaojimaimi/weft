@@ -180,9 +180,9 @@ impl GlyphAtlas {
 
     /// Look up a cached glyph by character, or rasterize on demand.
     ///
-    /// Look up a cached glyph by character, or rasterize on demand (CJK / any
-    /// char not in the pre-built ASCII cache). Called from the render path so
-    /// the grid's characters always have an atlas entry.
+    /// Called from the render path so the grid's characters always have an
+    /// atlas entry. Rasterizes exactly once per new character and uploads
+    /// the pixels to the Metal texture.
     ///
     /// Returns None only if the atlas is full or the character can't be rasterized.
     pub fn get_or_rasterize(&mut self, ch: char) -> Option<&GlyphInfo> {
@@ -202,78 +202,44 @@ impl GlyphAtlas {
             &self.primary_font
         };
 
-        // Try to rasterize
-        let placed = Self::rasterize_and_place(
-            font,
-            ch,
-            self.scaled_size,
+        // Step 1: Allocate atlas slot (layout only, no pixel work)
+        let info = Self::allocate_slot(
+            is_wide,
             self.cell_width,
             self.cell_height,
-            is_wide,
-            &mut vec![0u8; 0], // We can't modify the uploaded texture here easily
             self.atlas_w,
             self.atlas_h,
             &mut self.next_x,
             &mut self.next_y,
             &mut self.row_height,
+        )?;
+
+        // Step 2: Rasterize the glyph once
+        let glyph_w = if is_wide {
+            self.cell_width * 2
+        } else {
+            self.cell_width
+        };
+        let pixels = Self::rasterize_glyph(
+            font,
+            ch,
+            self.scaled_size,
+            glyph_w,
+            self.cell_height,
         );
 
-        if let Some(info) = placed {
-            // Re-upload the atlas texture region
-            // For simplicity, we just cache the UV coordinates
-            // A production implementation would upload just the new glyph region
-            self.cache.insert(ch, info);
+        // Step 3: Upload to Metal texture
+        Self::upload_region(
+            &self.texture,
+            &pixels,
+            info.size.0,
+            info.uv_origin,
+            self.atlas_w,
+            self.atlas_h,
+        );
 
-            // Rasterize again into the real atlas
-            let mut region_pixels = vec![0u8; (self.cell_width * self.cell_height * (if is_wide { 2 } else { 1 })) as usize];
-            if let Some(glyph_id) = font.glyph_for_char(ch) {
-                let glyph_w = if is_wide { self.cell_width * 2 } else { self.cell_width };
-                let glyph_size = Vector2I::new(glyph_w as i32, self.cell_height as i32);
-                let mut canvas = Canvas::new(glyph_size, Format::A8);
-                // Same transform as the pre-built atlas (rasterize_and_place).
-                let upem = font.metrics().units_per_em as f32;
-                let descent_px = (font.metrics().descent as f32).abs() * (self.scaled_size / upem);
-                let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
-                    * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
-                let result = font.rasterize_glyph(
-                    &mut canvas,
-                    glyph_id,
-                    self.scaled_size,
-                    transform,
-                    HintingOptions::None,
-                    RasterizationOptions::GrayscaleAa,
-                );
-                if result.is_ok() {
-                    region_pixels = canvas.pixels;
-                }
-            }
-
-            // Upload the glyph region to the Metal texture
-            let region = MTLRegion {
-                origin: metal::MTLOrigin {
-                    x: (info.uv_origin.0 * self.atlas_w as f32) as u64,
-                    y: (info.uv_origin.1 * self.atlas_h as f32) as u64,
-                    z: 0,
-                },
-                size: metal::MTLSize {
-                    width: info.size.0 as u64,
-                    height: info.size.1 as u64,
-                    depth: 1,
-                },
-            };
-
-            self.texture.replace_region(
-                region,
-                0,
-                region_pixels.as_ptr() as *const std::ffi::c_void,
-                info.size.0 as u64,
-            );
-
-            return self.cache.get(&ch);
-        }
-
-        // Fallback: return space glyph
-        self.cache.get(&' ')
+        self.cache.insert(ch, info);
+        self.cache.get(&ch)
     }
 
     /// Get the Metal atlas texture.
@@ -281,7 +247,127 @@ impl GlyphAtlas {
         &self.texture
     }
 
-    /// Rasterize a glyph and place it in the atlas buffer.
+    /// Allocate a slot in the atlas (layout only, no pixel work).
+    /// Advances the atlas cursor and returns UV/layout info for the slot.
+    #[allow(clippy::too_many_arguments)]
+    fn allocate_slot(
+        is_wide: bool,
+        cell_w: u32,
+        cell_h: u32,
+        atlas_w: u32,
+        atlas_h: u32,
+        next_x: &mut u32,
+        next_y: &mut u32,
+        row_height: &mut u32,
+    ) -> Option<GlyphInfo> {
+        let glyph_w = if is_wide { cell_w * 2 } else { cell_w };
+
+        // Check if we need a new row
+        if *next_x + glyph_w > atlas_w {
+            *next_x = 0;
+            *next_y += *row_height;
+            *row_height = 0;
+        }
+
+        // Check if atlas is full
+        if *next_y + cell_h > atlas_h {
+            return None;
+        }
+
+        let dst_x = *next_x;
+        let dst_y = *next_y;
+
+        let uv_origin = (
+            dst_x as f32 / atlas_w as f32,
+            dst_y as f32 / atlas_h as f32,
+        );
+        let uv_size = (
+            glyph_w as f32 / atlas_w as f32,
+            cell_h as f32 / atlas_h as f32,
+        );
+
+        // Advance position
+        *next_x += glyph_w;
+        *row_height = (*row_height).max(cell_h);
+
+        Some(GlyphInfo {
+            uv_origin,
+            uv_size,
+            size: (glyph_w, cell_h),
+            advance: glyph_w as f32,
+            is_wide,
+        })
+    }
+
+    /// Rasterize a single glyph into a pixel buffer.
+    /// Returns the pixel data ready for upload to the atlas texture.
+    fn rasterize_glyph(
+        font: &Font,
+        ch: char,
+        scaled_size: f32,
+        glyph_w: u32,
+        cell_h: u32,
+    ) -> Vec<u8> {
+        let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
+        let mut canvas = Canvas::new(glyph_size, Format::A8);
+
+        if let Some(glyph_id) = font.glyph_for_char(ch) {
+            // Y-flip + descent shift for upright glyphs inside the cell.
+            // See transform_probe test and rasterize_and_place comments for derivation.
+            let upem = font.metrics().units_per_em as f32;
+            let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
+            let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
+                * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
+
+            let result = font.rasterize_glyph(
+                &mut canvas,
+                glyph_id,
+                scaled_size,
+                transform,
+                HintingOptions::None,
+                RasterizationOptions::GrayscaleAa,
+            );
+
+            if result.is_err() {
+                tracing::warn!("Failed to rasterize '{}': {:?}", ch, result);
+            }
+        }
+
+        canvas.pixels
+    }
+
+    /// Upload a glyph's pixel data to the Metal texture at the given UV origin.
+    fn upload_region(
+        texture: &metal::Texture,
+        pixels: &[u8],
+        width: u32,
+        uv_origin: (f32, f32),
+        atlas_w: u32,
+        atlas_h: u32,
+    ) {
+        let x = (uv_origin.0 * atlas_w as f32) as u64;
+        let y = (uv_origin.1 * atlas_h as f32) as u64;
+        let height = (pixels.len() / width as usize) as u64;
+
+        let region = MTLRegion {
+            origin: metal::MTLOrigin { x, y, z: 0 },
+            size: metal::MTLSize {
+                width: width as u64,
+                height,
+                depth: 1,
+            },
+        };
+
+        texture.replace_region(
+            region,
+            0,
+            pixels.as_ptr() as *const std::ffi::c_void,
+            width as u64,
+        );
+    }
+
+    /// Rasterize a glyph and place it in the atlas buffer (used during init).
+    #[allow(clippy::too_many_arguments)]
     fn rasterize_and_place(
         font: &Font,
         ch: char,
@@ -345,7 +431,7 @@ impl GlyphAtlas {
             // CAMetalLayer flips vertically, so this lifts the glyph off the screen-cell
             // bottom and stops the next row's opaque background from clipping descenders.
             let upem = font.metrics().units_per_em as f32;
-            let descent_px = (font.metrics().descent as f32).abs() * (scaled_size / upem);
+            let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
             let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
                 * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
 

@@ -147,12 +147,13 @@ impl Default for Cursor {
 }
 
 /// Cursor style (DECSCUSR).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CursorStyle {
+    /// Steady block █ (default)
+    #[default]
+    Block,
     /// Blinking block █
     BlinkingBlock,
-    /// Steady block █
-    Block,
     /// Blinking underline _
     BlinkingUnderline,
     /// Steady underline _
@@ -161,12 +162,6 @@ pub enum CursorStyle {
     BlinkingBar,
     /// Steady bar |
     Bar,
-}
-
-impl Default for CursorStyle {
-    fn default() -> Self {
-        Self::Block
-    }
 }
 
 /// Scrollback buffer (ring buffer).
@@ -1015,10 +1010,11 @@ impl Grid {
                 merge_cursor_offset = 0;
             }
 
-            // Track cursor offset in the merged buffer
+            // Track cursor offset in the merged buffer.
+            // Use cursor.col directly — the cursor can legitimately be beyond
+            // content (e.g. after a CSI cursor-move on an empty line at col 5).
             if is_cursor_row {
-                merge_cursor_offset =
-                    merge_buf.len() + self.cursor.col.min(content_end);
+                merge_cursor_offset = merge_buf.len() + self.cursor.col;
                 merge_has_cursor = true;
             }
 
@@ -1064,6 +1060,17 @@ impl Grid {
                 // Skip wide spacers from old layout
                 if cell.flags.contains(CellFlags::WIDE_SPACER) {
                     continue;
+                }
+
+                // Wide char at last column doesn't fit — wrap first.
+                if cell.width == CellWidth::Full && col + 1 >= new_cols && col > 0 {
+                    current.wrapped = true;
+                    wrapped_rows.push(current);
+                    current = Row::new(new_cols);
+                    col = 0;
+                    if line.has_cursor && buf_idx == line.cursor_buf_offset {
+                        new_cursor_col = 0;
+                    }
                 }
 
                 if col < new_cols {

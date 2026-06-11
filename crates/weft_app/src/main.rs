@@ -467,7 +467,7 @@ fn clipboard_copy(text: &str) {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
 
-        let cls = objc2::ffi::objc_getClass("NSPasteboard\0".as_ptr() as *const i8);
+        let cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
         if cls.is_null() {
             return;
         }
@@ -476,7 +476,7 @@ fn clipboard_copy(text: &str) {
             return;
         }
 
-        let ns_string_cls = objc2::ffi::objc_getClass("NSString\0".as_ptr() as *const i8);
+        let ns_string_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
         if ns_string_cls.is_null() {
             return;
         }
@@ -499,7 +499,7 @@ fn clipboard_paste() -> Option<String> {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
 
-        let cls = objc2::ffi::objc_getClass("NSPasteboard\0".as_ptr() as *const i8);
+        let cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
         if cls.is_null() {
             return None;
         }
@@ -601,7 +601,9 @@ impl ApplicationHandler for App {
                         > std::time::Duration::from_millis(100)
                     {
                         if let Some(pty) = &self.pty {
-                            let _ = pty.resize(rows as u16, cols as u16);
+                            if let Err(e) = pty.resize(rows as u16, cols as u16) {
+                                warn!("PTY resize failed: {e}");
+                            }
                         }
                         self.pending_pty_resize = None;
                     }
