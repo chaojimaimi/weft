@@ -317,6 +317,11 @@ impl vte::Perform for Terminal {
             } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
+            // Mark the previous row as wrapped so reflow can merge it
+            // back when the terminal widens.
+            if self.grid.cursor.row > 0 {
+                self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
+            }
         }
 
         let width = if unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 1 {
@@ -338,6 +343,10 @@ impl vte::Perform for Terminal {
                 self.grid.scroll_up(1);
             } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
+            }
+            // Mark the previous row as wrapped for reflow
+            if self.grid.cursor.row > 0 {
+                self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
             }
             // Write on new line
             let new_row = self.grid.cursor.row;

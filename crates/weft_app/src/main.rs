@@ -51,6 +51,13 @@ struct App {
     /// Last known mouse position for click/scroll handling.
     last_mouse_x: f64,
     last_mouse_y: f64,
+    /// Debounced PTY resize: (rows, cols) waiting to be sent to the PTY
+    /// after the resize animation cascade settles. The grid is resized
+    /// immediately on each Resized event for smooth animation; only the
+    /// PTY SIGWINCH is debounced to prevent the shell from fighting cursor
+    /// position during rapid cascades.
+    pending_pty_resize: Option<(usize, usize)>,
+    last_resize_instant: std::time::Instant,
 }
 
 impl App {
@@ -71,6 +78,8 @@ impl App {
             ime_preedit: String::new(),
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
+            pending_pty_resize: None,
+            last_resize_instant: std::time::Instant::now(),
         }
     }
 
@@ -275,9 +284,10 @@ impl App {
         let Some(renderer) = &self.renderer else {
             return GridPos::new(0, 0);
         };
-        let scale = self.window.as_ref().map(|w| w.scale_factor()).unwrap_or(1.0);
-        let cell_w = renderer.cell_width() as f64 / scale;
-        let cell_h = renderer.cell_height() as f64 / scale;
+        // CursorMoved position is in physical pixels; cell_width/height are
+        // also in physical pixels — divide directly without scale conversion.
+        let cell_w = renderer.cell_width() as f64;
+        let cell_h = renderer.cell_height() as f64;
         let col = (x / cell_w) as usize;
         let row = (y / cell_h) as usize;
         GridPos::new(row, col)
@@ -552,27 +562,30 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
-                if let (Some(renderer), Some(window), Some(terminal)) =
-                    (&mut self.renderer, &self.window, &mut self.terminal)
+                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window)
                 {
-                    // cell_width()/cell_height() are in physical pixels (rasterized at the
-                    // window scale); physical_size is also physical pixels. Divide in
-                    // consistent units — mixing physical size with a logical cell size
-                    // (cell / scale) double-counts the scale factor and over-sizes the grid 2×.
                     let new_cols =
                         (physical_size.width as f64 / renderer.cell_width() as f64) as usize;
                     let new_rows =
                         (physical_size.height as f64 / renderer.cell_height() as f64) as usize;
 
                     if new_cols > 0 && new_rows > 0 {
-                        terminal.resize(new_rows, new_cols);
-                        if let Some(pty) = &self.pty {
-                            let _ = pty.resize(new_rows as u16, new_cols as u16);
-                        }
-                    }
+                        // Update renderer viewport immediately
+                        renderer.resize(window, physical_size);
 
-                    renderer.resize(window, physical_size);
-                    renderer.draw(terminal, &self.selection_handler, self.cursor_blink_on);
+                        // Resize grid immediately for smooth animation.
+                        // The rewrap is fast (<1ms) so doing it on every
+                        // intermediate event is fine.
+                        if let Some(terminal) = &mut self.terminal {
+                            terminal.resize(new_rows, new_cols);
+                        }
+
+                        // Debounce only the PTY SIGWINCH to prevent the
+                        // shell from fighting cursor position during rapid
+                        // resize cascades (~40 events during maximize).
+                        self.pending_pty_resize = Some((new_rows, new_cols));
+                        self.last_resize_instant = std::time::Instant::now();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -580,8 +593,22 @@ impl ApplicationHandler for App {
                 self.process_messages();
                 self.update_cursor_blink();
 
+                // Flush debounced PTY resize after the cascade settles
+                // (100ms of no new resize events). The grid was already
+                // resized immediately in the Resized handler.
+                if let Some((rows, cols)) = self.pending_pty_resize {
+                    if self.last_resize_instant.elapsed()
+                        > std::time::Duration::from_millis(100)
+                    {
+                        if let Some(pty) = &self.pty {
+                            let _ = pty.resize(rows as u16, cols as u16);
+                        }
+                        self.pending_pty_resize = None;
+                    }
+                }
+
                 if let (Some(renderer), Some(terminal)) =
-                    (&self.renderer, &self.terminal)
+                    (&mut self.renderer, &self.terminal)
                 {
                     renderer.draw(terminal, &self.selection_handler, self.cursor_blink_on);
                 }
@@ -596,7 +623,7 @@ impl ApplicationHandler for App {
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == winit::event::ElementState::Pressed && !event.repeat {
+                if event.state == winit::event::ElementState::Pressed {
                     if let PhysicalKey::Code(key_code) = event.physical_key {
                         self.handle_key_event(key_code, self.mods);
                     }

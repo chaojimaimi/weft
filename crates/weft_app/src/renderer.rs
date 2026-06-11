@@ -38,15 +38,16 @@ impl MetalRenderer {
         let scale = window.scale_factor();
         let size = window.inner_size();
 
-        // Use logical points for viewport (divide physical pixels by scale)
-        let vp_w = size.width as f32 / scale as f32;
-        let vp_h = size.height as f32 / scale as f32;
+        // Use physical pixels for viewport to stay consistent with drawable_size
+        // and grid dimensions (which are calculated from physical cell sizes).
+        let vp_w = size.width as f32;
+        let vp_h = size.height as f32;
 
         // Build glyph atlas with CJK support
         let atlas = GlyphAtlas::new(&device, 14.0, scale);
 
         info!(
-            "Window: {}x{} physical ({}x scale), viewport: {}x{} logical, atlas cells: {}x{}",
+            "Window: {}x{} physical ({}x scale), viewport: {}x{} physical, atlas cells: {}x{}",
             size.width, size.height, scale,
             vp_w, vp_h,
             atlas.cell_width, atlas.cell_height
@@ -202,10 +203,9 @@ fragment float4 text_fragment(
     }
 
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
-        let scale = window.scale_factor();
-        // Use logical points for viewport calculations
-        let vp_w = size.width as f32 / scale as f32;
-        let vp_h = size.height as f32 / scale as f32;
+        // Use physical pixels for viewport to match drawable_size and grid dimensions
+        let vp_w = size.width as f32;
+        let vp_h = size.height as f32;
         self.viewport = (vp_w, vp_h);
         // IMPORTANT: drawable_size must be in PHYSICAL PIXELS
         self.layer
@@ -213,18 +213,23 @@ fragment float4 text_fragment(
         window.request_redraw();
     }
 
-    /// Cell width in logical pixels (for terminal size calculation).
+    /// Cell width in physical pixels (for terminal size calculation).
     pub fn cell_width(&self) -> u32 {
         self.atlas.cell_width
     }
 
-    /// Cell height in logical pixels (for terminal size calculation).
+    /// Cell height in physical pixels (for terminal size calculation).
     pub fn cell_height(&self) -> u32 {
         self.atlas.cell_height
     }
 
     /// Draw the terminal Grid to screen.
-    pub fn draw(&self, terminal: &Terminal, selection: &SelectionHandler, cursor_blink_on: bool) {
+    pub fn draw(
+        &mut self,
+        terminal: &Terminal,
+        selection: &SelectionHandler,
+        cursor_blink_on: bool,
+    ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,
@@ -232,6 +237,17 @@ fragment float4 text_fragment(
 
         let grid = terminal.grid();
         let cursor = &grid.cursor;
+
+        // Ensure every character currently on screen has an atlas entry
+        // (rasterize CJK / any char not in the pre-built ASCII cache on demand).
+        for row in 0..grid.num_rows {
+            for col in 0..grid.num_cols {
+                let ch = grid.cell(row, col).character;
+                if ch != '\0' && ch != ' ' {
+                    self.atlas.get_or_rasterize(ch);
+                }
+            }
+        }
 
         // Build vertex data from Grid cells
         let vertices = self.build_grid_vertices(grid, cursor, selection, terminal.cursor_visible && cursor_blink_on, terminal.cursor_style);
@@ -307,7 +323,9 @@ fragment float4 text_fragment(
         show_cursor: bool,
         cursor_style: CursorStyle,
     ) -> Vec<f32> {
-        // Calculate logical cell size from viewport to ensure exact coverage
+        // Calculate cell size in physical pixels from viewport dimensions.
+        // Both viewport and grid dimensions are in physical pixel units,
+        // ensuring consistent cell sizing across window resizes.
         let cw = self.viewport.0 / grid.num_cols as f32;
         let ch = self.viewport.1 / grid.num_rows as f32;
         let num_rows = grid.num_rows;

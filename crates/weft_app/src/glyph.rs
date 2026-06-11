@@ -180,12 +180,11 @@ impl GlyphAtlas {
 
     /// Look up a cached glyph by character, or rasterize on demand.
     ///
-    /// NOTE: This method is currently unused in v0.2. It is designed for future
-    /// integration (v0.3+) where the renderer will support dynamic glyph rasterization
-    /// for characters not in the pre-built cache.
+    /// Look up a cached glyph by character, or rasterize on demand (CJK / any
+    /// char not in the pre-built ASCII cache). Called from the render path so
+    /// the grid's characters always have an atlas entry.
     ///
     /// Returns None only if the atlas is full or the character can't be rasterized.
-    #[allow(dead_code)]
     pub fn get_or_rasterize(&mut self, ch: char) -> Option<&GlyphInfo> {
         if self.cache.contains_key(&ch) {
             return self.cache.get(&ch);
@@ -231,11 +230,16 @@ impl GlyphAtlas {
                 let glyph_w = if is_wide { self.cell_width * 2 } else { self.cell_width };
                 let glyph_size = Vector2I::new(glyph_w as i32, self.cell_height as i32);
                 let mut canvas = Canvas::new(glyph_size, Format::A8);
+                // Same transform as the pre-built atlas (rasterize_and_place).
+                let upem = font.metrics().units_per_em as f32;
+                let descent_px = (font.metrics().descent as f32).abs() * (self.scaled_size / upem);
+                let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
+                    * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
                 let result = font.rasterize_glyph(
                     &mut canvas,
                     glyph_id,
                     self.scaled_size,
-                    Transform2F::default(),
+                    transform,
                     HintingOptions::None,
                     RasterizationOptions::GrayscaleAa,
                 );
