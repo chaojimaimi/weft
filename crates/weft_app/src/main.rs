@@ -39,6 +39,8 @@ enum AppMsg {
 #[derive(Debug)]
 enum AppEvent {
     Wake,
+    /// Config file changed on disk — reload and re-apply live.
+    ConfigReload,
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -732,8 +734,14 @@ impl ApplicationHandler<AppEvent> for App {
     /// Cross-thread wake-up (PTY output or blink timer): schedule one redraw.
     /// The pump/process/draw happens in `WindowEvent::RedrawRequested`, so we
     /// avoid the vsync busy-loop while still reacting promptly to output.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: AppEvent) {
-        self.request_redraw();
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+        match event {
+            AppEvent::Wake => self.request_redraw(),
+            AppEvent::ConfigReload => {
+                self.reload_config();
+                self.request_redraw();
+            }
+        }
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -765,6 +773,26 @@ impl ApplicationHandler<AppEvent> for App {
                 break; // event loop exited
             }
         });
+
+        // Config file watcher: poll the config's mtime ~1/sec and reload live
+        // on change (theme/font/keybindings/scrollback re-apply instantly).
+        // Zero dependencies — mtime polling is cheap for a single file.
+        if let Some(path) = Config::config_path() {
+            let reload_proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let cur = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if cur != last {
+                        last = cur;
+                        if reload_proxy.send_event(AppEvent::ConfigReload).is_err() {
+                            break; // event loop exited
+                        }
+                    }
+                }
+            });
+        }
 
         self.request_redraw();
     }
