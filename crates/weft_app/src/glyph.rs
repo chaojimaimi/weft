@@ -6,14 +6,51 @@
 use std::collections::HashMap;
 
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
+use font_kit::family_name::FamilyName;
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::core_text::Font;
+use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureUsage, TextureDescriptor,
 };
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
-use tracing::info;
+use tracing::{info, warn};
+use weft_core::config::FontConfig;
+
+/// Resolve a font by family name via the system source, falling back to a list
+/// of absolute `.ttc` paths (the bundled macOS defaults). Returns the first
+/// loadable font.
+fn resolve_font(family: &str, fallback_paths: &[&str]) -> Option<Font> {
+    if !family.is_empty() {
+        if let Some(f) = load_by_family(family) {
+            return Some(f);
+        }
+        warn!(family, "font family not found; trying path fallback");
+    }
+    for path in fallback_paths {
+        if let Ok(f) = Font::from_path(path, 0) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Look up a font by family name using the Core Text system source.
+fn load_by_family(family: &str) -> Option<Font> {
+    let source = SystemSource::new();
+    let handle = source
+        .select_best_match(&[FamilyName::Title(family.to_string())], &Properties::new())
+        .ok()?;
+    match handle {
+        font_kit::handle::Handle::Path { path, font_index } => {
+            Font::from_path(path, font_index).ok()
+        }
+        // Memory handles are rare (in-process fonts); skip them.
+        font_kit::handle::Handle::Memory { .. } => None,
+    }
+}
 
 /// UV rect for a glyph in the atlas texture.
 #[derive(Clone, Copy, Debug)]
@@ -60,30 +97,43 @@ pub struct GlyphAtlas {
 impl GlyphAtlas {
     /// Create a new glyph atlas by rasterizing printable ASCII (32–126).
     ///
-    /// Uses `device` to create the atlas texture.
-    /// `font_size` is in points (e.g., 14.0).
-    pub fn new(device: &Device, font_size: f32, scale_factor: f64) -> Self {
-        // Load primary font (Menlo)
-        let primary_font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0)
-            .expect("Failed to load Menlo font");
+    /// Uses `device` to create the atlas texture. `font_config` supplies the
+    /// primary/CJK/emoji family names, point size, and line-height factor.
+    pub fn new(device: &Device, font_config: &FontConfig, scale_factor: f64) -> Self {
+        // Primary font — resolved by family name, falling back to the bundled
+        // Menlo path (guaranteed on macOS). A missing primary is fatal.
+        let primary_font = resolve_font(&font_config.family, &["/System/Library/Fonts/Menlo.ttc"])
+            .expect("failed to load primary font (no family match and Menlo missing)");
 
-        // Load CJK fallback font
-        let cjk_font = Font::from_path("/System/Library/Fonts/PingFang.ttc", 0)
-            .or_else(|_| Font::from_path("/System/Library/Fonts/STHeiti Light.ttc", 0))
-            .ok();
+        // CJK fallback
+        let cjk_font = resolve_font(
+            &font_config.cjk_family,
+            &[
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+            ],
+        );
 
-        // Load emoji fallback font
-        let emoji_font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).ok();
+        // Emoji fallback
+        let emoji_font = resolve_font(
+            &font_config.emoji_family,
+            &["/System/Library/Fonts/Apple Color Emoji.ttc"],
+        );
 
+        let font_size = font_config.size;
         let scaled_size = font_size * scale_factor as f32;
 
         // Measure cell dimensions using a reference character
         let cell_w = Self::measure_advance(&primary_font, 'M', scaled_size);
-        let cell_h = (scaled_size * 1.2).ceil() as u32;
+        let cell_h = (scaled_size * font_config.line_height).ceil() as u32;
 
         info!(
+            family = %font_config.family,
             "Glyph atlas: cell {}x{}, font {}pt @ {}x scale",
-            cell_w, cell_h, font_size, scale_factor
+            cell_w,
+            cell_h,
+            font_size,
+            scale_factor
         );
 
         // Larger atlas for CJK support: 2048x2048

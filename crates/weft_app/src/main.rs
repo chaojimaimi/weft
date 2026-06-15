@@ -7,6 +7,7 @@ mod glyph;
 mod renderer;
 
 use renderer::MetalRenderer;
+use weft_core::config::Config;
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
 };
@@ -72,10 +73,19 @@ struct App {
     /// Proxy used by background threads (PTY reader, blink timer) to wake the
     /// event loop without a vsync busy-loop.
     proxy: EventLoopProxy<AppEvent>,
+    /// User configuration (loaded at startup, reloaded live by the watcher).
+    config: Config,
 }
 
 impl App {
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
+        let config = Config::load();
+        info!(
+            theme = %config.theme.name,
+            font = %config.font.family,
+            size = config.font.size,
+            "config loaded"
+        );
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             window: None,
@@ -95,6 +105,7 @@ impl App {
             pending_pty_resize: None,
             last_resize_instant: std::time::Instant::now(),
             proxy,
+            config,
         }
     }
 
@@ -609,7 +620,7 @@ impl ApplicationHandler<AppEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
 
         let window = event_loop.create_window(attrs).unwrap();
-        let renderer = MetalRenderer::new(&window);
+        let renderer = MetalRenderer::new(&window, self.config.font.clone());
 
         self.spawn_pty();
         self.window = Some(window);

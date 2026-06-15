@@ -12,13 +12,13 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
+use weft_core::config::FontConfig;
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
 /// Metal GPU renderer: draws the terminal Grid to screen.
 pub struct MetalRenderer {
-    #[allow(dead_code)]
     device: Device,
     queue: metal::CommandQueue,
     layer: MetalLayer,
@@ -26,10 +26,16 @@ pub struct MetalRenderer {
     sampler: metal::SamplerState,
     atlas: GlyphAtlas,
     viewport: (f32, f32),
+    /// Retained for live font/atlas rebuild (config reload). Used in v0.3.
+    #[allow(dead_code)]
+    scale: f64,
+    /// Retained for live font/atlas rebuild (config reload). Used in v0.3.
+    #[allow(dead_code)]
+    font_config: FontConfig,
 }
 
 impl MetalRenderer {
-    pub fn new(window: &Window) -> Self {
+    pub fn new(window: &Window, font_config: FontConfig) -> Self {
         let device = Device::system_default().expect("No Metal device found");
         let queue = device.new_command_queue();
 
@@ -44,7 +50,7 @@ impl MetalRenderer {
         let vp_h = size.height as f32;
 
         // Build glyph atlas with CJK support
-        let atlas = GlyphAtlas::new(&device, 14.0, scale);
+        let atlas = GlyphAtlas::new(&device, &font_config, scale);
 
         info!(
             "Window: {}x{} physical ({}x scale), viewport: {}x{} physical, atlas cells: {}x{}",
@@ -193,6 +199,8 @@ fragment float4 text_fragment(
             sampler,
             atlas,
             viewport: (vp_w, vp_h),
+            scale,
+            font_config,
         }
     }
 
@@ -215,6 +223,17 @@ fragment float4 text_fragment(
     /// Cell height in physical pixels (for terminal size calculation).
     pub fn cell_height(&self) -> u32 {
         self.atlas.cell_height
+    }
+
+    /// Rebuild the glyph atlas from a (possibly changed) font config — used on
+    /// live config reload when font family/size/line-height changes. Returns
+    /// the new cell dimensions so the caller can recompute grid rows/cols and
+    /// PTY size. (Wired up by the config-reload path.)
+    #[allow(dead_code)]
+    pub fn rebuild_atlas(&mut self, font_config: FontConfig) -> (u32, u32) {
+        self.font_config = font_config;
+        self.atlas = GlyphAtlas::new(&self.device, &self.font_config, self.scale);
+        (self.atlas.cell_width, self.atlas.cell_height)
     }
 
     /// Draw the terminal Grid to screen.
