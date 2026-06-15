@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
 use font_kit::loaders::core_text::Font;
-use metal::{Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureUsage, TextureDescriptor};
+use metal::{
+    Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureUsage, TextureDescriptor,
+};
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use tracing::info;
@@ -71,8 +73,7 @@ impl GlyphAtlas {
             .ok();
 
         // Load emoji fallback font
-        let emoji_font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0)
-            .ok();
+        let emoji_font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).ok();
 
         let scaled_size = font_size * scale_factor as f32;
 
@@ -120,8 +121,8 @@ impl GlyphAtlas {
 
         // Pre-rasterize common CJK punctuation and a few CJK chars
         let cjk_chars: &[char] = &[
-            '、', '。', '「', '」', '【', '】', '，', '；', '：', '？', '！',
-            '（', '）', '…', '—', '《', '》', '·',
+            '、', '。', '「', '」', '【', '】', '，', '；', '：', '？', '！', '（', '）', '…', '—',
+            '《', '》', '·',
         ];
         if let Some(ref cjk) = cjk_font {
             for &ch in cjk_chars {
@@ -220,13 +221,7 @@ impl GlyphAtlas {
         } else {
             self.cell_width
         };
-        let pixels = Self::rasterize_glyph(
-            font,
-            ch,
-            self.scaled_size,
-            glyph_w,
-            self.cell_height,
-        );
+        let pixels = Self::rasterize_glyph(font, ch, self.scaled_size, glyph_w, self.cell_height);
 
         // Step 3: Upload to Metal texture
         Self::upload_region(
@@ -277,10 +272,7 @@ impl GlyphAtlas {
         let dst_x = *next_x;
         let dst_y = *next_y;
 
-        let uv_origin = (
-            dst_x as f32 / atlas_w as f32,
-            dst_y as f32 / atlas_h as f32,
-        );
+        let uv_origin = (dst_x as f32 / atlas_w as f32, dst_y as f32 / atlas_h as f32);
         let uv_size = (
             glyph_w as f32 / atlas_w as f32,
             cell_h as f32 / atlas_h as f32,
@@ -448,7 +440,11 @@ impl GlyphAtlas {
                 let non_zero = canvas.pixels.iter().filter(|&&p| p > 0).count();
                 tracing::debug!(
                     "Rasterized '{}': canvas {}x{}, stride={}, non-zero in canvas={}",
-                    ch, glyph_w, cell_h, canvas.stride, non_zero
+                    ch,
+                    glyph_w,
+                    cell_h,
+                    canvas.stride,
+                    non_zero
                 );
 
                 // Blit glyph pixels into atlas buffer
@@ -456,8 +452,8 @@ impl GlyphAtlas {
                 for y in 0..cell_h {
                     for x in 0..glyph_w {
                         let src_idx = (y as usize * canvas.stride) + x as usize;
-                        let dst_idx = ((dst_y + y) as usize * atlas_w as usize)
-                            + (dst_x + x) as usize;
+                        let dst_idx =
+                            ((dst_y + y) as usize * atlas_w as usize) + (dst_x + x) as usize;
                         if src_idx < canvas.pixels.len() && dst_idx < atlas_pixels.len() {
                             atlas_pixels[dst_idx] = canvas.pixels[src_idx];
                             if canvas.pixels[src_idx] > 0 {
@@ -473,10 +469,7 @@ impl GlyphAtlas {
         }
 
         // Store glyph info with normalized UV coordinates
-        let uv_origin = (
-            dst_x as f32 / atlas_w as f32,
-            dst_y as f32 / atlas_h as f32,
-        );
+        let uv_origin = (dst_x as f32 / atlas_w as f32, dst_y as f32 / atlas_h as f32);
         let uv_size = (
             glyph_w as f32 / atlas_w as f32,
             cell_h as f32 / atlas_h as f32,
@@ -527,7 +520,10 @@ impl GlyphAtlas {
         let non_zero = pixels.iter().filter(|&&p| p > 0).count();
         tracing::info!(
             "Uploading texture: {}x{}, non-zero pixels: {}/{} ({:.1}%)",
-            width, height, non_zero, pixels.len(),
+            width,
+            height,
+            non_zero,
+            pixels.len(),
             non_zero as f32 / pixels.len() as f32 * 100.0
         );
 
@@ -547,8 +543,6 @@ impl GlyphAtlas {
             width as u64,
         );
     }
-
-
 }
 
 /// Check if a character is an emoji.
@@ -615,8 +609,8 @@ mod transform_probe {
         let scaled = 28.0f32;
         let (cw, ch_h) = (17i32, 34i32);
         let upem = font.metrics().units_per_em as f32;
-        let ascent = font.metrics().ascent as f32;
-        let descent = font.metrics().descent as f32;
+        let ascent = font.metrics().ascent;
+        let descent = font.metrics().descent;
         let scale_px = scaled / upem;
         let ascent_px = ascent * scale_px;
         let descent_px = descent * scale_px;

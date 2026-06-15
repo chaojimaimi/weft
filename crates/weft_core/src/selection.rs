@@ -259,11 +259,7 @@ mod tests {
 
     #[test]
     fn block_selection_contains() {
-        let sel = Selection::new(
-            GridPos::new(1, 2),
-            GridPos::new(3, 5),
-            SelectionMode::Block,
-        );
+        let sel = Selection::new(GridPos::new(1, 2), GridPos::new(3, 5), SelectionMode::Block);
         assert!(sel.contains(2, 3));
         assert!(!sel.contains(2, 1));
         assert!(!sel.contains(2, 6));

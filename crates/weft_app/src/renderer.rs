@@ -12,7 +12,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
-use weft_core::grid::{CellFlags, CursorStyle, CellWidth};
+use weft_core::grid::{CellFlags, CellWidth, CursorStyle};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
@@ -48,9 +48,7 @@ impl MetalRenderer {
 
         info!(
             "Window: {}x{} physical ({}x scale), viewport: {}x{} physical, atlas cells: {}x{}",
-            size.width, size.height, scale,
-            vp_w, vp_h,
-            atlas.cell_width, atlas.cell_height
+            size.width, size.height, scale, vp_w, vp_h, atlas.cell_width, atlas.cell_height
         );
 
         // Compile shaders with DEBUGGING MODE
@@ -174,11 +172,7 @@ fragment float4 text_fragment(
 
         info!(
             "Renderer initialized: {}x{} @ {}x scale, {}x{} cells",
-            size.width,
-            size.height,
-            scale,
-            atlas.cell_width,
-            atlas.cell_height
+            size.width, size.height, scale, atlas.cell_width, atlas.cell_height
         );
 
         // Create sampler for glyph atlas texture
@@ -258,7 +252,13 @@ fragment float4 text_fragment(
         }
 
         // Build vertex data from Grid cells
-        let vertices = self.build_grid_vertices(grid, cursor, selection, terminal.cursor_visible && cursor_blink_on, terminal.cursor_style);
+        let vertices = self.build_grid_vertices(
+            grid,
+            cursor,
+            selection,
+            terminal.cursor_visible && cursor_blink_on,
+            terminal.cursor_style,
+        );
 
         // Debug: log first row characters and verify vertex data
         if vertices.is_empty() {
@@ -307,7 +307,7 @@ fragment float4 text_fragment(
         encoder.set_render_pipeline_state(&self.pipeline);
         encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
         encoder.set_vertex_buffer(1, Some(&vp_buffer), 0);
-        
+
         let tex = self.atlas.texture();
         encoder.set_fragment_texture(0, Some(tex));
         encoder.set_fragment_sampler_state(0, Some(&self.sampler));
@@ -371,14 +371,18 @@ fragment float4 text_fragment(
                 let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
 
                 // Check if this cell is in the selection
-                let is_selected = selection.selection.as_ref().is_some_and(|sel| sel.contains(row, col));
+                let is_selected = selection
+                    .selection
+                    .as_ref()
+                    .is_some_and(|sel| sel.contains(row, col));
 
                 // Look up glyph UV
-                let ch_char = if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    ' '
-                } else {
-                    cell.character
-                };
+                let ch_char =
+                    if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
+                        ' '
+                    } else {
+                        cell.character
+                    };
 
                 let (u0, v0, u1, v1) = if let Some(glyph) = self.atlas.get(ch_char) {
                     let (u, v) = glyph.uv_origin;
@@ -386,7 +390,11 @@ fragment float4 text_fragment(
                     (u, v, u + uw, v + vh)
                 } else {
                     // Character not in atlas — use space
-                    let (u, v) = self.atlas.get(' ').map(|g| g.uv_origin).unwrap_or((0.0, 0.0));
+                    let (u, v) = self
+                        .atlas
+                        .get(' ')
+                        .map(|g| g.uv_origin)
+                        .unwrap_or((0.0, 0.0));
                     let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
                     (u, v, u + uw, v + vh)
                 };
@@ -409,7 +417,10 @@ fragment float4 text_fragment(
                     cursor_color
                 } else if is_selected {
                     selection_bg
-                } else if is_cursor && (cursor_style == CursorStyle::Bar || cursor_style == CursorStyle::BlinkingBar) {
+                } else if is_cursor
+                    && (cursor_style == CursorStyle::Bar
+                        || cursor_style == CursorStyle::BlinkingBar)
+                {
                     // Bar cursor: only highlight the left 2 pixels
                     // We'll draw the full cell with normal bg, then overlay bar later
                     bg
@@ -431,12 +442,90 @@ fragment float4 text_fragment(
 
                 // Two triangles: TL-BL-BR, TL-BR-TR
                 let quad: [[f32; 12]; 6] = [
-                    [x0, y0, u0, v0, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
-                    [x0, y1, u0, v1, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
-                    [x1, y1, u1, v1, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
-                    [x0, y0, u0, v0, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
-                    [x1, y1, u1, v1, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
-                    [x1, y0, u1, v0, final_fg[0], final_fg[1], final_fg[2], final_fg[3], final_bg[0], final_bg[1], final_bg[2], final_bg[3]],
+                    [
+                        x0,
+                        y0,
+                        u0,
+                        v0,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
+                    [
+                        x0,
+                        y1,
+                        u0,
+                        v1,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
+                    [
+                        x1,
+                        y1,
+                        u1,
+                        v1,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
+                    [
+                        x0,
+                        y0,
+                        u0,
+                        v0,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
+                    [
+                        x1,
+                        y1,
+                        u1,
+                        v1,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
+                    [
+                        x1,
+                        y0,
+                        u1,
+                        v0,
+                        final_fg[0],
+                        final_fg[1],
+                        final_fg[2],
+                        final_fg[3],
+                        final_bg[0],
+                        final_bg[1],
+                        final_bg[2],
+                        final_bg[3],
+                    ],
                 ];
 
                 for vertex in &quad {
@@ -450,12 +539,90 @@ fragment float4 text_fragment(
                             let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
                             let bar_w = bar_w.max(1.0).min(cw * 0.15);
                             let quad: [[f32; 12]; 6] = [
-                                [x0, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0 + bar_w, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0 + bar_w, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0 + bar_w, y0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [
+                                    x0,
+                                    y0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0 + bar_w,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0,
+                                    y0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0 + bar_w,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0 + bar_w,
+                                    y0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
                             ];
                             for vertex in &quad {
                                 vertices.extend_from_slice(vertex);
@@ -464,12 +631,90 @@ fragment float4 text_fragment(
                         CursorStyle::Underline | CursorStyle::BlinkingUnderline => {
                             let line_h = 2.0;
                             let quad: [[f32; 12]; 6] = [
-                                [x0, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x1, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x0, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x1, y1, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
-                                [x1, y1 - line_h, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, cursor_color[0], cursor_color[1], cursor_color[2], cursor_color[3]],
+                                [
+                                    x0,
+                                    y1 - line_h,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x1,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x0,
+                                    y1 - line_h,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x1,
+                                    y1,
+                                    0.0,
+                                    1.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
+                                [
+                                    x1,
+                                    y1 - line_h,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    cursor_color[0],
+                                    cursor_color[1],
+                                    cursor_color[2],
+                                    cursor_color[3],
+                                ],
                             ];
                             for vertex in &quad {
                                 vertices.extend_from_slice(vertex);
