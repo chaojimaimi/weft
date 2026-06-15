@@ -7,7 +7,7 @@ mod glyph;
 mod renderer;
 
 use renderer::MetalRenderer;
-use weft_core::config::Config;
+use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
 };
@@ -75,6 +75,8 @@ struct App {
     proxy: EventLoopProxy<AppEvent>,
     /// User configuration (loaded at startup, reloaded live by the watcher).
     config: Config,
+    /// Resolved keybindings (key + modifiers → action).
+    keybindings: KeyBindings,
 }
 
 impl App {
@@ -86,6 +88,7 @@ impl App {
             size = config.font.size,
             "config loaded"
         );
+        let keybindings = config.keybindings();
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             window: None,
@@ -106,6 +109,7 @@ impl App {
             last_resize_instant: std::time::Instant::now(),
             proxy,
             config,
+            keybindings,
         }
     }
 
@@ -139,7 +143,11 @@ impl App {
             }
         };
 
-        self.terminal = Some(Terminal::new(rows, cols));
+        self.terminal = Some(Terminal::with_scrollback(
+            rows,
+            cols,
+            self.config.scrollback.lines,
+        ));
         self.pty = Some(pty);
     }
 
@@ -198,9 +206,9 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_code: WinitKeyCode, mods: winit::event::Modifiers) {
-        let Some(terminal) = &self.terminal else {
+        if self.terminal.is_none() {
             return;
-        };
+        }
 
         let key = match key_code {
             WinitKeyCode::Enter => KeyCode::Enter,
@@ -294,19 +302,20 @@ impl App {
             m |= Modifiers::SUPER;
         }
 
-        // Cmd+C: copy selection to clipboard
-        if mods.state().super_key() && key == KeyCode::Char('c') && !mods.state().control_key() {
-            self.copy_selection();
-            return;
+        // Configurable keybindings: resolve (key, mods) → action. If it maps to
+        // a weft action (copy/paste/scroll/reload), dispatch and consume; else
+        // fall through to encoding the key for the PTY.
+        if let Some(action) = self.keybindings.lookup(key, m) {
+            if self.execute_action(action) {
+                return;
+            }
         }
 
-        // Cmd+V: paste from clipboard
-        if mods.state().super_key() && key == KeyCode::Char('v') && !mods.state().control_key() {
-            self.paste_from_clipboard();
-            return;
-        }
-
-        self.input_handler.app_cursor_keys = terminal.app_cursor_keys;
+        self.input_handler.app_cursor_keys = self
+            .terminal
+            .as_ref()
+            .map(|t| t.app_cursor_keys)
+            .unwrap_or(false);
 
         let bytes = self.input_handler.encode_key(key, m);
         if !bytes.is_empty() {
@@ -316,6 +325,123 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Dispatch a weft action resolved from a keybinding. Returns true if the
+    /// key was consumed (must not be forwarded to the PTY).
+    fn execute_action(&mut self, action: Action) -> bool {
+        match action {
+            Action::Copy => {
+                self.copy_selection();
+                true
+            }
+            Action::Paste => {
+                self.paste_from_clipboard();
+                true
+            }
+            Action::ReloadConfig => {
+                self.reload_config();
+                true
+            }
+            Action::ScrollPageUp
+            | Action::ScrollPageDown
+            | Action::ScrollToTop
+            | Action::ScrollToBottom => {
+                self.scroll_action(action);
+                true
+            }
+        }
+    }
+
+    /// Local scrollback navigation (page up/down, top, bottom).
+    fn scroll_action(&mut self, action: Action) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        let rows = terminal.grid().num_rows;
+        let grid = terminal.grid_mut();
+        match action {
+            Action::ScrollPageUp => grid.scroll_up_history(rows),
+            Action::ScrollPageDown => grid.scroll_down_history(rows),
+            Action::ScrollToTop => grid.scroll_to_top(),
+            Action::ScrollToBottom => grid.scroll_to_bottom(),
+            _ => {}
+        }
+        self.request_redraw();
+    }
+
+    /// Re-read config from disk and apply it live. Triggered by the
+    /// reload-config keybinding (and the file watcher).
+    fn reload_config(&mut self) {
+        let config = Config::load();
+        self.apply_config(config);
+        info!("config reloaded");
+    }
+
+    /// Apply a (possibly new) config: theme, font, keybindings, scrollback.
+    /// Theme/font/scrollback changes take effect immediately; window size/title
+    /// apply on the next launch.
+    fn apply_config(&mut self, config: Config) {
+        // Theme — renderer defaults + terminal palette reseed (recolors all
+        // Palette-indexed cells on the next draw).
+        let theme = config.theme();
+        if let Some(r) = &mut self.renderer {
+            r.set_theme(theme.clone());
+        }
+        if let Some(t) = &mut self.terminal {
+            t.set_palette(theme.palette);
+        }
+
+        // Font — rebuild the atlas (cell dimensions may change → recompute).
+        if self.config.font.family != config.font.family
+            || self.config.font.size != config.font.size
+            || self.config.font.line_height != config.font.line_height
+        {
+            if let Some(r) = &mut self.renderer {
+                r.rebuild_atlas(config.font.clone());
+            }
+            self.recompute_layout();
+        }
+
+        // Keybindings.
+        self.keybindings = config.keybindings();
+
+        // Scrollback capacity.
+        if let Some(t) = &mut self.terminal {
+            let cols = t.grid().num_cols;
+            t.grid_mut()
+                .scrollback
+                .set_max_lines(config.scrollback.lines, cols);
+        }
+
+        self.config = config;
+        self.request_redraw();
+    }
+
+    /// Recompute grid rows/cols from the current window + cell dimensions and
+    /// resize the terminal / queue a PTY SIGWINCH. Used after a font change
+    /// (cell size changes) and on window resize.
+    fn recompute_layout(&mut self) {
+        let (new_rows, new_cols, size) = {
+            let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+                return;
+            };
+            let size = window.inner_size();
+            let new_cols = (size.width as f64 / renderer.cell_width() as f64) as usize;
+            let new_rows = (size.height as f64 / renderer.cell_height() as f64) as usize;
+            (new_rows, new_cols, size)
+        };
+        if new_cols == 0 || new_rows == 0 {
+            return;
+        }
+        if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) {
+            renderer.resize(window, size);
+        }
+        if let Some(terminal) = &mut self.terminal {
+            terminal.resize(new_rows, new_cols);
+        }
+        self.pending_pty_resize = Some((new_rows, new_cols));
+        self.last_resize_instant = std::time::Instant::now();
     }
 
     /// Convert pixel coordinates to grid (row, col).
@@ -615,12 +741,16 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
+        let win = &self.config.window;
         let attrs = WindowAttributes::default()
-            .with_title("Weft")
-            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
+            .with_title(&win.title)
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                win.width as f64,
+                win.height as f64,
+            ));
 
         let window = event_loop.create_window(attrs).unwrap();
-        let renderer = MetalRenderer::new(&window, self.config.font.clone());
+        let renderer = MetalRenderer::new(&window, self.config.font.clone(), self.config.theme());
 
         self.spawn_pty();
         self.window = Some(window);

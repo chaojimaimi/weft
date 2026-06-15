@@ -12,7 +12,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
-use weft_core::config::FontConfig;
+use weft_core::config::{FontConfig, Theme};
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
@@ -26,16 +26,17 @@ pub struct MetalRenderer {
     sampler: metal::SamplerState,
     atlas: GlyphAtlas,
     viewport: (f32, f32),
-    /// Retained for live font/atlas rebuild (config reload). Used in v0.3.
-    #[allow(dead_code)]
+    /// Retained for live font/atlas rebuild (config reload).
     scale: f64,
-    /// Retained for live font/atlas rebuild (config reload). Used in v0.3.
-    #[allow(dead_code)]
+    /// Retained for live font/atlas rebuild (config reload).
     font_config: FontConfig,
+    /// Active theme (default fg/bg/cursor/selection). Per-frame, so a
+    /// `set_theme` call recolors the screen on the next draw.
+    theme: Theme,
 }
 
 impl MetalRenderer {
-    pub fn new(window: &Window, font_config: FontConfig) -> Self {
+    pub fn new(window: &Window, font_config: FontConfig, theme: Theme) -> Self {
         let device = Device::system_default().expect("No Metal device found");
         let queue = device.new_command_queue();
 
@@ -201,7 +202,21 @@ fragment float4 text_fragment(
             viewport: (vp_w, vp_h),
             scale,
             font_config,
+            theme,
         }
+    }
+
+    /// Swap the active theme. Recolors the whole screen on the next draw
+    /// (colors are resolved per-frame from cells' color-origins + this theme +
+    /// the terminal palette, so no rebuild is needed).
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Current background color (for the render-pass clear value).
+    #[allow(dead_code)]
+    pub fn background(&self) -> Color {
+        self.theme.background
     }
 
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
@@ -228,8 +243,7 @@ fragment float4 text_fragment(
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
     /// live config reload when font family/size/line-height changes. Returns
     /// the new cell dimensions so the caller can recompute grid rows/cols and
-    /// PTY size. (Wired up by the config-reload path.)
-    #[allow(dead_code)]
+    /// PTY size.
     pub fn rebuild_atlas(&mut self, font_config: FontConfig) -> (u32, u32) {
         self.font_config = font_config;
         self.atlas = GlyphAtlas::new(&self.device, &self.font_config, self.scale);
@@ -250,6 +264,15 @@ fragment float4 text_fragment(
 
         let grid = terminal.grid();
         let cursor = &grid.cursor;
+
+        // Clear color from the theme background.
+        let bg = self.theme.background;
+        let (bg_r, bg_g, bg_b, bg_a) = (
+            bg.r as f64 / 255.0,
+            bg.g as f64 / 255.0,
+            bg.b as f64 / 255.0,
+            bg.a as f64 / 255.0,
+        );
 
         // Collect unique on-screen characters not yet in the atlas, then
         // rasterize each exactly once. This avoids O(R*C) hash lookups per
@@ -287,7 +310,7 @@ fragment float4 text_fragment(
             color_att.set_texture(Some(drawable.texture()));
             color_att.set_load_action(MTLLoadAction::Clear);
             color_att.set_store_action(MTLStoreAction::Store);
-            color_att.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+            color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, bg_a));
 
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_render_command_encoder(pass_desc);
@@ -362,15 +385,11 @@ fragment float4 text_fragment(
 
         let mut vertices = Vec::with_capacity(num_rows * num_cols * 72);
 
-        // Default colors
-        let default_fg = [0.9, 0.9, 0.9, 1.0];
-        let default_bg = [0.12, 0.12, 0.14, 1.0];
-
-        // Cursor color (white, standard terminal cursor)
-        let cursor_color = [1.0, 1.0, 1.0, 1.0];
-
-        // Selection highlight color (semi-transparent blue)
-        let selection_bg = [0.2, 0.4, 0.8, 0.4];
+        // Theme-derived colors (resolved per-frame from the active theme).
+        let default_fg = color_to_normalized(self.theme.foreground);
+        let default_bg = color_to_normalized(self.theme.background);
+        let cursor_color = color_to_normalized(self.theme.cursor);
+        let selection_bg = color_to_normalized(self.theme.selection);
 
         for row in 0..num_rows {
             for col in 0..num_cols {
