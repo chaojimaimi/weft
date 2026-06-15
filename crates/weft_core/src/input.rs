@@ -9,7 +9,7 @@ use bitflags::bitflags;
 
 bitflags! {
     /// Keyboard modifier flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Modifiers: u8 {
         const SHIFT   = 0x01;
         const ALT     = 0x02;

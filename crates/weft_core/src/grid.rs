@@ -36,6 +36,56 @@ impl Color {
 
     pub const DEFAULT_FG: Color = Color::rgb(204, 204, 204);
     pub const DEFAULT_BG: Color = Color::rgb(26, 26, 46);
+
+    /// The xterm 256-color palette: 16 ANSI + 6×6×6 cube (16-231) + grayscale
+    /// (232-255). Shared by the VT palette seed and theme defaults so there is
+    /// a single source of truth.
+    pub fn standard_palette() -> [Color; 256] {
+        let mut palette = [Color::DEFAULT_FG; 256];
+
+        // Standard 16 colors
+        let standard = [
+            (0, 0, 0),       // 0 Black
+            (205, 0, 0),     // 1 Red
+            (0, 205, 0),     // 2 Green
+            (205, 205, 0),   // 3 Yellow
+            (0, 0, 238),     // 4 Blue
+            (205, 0, 205),   // 5 Magenta
+            (0, 205, 205),   // 6 Cyan
+            (229, 229, 229), // 7 White
+            (127, 127, 127), // 8 Bright Black
+            (255, 0, 0),     // 9 Bright Red
+            (0, 255, 0),     // 10 Bright Green
+            (255, 255, 0),   // 11 Bright Yellow
+            (92, 92, 255),   // 12 Bright Blue
+            (255, 0, 255),   // 13 Bright Magenta
+            (0, 255, 255),   // 14 Bright Cyan
+            (255, 255, 255), // 15 Bright White
+        ];
+        for (i, (r, g, b)) in standard.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+
+        // 16-231: 6x6x6 color cube
+        let cube_values = [0, 95, 135, 175, 215, 255];
+        let mut idx = 16;
+        for r in &cube_values {
+            for g in &cube_values {
+                for b in &cube_values {
+                    palette[idx] = Color::rgb(*r, *g, *b);
+                    idx += 1;
+                }
+            }
+        }
+
+        // 232-255: grayscale ramp
+        for i in 0u8..24 {
+            let v = 8 + i * 10;
+            palette[232 + i as usize] = Color::rgb(v, v, v);
+        }
+
+        palette
+    }
 }
 
 /// Where a cell's color comes from. Stored on the cell so a theme/palette
