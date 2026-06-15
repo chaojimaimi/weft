@@ -3,6 +3,8 @@
 //! Translates abstract key/mouse events into VT100/VT220 escape sequences
 //! that can be sent to the PTY for the shell to interpret.
 
+use std::io::Write;
+
 use bitflags::bitflags;
 
 bitflags! {
@@ -183,7 +185,9 @@ impl InputHandler {
         let px = col + self.mouse_coord_base as usize;
         let py = row + self.mouse_coord_base as usize;
 
-        Some(format!("\x1b[<{pb};{px};{py}{suffix}").into_bytes())
+        let mut buf = Vec::with_capacity(16);
+        let _ = write!(buf, "\x1b[<{pb};{px};{py}{suffix}");
+        Some(buf)
     }
 
     /// Set the mouse protocol mode (from DEC private mode sequences).
@@ -219,7 +223,13 @@ impl InputHandler {
     }
 
     /// Encode scroll wheel events.
-    pub fn encode_scroll(&self, up: bool, col: usize, row: usize, mods: Modifiers) -> Option<Vec<u8>> {
+    pub fn encode_scroll(
+        &self,
+        up: bool,
+        col: usize,
+        row: usize,
+        mods: Modifiers,
+    ) -> Option<Vec<u8>> {
         if self.mouse_protocol == MouseProtocol::Off {
             return None;
         }
@@ -241,7 +251,9 @@ impl InputHandler {
         let px = col + self.mouse_coord_base as usize;
         let py = row + self.mouse_coord_base as usize;
 
-        Some(format!("\x1b[<{pb};{px};{py}M").into_bytes())
+        let mut buf = Vec::with_capacity(16);
+        let _ = write!(buf, "\x1b[<{pb};{px};{py}M");
+        Some(buf)
     }
 
     fn encode_char(&self, c: char, mods: Modifiers) -> Vec<u8> {
@@ -350,11 +362,11 @@ impl InputHandler {
 
         if has_mods {
             let mod_code = self.modifier_code(mods);
-            format!("\x1b[1;{mod_code}{dir}").into_bytes()
+            self.csi_with_mod(1, dir as u8, mod_code)
         } else if self.app_cursor_keys {
-            format!("\x1bO{dir}").into_bytes()
+            vec![0x1b, b'O', dir as u8]
         } else {
-            format!("\x1b[{dir}").into_bytes()
+            vec![0x1b, b'[', dir as u8]
         }
     }
 
@@ -375,76 +387,63 @@ impl InputHandler {
     }
 
     fn encode_page(&self, suffix: char, _mods: Modifiers) -> Vec<u8> {
-        format!("\x1b[{suffix}").into_bytes()
+        vec![0x1b, b'[', suffix as u8]
     }
 
     fn encode_function_key(&self, n: u8, mods: Modifiers) -> Vec<u8> {
         let has_mods = mods.intersects(Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL);
 
         match n {
-            1 => {
+            // F1–F4: application mode `ESC O P/Q/R/S`, or CSI form with a modifier.
+            1..=4 => {
+                let final_byte = b'P' + (n - 1);
                 if has_mods {
                     let m = self.modifier_code(mods);
-                    format!("\x1b[1;{m}P").into_bytes()
+                    self.csi_with_mod(1, final_byte, m)
                 } else {
-                    b"\x1bOP".to_vec()
+                    vec![0x1b, b'O', final_byte]
                 }
             }
-            2 => {
-                if has_mods {
-                    let m = self.modifier_code(mods);
-                    format!("\x1b[1;{m}Q").into_bytes()
-                } else {
-                    b"\x1bOQ".to_vec()
-                }
-            }
-            3 => {
-                if has_mods {
-                    let m = self.modifier_code(mods);
-                    format!("\x1b[1;{m}R").into_bytes()
-                } else {
-                    b"\x1bOR".to_vec()
-                }
-            }
-            4 => {
-                if has_mods {
-                    let m = self.modifier_code(mods);
-                    format!("\x1b[1;{m}S").into_bytes()
-                } else {
-                    b"\x1bOS".to_vec()
-                }
-            }
+            // F5–F10 use CSI <code> ~ (codes 15/17/18/19/20/21).
             5..=10 => {
                 let codes = [15u8, 17, 18, 19, 20, 21];
-                let code = codes[n as usize - 5];
-                if has_mods {
-                    let m = self.modifier_code(mods);
-                    format!("\x1b[{code};{m}~").into_bytes()
-                } else {
-                    format!("\x1b[{code}~").into_bytes()
-                }
+                let code = codes[(n - 5) as usize];
+                self.csi_tilde(code, mods)
             }
+            // F11–F12 use CSI 23/24 ~.
             11..=12 => {
                 let code = 23 + (n - 11);
-                if has_mods {
-                    let m = self.modifier_code(mods);
-                    format!("\x1b[{code};{m}~").into_bytes()
-                } else {
-                    format!("\x1b[{code}~").into_bytes()
-                }
+                self.csi_tilde(code, mods)
             }
             _ => Vec::new(),
         }
     }
 
     fn encode_csi_tilde_or_mod(&self, code: u8, mods: Modifiers) -> Vec<u8> {
+        self.csi_tilde(code, mods)
+    }
+
+    /// Build `\x1b[<param>;<mod><final>` — used by arrow keys and F1–F4 when a
+    /// modifier is held. Writes bytes directly instead of going through `format!`
+    /// (no `String` allocation, no formatter machinery).
+    fn csi_with_mod(&self, param: u8, final_byte: u8, mod_code: u8) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8);
+        let _ = write!(buf, "\x1b[{param};{mod_code}");
+        buf.push(final_byte);
+        buf
+    }
+
+    /// Build `\x1b[<code>;<m>~` (modifier held) or `\x1b[<code>~`.
+    fn csi_tilde(&self, code: u8, mods: Modifiers) -> Vec<u8> {
         let has_mods = mods.intersects(Modifiers::SHIFT | Modifiers::ALT | Modifiers::CONTROL);
+        let mut buf = Vec::with_capacity(8);
         if has_mods {
             let m = self.modifier_code(mods);
-            format!("\x1b[{code};{m}~").into_bytes()
+            let _ = write!(buf, "\x1b[{code};{m}~");
         } else {
-            format!("\x1b[{code}~").into_bytes()
+            let _ = write!(buf, "\x1b[{code}~");
         }
+        buf
     }
 
     fn modifier_code(&self, mods: Modifiers) -> u8 {
@@ -504,7 +503,10 @@ mod tests {
 
     #[test]
     fn plain_char() {
-        assert_eq!(handler().encode_key(KeyCode::Char('a'), Modifiers::empty()), b"a");
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('a'), Modifiers::empty()),
+            b"a"
+        );
     }
 
     #[test]
@@ -526,26 +528,50 @@ mod tests {
     #[test]
     fn shift_symbols() {
         // Regression: Shift+symbol must yield the shifted char, not the base char.
-        assert_eq!(handler().encode_key(KeyCode::Char('`'), Modifiers::SHIFT), b"~");
-        assert_eq!(handler().encode_key(KeyCode::Char('4'), Modifiers::SHIFT), b"$");
-        assert_eq!(handler().encode_key(KeyCode::Char('-'), Modifiers::SHIFT), b"_");
-        assert_eq!(handler().encode_key(KeyCode::Char('['), Modifiers::SHIFT), b"{");
-        assert_eq!(handler().encode_key(KeyCode::Char('/'), Modifiers::SHIFT), b"?");
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('`'), Modifiers::SHIFT),
+            b"~"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('4'), Modifiers::SHIFT),
+            b"$"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('-'), Modifiers::SHIFT),
+            b"_"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('['), Modifiers::SHIFT),
+            b"{"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::Char('/'), Modifiers::SHIFT),
+            b"?"
+        );
     }
 
     #[test]
     fn enter_key() {
-        assert_eq!(handler().encode_key(KeyCode::Enter, Modifiers::empty()), b"\r");
+        assert_eq!(
+            handler().encode_key(KeyCode::Enter, Modifiers::empty()),
+            b"\r"
+        );
     }
 
     #[test]
     fn tab_key() {
-        assert_eq!(handler().encode_key(KeyCode::Tab, Modifiers::empty()), b"\t");
+        assert_eq!(
+            handler().encode_key(KeyCode::Tab, Modifiers::empty()),
+            b"\t"
+        );
     }
 
     #[test]
     fn escape_key() {
-        assert_eq!(handler().encode_key(KeyCode::Escape, Modifiers::empty()), b"\x1b");
+        assert_eq!(
+            handler().encode_key(KeyCode::Escape, Modifiers::empty()),
+            b"\x1b"
+        );
     }
 
     #[test]
@@ -648,22 +674,34 @@ mod tests {
 
     #[test]
     fn home_key() {
-        assert_eq!(handler().encode_key(KeyCode::Home, Modifiers::empty()), b"\x1b[1~");
+        assert_eq!(
+            handler().encode_key(KeyCode::Home, Modifiers::empty()),
+            b"\x1b[1~"
+        );
     }
 
     #[test]
     fn end_key() {
-        assert_eq!(handler().encode_key(KeyCode::End, Modifiers::empty()), b"\x1b[4~");
+        assert_eq!(
+            handler().encode_key(KeyCode::End, Modifiers::empty()),
+            b"\x1b[4~"
+        );
     }
 
     #[test]
     fn insert_key() {
-        assert_eq!(handler().encode_key(KeyCode::Insert, Modifiers::empty()), b"\x1b[2~");
+        assert_eq!(
+            handler().encode_key(KeyCode::Insert, Modifiers::empty()),
+            b"\x1b[2~"
+        );
     }
 
     #[test]
     fn delete_key() {
-        assert_eq!(handler().encode_key(KeyCode::Delete, Modifiers::empty()), b"\x1b[3~");
+        assert_eq!(
+            handler().encode_key(KeyCode::Delete, Modifiers::empty()),
+            b"\x1b[3~"
+        );
     }
 
     #[test]
@@ -678,12 +716,18 @@ mod tests {
 
     #[test]
     fn page_up() {
-        assert_eq!(handler().encode_key(KeyCode::PageUp, Modifiers::empty()), b"\x1b[H");
+        assert_eq!(
+            handler().encode_key(KeyCode::PageUp, Modifiers::empty()),
+            b"\x1b[H"
+        );
     }
 
     #[test]
     fn page_down() {
-        assert_eq!(handler().encode_key(KeyCode::PageDown, Modifiers::empty()), b"\x1b[I");
+        assert_eq!(
+            handler().encode_key(KeyCode::PageDown, Modifiers::empty()),
+            b"\x1b[I"
+        );
     }
 
     // ── Function keys ─────────────────────────────────────────────
@@ -705,14 +749,23 @@ mod tests {
         assert_eq!(h.encode_key(KeyCode::F(7), Modifiers::empty()), b"\x1b[18~");
         assert_eq!(h.encode_key(KeyCode::F(8), Modifiers::empty()), b"\x1b[19~");
         assert_eq!(h.encode_key(KeyCode::F(9), Modifiers::empty()), b"\x1b[20~");
-        assert_eq!(h.encode_key(KeyCode::F(10), Modifiers::empty()), b"\x1b[21~");
+        assert_eq!(
+            h.encode_key(KeyCode::F(10), Modifiers::empty()),
+            b"\x1b[21~"
+        );
     }
 
     #[test]
     fn f11_f12() {
         let h = handler();
-        assert_eq!(h.encode_key(KeyCode::F(11), Modifiers::empty()), b"\x1b[23~");
-        assert_eq!(h.encode_key(KeyCode::F(12), Modifiers::empty()), b"\x1b[24~");
+        assert_eq!(
+            h.encode_key(KeyCode::F(11), Modifiers::empty()),
+            b"\x1b[23~"
+        );
+        assert_eq!(
+            h.encode_key(KeyCode::F(12), Modifiers::empty()),
+            b"\x1b[24~"
+        );
     }
 
     #[test]
@@ -744,7 +797,10 @@ mod tests {
 
     #[test]
     fn numpad_digit() {
-        assert_eq!(handler().encode_key(KeyCode::Numpad('5'), Modifiers::empty()), b"5");
+        assert_eq!(
+            handler().encode_key(KeyCode::Numpad('5'), Modifiers::empty()),
+            b"5"
+        );
     }
 
     // ── Mouse protocol ────────────────────────────────────────────
@@ -752,14 +808,28 @@ mod tests {
     #[test]
     fn mouse_off_returns_none() {
         let h = handler();
-        assert!(h.encode_mouse(MouseButton::Left, MouseAction::Press, 5, 10, Modifiers::empty()).is_none());
+        assert!(h
+            .encode_mouse(
+                MouseButton::Left,
+                MouseAction::Press,
+                5,
+                10,
+                Modifiers::empty()
+            )
+            .is_none());
     }
 
     #[test]
     fn mouse_sgr_left_press() {
         let mut h = handler();
         h.mouse_protocol = MouseProtocol::Normal;
-        let bytes = h.encode_mouse(MouseButton::Left, MouseAction::Press, 5, 10, Modifiers::empty());
+        let bytes = h.encode_mouse(
+            MouseButton::Left,
+            MouseAction::Press,
+            5,
+            10,
+            Modifiers::empty(),
+        );
         assert!(bytes.is_some());
         let bytes = bytes.unwrap();
         // SGR: ESC[<0;6;11M (1-based coords)
@@ -770,7 +840,13 @@ mod tests {
     fn mouse_sgr_release() {
         let mut h = handler();
         h.mouse_protocol = MouseProtocol::Normal;
-        let bytes = h.encode_mouse(MouseButton::Left, MouseAction::Release, 5, 10, Modifiers::empty());
+        let bytes = h.encode_mouse(
+            MouseButton::Left,
+            MouseAction::Release,
+            5,
+            10,
+            Modifiers::empty(),
+        );
         assert!(bytes.is_some());
         let bytes = bytes.unwrap();
         // Release ends with 'm' (lowercase)
