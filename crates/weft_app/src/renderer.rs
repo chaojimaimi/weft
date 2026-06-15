@@ -12,7 +12,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
-use weft_core::grid::{CellFlags, CellWidth, CursorStyle};
+use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
@@ -254,6 +254,7 @@ fragment float4 text_fragment(
         // Build vertex data from Grid cells
         let vertices = self.build_grid_vertices(
             grid,
+            terminal.palette(),
             cursor,
             selection,
             terminal.cursor_visible && cursor_blink_on,
@@ -326,6 +327,7 @@ fragment float4 text_fragment(
     fn build_grid_vertices(
         &self,
         grid: &weft_core::grid::Grid,
+        palette: &[Color; 256],
         cursor: &weft_core::grid::Cursor,
         selection: &SelectionHandler,
         show_cursor: bool,
@@ -363,9 +365,10 @@ fragment float4 text_fragment(
                 let x = col as f32 * cw;
                 let y = row as f32 * ch;
 
-                // Determine cell colors
-                let fg = color_to_normalized(cell.fg, default_fg);
-                let bg = color_to_normalized(cell.bg, default_bg);
+                // Determine cell colors (resolve the cell's color-origin against
+                // the palette / theme defaults).
+                let fg = resolve_cell_color(cell.fg, default_fg, palette);
+                let bg = resolve_cell_color(cell.bg, default_bg, palette);
 
                 // Check if this is the cursor position
                 let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
@@ -731,16 +734,25 @@ fragment float4 text_fragment(
 }
 
 /// Convert a grid Color to normalized RGBA floats.
-fn color_to_normalized(color: weft_core::grid::Color, default: [f32; 4]) -> [f32; 4] {
-    if color.r == 0 && color.g == 0 && color.b == 0 && color.a == 0 {
-        return default;
-    }
+fn color_to_normalized(color: Color) -> [f32; 4] {
     [
         color.r as f32 / 255.0,
         color.g as f32 / 255.0,
         color.b as f32 / 255.0,
         color.a as f32 / 255.0,
     ]
+}
+
+/// Resolve a cell's color-origin against the current palette / theme default.
+/// `Default` → theme default; `Palette(i)` → palette slot; `Rgb` → as-is.
+/// Because this runs per-frame, changing the palette (theme switch or OSC)
+/// recolors the whole screen on the next draw without rewriting cells.
+fn resolve_cell_color(cc: CellColor, default: [f32; 4], palette: &[Color; 256]) -> [f32; 4] {
+    match cc {
+        CellColor::Default => default,
+        CellColor::Palette(i) => color_to_normalized(palette[i as usize]),
+        CellColor::Rgb(c) => color_to_normalized(c),
+    }
 }
 
 /// Attach a Metal layer to the winit window's NSView.

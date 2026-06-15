@@ -38,6 +38,19 @@ impl Color {
     pub const DEFAULT_BG: Color = Color::rgb(26, 26, 46);
 }
 
+/// Where a cell's color comes from. Stored on the cell so a theme/palette
+/// change can recolor the whole screen instantly: cells remember their origin
+/// (default / palette index / explicit RGB) rather than a pre-resolved color.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellColor {
+    /// Use the theme default (foreground or background depending on slot).
+    Default,
+    /// Index into the 256-color palette (ANSI 0-15 + 6×6×6 cube + grayscale).
+    Palette(u8),
+    /// Explicit truecolor (SGR 38;2;r;g;b).
+    Rgb(Color),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CellWidth {
     Half = 1,
@@ -49,8 +62,8 @@ pub enum CellWidth {
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub character: char,
-    pub fg: Color,
-    pub bg: Color,
+    pub fg: CellColor,
+    pub bg: CellColor,
     pub flags: CellFlags,
     pub width: CellWidth,
 }
@@ -59,8 +72,8 @@ impl Default for Cell {
     fn default() -> Self {
         Self {
             character: ' ',
-            fg: Color::DEFAULT_FG,
-            bg: Color::DEFAULT_BG,
+            fg: CellColor::Default,
+            bg: CellColor::Default,
             flags: CellFlags::empty(),
             width: CellWidth::Half,
         }
@@ -367,7 +380,13 @@ impl Grid {
 
     /// Write a character at the cursor position with given attributes.
     /// Used by VT performer to print with current SGR attributes.
-    pub fn write_char_with_attrs(&mut self, ch: char, fg: Color, bg: Color, flags: CellFlags) {
+    pub fn write_char_with_attrs(
+        &mut self,
+        ch: char,
+        fg: CellColor,
+        bg: CellColor,
+        flags: CellFlags,
+    ) {
         // Reset scroll offset on new output
         self.scroll_offset = 0;
 
@@ -642,10 +661,10 @@ impl Grid {
 
     /// Clear scrollback buffer (CSI 3 J).
     pub fn clear_scrollback(&mut self) {
-        let cols = self.num_cols;
-        self.scrollback = Scrollback::new(10000);
+        // Preserve the configured capacity (don't reset to a hardcoded default).
+        let max_lines = self.scrollback.max_lines;
+        self.scrollback = Scrollback::new(max_lines);
         self.scroll_offset = 0;
-        let _ = (cols,); // suppress unused warning
     }
 
     /// Clear line from cursor to end (CSI 0 K).
@@ -1570,10 +1589,15 @@ mod tests {
         let mut grid = Grid::new(24, 80);
         let red = Color::rgb(255, 0, 0);
         let blue = Color::rgb(0, 0, 255);
-        grid.write_char_with_attrs('X', red, blue, CellFlags::BOLD);
+        grid.write_char_with_attrs(
+            'X',
+            CellColor::Rgb(red),
+            CellColor::Rgb(blue),
+            CellFlags::BOLD,
+        );
         assert_eq!(grid.cell(0, 0).character, 'X');
-        assert_eq!(grid.cell(0, 0).fg, red);
-        assert_eq!(grid.cell(0, 0).bg, blue);
+        assert_eq!(grid.cell(0, 0).fg, CellColor::Rgb(red));
+        assert_eq!(grid.cell(0, 0).bg, CellColor::Rgb(blue));
         assert!(grid.cell(0, 0).flags.contains(CellFlags::BOLD));
     }
 
@@ -1642,8 +1666,8 @@ mod tests {
         // Writing new output should reset scroll offset
         grid.write_char_with_attrs(
             'A',
-            Color::DEFAULT_FG,
-            Color::DEFAULT_BG,
+            CellColor::Default,
+            CellColor::Default,
             CellFlags::empty(),
         );
         assert_eq!(grid.scroll_offset, 0);
@@ -1970,7 +1994,7 @@ mod tests {
     /// (which the VT parser uses), then widen — the line must unwrap.
     #[test]
     fn resize_unwraps_line_written_by_vt_parser() {
-        use super::{CellFlags, Color};
+        use super::CellFlags;
         let mut grid = Grid::with_scrollback(5, 20, 100);
 
         // Write 35 characters — wraps in a 20-col grid
@@ -1978,8 +2002,8 @@ mod tests {
             let ch = char::from_digit((i % 10) as u32, 10).unwrap();
             grid.write_char_with_attrs(
                 ch,
-                Color::DEFAULT_FG,
-                Color::DEFAULT_BG,
+                CellColor::Default,
+                CellColor::Default,
                 CellFlags::empty(),
             );
         }

@@ -3,23 +3,23 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
-use crate::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::input::MouseProtocol;
 
 /// Current text attributes applied to newly printed characters.
 /// Updated by SGR (CSI m) sequences, consumed by `print()`.
 #[derive(Clone, Debug)]
 pub struct Attrs {
-    pub fg: Color,
-    pub bg: Color,
+    pub fg: CellColor,
+    pub bg: CellColor,
     pub flags: CellFlags,
 }
 
 impl Default for Attrs {
     fn default() -> Self {
         Self {
-            fg: Color::DEFAULT_FG,
-            bg: Color::DEFAULT_BG,
+            fg: CellColor::Default,
+            bg: CellColor::Default,
             flags: CellFlags::empty(),
         }
     }
@@ -97,6 +97,13 @@ impl Terminal {
 
     pub fn grid_mut(&mut self) -> &mut Grid {
         &mut self.grid
+    }
+
+    /// The 256-color palette. Seeded from the theme, mutable by OSC 4/104.
+    /// The renderer resolves `CellColor::Palette(i)` against this each frame,
+    /// so theme switches and OSC edits recolor the screen on the next draw.
+    pub fn palette(&self) -> &[Color; 256] {
+        &self.palette
     }
 
     /// Whether the alternate screen buffer is currently active.
@@ -268,7 +275,7 @@ impl Terminal {
                 29 => self.attrs.flags.remove(CellFlags::STRIKETHROUGH),
                 // Standard foreground 30-37
                 30..=37 => {
-                    self.attrs.fg = self.palette[v as usize - 30];
+                    self.attrs.fg = CellColor::Palette((v - 30) as u8);
                 }
                 // 256-color / truecolor foreground
                 38 => {
@@ -278,10 +285,10 @@ impl Terminal {
                     }
                 }
                 // Default foreground
-                39 => self.attrs.fg = Color::DEFAULT_FG,
+                39 => self.attrs.fg = CellColor::Default,
                 // Standard background 40-47
                 40..=47 => {
-                    self.attrs.bg = self.palette[v as usize - 40];
+                    self.attrs.bg = CellColor::Palette((v - 40) as u8);
                 }
                 // 256-color / truecolor background
                 48 => {
@@ -291,14 +298,14 @@ impl Terminal {
                     }
                 }
                 // Default background
-                49 => self.attrs.bg = Color::DEFAULT_BG,
+                49 => self.attrs.bg = CellColor::Default,
                 // Bright foreground 90-97
                 90..=97 => {
-                    self.attrs.fg = self.palette[v as usize - 90 + 8];
+                    self.attrs.fg = CellColor::Palette((v - 90 + 8) as u8);
                 }
                 // Bright background 100-107
                 100..=107 => {
-                    self.attrs.bg = self.palette[v as usize - 100 + 8];
+                    self.attrs.bg = CellColor::Palette((v - 100 + 8) as u8);
                 }
                 _ => {
                     tracing::trace!(v, "unhandled SGR param");
@@ -309,22 +316,24 @@ impl Terminal {
     }
 
     /// Parse SGR color starting after the 38/48 marker.
-    /// Returns `(Color, skip_count)` where skip_count is how many extra
-    /// values (beyond the 38/48) were consumed.
-    fn parse_sgr_color(&self, vals: &[u16], start: usize) -> Option<(Color, usize)> {
+    /// Returns `(CellColor, skip_count)` where skip_count is how many extra
+    /// values (beyond the 38/48) were consumed. Stores the *origin* (palette
+    /// index or explicit RGB) rather than resolving against the palette, so a
+    /// theme/palette change can recolor already-written cells.
+    fn parse_sgr_color(&self, vals: &[u16], start: usize) -> Option<(CellColor, usize)> {
         let kind = vals.get(start).copied()?;
         match kind {
             // Indexed 256-color: 38;5;N
             5 => {
-                let idx = vals.get(start + 1).copied()?.min(255) as usize;
-                Some((self.palette[idx], 2))
+                let idx = vals.get(start + 1).copied()?.min(255) as u8;
+                Some((CellColor::Palette(idx), 2))
             }
             // Truecolor: 38;2;R;G;B
             2 => {
                 let r = vals.get(start + 1).copied()? as u8;
                 let g = vals.get(start + 2).copied()? as u8;
                 let b = vals.get(start + 3).copied()? as u8;
-                Some((Color::rgb(r, g, b), 4))
+                Some((CellColor::Rgb(Color::rgb(r, g, b)), 4))
             }
             _ => None,
         }
@@ -848,7 +857,7 @@ mod tests {
         let mut t = term();
         t.process(b"\x1b[31mX");
         assert_eq!(t.grid().cell(0, 0).character, 'X');
-        assert_eq!(t.grid().cell(0, 0).fg, t.palette[1]); // red
+        assert_eq!(t.grid().cell(0, 0).fg, CellColor::Palette(1)); // red = palette[1]
     }
 
     #[test]
@@ -864,8 +873,8 @@ mod tests {
     fn sgr_reset() {
         let mut t = term();
         t.process(b"\x1b[31mX\x1b[0mY");
-        assert_eq!(t.grid().cell(0, 0).fg, t.palette[1]);
-        assert_eq!(t.grid().cell(0, 1).fg, Color::DEFAULT_FG);
+        assert_eq!(t.grid().cell(0, 0).fg, CellColor::Palette(1));
+        assert_eq!(t.grid().cell(0, 1).fg, CellColor::Default);
     }
 
     #[test]
@@ -874,7 +883,7 @@ mod tests {
         t.process(b"\x1b[1;31mA\x1b[mB");
         assert!(t.grid().cell(0, 0).flags.contains(CellFlags::BOLD));
         assert!(!t.grid().cell(0, 1).flags.contains(CellFlags::BOLD));
-        assert_eq!(t.grid().cell(0, 1).fg, Color::DEFAULT_FG);
+        assert_eq!(t.grid().cell(0, 1).fg, CellColor::Default);
     }
 
     // ── Cursor movement ──────────────────────────────────────────
@@ -1062,28 +1071,31 @@ mod tests {
     fn truecolor_fg() {
         let mut t = term();
         t.process(b"\x1b[38;2;255;128;0mX");
-        assert_eq!(t.grid().cell(0, 0).fg, Color::rgb(255, 128, 0));
+        assert_eq!(
+            t.grid().cell(0, 0).fg,
+            CellColor::Rgb(Color::rgb(255, 128, 0))
+        );
     }
 
     #[test]
     fn indexed_256_color() {
         let mut t = term();
         t.process(b"\x1b[38;5;196mX");
-        assert_eq!(t.grid().cell(0, 0).fg, t.palette[196]);
+        assert_eq!(t.grid().cell(0, 0).fg, CellColor::Palette(196));
     }
 
     #[test]
     fn bright_foreground() {
         let mut t = term();
         t.process(b"\x1b[91mX");
-        assert_eq!(t.grid().cell(0, 0).fg, t.palette[9]);
+        assert_eq!(t.grid().cell(0, 0).fg, CellColor::Palette(9)); // SGR 91 → palette[9]
     }
 
     #[test]
     fn background_color() {
         let mut t = term();
         t.process(b"\x1b[44mX");
-        assert_eq!(t.grid().cell(0, 0).bg, t.palette[4]);
+        assert_eq!(t.grid().cell(0, 0).bg, CellColor::Palette(4)); // SGR 44 → palette[4]
     }
 
     // ── Insert/delete ────────────────────────────────────────────
