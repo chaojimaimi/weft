@@ -70,14 +70,20 @@ impl Pty {
     ///
     /// `args` are passed as additional arguments to the program.
     pub fn spawn<W: Fn() + Send + 'static>(shell: &str, size: (u16, u16), wake: W) -> Result<Self> {
-        Self::spawn_with_args(shell, &[], size, wake)
+        Self::spawn_with_args(shell, &[], size, &[], wake)
     }
 
-    /// Spawn a process inside a PTY with additional arguments.
+    /// Spawn a process inside a PTY with additional arguments and env overrides.
+    ///
+    /// `extra_env` are `KEY=VALUE`-style overrides merged on top of the current
+    /// environment for the child. When non-empty the child is launched with
+    /// `execve` (explicit env, no `PATH` search — `program` should be absolute);
+    /// when empty it uses `execvp` (inherits env, searches `PATH`) as before.
     pub fn spawn_with_args<W: Fn() + Send + 'static>(
         program: &str,
         args: &[&str],
         size: (u16, u16),
+        extra_env: &[(&str, &str)],
         wake: W,
     ) -> Result<Self> {
         let winsize = Winsize {
@@ -86,6 +92,12 @@ impl Pty {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
+
+        // Snapshot the child environment *before* forking. We merge overrides
+        // here, in the parent, so the forked child of a multi-threaded tokio
+        // runtime never takes the env write-lock (which can deadlock across
+        // fork). The child then just `execve`s with these pre-built bytes.
+        let env_cstrings = build_child_env(extra_env);
 
         // SAFETY: forkpty is safe to call — it creates a PTY pair and forks.
         // The child immediately execs, so there are no shared resources to corrupt.
@@ -103,8 +115,17 @@ impl Pty {
                     );
                 }
                 let argv: Vec<&std::ffi::CStr> = argv_cstrs.iter().map(|c| c.as_c_str()).collect();
-                let _ = unistd::execvp(&prog_cstr, &argv);
-                // execvp only returns on error — exit child immediately.
+                if env_cstrings.is_empty() {
+                    // No overrides: inherit env, search PATH (preserves prior behavior).
+                    let _ = unistd::execvp(&prog_cstr, &argv);
+                } else {
+                    // Explicit env. execve does not search PATH, so `program`
+                    // must be absolute — true for shells from $SHELL.
+                    let envp: Vec<&std::ffi::CStr> =
+                        env_cstrings.iter().map(|c| c.as_c_str()).collect();
+                    let _ = unistd::execve(&prog_cstr, &argv, &envp);
+                }
+                // exec only returns on error — exit child immediately.
                 std::process::exit(127);
             }
             ForkptyResult::Parent { child, master } => {
@@ -233,6 +254,33 @@ impl Drop for Pty {
         // Best-effort: send SIGHUP to child when PTY is dropped.
         let _ = signal::kill(self.child_pid, Signal::SIGHUP);
     }
+}
+
+/// Build the child's environment as a list of `KEY=VALUE` C-strings.
+///
+/// Starts from the current environment, applies `overrides` (last wins), and
+/// returns NUL-terminated bytes ready for `execve`. Called in the *parent*
+/// before `forkpty` so the forked child never touches the env lock.
+fn build_child_env(overrides: &[(&str, &str)]) -> Vec<std::ffi::CString> {
+    if overrides.is_empty() {
+        return Vec::new();
+    }
+    use std::collections::HashMap;
+    let mut env: HashMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
+    for (k, v) in overrides {
+        env.insert(std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+    }
+    env.into_iter()
+        .map(|(k, v)| {
+            let mut bytes = Vec::with_capacity(k.len() + 1 + v.len());
+            bytes.extend_from_slice(k.as_encoded_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(v.as_encoded_bytes());
+            // Environment entries cannot contain NUL; a NUL here would be a
+            // programmer error, so panicking is correct.
+            std::ffi::CString::new(bytes).expect("env entry must not contain NUL")
+        })
+        .collect()
 }
 
 /// Async read loop: reads from the PTY master fd and sends output events.
@@ -428,7 +476,7 @@ mod tests {
     /// Uses `sleep 0` (exits immediately with code 0).
     #[tokio::test]
     async fn detects_child_exit() {
-        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), || {})
+        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], || {})
             .expect("failed to spawn PTY");
 
         // Collect events until we get an Exit.
@@ -460,6 +508,36 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         pty.write_sync(b"test\n").expect("sync write failed");
         assert!(pty.is_alive());
+    }
+
+    /// Test that `extra_env` overrides reach the child via the `execve` path.
+    /// `/usr/bin/env` prints its environment and exits; our override must appear.
+    #[tokio::test]
+    async fn extra_env_reaches_child() {
+        let mut pty = Pty::spawn_with_args(
+            "/usr/bin/env",
+            &[],
+            (24, 80),
+            &[("WEFT_TEST_OVERRIDE", "sentinel-12345")],
+            || {},
+        )
+        .expect("failed to spawn PTY");
+
+        let mut buf = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
+                Ok(Some(PtyEvent::Output(data))) => buf.extend_from_slice(&data),
+                Ok(Some(PtyEvent::Exit(_))) => break,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("WEFT_TEST_OVERRIDE=sentinel-12345"),
+            "override missing from child env; got:\n{s}"
+        );
     }
 
     /// Test error type display.
