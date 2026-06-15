@@ -375,11 +375,16 @@ fragment float4 text_fragment(
         show_cursor: bool,
         cursor_style: CursorStyle,
     ) -> Vec<f32> {
-        // Calculate cell size in physical pixels from viewport dimensions.
-        // Both viewport and grid dimensions are in physical pixel units,
-        // ensuring consistent cell sizing across window resizes.
-        let cw = self.viewport.0 / grid.num_cols as f32;
-        let ch = self.viewport.1 / grid.num_rows as f32;
+        // Render at the atlas's native cell size — do NOT stretch cells to
+        // fill the viewport (cw = viewport / num_cols). Stretching distorts
+        // glyphs and, for full-width CJK, amplifies the baked intra-slot
+        // padding into a gap that drifts wider on every resize (cw diverges
+        // from cell_width as the window resizes within a column bucket). The
+        // grid occupies num_cols * cell_width px; any remainder is background.
+        // This also keeps rendered positions aligned with mouse hit-testing,
+        // which already divides by cell_width.
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
         let num_rows = grid.num_rows;
         let num_cols = grid.num_cols;
 
