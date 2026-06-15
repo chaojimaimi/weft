@@ -69,12 +69,17 @@ impl Pty {
     /// and starts an async read loop that forwards output via a channel.
     ///
     /// `args` are passed as additional arguments to the program.
-    pub fn spawn(shell: &str, size: (u16, u16)) -> Result<Self> {
-        Self::spawn_with_args(shell, &[], size)
+    pub fn spawn<W: Fn() + Send + 'static>(shell: &str, size: (u16, u16), wake: W) -> Result<Self> {
+        Self::spawn_with_args(shell, &[], size, wake)
     }
 
     /// Spawn a process inside a PTY with additional arguments.
-    pub fn spawn_with_args(program: &str, args: &[&str], size: (u16, u16)) -> Result<Self> {
+    pub fn spawn_with_args<W: Fn() + Send + 'static>(
+        program: &str,
+        args: &[&str],
+        size: (u16, u16),
+        wake: W,
+    ) -> Result<Self> {
         let winsize = Winsize {
             ws_row: size.0,
             ws_col: size.1,
@@ -84,9 +89,7 @@ impl Pty {
 
         // SAFETY: forkpty is safe to call — it creates a PTY pair and forks.
         // The child immediately execs, so there are no shared resources to corrupt.
-        let result = unsafe {
-            forkpty(Some(&winsize), None).map_err(PtyError::Fork)?
-        };
+        let result = unsafe { forkpty(Some(&winsize), None).map_err(PtyError::Fork)? };
 
         match result {
             ForkptyResult::Child => {
@@ -96,8 +99,7 @@ impl Pty {
                 let mut argv_cstrs: Vec<std::ffi::CString> = vec![prog_cstr.clone()];
                 for arg in args {
                     argv_cstrs.push(
-                        std::ffi::CString::new(*arg)
-                            .expect("arg must not contain null bytes"),
+                        std::ffi::CString::new(*arg).expect("arg must not contain null bytes"),
                     );
                 }
                 let argv: Vec<&std::ffi::CStr> = argv_cstrs.iter().map(|c| c.as_c_str()).collect();
@@ -112,8 +114,7 @@ impl Pty {
                 let tx = event_tx.clone();
                 let fd = master.as_raw_fd();
                 // Set master to non-blocking for tokio async I/O.
-                let raw = fcntl(fd, FcntlArg::F_GETFL)
-                    .expect("F_GETFL failed");
+                let raw = fcntl(fd, FcntlArg::F_GETFL).expect("F_GETFL failed");
                 let flags = OFlag::from_bits(raw).expect("unexpected fcntl flags");
                 fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
                     .expect("F_SETFL O_NONBLOCK failed");
@@ -133,7 +134,7 @@ impl Pty {
                 let read_child_pid = child;
 
                 tokio::spawn(async move {
-                    read_loop(duped, read_child_pid, tx).await;
+                    read_loop(duped, read_child_pid, tx, wake).await;
                 });
 
                 Ok(Self {
@@ -155,9 +156,7 @@ impl Pty {
             ws_ypixel: 0,
         };
         // SAFETY: TIOCSWINSZ is a safe ioctl that only writes to the winsize struct.
-        unsafe {
-            nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize)
-        };
+        unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize) };
         // ioctl returns -1 on error, but the exact error check varies by platform.
         // nix doesn't wrap TIOCSWINSZ directly, so we check errno manually.
         Ok(())
@@ -177,16 +176,12 @@ impl Pty {
             }
             OwnedFd::from_raw_fd(new_fd)
         };
-        let writer = tokio::io::unix::AsyncFd::new(duped)
-            .expect("failed to create async fd for write");
+        let writer =
+            tokio::io::unix::AsyncFd::new(duped).expect("failed to create async fd for write");
         // Use the AsyncFd to perform a non-blocking write.
         loop {
-            let mut guard = writer.writable().await
-                .map_err(PtyError::Write)?;
-            match guard.try_io(|fd| {
-                nix::unistd::write(fd, data)
-                    .map_err(io::Error::from)
-            }) {
+            let mut guard = writer.writable().await.map_err(PtyError::Write)?;
+            match guard.try_io(|fd| nix::unistd::write(fd, data).map_err(io::Error::from)) {
                 Ok(Ok(_)) => return Ok(()),
                 Ok(Err(e)) => return Err(PtyError::Write(e)),
                 Err(_would_block) => continue,
@@ -196,8 +191,7 @@ impl Pty {
 
     /// Write bytes synchronously (for use before tokio runtime or in tests).
     pub fn write_sync(&self, data: &[u8]) -> Result<()> {
-        nix::unistd::write(&self.master, data)
-            .map_err(|e| PtyError::Write(io::Error::from(e)))?;
+        nix::unistd::write(&self.master, data).map_err(|e| PtyError::Write(io::Error::from(e)))?;
         Ok(())
     }
 
@@ -209,9 +203,12 @@ impl Pty {
     /// Try to receive the next PTY event without blocking.
     /// Returns `Err` if no event is available.
     pub fn try_recv(&mut self) -> Result<PtyEvent> {
-        self.event_rx
-            .try_recv()
-            .map_err(|_| PtyError::Read(io::Error::new(io::ErrorKind::WouldBlock, "no data available")))
+        self.event_rx.try_recv().map_err(|_| {
+            PtyError::Read(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "no data available",
+            ))
+        })
     }
 
     /// Check if the child process is still alive.
@@ -240,10 +237,11 @@ impl Drop for Pty {
 
 /// Async read loop: reads from the PTY master fd and sends output events.
 /// Detects child exit via EIO error and sends an Exit event.
-async fn read_loop(
+async fn read_loop<W: Fn() + Send + 'static>(
     fd: OwnedFd,
     child_pid: Pid,
     tx: mpsc::UnboundedSender<PtyEvent>,
+    wake: W,
 ) {
     // Buffer size: 256KB as per architecture doc.
     const BUF_SIZE: usize = 256 * 1024;
@@ -270,10 +268,9 @@ async fn read_loop(
             }
         };
 
-        match guard.try_io(|fd| {
-            nix::unistd::read(fd.as_raw_fd(), &mut buf)
-                .map_err(io::Error::from)
-        }) {
+        match guard
+            .try_io(|fd| nix::unistd::read(fd.as_raw_fd(), &mut buf).map_err(io::Error::from))
+        {
             Ok(Ok(0)) => {
                 // EOF — child closed the PTY.
                 tracing::debug!("PTY read returned 0 (EOF)");
@@ -286,6 +283,9 @@ async fn read_loop(
                     tracing::debug!("PTY event receiver dropped, stopping read loop");
                     return;
                 }
+                // Nudge the UI event loop so fresh output is pumped promptly,
+                // instead of idling until the next keyboard/mouse event.
+                wake();
             }
             Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Spurious wakeup, retry.
@@ -383,8 +383,7 @@ mod tests {
     /// Test that spawning a PTY with /bin/cat works and we can read/write.
     #[tokio::test]
     async fn spawn_and_echo() {
-        let mut pty = Pty::spawn("/bin/cat", (24, 80))
-            .expect("failed to spawn PTY");
+        let mut pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
 
         // Give the child a moment to start.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -393,13 +392,10 @@ mod tests {
         pty.write(b"hello\n").await.expect("write failed");
 
         // Read it back (cat echoes input).
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            pty.recv(),
-        )
-        .await
-        .expect("timeout waiting for output")
-        .expect("channel closed");
+        let output = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv())
+            .await
+            .expect("timeout waiting for output")
+            .expect("channel closed");
 
         match output {
             PtyEvent::Output(data) => {
@@ -421,8 +417,7 @@ mod tests {
     /// Test that resize doesn't error.
     #[tokio::test]
     async fn resize_works() {
-        let pty = Pty::spawn("/bin/cat", (24, 80))
-            .expect("failed to spawn PTY");
+        let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -433,26 +428,19 @@ mod tests {
     /// Uses `sleep 0` (exits immediately with code 0).
     #[tokio::test]
     async fn detects_child_exit() {
-        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80))
+        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), || {})
             .expect("failed to spawn PTY");
 
         // Collect events until we get an Exit.
         let mut got_exit = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                pty.recv(),
-            )
-            .await;
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
 
             match event {
                 Ok(Some(PtyEvent::Exit(result))) => {
                     // /bin/true exits with code 0.
-                    assert!(
-                        result.is_ok(),
-                        "expected clean exit, got: {result:?}"
-                    );
+                    assert!(result.is_ok(), "expected clean exit, got: {result:?}");
                     assert_eq!(result.unwrap(), 0, "sleep 0 should exit 0");
                     got_exit = true;
                     break;
@@ -468,8 +456,7 @@ mod tests {
     /// Test sync write.
     #[tokio::test]
     async fn sync_write_works() {
-        let pty = Pty::spawn("/bin/cat", (24, 80))
-            .expect("failed to spawn PTY");
+        let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         pty.write_sync(b"test\n").expect("sync write failed");
         assert!(pty.is_alive());

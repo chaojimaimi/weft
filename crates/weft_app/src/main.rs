@@ -8,7 +8,7 @@ mod renderer;
 
 use renderer::MetalRenderer;
 use weft_core::input::{
-    encode_paste, MouseAction, MouseButton, MouseProtocol, InputHandler, KeyCode, Modifiers,
+    encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
 };
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::{GridPos, SelectionHandler, SelectionMode};
@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, Sender};
 use tracing::{error, info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode as WinitKeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes};
 
@@ -27,6 +27,16 @@ use winit::window::{Window, WindowAttributes};
 enum AppMsg {
     PtyOutput(Vec<u8>),
     PtyExit(Result<i32, String>),
+}
+
+/// Cross-thread wake-up for the winit event loop.
+///
+/// Sent by the PTY reader thread (new output) and the cursor-blink timer so
+/// the loop redraws only when there is actual work — instead of busy-looping
+/// at vsync and pinning a CPU core.
+#[derive(Debug)]
+enum AppEvent {
+    Wake,
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -58,10 +68,13 @@ struct App {
     /// position during rapid cascades.
     pending_pty_resize: Option<(usize, usize)>,
     last_resize_instant: std::time::Instant,
+    /// Proxy used by background threads (PTY reader, blink timer) to wake the
+    /// event loop without a vsync busy-loop.
+    proxy: EventLoopProxy<AppEvent>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             window: None,
@@ -80,6 +93,7 @@ impl App {
             last_mouse_y: 0.0,
             pending_pty_resize: None,
             last_resize_instant: std::time::Instant::now(),
+            proxy,
         }
     }
 
@@ -88,7 +102,10 @@ impl App {
         let cols = 80;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let pty = match Pty::spawn(&shell, (rows as u16, cols as u16)) {
+        let wake_proxy = self.proxy.clone();
+        let pty = match Pty::spawn(&shell, (rows as u16, cols as u16), move || {
+            let _ = wake_proxy.send_event(AppEvent::Wake);
+        }) {
             Ok(p) => p,
             Err(e) => {
                 error!("Failed to spawn PTY: {e}");
@@ -161,7 +178,9 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_code: WinitKeyCode, mods: winit::event::Modifiers) {
-        let Some(terminal) = &self.terminal else { return };
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
 
         let key = match key_code {
             WinitKeyCode::Enter => KeyCode::Enter,
@@ -360,11 +379,19 @@ impl App {
     fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta, x: f64, y: f64) {
         let lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, v) => {
-                if v > 0.0 { v.ceil() as usize } else { v.floor().abs() as usize }
+                if v > 0.0 {
+                    v.ceil() as usize
+                } else {
+                    v.floor().abs() as usize
+                }
             }
             winit::event::MouseScrollDelta::PixelDelta(pos) => {
                 let v = pos.y / 40.0; // approx 40px per line
-                if v > 0.0 { v.ceil() as usize } else { v.floor().abs() as usize }
+                if v > 0.0 {
+                    v.ceil() as usize
+                } else {
+                    v.floor().abs() as usize
+                }
             }
         };
 
@@ -372,7 +399,9 @@ impl App {
             return;
         }
 
-        let Some(terminal) = &mut self.terminal else { return };
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
 
         // Check if mouse protocol is active — forward scroll to PTY
         if terminal.mouse_protocol != MouseProtocol::Off {
@@ -382,9 +411,15 @@ impl App {
             };
             let pos = self.pixel_to_grid(x, y);
             let mut m = Modifiers::empty();
-            if self.mods.state().shift_key() { m |= Modifiers::SHIFT; }
-            if self.mods.state().alt_key() { m |= Modifiers::ALT; }
-            if self.mods.state().control_key() { m |= Modifiers::CONTROL; }
+            if self.mods.state().shift_key() {
+                m |= Modifiers::SHIFT;
+            }
+            if self.mods.state().alt_key() {
+                m |= Modifiers::ALT;
+            }
+            if self.mods.state().control_key() {
+                m |= Modifiers::CONTROL;
+            }
             if let Some(bytes) = self.input_handler.encode_scroll(up, pos.col, pos.row, m) {
                 if let Some(pty) = &self.pty {
                     let _ = pty.write_sync(&bytes);
@@ -409,15 +444,26 @@ impl App {
 
     /// Send a mouse event to the PTY if mouse protocol is active.
     fn send_mouse_event(&self, button: MouseButton, action: MouseAction, pos: GridPos) {
-        let Some(terminal) = &self.terminal else { return };
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
         if terminal.mouse_protocol == MouseProtocol::Off {
             return;
         }
         let mut m = Modifiers::empty();
-        if self.mods.state().shift_key() { m |= Modifiers::SHIFT; }
-        if self.mods.state().alt_key() { m |= Modifiers::ALT; }
-        if self.mods.state().control_key() { m |= Modifiers::CONTROL; }
-        if let Some(bytes) = self.input_handler.encode_mouse(button, action, pos.col, pos.row, m) {
+        if self.mods.state().shift_key() {
+            m |= Modifiers::SHIFT;
+        }
+        if self.mods.state().alt_key() {
+            m |= Modifiers::ALT;
+        }
+        if self.mods.state().control_key() {
+            m |= Modifiers::CONTROL;
+        }
+        if let Some(bytes) = self
+            .input_handler
+            .encode_mouse(button, action, pos.col, pos.row, m)
+        {
             if let Some(pty) = &self.pty {
                 let _ = pty.write_sync(&bytes);
             }
@@ -426,7 +472,9 @@ impl App {
 
     /// Copy selection to system clipboard.
     fn copy_selection(&self) {
-        let Some(terminal) = &self.terminal else { return };
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
         if let Some(text) = self.selection_handler.selected_text(terminal.grid()) {
             if !text.is_empty() {
                 clipboard_copy(&text);
@@ -440,7 +488,11 @@ impl App {
             if text.is_empty() {
                 return;
             }
-            let bracketed = self.terminal.as_ref().map(|t| t.bracketed_paste).unwrap_or(false);
+            let bracketed = self
+                .terminal
+                .as_ref()
+                .map(|t| t.bracketed_paste)
+                .unwrap_or(false);
             let bytes = encode_paste(&text, bracketed);
             if let Some(pty) = &self.pty {
                 if let Err(e) = pty.write_sync(&bytes) {
@@ -530,7 +582,14 @@ fn clipboard_paste() -> Option<String> {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<AppEvent> for App {
+    /// Cross-thread wake-up (PTY output or blink timer): schedule one redraw.
+    /// The pump/process/draw happens in `WindowEvent::RedrawRequested`, so we
+    /// avoid the vsync busy-loop while still reacting promptly to output.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: AppEvent) {
+        self.request_redraw();
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -547,6 +606,16 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
 
+        // Cursor-blink timer: wake the loop ~2x/sec so the caret toggles
+        // without a vsync busy-loop. Exits when the event loop drops the proxy.
+        let blink_proxy = self.proxy.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(530));
+            if blink_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
+
         self.request_redraw();
     }
 
@@ -562,8 +631,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
-                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window)
-                {
+                if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let new_cols =
                         (physical_size.width as f64 / renderer.cell_width() as f64) as usize;
                     let new_rows =
@@ -597,9 +665,7 @@ impl ApplicationHandler for App {
                 // (100ms of no new resize events). The grid was already
                 // resized immediately in the Resized handler.
                 if let Some((rows, cols)) = self.pending_pty_resize {
-                    if self.last_resize_instant.elapsed()
-                        > std::time::Duration::from_millis(100)
-                    {
+                    if self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100) {
                         if let Some(pty) = &self.pty {
                             if let Err(e) = pty.resize(rows as u16, cols as u16) {
                                 warn!("PTY resize failed: {e}");
@@ -609,20 +675,14 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if let (Some(renderer), Some(terminal)) =
-                    (&mut self.renderer, &self.terminal)
-                {
+                if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
                     renderer.draw(terminal, &self.selection_handler, self.cursor_blink_on);
                 }
 
-                // Keep the render loop alive: pump_pty/process_messages above only
-                // request a redraw when PTY data is sitting in the channel *at poll
-                // time, but the shell echoes keystrokes asynchronously, after the
-                // redraw triggered by the key. Without this, the screen freezes until
-                // the next mouse/keyboard event ("must click to see output").
-                // TODO: replace this vsync busy-loop with an EventLoopProxy wake from
-                // the PTY reader thread for power efficiency.
-                self.request_redraw();
+                // No busy-loop redraw here: the PTY reader thread and the
+                // cursor-blink timer wake the loop via `AppEvent::Wake`
+                // whenever there is work (see `user_event`). This lets the CPU
+                // idle instead of spinning at vsync.
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
@@ -634,16 +694,14 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(new_mods) => {
                 self.mods = new_mods;
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                match state {
-                    winit::event::ElementState::Pressed => {
-                        self.handle_mouse_press(self.last_mouse_x, self.last_mouse_y, button);
-                    }
-                    winit::event::ElementState::Released => {
-                        self.handle_mouse_release(self.last_mouse_x, self.last_mouse_y, button);
-                    }
+            WindowEvent::MouseInput { state, button, .. } => match state {
+                winit::event::ElementState::Pressed => {
+                    self.handle_mouse_press(self.last_mouse_x, self.last_mouse_y, button);
                 }
-            }
+                winit::event::ElementState::Released => {
+                    self.handle_mouse_release(self.last_mouse_x, self.last_mouse_y, button);
+                }
+            },
             WindowEvent::CursorMoved { position, .. } => {
                 self.last_mouse_x = position.x;
                 self.last_mouse_y = position.y;
@@ -661,7 +719,11 @@ impl ApplicationHandler for App {
                         self.ime_preedit.clear();
                         // Send committed text to PTY
                         if !text.is_empty() {
-                            let bracketed = self.terminal.as_ref().map(|t| t.bracketed_paste).unwrap_or(false);
+                            let bracketed = self
+                                .terminal
+                                .as_ref()
+                                .map(|t| t.bracketed_paste)
+                                .unwrap_or(false);
                             let bytes = encode_paste(&text, bracketed);
                             if let Some(pty) = &self.pty {
                                 let _ = pty.write_sync(&bytes);
@@ -694,7 +756,8 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
-    let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new();
+    let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
+    let proxy = event_loop.create_proxy();
+    let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
 }
