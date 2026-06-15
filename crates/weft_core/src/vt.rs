@@ -3,7 +3,7 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
-use crate::grid::{CellFlags, CellWidth, Color, CursorStyle, Grid};
+use crate::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::input::MouseProtocol;
 
 /// Current text attributes applied to newly printed characters.
@@ -59,6 +59,13 @@ pub struct Terminal {
     pub mouse_protocol: MouseProtocol,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
+    /// Alternate screen buffer for full-screen apps (DEC 1049/47).
+    /// Swapped with `grid` on enter/exit; main content survives in `alt_grid`.
+    alt_grid: Grid,
+    /// True while the alternate screen is active.
+    alt_active: bool,
+    /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
+    saved_cursor: Option<Cursor>,
 }
 
 impl Terminal {
@@ -76,6 +83,11 @@ impl Terminal {
             cursor_style: CursorStyle::Block,
             mouse_protocol: MouseProtocol::Off,
             palette: Self::init_palette(),
+            // Alt screen has no scrollback: full-screen apps manage their own
+            // scrolling and history should not leak across invocations.
+            alt_grid: Grid::with_scrollback(rows, cols, 0),
+            alt_active: false,
+            saved_cursor: None,
         }
     }
 
@@ -85,6 +97,41 @@ impl Terminal {
 
     pub fn grid_mut(&mut self) -> &mut Grid {
         &mut self.grid
+    }
+
+    /// Whether the alternate screen buffer is currently active.
+    pub fn is_alt_screen_active(&self) -> bool {
+        self.alt_active
+    }
+
+    /// Swap the primary and alternate screen buffers (DEC 1049/47).
+    ///
+    /// `save_cursor_and_clear` distinguishes the two modes:
+    /// - `true` (1049): save the primary cursor, clear the alt screen on
+    ///   entry, restore the cursor on exit.
+    /// - `false` (47): plain swap, no cursor save/restore, no clear.
+    ///
+    /// Modelled on Alacritty's `swap_alt` (O(1) `mem::swap`) with the
+    /// parameterised clear/restore semantics from Warp's `SwapScreen` mode.
+    fn swap_alt(&mut self, save_cursor_and_clear: bool) {
+        if !self.alt_active {
+            if save_cursor_and_clear {
+                self.saved_cursor = Some(self.grid.cursor.clone());
+                self.alt_grid.clear();
+            }
+            // Alternate screen starts fresh with the cursor at home (0,0).
+            self.alt_grid.cursor = Cursor::default();
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            self.alt_active = true;
+        } else {
+            std::mem::swap(&mut self.grid, &mut self.alt_grid);
+            if save_cursor_and_clear {
+                if let Some(c) = self.saved_cursor.take() {
+                    self.grid.cursor = c;
+                }
+            }
+            self.alt_active = false;
+        }
     }
 
     pub fn attrs(&self) -> &Attrs {
@@ -112,9 +159,10 @@ impl Terminal {
         self.parser = parser;
     }
 
-    /// Resize the terminal grid.
+    /// Resize the terminal grid (and alternate screen to match).
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.grid.resize(rows, cols);
+        self.alt_grid.resize(rows, cols);
     }
 
     /// Full terminal reset (RIS / ESC c).
@@ -190,7 +238,10 @@ impl Terminal {
 
         // Flatten each param group's first value into a single list.
         // Semicolons → separate groups, colons → sub-params within one group.
-        let vals: Vec<u16> = params.iter().map(|sub| sub.first().copied().unwrap_or(0)).collect();
+        let vals: Vec<u16> = params
+            .iter()
+            .map(|sub| sub.first().copied().unwrap_or(0))
+            .collect();
 
         let mut i = 0;
         while i < vals.len() {
@@ -282,15 +333,46 @@ impl Terminal {
     /// Handle DEC private mode set/reset (CSI ? <n> h/l).
     fn handle_dec_private_mode(&mut self, mode: u16, set: bool) {
         match mode {
-            1 => self.app_cursor_keys = set,    // DECCKM
-            6 => self.origin_mode = set,        // DECOM
+            1 => self.app_cursor_keys = set, // DECCKM
+            6 => self.origin_mode = set,     // DECOM
             7 => { /* DECAWM — auto wrap mode, always on */ }
-            25 => self.cursor_visible = set,    // DECTCEM — cursor show/hide
+            25 => self.cursor_visible = set, // DECTCEM — cursor show/hide
+            47 | 1049 => {
+                // DEC alternate screen buffer: only swap on a real state
+                // change, matching Warp's idempotent enter/exit guards.
+                if set != self.alt_active {
+                    self.swap_alt(mode == 1049);
+                }
+            }
             2004 => self.bracketed_paste = set, // Bracketed paste
-            9 => self.mouse_protocol = if set { MouseProtocol::X10 } else { MouseProtocol::Off },
-            1000 => self.mouse_protocol = if set { MouseProtocol::Normal } else { MouseProtocol::Off },
-            1002 => self.mouse_protocol = if set { MouseProtocol::ButtonEvent } else { MouseProtocol::Off },
-            1003 => self.mouse_protocol = if set { MouseProtocol::AnyEvent } else { MouseProtocol::Off },
+            9 => {
+                self.mouse_protocol = if set {
+                    MouseProtocol::X10
+                } else {
+                    MouseProtocol::Off
+                }
+            }
+            1000 => {
+                self.mouse_protocol = if set {
+                    MouseProtocol::Normal
+                } else {
+                    MouseProtocol::Off
+                }
+            }
+            1002 => {
+                self.mouse_protocol = if set {
+                    MouseProtocol::ButtonEvent
+                } else {
+                    MouseProtocol::Off
+                }
+            }
+            1003 => {
+                self.mouse_protocol = if set {
+                    MouseProtocol::AnyEvent
+                } else {
+                    MouseProtocol::Off
+                }
+            }
             _ => tracing::trace!(mode, set, "unhandled DEC private mode"),
         }
     }
@@ -307,6 +389,10 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
+        // New PTY output: snap back to the live viewport so fresh content is
+        // visible instead of a stale scrollback view.
+        self.grid.scroll_offset = 0;
+
         // Handle deferred wrap
         if self.grid.cursor.wrap_pending {
             self.grid.cursor.wrap_pending = false;
@@ -570,16 +656,17 @@ impl vte::Perform for Terminal {
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         match (intermediates, byte) {
-            (&[], 0x37) => self.grid.save_cursor(),       // DECSC
-            (&[], 0x38) => self.grid.restore_cursor(),     // DECRC
-            (&[], 0x44) => self.grid.index(),              // IND
-            (&[], 0x4D) => self.grid.reverse_index(),      // RI
-            (&[], 0x45) => {                               // NEL
+            (&[], 0x37) => self.grid.save_cursor(),    // DECSC
+            (&[], 0x38) => self.grid.restore_cursor(), // DECRC
+            (&[], 0x44) => self.grid.index(),          // IND
+            (&[], 0x4D) => self.grid.reverse_index(),  // RI
+            (&[], 0x45) => {
+                // NEL
                 self.grid.index();
                 self.grid.carriage_return();
             }
-            (&[], 0x48) => self.grid.set_tabstop(),        // HTS
-            (&[], 0x63) => self.reset(),                   // RIS
+            (&[], 0x48) => self.grid.set_tabstop(), // HTS
+            (&[], 0x63) => self.reset(),            // RIS
             (&[], 0x3D) | (&[], 0x3E) => { /* DECKPAM/DECKPNM — ignored */ }
             _ => {
                 tracing::trace!(?intermediates, byte, "unhandled ESC");
@@ -619,9 +706,7 @@ impl vte::Perform for Terminal {
                     match params[1] {
                         b"A" => self.shell_markers.push(ShellMarker::PromptStart),
                         b"B" => self.shell_markers.push(ShellMarker::CommandStart),
-                        b"C" => self
-                            .shell_markers
-                            .push(ShellMarker::CommandOutputStart),
+                        b"C" => self.shell_markers.push(ShellMarker::CommandOutputStart),
                         b"D" => {
                             let exit_code = if params.len() > 2 {
                                 std::str::from_utf8(params[2])
@@ -644,13 +729,7 @@ impl vte::Perform for Terminal {
         }
     }
 
-    fn hook(
-        &mut self,
-        _params: &vte::Params,
-        _intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
         tracing::trace!(action = ?action, "DCS hook (ignored in v0.1)");
     }
 
@@ -707,6 +786,61 @@ mod tests {
         assert_eq!(t.grid().cell(0, 1).character, 'e');
         assert_eq!(t.grid().cell(0, 4).character, 'o');
         assert_eq!(t.grid().cursor.col, 5);
+    }
+
+    #[test]
+    fn new_output_resets_scroll_offset() {
+        let mut t = Terminal::new(3, 8);
+        // Scroll several lines into scrollback.
+        t.process(b"row0\nrow1\nrow2\nrow3\nrow4\nrow5\n");
+        assert!(
+            t.grid().scrollback_len() > 0,
+            "precondition: history exists"
+        );
+
+        // User views older history.
+        t.grid_mut().scroll_up_history(2);
+        assert!(t.grid().is_scrolled(), "precondition: scrolled up");
+
+        // New PTY output must snap back to the live viewport.
+        t.process(b"X");
+        assert_eq!(t.grid().scroll_offset, 0, "new output resets offset");
+        assert!(!t.grid().is_scrolled());
+    }
+
+    #[test]
+    fn alt_screen_enter_clear_and_exit_restores() {
+        let mut t = Terminal::new(5, 10);
+        t.process(b"hello");
+        assert_eq!(t.grid().cell(0, 0).character, 'h');
+
+        // DEC 1049h: enter alternate screen, stash main, clear alt view.
+        t.process(b"\x1b[?1049h");
+        assert!(t.is_alt_screen_active());
+        assert_eq!(t.grid().cell(0, 0).character, ' ', "alt screen cleared");
+
+        // Writes land on the alternate screen only.
+        t.process(b"world");
+        assert_eq!(t.grid().cell(0, 0).character, 'w');
+
+        // DEC 1049l: leave alternate screen, main content restored.
+        t.process(b"\x1b[?1049l");
+        assert!(!t.is_alt_screen_active());
+        assert_eq!(t.grid().cell(0, 0).character, 'h', "main screen restored");
+    }
+
+    #[test]
+    fn alt_screen_cursor_restored_on_exit() {
+        let mut t = Terminal::new(5, 10);
+        t.process(b"hello"); // cursor at col 5
+        assert_eq!(t.grid().cursor.col, 5);
+
+        t.process(b"\x1b[?1049h");
+        // Move around inside the alternate screen.
+        t.process(b"\x1b[3;3HXYZ");
+        t.process(b"\x1b[?1049l");
+        // Main cursor returns to where we left it.
+        assert_eq!(t.grid().cursor.col, 5, "cursor restored to main position");
     }
 
     #[test]

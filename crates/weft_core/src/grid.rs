@@ -336,7 +336,26 @@ impl Grid {
 
     // ── Cell access ──────────────────────────────────────────────
 
+    /// Read a cell for rendering.
+    ///
+    /// When the user has scrolled up (`scroll_offset > 0`), the viewport is a
+    /// window into the combined `[scrollback] ++ [viewport]` line sequence.
+    /// Row `r` of the visible window maps to global line
+    /// `scrollback.len() - offset + r`: lines below `scrollback.len()` come
+    /// from history, the rest from the live viewport.
     pub fn cell(&self, row: usize, col: usize) -> &Cell {
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        if offset > 0 {
+            let global = sb_len - offset + row;
+            if global < sb_len {
+                if let Some(history_row) = self.scrollback.get(global) {
+                    return &history_row.cells[col];
+                }
+            } else {
+                return &self.viewport[global - sb_len].cells[col];
+            }
+        }
         &self.viewport[row].cells[col]
     }
 
@@ -348,13 +367,7 @@ impl Grid {
 
     /// Write a character at the cursor position with given attributes.
     /// Used by VT performer to print with current SGR attributes.
-    pub fn write_char_with_attrs(
-        &mut self,
-        ch: char,
-        fg: Color,
-        bg: Color,
-        flags: CellFlags,
-    ) {
+    pub fn write_char_with_attrs(&mut self, ch: char, fg: Color, bg: Color, flags: CellFlags) {
         // Reset scroll offset on new output
         self.scroll_offset = 0;
 
@@ -632,7 +645,7 @@ impl Grid {
         let cols = self.num_cols;
         self.scrollback = Scrollback::new(10000);
         self.scroll_offset = 0;
-        let _ = (cols, ); // suppress unused warning
+        let _ = (cols,); // suppress unused warning
     }
 
     /// Clear line from cursor to end (CSI 0 K).
@@ -709,7 +722,8 @@ impl Grid {
 
         // Shift rows up
         for i in top..=(bottom - n) {
-            self.viewport[i] = std::mem::replace(&mut self.viewport[i + n], Row::new(self.num_cols));
+            self.viewport[i] =
+                std::mem::replace(&mut self.viewport[i + n], Row::new(self.num_cols));
         }
         for i in (bottom - n + 1)..=bottom {
             self.viewport[i] = Row::new(self.num_cols);
@@ -729,7 +743,8 @@ impl Grid {
         }
 
         for i in (top + n..=bottom).rev() {
-            self.viewport[i] = std::mem::replace(&mut self.viewport[i - n], Row::new(self.num_cols));
+            self.viewport[i] =
+                std::mem::replace(&mut self.viewport[i - n], Row::new(self.num_cols));
         }
         for i in top..(top + n) {
             self.viewport[i] = Row::new(self.num_cols);
@@ -760,8 +775,10 @@ impl Grid {
 
     /// Scroll viewport up (view older history).
     pub fn scroll_up_history(&mut self, lines: usize) {
-        let available = self.scrollback.len().saturating_sub(self.scroll_offset);
-        self.scroll_offset = (self.scroll_offset + lines).min(available);
+        // Offset can never exceed the number of available history lines;
+        // clamping to `scrollback.len()` keeps `cell()` indexing in bounds.
+        let max = self.scrollback.len();
+        self.scroll_offset = (self.scroll_offset + lines).min(max);
     }
 
     /// Scroll viewport down (view newer content).
@@ -826,7 +843,8 @@ impl Grid {
             let bottom = self.scroll_bottom;
             let shift = count.min(bottom - row + 1);
             for i in (row + shift..=bottom).rev() {
-                self.viewport[i] = std::mem::replace(&mut self.viewport[i - shift], Row::new(self.num_cols));
+                self.viewport[i] =
+                    std::mem::replace(&mut self.viewport[i - shift], Row::new(self.num_cols));
             }
             for i in row..row + shift {
                 if i <= bottom {
@@ -843,7 +861,8 @@ impl Grid {
             let bottom = self.scroll_bottom;
             let shift = count.min(bottom - row + 1);
             for i in row..=bottom - shift {
-                self.viewport[i] = std::mem::replace(&mut self.viewport[i + shift], Row::new(self.num_cols));
+                self.viewport[i] =
+                    std::mem::replace(&mut self.viewport[i + shift], Row::new(self.num_cols));
             }
             for i in (bottom - shift + 1)..=bottom {
                 self.viewport[i] = Row::new(self.num_cols);
@@ -959,18 +978,18 @@ impl Grid {
         let mut merge_has_cursor = false;
         let mut merge_cursor_offset: usize = 0;
 
-        let flush_line = |buf: Vec<Cell>, has_cur: bool, cur_off: usize,
-                          lines: &mut Vec<LogicalLine>| {
-            let empty = !has_cur
-                && buf.iter().all(|c| c.character == ' ' && c.flags.is_empty());
-            if !empty {
-                lines.push(LogicalLine {
-                    cells: buf,
-                    has_cursor: has_cur,
-                    cursor_buf_offset: cur_off,
-                });
-            }
-        };
+        let flush_line =
+            |buf: Vec<Cell>, has_cur: bool, cur_off: usize, lines: &mut Vec<LogicalLine>| {
+                let empty =
+                    !has_cur && buf.iter().all(|c| c.character == ' ' && c.flags.is_empty());
+                if !empty {
+                    lines.push(LogicalLine {
+                        cells: buf,
+                        has_cursor: has_cur,
+                        cursor_buf_offset: cur_off,
+                    });
+                }
+            };
 
         // Track the PREVIOUS row's wrapped flag. wrapped=true means
         // "this row's content continues on the next row", so we check
@@ -1106,8 +1125,7 @@ impl Grid {
             let cursor_row = cursor_wrap_start.min(total.saturating_sub(1));
             (0, cursor_row)
         } else {
-            let ideal_start =
-                cursor_wrap_start.saturating_sub(new_rows.saturating_sub(1));
+            let ideal_start = cursor_wrap_start.saturating_sub(new_rows.saturating_sub(1));
             let max_start = total.saturating_sub(new_rows);
             let vp_start = ideal_start.min(max_start);
             let cursor_row = cursor_wrap_start.saturating_sub(vp_start);
@@ -1206,8 +1224,7 @@ mod tests {
     fn scroll_up_at_bottom() {
         let mut grid = Grid::new(5, 4);
         for i in 0..5 {
-            grid.viewport[i].cells[0].character =
-                char::from_digit(i as u32 + 1, 10).unwrap();
+            grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.cursor.row = 4;
         grid.newline();
@@ -1219,8 +1236,7 @@ mod tests {
     fn scroll_up_stores_in_scrollback() {
         let mut grid = Grid::with_scrollback(5, 4, 100);
         for i in 0..5 {
-            grid.viewport[i].cells[0].character =
-                char::from_digit(i as u32 + 1, 10).unwrap();
+            grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.cursor.row = 4;
         grid.newline();
@@ -1258,6 +1274,41 @@ mod tests {
         // Scroll to top
         grid.scroll_to_top();
         assert_eq!(grid.scroll_offset, sb_len);
+    }
+
+    #[test]
+    fn cell_shows_scrollback_content_when_scrolled() {
+        let mut grid = Grid::with_scrollback(3, 4, 100);
+        // Fill viewport with '1','2','3' then scroll so '1' enters scrollback.
+        grid.viewport[0].cells[0].character = '1';
+        grid.viewport[1].cells[0].character = '2';
+        grid.viewport[2].cells[0].character = '3';
+        grid.cursor.row = 2;
+        grid.newline(); // '1' -> scrollback, viewport = ['2','3',' ']
+
+        assert_eq!(grid.scrollback.len(), 1, "precondition: one scrolled line");
+
+        // Scroll up one line: viewport should show scrollback + viewport tail.
+        grid.scroll_up_history(1);
+        assert_eq!(grid.cell(0, 0).character, '1', "row 0 from scrollback");
+        assert_eq!(grid.cell(1, 0).character, '2', "row 1 from viewport[0]");
+        assert_eq!(grid.cell(2, 0).character, '3', "row 2 from viewport[1]");
+
+        // Scrolling back to bottom restores the live viewport.
+        grid.scroll_to_bottom();
+        assert_eq!(grid.cell(0, 0).character, '2');
+    }
+
+    #[test]
+    fn scroll_up_history_never_exceeds_scrollback_len() {
+        let mut grid = Grid::with_scrollback(5, 4, 100);
+        // Two lines of scrollback.
+        grid.scrollback.push(Row::new(4));
+        grid.scrollback.push(Row::new(4));
+        grid.scroll_offset = 1;
+        // Scrolling far past the top must clamp to scrollback length, not shrink.
+        grid.scroll_up_history(5);
+        assert_eq!(grid.scroll_offset, 2, "clamps to scrollback.len()");
     }
 
     #[test]
@@ -1393,8 +1444,7 @@ mod tests {
     fn scroll_down_inserts_blank_at_top() {
         let mut grid = Grid::new(5, 4);
         for i in 0..5 {
-            grid.viewport[i].cells[0].character =
-                char::from_digit(i as u32 + 1, 10).unwrap();
+            grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.scroll_down(1);
         assert_eq!(grid.cell(0, 0).character, ' ');
@@ -1453,8 +1503,7 @@ mod tests {
     fn index_scrolls_at_bottom() {
         let mut grid = Grid::new(5, 4);
         for i in 0..5 {
-            grid.viewport[i].cells[0].character =
-                char::from_digit(i as u32 + 1, 10).unwrap();
+            grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.cursor.row = 4;
         grid.index();
@@ -1466,8 +1515,7 @@ mod tests {
     fn reverse_index_scrolls_at_top() {
         let mut grid = Grid::new(5, 4);
         for i in 0..5 {
-            grid.viewport[i].cells[0].character =
-                char::from_digit(i as u32 + 1, 10).unwrap();
+            grid.viewport[i].cells[0].character = char::from_digit(i as u32 + 1, 10).unwrap();
         }
         grid.cursor.row = 0;
         grid.reverse_index();
@@ -1592,7 +1640,12 @@ mod tests {
         grid.scroll_up_history(3);
         assert_eq!(grid.scroll_offset, 3);
         // Writing new output should reset scroll offset
-        grid.write_char_with_attrs('A', Color::DEFAULT_FG, Color::DEFAULT_BG, CellFlags::empty());
+        grid.write_char_with_attrs(
+            'A',
+            Color::DEFAULT_FG,
+            Color::DEFAULT_BG,
+            CellFlags::empty(),
+        );
         assert_eq!(grid.scroll_offset, 0);
     }
 
@@ -1647,8 +1700,7 @@ mod tests {
         }
         for r in 1..4 {
             for c in 0..8 {
-                grid.viewport[r].cells[c].character =
-                    char::from_digit(r as u32, 10).unwrap();
+                grid.viewport[r].cells[c].character = char::from_digit(r as u32, 10).unwrap();
             }
         }
         grid.cursor.row = 3;
@@ -1683,8 +1735,8 @@ mod tests {
         // The cursor's row must have actual content (not lost to scrollback).
         // This is the core regression check: before the fix, the viewport was
         // positioned on empty padding rows, so the cursor landed on an empty row.
-        let cursor_has_content = (0..grid.num_cols)
-            .any(|c| grid.cell(grid.cursor.row, c).character != '\0');
+        let cursor_has_content =
+            (0..grid.num_cols).any(|c| grid.cell(grid.cursor.row, c).character != '\0');
         assert!(
             cursor_has_content,
             "cursor row {} should have content after shrink, not be empty padding",
@@ -1699,8 +1751,7 @@ mod tests {
         let mut grid = Grid::with_scrollback(3, 10, 100);
         // Fill row 1 with content across all 10 cols
         for c in 0..10 {
-            grid.viewport[1].cells[c].character =
-                char::from_digit(c as u32, 10).unwrap();
+            grid.viewport[1].cells[c].character = char::from_digit(c as u32, 10).unwrap();
         }
         grid.cursor.row = 1;
         grid.cursor.col = 7; // col 7 should be in the first wrapped sub-row
@@ -1755,7 +1806,10 @@ mod tests {
                 }
             }
         }
-        assert!(found_prompt, "prompt '$' should be in viewport after minimize");
+        assert!(
+            found_prompt,
+            "prompt '$' should be in viewport after minimize"
+        );
 
         // At least some original content (A/B/C) should be visible
         let mut found_content = false;
@@ -1830,7 +1884,8 @@ mod tests {
         assert!(
             diff <= 2,
             "content should not degrade significantly: cycle1={}, cycle2={}",
-            content_after_cycle1, content_after_cycle2
+            content_after_cycle1,
+            content_after_cycle2
         );
 
         // And there should still be visible content
@@ -1849,13 +1904,11 @@ mod tests {
         // Write "ABCDEFGHIJ" (10 chars) — fills row 0, wrapped=true
         // Then "KLMNO" (5 chars) on row 1 — continuation
         for c in 0..10 {
-            grid.viewport[0].cells[c].character =
-                char::from_digit((c % 10) as u32, 10).unwrap();
+            grid.viewport[0].cells[c].character = char::from_digit((c % 10) as u32, 10).unwrap();
         }
         grid.viewport[0].wrapped = true;
         for c in 0..5 {
-            grid.viewport[1].cells[c].character =
-                char::from_digit((c % 10) as u32, 10).unwrap();
+            grid.viewport[1].cells[c].character = char::from_digit((c % 10) as u32, 10).unwrap();
         }
         grid.cursor.row = 1;
         grid.cursor.col = 5;
@@ -1917,7 +1970,7 @@ mod tests {
     /// (which the VT parser uses), then widen — the line must unwrap.
     #[test]
     fn resize_unwraps_line_written_by_vt_parser() {
-        use super::{CellFlags, CellWidth, Color};
+        use super::{CellFlags, Color};
         let mut grid = Grid::with_scrollback(5, 20, 100);
 
         // Write 35 characters — wraps in a 20-col grid
