@@ -12,6 +12,7 @@ use weft_core::input::{
 };
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::{GridPos, SelectionHandler, SelectionMode};
+use weft_core::shell::Integration;
 use weft_core::vt::Terminal;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -102,22 +103,30 @@ impl App {
         let cols = 80;
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+
+        // Shell integration: redirect the shell's rc lookup so it sources our
+        // OSC 133 hooks itself (no PTY-stdin injection → no echo). Returns the
+        // env overrides to set on the child; falls back to empty on any error.
+        let env = shell_integration_env(&shell);
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
         let wake_proxy = self.proxy.clone();
-        let pty = match Pty::spawn(&shell, (rows as u16, cols as u16), move || {
-            let _ = wake_proxy.send_event(AppEvent::Wake);
-        }) {
+        let pty = match Pty::spawn_with_args(
+            &shell,
+            &[],
+            (rows as u16, cols as u16),
+            &env_refs,
+            move || {
+                let _ = wake_proxy.send_event(AppEvent::Wake);
+            },
+        ) {
             Ok(p) => p,
             Err(e) => {
                 error!("Failed to spawn PTY: {e}");
                 return;
             }
         };
-
-        // Shell integration hook injection is intentionally NOT done here. Injecting
-        // the OSC 133 hook via PTY stdin into an *interactive* shell echoes the hook
-        // source (and a buggy `eval '<multi-line>'` form drops zsh into a `quote>`
-        // continuation). v0.3 will provide integration via an env var the user's rc
-        // file sources instead. See shell::format_injection_command for the WIP form.
 
         self.terminal = Some(Terminal::new(rows, cols));
         self.pty = Some(pty);
@@ -746,6 +755,81 @@ impl ApplicationHandler<AppEvent> for App {
             _ => {}
         }
     }
+}
+
+/// Resolve weft's cache dir: `$XDG_CACHE_HOME/weft`, else `~/.cache/weft`.
+/// `None` when neither `XDG_CACHE_HOME` nor `HOME` is set.
+fn weft_cache_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("weft"));
+        }
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("weft"))
+}
+
+/// Configure shell integration for the child shell and return env overrides.
+///
+/// - **zsh:** writes a generated `.zshenv` to `<cache>/zsh/` and points
+///   `ZDOTDIR` there. The shell sources our OSC 133 hooks itself — no stdin
+///   injection, no echo. The user's real `~/.zshrc` still loads (the generated
+///   `.zshenv` restores `ZDOTDIR` first).
+/// - **bash:** ships a snippet at `<cache>/bash-integration.sh`; the user opts
+///   in with one `source` line in `~/.bashrc` (no clean interactive redirect).
+///
+/// Returns `KEY=VALUE` overrides to pass to the PTY. On any setup failure it
+/// logs a warning and returns empty — the shell still launches, just without
+/// integration.
+fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
+    let plan = Integration::from_shell(shell);
+    if !plan.is_supported() {
+        return Vec::new();
+    }
+
+    let Some(cache_root) = weft_cache_dir() else {
+        warn!("HOME/XDG_CACHE_HOME unset — shell integration disabled");
+        return Vec::new();
+    };
+
+    // Base env: integration flag (+ forwarded original ZDOTDIR for zsh restore).
+    let orig_zdotdir = std::env::var("ZDOTDIR").ok();
+    let mut env: Vec<(String, String)> = plan
+        .child_env(orig_zdotdir.as_deref())
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+    // zsh: write the generated .zshenv and redirect ZDOTDIR at its directory.
+    if let Some((redirect_var, file)) = plan.rc_redirect() {
+        let dir = cache_root.join("zsh");
+        if let Err(e) = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join(file.filename), file.body))
+        {
+            warn!(error = %e, "failed to write zsh integration .zshenv; integration disabled");
+            return Vec::new();
+        }
+        env.push((redirect_var.to_string(), dir.to_string_lossy().into_owned()));
+    }
+
+    // bash: ship the snippet so users can source it.
+    if let Some(snippet) = plan.sourceable_snippet() {
+        let path = cache_root.join("bash-integration.sh");
+        if let Err(e) =
+            std::fs::create_dir_all(&cache_root).and_then(|_| std::fs::write(&path, snippet))
+        {
+            warn!(error = %e, "failed to write bash integration snippet");
+        } else {
+            info!(
+                path = %path.display(),
+                "bash integration snippet written — add to ~/.bashrc: \
+                 `[ -n \"$WEFT_SHELL_INTEGRATION\" ] && . \"{}\"`",
+                path.display(),
+            );
+        }
+    }
+
+    env
 }
 
 fn main() {
