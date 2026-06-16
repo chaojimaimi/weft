@@ -428,6 +428,37 @@ impl Grid {
         &mut r.cells[col]
     }
 
+    /// Extract a single **live viewport** row's text — skipping wide-char
+    /// spacers and trimming trailing blank/default cells. `row` is a viewport
+    /// index (like `cursor.row`). Used to snapshot the command line at OSC
+    /// 133;B (the prompt row, before any output scrolls it into history).
+    pub fn row_text(&self, row: usize) -> String {
+        if row >= self.num_rows {
+            return String::new();
+        }
+        let cells = &self.viewport[row].cells;
+        // Extent: index after the last non-blank cell (blank = never-written
+        // space / NUL).
+        let last = cells
+            .iter()
+            .take(self.num_cols)
+            .rposition(|c| c.character != ' ' && c.character != '\0')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut out = String::with_capacity(last);
+        for cell in cells.iter().take(last) {
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                continue;
+            }
+            out.push(if cell.character == '\0' {
+                ' '
+            } else {
+                cell.character
+            });
+        }
+        out
+    }
+
     /// Write a character at the cursor position with given attributes.
     /// Used by VT performer to print with current SGR attributes.
     pub fn write_char_with_attrs(
@@ -1272,6 +1303,26 @@ mod tests {
         let cell = Cell::default();
         assert_eq!(cell.character, ' ');
         assert_eq!(cell.width, CellWidth::Half);
+    }
+
+    #[test]
+    fn row_text_trims_trailing_and_keeps_internal_spaces() {
+        let mut grid = Grid::new(2, 12);
+        // Write "ls  -la" at row 0 (two internal spaces), leaving trailing
+        // default cells.
+        for ch in "ls  -la".chars() {
+            grid.viewport[0].cells[grid.cursor.col].character = ch;
+            grid.cursor.col += 1;
+        }
+        assert_eq!(grid.row_text(0), "ls  -la");
+        // Untouched row → empty.
+        assert_eq!(grid.row_text(1), "");
+    }
+
+    #[test]
+    fn row_text_out_of_bounds_is_empty() {
+        let grid = Grid::new(2, 10);
+        assert_eq!(grid.row_text(99), "");
     }
 
     #[test]

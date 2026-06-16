@@ -3,6 +3,7 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
+use crate::blocks::BlockTracker;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::input::MouseProtocol;
 
@@ -45,6 +46,9 @@ pub struct Terminal {
     title: String,
     /// Shell integration markers collected during parsing.
     shell_markers: Vec<ShellMarker>,
+    /// Command-block state machine: consumes the OSC 133 marker stream and the
+    /// printed output to build finished [`Block`](crate::blocks::Block)s.
+    block_tracker: BlockTracker,
     /// Application cursor key mode (DECCKM, CSI ?1h/l).
     pub app_cursor_keys: bool,
     /// Bracketed paste mode (CSI ?2004h/l).
@@ -82,6 +86,7 @@ impl Terminal {
             attrs: Attrs::default(),
             title: String::new(),
             shell_markers: Vec::new(),
+            block_tracker: BlockTracker::new(),
             app_cursor_keys: false,
             bracketed_paste: false,
             origin_mode: false,
@@ -167,6 +172,17 @@ impl Terminal {
         &self.shell_markers
     }
 
+    /// The command-block tracker (history of finished blocks + live phase).
+    pub fn block_tracker(&self) -> &BlockTracker {
+        &self.block_tracker
+    }
+
+    /// Mutable access to the block tracker (e.g. to drain unpersisted blocks
+    /// or load history at startup).
+    pub fn block_tracker_mut(&mut self) -> &mut BlockTracker {
+        &mut self.block_tracker
+    }
+
     /// Feed raw bytes from PTY through the vte parser.
     /// Each byte is advanced through the parser, which calls back
     /// into our Perform implementation.
@@ -191,6 +207,23 @@ impl Terminal {
         let rows = self.grid.num_rows;
         let cols = self.grid.num_cols;
         *self = Self::new(rows, cols);
+    }
+
+    /// Snapshot the command line at OSC 133;B (preexec). Real shells emit a
+    /// `\n` after the user presses Enter, so the cursor sits on a fresh line
+    /// *below* the command — walk up to the nearest non-empty row. This is
+    /// best-effort (~80%): it returns the last line of the prompt+command and
+    /// is used only as a block title. (Detached output capture, not this, is
+    /// the authoritative record.)
+    fn snapshot_command_line(&self) -> String {
+        let mut row = self.grid.cursor.row;
+        loop {
+            let text = self.grid.row_text(row);
+            if !text.is_empty() || row == 0 {
+                return text;
+            }
+            row -= 1;
+        }
     }
 
     // ── Palette initialization ───────────────────────────────────
@@ -374,6 +407,14 @@ impl vte::Perform for Terminal {
         // visible instead of a stale scrollback view.
         self.grid.scroll_offset = 0;
 
+        // Feed the printed char to the active command block's output capture.
+        // The tracker self-gates on phase (only captures while
+        // CommandExecuting); we additionally pause during the alternate screen
+        // so vim/less full-screen content never leaks into a block.
+        if !self.alt_active {
+            self.block_tracker.on_print(c);
+        }
+
         // Handle deferred wrap
         if self.grid.cursor.wrap_pending {
             self.grid.cursor.wrap_pending = false;
@@ -477,6 +518,9 @@ impl vte::Perform for Terminal {
                 // LF, VT, FF → move to next line (CR+LF on Unix terminals).
                 // The raw VT `index()` only moves down; Unix terminals
                 // treat LF as newline (carriage return + index).
+                if !self.alt_active {
+                    self.block_tracker.on_newline();
+                }
                 self.grid.carriage_return();
                 self.grid.index();
             }
@@ -685,9 +729,23 @@ impl vte::Perform for Terminal {
             "133" => {
                 if params.len() > 1 {
                     match params[1] {
-                        b"A" => self.shell_markers.push(ShellMarker::PromptStart),
-                        b"B" => self.shell_markers.push(ShellMarker::CommandStart),
-                        b"C" => self.shell_markers.push(ShellMarker::CommandOutputStart),
+                        b"A" => {
+                            self.shell_markers.push(ShellMarker::PromptStart);
+                            self.block_tracker.on_prompt_start();
+                        }
+                        b"B" => {
+                            self.shell_markers.push(ShellMarker::CommandStart);
+                            // 133;B (preexec): snapshot the command line now,
+                            // before output scrolls it into history. Real shells
+                            // emit a newline first, so the cursor may sit below
+                            // the command — `snapshot_command_line` walks up.
+                            let command = self.snapshot_command_line();
+                            self.block_tracker.on_command_start(command);
+                        }
+                        b"C" => {
+                            self.shell_markers.push(ShellMarker::CommandOutputStart);
+                            self.block_tracker.on_command_output_start();
+                        }
                         b"D" => {
                             let exit_code = if params.len() > 2 {
                                 std::str::from_utf8(params[2])
@@ -699,6 +757,7 @@ impl vte::Perform for Terminal {
                             };
                             self.shell_markers
                                 .push(ShellMarker::CommandEnd { exit_code });
+                            self.block_tracker.on_command_end(exit_code);
                         }
                         _ => {}
                     }
@@ -752,6 +811,7 @@ fn parse_x11_color(bytes: &[u8]) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::ShellPhase;
 
     fn term() -> Terminal {
         Terminal::new(24, 80)
@@ -1035,6 +1095,61 @@ mod tests {
             t.shell_markers()[0],
             ShellMarker::CommandEnd { exit_code: 42 }
         );
+    }
+
+    // ── Command blocks (OSC 133 → BlockTracker) ───────────────────
+
+    #[test]
+    fn osc133_lifecycle_produces_block() {
+        let mut t = term();
+        // Prompt start → AtPrompt + integration ready.
+        t.process(b"\x1b]133;A\x07");
+        assert!(t.block_tracker().bootstrap_ready());
+        assert_eq!(t.block_tracker().phase(), ShellPhase::AtPrompt);
+
+        // Prompt + command render during AtPrompt → NOT captured as output.
+        t.process(b"$ ls -la\r");
+        // Command start (preexec): snapshot the command row.
+        t.process(b"\x1b]133;B\x07");
+        assert_eq!(t.block_tracker().phase(), ShellPhase::CommandExecuting);
+        // Output start + streaming output.
+        t.process(b"\x1b]133;C\x07");
+        t.process(b"file1\nfile2\n");
+        // Command end → finalize.
+        t.process(b"\x1b]133;D;0\x07");
+
+        let blocks = t.block_tracker().blocks();
+        assert_eq!(blocks.len(), 1);
+        let b = &blocks[0];
+        assert_eq!(b.command, "$ ls -la", "command = prompt row at 133;B");
+        assert_eq!(b.output, "file1\nfile2\n", "output captured B..D");
+        assert_eq!(b.exit_code, Some(0));
+        assert_eq!(t.block_tracker().phase(), ShellPhase::AtPrompt);
+    }
+
+    #[test]
+    fn alt_screen_output_is_not_captured() {
+        let mut t = term();
+        t.process(b"\x1b]133;A\x07");
+        t.process(b"$ run vim\r");
+        t.process(b"\x1b]133;B\x07"); // CommandExecuting — capture active
+                                      // Enter the alternate screen (DEC 1049): a full-screen app takes over.
+        t.process(b"\x1b[?1049h");
+        assert!(t.is_alt_screen_active());
+        // This content belongs to the full-screen app — it must NOT leak into
+        // the block's output snapshot.
+        t.process(b"VIM FULLSCREEN CONTENT\nmore lines\n");
+        // Leave the alternate screen and end the command.
+        t.process(b"\x1b[?1049l");
+        t.process(b"\x1b]133;D;0\x07");
+
+        let b = &t.block_tracker().blocks()[0];
+        assert!(
+            !b.output.contains("VIM FULLSCREEN CONTENT"),
+            "alt-screen content leaked into block output: {:?}",
+            b.output
+        );
+        assert_eq!(b.exit_code, Some(0));
     }
 
     // ── Colors ───────────────────────────────────────────────────
