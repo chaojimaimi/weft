@@ -12,6 +12,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
+use weft_core::blocks::Block;
 use weft_core::config::{FontConfig, Theme};
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
@@ -300,6 +301,16 @@ fragment float4 text_fragment(
         self.atlas.cell_height
     }
 
+    /// Viewport width in physical pixels.
+    pub fn viewport_width(&self) -> f32 {
+        self.viewport.0
+    }
+
+    /// Backing-store scale (Retina factor).
+    pub fn scale(&self) -> f64 {
+        self.scale
+    }
+
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
     /// live config reload when font family/size/line-height changes. Returns
     /// the new cell dimensions so the caller can recompute grid rows/cols and
@@ -310,12 +321,13 @@ fragment float4 text_fragment(
         (self.atlas.cell_width, self.atlas.cell_height)
     }
 
-    /// Draw the terminal Grid to screen.
+    /// Draw the terminal Grid (and optional history panel) to screen.
     pub fn draw(
         &mut self,
         terminal: &Terminal,
         selection: &SelectionHandler,
         cursor_blink_on: bool,
+        panel: Option<&PanelDrawParams>,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -350,13 +362,25 @@ fragment float4 text_fragment(
                     }
                 }
             }
+            // Panel text needs its own chars rasterized too (it draws strings
+            // not present in the grid, e.g. the title or duration suffixes).
+            if let Some(p) = panel {
+                for c in format!("Command History ({})", p.blocks.len()).chars() {
+                    missing.insert(c);
+                }
+                let max_rows = visible_panel_rows(self.viewport.1, self.cell_height());
+                for (cmd, _exit, dur) in panel_rows(p.blocks, max_rows) {
+                    missing.extend(cmd.chars());
+                    missing.extend(dur.chars());
+                }
+            }
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
         }
 
         // Build vertex data from Grid cells
-        let vertices = self.build_grid_vertices(
+        let mut vertices = self.build_grid_vertices(
             grid,
             terminal.palette(),
             cursor,
@@ -364,6 +388,12 @@ fragment float4 text_fragment(
             terminal.cursor_visible && cursor_blink_on,
             terminal.cursor_style,
         );
+
+        // Overlay the history panel on top of the grid (drawn after, so it
+        // composites over terminal cells via the enabled alpha blend).
+        if let Some(p) = panel {
+            vertices.extend_from_slice(&self.build_panel_vertices(p.blocks, p.width_px));
+        }
 
         // Debug: log first row characters and verify vertex data
         if vertices.is_empty() {
@@ -842,6 +872,210 @@ fragment float4 text_fragment(
 
         vertices
     }
+
+    /// Build vertices for the right-side history panel overlay: a translucent
+    /// background, a title, and one row per finished block (newest first),
+    /// color-coded by exit code with a duration suffix. Drawn after the grid so
+    /// it composites on top via the enabled alpha blend.
+    fn build_panel_vertices(&self, blocks: &[Block], width_px: f32) -> Vec<f32> {
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let vp_h = self.viewport.1;
+        if width_px <= 0.0 || cw <= 0.0 || ch <= 0.0 {
+            return Vec::new();
+        }
+        let panel_x = (vp_w - width_px).max(0.0);
+        let panel_cols = ((width_px / cw) as usize).max(1);
+        let mut vertices = Vec::new();
+
+        // Translucent panel background: a darkened theme bg drawn as a bg-only
+        // quad sampling the space glyph (mask 0 → shader emits pure bg color).
+        let theme_bg = color_to_normalized(self.theme.background);
+        let panel_bg = [
+            theme_bg[0] * 0.45,
+            theme_bg[1] * 0.45,
+            theme_bg[2] * 0.45,
+            0.94,
+        ];
+        let (u, v, uw, vh) = self.space_uv();
+        // V-swap to match grid rendering (CAMetalLayer flip compensation).
+        push_quad(
+            &mut vertices,
+            [panel_x, 0.0, panel_x + width_px, vp_h],
+            [u, v + vh, u + uw, v],
+            [0.0; 4],
+            panel_bg,
+        );
+
+        let fg = color_to_normalized(self.theme.foreground);
+        let dim = [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0];
+        let green = [0.53, 0.80, 0.36, 1.0];
+        let red = [0.85, 0.36, 0.36, 1.0];
+
+        // Title row.
+        let title = format!("Command History ({})", blocks.len());
+        self.push_text(
+            &mut vertices,
+            panel_x + cw * 0.5,
+            ch * 0.4,
+            &title,
+            dim,
+            panel_cols,
+        );
+
+        // Rows: newest first.
+        let max_rows = visible_panel_rows(vp_h, self.cell_height());
+        let row_h = ch * 1.1;
+        let mut y = ch * 1.9;
+        for (cmd, exit, dur) in panel_rows(blocks, max_rows) {
+            let color = match exit {
+                Some(0) => green,
+                Some(_) => red,
+                None => dim,
+            };
+            let dur_len = dur.chars().count();
+            let cmd_cols = panel_cols.saturating_sub(dur_len + 2).max(1);
+            let label = truncate_str(cmd, cmd_cols);
+            self.push_text(
+                &mut vertices,
+                panel_x + cw * 0.5,
+                y,
+                &label,
+                color,
+                cmd_cols,
+            );
+            if !dur.is_empty() {
+                let dur_x = panel_x + width_px - cw * 0.5 - dur_len as f32 * cw;
+                self.push_text(&mut vertices, dur_x, y, &dur, dim, dur_len + 1);
+            }
+            y += row_h;
+            if y + ch > vp_h {
+                break;
+            }
+        }
+
+        vertices
+    }
+
+    /// Lay out a string left-to-right as single-cell glyph quads. ASCII fast
+    /// path; wide chars compress to one cell (acceptable for panel labels).
+    fn push_text(
+        &self,
+        vertices: &mut Vec<f32>,
+        x: f32,
+        y: f32,
+        text: &str,
+        fg: [f32; 4],
+        max_chars: usize,
+    ) {
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        for (i, c) in text.chars().take(max_chars).enumerate() {
+            let Some(g) = self.atlas.get(c) else {
+                continue;
+            };
+            let (u, v) = g.uv_origin;
+            let (uw, vh) = g.uv_size;
+            let cx = x + i as f32 * cw;
+            push_quad(
+                vertices,
+                [cx, y, cx + cw, y + ch],
+                [u, v + vh, u + uw, v],
+                fg,
+                [0.0; 4],
+            );
+        }
+    }
+
+    /// UV rect of the space glyph (background-only quads need mask 0).
+    fn space_uv(&self) -> (f32, f32, f32, f32) {
+        self.atlas
+            .get(' ')
+            .map(|g| {
+                let (u, v) = g.uv_origin;
+                let (uw, vh) = g.uv_size;
+                (u, v, uw, vh)
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0))
+    }
+}
+
+/// What the sidebar history panel should draw. Built by the app only when the
+/// panel is open and passed to [`MetalRenderer::draw`].
+pub struct PanelDrawParams<'a> {
+    /// Finished blocks (oldest-first; the renderer shows newest first).
+    pub blocks: &'a [Block],
+    /// Panel width in physical pixels.
+    pub width_px: f32,
+}
+
+/// Append a two-triangle quad (6 vertices, stride-48 layout matching the grid
+/// vertex descriptor) to `vertices`. `dst`/`uv` are `[x0, y0, x1, y1]`.
+fn push_quad(vertices: &mut Vec<f32>, dst: [f32; 4], uv: [f32; 4], fg: [f32; 4], bg: [f32; 4]) {
+    let [x0, y0, x1, y1] = dst;
+    let [u0, v0, u1, v1] = uv;
+    for (x, y, u, v) in [
+        (x0, y0, u0, v0),
+        (x0, y1, u0, v1),
+        (x1, y1, u1, v1),
+        (x0, y0, u0, v0),
+        (x1, y1, u1, v1),
+        (x1, y0, u1, v0),
+    ] {
+        vertices.extend_from_slice(&[
+            x, y, u, v, fg[0], fg[1], fg[2], fg[3], bg[0], bg[1], bg[2], bg[3],
+        ]);
+    }
+}
+
+/// How many block rows fit below the title (in whole grid rows).
+fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
+    if cell_h == 0 {
+        return 0;
+    }
+    ((viewport_h / cell_h as f32) as usize).saturating_sub(2)
+}
+
+/// Visible panel rows as `(command, exit_code, duration_str)`, newest first.
+fn panel_rows(blocks: &[Block], max_rows: usize) -> Vec<(&str, Option<i32>, String)> {
+    blocks
+        .iter()
+        .rev()
+        .take(max_rows)
+        .map(|b| (b.command.as_str(), b.exit_code, block_duration_str(b)))
+        .collect()
+}
+
+/// Human-readable elapsed time for a finished block.
+fn block_duration_str(b: &Block) -> String {
+    let Some(finished) = b.finished_at else {
+        return String::new();
+    };
+    let ms = finished
+        .duration_since(b.started_at)
+        .unwrap_or_default()
+        .as_millis();
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}m", ms / 60_000)
+    }
+}
+
+/// Truncate `s` to `max` chars, appending an ellipsis if it was cut.
+fn truncate_str(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
 }
 
 /// Convert a grid Color to normalized RGBA floats.

@@ -6,7 +6,7 @@
 mod glyph;
 mod renderer;
 
-use renderer::MetalRenderer;
+use renderer::{MetalRenderer, PanelDrawParams};
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
@@ -83,6 +83,8 @@ struct App {
     /// SQLite store for command blocks. `None` when the cache dir is
     /// unavailable or opening failed (persistence is best-effort).
     block_store: Option<BlockStore>,
+    /// Whether the command-history sidebar panel is shown.
+    panel_open: bool,
 }
 
 impl App {
@@ -117,6 +119,7 @@ impl App {
             config,
             keybindings,
             block_store: None,
+            panel_open: false,
         }
     }
 
@@ -367,6 +370,11 @@ impl App {
             | Action::ScrollToTop
             | Action::ScrollToBottom => {
                 self.scroll_action(action);
+                true
+            }
+            Action::ToggleBlockPanel => {
+                self.panel_open = !self.panel_open;
+                self.request_redraw();
                 true
             }
         }
@@ -935,7 +943,22 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
-                    renderer.draw(terminal, &self.selection_handler, self.cursor_blink_on);
+                    let panel = if self.panel_open {
+                        let width_px =
+                            (renderer.viewport_width() * 0.38).min(460.0 * renderer.scale() as f32);
+                        Some(PanelDrawParams {
+                            blocks: terminal.block_tracker().blocks(),
+                            width_px,
+                        })
+                    } else {
+                        None
+                    };
+                    renderer.draw(
+                        terminal,
+                        &self.selection_handler,
+                        self.cursor_blink_on,
+                        panel.as_ref(),
+                    );
                 }
 
                 // No busy-loop redraw here: the PTY reader thread and the
