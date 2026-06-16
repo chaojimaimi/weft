@@ -12,7 +12,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
-use weft_core::blocks::Block;
+use weft_core::blocks::{Block, BlockId};
 use weft_core::config::{FontConfig, Theme};
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
@@ -348,9 +348,10 @@ fragment float4 text_fragment(
         );
         let clear_a = bg_a * self.opacity as f64;
 
-        // Collect unique on-screen characters not yet in the atlas, then
-        // rasterize each exactly once. This avoids O(R*C) hash lookups per
-        // frame — after warm-up the set is almost always empty.
+        // Collect unique on-screen GRID + panel characters not yet in the
+        // atlas, then rasterize each exactly once. (Partial borrow of
+        // self.atlas here is disjoint from the `drawable` borrow of self.layer,
+        // so it coexists.)
         {
             use std::collections::HashSet;
             let mut missing = HashSet::new();
@@ -362,16 +363,18 @@ fragment float4 text_fragment(
                     }
                 }
             }
-            // Panel text needs its own chars rasterized too (it draws strings
-            // not present in the grid, e.g. the title or duration suffixes).
             if let Some(p) = panel {
-                for c in format!("Command History ({})", p.blocks.len()).chars() {
-                    missing.insert(c);
-                }
-                let max_rows = visible_panel_rows(self.viewport.1, self.cell_height());
-                for (cmd, _exit, dur) in panel_rows(p.blocks, max_rows) {
-                    missing.extend(cmd.chars());
-                    missing.extend(dur.chars());
+                missing.extend("Search:".chars());
+                missing.extend(p.query.chars());
+                let max_blocks = visible_panel_rows(self.viewport.1, self.cell_height());
+                for b in panel_display(p.blocks, p.query, max_blocks) {
+                    missing.extend(b.command.chars());
+                    missing.extend(block_duration_str(b).chars());
+                    if Some(b.id) == p.expanded_id {
+                        for line in b.output.lines().take(8) {
+                            missing.extend(line.chars());
+                        }
+                    }
                 }
             }
             for ch in &missing {
@@ -392,7 +395,7 @@ fragment float4 text_fragment(
         // Overlay the history panel on top of the grid (drawn after, so it
         // composites over terminal cells via the enabled alpha blend).
         if let Some(p) = panel {
-            vertices.extend_from_slice(&self.build_panel_vertices(p.blocks, p.width_px));
+            vertices.extend_from_slice(&self.build_panel_vertices(p));
         }
 
         // Debug: log first row characters and verify vertex data
@@ -874,14 +877,16 @@ fragment float4 text_fragment(
     }
 
     /// Build vertices for the right-side history panel overlay: a translucent
-    /// background, a title, and one row per finished block (newest first),
-    /// color-coded by exit code with a duration suffix. Drawn after the grid so
-    /// it composites on top via the enabled alpha blend.
-    fn build_panel_vertices(&self, blocks: &[Block], width_px: f32) -> Vec<f32> {
+    /// background, a search box, and one row per finished block (newest first,
+    /// filtered by the query), color-coded by exit code. The selected row is
+    /// highlighted and, if expanded, its output is shown beneath. Drawn after
+    /// the grid so it composites on top via the enabled alpha blend.
+    fn build_panel_vertices(&self, p: &PanelDrawParams) -> Vec<f32> {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
+        let width_px = p.width_px;
         if width_px <= 0.0 || cw <= 0.0 || ch <= 0.0 {
             return Vec::new();
         }
@@ -898,12 +903,19 @@ fragment float4 text_fragment(
             theme_bg[2] * 0.45,
             0.94,
         ];
-        let (u, v, uw, vh) = self.space_uv();
+        let sel_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.18,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.18,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.18,
+            0.95,
+        ];
+        let (su, sv, suw, svh) = self.space_uv();
         // V-swap to match grid rendering (CAMetalLayer flip compensation).
+        let bg_uv = [su, sv + svh, su + suw, sv];
         push_quad(
             &mut vertices,
             [panel_x, 0.0, panel_x + width_px, vp_h],
-            [u, v + vh, u + uw, v],
+            bg_uv,
             [0.0; 4],
             panel_bg,
         );
@@ -913,36 +925,58 @@ fragment float4 text_fragment(
         let green = [0.53, 0.80, 0.36, 1.0];
         let red = [0.85, 0.36, 0.36, 1.0];
 
-        // Title row.
-        let title = format!("Command History ({})", blocks.len());
+        // Search box row: "Search:" label + the live query text.
         self.push_text(
             &mut vertices,
             panel_x + cw * 0.5,
             ch * 0.4,
-            &title,
+            "Search:",
             dim,
             panel_cols,
         );
+        let query_x = panel_x + cw * 0.5 + "Search: ".chars().count() as f32 * cw;
+        self.push_text(&mut vertices, query_x, ch * 0.4, p.query, fg, panel_cols);
 
-        // Rows: newest first.
+        // Display list: newest-first, filtered by query (capped to fit).
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
+        let display = panel_display(p.blocks, p.query, max_rows);
         let row_h = ch * 1.1;
         let mut y = ch * 1.9;
-        for (cmd, exit, dur) in panel_rows(blocks, max_rows) {
-            let color = match exit {
-                Some(0) => green,
-                Some(_) => red,
-                None => dim,
+        let mut drawn = 0usize;
+
+        for (i, block) in display.iter().enumerate() {
+            if drawn >= max_rows || y + ch > vp_h {
+                break;
+            }
+            let selected = i == p.selection;
+            if selected {
+                push_quad(
+                    &mut vertices,
+                    [panel_x, y - ch * 0.1, panel_x + width_px, y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    sel_bg,
+                );
+            }
+            let cmd_color = if selected {
+                fg
+            } else {
+                match block.exit_code {
+                    Some(0) => green,
+                    Some(_) => red,
+                    None => dim,
+                }
             };
+            let dur = block_duration_str(block);
             let dur_len = dur.chars().count();
             let cmd_cols = panel_cols.saturating_sub(dur_len + 2).max(1);
-            let label = truncate_str(cmd, cmd_cols);
+            let label = truncate_str(&block.command, cmd_cols);
             self.push_text(
                 &mut vertices,
                 panel_x + cw * 0.5,
                 y,
                 &label,
-                color,
+                cmd_color,
                 cmd_cols,
             );
             if !dur.is_empty() {
@@ -950,8 +984,27 @@ fragment float4 text_fragment(
                 self.push_text(&mut vertices, dur_x, y, &dur, dim, dur_len + 1);
             }
             y += row_h;
-            if y + ch > vp_h {
-                break;
+            drawn += 1;
+
+            // Expanded output for the selected block.
+            if Some(block.id) == p.expanded_id {
+                let out_cols = panel_cols.saturating_sub(2).max(1);
+                for line in block.output.lines().take(8) {
+                    if drawn >= max_rows || y + ch > vp_h {
+                        break;
+                    }
+                    let rendered = truncate_str(line, out_cols);
+                    self.push_text(
+                        &mut vertices,
+                        panel_x + cw * 1.5,
+                        y,
+                        &rendered,
+                        dim,
+                        out_cols,
+                    );
+                    y += row_h;
+                    drawn += 1;
+                }
             }
         }
 
@@ -960,6 +1013,7 @@ fragment float4 text_fragment(
 
     /// Lay out a string left-to-right as single-cell glyph quads. ASCII fast
     /// path; wide chars compress to one cell (acceptable for panel labels).
+    /// Glyphs must already be in the atlas (warmed up by the caller).
     fn push_text(
         &self,
         vertices: &mut Vec<f32>,
@@ -1008,6 +1062,33 @@ pub struct PanelDrawParams<'a> {
     pub blocks: &'a [Block],
     /// Panel width in physical pixels.
     pub width_px: f32,
+    /// Live search filter (matches command or output, case-insensitive).
+    pub query: &'a str,
+    /// Index of the selected row within the newest-first filtered list.
+    pub selection: usize,
+    /// Id of the block whose output is expanded inline (None = all collapsed).
+    pub expanded_id: Option<BlockId>,
+}
+
+/// Whether a block matches the panel search query (empty query = match all).
+/// Shared by the renderer (list layout) and the app (selection clamping).
+pub fn block_matches_query(block: &Block, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let q = query.to_lowercase();
+    block.command.to_lowercase().contains(&q) || block.output.to_lowercase().contains(&q)
+}
+
+/// Newest-first, query-filtered block list capped to `max` entries. Shared by
+/// the warm-up pass and `build_panel_vertices` so they render the same set.
+fn panel_display<'a>(blocks: &'a [Block], query: &str, max: usize) -> Vec<&'a Block> {
+    blocks
+        .iter()
+        .rev()
+        .filter(|b| block_matches_query(b, query))
+        .take(max)
+        .collect()
 }
 
 /// Append a two-triangle quad (6 vertices, stride-48 layout matching the grid
@@ -1035,16 +1116,6 @@ fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
         return 0;
     }
     ((viewport_h / cell_h as f32) as usize).saturating_sub(2)
-}
-
-/// Visible panel rows as `(command, exit_code, duration_str)`, newest first.
-fn panel_rows(blocks: &[Block], max_rows: usize) -> Vec<(&str, Option<i32>, String)> {
-    blocks
-        .iter()
-        .rev()
-        .take(max_rows)
-        .map(|b| (b.command.as_str(), b.exit_code, block_duration_str(b)))
-        .collect()
 }
 
 /// Human-readable elapsed time for a finished block.

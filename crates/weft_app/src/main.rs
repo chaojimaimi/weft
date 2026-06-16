@@ -6,7 +6,8 @@
 mod glyph;
 mod renderer;
 
-use renderer::{MetalRenderer, PanelDrawParams};
+use renderer::{block_matches_query, MetalRenderer, PanelDrawParams};
+use weft_core::blocks::BlockId;
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
@@ -85,6 +86,12 @@ struct App {
     block_store: Option<BlockStore>,
     /// Whether the command-history sidebar panel is shown.
     panel_open: bool,
+    /// Live search filter typed into the panel.
+    panel_query: String,
+    /// Selected row index within the newest-first filtered list.
+    panel_selection: usize,
+    /// Id of the block whose output is expanded inline in the panel.
+    panel_expanded: Option<BlockId>,
 }
 
 impl App {
@@ -120,6 +127,9 @@ impl App {
             keybindings,
             block_store: None,
             panel_open: false,
+            panel_query: String::new(),
+            panel_selection: 0,
+            panel_expanded: None,
         }
     }
 
@@ -333,6 +343,13 @@ impl App {
             }
         }
 
+        // When the history panel is open, navigation/typing/search go to it
+        // (not the shell). Modifier chords (cmd/ctrl/alt) still fall through so
+        // keybindings like cmd+shift+b (toggle) keep working.
+        if self.panel_open && self.handle_panel_key(key, m) {
+            return;
+        }
+
         self.input_handler.app_cursor_keys = self
             .terminal
             .as_ref()
@@ -374,10 +391,111 @@ impl App {
             }
             Action::ToggleBlockPanel => {
                 self.panel_open = !self.panel_open;
+                if self.panel_open {
+                    // Fresh search/selection each time the panel opens.
+                    self.panel_query.clear();
+                    self.panel_selection = 0;
+                    self.panel_expanded = None;
+                }
                 self.request_redraw();
                 true
             }
         }
+    }
+
+    /// Handle a key while the history panel is open. Returns true if consumed
+    /// (search typing / arrow nav / expand / close). Modifier chords fall
+    /// through (returns false) so keybindings still work.
+    fn handle_panel_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
+        // Let cmd/ctrl/alt chords pass through to keybindings / PTY.
+        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
+            return false;
+        }
+        match key {
+            KeyCode::Escape => {
+                self.panel_open = false;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Up => {
+                self.panel_selection = self.panel_selection.saturating_sub(1);
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Down => {
+                self.panel_selection = self.panel_selection.saturating_add(1);
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Backspace => {
+                self.panel_query.pop();
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                // Toggle inline expansion of the selected block's output.
+                let selected_id = self.panel_selected_block_id();
+                if let Some(id) = selected_id {
+                    self.panel_expanded = if self.panel_expanded == Some(id) {
+                        None
+                    } else {
+                        Some(id)
+                    };
+                    self.request_redraw();
+                }
+                true
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.panel_query.push(c);
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Count of blocks visible in the panel (newest-first, query-filtered).
+    fn panel_visible_count(&self) -> usize {
+        let Some(terminal) = &self.terminal else {
+            return 0;
+        };
+        let blocks = terminal.block_tracker().blocks();
+        let visible = terminal.grid().num_rows;
+        blocks
+            .iter()
+            .rev()
+            .filter(|b| block_matches_query(b, &self.panel_query))
+            .take(visible)
+            .count()
+    }
+
+    /// Keep the selection inside the filtered, visible list.
+    fn clamp_panel_selection(&mut self) {
+        let max = self.panel_visible_count();
+        if max == 0 {
+            self.panel_selection = 0;
+        } else {
+            self.panel_selection = self.panel_selection.min(max - 1);
+        }
+    }
+
+    /// The [`BlockId`] of the currently selected panel row, if any.
+    fn panel_selected_block_id(&self) -> Option<BlockId> {
+        let terminal = self.terminal.as_ref()?;
+        let visible = terminal.grid().num_rows;
+        terminal
+            .block_tracker()
+            .blocks()
+            .iter()
+            .rev()
+            .filter(|b| block_matches_query(b, &self.panel_query))
+            .take(visible)
+            .nth(self.panel_selection)
+            .map(|b| b.id)
     }
 
     /// Local scrollback navigation (page up/down, top, bottom).
@@ -949,6 +1067,9 @@ impl ApplicationHandler<AppEvent> for App {
                         Some(PanelDrawParams {
                             blocks: terminal.block_tracker().blocks(),
                             width_px,
+                            query: &self.panel_query,
+                            selection: self.panel_selection,
+                            expanded_id: self.panel_expanded,
                         })
                     } else {
                         None
