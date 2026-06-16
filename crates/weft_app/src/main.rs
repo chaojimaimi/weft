@@ -405,6 +405,25 @@ impl App {
             self.recompute_layout();
         }
 
+        // Window background opacity (layer-level transparency; text stays
+        // opaque). Recolors the next frame. Window-level transparency is
+        // startup-only — see `resumed`.
+        if (self.config.window.opacity - config.window.opacity).abs() > f32::EPSILON {
+            if let Some(r) = &mut self.renderer {
+                r.set_opacity(config.window.opacity);
+            }
+        }
+
+        // Content padding (changes usable rows/cols → recompute layout).
+        if self.config.window.padding_x != config.window.padding_x
+            || self.config.window.padding_y != config.window.padding_y
+        {
+            if let Some(r) = &mut self.renderer {
+                r.set_padding((config.window.padding_x, config.window.padding_y));
+            }
+            self.recompute_layout();
+        }
+
         // Keybindings.
         self.keybindings = config.keybindings();
 
@@ -420,23 +439,34 @@ impl App {
         self.request_redraw();
     }
 
-    /// Recompute grid rows/cols from the current window + cell dimensions and
-    /// resize the terminal / queue a PTY SIGWINCH. Used after a font change
-    /// (cell size changes) and on window resize.
-    fn recompute_layout(&mut self) {
-        let (new_rows, new_cols, size) = {
-            let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-                return;
-            };
-            let size = window.inner_size();
-            let new_cols = (size.width as f64 / renderer.cell_width() as f64) as usize;
-            let new_rows = (size.height as f64 / renderer.cell_height() as f64) as usize;
-            (new_rows, new_cols, size)
+    /// Compute grid (rows, cols) from the window size minus content padding and
+    /// the current cell dimensions. Returns (0, 0) until the window/renderer are
+    /// ready. Centralizes the padding-aware geometry used by both resize paths.
+    fn grid_dims(&self) -> (usize, usize) {
+        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
+            return (0, 0);
         };
+        let size = window.inner_size();
+        let usable_w = size.width as f64 - 2.0 * renderer.padding_x() as f64;
+        let usable_h = size.height as f64 - 2.0 * renderer.padding_y() as f64;
+        let cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
+        let rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
+        (rows, cols)
+    }
+
+    /// Recompute grid rows/cols from the current window + cell dimensions and
+    /// resize the terminal / queue a PTY SIGWINCH. Used after a font or padding
+    /// change (cell size or usable area changes) and on window resize.
+    fn recompute_layout(&mut self) {
+        let (new_rows, new_cols) = self.grid_dims();
         if new_cols == 0 || new_rows == 0 {
             return;
         }
-        if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let size = window.inner_size();
+        if let Some(renderer) = &mut self.renderer {
             renderer.resize(window, size);
         }
         if let Some(terminal) = &mut self.terminal {
@@ -453,10 +483,11 @@ impl App {
         };
         // CursorMoved position is in physical pixels; cell_width/height are
         // also in physical pixels — divide directly without scale conversion.
+        // Subtract content padding first so clicks map to the padded grid.
         let cell_w = renderer.cell_width() as f64;
         let cell_h = renderer.cell_height() as f64;
-        let col = (x / cell_w) as usize;
-        let row = (y / cell_h) as usize;
+        let col = ((x - renderer.padding_x() as f64) / cell_w).max(0.0) as usize;
+        let row = ((y - renderer.padding_y() as f64) / cell_h).max(0.0) as usize;
         GridPos::new(row, col)
     }
 
@@ -755,10 +786,20 @@ impl ApplicationHandler<AppEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(
                 win.width as f64,
                 win.height as f64,
-            ));
+            ))
+            // Window-level transparency is fixed at creation; the layer opaque
+            // flag + bg alpha still update live, but crossing the 1.0 boundary
+            // (opaque ↔ see-through) needs a relaunch.
+            .with_transparent(win.opacity < 1.0);
 
         let window = event_loop.create_window(attrs).unwrap();
-        let renderer = MetalRenderer::new(&window, self.config.font.clone(), self.config.theme());
+        let renderer = MetalRenderer::new(
+            &window,
+            self.config.font.clone(),
+            self.config.theme(),
+            (win.padding_x, win.padding_y),
+            win.opacity,
+        );
 
         self.spawn_pty();
         self.window = Some(window);
@@ -810,10 +851,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Resized(physical_size) => {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
-                    let new_cols =
-                        (physical_size.width as f64 / renderer.cell_width() as f64) as usize;
-                    let new_rows =
-                        (physical_size.height as f64 / renderer.cell_height() as f64) as usize;
+                    let pad_x = renderer.padding_x() as f64;
+                    let pad_y = renderer.padding_y() as f64;
+                    let usable_w = physical_size.width as f64 - 2.0 * pad_x;
+                    let usable_h = physical_size.height as f64 - 2.0 * pad_y;
+                    let new_cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
+                    let new_rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
 
                     if new_cols > 0 && new_rows > 0 {
                         // Update renderer viewport immediately

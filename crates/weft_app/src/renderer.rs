@@ -33,10 +33,27 @@ pub struct MetalRenderer {
     /// Active theme (default fg/bg/cursor/selection). Per-frame, so a
     /// `set_theme` call recolors the screen on the next draw.
     theme: Theme,
+    /// Content padding in **physical** pixels (logical config value × scale).
+    /// Cells are positioned `pad_x + col·cw`, `pad_y + row·ch`; the usable
+    /// area for row/col math is the viewport minus `2·pad`.
+    padding_x: f32,
+    padding_y: f32,
+    /// Window background opacity [0,1]. Below 1.0 the background is
+    /// see-through (text/selection/cursor stay opaque); the cell bg alpha is
+    /// scaled by this value per-frame, so a live `set_opacity` recolors
+    /// instantly. The window's own transparency flag is set at startup, so
+    /// crossing the 1.0 boundary needs a relaunch.
+    opacity: f32,
 }
 
 impl MetalRenderer {
-    pub fn new(window: &Window, font_config: FontConfig, theme: Theme) -> Self {
+    pub fn new(
+        window: &Window,
+        font_config: FontConfig,
+        theme: Theme,
+        padding_logical: (u32, u32),
+        opacity: f32,
+    ) -> Self {
         let device = Device::system_default().expect("No Metal device found");
         let queue = device.new_command_queue();
 
@@ -44,6 +61,11 @@ impl MetalRenderer {
 
         let scale = window.scale_factor();
         let size = window.inner_size();
+
+        // Logical padding (points) → physical pixels for rendering/layout.
+        let padding_x = padding_logical.0 as f32 * scale as f32;
+        let padding_y = padding_logical.1 as f32 * scale as f32;
+        let opacity = opacity.clamp(0.0, 1.0);
 
         // Use physical pixels for viewport to stay consistent with drawable_size
         // and grid dimensions (which are calculated from physical cell sizes).
@@ -114,7 +136,12 @@ fragment float4 text_fragment(
     // Sample the glyph mask from the R8 atlas and blend fg over bg.
     float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
     float4 color = mix(in.bg_color, in.fg_color, mask);
-    color.a = 1.0;
+    // Background opacity: the cell bg's alpha carries the window opacity
+    // (scaled in build_grid_vertices). Text (mask→1) stays opaque; empty
+    // background (mask→0) takes that alpha so the desktop shows through.
+    // For an opaque window the bg alpha is 1.0, so this is identical to
+    // `color.a = 1.0`.
+    color.a = mix(in.bg_color.a, 1.0, mask);
     return color;
 }
 "#;
@@ -175,6 +202,9 @@ fragment float4 text_fragment(
 
         unsafe {
             attach_layer_to_nsview(&layer, window, scale);
+            // Layer opacity: a non-opaque layer lets the transparent window
+            // show the desktop through the (alpha-scaled) cell backgrounds.
+            set_layer_opaque(&layer, opacity >= 1.0);
         }
 
         info!(
@@ -203,6 +233,9 @@ fragment float4 text_fragment(
             scale,
             font_config,
             theme,
+            padding_x,
+            padding_y,
+            opacity,
         }
     }
 
@@ -211,6 +244,33 @@ fragment float4 text_fragment(
     /// the terminal palette, so no rebuild is needed).
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Content padding in physical pixels (logical config × scale).
+    pub fn padding_x(&self) -> f32 {
+        self.padding_x
+    }
+
+    /// Content padding in physical pixels (logical config × scale).
+    pub fn padding_y(&self) -> f32 {
+        self.padding_y
+    }
+
+    /// Update content padding (logical config px). Caller must recompute the
+    /// grid layout afterwards — padding changes the usable rows/cols.
+    pub fn set_padding(&mut self, padding_logical: (u32, u32)) {
+        self.padding_x = padding_logical.0 as f32 * self.scale as f32;
+        self.padding_y = padding_logical.1 as f32 * self.scale as f32;
+    }
+
+    /// Update window background opacity [0,1]. Recolors the next frame (bg
+    /// alpha is resolved per-frame); also flips the CAMetalLayer opaque flag.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        self.opacity = opacity.clamp(0.0, 1.0);
+        // SAFETY: layer is a valid CAMetalLayer; setOpaque: is its property setter.
+        unsafe {
+            set_layer_opaque(&self.layer, self.opacity >= 1.0);
+        }
     }
 
     /// Current background color (for the render-pass clear value).
@@ -265,7 +325,8 @@ fragment float4 text_fragment(
         let grid = terminal.grid();
         let cursor = &grid.cursor;
 
-        // Clear color from the theme background.
+        // Clear color from the theme background, scaled by window opacity so a
+        // transparent window's uncovered area shows the desktop.
         let bg = self.theme.background;
         let (bg_r, bg_g, bg_b, bg_a) = (
             bg.r as f64 / 255.0,
@@ -273,6 +334,7 @@ fragment float4 text_fragment(
             bg.b as f64 / 255.0,
             bg.a as f64 / 255.0,
         );
+        let clear_a = bg_a * self.opacity as f64;
 
         // Collect unique on-screen characters not yet in the atlas, then
         // rasterize each exactly once. This avoids O(R*C) hash lookups per
@@ -310,7 +372,7 @@ fragment float4 text_fragment(
             color_att.set_texture(Some(drawable.texture()));
             color_att.set_load_action(MTLLoadAction::Clear);
             color_att.set_store_action(MTLStoreAction::Store);
-            color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, bg_a));
+            color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
 
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_render_command_encoder(pass_desc);
@@ -342,7 +404,7 @@ fragment float4 text_fragment(
         color_att.set_texture(Some(drawable.texture()));
         color_att.set_load_action(MTLLoadAction::Clear);
         color_att.set_store_action(MTLStoreAction::Store);
-        color_att.set_clear_color(MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+        color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
 
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
@@ -405,13 +467,19 @@ fragment float4 text_fragment(
                     continue;
                 }
 
-                let x = col as f32 * cw;
-                let y = row as f32 * ch;
+                let x = self.padding_x + col as f32 * cw;
+                let y = self.padding_y + row as f32 * ch;
 
                 // Determine cell colors (resolve the cell's color-origin against
                 // the palette / theme defaults).
                 let fg = resolve_cell_color(cell.fg, default_fg, palette);
                 let bg = resolve_cell_color(cell.bg, default_bg, palette);
+                // Scale the plain background alpha by window opacity so empty
+                // cells show the desktop through them. Text/selection/cursor
+                // pick their own colors with alpha 1.0 in `final_bg` below, so
+                // they stay fully opaque regardless of this scaling.
+                let mut bg = bg;
+                bg[3] *= self.opacity;
 
                 // Check if this is the cursor position
                 let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
@@ -818,4 +886,16 @@ unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window, scale: f64
     // shader already maps logical-top → clip-top, so the drawable is upright; do NOT
     // set geometryFlipped (it would composite the framebuffer upside-down).
     let _: () = msg_send![layer_ptr, setGeometryFlipped: false];
+}
+
+/// Toggle the CAMetalLayer's `opaque` flag. A non-opaque layer lets a
+/// transparent NSWindow show the desktop through alpha-scaled cell backgrounds.
+///
+/// # Safety
+/// `layer` must be a live `CAMetalLayer` (or subclass). `setOpaque:` is the
+/// `CALayer` property setter, so the selector is valid.
+unsafe fn set_layer_opaque(layer: &MetalLayer, opaque: bool) {
+    let layer_ptr: *mut objc2::runtime::AnyObject =
+        (&**layer) as *const _ as *mut objc2::runtime::AnyObject;
+    let _: () = msg_send![layer_ptr, setOpaque: opaque];
 }

@@ -488,6 +488,10 @@ mod tests {
         assert_eq!(c.font.size, 14.0);
         assert_eq!(c.scrollback.lines, 10_000);
         assert_eq!(c.window.width, 800);
+        // L4 window fields: opaque by default, no content padding.
+        assert_eq!(c.window.opacity, 1.0);
+        assert_eq!(c.window.padding_x, 0);
+        assert_eq!(c.window.padding_y, 0);
     }
 
     #[test]
