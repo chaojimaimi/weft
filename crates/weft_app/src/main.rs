@@ -11,6 +11,7 @@ use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
 };
+use weft_core::persistence::BlockStore;
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::{GridPos, SelectionHandler, SelectionMode};
 use weft_core::shell::Integration;
@@ -79,6 +80,9 @@ struct App {
     config: Config,
     /// Resolved keybindings (key + modifiers → action).
     keybindings: KeyBindings,
+    /// SQLite store for command blocks. `None` when the cache dir is
+    /// unavailable or opening failed (persistence is best-effort).
+    block_store: Option<BlockStore>,
 }
 
 impl App {
@@ -112,6 +116,7 @@ impl App {
             proxy,
             config,
             keybindings,
+            block_store: None,
         }
     }
 
@@ -188,6 +193,18 @@ impl App {
                 AppMsg::PtyExit(code) => {
                     info!("Shell exited: {:?}", code);
                     return false;
+                }
+            }
+        }
+
+        // Persist any command blocks finished during this batch (synchronous:
+        // local SQLite inserts are fast; volume is one block per command).
+        if let Some(store) = &self.block_store {
+            if let Some(terminal) = &mut self.terminal {
+                for block in terminal.block_tracker_mut().drain_unpersisted() {
+                    if let Err(e) = store.insert(&block) {
+                        warn!(error = %e, "failed to persist block");
+                    }
                 }
             }
         }
@@ -804,6 +821,27 @@ impl ApplicationHandler<AppEvent> for App {
         self.spawn_pty();
         self.window = Some(window);
         self.renderer = Some(renderer);
+
+        // Open the command-block DB (best-effort) and hydrate the tracker with
+        // recent history so the panel has content on first show.
+        self.block_store = weft_cache_dir().and_then(|cache| {
+            let path = cache.join("blocks.db");
+            match BlockStore::open(&path) {
+                Ok(store) => {
+                    if let Some(terminal) = &mut self.terminal {
+                        match store.recent(1000) {
+                            Ok(history) => terminal.block_tracker_mut().load_blocks(history),
+                            Err(e) => warn!(error = %e, "failed to load block history"),
+                        }
+                    }
+                    Some(store)
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to open block store; persistence disabled");
+                    None
+                }
+            }
+        });
 
         // Cursor-blink timer: wake the loop ~2x/sec so the caret toggles
         // without a vsync busy-loop. Exits when the event loop drops the proxy.
