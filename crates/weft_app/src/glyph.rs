@@ -358,8 +358,26 @@ impl GlyphAtlas {
             // See transform_probe test and rasterize_and_place comments for derivation.
             let upem = font.metrics().units_per_em as f32;
             let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
+
+            // Horizontal stretch: scale the glyph's natural advance to fill
+            // glyph_w. A full-width CJK glyph advances ~1em but its slot is
+            // 2·cell_width (≈1.2em); without this it leaves a right-side gap
+            // between every CJK character. The monospace primary font advances
+            // cell_width == glyph_w, so scale_x ≈ 1 (no distortion for ASCII).
+            let scale_x = font
+                .advance(glyph_id)
+                .map(|a| {
+                    let advance_px = a.x() * (scaled_size / upem);
+                    if advance_px > 0.0 {
+                        (glyph_w as f32 / advance_px).clamp(0.5, 2.0)
+                    } else {
+                        1.0
+                    }
+                })
+                .unwrap_or(1.0);
+
             let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
-                * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
+                * Transform2F::from_scale(Vector2F::new(scale_x, -1.0));
 
             let result = font.rasterize_glyph(
                 &mut canvas,
@@ -474,8 +492,21 @@ impl GlyphAtlas {
             // bottom and stops the next row's opaque background from clipping descenders.
             let upem = font.metrics().units_per_em as f32;
             let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
+            // Horizontal stretch so full-width glyphs fill their slot (see
+            // rasterize_glyph); ~1 for the monospace primary font.
+            let scale_x = font
+                .advance(glyph_id)
+                .map(|a| {
+                    let advance_px = a.x() * (scaled_size / upem);
+                    if advance_px > 0.0 {
+                        (glyph_w as f32 / advance_px).clamp(0.5, 2.0)
+                    } else {
+                        1.0
+                    }
+                })
+                .unwrap_or(1.0);
             let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
-                * Transform2F::from_scale(Vector2F::new(1.0, -1.0));
+                * Transform2F::from_scale(Vector2F::new(scale_x, -1.0));
 
             let result = font.rasterize_glyph(
                 &mut canvas,
