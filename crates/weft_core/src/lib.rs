@@ -1,5 +1,6 @@
 //! Weft Core — Terminal emulation logic (no rendering dependency)
 
+pub mod blocks;
 pub mod config;
 pub mod grid;
 pub mod input;
