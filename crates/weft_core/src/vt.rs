@@ -1148,3 +1148,52 @@ mod tests {
         assert_eq!(t.grid().scroll_region(), (0, 23));
     }
 }
+
+#[cfg(test)]
+mod reflow_cjk_tests {
+    use super::*;
+
+    /// A full-width char that would straddle the right margin makes the print
+    /// path wrap before placing it, leaving the last cell as a never-written
+    /// default. Reflow must NOT bake that trailing blank into the logical line
+    /// as a real space — otherwise each resize inserts a phantom space between
+    /// CJK characters (compounding). See Grid::resize content_end trimming.
+    #[test]
+    fn wide_wrap_blank_is_not_baked_into_logical_line() {
+        let mut t = Terminal::new(40, 94);
+        // Long line with CJK that lands at a wrap boundary when narrowed.
+        let echo = "andylee@host dir % cd /tmp && rm -f 待产手册_v1.0.md && touch 待产手册_v1.0.md && ls -lt 待产手册_v1.0.md\n";
+        t.process(echo.as_bytes());
+        let ls = "-rw-r--r--@ 1 user  wheel  0 Jun 16 12:00 待产手册_v1.0.md\n";
+        t.process(ls.as_bytes());
+        t.process(b"andylee@host /tmp % ");
+
+        // Wrap (narrow) then unwrap (wide). CJK runs must stay contiguous —
+        // no phantom space between characters.
+        for w in [50, 64, 94, 40, 94, 55, 94] {
+            t.resize(40, w);
+        }
+
+        let g = t.grid();
+        for row in 0..g.num_rows {
+            let mut run = String::new();
+            let mut in_cjk = false;
+            for col in 0..g.num_cols {
+                let c = g.cell(row, col);
+                if c.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+                let wide = unicode_width::UnicodeWidthChar::width(c.character).unwrap_or(0) > 1;
+                if wide {
+                    run.push(c.character);
+                    in_cjk = true;
+                } else if in_cjk && c.character == ' ' {
+                    // A space immediately after/within a CJK run is the bug.
+                    panic!("phantom space in CJK run {run:?} at row {row}");
+                } else if in_cjk {
+                    break;
+                }
+            }
+        }
+    }
+}

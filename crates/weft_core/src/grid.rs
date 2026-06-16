@@ -1068,18 +1068,21 @@ impl Grid {
         for (all_idx, row) in all_rows.into_iter().enumerate() {
             let is_cursor_row = all_idx == old_cursor_all_idx;
 
-            // Content extent: for wrapped rows the entire width is content
-            // (the terminal wrapped because the row was full); for the last
-            // sub-row, trim trailing spaces.
-            let content_end = if row.wrapped {
-                row.cells.len()
-            } else {
-                row.cells
-                    .iter()
-                    .rposition(|c| c.character != ' ' || !c.flags.is_empty())
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            };
+            // Content extent: trim trailing BLANK cells (never-written defaults).
+            // This matters for wrapped rows too: when a full-width char would
+            // straddle the right margin the print path wraps *before* placing
+            // it, leaving the last cell as a never-written default. Treating
+            // that cell as content (the old `row.cells.len()` for wrapped rows)
+            // baked a phantom space into the logical line on every reflow,
+            // compounding into growing gaps between CJK characters. A written
+            // space is preserved because writes always set the DIRTY flag, so
+            // `!flags.is_empty()` keeps it.
+            let content_end = row
+                .cells
+                .iter()
+                .rposition(|c| c.character != ' ' || !c.flags.is_empty())
+                .map(|i| i + 1)
+                .unwrap_or(0);
 
             let is_continuation = prev_wrapped && !merge_buf.is_empty();
             prev_wrapped = row.wrapped;
