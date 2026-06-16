@@ -629,8 +629,18 @@ impl App {
         // Subtract content padding first so clicks map to the padded grid.
         let cell_w = renderer.cell_width() as f64;
         let cell_h = renderer.cell_height() as f64;
-        let col = ((x - renderer.padding_x() as f64) / cell_w).max(0.0) as usize;
-        let row = ((y - renderer.padding_y() as f64) / cell_h).max(0.0) as usize;
+        // Clamp to valid grid bounds. A click past the right/bottom edge (e.g.
+        // a drag-to-select ending at the window margin) would otherwise yield
+        // col == num_cols / row == num_rows and panic text_from_grid on copy.
+        let (num_rows, num_cols) = self
+            .terminal
+            .as_ref()
+            .map(|t| (t.grid().num_rows, t.grid().num_cols))
+            .unwrap_or((1, 1));
+        let col = (((x - renderer.padding_x() as f64) / cell_w).max(0.0) as usize)
+            .min(num_cols.saturating_sub(1));
+        let row = (((y - renderer.padding_y() as f64) / cell_h).max(0.0) as usize)
+            .min(num_rows.saturating_sub(1));
         GridPos::new(row, col)
     }
 

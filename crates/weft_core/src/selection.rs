@@ -79,6 +79,17 @@ impl Selection {
     /// Extract the selected text from the grid.
     pub fn text_from_grid(&self, grid: &Grid) -> String {
         let (tl, br) = self.ordered();
+        // Clamp endpoints to valid grid bounds — a selection endpoint past the
+        // right/bottom margin (col == num_cols / row == num_rows) would
+        // otherwise index out of bounds below and panic on copy. (The app also
+        // clamps in pixel_to_grid; this is defense in depth for any caller.)
+        if grid.num_rows == 0 || grid.num_cols == 0 {
+            return String::new();
+        }
+        let max_row = grid.num_rows - 1;
+        let max_col = grid.num_cols - 1;
+        let tl = GridPos::new(tl.row.min(max_row), tl.col.min(max_col));
+        let br = GridPos::new(br.row.min(max_row), br.col.min(max_col));
         let mut result = String::new();
 
         match self.mode {
@@ -228,6 +239,28 @@ mod tests {
         );
         let text = sel.text_from_grid(&grid);
         assert!(!text.is_empty());
+    }
+
+    #[test]
+    fn out_of_bounds_end_does_not_panic() {
+        // Regression: a drag-to-select ending at the window margin used to
+        // produce col == num_cols / row == num_rows and panic text_from_grid
+        // on Cmd+C. Endpoints are now clamped to valid bounds.
+        let grid = filled_grid(); // 5 rows × 10 cols
+        let sel = Selection::new(
+            GridPos::new(0, 0),
+            GridPos::new(99, 99), // far past the grid
+            SelectionMode::Simple,
+        );
+        let text = sel.text_from_grid(&grid); // must not panic
+        assert!(!text.is_empty(), "should still capture in-bounds content");
+
+        let block = Selection::new(
+            GridPos::new(0, 0),
+            GridPos::new(99, 99),
+            SelectionMode::Block,
+        );
+        let _ = block.text_from_grid(&grid); // must not panic
     }
 
     #[test]
