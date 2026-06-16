@@ -841,29 +841,33 @@ fn clipboard_copy(text: &str) {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
 
-        let cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
-        if cls.is_null() {
+        let pb_cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
+        let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
+        if pb_cls.is_null() || str_cls.is_null() {
             return;
         }
-        let pasteboard: *mut AnyObject = msg_send![cls as *const AnyObject, generalPasteboard];
+        let pasteboard: *mut AnyObject = msg_send![pb_cls as *const AnyObject, generalPasteboard];
         if pasteboard.is_null() {
             return;
         }
 
-        let ns_string_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
-        if ns_string_cls.is_null() {
+        // NSPasteboardTypeString == "public.utf8-plain-text". Build NSStrings
+        // for the value and the type, then use the real setters (the old code
+        // called non-existent `setString:` and `string` selectors, so the
+        // clipboard never actually worked).
+        let c_text = std::ffi::CString::new(text).unwrap_or_default();
+        let value_ns: *mut AnyObject =
+            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_text.as_ptr()];
+        let c_type = std::ffi::CString::new("public.utf8-plain-text").unwrap();
+        let type_ns: *mut AnyObject =
+            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_type.as_ptr()];
+        if value_ns.is_null() || type_ns.is_null() {
             return;
         }
-        let ns_string: *mut AnyObject = msg_send![ns_string_cls as *const AnyObject, alloc];
-        let c_str = std::ffi::CString::new(text).unwrap_or_default();
-        let ns_string: *mut AnyObject = msg_send![ns_string,
-            initWithBytes: c_str.as_ptr()
-            length: text.len()
-            encoding: 1u64 // NSUTF8StringEncoding
-        ];
 
         let _: () = msg_send![pasteboard, clearContents];
-        let _: () = msg_send![pasteboard, setString: ns_string];
+        // `setString:forType:` returns BOOL (success); we ignore it.
+        let _: bool = msg_send![pasteboard, setString: value_ns forType: type_ns];
     }
 }
 
@@ -873,22 +877,24 @@ fn clipboard_paste() -> Option<String> {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
 
-        let cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
-        if cls.is_null() {
+        let pb_cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
+        let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
+        if pb_cls.is_null() || str_cls.is_null() {
             return None;
         }
-        let pasteboard: *mut AnyObject = msg_send![cls as *const AnyObject, generalPasteboard];
+        let pasteboard: *mut AnyObject = msg_send![pb_cls as *const AnyObject, generalPasteboard];
         if pasteboard.is_null() {
             return None;
         }
 
-        let ns_string: *mut AnyObject = msg_send![pasteboard, string];
-        if ns_string.is_null() {
-            return None;
-        }
+        let c_type = std::ffi::CString::new("public.utf8-plain-text").unwrap();
+        let type_ns: *mut AnyObject =
+            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_type.as_ptr()];
 
-        let len: usize = msg_send![ns_string, lengthOfBytesUsingEncoding: 1u64];
-        if len == 0 {
+        // stringForType: returns a nullable NSString (nil if no string of that
+        // type is on the pasteboard).
+        let ns_string: *mut AnyObject = msg_send![pasteboard, stringForType: type_ns];
+        if ns_string.is_null() {
             return None;
         }
 
