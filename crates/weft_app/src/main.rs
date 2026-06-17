@@ -133,10 +133,7 @@ impl App {
         }
     }
 
-    fn spawn_pty(&mut self) {
-        let rows = 24;
-        let cols = 80;
-
+    fn spawn_pty(&mut self, rows: usize, cols: usize) {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
 
         // Shell integration: redirect the shell's rc lookup so it sources our
@@ -168,7 +165,7 @@ impl App {
             cols,
             self.config.scrollback.lines,
         ));
-        info!(rows, cols, "initial terminal size (pre-resize)");
+        info!(rows, cols, "initial terminal size");
         self.pty = Some(pty);
     }
 
@@ -1000,16 +997,18 @@ impl ApplicationHandler<AppEvent> for App {
         // composed text — Chinese wouldn't type in the shell or in TUI apps.
         window.set_ime_allowed(true);
 
-        self.spawn_pty();
+        // Spawn the PTY at the window's actual cell size from the start (not a
+        // hardcoded 24×80). Otherwise the program reads 24×80, renders, then
+        // gets a late SIGWINCH to the real size and re-renders — a race that
+        // desyncs its cursor model from the grid (seen in claude: cursor/text
+        // land offset from the drawn UI).
+        let win_size = window.inner_size();
+        let init_rows =
+            ((win_size.height as f64) / renderer.cell_height() as f64).max(1.0) as usize;
+        let init_cols = ((win_size.width as f64) / renderer.cell_width() as f64).max(1.0) as usize;
+        self.spawn_pty(init_rows, init_cols);
         self.window = Some(window);
         self.renderer = Some(renderer);
-
-        // Size the terminal grid + PTY to the actual window. The grid was
-        // spawned at a default 24×80; without this it never matches the window
-        // (winit doesn't reliably fire an initial Resized), so full-screen /​
-        // line-based TUIs (claude, vim) render at the wrong size and the cursor
-        // lands offset from where the app draws its UI.
-        self.recompute_layout();
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.

@@ -558,6 +558,22 @@ impl vte::Perform for Terminal {
             return;
         }
 
+        // Diagnostic: trace cursor-moving CSIs to pin down TUI cursor desync.
+        if matches!(
+            action,
+            'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'H' | 'f' | 'G' | 'd'
+        ) {
+            tracing::debug!(
+                action = %action,
+                p0 = param(params, 0, 1),
+                p1 = param(params, 1, 1),
+                before_row = self.grid.cursor.row,
+                before_col = self.grid.cursor.col,
+                origin = self.origin_mode,
+                "csi-move"
+            );
+        }
+
         match action {
             // Cursor movement
             'A' => self.grid.move_up(param(params, 0, 1) as usize),
