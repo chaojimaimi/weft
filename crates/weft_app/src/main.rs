@@ -1004,6 +1004,13 @@ impl ApplicationHandler<AppEvent> for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
 
+        // Size the terminal grid + PTY to the actual window. The grid was
+        // spawned at a default 24×80; without this it never matches the window
+        // (winit doesn't reliably fire an initial Resized), so full-screen /​
+        // line-based TUIs (claude, vim) render at the wrong size and the cursor
+        // lands offset from where the app draws its UI.
+        self.recompute_layout();
+
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
         self.block_store = weft_cache_dir().and_then(|cache| {
@@ -1087,6 +1094,7 @@ impl ApplicationHandler<AppEvent> for App {
                         // intermediate event is fine.
                         if let Some(terminal) = &mut self.terminal {
                             terminal.resize(new_rows, new_cols);
+                            info!(rows = new_rows, cols = new_cols, "terminal resized (event)");
                         }
 
                         // Debounce only the PTY SIGWINCH to prevent the
