@@ -875,8 +875,12 @@ fn clipboard_copy(text: &str) {
             return;
         }
 
-        let _: () = msg_send![pasteboard, clearContents];
-        // `setString:forType:` returns BOOL (success); we ignore it.
+        // clearContents returns NSInteger (objc2 verifies the return type code
+        // against the method signature at runtime in debug, so this must be
+        // `isize` = 'q', not `()`).
+        let _: isize = msg_send![pasteboard, clearContents];
+        // `setString:forType:` returns BOOL (arm64 macOS: `_Bool` = type code
+        // 'B', matching Rust `bool`); we ignore it.
         let _: bool = msg_send![pasteboard, setString: value_ns forType: type_ns];
     }
 }
