@@ -357,6 +357,15 @@ impl App {
             .unwrap_or(false);
 
         let bytes = self.input_handler.encode_key(key, m);
+        // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
+        // send for each key, including whether DECCKM/app-cursor mode is on.
+        tracing::debug!(
+            ?key,
+            ?m,
+            app_cursor_keys = self.input_handler.app_cursor_keys,
+            ?bytes,
+            "key → pty"
+        );
         if !bytes.is_empty() {
             if let Some(pty) = &self.pty {
                 if let Err(e) = pty.write_sync(&bytes) {
@@ -963,6 +972,11 @@ impl ApplicationHandler<AppEvent> for App {
             (win.padding_x, win.padding_y),
             win.opacity,
         );
+
+        // Enable IME so CJK input methods compose/commit into the PTY. Without
+        // this winit delivers raw keystrokes (e.g. pinyin letters) instead of
+        // composed text — Chinese wouldn't type in the shell or in TUI apps.
+        window.set_ime_allowed(true);
 
         self.spawn_pty();
         self.window = Some(window);
