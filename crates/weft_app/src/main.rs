@@ -653,19 +653,37 @@ impl App {
         GridPos::new(row, col)
     }
 
+    /// True when the foreground program has grabbed the mouse (mouse reporting
+    /// on) and the user is NOT holding Shift to force a selection. While true,
+    /// clicks/drags are forwarded to the program and we must NOT start a visual
+    /// selection (otherwise a stray blue cell follows the click — e.g. inside
+    /// `claude`/`vim`). Standard xterm/Alacritty behavior.
+    fn mouse_reporting_active(&self) -> bool {
+        if self.mods.state().shift_key() {
+            return false; // Shift = force terminal selection
+        }
+        self.terminal
+            .as_ref()
+            .map(|t| t.mouse_protocol != MouseProtocol::Off)
+            .unwrap_or(false)
+    }
+
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
         let pos = self.pixel_to_grid(x, y);
+        let selecting = !self.mouse_reporting_active();
 
         match button {
             winit::event::MouseButton::Left => {
-                // Double-click: line selection; Triple-click: block selection
-                // For simplicity: Shift+click = block, click = simple
-                let mode = if self.mods.state().shift_key() {
-                    SelectionMode::Block
-                } else {
-                    SelectionMode::Simple
-                };
-                self.selection_handler.start(pos, mode);
+                if selecting {
+                    // Double-click: line selection; Triple-click: block selection
+                    // For simplicity: Shift+click = block, click = simple
+                    let mode = if self.mods.state().shift_key() {
+                        SelectionMode::Block
+                    } else {
+                        SelectionMode::Simple
+                    };
+                    self.selection_handler.start(pos, mode);
+                }
 
                 // If mouse protocol is active, send mouse event to PTY
                 self.send_mouse_event(MouseButton::Left, MouseAction::Press, pos);
@@ -676,11 +694,13 @@ impl App {
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }
             winit::event::MouseButton::Right => {
-                // Right click: extend selection
-                if self.selection_handler.selection.is_none() {
-                    self.selection_handler.start(pos, SelectionMode::Simple);
-                } else {
-                    self.selection_handler.extend(pos);
+                if selecting {
+                    // Right click: extend selection
+                    if self.selection_handler.selection.is_none() {
+                        self.selection_handler.start(pos, SelectionMode::Simple);
+                    } else {
+                        self.selection_handler.extend(pos);
+                    }
                 }
                 self.send_mouse_event(MouseButton::Right, MouseAction::Press, pos);
             }
