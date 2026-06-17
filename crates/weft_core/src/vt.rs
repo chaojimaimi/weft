@@ -70,6 +70,12 @@ pub struct Terminal {
     alt_active: bool,
     /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
     saved_cursor: Option<Cursor>,
+    /// Bytes to write back to the PTY in response to terminal queries
+    /// (DA1/DA2 device attributes, DSR cursor-position report, text-area size
+    /// report). Modern TUIs probe these to detect capabilities and engage their
+    /// full UI; weft must answer or they degrade (claude falls back to a basic
+    /// line mode with an unconstrained, roaming cursor).
+    pending_output: Vec<u8>,
 }
 
 impl Terminal {
@@ -99,6 +105,7 @@ impl Terminal {
             alt_grid: Grid::with_scrollback(rows, cols, 0),
             alt_active: false,
             saved_cursor: None,
+            pending_output: Vec::new(),
         }
     }
 
@@ -200,6 +207,17 @@ impl Terminal {
             parser.advance(self, byte);
         }
         self.parser = parser;
+    }
+
+    /// Queue bytes to write back to the PTY (terminal query responses).
+    fn respond(&mut self, bytes: &[u8]) {
+        self.pending_output.extend_from_slice(bytes);
+    }
+
+    /// Take any pending response bytes (DA/DSR/size reports). The app writes
+    /// these to the PTY after each `process` batch.
+    pub fn take_response(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_output)
     }
 
     /// Resize the terminal grid (and alternate screen to match).
@@ -641,6 +659,38 @@ impl vte::Perform for Terminal {
 
             // SGR
             'm' => self.handle_sgr(params),
+
+            // ── Terminal queries (must respond, else TUIs degrade) ──
+            // DA1 / primary device attributes (CSI c).
+            'c' if intermediates.is_empty() => {
+                // VT220-class with ANSI color — a response any TUI accepts.
+                self.respond(b"\x1b[?62;1;2;4;6;9;15;22c");
+            }
+            // DA2 / secondary device attributes (CSI > c).
+            'c' if intermediates == [b'>'] => {
+                // "weft", version 0, ROM 0.
+                self.respond(b"\x1b[>0;276;0c");
+            }
+            // DSR — device status / cursor-position report (CSI n).
+            'n' => match param(params, 0, 0) {
+                5 => self.respond(b"\x1b[0n"), // terminal OK
+                6 => {
+                    // CPR: cursor position, 1-based.
+                    let r = self.grid.cursor.row + 1;
+                    let c = self.grid.cursor.col + 1;
+                    self.respond(format!("\x1b[{r};{c}R").as_bytes());
+                }
+                _ => {}
+            },
+            // Text-area size report (CSI t). 18 = size in chars, 14/16 = pixels.
+            't' => match param(params, 0, 0) {
+                18 | 19 => {
+                    let rows = self.grid.num_rows;
+                    let cols = self.grid.num_cols;
+                    self.respond(format!("\x1b[8;{rows};{cols}t").as_bytes());
+                }
+                _ => {}
+            },
 
             // Scrolling
             'S' => {
@@ -1202,6 +1252,41 @@ mod tests {
             b.output
         );
         assert_eq!(b.exit_code, Some(0));
+    }
+
+    // ── Terminal query responses (DA/DSR/size) ──────────────────
+
+    #[test]
+    fn dsr_reports_cursor_position_1_based() {
+        let mut t = term();
+        t.grid_mut().cursor.row = 4;
+        t.grid_mut().cursor.col = 9;
+        t.process(b"\x1b[6n");
+        // 1-based → row 5, col 10.
+        assert_eq!(t.take_response(), b"\x1b[5;10R");
+    }
+
+    #[test]
+    fn da1_and_text_area_size_responses() {
+        let mut t = term(); // 24×80
+        t.process(b"\x1b[c"); // DA1
+        t.process(b"\x1b[18t"); // text-area size in chars
+        let resp = t.take_response();
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.contains("\x1b[?62") && s.contains('c'),
+            "DA1 missing: {s}"
+        );
+        assert!(s.contains("\x1b[8;24;80t"), "size report missing: {s}");
+    }
+
+    #[test]
+    fn da2_secondary_device_attributes() {
+        let mut t = term();
+        t.process(b"\x1b[>c");
+        let resp = t.take_response();
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("\x1b[>") && s.ends_with('c'), "DA2: {s}");
     }
 
     // ── Colors ───────────────────────────────────────────────────

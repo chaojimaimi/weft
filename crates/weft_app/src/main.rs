@@ -196,9 +196,20 @@ impl App {
             match msg {
                 AppMsg::PtyOutput(data) => {
                     tracing::trace!("PTY output: {} bytes", data.len());
+                    let mut response = Vec::new();
                     if let Some(terminal) = &mut self.terminal {
                         terminal.process(&data);
+                        response = terminal.take_response();
                         need_redraw = true;
+                    }
+                    // Write any terminal-query responses (DA/DSR/size reports)
+                    // back to the PTY so TUIs get their capability answers.
+                    if !response.is_empty() {
+                        if let Some(pty) = &self.pty {
+                            if let Err(e) = pty.write_sync(&response) {
+                                warn!(error = %e, "failed to write terminal response");
+                            }
+                        }
                     }
                 }
                 AppMsg::PtyExit(code) => {
