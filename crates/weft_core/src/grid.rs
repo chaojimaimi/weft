@@ -623,10 +623,22 @@ impl Grid {
         self.cursor.col = col.min(self.num_cols - 1);
     }
 
-    /// Move cursor to absolute position (1-based params → 0-based).
-    pub fn goto(&mut self, row: usize, col: usize) {
+    /// Move cursor to the position given by CUP/HVP (1-based params).
+    ///
+    /// Under DECOM (origin mode), the row is relative to the scroll-region top
+    /// and clamped to the region — full-screen TUI apps (e.g. `claude`, vim)
+    /// set a scroll region + DECOM and expect CUP to be region-relative. We
+    /// support only vertical margins (DECSTBM); columns stay absolute
+    /// (no DECSLRM left/right margins).
+    pub fn goto(&mut self, row: usize, col: usize, origin_mode: bool) {
         self.cursor.wrap_pending = false;
-        self.cursor.row = row.saturating_sub(1).min(self.num_rows - 1);
+        let (origin_row, max_row) = if origin_mode {
+            (self.scroll_top, self.scroll_bottom)
+        } else {
+            (0, self.num_rows - 1)
+        };
+        let r = row.saturating_sub(1);
+        self.cursor.row = (origin_row + r).min(max_row);
         self.cursor.col = col.saturating_sub(1).min(self.num_cols - 1);
     }
 
@@ -1487,7 +1499,7 @@ mod tests {
     #[test]
     fn goto_sets_position() {
         let mut grid = Grid::new(24, 80);
-        grid.goto(10, 20); // 1-based → (9, 19)
+        grid.goto(10, 20, false); // 1-based → (9, 19)
         assert_eq!(grid.cursor.row, 9);
         assert_eq!(grid.cursor.col, 19);
     }
@@ -1495,9 +1507,26 @@ mod tests {
     #[test]
     fn goto_clamps_to_grid_bounds() {
         let mut grid = Grid::new(24, 80);
-        grid.goto(100, 200);
+        grid.goto(100, 200, false);
         assert_eq!(grid.cursor.row, 23);
         assert_eq!(grid.cursor.col, 79);
+    }
+
+    #[test]
+    fn goto_origin_mode_is_relative_to_scroll_region() {
+        // set_scroll_region is 1-based: (6,11) → 0-based rows 5..10.
+        // DECOM set → CUP (1,1) is the region top (row 5).
+        let mut grid = Grid::new(24, 80);
+        grid.set_scroll_region(6, 11);
+        grid.goto(1, 1, true);
+        assert_eq!(grid.cursor.row, 5, "origin mode offsets by scroll_top");
+        assert_eq!(grid.cursor.col, 0);
+        // Row 3 → region row 5+2 = 7.
+        grid.goto(3, 5, true);
+        assert_eq!(grid.cursor.row, 7);
+        // Out-of-range row clamps to scroll_bottom (10), not the screen bottom.
+        grid.goto(100, 1, true);
+        assert_eq!(grid.cursor.row, 10);
     }
 
     #[test]
@@ -1581,7 +1610,7 @@ mod tests {
         grid.cursor.row = 5;
         grid.cursor.col = 10;
         grid.save_cursor();
-        grid.goto(20, 40);
+        grid.goto(20, 40, false);
         grid.restore_cursor();
         assert_eq!(grid.cursor.row, 5);
         assert_eq!(grid.cursor.col, 10);

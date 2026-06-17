@@ -348,7 +348,12 @@ impl Terminal {
     fn handle_dec_private_mode(&mut self, mode: u16, set: bool) {
         match mode {
             1 => self.app_cursor_keys = set, // DECCKM
-            6 => self.origin_mode = set,     // DECOM
+            6 => {
+                // DECOM (origin mode): CUP becomes relative to the scroll
+                // region. Full-screen TUIs (vim, claude) rely on this.
+                self.origin_mode = set;
+                tracing::debug!(set, "DECOM origin mode toggled");
+            }
             7 => { /* DECAWM — auto wrap mode, always on */ }
             25 => self.cursor_visible = set, // DECTCEM — cursor show/hide
             47 | 1049 => {
@@ -568,7 +573,7 @@ impl vte::Perform for Terminal {
             'H' | 'f' => {
                 let row = param(params, 0, 1) as usize;
                 let col = param(params, 1, 1) as usize;
-                self.grid.goto(row, col);
+                self.grid.goto(row, col, self.origin_mode);
             }
             'G' => {
                 let col = param(params, 0, 1) as usize;
