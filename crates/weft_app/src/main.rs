@@ -168,6 +168,7 @@ impl App {
             cols,
             self.config.scrollback.lines,
         ));
+        info!(rows, cols, "initial terminal size (pre-resize)");
         self.pty = Some(pty);
     }
 
@@ -623,6 +624,7 @@ impl App {
         }
         if let Some(terminal) = &mut self.terminal {
             terminal.resize(new_rows, new_cols);
+            info!(rows = new_rows, cols = new_cols, "terminal resized");
         }
         self.pending_pty_resize = Some((new_rows, new_cols));
         self.last_resize_instant = std::time::Instant::now();

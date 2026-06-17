@@ -158,6 +158,12 @@ impl Terminal {
             }
             self.alt_active = false;
         }
+        tracing::info!(
+            active = self.alt_active,
+            rows = self.grid.num_rows,
+            cols = self.grid.num_cols,
+            "alt-screen toggled"
+        );
     }
 
     pub fn attrs(&self) -> &Attrs {
@@ -574,6 +580,14 @@ impl vte::Perform for Terminal {
                 let row = param(params, 0, 1) as usize;
                 let col = param(params, 1, 1) as usize;
                 self.grid.goto(row, col, self.origin_mode);
+                tracing::debug!(
+                    req_row = row,
+                    req_col = col,
+                    origin = self.origin_mode,
+                    cur_row = self.grid.cursor.row,
+                    cur_col = self.grid.cursor.col,
+                    "CUP"
+                );
             }
             'G' => {
                 let col = param(params, 0, 1) as usize;
@@ -627,20 +641,37 @@ impl vte::Perform for Terminal {
             'r' => {
                 if params.is_empty() {
                     self.grid.reset_scroll_region();
+                    tracing::debug!("scroll region reset");
                 } else {
                     let top = param(params, 0, 1) as usize;
                     let bottom = param(params, 1, 0) as usize;
                     if bottom == 0 {
                         self.grid.reset_scroll_region();
+                        tracing::debug!("scroll region reset (bottom=0)");
                     } else {
                         self.grid.set_scroll_region(top, bottom);
+                        tracing::debug!(top, bottom, "scroll region set");
                     }
                 }
             }
 
             // Cursor save/restore (SCO style)
-            's' => self.grid.save_cursor(),
-            'u' => self.grid.restore_cursor(),
+            's' => {
+                self.grid.save_cursor();
+                tracing::debug!(
+                    row = self.grid.cursor.row,
+                    col = self.grid.cursor.col,
+                    "DECSC save"
+                );
+            }
+            'u' => {
+                self.grid.restore_cursor();
+                tracing::debug!(
+                    row = self.grid.cursor.row,
+                    col = self.grid.cursor.col,
+                    "DECRC restore"
+                );
+            }
 
             // Insert/delete
             '@' => self.grid.insert_blank(param(params, 0, 1) as usize),
