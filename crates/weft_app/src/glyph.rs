@@ -721,6 +721,18 @@ mod transform_probe {
     }
 
     #[test]
+    fn menlo_renders_angle_quote_with_ink() {
+        // Regression guard: the ❯ (U+276F) prompt marker must rasterize with
+        // real ink from Menlo. (Apple Symbols does NOT have U+276F, so the
+        // prompt color/visibility depends on Menlo rendering it directly.)
+        let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
+        assert!(font.glyph_for_char('❯').is_some(), "Menlo must have ❯");
+        let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28);
+        let ink = px.iter().filter(|p| **p > 0).count();
+        assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
+    }
+
+    #[test]
     fn probe_transforms() {
         let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
         let scaled = 28.0f32;

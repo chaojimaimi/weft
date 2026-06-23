@@ -421,7 +421,11 @@ fragment float4 text_fragment(
         let mut vertices = if let Some(p) = prompt {
             let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
             let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
-            self.build_block_view_vertices(terminal.block_tracker().session_blocks(), box_top_y)
+            self.build_block_view_vertices(
+                terminal.block_tracker().session_blocks(),
+                box_top_y,
+                p.cwd,
+            )
         } else {
             self.build_grid_vertices(
                 grid,
@@ -1122,9 +1126,11 @@ fragment float4 text_fragment(
 
         // Prompt glyph only — cwd lives in the block history, not the input
         // box (Warp style), so the typed command never runs into the path.
+        // Vivid color so the marker reads distinctly (theme.cursor was too dim).
         let prompt_str = "❯ ";
         let prompt_chars = 2;
-        self.push_text(&mut verts, left, text_y0, prompt_str, accent, prompt_chars);
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        self.push_text(&mut verts, left, text_y0, prompt_str, prompt_c, prompt_chars);
 
         // Editor buffer lines (line 0 starts after the prompt).
         for (i, line) in p.lines.iter().enumerate() {
@@ -1174,7 +1180,12 @@ fragment float4 text_fragment(
     /// captured output, newest at the bottom just above the input box. Older
     /// blocks scroll off the top once the viewport fills. `box_top_y` is the
     /// top edge of the input box (blocks render upward from there).
-    fn build_block_view_vertices(&self, blocks: &[Block], box_top_y: f32) -> Vec<f32> {
+    fn build_block_view_vertices(
+        &self,
+        blocks: &[Block],
+        box_top_y: f32,
+        cwd: Option<&str>,
+    ) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -1187,12 +1198,16 @@ fragment float4 text_fragment(
         let pad_x = self.padding_x;
         let pad_y = self.padding_y;
         let left = pad_x + cw; // one-cell left margin (matches the input box)
-        let cols = (((vp_w - pad_x - left) / cw).max(1.0)) as usize;
+        let right = vp_w - pad_x;
+        let cols = (((right - left) / cw).max(1.0)) as usize;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.cursor);
+        // Vivid prompt color so ❯ reads as a distinct marker, not body text
+        // (theme.cursor was too close to the foreground to stand out).
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
         let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+        let separator = [0.65, 0.65, 0.65, 0.22];
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -1200,8 +1215,21 @@ fragment float4 text_fragment(
         // shell's live output is irrelevant once a command has finished).
         push_quad(&mut verts, [0.0, 0.0, vp_w, vp_h], bg_uv, [0.0; 4], theme_bg);
 
-        // Render blocks newest-first, upward from just above the input box.
         let mut y = box_top_y - ch;
+
+        // Empty session: show the current cwd so the initial window isn't a
+        // blank void (Warp surfaces your location up front).
+        if blocks.is_empty() {
+            if let Some(cwd) = cwd {
+                let display = abbreviate_path(cwd);
+                if !display.is_empty() && y >= pad_y {
+                    self.push_text(&mut verts, left, y, &display, dim, cols);
+                }
+            }
+            return verts;
+        }
+
+        // Render blocks newest-first, upward from just above the input box.
         for b in blocks.iter().rev() {
             if y < pad_y {
                 break;
@@ -1214,9 +1242,9 @@ fragment float4 text_fragment(
                 self.push_text(&mut verts, left, y, line, dim, cols);
                 y -= ch;
             }
-            // Command line: ❯ command
+            // Command line: ❯ command (vivid ❯ + white command).
             if y >= pad_y {
-                self.push_text(&mut verts, left, y, "❯ ", accent, cols);
+                self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
                 self.push_text(&mut verts, cmd_x, y, &b.command, fg, avail);
@@ -1226,21 +1254,32 @@ fragment float4 text_fragment(
             // the command, so it renders last (highest) within the block.
             if y >= pad_y {
                 let dur = block_duration_str(b);
-                let cwd = b
+                let bcwd = b
                     .cwd
                     .as_deref()
                     .map(abbreviate_path)
                     .unwrap_or_else(|| "~".to_string());
                 let header = if dur.is_empty() {
-                    cwd
+                    bcwd
                 } else {
-                    format!("{cwd} ({dur})")
+                    format!("{bcwd} ({dur})")
                 };
                 self.push_text(&mut verts, left, y, &header, dim, cols);
                 y -= ch;
             }
-            // A little breathing room between blocks.
-            y -= ch * 0.4;
+            // Separator rule + a blank line before the older block above
+            // (Warp-style block separation — fixes blocks running together).
+            y -= ch;
+            if y >= pad_y {
+                let ly = y + ch * 0.5;
+                push_quad(
+                    &mut verts,
+                    [left, ly, right, ly + 1.5],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
+            }
         }
 
         verts
