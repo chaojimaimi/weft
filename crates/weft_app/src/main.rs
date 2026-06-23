@@ -359,6 +359,36 @@ impl App {
             return;
         }
 
+        // Editor takeover: at the prompt with integration ready, keys drive the
+        // input-box editor instead of being forwarded to the PTY. Enter submits
+        // (writes the command); Shift+Enter grows the box. Drops back to
+        // passthrough automatically in alt-screen / command-running / SSH.
+        let input_mode = self
+            .terminal
+            .as_ref()
+            .map(|t| t.effective_input_mode())
+            .unwrap_or(weft_core::input::InputMode::Passthrough);
+        if input_mode == weft_core::input::InputMode::Editor {
+            let prev_lines = self
+                .terminal
+                .as_ref()
+                .map(|t| t.editor().line_count())
+                .unwrap_or(1);
+            let consumed = self.handle_editor_key(key, m);
+            let new_lines = self
+                .terminal
+                .as_ref()
+                .map(|t| t.editor().line_count())
+                .unwrap_or(1);
+            if new_lines != prev_lines {
+                self.recompute_layout();
+            }
+            if consumed {
+                self.request_redraw();
+                return;
+            }
+        }
+
         self.input_handler.app_cursor_keys = self
             .terminal
             .as_ref()
@@ -472,6 +502,197 @@ impl App {
                 self.request_redraw();
                 true
             }
+            _ => false,
+        }
+    }
+
+    /// Handle a key while in Editor input mode (the input box owns the prompt).
+    /// Returns true if consumed. Ctrl chords that aren't editor ops fall through
+    /// (returns false) so Ctrl+C etc. still reach the PTY.
+    fn handle_editor_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
+        use weft_core::input::{KeyCode::*, Modifiers};
+
+        // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
+        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
+            let consumed = if let Some(t) = self.terminal.as_mut() {
+                let e = t.editor_mut();
+                match key {
+                    Char('a') => {
+                        e.buffer.move_line_home();
+                        true
+                    }
+                    Char('e') => {
+                        e.buffer.move_line_end();
+                        true
+                    }
+                    Char('w') => {
+                        e.buffer.delete_word_back();
+                        true
+                    }
+                    Char('u') => {
+                        e.buffer.clear_line();
+                        true
+                    }
+                    Char('k') => {
+                        e.buffer.delete_to_end();
+                        true
+                    }
+                    Char('r') => {
+                        if e.is_searching() {
+                            e.search_next();
+                        } else {
+                            e.search_start();
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            return consumed;
+        }
+
+        // Ctrl+R search mode intercepts printable/backspace/enter/esc/arrows.
+        let searching = self
+            .terminal
+            .as_ref()
+            .map(|t| t.editor().is_searching())
+            .unwrap_or(false);
+        if searching {
+            if let Some(t) = self.terminal.as_mut() {
+                let e = t.editor_mut();
+                match key {
+                    Char(c) => {
+                        e.search_input(c);
+                        return true;
+                    }
+                    Backspace => {
+                        e.search_backspace();
+                        return true;
+                    }
+                    Enter => {
+                        e.search_accept();
+                        return true;
+                    }
+                    Escape => {
+                        e.search_cancel();
+                        return true;
+                    }
+                    Up | Down => {
+                        e.search_next();
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            return false;
+        }
+
+        let shift = mods.contains(Modifiers::SHIFT);
+        match key {
+            Enter if !shift => {
+                // Submit: build PTY bytes and locally block the editor (the
+                // Enter→preexec window). The shell's later 133;B consumes the
+                // editor's command via `command_from_editor`.
+                let bytes = self
+                    .terminal
+                    .as_mut()
+                    .map(|t| t.submit_command())
+                    .unwrap_or_default();
+                if !bytes.is_empty() {
+                    if let Some(pty) = &self.pty {
+                        let _ = pty.write_sync(&bytes);
+                    }
+                }
+                let resp = self
+                    .terminal
+                    .as_mut()
+                    .map(|t| t.take_response())
+                    .unwrap_or_default();
+                if !resp.is_empty() {
+                    if let Some(pty) = &self.pty {
+                        let _ = pty.write_sync(&resp);
+                    }
+                }
+                true
+            }
+            Enter => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.split_newline();
+                }
+                true
+            }
+            Char(c) => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.insert_char(c);
+                }
+                true
+            }
+            Backspace => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.delete_backspace();
+                }
+                true
+            }
+            Delete => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.delete_forward();
+                }
+                true
+            }
+            Left => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.move_left();
+                }
+                true
+            }
+            Right => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.move_right();
+                }
+                true
+            }
+            Home => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.move_line_home();
+                }
+                true
+            }
+            End => {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.editor_mut().buffer.move_line_end();
+                }
+                true
+            }
+            Up => {
+                if let Some(t) = self.terminal.as_mut() {
+                    let e = t.editor_mut();
+                    if e.buffer.cursor.0 == 0 {
+                        e.history_prev();
+                    } else {
+                        e.buffer.cursor.0 -= 1;
+                        let len = e.buffer.lines[e.buffer.cursor.0].chars().count();
+                        e.buffer.cursor.1 = e.buffer.cursor.1.min(len);
+                    }
+                }
+                true
+            }
+            Down => {
+                if let Some(t) = self.terminal.as_mut() {
+                    let e = t.editor_mut();
+                    let last = e.buffer.line_count() - 1;
+                    if e.buffer.cursor.0 == last {
+                        e.history_next();
+                    } else {
+                        e.buffer.cursor.0 += 1;
+                        let len = e.buffer.lines[e.buffer.cursor.0].chars().count();
+                        e.buffer.cursor.1 = e.buffer.cursor.1.min(len);
+                    }
+                }
+                true
+            }
+            Escape => true, // swallow stray Esc in editor mode
             _ => false,
         }
     }
@@ -1194,16 +1415,31 @@ impl ApplicationHandler<AppEvent> for App {
                     }
                     winit::event::Ime::Commit(text) => {
                         self.ime_preedit.clear();
-                        // Send committed text to PTY
                         if !text.is_empty() {
-                            let bracketed = self
+                            let mode = self
                                 .terminal
                                 .as_ref()
-                                .map(|t| t.bracketed_paste)
-                                .unwrap_or(false);
-                            let bytes = encode_paste(&text, bracketed);
-                            if let Some(pty) = &self.pty {
-                                let _ = pty.write_sync(&bytes);
+                                .map(|t| t.effective_input_mode())
+                                .unwrap_or(weft_core::input::InputMode::Passthrough);
+                            if mode == weft_core::input::InputMode::Editor {
+                                // Editor takeover: composed text goes into the box.
+                                if let Some(t) = self.terminal.as_mut() {
+                                    for c in text.chars() {
+                                        t.editor_mut().buffer.insert_char(c);
+                                    }
+                                }
+                                self.request_redraw();
+                            } else {
+                                // Passthrough: send committed text to the PTY.
+                                let bracketed = self
+                                    .terminal
+                                    .as_ref()
+                                    .map(|t| t.bracketed_paste)
+                                    .unwrap_or(false);
+                                let bytes = encode_paste(&text, bracketed);
+                                if let Some(pty) = &self.pty {
+                                    let _ = pty.write_sync(&bytes);
+                                }
                             }
                         }
                     }
