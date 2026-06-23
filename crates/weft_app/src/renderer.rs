@@ -402,13 +402,15 @@ fragment float4 text_fragment(
             }
         }
 
-        // Build vertex data from Grid cells
+        // Build vertex data from Grid cells. The grid cursor is hidden while
+        // the editor input box owns the prompt — that box draws its own
+        // cursor, and showing both produced a double-cursor.
         let mut vertices = self.build_grid_vertices(
             grid,
             terminal.palette(),
             cursor,
             selection,
-            terminal.cursor_visible && cursor_blink_on,
+            terminal.cursor_visible && cursor_blink_on && prompt.is_none(),
             terminal.cursor_style,
         );
 
@@ -420,7 +422,7 @@ fragment float4 text_fragment(
 
         // Overlay the editor input box at the bottom (Editor mode only).
         if let Some(p) = prompt {
-            vertices.extend_from_slice(&self.build_prompt_vertices(p));
+            vertices.extend_from_slice(&self.build_prompt_vertices(p, cursor_blink_on));
         }
 
         // Debug: log first row characters and verify vertex data
@@ -1040,7 +1042,7 @@ fragment float4 text_fragment(
     /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
     /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
     /// after the grid so it composites on top via the enabled alpha blend.
-    fn build_prompt_vertices(&self, p: &PromptDrawParams) -> Vec<f32> {
+    fn build_prompt_vertices(&self, p: &PromptDrawParams, cursor_blink_on: bool) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -1060,11 +1062,13 @@ fragment float4 text_fragment(
         let box_x1 = (vp_w - self.padding_x).max(box_x0);
 
         let theme_bg = color_to_normalized(self.theme.background);
+        // Opaque so the box cleanly covers the grid rows behind it — the grid
+        // is now full-window, so the shell's blank prompt sits under the box.
         let box_bg = [
-            theme_bg[0] * 0.45,
-            theme_bg[1] * 0.45,
-            theme_bg[2] * 0.45,
-            0.94,
+            theme_bg[0] * 0.5,
+            theme_bg[1] * 0.5,
+            theme_bg[2] * 0.5,
+            1.0,
         ];
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.cursor);
@@ -1097,20 +1101,11 @@ fragment float4 text_fragment(
             return verts;
         }
 
-        // Prompt glyph + cwd on the first text row.
-        let prompt_str = match p.cwd {
-            Some(cwd) => format!("❯ {cwd}"),
-            None => "❯ ".to_string(),
-        };
-        let prompt_chars = prompt_str.chars().count();
-        self.push_text(
-            &mut verts,
-            left,
-            text_y0,
-            &prompt_str,
-            accent,
-            prompt_chars.min(box_cols),
-        );
+        // Prompt glyph only — cwd lives in the block history, not the input
+        // box (Warp style), so the typed command never runs into the path.
+        let prompt_str = "❯ ";
+        let prompt_chars = 2;
+        self.push_text(&mut verts, left, text_y0, prompt_str, accent, prompt_chars);
 
         // Editor buffer lines (line 0 starts after the prompt).
         for (i, line) in p.lines.iter().enumerate() {
@@ -1135,13 +1130,15 @@ fragment float4 text_fragment(
         };
         let cx = text_start_x + cc as f32 * cw;
         let bar_w = (cw * 0.12).max(2.0);
-        push_quad(
-            &mut verts,
-            [cx, cy, cx + bar_w, cy + ch],
-            bg_uv,
-            [0.0; 4],
-            accent,
-        );
+        if cursor_blink_on {
+            push_quad(
+                &mut verts,
+                [cx, cy, cx + bar_w, cy + ch],
+                bg_uv,
+                [0.0; 4],
+                accent,
+            );
+        }
 
         // IME preedit right after the cursor.
         if let Some(preedit) = p.preedit {

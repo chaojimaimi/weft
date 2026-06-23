@@ -250,7 +250,28 @@ impl GlyphAtlas {
         } else if is_wide {
             self.cjk_font.as_ref().unwrap_or(&self.primary_font)
         } else {
-            &self.primary_font
+            // Narrow text: prefer the monospace primary, but if it lacks the
+            // glyph (e.g. ❯ U+276F, some box-drawing/punctuation) fall back to
+            // the CJK then emoji font before giving up. Without this, a missing
+            // glyph rasterizes as a blank cell — the input-box prompt marker ❯
+            // disappeared entirely.
+            if self.primary_font.glyph_for_char(ch).is_some() {
+                &self.primary_font
+            } else if self
+                .cjk_font
+                .as_ref()
+                .is_some_and(|f| f.glyph_for_char(ch).is_some())
+            {
+                self.cjk_font.as_ref().unwrap()
+            } else if self
+                .emoji_font
+                .as_ref()
+                .is_some_and(|f| f.glyph_for_char(ch).is_some())
+            {
+                self.emoji_font.as_ref().unwrap()
+            } else {
+                &self.primary_font
+            }
         };
 
         // Step 1: Allocate atlas slot (layout only, no pixel work)

@@ -834,38 +834,15 @@ impl App {
         };
         let size = window.inner_size();
         let usable_w = size.width as f64 - 2.0 * renderer.padding_x() as f64;
-        // Output-grid height excludes the bottom input box (0 when the box is
-        // hidden in passthrough mode) — the shell never sees the box's rows.
-        let input_h = self.input_box_height_px();
-        let usable_h = (size.height as f64 - 2.0 * renderer.padding_y() as f64 - input_h).max(0.0);
+        // The grid/PTY is always the FULL window. The editor input box is an
+        // overlay that covers the bottom rows in Editor mode — it never
+        // changes the grid size, so editor↔passthrough transitions don't fire
+        // a SIGWINCH/reflow storm (which was clearing prior output + the
+        // command echo). The shell's blank prompt sits under the box.
+        let usable_h = (size.height as f64 - 2.0 * renderer.padding_y() as f64).max(0.0);
         let cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
         let rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
         (rows, cols)
-    }
-
-    /// Pixel height of the bottom input box. 0 when not in Editor mode (box
-    /// hidden → the full window is the output grid). Otherwise one padding row
-    /// above + N text lines + one padding row below.
-    fn input_box_height_px(&self) -> f64 {
-        let mode = self
-            .terminal
-            .as_ref()
-            .map(|t| t.effective_input_mode())
-            .unwrap_or(weft_core::input::InputMode::Passthrough);
-        if mode != weft_core::input::InputMode::Editor {
-            return 0.0;
-        }
-        let Some(renderer) = &self.renderer else {
-            return 0.0;
-        };
-        let lines = self
-            .terminal
-            .as_ref()
-            .map(|t| t.editor().line_count())
-            .unwrap_or(1)
-            .max(1);
-        let ch = renderer.cell_height() as f64;
-        lines as f64 * ch + 2.0 * ch
     }
 
     /// Recompute grid rows/cols from the current window + cell dimensions and
@@ -1340,14 +1317,13 @@ impl ApplicationHandler<AppEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
-                // Subtract the input-box height (0 when hidden) so the PTY rows
-                // match the output grid, not the full window.
-                let input_h = self.input_box_height_px();
+                // Grid/PTY tracks the FULL window (the editor input box is an
+                // overlay, never a grid resize) — see grid_dims.
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let pad_x = renderer.padding_x() as f64;
                     let pad_y = renderer.padding_y() as f64;
                     let usable_w = physical_size.width as f64 - 2.0 * pad_x;
-                    let usable_h = (physical_size.height as f64 - 2.0 * pad_y - input_h).max(0.0);
+                    let usable_h = (physical_size.height as f64 - 2.0 * pad_y).max(0.0);
                     let new_cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
                     let new_rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
 
@@ -1376,10 +1352,11 @@ impl ApplicationHandler<AppEvent> for App {
                 self.process_messages();
                 self.update_cursor_blink();
 
-                // If the output-grid row count drifted from what the terminal
-                // holds — the input box appeared/disappeared/grew, which is
-                // driven by PTY output (OSC 133) rather than keys — recompute so
-                // the PTY rows track the box. Converges in one frame.
+                // If the grid row count drifted from what the terminal holds
+                // (font/padding/window-size change, or the one-time convergence
+                // from the spawn size to the padded size) — recompute. Mode
+                // transitions no longer cause drift: the grid is always
+                // full-window and the input box is a non-resizing overlay.
                 let desired_rows = self.grid_dims().0;
                 let current_rows = self
                     .terminal
@@ -1441,11 +1418,10 @@ impl ApplicationHandler<AppEvent> for App {
                     // Hide the grid (shell) cursor while the editor owns input:
                     // a blinking caret at the shell prompt misreads as "type
                     // here". The input-box cursor is drawn by build_prompt_vertices.
-                    let grid_cursor_on = self.cursor_blink_on && prompt.is_none();
                     renderer.draw(
                         terminal,
                         &self.selection_handler,
-                        grid_cursor_on,
+                        self.cursor_blink_on,
                         panel.as_ref(),
                         prompt.as_ref(),
                     );
