@@ -41,6 +41,10 @@ pub struct Block {
     /// Best-effort (~80% accurate): it is the whole prompt row trimmed, so it
     /// may include a prompt glyph. Used as a title, not authoritative.
     pub command: String,
+    /// Working directory at command start (from OSC 7). Shown in the block
+    /// header (`<cwd> (<duration>)`) Warp-style. `None` for blocks loaded
+    /// from older DB rows that predate the field.
+    pub cwd: Option<String>,
     /// Output captured between `133;B` and `133;D` (detached snapshot).
     pub output: String,
     /// Exit code from `133;D;<exit>`. `None` when the command was interrupted
@@ -90,8 +94,16 @@ pub struct BlockTracker {
     // ── in-flight command (between 133;B and 133;D) ──
     pending_command: Option<String>,
     pending_started: Option<SystemTime>,
+    /// cwd snapshotted at 133;B (from `current_cwd`), stamped onto the block.
+    pending_cwd: Option<String>,
+    /// Latest cwd from OSC 7; snapshotted into each new block.
+    current_cwd: Option<String>,
     output_buf: String,
     output_truncated: bool,
+    /// Index in `blocks` where the current session's blocks begin. Blocks
+    /// before this were loaded from SQLite on startup (history search only —
+    /// NOT shown in the main block view, which is session-scoped).
+    session_start: usize,
 }
 
 impl Default for BlockTracker {
@@ -110,9 +122,18 @@ impl BlockTracker {
             next_id: 1,
             pending_command: None,
             pending_started: None,
+            pending_cwd: None,
+            current_cwd: None,
             output_buf: String::new(),
             output_truncated: false,
+            session_start: 0,
         }
+    }
+
+    /// Current working directory (updated from OSC 7). Snapshotted into the
+    /// next block at `133;B` so each block carries the dir it ran in.
+    pub fn set_cwd(&mut self, cwd: Option<String>) {
+        self.current_cwd = cwd;
     }
 
     // ── ShellPhase accessors ─────────────────────────────────────────────
@@ -131,9 +152,18 @@ impl BlockTracker {
         self.phase == ShellPhase::CommandExecuting
     }
 
-    /// All finished blocks (newest last). The history panel / search read this.
+    /// All finished blocks (newest last). The history panel / search read this
+    /// (includes blocks loaded from SQLite on startup).
     pub fn blocks(&self) -> &[Block] {
         &self.blocks
+    }
+
+    /// Blocks created THIS session only (excludes the startup-hydrated SQLite
+    /// history). The main Warp-style block view reads this so it doesn't show
+    /// phantom pre-session history; the panel still uses [`blocks`].
+    pub fn session_blocks(&self) -> &[Block] {
+        let start = self.session_start.min(self.blocks.len());
+        &self.blocks[start..]
     }
 
     /// Take the finished-but-unpersisted blocks. The app calls this after each
@@ -152,6 +182,9 @@ impl BlockTracker {
             }
         }
         self.blocks.extend(blocks);
+        // Everything loaded so far is pre-session history; session blocks
+        // (appended after this) begin at the new length.
+        self.session_start = self.blocks.len();
     }
 
     // ── Marker-driven state transitions ──────────────────────────────────
@@ -172,6 +205,7 @@ impl BlockTracker {
     pub fn on_command_start(&mut self, command: String) {
         self.pending_command = Some(command);
         self.pending_started = Some(SystemTime::now());
+        self.pending_cwd = self.current_cwd.clone();
         self.output_buf.clear();
         self.output_truncated = false;
         self.phase = ShellPhase::CommandExecuting;
@@ -230,6 +264,7 @@ impl BlockTracker {
             return;
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
+        let cwd = self.pending_cwd.take();
         let mut output = std::mem::take(&mut self.output_buf);
         if self.output_truncated {
             output.push_str("\n…(output truncated, >64 KiB)");
@@ -239,6 +274,7 @@ impl BlockTracker {
         let block = Block {
             id: BlockId(self.next_id),
             command,
+            cwd,
             output,
             exit_code,
             started_at,
@@ -431,6 +467,7 @@ mod tests {
             Block {
                 id: BlockId(7),
                 command: "old".into(),
+                cwd: None,
                 output: String::new(),
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
@@ -440,6 +477,7 @@ mod tests {
             Block {
                 id: BlockId(3),
                 command: "older".into(),
+                cwd: None,
                 output: String::new(),
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
@@ -453,6 +491,39 @@ mod tests {
         // Next freshly-detected block must not collide with loaded id 7.
         run_one(&mut t, "new", "", 0);
         assert_eq!(t.blocks().last().unwrap().id, BlockId(8));
+    }
+
+    #[test]
+    fn session_blocks_exclude_loaded_history() {
+        let mut t = BlockTracker::new();
+        // Pre-session blocks loaded from SQLite on startup.
+        t.load_blocks(vec![Block {
+            id: BlockId(1),
+            command: "old".into(),
+            cwd: None,
+            output: String::new(),
+            exit_code: Some(0),
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: Some(SystemTime::UNIX_EPOCH),
+            collapsed: false,
+        }]);
+        assert_eq!(t.blocks().len(), 1);
+        // The main block view is session-scoped: loaded history is excluded.
+        assert!(t.session_blocks().is_empty());
+
+        // A command run this session becomes a session block.
+        run_one(&mut t, "ls", "", 0);
+        assert_eq!(t.blocks().len(), 2);
+        assert_eq!(t.session_blocks().len(), 1);
+        assert_eq!(t.session_blocks()[0].command, "ls");
+    }
+
+    #[test]
+    fn cwd_is_stamped_from_set_cwd_at_command_start() {
+        let mut t = BlockTracker::new();
+        t.set_cwd(Some("/Users/me/proj".to_string()));
+        let b = run_one(&mut t, "pwd", "/Users/me/proj", 0);
+        assert_eq!(b.cwd.as_deref(), Some("/Users/me/proj"));
     }
 
     #[test]

@@ -398,8 +398,9 @@ fragment float4 text_fragment(
                 }
             }
             // Block-view (Editor-mode main area): commands, outputs, durations.
+            // Session blocks only — startup-hydrated history stays in the panel.
             if prompt.is_some() {
-                for b in terminal.block_tracker().blocks().iter().rev().take(64) {
+                for b in terminal.block_tracker().session_blocks().iter().rev().take(64) {
                     missing.extend("❯ ".chars());
                     missing.extend(b.command.chars());
                     missing.extend(block_duration_str(b).chars());
@@ -420,7 +421,7 @@ fragment float4 text_fragment(
         let mut vertices = if let Some(p) = prompt {
             let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
             let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
-            self.build_block_view_vertices(terminal.block_tracker().blocks(), box_top_y)
+            self.build_block_view_vertices(terminal.block_tracker().session_blocks(), box_top_y)
         } else {
             self.build_grid_vertices(
                 grid,
@@ -1213,18 +1214,29 @@ fragment float4 text_fragment(
                 self.push_text(&mut verts, left, y, line, dim, cols);
                 y -= ch;
             }
-            // Command line: ❯ command ... (duration)
+            // Command line: ❯ command
             if y >= pad_y {
                 self.push_text(&mut verts, left, y, "❯ ", accent, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
                 self.push_text(&mut verts, cmd_x, y, &b.command, fg, avail);
+                y -= ch;
+            }
+            // Header line: <cwd> (<duration>)  (Warp-style, dim) — sits above
+            // the command, so it renders last (highest) within the block.
+            if y >= pad_y {
                 let dur = block_duration_str(b);
-                let dc = dur.chars().count();
-                if !dur.is_empty() && dc + 2 < cols {
-                    let dx = left + (cols - dc) as f32 * cw;
-                    self.push_text(&mut verts, dx, y, &dur, dim, dc);
-                }
+                let cwd = b
+                    .cwd
+                    .as_deref()
+                    .map(abbreviate_path)
+                    .unwrap_or_else(|| "~".to_string());
+                let header = if dur.is_empty() {
+                    cwd
+                } else {
+                    format!("{cwd} ({dur})")
+                };
+                self.push_text(&mut verts, left, y, &header, dim, cols);
                 y -= ch;
             }
             // A little breathing room between blocks.
@@ -1358,6 +1370,20 @@ fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
 }
 
 /// Human-readable elapsed time for a finished block.
+/// Abbreviate an absolute path for display: replace a `$HOME` prefix with `~`
+/// (e.g. `/Users/andylee/proj` → `~/proj`). Falls back to the raw path when
+/// `$HOME` is unset or isn't a prefix.
+fn abbreviate_path(path: &str) -> String {
+    if let Some(home) = std::env::var_os("HOME") {
+        if let Some(h) = home.to_str() {
+            if !h.is_empty() && path.starts_with(h) {
+                return format!("~{}", &path[h.len()..]);
+            }
+        }
+    }
+    path.to_string()
+}
+
 fn block_duration_str(b: &Block) -> String {
     let Some(finished) = b.finished_at else {
         return String::new();

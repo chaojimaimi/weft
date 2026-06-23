@@ -121,6 +121,7 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
     Ok(Block {
         id: BlockId(id as u64),
         command,
+        cwd: None,
         output,
         exit_code,
         started_at: millis_to_system_time(started_ms),
@@ -170,6 +171,7 @@ mod tests {
         Block {
             id: BlockId(id),
             command: command.into(),
+            cwd: None,
             output: output.into(),
             exit_code: exit,
             started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(id * 1000),

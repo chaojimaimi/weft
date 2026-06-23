@@ -875,7 +875,10 @@ impl vte::Perform for Terminal {
             "7" => {
                 if params.len() > 1 {
                     if let Some(path) = parse_osc7_cwd(params[1]) {
-                        self.cwd = Some(path);
+                        self.cwd = Some(path.clone());
+                        // Mirror into the block tracker so each block is stamped
+                        // with the dir it ran in (for the block-view header).
+                        self.block_tracker.set_cwd(Some(path));
                     }
                 }
             }
