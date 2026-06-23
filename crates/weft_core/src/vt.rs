@@ -4,8 +4,9 @@
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
 use crate::blocks::BlockTracker;
+use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
-use crate::input::MouseProtocol;
+use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
 
 /// Current text attributes applied to newly printed characters.
 /// Updated by SGR (CSI m) sequences, consumed by `print()`.
@@ -49,6 +50,12 @@ pub struct Terminal {
     /// Command-block state machine: consumes the OSC 133 marker stream and the
     /// printed output to build finished [`Block`](crate::blocks::Block)s.
     block_tracker: BlockTracker,
+    editor: Editor,
+    /// cwd reported by the shell via OSC 7.
+    cwd: Option<String>,
+    /// Set on editor submit, consumed by `133;B`. While `Some`, input passes
+    /// through (Enter→preexec window) and the command source is the editor.
+    command_from_editor: Option<String>,
     /// Application cursor key mode (DECCKM, CSI ?1h/l).
     pub app_cursor_keys: bool,
     /// Bracketed paste mode (CSI ?2004h/l).
@@ -93,6 +100,9 @@ impl Terminal {
             title: String::new(),
             shell_markers: Vec::new(),
             block_tracker: BlockTracker::new(),
+            editor: Editor::new(),
+            cwd: None,
+            command_from_editor: None,
             app_cursor_keys: false,
             bracketed_paste: false,
             origin_mode: false,
@@ -130,6 +140,28 @@ impl Terminal {
     /// "switch theme = reset palette".
     pub fn set_palette(&mut self, palette: [Color; 256]) {
         self.palette = palette;
+    }
+
+    pub fn editor(&self) -> &Editor {
+        &self.editor
+    }
+
+    pub fn editor_mut(&mut self) -> &mut Editor {
+        &mut self.editor
+    }
+
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// Effective input routing right now (passthrough vs. editor).
+    pub fn effective_input_mode(&self) -> InputMode {
+        effective_mode(
+            self.block_tracker.phase(),
+            self.alt_active,
+            self.block_tracker.bootstrap_ready(),
+            self.command_from_editor.is_some(),
+        )
     }
 
     /// Whether the alternate screen buffer is currently active.
@@ -248,6 +280,18 @@ impl Terminal {
             }
             row -= 1;
         }
+    }
+
+    /// Called by the app when the user submits the editor (Enter). Returns the
+    /// bytes to write to the PTY. Sets `command_from_editor` so (a) further
+    /// input passes through until `133;B`, and (b) `133;B` records the
+    /// editor's command rather than the grid snapshot.
+    pub fn submit_command(&mut self) -> Vec<u8> {
+        let command = self.editor.text();
+        self.command_from_editor = Some(command.clone());
+        let bytes = build_submit_bytes(&command, self.bracketed_paste);
+        self.editor.clear();
+        bytes
     }
 
     // ── Palette initialization ───────────────────────────────────
@@ -828,6 +872,13 @@ impl vte::Perform for Terminal {
                     }
                 }
             }
+            "7" => {
+                if params.len() > 1 {
+                    if let Some(path) = parse_osc7_cwd(params[1]) {
+                        self.cwd = Some(path);
+                    }
+                }
+            }
             "133" => {
                 if params.len() > 1 {
                     match params[1] {
@@ -837,11 +888,16 @@ impl vte::Perform for Terminal {
                         }
                         b"B" => {
                             self.shell_markers.push(ShellMarker::CommandStart);
-                            // 133;B (preexec): snapshot the command line now,
-                            // before output scrolls it into history. Real shells
-                            // emit a newline first, so the cursor may sit below
-                            // the command — `snapshot_command_line` walks up.
-                            let command = self.snapshot_command_line();
+                            // 133;B (preexec): if the editor submitted the
+                            // command, record that; otherwise snapshot the grid
+                            // row (real shells emit a newline first, so the
+                            // cursor may sit below the command —
+                            // `snapshot_command_line` walks up).
+                            let command = if let Some(c) = self.command_from_editor.take() {
+                                c
+                            } else {
+                                self.snapshot_command_line()
+                            };
                             self.block_tracker.on_command_start(command);
                         }
                         b"C" => {
@@ -882,6 +938,14 @@ impl vte::Perform for Terminal {
     fn unhook(&mut self) {
         // DCS end — ignored in v0.1
     }
+}
+
+/// Parse an OSC 7 payload `file://[host]/abs/path` → `/abs/path`.
+fn parse_osc7_cwd(payload: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let s = s.strip_prefix("file://")?;
+    let path_start = s.find('/')?;
+    Some(s[path_start..].to_string())
 }
 
 /// Parse an X11 color string (#RRGGBB or rgb:RR/GG/BB) into a Color.
@@ -1398,6 +1462,94 @@ mod tests {
         assert_eq!(t.grid().scroll_region(), (4, 19));
         t.process(b"\x1b[r"); // reset
         assert_eq!(t.grid().scroll_region(), (0, 23));
+    }
+
+    // ── v0.5 editor takeover: OSC 7 + effective mode + submit ──────
+
+    use crate::editor::Editor;
+    use crate::input::{build_submit_bytes, InputMode};
+
+    #[test]
+    fn osc7_sets_cwd() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]7;file://macbook.local/Users/me/proj\x1b\\");
+        assert_eq!(t.cwd(), Some("/Users/me/proj"));
+    }
+
+    #[test]
+    fn osc7_localhost_host_strips_correctly() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]7;file://localhost/tmp\x1b\\");
+        assert_eq!(t.cwd(), Some("/tmp"));
+    }
+
+    #[test]
+    fn osc7_malformed_is_ignored() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]7;not-a-uri\x1b\\");
+        assert_eq!(t.cwd(), None);
+    }
+
+    #[test]
+    fn editor_takes_over_only_after_bootstrap_at_prompt() {
+        let mut t = Terminal::new(24, 80);
+        // Not integrated yet.
+        assert_eq!(t.effective_input_mode(), InputMode::Passthrough);
+        // Bootstrap + AtPrompt.
+        t.process(b"\x1b]133;A\x07");
+        assert_eq!(t.effective_input_mode(), InputMode::Editor);
+    }
+
+    #[test]
+    fn editor_hidden_in_alt_screen() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]133;A\x07");
+        assert_eq!(t.effective_input_mode(), InputMode::Editor);
+        t.process(b"\x1b[?1049h"); // enter alt screen
+        assert_eq!(t.effective_input_mode(), InputMode::Passthrough);
+    }
+
+    #[test]
+    fn submit_command_builds_bytes_and_blocks_editor() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]133;A\x07");
+        for c in "ls -la".chars() {
+            t.editor_mut().buffer.insert_char(c);
+        }
+        let bytes = t.submit_command();
+        assert_eq!(bytes, build_submit_bytes("ls -la", false));
+        // Editor cleared and blocked until 133;B.
+        assert_eq!(t.editor().text(), "");
+        assert_eq!(t.effective_input_mode(), InputMode::Passthrough);
+    }
+
+    #[test]
+    fn command_133b_uses_editor_command_not_grid_snapshot() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]133;A\x07");
+        for c in "real-cmd".chars() {
+            t.editor_mut().buffer.insert_char(c);
+        }
+        t.submit_command();
+        // Shell "executes": emits 133;B. The tracker should record the editor
+        // command, not the (empty) grid prompt row.
+        t.process(b"\x1b]133;B\x07");
+        t.process(b"\x1b]133;D;0\x07");
+        let blocks = t.block_tracker().blocks();
+        assert_eq!(blocks.last().unwrap().command, "real-cmd");
+    }
+
+    #[test]
+    fn passthrough_133b_uses_grid_snapshot() {
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]133;A\x07");
+        // No editor submit → passthrough path → command from grid snapshot.
+        // Print a fake prompt+command line, then 133;B.
+        t.process(b"$ echo hi");
+        t.process(b"\x1b]133;B\x07");
+        t.process(b"\x1b]133;D;0\x07");
+        let cmd = t.block_tracker().blocks().last().unwrap().command.clone();
+        assert!(cmd.contains("echo hi"), "got {cmd:?}");
     }
 }
 
