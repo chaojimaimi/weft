@@ -60,6 +60,7 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         local __weft_rc=$?
         printf '\\033]133;D;%d\\007' \"$__weft_rc\"
         printf '\\033]133;A\\007'
+        printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
     }
     __weft_preexec() {
         printf '\\033]133;B\\007'
@@ -84,6 +85,7 @@ __weft_bash_precmd() {
     local __weft_rc=$?
     printf '\\033]133;D;%d\\007' \"$__weft_rc\"
     printf '\\033]133;A\\007'
+    printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
 }
 __weft_bash_preexec() {
     printf '\\033]133;B\\007'
@@ -297,5 +299,31 @@ mod tests {
         let zsh = Integration::Zsh.child_env(None);
         let bash = Integration::Bash.child_env(None);
         assert_eq!(zsh.first(), bash.first());
+    }
+
+    // ── v0.5: OSC 7 cwd emission ──────────────────────────────────
+
+    #[test]
+    fn zsh_hook_emits_osc7_cwd() {
+        let (_, file) = Integration::Zsh.rc_redirect().unwrap();
+        // precmd emits OSC 7 with $HOSTNAME + $PWD.
+        assert!(
+            file.body.contains("\\033]7;file://%s%s\\007"),
+            "zsh precmd must emit OSC 7; body was:\n{}",
+            file.body
+        );
+        // The two %s args are $HOSTNAME and $PWD.
+        assert!(file.body.contains("$HOSTNAME"));
+        assert!(file.body.contains("$PWD"));
+    }
+
+    #[test]
+    fn bash_hook_emits_osc7_cwd() {
+        let snippet = Integration::Bash.sourceable_snippet().unwrap();
+        assert!(
+            snippet.contains("\\033]7;file://%s%s\\007"),
+            "bash precmd must emit OSC 7; snippet was:\n{}",
+            snippet
+        );
     }
 }
