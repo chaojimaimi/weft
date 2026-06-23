@@ -59,6 +59,14 @@ pub struct Block {
     pub collapsed: bool,
 }
 
+/// A view of the currently-running command (borrowed from [`BlockTracker`]),
+/// for the renderer's live block during CommandExecuting.
+pub struct InFlightBlock<'a> {
+    pub command: &'a str,
+    pub cwd: Option<&'a str>,
+    pub output: &'a str,
+}
+
 /// Shell-phase state machine, driven by OSC 133. See
 /// `docs/DECISION-input-architecture.md` (§123-204). v0.4 uses it only to
 /// gate output capture and mark integration readiness; the derived
@@ -170,6 +178,21 @@ impl BlockTracker {
     /// PTY batch and inserts them into SQLite; the blocks remain in [`blocks`].
     pub fn drain_unpersisted(&mut self) -> Vec<Block> {
         std::mem::take(&mut self.unpersisted)
+    }
+
+    /// The currently-running command (between `133;B` and `133;D`), for the
+    /// renderer's live block during CommandExecuting (e.g. an interactive
+    /// `sudo su`). `None` when nothing is in flight.
+    pub fn in_flight(&self) -> Option<InFlightBlock<'_>> {
+        if !self.is_capturing() {
+            return None;
+        }
+        let command = self.pending_command.as_deref()?;
+        Some(InFlightBlock {
+            command,
+            cwd: self.pending_cwd.as_deref(),
+            output: self.output_buf.as_str(),
+        })
     }
 
     /// Load previously-persisted blocks (e.g. on startup from SQLite). They go

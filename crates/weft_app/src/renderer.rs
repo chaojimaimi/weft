@@ -409,6 +409,14 @@ fragment float4 text_fragment(
                         missing.extend(line.chars());
                     }
                 }
+                // In-flight (live) block during CommandExecuting.
+                if let Some(live) = terminal.block_tracker().in_flight() {
+                    missing.extend("❯ ".chars());
+                    missing.extend(live.command.chars());
+                    for line in live.output.lines().take(200) {
+                        missing.extend(line.chars());
+                    }
+                }
             }
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
@@ -432,31 +440,20 @@ fragment float4 text_fragment(
                     terminal.block_tracker().session_blocks(),
                     box_top_y,
                     p.cwd,
+                    None,
                 )
             } else {
-                // CommandExecuting overlay: live grid on the bottom, completed
-                // blocks (opaque) over the top so history stays as blocks. The
-                // split tracks the GRID CURSOR, not a fixed ratio: live output
-                // (Password:, the root shell) sits at the cursor, so the overlay
-                // must cover only what's above it — otherwise a short session's
-                // output hides under the overlay.
-                let mut v = self.build_grid_vertices(
-                    grid,
-                    terminal.palette(),
-                    cursor,
-                    selection,
-                    terminal.cursor_visible && cursor_blink_on,
-                    terminal.cursor_style,
-                );
-                // Leave the live area at least a few rows; clamp to the viewport.
-                let live_top_max = (vp_h - pad_y - 6.0 * ch).max(pad_y);
-                let y_split = (pad_y + cursor.row as f32 * ch).clamp(pad_y, live_top_max);
-                v.extend_from_slice(&self.build_block_view_vertices(
+                // CommandExecuting: full block view with the in-flight command
+                // as a live block at the bottom (its streaming output) and the
+                // completed history above. No grid — the live session IS the
+                // in-flight block's captured output, so the history never
+                // reverts to raw and isn't squeezed by the grid cursor.
+                self.build_block_view_vertices(
                     terminal.block_tracker().session_blocks(),
-                    y_split,
+                    vp_h - pad_y,
                     None,
-                ));
-                v
+                    terminal.block_tracker().in_flight(),
+                )
             }
         } else {
             self.build_grid_vertices(
@@ -1140,17 +1137,6 @@ fragment float4 text_fragment(
             box_bg,
         );
 
-        // Divider rule across the top edge of the input box — matches the
-        // inter-block separators so the input area is clearly set off from the
-        // history above it.
-        push_quad(
-            &mut verts,
-            [box_x0, box_y0, box_x1, box_y0 + 1.5],
-            bg_uv,
-            [0.0; 4],
-            [0.65, 0.65, 0.65, 0.22],
-        );
-
         let text_y0 = box_y0 + ch; // first text row (below the top pad row)
         let left = box_x0; // flush to the box edge (matches the block view)
         let box_cols = (((box_x1 - left) / cw).max(1.0)) as usize;
@@ -1218,20 +1204,20 @@ fragment float4 text_fragment(
         verts
     }
 
-    /// Warp-style block history shown in Editor mode instead of the raw grid.
-    /// Each finished command renders as `❯ command (duration)` followed by its
-    /// captured output, newest at the bottom just above the input box. Older
-    /// blocks scroll off the top once the viewport fills. `box_top_y` is the
-    /// `region_bottom_y` is the bottom edge of the block region: the top of the
-    /// input box in editor mode, or the top of the live-grid area in
-    /// CommandExecuting mode. The opaque bg covers `[0, region_bottom_y]`;
-    /// `cwd`, when `Some`, draws the persistent cwd line just inside the region
-    /// (editor mode only — `None` for the CommandExecuting overlay).
+    /// Warp-style block history. `region_bottom_y` is the bottom edge of the
+    /// block region (top of the input box in editor mode, or the screen bottom
+    /// in CommandExecuting). The opaque bg covers `[0, region_bottom_y]`.
+    /// `cwd`, when `Some` and no `live` block, draws the persistent cwd line
+    /// (editor mode) with a divider ABOVE it (cwd grouped with the input box).
+    /// `live`, when `Some` (CommandExecuting), draws the in-flight command's
+    /// streaming output at the bottom — so a long-running command (interactive
+    /// `sudo su`) keeps the full history above it instead of reverting to raw.
     fn build_block_view_vertices(
         &self,
         blocks: &[Block],
         region_bottom_y: f32,
         cwd: Option<&str>,
+        live: Option<weft_core::blocks::InFlightBlock<'_>>,
     ) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
@@ -1247,19 +1233,18 @@ fragment float4 text_fragment(
         let left = pad_x; // flush to the content padding (Warp starts at the edge)
         let right = vp_w - pad_x;
         let cols = (((right - left) / cw).max(1.0)) as usize;
+        // Slightly looser line pitch than the raw cell height for readability.
+        let pitch = ch * 1.1;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // Vivid prompt color so ❯ reads as a distinct marker, not body text
-        // (theme.cursor was too close to the foreground to stand out).
+        // Vivid prompt color so ❯ reads as a distinct marker, not body text.
         let prompt_c = [0.42, 0.85, 1.0, 1.0];
         let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
         let separator = [0.65, 0.65, 0.65, 0.22];
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        // Opaque background covers the block region only — `[0, region_bottom_y]`.
-        // Below it the input box (editor) or the live grid (CommandExecuting) shows.
         push_quad(
             &mut verts,
             [0.0, 0.0, vp_w, region_bottom_y.max(0.0)],
@@ -1268,25 +1253,48 @@ fragment float4 text_fragment(
             theme_bg,
         );
 
-        // Persistent cwd line just inside the region (editor mode only).
-        let mut y = region_bottom_y - ch;
-        if let Some(cwd) = cwd {
-            let display = abbreviate_path(cwd);
-            if !display.is_empty() && y >= pad_y {
-                self.push_text(&mut verts, left, y, &display, dim, cols);
+        let mut y = region_bottom_y - pitch;
+
+        // Live (in-flight) block at the bottom during CommandExecuting.
+        if let Some(live) = live {
+            for line in live.output.lines().rev() {
+                if y < pad_y {
+                    break;
+                }
+                self.push_text(&mut verts, left, y, line, fg, cols);
+                y -= pitch;
             }
-            y = region_bottom_y - 2.0 * ch;
+            if y >= pad_y {
+                self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
+                let cmd_x = left + 2.0 * cw;
+                let avail = cols.saturating_sub(2).max(1);
+                self.push_text(&mut verts, cmd_x, y, live.command, fg, avail);
+                y -= pitch;
+            }
+            y -= pitch;
+            if y >= pad_y {
+                let ly = y + pitch * 0.5;
+                push_quad(&mut verts, [left, ly, right, ly + 1.5], bg_uv, [0.0; 4], separator);
+            }
+        } else if let Some(cwd) = cwd {
+            // Editor: divider ABOVE the cwd line (cwd grouped with the input
+            // box, not the history), then the cwd text below the divider.
+            if y >= pad_y {
+                push_quad(&mut verts, [left, y, right, y + 1.5], bg_uv, [0.0; 4], separator);
+                let display = abbreviate_path(cwd);
+                if !display.is_empty() {
+                    self.push_text(&mut verts, left, y, &display, dim, cols);
+                }
+            }
+            y = region_bottom_y - 2.0 * pitch;
         }
 
-        // Render blocks newest-first, upward.
+        // Completed blocks, newest-first upward.
         for b in blocks.iter().rev() {
             if y < pad_y {
                 break;
             }
-            // Output lines (bottom-up so the last line sits nearest the command).
-            // Drop a trailing bare prompt marker ('%', '$', '#') — zsh's
-            // PROMPT_EOL_MARK or a leaked prompt lands at the end of the
-            // captured output and would render as a stray line.
+            // Output lines (bottom-up). Drop a trailing bare prompt marker.
             let mut out_lines: Vec<&str> = b.output.lines().collect();
             while out_lines
                 .last()
@@ -1298,8 +1306,9 @@ fragment float4 text_fragment(
                 if y < pad_y {
                     break;
                 }
-                self.push_text(&mut verts, left, y, line, dim, cols);
-                y -= ch;
+                // Output in the same color as the command (Warp style).
+                self.push_text(&mut verts, left, y, line, fg, cols);
+                y -= pitch;
             }
             // Command line: ❯ command (vivid ❯ + white command).
             if y >= pad_y {
@@ -1307,10 +1316,9 @@ fragment float4 text_fragment(
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
                 self.push_text(&mut verts, cmd_x, y, &b.command, fg, avail);
-                y -= ch;
+                y -= pitch;
             }
-            // Header line: <cwd> (<duration>)  (Warp-style, dim) — sits above
-            // the command, so it renders last (highest) within the block.
+            // Header line: <cwd> (<duration>)  (dim, above the command).
             if y >= pad_y {
                 let dur = block_duration_str(b);
                 let bcwd = b
@@ -1324,20 +1332,13 @@ fragment float4 text_fragment(
                     format!("{bcwd} ({dur})")
                 };
                 self.push_text(&mut verts, left, y, &header, dim, cols);
-                y -= ch;
+                y -= pitch;
             }
-            // Separator rule + a blank line before the older block above
-            // (Warp-style block separation — fixes blocks running together).
-            y -= ch;
+            // Separator rule + gap before the older block above.
+            y -= pitch;
             if y >= pad_y {
-                let ly = y + ch * 0.5;
-                push_quad(
-                    &mut verts,
-                    [left, ly, right, ly + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
+                let ly = y + pitch * 0.5;
+                push_quad(&mut verts, [left, ly, right, ly + 1.5], bg_uv, [0.0; 4], separator);
             }
         }
 
