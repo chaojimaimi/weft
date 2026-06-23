@@ -2,6 +2,7 @@
 
 pub mod blocks;
 pub mod config;
+pub mod editor;
 pub mod grid;
 pub mod input;
 pub mod persistence;
