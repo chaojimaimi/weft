@@ -7,6 +7,55 @@ use std::io::Write;
 
 use bitflags::bitflags;
 
+use crate::blocks::ShellPhase;
+
+/// Effective input routing at any given moment.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum InputMode {
+    /// Bytes flow straight to the PTY (current behavior).
+    Passthrough,
+    /// Keys drive the editor; submit writes the command.
+    Editor,
+}
+
+/// Decide passthrough vs. editor. See DECISION-input-architecture.md §5.2.
+/// `command_from_editor` covers the Enter→preexec window: after submit but
+/// before `133;B`, we must pass through so trailing keystrokes reach the
+/// program rather than a frozen editor.
+pub fn effective_mode(
+    shell_phase: ShellPhase,
+    alt_active: bool,
+    bootstrap_ready: bool,
+    command_from_editor: bool,
+) -> InputMode {
+    if alt_active || !bootstrap_ready || command_from_editor {
+        return InputMode::Passthrough;
+    }
+    match shell_phase {
+        ShellPhase::NotIntegrated | ShellPhase::CommandExecuting => InputMode::Passthrough,
+        ShellPhase::AtPrompt => InputMode::Editor,
+    }
+}
+
+/// Build the bytes written to the PTY on submit. Warp model (DECISION §7.2):
+/// `Ctrl-U` (clear any half-line defensively) + command (wrapped in
+/// bracketed-paste if enabled, else internal `\n`→`\r`) + `\n`.
+pub fn build_submit_bytes(command: &str, bracketed_paste_on: bool) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(command.len() + 16);
+    bytes.push(0x15); // Ctrl-U
+    if bracketed_paste_on && !command.is_empty() {
+        bytes.extend(b"\x1b[200~");
+        bytes.extend(command.as_bytes());
+        bytes.extend(b"\x1b[201~");
+    } else {
+        for &b in command.as_bytes() {
+            bytes.push(if b == b'\n' { b'\r' } else { b });
+        }
+    }
+    bytes.push(b'\n');
+    bytes
+}
+
 bitflags! {
     /// Keyboard modifier flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -889,5 +938,84 @@ mod tests {
     fn unbracketed_paste() {
         let bytes = encode_paste("hello", false);
         assert_eq!(bytes, b"hello");
+    }
+
+    // ── v0.5 editor takeover: submit bytes + effective mode ─────────
+
+    use crate::blocks::ShellPhase;
+
+    #[test]
+    fn build_submit_bytes_bracketed_wraps_multiline() {
+        let bytes = build_submit_bytes("echo a\necho b", true);
+        // Ctrl-U, bracketed-paste open, command, close, \n
+        assert_eq!(bytes[0], 0x15);
+        assert!(bytes.starts_with(&[0x15, 0x1b, b'[', b'2', b'0', b'0', b'~']));
+        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
+        assert_eq!(*bytes.last().unwrap(), b'\n');
+    }
+
+    #[test]
+    fn build_submit_bytes_no_bracket_rewrites_newline_to_cr() {
+        let bytes = build_submit_bytes("echo a\necho b", false);
+        assert_eq!(bytes[0], 0x15);
+        // Internal \n became \r; no bracket wrappers.
+        assert!(!bytes.windows(6).any(|w| w == b"\x1b[200~"));
+        let body = &bytes[1..bytes.len() - 1]; // strip Ctrl-U and trailing \n
+        assert_eq!(body, b"echo a\recho b");
+    }
+
+    #[test]
+    fn build_submit_bytes_empty_command() {
+        let bytes = build_submit_bytes("", true);
+        assert_eq!(bytes, b"\x15\n"); // Ctrl-U + \n, no paste wrappers on empty
+    }
+
+    #[test]
+    fn effective_mode_takes_editor_only_at_prompt_bootstrapped() {
+        assert_eq!(
+            effective_mode(ShellPhase::AtPrompt, false, true, false),
+            InputMode::Editor
+        );
+    }
+
+    #[test]
+    fn effective_mode_alt_screen_forces_passthrough() {
+        assert_eq!(
+            effective_mode(ShellPhase::AtPrompt, true, true, false),
+            InputMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn effective_mode_not_bootstrapped_forces_passthrough() {
+        assert_eq!(
+            effective_mode(ShellPhase::AtPrompt, false, false, false),
+            InputMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn effective_mode_command_executing_passthrough() {
+        assert_eq!(
+            effective_mode(ShellPhase::CommandExecuting, false, true, false),
+            InputMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn effective_mode_not_integrated_passthrough() {
+        assert_eq!(
+            effective_mode(ShellPhase::NotIntegrated, false, true, false),
+            InputMode::Passthrough
+        );
+    }
+
+    #[test]
+    fn effective_mode_just_submitted_passthrough() {
+        // Enter pressed, 133;B not yet arrived → command_from_editor=true.
+        assert_eq!(
+            effective_mode(ShellPhase::AtPrompt, false, true, true),
+            InputMode::Passthrough
+        );
     }
 }
