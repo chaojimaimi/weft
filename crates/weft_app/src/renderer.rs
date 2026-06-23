@@ -1109,7 +1109,7 @@ fragment float4 text_fragment(
         );
 
         let text_y0 = box_y0 + ch; // first text row (below the top pad row)
-        let left = box_x0 + cw; // one-cell left margin
+        let left = box_x0; // flush to the box edge (matches the block view)
         let box_cols = (((box_x1 - left) / cw).max(1.0)) as usize;
 
         // Ctrl+R search UI replaces the normal prompt.
@@ -1197,7 +1197,7 @@ fragment float4 text_fragment(
 
         let pad_x = self.padding_x;
         let pad_y = self.padding_y;
-        let left = pad_x + cw; // one-cell left margin (matches the input box)
+        let left = pad_x; // flush to the content padding (Warp starts at the edge)
         let right = vp_w - pad_x;
         let cols = (((right - left) / cw).max(1.0)) as usize;
 
@@ -1235,7 +1235,17 @@ fragment float4 text_fragment(
                 break;
             }
             // Output lines (bottom-up so the last line sits nearest the command).
-            for line in b.output.lines().rev() {
+            // Drop a trailing bare prompt marker ('%', '$', '#') — zsh's
+            // PROMPT_EOL_MARK or a leaked prompt lands at the end of the
+            // captured output and would render as a stray line.
+            let mut out_lines: Vec<&str> = b.output.lines().collect();
+            while out_lines
+                .last()
+                .is_some_and(|l| matches!(l.trim(), "%" | "$" | "#"))
+            {
+                out_lines.pop();
+            }
+            for line in out_lines.iter().rev() {
                 if y < pad_y {
                     break;
                 }

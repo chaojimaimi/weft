@@ -586,7 +586,20 @@ impl vte::Perform for Terminal {
         match byte {
             0x07 => { /* BEL — bell, ignored in v0.1 */ }
             0x08 => self.grid.backspace(),
-            0x09 => self.grid.advance_tab(1),
+            0x09 => {
+                // Tab is a C0 control, so the print path never sees it — but
+                // columnar tools (ls, etc.) separate fields with tabs. Mirror
+                // the cursor's tab advance into the captured block output as
+                // spaces, otherwise the block view concatenates the fields.
+                let prev_col = self.grid.cursor.col;
+                self.grid.advance_tab(1);
+                if !self.alt_active {
+                    let advanced = self.grid.cursor.col.saturating_sub(prev_col);
+                    for _ in 0..advanced {
+                        self.block_tracker.on_print(' ');
+                    }
+                }
+            }
             0x0A..=0x0C => {
                 // LF, VT, FF → move to next line (CR+LF on Unix terminals).
                 // The raw VT `index()` only moves down; Unix terminals
@@ -1527,6 +1540,29 @@ mod tests {
         // Editor cleared and blocked until 133;B.
         assert_eq!(t.editor().text(), "");
         assert_eq!(t.effective_input_mode(), InputMode::Passthrough);
+    }
+
+    #[test]
+    fn tab_in_command_output_is_captured_as_spaces() {
+        // Regression: macOS `ls` separates columns with tabs, which are C0
+        // controls (handled by `execute`, not `print`). Without mirroring the
+        // tab advance into the block's captured output, the block view showed
+        // filenames concatenated (`Cargo.lockCargo.toml...`).
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]133;A\x07"); // bootstrap + AtPrompt
+        t.process(b"\x1b]133;B\x07"); // command start — capture on
+        t.process(b"a\tb\tc");
+        t.process(b"\x1b]133;D;0\x07"); // command end — finalize
+        let blocks = t.block_tracker().blocks();
+        assert_eq!(blocks.len(), 1);
+        let out = &blocks[0].output;
+        assert!(!out.contains('\t'), "tab leaked into output: {out:?}");
+        let a = out.find('a').unwrap();
+        let b = out.find('b').unwrap();
+        assert!(
+            b > a + 1,
+            "a and b are adjacent (tabs not expanded): {out:?}"
+        );
     }
 
     #[test]

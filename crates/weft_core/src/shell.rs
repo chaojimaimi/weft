@@ -63,7 +63,11 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-$HOST}\" \"$PWD\"
         # weft renders the prompt in its input box; blank the shell's PS1 so
         # the grid doesn't show a duplicate prompt line at the shell cursor.
+        # Also clear PROMPT_EOL_MARK (zsh prints it — a '%' — when a command's
+        # output lacks a trailing newline, and it lands inside the block's
+        # capture window, showing a stray '%' after each command).
         PROMPT=''
+        PROMPT_EOL_MARK=''
     }
     __weft_preexec() {
         printf '\\033]133;B\\007'
