@@ -169,6 +169,14 @@ impl Terminal {
         self.alt_active
     }
 
+    /// True when the Warp-style block view should render (integrated shell, not
+    /// in an alt-screen app). Covers both AtPrompt (editor + input box) and
+    /// CommandExecuting (blocks overlaid above the live grid) — the renderer
+    /// distinguishes them via the prompt / shell phase.
+    pub fn show_block_view(&self) -> bool {
+        self.block_tracker.bootstrap_ready() && !self.alt_active
+    }
+
     /// Swap the primary and alternate screen buffers (DEC 1049/47).
     ///
     /// `save_cursor_and_clear` distinguishes the two modes:

@@ -397,9 +397,10 @@ fragment float4 text_fragment(
                     }
                 }
             }
-            // Block-view (Editor-mode main area): commands, outputs, durations.
-            // Session blocks only — startup-hydrated history stays in the panel.
-            if prompt.is_some() {
+            // Block-view (Editor mode + CommandExecuting overlay): commands,
+            // outputs, durations. Session blocks only — hydrated history stays
+            // in the panel.
+            if terminal.show_block_view() {
                 for b in terminal.block_tracker().session_blocks().iter().rev().take(64) {
                     missing.extend("❯ ".chars());
                     missing.extend(b.command.chars());
@@ -414,25 +415,50 @@ fragment float4 text_fragment(
             }
         }
 
-        // Editor mode shows the Warp-style block history instead of the raw
-        // grid; passthrough (command running / alt-screen) shows the live grid.
+        // Editor mode (at the prompt): full block history + input box.
+        // CommandExecuting (a tracked command is running — e.g. an interactive
+        // `sudo su` sub-shell): the live grid fills the bottom while the
+        // completed block history is overlaid on top, so the history never
+        // reverts to raw text (matches Warp). Alt-screen / not-integrated: grid.
         let ch = self.cell_height() as f32;
         let vp_h = self.viewport.1;
-        let mut vertices = if let Some(p) = prompt {
-            let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
-            let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
-            self.build_block_view_vertices(
-                terminal.block_tracker().session_blocks(),
-                box_top_y,
-                p.cwd,
-            )
+        let pad_y = self.padding_y;
+        let show_blocks = terminal.show_block_view();
+        let mut vertices = if show_blocks {
+            if let Some(p) = prompt {
+                let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
+                let box_top_y = (vp_h - pad_y - box_h).max(0.0);
+                self.build_block_view_vertices(
+                    terminal.block_tracker().session_blocks(),
+                    box_top_y,
+                    p.cwd,
+                )
+            } else {
+                // CommandExecuting overlay: live grid on the bottom, completed
+                // blocks (opaque) over the top so history stays as blocks.
+                let mut v = self.build_grid_vertices(
+                    grid,
+                    terminal.palette(),
+                    cursor,
+                    selection,
+                    terminal.cursor_visible && cursor_blink_on,
+                    terminal.cursor_style,
+                );
+                let y_split = pad_y + (vp_h - 2.0 * pad_y) * 0.6;
+                v.extend_from_slice(&self.build_block_view_vertices(
+                    terminal.block_tracker().session_blocks(),
+                    y_split,
+                    None,
+                ));
+                v
+            }
         } else {
             self.build_grid_vertices(
                 grid,
                 terminal.palette(),
                 cursor,
                 selection,
-                terminal.cursor_visible && cursor_blink_on,
+                terminal.cursor_visible && cursor_blink_on && prompt.is_none(),
                 terminal.cursor_style,
             )
         };
@@ -1179,11 +1205,15 @@ fragment float4 text_fragment(
     /// Each finished command renders as `❯ command (duration)` followed by its
     /// captured output, newest at the bottom just above the input box. Older
     /// blocks scroll off the top once the viewport fills. `box_top_y` is the
-    /// top edge of the input box (blocks render upward from there).
+    /// `region_bottom_y` is the bottom edge of the block region: the top of the
+    /// input box in editor mode, or the top of the live-grid area in
+    /// CommandExecuting mode. The opaque bg covers `[0, region_bottom_y]`;
+    /// `cwd`, when `Some`, draws the persistent cwd line just inside the region
+    /// (editor mode only — `None` for the CommandExecuting overlay).
     fn build_block_view_vertices(
         &self,
         blocks: &[Block],
-        box_top_y: f32,
+        region_bottom_y: f32,
         cwd: Option<&str>,
     ) -> Vec<f32> {
         let mut verts = Vec::new();
@@ -1211,23 +1241,27 @@ fragment float4 text_fragment(
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        // Opaque background over the whole viewport hides the raw grid (the
-        // shell's live output is irrelevant once a command has finished).
-        push_quad(&mut verts, [0.0, 0.0, vp_w, vp_h], bg_uv, [0.0; 4], theme_bg);
+        // Opaque background covers the block region only — `[0, region_bottom_y]`.
+        // Below it the input box (editor) or the live grid (CommandExecuting) shows.
+        push_quad(
+            &mut verts,
+            [0.0, 0.0, vp_w, region_bottom_y.max(0.0)],
+            bg_uv,
+            [0.0; 4],
+            theme_bg,
+        );
 
-        // Persistent current-directory line directly above the input box
-        // (always shown, abbreviated) — the "you are here" context for the
-        // next command, matching the initial/empty state.
-        let cwd_y = box_top_y - ch;
+        // Persistent cwd line just inside the region (editor mode only).
+        let mut y = region_bottom_y - ch;
         if let Some(cwd) = cwd {
             let display = abbreviate_path(cwd);
-            if !display.is_empty() && cwd_y >= pad_y {
-                self.push_text(&mut verts, left, cwd_y, &display, dim, cols);
+            if !display.is_empty() && y >= pad_y {
+                self.push_text(&mut verts, left, y, &display, dim, cols);
             }
+            y = region_bottom_y - 2.0 * ch;
         }
 
-        // Render blocks newest-first, upward from above the cwd line.
-        let mut y = box_top_y - 2.0 * ch;
+        // Render blocks newest-first, upward.
         for b in blocks.iter().rev() {
             if y < pad_y {
                 break;
