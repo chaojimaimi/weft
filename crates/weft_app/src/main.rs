@@ -1438,10 +1438,14 @@ impl ApplicationHandler<AppEvent> for App {
                         } else {
                             None
                         };
+                    // Hide the grid (shell) cursor while the editor owns input:
+                    // a blinking caret at the shell prompt misreads as "type
+                    // here". The input-box cursor is drawn by build_prompt_vertices.
+                    let grid_cursor_on = self.cursor_blink_on && prompt.is_none();
                     renderer.draw(
                         terminal,
                         &self.selection_handler,
-                        self.cursor_blink_on,
+                        grid_cursor_on,
                         panel.as_ref(),
                         prompt.as_ref(),
                     );

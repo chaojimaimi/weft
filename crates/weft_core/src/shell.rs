@@ -61,6 +61,9 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         printf '\\033]133;D;%d\\007' \"$__weft_rc\"
         printf '\\033]133;A\\007'
         printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-$HOST}\" \"$PWD\"
+        # weft renders the prompt in its input box; blank the shell's PS1 so
+        # the grid doesn't show a duplicate prompt line at the shell cursor.
+        PROMPT=''
     }
     __weft_preexec() {
         printf '\\033]133;B\\007'
@@ -86,6 +89,7 @@ __weft_bash_precmd() {
     printf '\\033]133;D;%d\\007' \"$__weft_rc\"
     printf '\\033]133;A\\007'
     printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
+    PS1=''
 }
 __weft_bash_preexec() {
     printf '\\033]133;B\\007'
@@ -315,6 +319,8 @@ mod tests {
         );
         assert!(file.body.contains("${HOSTNAME:-$HOST}"));
         assert!(file.body.contains("$PWD"));
+        // weft renders the prompt in its input box; shell PS1 is suppressed.
+        assert!(file.body.contains("PROMPT=''"));
     }
 
     #[test]
@@ -325,5 +331,6 @@ mod tests {
             "bash precmd must emit OSC 7; snippet was:\n{}",
             snippet
         );
+        assert!(snippet.contains("PS1=''"));
     }
 }
