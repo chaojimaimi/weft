@@ -60,7 +60,7 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         local __weft_rc=$?
         printf '\\033]133;D;%d\\007' \"$__weft_rc\"
         printf '\\033]133;A\\007'
-        printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
+        printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-$HOST}\" \"$PWD\"
     }
     __weft_preexec() {
         printf '\\033]133;B\\007'
@@ -306,14 +306,14 @@ mod tests {
     #[test]
     fn zsh_hook_emits_osc7_cwd() {
         let (_, file) = Integration::Zsh.rc_redirect().unwrap();
-        // precmd emits OSC 7 with $HOSTNAME + $PWD.
+        // precmd emits OSC 7 with ${HOSTNAME:-$HOST} + $PWD (zsh defaults to
+        // $HOST, so fall back to it when HOSTNAME is unset).
         assert!(
             file.body.contains("\\033]7;file://%s%s\\007"),
             "zsh precmd must emit OSC 7; body was:\n{}",
             file.body
         );
-        // The two %s args are $HOSTNAME and $PWD.
-        assert!(file.body.contains("$HOSTNAME"));
+        assert!(file.body.contains("${HOSTNAME:-$HOST}"));
         assert!(file.body.contains("$PWD"));
     }
 

@@ -49,7 +49,14 @@ pub fn build_submit_bytes(command: &str, bracketed_paste_on: bool) -> Vec<u8> {
         bytes.extend(b"\x1b[201~");
     } else {
         for &b in command.as_bytes() {
-            bytes.push(if b == b'\n' { b'\r' } else { b });
+            match b {
+                b'\n' => bytes.push(b'\r'),
+                // Strip C0 control chars and DEL (esp. ESC 0x1b) so a pasted
+                // command can't inject terminal sequences when the shell lacks
+                // bracketed-paste mode. \t and UTF-8 bytes pass through.
+                0x00..=0x08 | 0x0b..=0x1f | 0x7f => {}
+                _ => bytes.push(b),
+            }
         }
     }
     bytes.push(b'\n');
@@ -968,6 +975,24 @@ mod tests {
     fn build_submit_bytes_empty_command() {
         let bytes = build_submit_bytes("", true);
         assert_eq!(bytes, b"\x15\n"); // Ctrl-U + \n, no paste wrappers on empty
+    }
+
+    #[test]
+    fn build_submit_bytes_strips_escape_when_not_bracketed() {
+        // ESC is stripped, neutralizing the control sequence (the trailing
+        // `[2J` is harmless literal text and passes through). Without this a
+        // pasted command could inject terminal sequences when bracketed paste
+        // is off.
+        let bytes = build_submit_bytes("echo\x1b[2J", false);
+        assert_eq!(bytes, b"\x15echo[2J\n");
+        // A bare ESC mid-command is also stripped.
+        assert_eq!(build_submit_bytes("a\x1bb", false), b"\x15ab\n");
+    }
+
+    #[test]
+    fn build_submit_bytes_keeps_tab_when_not_bracketed() {
+        let bytes = build_submit_bytes("a\tb", false);
+        assert_eq!(bytes, b"\x15a\tb\n");
     }
 
     #[test]

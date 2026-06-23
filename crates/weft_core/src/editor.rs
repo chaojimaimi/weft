@@ -33,6 +33,13 @@ impl EditorBuffer {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        // Reject C0/C1 control characters (ESC, NUL, …). They can't be part of
+        // a legitimately typed command and would enable command-spoofing /
+        // terminal-sequence injection once forwarded to the PTY. Newlines arrive
+        // via `split_newline`, not here.
+        if c.is_control() {
+            return;
+        }
         let (line, col) = self.cursor;
         let byte = Self::byte_idx(&self.lines[line], col);
         self.lines[line].insert(byte, c);
@@ -79,6 +86,16 @@ impl EditorBuffer {
     /// Whole-buffer text, lines joined by `\n` (no trailing newline).
     pub fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Replace the whole buffer with `text`, cursor at the end. Cheaper than
+    /// per-char `insert_char` (which is O(n²) for long strings) and dedupes the
+    /// history-nav / search-accept / cancel restore paths.
+    pub fn set_text(&mut self, text: &str) {
+        self.lines = text.split('\n').map(String::from).collect();
+        let last_idx = self.lines.len().saturating_sub(1);
+        let last_len = self.lines.last().map(|s| s.chars().count()).unwrap_or(0);
+        self.cursor = (last_idx, last_len);
     }
 
     pub fn delete_forward(&mut self) {
@@ -244,10 +261,7 @@ impl Editor {
             // Back to live position.
             self.history_idx = None;
             let restored = self.saved_text.take().unwrap_or_default();
-            self.buffer = EditorBuffer::new();
-            for c in restored.chars() {
-                self.buffer.insert_char(c);
-            }
+            self.buffer.set_text(&restored);
         } else {
             self.history_idx = Some(i - 1);
             self.set_buffer_from_history();
@@ -257,10 +271,7 @@ impl Editor {
     fn set_buffer_from_history(&mut self) {
         let i = self.history_idx.unwrap();
         let text = self.history[i].clone();
-        self.buffer = EditorBuffer::new();
-        for c in text.chars() {
-            self.buffer.insert_char(c);
-        }
+        self.buffer.set_text(&text);
     }
 
     // ── Ctrl+R search ──────────────────────────────────────────────────
@@ -299,12 +310,20 @@ impl Editor {
         }
     }
 
+    /// Cycle to the previous match (wraps). Counterpart to `search_next` so
+    /// Ctrl+R Up/Down can navigate both directions.
+    pub fn search_prev(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            let n = s.matches.len();
+            if n > 0 {
+                s.selected = (s.selected + n - 1) % n;
+            }
+        }
+    }
+
     pub fn search_accept(&mut self) {
         if let Some(text) = self.search_selected_text() {
-            self.buffer = EditorBuffer::new();
-            for c in text.chars() {
-                self.buffer.insert_char(c);
-            }
+            self.buffer.set_text(&text);
         }
         self.search = None;
         self.saved_text = None;
@@ -313,10 +332,7 @@ impl Editor {
     pub fn search_cancel(&mut self) {
         self.search = None;
         if let Some(text) = self.saved_text.take() {
-            self.buffer = EditorBuffer::new();
-            for c in text.chars() {
-                self.buffer.insert_char(c);
-            }
+            self.buffer.set_text(&text);
         }
     }
 
@@ -628,5 +644,42 @@ mod tests {
         e.search_start();
         e.search_input('z');
         assert_eq!(e.search_selected_text(), None);
+    }
+
+    #[test]
+    fn insert_char_rejects_control_chars() {
+        let mut b = EditorBuffer::new();
+        b.insert_char('a');
+        b.insert_char('\x1b'); // ESC — spoofing/injection vector, rejected
+        b.insert_char('\x00'); // NUL
+        b.insert_char('b');
+        assert_eq!(b.text(), "ab");
+        assert_eq!(b.cursor, (0, 2));
+    }
+
+    #[test]
+    fn set_text_replaces_and_positions_cursor_at_end() {
+        let mut b = EditorBuffer::new();
+        b.set_text("ab\ncd");
+        assert_eq!(b.text(), "ab\ncd");
+        assert_eq!(b.cursor, (1, 2));
+        // Empty -> single empty line, cursor at origin.
+        b.set_text("");
+        assert_eq!(b.text(), "");
+        assert_eq!(b.cursor, (0, 0));
+    }
+
+    #[test]
+    fn search_prev_navigates_backwards_and_wraps() {
+        let mut e = editor_with_history(&["git status", "git push"]);
+        e.search_start();
+        for c in "git".chars() {
+            e.search_input(c);
+        }
+        assert_eq!(e.search_selected_text(), Some("git push".to_string())); // newest
+        e.search_prev();
+        assert_eq!(e.search_selected_text(), Some("git status".to_string()));
+        e.search_prev(); // wraps back to newest
+        assert_eq!(e.search_selected_text(), Some("git push".to_string()));
     }
 }

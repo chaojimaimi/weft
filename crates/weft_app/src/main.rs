@@ -579,7 +579,11 @@ impl App {
                         e.search_cancel();
                         return true;
                     }
-                    Up | Down => {
+                    Up => {
+                        e.search_prev();
+                        return true;
+                    }
+                    Down => {
                         e.search_next();
                         return true;
                     }

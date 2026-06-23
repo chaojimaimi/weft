@@ -885,6 +885,10 @@ impl vte::Perform for Terminal {
                         b"A" => {
                             self.shell_markers.push(ShellMarker::PromptStart);
                             self.block_tracker.on_prompt_start();
+                            // Clear any stale submit flag so a missing 133;B
+                            // (crashed / non-integrated sub-shell) can't pin the
+                            // editor in passthrough forever.
+                            self.command_from_editor = None;
                         }
                         b"B" => {
                             self.shell_markers.push(ShellMarker::CommandStart);
@@ -1466,7 +1470,6 @@ mod tests {
 
     // ── v0.5 editor takeover: OSC 7 + effective mode + submit ──────
 
-    use crate::editor::Editor;
     use crate::input::{build_submit_bytes, InputMode};
 
     #[test]
