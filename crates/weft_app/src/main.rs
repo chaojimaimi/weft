@@ -6,7 +6,7 @@
 mod glyph;
 mod renderer;
 
-use renderer::{block_matches_query, MetalRenderer, PanelDrawParams};
+use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
 use weft_core::blocks::BlockId;
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
@@ -1414,11 +1414,32 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         None
                     };
+                    // Editor input box: built only in Editor mode (hidden in
+                    // passthrough). cwd/lines/search borrow `terminal`; the
+                    // preedit borrows `self.ime_preedit` (a disjoint field).
+                    let prompt =
+                        if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
+                            let search = terminal.editor().search_view();
+                            Some(PromptDrawParams {
+                                cwd: terminal.cwd(),
+                                lines: &terminal.editor().buffer.lines,
+                                cursor: terminal.editor().buffer.cursor,
+                                preedit: if self.ime_preedit.is_empty() {
+                                    None
+                                } else {
+                                    Some(self.ime_preedit.as_str())
+                                },
+                                search,
+                            })
+                        } else {
+                            None
+                        };
                     renderer.draw(
                         terminal,
                         &self.selection_handler,
                         self.cursor_blink_on,
                         panel.as_ref(),
+                        prompt.as_ref(),
                     );
                 }
 

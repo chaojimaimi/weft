@@ -328,6 +328,7 @@ fragment float4 text_fragment(
         selection: &SelectionHandler,
         cursor_blink_on: bool,
         panel: Option<&PanelDrawParams>,
+        prompt: Option<&PromptDrawParams>,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -377,6 +378,25 @@ fragment float4 text_fragment(
                     }
                 }
             }
+            if let Some(p) = prompt {
+                missing.extend("❯ ".chars());
+                if let Some(cwd) = p.cwd {
+                    missing.extend(cwd.chars());
+                }
+                for line in p.lines {
+                    missing.extend(line.chars());
+                }
+                if let Some(preedit) = p.preedit {
+                    missing.extend(preedit.chars());
+                }
+                if let Some((q, sel)) = p.search {
+                    missing.extend("search: ".chars());
+                    missing.extend(q.chars());
+                    if let Some(m) = sel {
+                        missing.extend(m.chars());
+                    }
+                }
+            }
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
@@ -396,6 +416,11 @@ fragment float4 text_fragment(
         // composites over terminal cells via the enabled alpha blend).
         if let Some(p) = panel {
             vertices.extend_from_slice(&self.build_panel_vertices(p));
+        }
+
+        // Overlay the editor input box at the bottom (Editor mode only).
+        if let Some(p) = prompt {
+            vertices.extend_from_slice(&self.build_prompt_vertices(p));
         }
 
         // Debug: log first row characters and verify vertex data
@@ -1011,6 +1036,123 @@ fragment float4 text_fragment(
         vertices
     }
 
+    /// Build vertices for the bottom editor input box (v0.5 editor takeover):
+    /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
+    /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
+    /// after the grid so it composites on top via the enabled alpha blend.
+    fn build_prompt_vertices(&self, p: &PromptDrawParams) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let vp_h = self.viewport.1;
+        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
+            return verts;
+        }
+
+        let n_lines = p.lines.len().max(1);
+        // Box height matches what `input_box_height_px` subtracted from the
+        // grid (one pad row + N text lines + one pad row) so they never gap.
+        let box_h = ch * (n_lines as f32 + 2.0);
+        let box_y1 = (vp_h - self.padding_y).max(0.0);
+        let box_y0 = (box_y1 - box_h).max(0.0);
+        let box_x0 = self.padding_x;
+        let box_x1 = (vp_w - self.padding_x).max(box_x0);
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let box_bg = [
+            theme_bg[0] * 0.45,
+            theme_bg[1] * 0.45,
+            theme_bg[2] * 0.45,
+            0.94,
+        ];
+        let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.cursor);
+        let (su, sv, suw, svh) = self.space_uv();
+        // V-swap to match grid rendering (CAMetalLayer flip compensation).
+        let bg_uv = [su, sv + svh, su + suw, sv];
+
+        // Translucent background.
+        push_quad(
+            &mut verts,
+            [box_x0, box_y0, box_x1, box_y1],
+            bg_uv,
+            [0.0; 4],
+            box_bg,
+        );
+
+        let text_y0 = box_y0 + ch; // first text row (below the top pad row)
+        let left = box_x0 + cw; // one-cell left margin
+        let box_cols = (((box_x1 - left) / cw).max(1.0)) as usize;
+
+        // Ctrl+R search UI replaces the normal prompt.
+        if let Some((query, selected)) = p.search {
+            let label = "search: ";
+            self.push_text(&mut verts, left, text_y0, label, fg, box_cols);
+            let qx = left + label.chars().count() as f32 * cw;
+            self.push_text(&mut verts, qx, text_y0, query, accent, box_cols);
+            if let Some(m) = selected {
+                self.push_text(&mut verts, left, text_y0 + ch, m, fg, box_cols);
+            }
+            return verts;
+        }
+
+        // Prompt glyph + cwd on the first text row.
+        let prompt_str = match p.cwd {
+            Some(cwd) => format!("❯ {cwd}"),
+            None => "❯ ".to_string(),
+        };
+        let prompt_chars = prompt_str.chars().count();
+        self.push_text(
+            &mut verts,
+            left,
+            text_y0,
+            &prompt_str,
+            accent,
+            prompt_chars.min(box_cols),
+        );
+
+        // Editor buffer lines (line 0 starts after the prompt).
+        for (i, line) in p.lines.iter().enumerate() {
+            let y = text_y0 + i as f32 * ch;
+            let (start_x, max_chars) = if i == 0 {
+                let sx = left + prompt_chars as f32 * cw;
+                let avail = box_cols.saturating_sub(prompt_chars).max(1);
+                (sx, avail)
+            } else {
+                (left, box_cols)
+            };
+            self.push_text(&mut verts, start_x, y, line, fg, max_chars);
+        }
+
+        // Cursor bar at (line, col).
+        let (cl, cc) = p.cursor;
+        let cy = text_y0 + cl as f32 * ch;
+        let text_start_x = if cl == 0 {
+            left + prompt_chars as f32 * cw
+        } else {
+            left
+        };
+        let cx = text_start_x + cc as f32 * cw;
+        let bar_w = (cw * 0.12).max(2.0);
+        push_quad(
+            &mut verts,
+            [cx, cy, cx + bar_w, cy + ch],
+            bg_uv,
+            [0.0; 4],
+            accent,
+        );
+
+        // IME preedit right after the cursor.
+        if let Some(preedit) = p.preedit {
+            if !preedit.is_empty() {
+                self.push_text(&mut verts, cx + bar_w, cy, preedit, accent, box_cols);
+            }
+        }
+
+        verts
+    }
+
     /// Lay out a string left-to-right as single-cell glyph quads. ASCII fast
     /// path; wide chars compress to one cell (acceptable for panel labels).
     /// Glyphs must already be in the atlas (warmed up by the caller).
@@ -1068,6 +1210,22 @@ pub struct PanelDrawParams<'a> {
     pub selection: usize,
     /// Id of the block whose output is expanded inline (None = all collapsed).
     pub expanded_id: Option<BlockId>,
+}
+
+/// What the bottom editor input box should draw (v0.5 editor takeover). Built
+/// by the app only in Editor mode and passed to [`MetalRenderer::draw`].
+pub struct PromptDrawParams<'a> {
+    /// Current working directory (from OSC 7) shown after the `❯` glyph.
+    pub cwd: Option<&'a str>,
+    /// Editor buffer lines (line 0 follows the prompt).
+    pub lines: &'a [String],
+    /// Cursor position (line index, char column).
+    pub cursor: (usize, usize),
+    /// Active IME preedit string, drawn right after the cursor.
+    pub preedit: Option<&'a str>,
+    /// `(query, selected_match)` when Ctrl+R search is active (replaces the
+    /// normal prompt rendering).
+    pub search: Option<(&'a str, Option<&'a str>)>,
 }
 
 /// Whether a block matches the panel search query (empty query = match all).
