@@ -90,6 +90,9 @@ pub struct GlyphAtlas {
     cjk_font: Option<Font>,
     /// Emoji fallback font (Apple Color Emoji).
     emoji_font: Option<Font>,
+    /// Symbol fallback font (Apple Symbols) — last-resort glyphs the primary
+    /// font lacks (e.g. ❯ U+276F in the Dingbats block, box-drawing, arrows).
+    symbol_font: Option<Font>,
     /// Scaled font size in pixels.
     scaled_size: f32,
 }
@@ -119,6 +122,11 @@ impl GlyphAtlas {
             &font_config.emoji_family,
             &["/System/Library/Fonts/Apple Color Emoji.ttc"],
         );
+
+        // Symbol fallback (Apple Symbols) — covers glyphs like ❯ (U+276F) that
+        // Menlo lacks, so the prompt marker renders instead of blanking.
+        let symbol_font =
+            resolve_font("Apple Symbols", &["/System/Library/Fonts/Apple Symbols.ttf"]);
 
         let font_size = font_config.size;
         let scaled_size = font_size * scale_factor as f32;
@@ -220,6 +228,7 @@ impl GlyphAtlas {
             primary_font,
             cjk_font,
             emoji_font,
+            symbol_font,
             scaled_size,
         }
     }
@@ -269,6 +278,12 @@ impl GlyphAtlas {
                 .is_some_and(|f| f.glyph_for_char(ch).is_some())
             {
                 self.emoji_font.as_ref().unwrap()
+            } else if self
+                .symbol_font
+                .as_ref()
+                .is_some_and(|f| f.glyph_for_char(ch).is_some())
+            {
+                self.symbol_font.as_ref().unwrap()
             } else {
                 &self.primary_font
             }

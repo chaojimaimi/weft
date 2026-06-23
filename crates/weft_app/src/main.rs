@@ -246,7 +246,12 @@ impl App {
         }
     }
 
-    fn handle_key_event(&mut self, key_code: WinitKeyCode, mods: winit::event::Modifiers) {
+    fn handle_key_event(
+        &mut self,
+        key_code: WinitKeyCode,
+        mods: winit::event::Modifiers,
+        text: Option<&str>,
+    ) {
         if self.terminal.is_none() {
             return;
         }
@@ -374,7 +379,7 @@ impl App {
                 .as_ref()
                 .map(|t| t.editor().line_count())
                 .unwrap_or(1);
-            let consumed = self.handle_editor_key(key, m);
+            let consumed = self.handle_editor_key(key, m, text);
             let new_lines = self
                 .terminal
                 .as_ref()
@@ -509,8 +514,9 @@ impl App {
     /// Handle a key while in Editor input mode (the input box owns the prompt).
     /// Returns true if consumed. Ctrl chords that aren't editor ops fall through
     /// (returns false) so Ctrl+C etc. still reach the PTY.
-    fn handle_editor_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
+    fn handle_editor_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
         use weft_core::input::{KeyCode::*, Modifiers};
+        let shift = mods.contains(Modifiers::SHIFT);
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
@@ -564,7 +570,7 @@ impl App {
                 let e = t.editor_mut();
                 match key {
                     Char(c) => {
-                        e.search_input(c);
+                        e.search_input(resolve_text_char(text, c, shift));
                         return true;
                     }
                     Backspace => {
@@ -593,7 +599,6 @@ impl App {
             return false;
         }
 
-        let shift = mods.contains(Modifiers::SHIFT);
         match key {
             Enter if !shift => {
                 // Submit: build PTY bytes and locally block the editor (the
@@ -629,7 +634,9 @@ impl App {
             }
             Char(c) => {
                 if let Some(t) = self.terminal.as_mut() {
-                    t.editor_mut().buffer.insert_char(c);
+                    t.editor_mut()
+                        .buffer
+                        .insert_char(resolve_text_char(text, c, shift));
                 }
                 true
             }
@@ -1435,7 +1442,10 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     if let PhysicalKey::Code(key_code) = event.physical_key {
-                        self.handle_key_event(key_code, self.mods);
+                        // `event.text` already reflects Shift (and the keymap),
+                        // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
+                        // so typed commands keep their case / shifted symbols.
+                        self.handle_key_event(key_code, self.mods, event.text.as_deref());
                     }
                 }
             }
@@ -1508,6 +1518,28 @@ impl ApplicationHandler<AppEvent> for App {
             }
             _ => {}
         }
+    }
+}
+
+/// Resolve the character to insert for a printable editor key. Prefers the
+/// keyboard-layout text (`KeyEvent::text`), which already reflects Shift and
+/// the active layout — Shift+A -> 'A', Shift+1 -> '!', etc. Falls back to the
+/// physical key's base char (uppercased when Shift is held) only when the text
+/// is absent or not a single printable char (some IME configurations omit it),
+/// so typed commands keep their case even then.
+fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
+    if let Some(s) = text {
+        let mut it = s.chars();
+        if let (Some(c), None) = (it.next(), it.next()) {
+            if !c.is_control() {
+                return c;
+            }
+        }
+    }
+    if shift {
+        fallback.to_ascii_uppercase()
+    } else {
+        fallback
     }
 }
 
