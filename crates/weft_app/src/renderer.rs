@@ -397,22 +397,40 @@ fragment float4 text_fragment(
                     }
                 }
             }
+            // Block-view (Editor-mode main area): commands, outputs, durations.
+            if prompt.is_some() {
+                for b in terminal.block_tracker().blocks().iter().rev().take(64) {
+                    missing.extend("❯ ".chars());
+                    missing.extend(b.command.chars());
+                    missing.extend(block_duration_str(b).chars());
+                    for line in b.output.lines().take(200) {
+                        missing.extend(line.chars());
+                    }
+                }
+            }
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
         }
 
-        // Build vertex data from Grid cells. The grid cursor is hidden while
-        // the editor input box owns the prompt — that box draws its own
-        // cursor, and showing both produced a double-cursor.
-        let mut vertices = self.build_grid_vertices(
-            grid,
-            terminal.palette(),
-            cursor,
-            selection,
-            terminal.cursor_visible && cursor_blink_on && prompt.is_none(),
-            terminal.cursor_style,
-        );
+        // Editor mode shows the Warp-style block history instead of the raw
+        // grid; passthrough (command running / alt-screen) shows the live grid.
+        let ch = self.cell_height() as f32;
+        let vp_h = self.viewport.1;
+        let mut vertices = if let Some(p) = prompt {
+            let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
+            let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
+            self.build_block_view_vertices(terminal.block_tracker().blocks(), box_top_y)
+        } else {
+            self.build_grid_vertices(
+                grid,
+                terminal.palette(),
+                cursor,
+                selection,
+                terminal.cursor_visible && cursor_blink_on,
+                terminal.cursor_style,
+            )
+        };
 
         // Overlay the history panel on top of the grid (drawn after, so it
         // composites over terminal cells via the enabled alpha blend).
@@ -1145,6 +1163,72 @@ fragment float4 text_fragment(
             if !preedit.is_empty() {
                 self.push_text(&mut verts, cx + bar_w, cy, preedit, accent, box_cols);
             }
+        }
+
+        verts
+    }
+
+    /// Warp-style block history shown in Editor mode instead of the raw grid.
+    /// Each finished command renders as `❯ command (duration)` followed by its
+    /// captured output, newest at the bottom just above the input box. Older
+    /// blocks scroll off the top once the viewport fills. `box_top_y` is the
+    /// top edge of the input box (blocks render upward from there).
+    fn build_block_view_vertices(&self, blocks: &[Block], box_top_y: f32) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let vp_h = self.viewport.1;
+        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
+            return verts;
+        }
+
+        let pad_x = self.padding_x;
+        let pad_y = self.padding_y;
+        let left = pad_x + cw; // one-cell left margin (matches the input box)
+        let cols = (((vp_w - pad_x - left) / cw).max(1.0)) as usize;
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.cursor);
+        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+
+        // Opaque background over the whole viewport hides the raw grid (the
+        // shell's live output is irrelevant once a command has finished).
+        push_quad(&mut verts, [0.0, 0.0, vp_w, vp_h], bg_uv, [0.0; 4], theme_bg);
+
+        // Render blocks newest-first, upward from just above the input box.
+        let mut y = box_top_y - ch;
+        for b in blocks.iter().rev() {
+            if y < pad_y {
+                break;
+            }
+            // Output lines (bottom-up so the last line sits nearest the command).
+            for line in b.output.lines().rev() {
+                if y < pad_y {
+                    break;
+                }
+                self.push_text(&mut verts, left, y, line, dim, cols);
+                y -= ch;
+            }
+            // Command line: ❯ command ... (duration)
+            if y >= pad_y {
+                self.push_text(&mut verts, left, y, "❯ ", accent, cols);
+                let cmd_x = left + 2.0 * cw;
+                let avail = cols.saturating_sub(2).max(1);
+                self.push_text(&mut verts, cmd_x, y, &b.command, fg, avail);
+                let dur = block_duration_str(b);
+                let dc = dur.chars().count();
+                if !dur.is_empty() && dc + 2 < cols {
+                    let dx = left + (cols - dc) as f32 * cw;
+                    self.push_text(&mut verts, dx, y, &dur, dim, dc);
+                }
+                y -= ch;
+            }
+            // A little breathing room between blocks.
+            y -= ch * 0.4;
         }
 
         verts
