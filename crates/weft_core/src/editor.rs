@@ -155,6 +155,228 @@ impl Default for EditorBuffer {
     }
 }
 
+/// Owned input box state: the buffer plus command history and Ctrl+R search.
+pub struct Editor {
+    pub buffer: EditorBuffer,
+    history: Vec<String>,
+    /// Index into `history` while navigating (newest-first), or `None` when
+    /// at the "live" prompt position.
+    history_idx: Option<usize>,
+    /// Snapshot of buffer text when history nav / search began, so cancel
+    /// restores it.
+    saved_text: Option<String>,
+    search: Option<Search>,
+}
+
+/// Ctrl+R search state.
+pub struct Search {
+    pub query: String,
+    /// Indices into `history` (newest-first) matching the query.
+    matches: Vec<usize>,
+    /// Selected position within `matches`.
+    selected: usize,
+}
+
+impl Editor {
+    pub fn new() -> Self {
+        Self {
+            buffer: EditorBuffer::new(),
+            history: Vec::new(),
+            history_idx: None,
+            saved_text: None,
+            search: None,
+        }
+    }
+
+    /// Hydrate from persisted history (oldest→newest; we navigate newest-first).
+    pub fn load_history(&mut self, history: Vec<String>) {
+        self.history = history;
+        // Store newest-first for nav.
+        self.history.reverse();
+    }
+
+    pub fn text(&self) -> String {
+        self.buffer.text()
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.buffer.line_count()
+    }
+
+    /// Reset to an empty single-line buffer (after submit, or when leaving
+    /// AtPrompt).
+    pub fn clear(&mut self) {
+        self.buffer = EditorBuffer::new();
+        self.history_idx = None;
+        self.saved_text = None;
+        self.search = None;
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    // ── history navigation (↑/↓) ───────────────────────────────────────
+
+    pub fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        if self.history_idx.is_none() {
+            // Entering history: snapshot current text for ↓ to restore.
+            self.saved_text = Some(self.buffer.text());
+            self.history_idx = Some(0);
+        } else if let Some(i) = self.history_idx {
+            if i + 1 < self.history.len() {
+                self.history_idx = Some(i + 1);
+            } else {
+                return; // clamp at oldest
+            }
+        }
+        self.set_buffer_from_history();
+    }
+
+    pub fn history_next(&mut self) {
+        let Some(i) = self.history_idx else {
+            return;
+        };
+        if i == 0 {
+            // Back to live position.
+            self.history_idx = None;
+            let restored = self.saved_text.take().unwrap_or_default();
+            self.buffer = EditorBuffer::new();
+            for c in restored.chars() {
+                self.buffer.insert_char(c);
+            }
+        } else {
+            self.history_idx = Some(i - 1);
+            self.set_buffer_from_history();
+        }
+    }
+
+    fn set_buffer_from_history(&mut self) {
+        let i = self.history_idx.unwrap();
+        let text = self.history[i].clone();
+        self.buffer = EditorBuffer::new();
+        for c in text.chars() {
+            self.buffer.insert_char(c);
+        }
+    }
+
+    // ── Ctrl+R search ──────────────────────────────────────────────────
+
+    pub fn search_start(&mut self) {
+        self.saved_text = Some(self.buffer.text());
+        self.search = Some(Search {
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+        });
+        self.recompute_matches();
+    }
+
+    pub fn search_input(&mut self, c: char) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.push(c);
+            s.selected = 0;
+        }
+        self.recompute_matches();
+    }
+
+    pub fn search_backspace(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.query.pop();
+            s.selected = 0;
+        }
+        self.recompute_matches();
+    }
+
+    pub fn search_next(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            if !s.matches.is_empty() {
+                s.selected = (s.selected + 1) % s.matches.len();
+            }
+        }
+    }
+
+    pub fn search_accept(&mut self) {
+        if let Some(text) = self.search_selected_text() {
+            self.buffer = EditorBuffer::new();
+            for c in text.chars() {
+                self.buffer.insert_char(c);
+            }
+        }
+        self.search = None;
+        self.saved_text = None;
+    }
+
+    pub fn search_cancel(&mut self) {
+        self.search = None;
+        if let Some(text) = self.saved_text.take() {
+            self.buffer = EditorBuffer::new();
+            for c in text.chars() {
+                self.buffer.insert_char(c);
+            }
+        }
+    }
+
+    /// The currently-selected match text, if any.
+    pub fn search_selected_text(&self) -> Option<String> {
+        let s = self.search.as_ref()?;
+        let &hist_idx = s.matches.get(s.selected)?;
+        Some(self.history[hist_idx].clone())
+    }
+
+    /// `(query, selected_match_text)` for rendering.
+    pub fn search_view(&self) -> Option<(&str, Option<&str>)> {
+        let s = self.search.as_ref()?;
+        let sel = s.matches.get(s.selected).map(|&i| self.history[i].as_str());
+        Some((s.query.as_str(), sel))
+    }
+
+    fn recompute_matches(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        // history is newest-first; matches keep that order.
+        let matches: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| is_subsequence(&query, h))
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(s) = self.search.as_mut() {
+            s.matches = matches;
+            if s.selected >= s.matches.len() && !s.matches.is_empty() {
+                s.selected = 0;
+            }
+        }
+    }
+}
+
+impl Default for Editor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// True when every char of `query` appears in `candidate` in order (fuzzy
+/// subsequence). Empty query matches nothing (so an empty search box shows no
+/// preview, matching the test).
+fn is_subsequence(query: &str, candidate: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let mut q = query.chars().peekable();
+    for c in candidate.chars() {
+        if q.peek() == Some(&c) {
+            q.next();
+        }
+    }
+    q.peek().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +553,80 @@ mod tests {
         assert_eq!(b.text(), "ab\ncd");
         assert_eq!(b.cursor, (1, 0));
         assert_eq!(b.line_count(), 2);
+    }
+
+    fn editor_with_history(history: &[&str]) -> Editor {
+        let mut e = Editor::new();
+        e.load_history(history.iter().map(|s| s.to_string()).collect());
+        e
+    }
+
+    #[test]
+    fn history_prev_fills_buffer_and_clamps() {
+        let mut e = editor_with_history(&["first", "second"]);
+        e.history_prev();
+        assert_eq!(e.buffer.text(), "second"); // newest first
+        e.history_prev();
+        assert_eq!(e.buffer.text(), "first");
+        e.history_prev(); // clamps at oldest
+        assert_eq!(e.buffer.text(), "first");
+    }
+
+    #[test]
+    fn history_next_returns_to_empty() {
+        let mut e = editor_with_history(&["only"]);
+        e.history_prev();
+        e.history_next();
+        assert_eq!(e.buffer.text(), "");
+    }
+
+    #[test]
+    fn search_finds_subsequence_match() {
+        let mut e = editor_with_history(&["git status", "git push", "ls -la"]);
+        e.search_start();
+        e.search_input('g');
+        e.search_input('p'); // query "gp" matches "git push" only
+        assert_eq!(e.search_selected_text(), Some("git push".to_string()));
+    }
+
+    #[test]
+    fn search_next_cycles_through_matches() {
+        let mut e = editor_with_history(&["git status", "git push"]);
+        e.search_start();
+        e.search_input('g');
+        e.search_input('i');
+        e.search_input('t'); // "git" matches both
+        assert_eq!(e.search_selected_text(), Some("git push".to_string())); // newest
+        e.search_next();
+        assert_eq!(e.search_selected_text(), Some("git status".to_string()));
+    }
+
+    #[test]
+    fn search_accept_fills_buffer() {
+        let mut e = editor_with_history(&["git push"]);
+        e.search_start();
+        e.search_input('g');
+        e.search_accept();
+        assert_eq!(e.buffer.text(), "git push");
+        assert!(!e.is_searching());
+    }
+
+    #[test]
+    fn search_cancel_restores_original() {
+        let mut e = editor_with_history(&["git push"]);
+        e.buffer.insert_char('x');
+        e.search_start();
+        e.search_input('g');
+        e.search_cancel();
+        assert_eq!(e.buffer.text(), "x");
+        assert!(!e.is_searching());
+    }
+
+    #[test]
+    fn search_no_match_keeps_empty_selection() {
+        let mut e = editor_with_history(&["ls"]);
+        e.search_start();
+        e.search_input('z');
+        assert_eq!(e.search_selected_text(), None);
     }
 }
