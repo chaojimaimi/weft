@@ -435,7 +435,11 @@ fragment float4 text_fragment(
                 )
             } else {
                 // CommandExecuting overlay: live grid on the bottom, completed
-                // blocks (opaque) over the top so history stays as blocks.
+                // blocks (opaque) over the top so history stays as blocks. The
+                // split tracks the GRID CURSOR, not a fixed ratio: live output
+                // (Password:, the root shell) sits at the cursor, so the overlay
+                // must cover only what's above it — otherwise a short session's
+                // output hides under the overlay.
                 let mut v = self.build_grid_vertices(
                     grid,
                     terminal.palette(),
@@ -444,7 +448,9 @@ fragment float4 text_fragment(
                     terminal.cursor_visible && cursor_blink_on,
                     terminal.cursor_style,
                 );
-                let y_split = pad_y + (vp_h - 2.0 * pad_y) * 0.6;
+                // Leave the live area at least a few rows; clamp to the viewport.
+                let live_top_max = (vp_h - pad_y - 6.0 * ch).max(pad_y);
+                let y_split = (pad_y + cursor.row as f32 * ch).clamp(pad_y, live_top_max);
                 v.extend_from_slice(&self.build_block_view_vertices(
                     terminal.block_tracker().session_blocks(),
                     y_split,
@@ -1132,6 +1138,17 @@ fragment float4 text_fragment(
             bg_uv,
             [0.0; 4],
             box_bg,
+        );
+
+        // Divider rule across the top edge of the input box — matches the
+        // inter-block separators so the input area is clearly set off from the
+        // history above it.
+        push_quad(
+            &mut verts,
+            [box_x0, box_y0, box_x1, box_y0 + 1.5],
+            bg_uv,
+            [0.0; 4],
+            [0.65, 0.65, 0.65, 0.22],
         );
 
         let text_y0 = box_y0 + ch; // first text row (below the top pad row)
