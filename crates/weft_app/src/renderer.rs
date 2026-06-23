@@ -1215,21 +1215,19 @@ fragment float4 text_fragment(
         // shell's live output is irrelevant once a command has finished).
         push_quad(&mut verts, [0.0, 0.0, vp_w, vp_h], bg_uv, [0.0; 4], theme_bg);
 
-        let mut y = box_top_y - ch;
-
-        // Empty session: show the current cwd so the initial window isn't a
-        // blank void (Warp surfaces your location up front).
-        if blocks.is_empty() {
-            if let Some(cwd) = cwd {
-                let display = abbreviate_path(cwd);
-                if !display.is_empty() && y >= pad_y {
-                    self.push_text(&mut verts, left, y, &display, dim, cols);
-                }
+        // Persistent current-directory line directly above the input box
+        // (always shown, abbreviated) — the "you are here" context for the
+        // next command, matching the initial/empty state.
+        let cwd_y = box_top_y - ch;
+        if let Some(cwd) = cwd {
+            let display = abbreviate_path(cwd);
+            if !display.is_empty() && cwd_y >= pad_y {
+                self.push_text(&mut verts, left, cwd_y, &display, dim, cols);
             }
-            return verts;
         }
 
-        // Render blocks newest-first, upward from just above the input box.
+        // Render blocks newest-first, upward from above the cwd line.
+        let mut y = box_top_y - 2.0 * ch;
         for b in blocks.iter().rev() {
             if y < pad_y {
                 break;

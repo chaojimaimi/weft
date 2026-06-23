@@ -177,6 +177,30 @@ impl GlyphAtlas {
             }
         }
 
+        // Pre-rasterize the prompt marker and common UI glyphs with the primary
+        // font, at init (atlas empty, no draw-time upload). The ❯ (U+276F)
+        // prompt must be in the texture before the first draw — the warm-up
+        // path was leaving it blank in the running app.
+        for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─'] {
+            let placed = Self::rasterize_and_place(
+                &primary_font,
+                ch,
+                scaled_size,
+                cell_w,
+                cell_h,
+                false,
+                &mut atlas_pixels,
+                atlas_w,
+                atlas_h,
+                &mut next_x,
+                &mut next_y,
+                &mut row_height,
+            );
+            if let Some(info) = placed {
+                cache.insert(ch, info);
+            }
+        }
+
         // Pre-rasterize common CJK punctuation and a few CJK chars
         let cjk_chars: &[char] = &[
             '、', '。', '「', '」', '【', '】', '，', '；', '：', '？', '！', '（', '）', '…', '—',
@@ -722,7 +746,6 @@ mod transform_probe {
 
     #[test]
     fn menlo_renders_angle_quote_with_ink() {
-        // Regression guard: the ❯ (U+276F) prompt marker must rasterize with
         // real ink from Menlo. (Apple Symbols does NOT have U+276F, so the
         // prompt color/visibility depends on Menlo rendering it directly.)
         let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
@@ -730,6 +753,15 @@ mod transform_probe {
         let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28);
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
+    }
+
+    #[test]
+    fn angle_quote_is_not_classified_wide() {
+        // If ❯ were wide (unicode-width > 1), get_or_rasterize would route it
+        // to the CJK font (which lacks it) → a blank prompt marker. It must be
+        // width 1 so the primary (Menlo) path renders it.
+        let w = unicode_width::UnicodeWidthChar::width('❯').unwrap_or(0);
+        assert_eq!(w, 1, "❯ must be width 1, got {w}");
     }
 
     #[test]
