@@ -37,5 +37,7 @@ unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 core-graphics-types = "0.1"
+# Secret masking (v0.5 F8)
+regex = "1"
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }

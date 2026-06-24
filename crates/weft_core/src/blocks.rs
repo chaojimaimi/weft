@@ -301,6 +301,9 @@ impl BlockTracker {
             output.push_str("\n…(output truncated, >64 KiB)");
         }
         self.output_truncated = false;
+        // Mask secrets capture-side so the stored block (history / search /
+        // future AI context) never holds a credential. The live grid stays raw.
+        output = crate::secrets::mask(&output);
 
         let block = Block {
             id: BlockId(self.next_id),
