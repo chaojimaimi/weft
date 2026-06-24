@@ -1533,6 +1533,7 @@ impl ApplicationHandler<AppEvent> for App {
                     let prompt =
                         if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
                             let search = terminal.editor().search_view();
+                            let completions = terminal.editor().completion_view();
                             Some(PromptDrawParams {
                                 cwd: terminal.cwd(),
                                 lines: &terminal.editor().buffer.lines,
@@ -1543,6 +1544,7 @@ impl ApplicationHandler<AppEvent> for App {
                                     Some(self.ime_preedit.as_str())
                                 },
                                 search,
+                                completions,
                             })
                         } else {
                             None

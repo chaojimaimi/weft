@@ -397,6 +397,11 @@ fragment float4 text_fragment(
                         missing.extend(m.chars());
                     }
                 }
+                if let Some((completions, _)) = p.completions {
+                    for m in completions {
+                        missing.extend(m.label.chars());
+                    }
+                }
             }
             // Block-view (Editor mode + CommandExecuting overlay): commands,
             // outputs, durations. Session blocks only — hydrated history stays
@@ -1198,6 +1203,38 @@ fragment float4 text_fragment(
             }
         }
 
+        // Tab-completion dropdown, stacked above the input box (newest selected
+        // row nearest the box). A window of up to 8 candidates ending at the
+        // selected one; the selected row gets a highlight bar.
+        if let Some((matches, selected)) = p.completions {
+            if !matches.is_empty() && p.search.is_none() {
+                let max_rows = 8usize;
+                let start = selected.saturating_sub(max_rows - 1);
+                let end = (start + max_rows).min(matches.len());
+                let avail = box_cols.saturating_sub(1).max(1);
+                let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+                let mut y = box_y0 - ch;
+                for i in (start..end).rev() {
+                    if y < 0.0 {
+                        break;
+                    }
+                    let is_sel = i == selected;
+                    if is_sel {
+                        push_quad(
+                            &mut verts,
+                            [box_x0, y, box_x1, y + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            [prompt_c[0], prompt_c[1], prompt_c[2], 0.25],
+                        );
+                    }
+                    let color = if is_sel { fg } else { dim };
+                    self.push_text(&mut verts, box_x0 + cw, y, &matches[i].label, color, avail);
+                    y -= ch;
+                }
+            }
+        }
+
         verts
     }
 
@@ -1443,6 +1480,9 @@ pub struct PromptDrawParams<'a> {
     /// `(query, selected_match)` when Ctrl+R search is active (replaces the
     /// normal prompt rendering).
     pub search: Option<(&'a str, Option<&'a str>)>,
+    /// `(matches, selected_index)` when Tab completion is active — rendered as
+    /// a dropdown above the input box.
+    pub completions: Option<(&'a [weft_core::complete::Match], usize)>,
 }
 
 /// Whether a block matches the panel search query (empty query = match all).
