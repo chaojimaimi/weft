@@ -61,6 +61,9 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         printf '\\033]133;D;%d\\007' \"$__weft_rc\"
         printf '\\033]133;A\\007'
         printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-$HOST}\" \"$PWD\"
+        # Report the current git branch (if in a repo) for the prompt header.
+        local __weft_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+        [ -n \"$__weft_branch\" ] && printf '\\033]9;git=%s\\007' \"$__weft_branch\"
         # weft renders the prompt in its input box; blank the shell's PS1 so
         # the grid doesn't show a duplicate prompt line at the shell cursor.
         # Also clear PROMPT_EOL_MARK (zsh prints it — a '%' — when a command's

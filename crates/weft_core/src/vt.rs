@@ -53,6 +53,8 @@ pub struct Terminal {
     editor: Editor,
     /// cwd reported by the shell via OSC 7.
     cwd: Option<String>,
+    /// Git branch reported by the shell hook via OSC 9;git=<branch>.
+    git_branch: Option<String>,
     /// Set on editor submit, consumed by `133;B`. While `Some`, input passes
     /// through (Enter→preexec window) and the command source is the editor.
     command_from_editor: Option<String>,
@@ -102,6 +104,7 @@ impl Terminal {
             block_tracker: BlockTracker::new(),
             editor: Editor::new(),
             cwd: None,
+            git_branch: None,
             command_from_editor: None,
             app_cursor_keys: false,
             bracketed_paste: false,
@@ -152,6 +155,11 @@ impl Terminal {
 
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    /// Current git branch (from OSC 9;git=<branch>), for the prompt header.
+    pub fn git_branch(&self) -> Option<&str> {
+        self.git_branch.as_deref()
     }
 
     /// Effective input routing right now (passthrough vs. editor).
@@ -900,6 +908,16 @@ impl vte::Perform for Terminal {
                         // Mirror into the block tracker so each block is stamped
                         // with the dir it ran in (for the block-view header).
                         self.block_tracker.set_cwd(Some(path));
+                    }
+                }
+            }
+            "9" => {
+                // Custom OSC 9;git=<branch> — shell hook reports the git branch.
+                if let Some(payload) = params.get(1) {
+                    if let Ok(s) = std::str::from_utf8(payload) {
+                        if let Some(branch) = s.strip_prefix("git=") {
+                            self.git_branch = Some(branch.to_string());
+                        }
                     }
                 }
             }

@@ -451,6 +451,7 @@ fragment float4 text_fragment(
                     terminal.block_tracker().session_blocks(),
                     box_top_y,
                     p.cwd,
+                    terminal.git_branch(),
                     None,
                 )
             } else {
@@ -463,6 +464,7 @@ fragment float4 text_fragment(
                     terminal.block_tracker().session_blocks(),
                     vp_h - pad_y,
                     None,
+                    terminal.git_branch(),
                     terminal.block_tracker().in_flight(),
                 )
             };
@@ -1260,6 +1262,7 @@ fragment float4 text_fragment(
         blocks: &[Block],
         region_bottom_y: f32,
         cwd: Option<&str>,
+        git_branch: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
     ) -> (Vec<f32>, Vec<(BlockId, f32, f32)>) {
         let mut verts = Vec::new();
@@ -1326,6 +1329,11 @@ fragment float4 text_fragment(
             if y >= pad_y {
                 push_quad(&mut verts, [left, y, right, y + 1.5], bg_uv, [0.0; 4], separator);
                 let display = abbreviate_path(cwd);
+                let display = if let Some(b) = git_branch {
+                    format!("{display} git:({b})")
+                } else {
+                    display
+                };
                 if !display.is_empty() {
                     self.push_text(&mut verts, left, y, &display, dim, cols);
                 }
