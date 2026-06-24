@@ -224,6 +224,11 @@ impl Editor {
         self.history.reverse();
     }
 
+    /// Command history (newest-first) for completion / display.
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
     pub fn text(&self) -> String {
         self.buffer.text()
     }

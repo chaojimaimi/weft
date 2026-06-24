@@ -8,6 +8,7 @@ mod renderer;
 
 use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
 use weft_core::blocks::BlockId;
+use weft_core::complete::{complete, CompleteCtx};
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
@@ -74,6 +75,9 @@ struct App {
     /// position during rapid cascades.
     pending_pty_resize: Option<(usize, usize)>,
     last_resize_instant: std::time::Instant,
+    /// Cached `$PATH` executable names for Tab completion (scanned once at
+    /// startup; empty if completion is disabled).
+    path_bins: Vec<String>,
     /// Proxy used by background threads (PTY reader, blink timer) to wake the
     /// event loop without a vsync busy-loop.
     proxy: EventLoopProxy<AppEvent>,
@@ -122,6 +126,7 @@ impl App {
             last_mouse_y: 0.0,
             pending_pty_resize: None,
             last_resize_instant: std::time::Instant::now(),
+            path_bins: scan_path_bins(),
             proxy,
             config,
             keybindings,
@@ -599,7 +604,50 @@ impl App {
             return false;
         }
 
+        // Tab-completion mode: Tab cycles, Enter accepts (no submit), Up/Down
+        // navigate, Esc cancels. Any other key cancels and falls through to
+        // normal editing (so typing/deleting ends the session).
+        let completing = self
+            .terminal
+            .as_ref()
+            .map(|t| t.editor().is_completing())
+            .unwrap_or(false);
+        if completing {
+            let consumed = match key {
+                Tab => {
+                    self.editor_completion_next();
+                    true
+                }
+                Enter => {
+                    self.editor_completion_accept();
+                    true
+                }
+                Up => {
+                    self.editor_completion_prev();
+                    true
+                }
+                Down => {
+                    self.editor_completion_next();
+                    true
+                }
+                Escape => {
+                    self.editor_completion_cancel();
+                    true
+                }
+                _ => false,
+            };
+            if consumed {
+                self.request_redraw();
+                return true;
+            }
+            self.editor_completion_cancel();
+        }
+
         match key {
+            Tab => {
+                self.editor_start_completion();
+                true
+            }
             Enter if !shift => {
                 // Submit: build PTY bytes and locally block the editor (the
                 // Enter→preexec window). The shell's later 133;B consumes the
@@ -707,6 +755,83 @@ impl App {
             _ => false,
         }
     }
+
+    // ── Tab completion (drives Editor's completion state machine) ───────────
+
+    fn editor_start_completion(&mut self) {
+        // Gather context under an immutable borrow, then mutate the editor.
+        let (line_owned, col, cwd, history) = match self.terminal.as_ref() {
+            Some(t) => {
+                let line_idx = t.editor().buffer.cursor.0;
+                let col = t.editor().buffer.cursor.1;
+                let line = t.editor().buffer.lines.get(line_idx).cloned();
+                let cwd = t.cwd().unwrap_or("").to_string();
+                let history = t.editor().history().to_vec();
+                (line, col, cwd, history)
+            }
+            None => return,
+        };
+        let Some(line_str) = line_owned.as_deref() else {
+            return;
+        };
+        let Some((ws, we)) = word_at(line_str, col) else {
+            return;
+        };
+        let prefix: String = line_str.chars().skip(ws).take(we - ws).collect();
+        if prefix.is_empty() {
+            return;
+        }
+        let path_bins: Vec<String> = if is_command_position(line_str, ws) {
+            self.path_bins.clone()
+        } else {
+            Vec::new()
+        };
+        let ctx = CompleteCtx {
+            cwd: &cwd,
+            history: &history,
+            path_bins: &path_bins,
+        };
+        let matches = complete(&prefix, &ctx);
+        if matches.is_empty() {
+            return;
+        }
+        let Some(t) = self.terminal.as_mut() else {
+            return;
+        };
+        let e = t.editor_mut();
+        if matches.len() == 1 {
+            // Single candidate: accept immediately (replace the word).
+            e.start_completion(matches, ws, we);
+            e.completion_accept();
+        } else {
+            e.start_completion(matches, ws, we);
+        }
+    }
+
+    fn editor_completion_next(&mut self) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.editor_mut().completion_next();
+        }
+    }
+
+    fn editor_completion_prev(&mut self) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.editor_mut().completion_prev();
+        }
+    }
+
+    fn editor_completion_accept(&mut self) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.editor_mut().completion_accept();
+        }
+    }
+
+    fn editor_completion_cancel(&mut self) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.editor_mut().completion_cancel();
+        }
+    }
+
 
     /// Count of blocks visible in the panel (newest-first, query-filtered).
     fn panel_visible_count(&self) -> usize {
@@ -1527,6 +1652,64 @@ impl ApplicationHandler<AppEvent> for App {
 /// physical key's base char (uppercased when Shift is held) only when the text
 /// is absent or not a single printable char (some IME configurations omit it),
 /// so typed commands keep their case even then.
+/// The char-column range `(start, end)` of the word ending at the cursor
+/// column `col` (the partial token to complete), or `None` when the cursor
+/// sits on whitespace / an empty line. `end` == `col`.
+fn word_at(line: &str, col: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return None;
+    }
+    let end = col.min(chars.len());
+    let mut start = end;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    if start == end {
+        return None; // cursor on whitespace
+    }
+    Some((start, end))
+}
+
+/// Whether the word at `word_start` is in command position (line start, or
+/// after a shell operator `| & ; > <`). Decides whether the `$PATH` command
+/// completion source is consulted.
+fn is_command_position(line: &str, word_start: usize) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = word_start;
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return true;
+    }
+    matches!(chars[i - 1], '|' | '&' | ';' | '>' | '<')
+}
+
+/// Scan `$PATH` for executable names (files, not dirs). Best-effort: unreadable
+/// / missing dirs are skipped. Deduped + sorted. Cached once at startup.
+fn scan_path_bins() -> Vec<String> {
+    let mut bins = std::collections::BTreeSet::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry
+                        .file_type()
+                        .map(|t| t.is_file())
+                        .unwrap_or(false)
+                    {
+                        if let Some(name) = entry.file_name().to_str() {
+                            bins.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    bins.into_iter().collect()
+}
+
 fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
     if let Some(s) = text {
         let mut it = s.chars();
@@ -1630,4 +1813,28 @@ fn main() {
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_at_picks_token_left_of_cursor() {
+        assert_eq!(word_at("ls -l", 5), Some((3, 5))); // "-l"
+        assert_eq!(word_at("ls", 2), Some((0, 2))); // "ls"
+    }
+
+    #[test]
+    fn word_at_none_on_whitespace_or_empty() {
+        assert_eq!(word_at("ls ", 3), None); // cursor on trailing space
+        assert_eq!(word_at("", 0), None);
+    }
+
+    #[test]
+    fn is_command_position_first_word_or_after_operator() {
+        assert!(is_command_position("ls", 0));
+        assert!(is_command_position("a | b", 4)); // "b" after pipe
+        assert!(!is_command_position("ls -l", 3)); // "-l" is an arg
+    }
 }
