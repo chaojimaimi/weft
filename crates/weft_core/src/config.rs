@@ -239,6 +239,7 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub window: WindowConfig,
     pub scrollback: ScrollbackConfig,
+    pub editor: EditorConfig,
     /// Raw user keybinding overrides: `"cmd+x" = "copy"`. Resolved later via
     /// [`Config::keybindings`] (merged onto defaults).
     pub keybindings: HashMap<String, Action>,
@@ -371,6 +372,16 @@ impl Default for ScrollbackConfig {
     fn default() -> Self {
         Self { lines: 10_000 }
     }
+}
+
+/// Editor (input-box) options.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct EditorConfig {
+    /// If true, `Ctrl+Enter` submits and plain `Enter` inserts a newline
+    /// (Warp default). If false (default), `Enter` submits and `Shift+Enter`
+    /// inserts a newline.
+    pub submit_on_ctrl_enter: bool,
 }
 
 // ── Parsing helpers ────────────────────────────────────────────────────
@@ -639,5 +650,14 @@ name = "weft-light"
         // this asserts graceful handling when the path can't be resolved.)
         let c = Config::load();
         assert_eq!(c.font.family, "Menlo");
+    }
+
+    #[test]
+    fn editor_submit_on_ctrl_enter_parses() {
+        let c: Config = toml::from_str("[editor]\nsubmit_on_ctrl_enter = true\n").unwrap();
+        assert!(c.editor.submit_on_ctrl_enter);
+        // default is false
+        let d: Config = toml::from_str("").unwrap();
+        assert!(!d.editor.submit_on_ctrl_enter);
     }
 }

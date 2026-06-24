@@ -648,34 +648,19 @@ impl App {
                 self.editor_start_completion();
                 true
             }
-            Enter if !shift => {
-                // Submit: build PTY bytes and locally block the editor (the
-                // Enter→preexec window). The shell's later 133;B consumes the
-                // editor's command via `command_from_editor`.
-                let bytes = self
-                    .terminal
-                    .as_mut()
-                    .map(|t| t.submit_command())
-                    .unwrap_or_default();
-                if !bytes.is_empty() {
-                    if let Some(pty) = &self.pty {
-                        let _ = pty.write_sync(&bytes);
-                    }
-                }
-                let resp = self
-                    .terminal
-                    .as_mut()
-                    .map(|t| t.take_response())
-                    .unwrap_or_default();
-                if !resp.is_empty() {
-                    if let Some(pty) = &self.pty {
-                        let _ = pty.write_sync(&resp);
-                    }
-                }
-                true
-            }
             Enter => {
-                if let Some(t) = self.terminal.as_mut() {
+                // submit_on_ctrl_enter: Ctrl+Enter submits, plain Enter newlines
+                // (Warp default). Otherwise plain Enter submits, Shift+Enter
+                // newlines.
+                let ctrl = mods.contains(Modifiers::CONTROL);
+                let do_submit = if self.config.editor.submit_on_ctrl_enter {
+                    ctrl
+                } else {
+                    !shift
+                };
+                if do_submit {
+                    self.editor_submit();
+                } else if let Some(t) = self.terminal.as_mut() {
                     t.editor_mut().buffer.split_newline();
                 }
                 true
@@ -829,6 +814,31 @@ impl App {
     fn editor_completion_cancel(&mut self) {
         if let Some(t) = self.terminal.as_mut() {
             t.editor_mut().completion_cancel();
+        }
+    }
+
+    /// Submit the editor's command: write PTY bytes (and any terminal query
+    /// response) and locally block the editor through the Enter→preexec window.
+    fn editor_submit(&mut self) {
+        let bytes = self
+            .terminal
+            .as_mut()
+            .map(|t| t.submit_command())
+            .unwrap_or_default();
+        if !bytes.is_empty() {
+            if let Some(pty) = &self.pty {
+                let _ = pty.write_sync(&bytes);
+            }
+        }
+        let resp = self
+            .terminal
+            .as_mut()
+            .map(|t| t.take_response())
+            .unwrap_or_default();
+        if !resp.is_empty() {
+            if let Some(pty) = &self.pty {
+                let _ = pty.write_sync(&resp);
+            }
         }
     }
 
