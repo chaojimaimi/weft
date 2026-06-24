@@ -233,4 +233,109 @@ mod tests {
             assert_eq!(joined, line, "tokens must cover the line exactly: {line}");
         }
     }
+
+    // ── edge cases (Task 2) ────────────────────────────────────────────────
+
+    #[test]
+    fn quoted_string_preserves_spaces() {
+        let toks = tokenize("echo \"a b c\"");
+        let s = toks
+            .iter()
+            .find(|t| t.kind == TokenKind::String)
+            .expect("a String token");
+        assert_eq!(s.text, "\"a b c\"");
+        // Only ONE Whitespace token (the separator between echo and the string);
+        // the two spaces inside the quotes must NOT become separate Whitespace tokens.
+        let ws = toks
+            .iter()
+            .filter(|t| t.kind == TokenKind::Whitespace)
+            .count();
+        assert_eq!(ws, 1, "internal spaces must stay inside the String token");
+    }
+
+    #[test]
+    fn escaped_quote_inside_string() {
+        // one String token containing the escaped quote
+        let toks = tokenize("echo \"a\\\"b\"");
+        let strings: Vec<&Token> = toks.iter().filter(|t| t.kind == TokenKind::String).collect();
+        assert_eq!(strings.len(), 1);
+        assert_eq!(strings[0].text, "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn pipe_resets_command_position() {
+        assert_eq!(
+            kinds("a | b"),
+            vec![
+                TokenKind::Command,   // a
+                TokenKind::Whitespace,
+                TokenKind::Operator,  // |
+                TokenKind::Whitespace,
+                TokenKind::Command,   // b (command after pipe)
+            ]
+        );
+    }
+
+    #[test]
+    fn path_forms_as_arguments() {
+        assert_eq!(
+            kinds("cmd /abs/y rel/p ~/z"),
+            vec![
+                TokenKind::Command,
+                TokenKind::Whitespace,
+                TokenKind::Path, // /abs/y
+                TokenKind::Whitespace,
+                TokenKind::Path, // rel/p
+                TokenKind::Whitespace,
+                TokenKind::Path, // ~/z
+            ]
+        );
+    }
+
+    #[test]
+    fn first_word_path_like_is_command() {
+        // ./run is path-like but it's the command position -> Command
+        assert_eq!(
+            kinds("./run --x"),
+            vec![
+                TokenKind::Command,
+                TokenKind::Whitespace,
+                TokenKind::Flag,
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_operators_split() {
+        assert_eq!(
+            kinds("a && b > c"),
+            vec![
+                TokenKind::Command,
+                TokenKind::Whitespace,
+                TokenKind::Operator, // &&
+                TokenKind::Whitespace,
+                TokenKind::Command, // b
+                TokenKind::Whitespace,
+                TokenKind::Operator, // >
+                TokenKind::Whitespace,
+                TokenKind::Command, // c
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quoted_string() {
+        let toks = tokenize("echo 'a | b'");
+        let s = toks.iter().find(|t| t.kind == TokenKind::String).unwrap();
+        assert_eq!(s.text, "'a | b'");
+        // the pipe inside single quotes is NOT an operator
+        assert!(!toks.iter().any(|t| t.kind == TokenKind::Operator));
+    }
+
+    #[test]
+    fn unclosed_quote_consumes_to_end() {
+        // graceful: an unterminated quote reads to end-of-line as one String
+        let toks = tokenize("echo \"oops");
+        assert!(toks.iter().any(|t| t.kind == TokenKind::String && t.text == "\"oops"));
+    }
 }
