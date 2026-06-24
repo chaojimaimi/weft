@@ -180,6 +180,14 @@ impl BlockTracker {
         std::mem::take(&mut self.unpersisted)
     }
 
+    /// Toggle the fold (collapse/expand) state of a block by id. Session-only
+    /// (not persisted to SQLite in the MVP — the insert-time `collapsed` is).
+    pub fn toggle_collapse(&mut self, id: BlockId) {
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.id == id) {
+            b.collapsed = !b.collapsed;
+        }
+    }
+
     /// The currently-running command (between `133;B` and `133;D`), for the
     /// renderer's live block during CommandExecuting (e.g. an interactive
     /// `sudo su`). `None` when nothing is in flight.

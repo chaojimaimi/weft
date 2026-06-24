@@ -181,7 +181,7 @@ impl GlyphAtlas {
         // font, at init (atlas empty, no draw-time upload). The ❯ (U+276F)
         // prompt must be in the texture before the first draw — the warm-up
         // path was leaving it blank in the running app.
-        for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─'] {
+        for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─', '▸', '▾'] {
             let placed = Self::rasterize_and_place(
                 &primary_font,
                 ch,

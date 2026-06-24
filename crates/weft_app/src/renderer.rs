@@ -46,6 +46,9 @@ pub struct MetalRenderer {
     /// instantly. The window's own transparency flag is set at startup, so
     /// crossing the 1.0 boundary needs a relaunch.
     opacity: f32,
+    /// Last-rendered block click regions: (id, y_top, y_bottom) in physical
+    /// pixels, for fold toggle on click. Repopulated each Editor-mode draw.
+    pub block_hit_regions: Vec<(BlockId, f32, f32)>,
 }
 
 impl MetalRenderer {
@@ -238,6 +241,7 @@ fragment float4 text_fragment(
             padding_x,
             padding_y,
             opacity,
+            block_hit_regions: Vec::new(),
         }
     }
 
@@ -438,8 +442,9 @@ fragment float4 text_fragment(
         let vp_h = self.viewport.1;
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
+        let mut pending_hit_regions: Vec<(BlockId, f32, f32)> = Vec::new();
         let mut vertices = if show_blocks {
-            if let Some(p) = prompt {
+            let (v, regions) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
                 let box_top_y = (vp_h - pad_y - box_h).max(0.0);
                 self.build_block_view_vertices(
@@ -460,7 +465,9 @@ fragment float4 text_fragment(
                     None,
                     terminal.block_tracker().in_flight(),
                 )
-            }
+            };
+            pending_hit_regions = regions;
+            v
         } else {
             self.build_grid_vertices(
                 grid,
@@ -497,6 +504,7 @@ fragment float4 text_fragment(
             encoder.end_encoding();
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+            self.block_hit_regions = pending_hit_regions;
             return;
         }
 
@@ -543,6 +551,7 @@ fragment float4 text_fragment(
 
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        self.block_hit_regions = pending_hit_regions;
     }
 
     /// Build vertex buffer from the terminal Grid.
@@ -1252,14 +1261,15 @@ fragment float4 text_fragment(
         region_bottom_y: f32,
         cwd: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Vec<(BlockId, f32, f32)>) {
         let mut verts = Vec::new();
+        let mut hit_regions: Vec<(BlockId, f32, f32)> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return verts;
+            return (verts, hit_regions);
         }
 
         let pad_x = self.padding_x;
@@ -1328,32 +1338,45 @@ fragment float4 text_fragment(
             if y < pad_y {
                 break;
             }
-            // Output lines (bottom-up). Drop a trailing bare prompt marker.
-            let mut out_lines: Vec<&str> = b.output.lines().collect();
-            while out_lines
-                .last()
-                .is_some_and(|l| matches!(l.trim(), "%" | "$" | "#"))
-            {
-                out_lines.pop();
-            }
-            for line in out_lines.iter().rev() {
-                if y < pad_y {
-                    break;
+            let foldable = b.output.lines().any(|l| !l.trim().is_empty());
+            // Output lines (hidden when collapsed). Drop a trailing bare prompt.
+            if !b.collapsed {
+                let mut out_lines: Vec<&str> = b.output.lines().collect();
+                while out_lines
+                    .last()
+                    .is_some_and(|l| matches!(l.trim(), "%" | "$" | "#"))
+                {
+                    out_lines.pop();
                 }
-                // Output in the same color as the command (Warp style).
-                self.push_text(&mut verts, left, y, line, fg, cols);
-                y -= pitch;
+                for line in out_lines.iter().rev() {
+                    if y < pad_y {
+                        break;
+                    }
+                    self.push_text(&mut verts, left, y, line, fg, cols);
+                    y -= pitch;
+                }
             }
-            // Command line: ❯ command (vivid ❯ + white command).
+            // Command line: [chevron] ❯ command. The chevron (▸/▾) marks a
+            // foldable block; its row is the click-toggle hit target.
             if y >= pad_y {
-                self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
-                let cmd_x = left + 2.0 * cw;
-                let avail = cols.saturating_sub(2).max(1);
+                let (chev_w, avail_sub) = if foldable {
+                    let chev = if b.collapsed { "▸" } else { "▾" };
+                    self.push_text(&mut verts, left, y, chev, prompt_c, cols);
+                    (cw, 3)
+                } else {
+                    (0.0, 2)
+                };
+                self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
+                let cmd_x = left + chev_w + 2.0 * cw;
+                let avail = cols.saturating_sub(avail_sub).max(1);
                 self.push_line_tokenized(&mut verts, cmd_x, y, &b.command, fg, avail);
+                if foldable {
+                    hit_regions.push((b.id, y, y + pitch));
+                }
                 y -= pitch;
             }
-            // Header line: <cwd> (<duration>)  (dim, above the command).
-            if y >= pad_y {
+            // Header line (hidden when collapsed).
+            if !b.collapsed && y >= pad_y {
                 let dur = block_duration_str(b);
                 let bcwd = b
                     .cwd
@@ -1376,7 +1399,7 @@ fragment float4 text_fragment(
             }
         }
 
-        verts
+        (verts, hit_regions)
     }
 
     /// Lay out a string left-to-right as single-cell glyph quads. ASCII fast

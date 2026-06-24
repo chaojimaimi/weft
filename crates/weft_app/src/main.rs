@@ -1050,7 +1050,29 @@ impl App {
             .unwrap_or(false)
     }
 
+    /// Which foldable block (if any) owns the physical-pixel y in the last
+    /// rendered block view. `None` outside the block view or off every block.
+    fn block_at(&self, y: f32) -> Option<BlockId> {
+        let regions = self.renderer.as_ref()?.block_hit_regions.as_slice();
+        regions
+            .iter()
+            .find(|(_, top, bottom)| y >= *top && y <= *bottom)
+            .map(|(id, _, _)| *id)
+    }
+
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        // Editor-mode block view: clicking a foldable block's command line
+        // toggles its collapse (instead of starting a grid selection).
+        if button == winit::event::MouseButton::Left {
+            if let Some(id) = self.block_at(y as f32) {
+                if let Some(t) = self.terminal.as_mut() {
+                    t.block_tracker_mut().toggle_collapse(id);
+                    self.request_redraw();
+                }
+                return;
+            }
+        }
+
         let pos = self.pixel_to_grid(x, y);
         let selecting = !self.mouse_reporting_active();
 
