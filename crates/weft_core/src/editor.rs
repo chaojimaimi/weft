@@ -183,6 +183,8 @@ pub struct Editor {
     /// restores it.
     saved_text: Option<String>,
     search: Option<Search>,
+    /// Active `Tab`-completion candidates, if any.
+    completions: Option<CompletionState>,
 }
 
 /// Ctrl+R search state.
@@ -194,6 +196,15 @@ pub struct Search {
     selected: usize,
 }
 
+/// `Tab`-completion state. `word_start..word_end` is the column range on the
+/// cursor line to replace when a candidate is accepted.
+pub struct CompletionState {
+    pub matches: Vec<crate::complete::Match>,
+    pub selected: usize,
+    pub word_start: usize,
+    pub word_end: usize,
+}
+
 impl Editor {
     pub fn new() -> Self {
         Self {
@@ -202,6 +213,7 @@ impl Editor {
             history_idx: None,
             saved_text: None,
             search: None,
+            completions: None,
         }
     }
 
@@ -368,6 +380,83 @@ impl Editor {
                 s.selected = 0;
             }
         }
+    }
+
+    // ── Tab completion ────────────────────────────────────────────────────
+
+    pub fn is_completing(&self) -> bool {
+        self.completions.is_some()
+    }
+
+    /// Begin a completion session with `matches` (must be non-empty). The word
+    /// to replace occupies columns `word_start..word_end` on the cursor line.
+    pub fn start_completion(
+        &mut self,
+        matches: Vec<crate::complete::Match>,
+        word_start: usize,
+        word_end: usize,
+    ) {
+        if matches.is_empty() {
+            return;
+        }
+        self.completions = Some(CompletionState {
+            matches,
+            selected: 0,
+            word_start,
+            word_end,
+        });
+    }
+
+    pub fn completion_next(&mut self) {
+        if let Some(c) = self.completions.as_mut() {
+            if c.matches.len() > 1 {
+                c.selected = (c.selected + 1) % c.matches.len();
+            }
+        }
+    }
+
+    pub fn completion_prev(&mut self) {
+        if let Some(c) = self.completions.as_mut() {
+            if c.matches.len() > 1 {
+                c.selected = c.selected.checked_sub(1).unwrap_or(c.matches.len() - 1);
+            }
+        }
+    }
+
+    /// Accept the selected completion: replace the word range on the cursor
+    /// line with the candidate's insert text, move the cursor, and clear the
+    /// session. Returns false if no session was active.
+    pub fn completion_accept(&mut self) -> bool {
+        let st = match self.completions.take() {
+            Some(s) => s,
+            None => return false,
+        };
+        let insert = st.matches[st.selected].insert.clone();
+        let line = self.buffer.cursor.0;
+        if let Some(l) = self.buffer.lines.get_mut(line) {
+            let chars: Vec<char> = l.chars().collect();
+            let ws = st.word_start.min(chars.len());
+            let we = st.word_end.min(chars.len()).max(ws);
+            let insert_chars: Vec<char> = insert.chars().collect();
+            let mut rebuilt: Vec<char> = Vec::with_capacity(chars.len() + insert_chars.len());
+            rebuilt.extend(chars[..ws].iter());
+            rebuilt.extend(insert_chars.iter());
+            rebuilt.extend(chars[we..].iter());
+            *l = rebuilt.iter().collect();
+            self.buffer.cursor.1 = ws + insert.chars().count();
+        }
+        true
+    }
+
+    pub fn completion_cancel(&mut self) {
+        self.completions = None;
+    }
+
+    /// `(matches, selected)` for rendering the dropdown.
+    pub fn completion_view(&self) -> Option<(&[crate::complete::Match], usize)> {
+        self.completions
+            .as_ref()
+            .map(|c| (c.matches.as_slice(), c.selected))
     }
 }
 
@@ -681,5 +770,84 @@ mod tests {
         assert_eq!(e.search_selected_text(), Some("git status".to_string()));
         e.search_prev(); // wraps back to newest
         assert_eq!(e.search_selected_text(), Some("git push".to_string()));
+    }
+
+    // ── Tab completion ────────────────────────────────────────────────────
+
+    use crate::complete::{Match, MatchKind};
+
+    fn m(label: &str, insert: &str) -> Match {
+        Match {
+            label: label.into(),
+            kind: MatchKind::Command,
+            insert: insert.into(),
+        }
+    }
+
+    #[test]
+    fn start_then_next_cycles() {
+        let mut e = Editor::new();
+        e.start_completion(vec![m("a", "a"), m("b", "b"), m("c", "c")], 0, 1);
+        assert_eq!(e.completion_view().unwrap().1, 0);
+        e.completion_next();
+        assert_eq!(e.completion_view().unwrap().1, 1);
+        e.completion_next();
+        assert_eq!(e.completion_view().unwrap().1, 2);
+        e.completion_next(); // wraps
+        assert_eq!(e.completion_view().unwrap().1, 0);
+    }
+
+    #[test]
+    fn prev_wraps_to_last() {
+        let mut e = Editor::new();
+        e.start_completion(vec![m("a", "a"), m("b", "b")], 0, 1);
+        e.completion_prev(); // from 0 -> wraps to last
+        assert_eq!(e.completion_view().unwrap().1, 1);
+    }
+
+    #[test]
+    fn cancel_clears() {
+        let mut e = Editor::new();
+        e.start_completion(vec![m("a", "a")], 0, 1);
+        assert!(e.is_completing());
+        e.completion_cancel();
+        assert!(!e.is_completing());
+    }
+
+    #[test]
+    fn accept_applies_insert_and_clears() {
+        let mut e = Editor::new();
+        e.buffer.lines = vec!["ls".to_string()];
+        e.buffer.cursor = (0, 2); // cursor at end of "ls"
+        // replace the whole word "ls" (cols 0..2) with the selected insert "lsof"
+        e.start_completion(vec![m("lsof", "lsof")], 0, 2);
+        assert!(e.completion_accept());
+        assert_eq!(e.buffer.lines[0], "lsof");
+        assert_eq!(e.buffer.cursor.1, 4); // cursor after "lsof"
+        assert!(!e.is_completing());
+    }
+
+    #[test]
+    fn accept_preserves_text_around_word() {
+        let mut e = Editor::new();
+        e.buffer.lines = vec!["echo ls more".to_string()];
+        e.buffer.cursor = (0, 7); // cursor right after "ls"
+        // word "ls" occupies cols 5..7
+        e.start_completion(vec![m("lsof", "lsof")], 5, 7);
+        assert!(e.completion_accept());
+        assert_eq!(e.buffer.lines[0], "echo lsof more");
+    }
+
+    #[test]
+    fn accept_returns_false_when_not_completing() {
+        let mut e = Editor::new();
+        assert!(!e.completion_accept());
+    }
+
+    #[test]
+    fn start_with_empty_matches_is_noop() {
+        let mut e = Editor::new();
+        e.start_completion(vec![], 0, 1);
+        assert!(!e.is_completing());
     }
 }
