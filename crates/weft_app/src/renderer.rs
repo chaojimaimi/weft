@@ -16,6 +16,7 @@ use weft_core::blocks::{Block, BlockId};
 use weft_core::config::{FontConfig, Theme};
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
+use weft_core::syntax::{self, TokenKind};
 use weft_core::vt::Terminal;
 
 /// Metal GPU renderer: draws the terminal Grid to screen.
@@ -1167,7 +1168,7 @@ fragment float4 text_fragment(
             } else {
                 (left, box_cols)
             };
-            self.push_text(&mut verts, start_x, y, line, fg, max_chars);
+            self.push_line_tokenized(&mut verts, start_x, y, line, fg, max_chars);
         }
 
         // Cursor bar at (line, col).
@@ -1264,7 +1265,7 @@ fragment float4 text_fragment(
                 self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
-                self.push_text(&mut verts, cmd_x, y, live.command, fg, avail);
+                self.push_line_tokenized(&mut verts, cmd_x, y, live.command, fg, avail);
                 y -= pitch;
             }
             y -= pitch;
@@ -1311,7 +1312,7 @@ fragment float4 text_fragment(
                 self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
-                self.push_text(&mut verts, cmd_x, y, &b.command, fg, avail);
+                self.push_line_tokenized(&mut verts, cmd_x, y, &b.command, fg, avail);
                 y -= pitch;
             }
             // Header line: <cwd> (<duration>)  (dim, above the command).
@@ -1369,6 +1370,34 @@ fragment float4 text_fragment(
                 fg,
                 [0.0; 4],
             );
+        }
+    }
+
+    /// Lay out a line left-to-right, coloring each shell token by its kind
+    /// (syntax highlight). `default_fg` is used for Whitespace/Default tokens.
+    /// Glyphs must already be in the atlas (warmed up by the caller).
+    fn push_line_tokenized(
+        &self,
+        vertices: &mut Vec<f32>,
+        x: f32,
+        y: f32,
+        line: &str,
+        default_fg: [f32; 4],
+        max_chars: usize,
+    ) {
+        let cw = self.cell_width() as f32;
+        let mut cur_x = x;
+        let mut remaining = max_chars;
+        for token in syntax::tokenize(line) {
+            if remaining == 0 {
+                break;
+            }
+            let color = syntax_color(token.kind, default_fg);
+            let take = token.text.chars().count().min(remaining);
+            let text: String = token.text.chars().take(take).collect();
+            self.push_text(vertices, cur_x, y, &text, color, take);
+            cur_x += take as f32 * cw;
+            remaining -= take;
         }
     }
 
@@ -1563,4 +1592,44 @@ unsafe fn set_layer_opaque(layer: &MetalLayer, opaque: bool) {
     let layer_ptr: *mut objc2::runtime::AnyObject =
         (&**layer) as *const _ as *mut objc2::runtime::AnyObject;
     let _: () = msg_send![layer_ptr, setOpaque: opaque];
+}
+
+/// Fixed syntax-highlight colors (v0.5 phase 1 — not theme-driven yet).
+/// Whitespace/Default fall back to `default_fg`.
+fn syntax_color(kind: TokenKind, default_fg: [f32; 4]) -> [f32; 4] {
+    match kind {
+        TokenKind::Command => [0.55, 0.85, 0.55, 1.0], // green
+        TokenKind::Flag => [0.45, 0.85, 1.0, 1.0],     // cyan
+        TokenKind::Path => [0.85, 0.78, 0.45, 1.0],    // yellow/olive
+        TokenKind::String => [0.95, 0.55, 0.75, 1.0],  // magenta
+        TokenKind::Variable => [0.55, 0.7, 1.0, 1.0],  // blue
+        TokenKind::Operator => [0.95, 0.5, 0.5, 1.0],  // red
+        TokenKind::Whitespace | TokenKind::Default => default_fg,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn syntax_color_distinct_and_default_fallback() {
+        let default = [1.0, 1.0, 1.0, 1.0];
+        let colors = [
+            syntax_color(TokenKind::Command, default),
+            syntax_color(TokenKind::Flag, default),
+            syntax_color(TokenKind::Path, default),
+            syntax_color(TokenKind::String, default),
+            syntax_color(TokenKind::Variable, default),
+            syntax_color(TokenKind::Operator, default),
+        ];
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(colors[i], colors[j], "syntax colors at {i}/{j} collide");
+            }
+        }
+        // Default/Whitespace fall back to the provided default fg.
+        assert_eq!(syntax_color(TokenKind::Default, default), default);
+        assert_eq!(syntax_color(TokenKind::Whitespace, default), default);
+    }
 }
