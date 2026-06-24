@@ -66,7 +66,13 @@ pub fn complete(prefix: &str, ctx: &CompleteCtx) -> Vec<Match> {
     // Filesystem paths.
     out.extend(path_matches(prefix, ctx.cwd));
 
-    // (Command source added in Task 7.)
+    // Command names ($PATH executables). The caller passes an empty path_bins
+    // when the cursor isn't at a command position, so no commands are scanned.
+    for bin in ctx.path_bins {
+        if bin.starts_with(prefix) && bin.len() > prefix.len() {
+            out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
+        }
+    }
 
     // Dedup by label, keeping the first (highest-priority) occurrence.
     let mut seen = std::collections::HashSet::new();
@@ -258,5 +264,32 @@ mod tests {
         let foo: Vec<_> = ms.iter().filter(|m| m.label == "foo").collect();
         assert_eq!(foo.len(), 1, "duplicate labels collapse to one");
         assert_eq!(foo[0].kind, MatchKind::History, "history outranks path");
+    }
+
+    #[test]
+    fn command_prefix_match() {
+        let path_bins = vec!["ls".to_string(), "cat".to_string(), "grep".to_string()];
+        let ctx = CompleteCtx { cwd: NO_CWD, history: &[], path_bins: &path_bins };
+        let ms = complete("l", &ctx);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].label, "ls");
+        assert_eq!(ms[0].kind, MatchKind::Command);
+    }
+
+    #[test]
+    fn priority_ordering_history_path_command() {
+        // distinct labels from each source; ranked History > Path > Command.
+        let d = scratch_dir("priority");
+        fs::write(d.join("ab-path"), "").unwrap();
+        let history = vec!["ab-history".to_string()];
+        let path_bins = vec!["ab-cmd".to_string()];
+        let ctx = CompleteCtx { cwd: d.to_str().unwrap(), history: &history, path_bins: &path_bins };
+        let ms = complete("ab", &ctx);
+        let kinds: Vec<MatchKind> = ms.iter().map(|m| m.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![MatchKind::History, MatchKind::Path, MatchKind::Command],
+            "order must be History > Path > Command"
+        );
     }
 }
