@@ -1114,21 +1114,17 @@ fragment float4 text_fragment(
         let box_x1 = (vp_w - self.padding_x).max(box_x0);
 
         let theme_bg = color_to_normalized(self.theme.background);
-        // Opaque so the box cleanly covers the grid rows behind it — the grid
-        // is now full-window, so the shell's blank prompt sits under the box.
-        let box_bg = [
-            theme_bg[0] * 0.5,
-            theme_bg[1] * 0.5,
-            theme_bg[2] * 0.5,
-            1.0,
-        ];
+        // The input area uses the SAME background as the window (Warp style —
+        // no distinct input panel). Still opaque so it cleanly covers the grid
+        // rows behind it (the shell's blank prompt sits under the box).
+        let box_bg = theme_bg;
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.cursor);
         let (su, sv, suw, svh) = self.space_uv();
         // V-swap to match grid rendering (CAMetalLayer flip compensation).
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        // Translucent background.
+        // Uniform window background for the input area (no distinct panel).
         push_quad(
             &mut verts,
             [box_x0, box_y0, box_x1, box_y1],
