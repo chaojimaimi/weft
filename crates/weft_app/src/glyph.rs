@@ -19,6 +19,86 @@ use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use tracing::{info, warn};
 use weft_core::config::FontConfig;
 
+/// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
+/// CoreGraphics. font-kit's `rasterize_glyph` cannot handle color bitmap fonts
+/// (Apple Color Emoji produces 0 pixels on A8/RGBA32 canvases). This bypasses
+/// font-kit by creating a color-supporting CGContext and using
+/// `CTFontDrawGlyphs` directly, which renders the sbix bitmap in full color.
+/// The RGBA result is reduced to a single alpha channel for the R8 atlas.
+///
+/// Returns `None` if the glyph cannot be found or rasterized.
+fn rasterize_emoji_alpha(font: &Font, ch: char, glyph_w: u32, cell_h: u32) -> Option<Vec<u8>> {
+    use core_foundation::string::UniChar;
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_text::font::CTFont;
+
+    let ct_font: CTFont = font.native_font();
+
+    // Map character → CGGlyph via UTF-16 (astral-plane chars need surrogate pair).
+    let mut utf16 = [0u16; 3];
+    let encoded = ch.encode_utf16(&mut utf16);
+    let chars: Vec<UniChar> = encoded.iter().map(|&u| u as UniChar).collect();
+    let mut glyphs = vec![0u16; chars.len()];
+    let got = unsafe {
+        ct_font.get_glyphs_for_characters(
+            chars.as_ptr(),
+            glyphs.as_mut_ptr(),
+            chars.len() as core_foundation::base::CFIndex,
+        )
+    };
+    if !got || glyphs.iter().all(|&g| g == 0) {
+        return None;
+    }
+
+    // Create a color-supporting RGBA bitmap context. sbix bitmaps only render
+    // in RGB color spaces — device-gray yields 0 pixels.
+    let cs = CGColorSpace::create_device_rgb();
+    let w = glyph_w as usize;
+    let h = cell_h as usize;
+    let mut ctx = CGContext::create_bitmap_context(
+        None,
+        w,
+        h,
+        8,     // bitsPerComponent
+        w * 4, // bytesPerRow
+        &cs,
+        core_graphics::base::kCGImageAlphaPremultipliedLast,
+    );
+
+    // Draw glyph at bottom-left with descent offset (CG is Y-up).
+    // Provide one position per glyph (astral-plane chars may produce 2 glyphs
+    // from a surrogate pair — draw_glyphs asserts glyphs.len() == positions.len()).
+    let descent = ct_font.descent();
+    let positions: Vec<core_graphics_types::geometry::CGPoint> = glyphs
+        .iter()
+        .map(|_| core_graphics_types::geometry::CGPoint::new(0.0, descent.abs()))
+        .collect();
+    ct_font.draw_glyphs(&glyphs, &positions, ctx.clone());
+
+    // Read RGBA → alpha mask with Y-flip (atlas is top-down).
+    let bpr = ctx.bytes_per_row();
+    let raw = ctx.data();
+    let mut alpha = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let src_idx = y * bpr + x * 4;
+            if src_idx + 3 < raw.len() {
+                let dst_y = h - 1 - y; // flip Y for top-down atlas
+                alpha[dst_y * w + x] = raw[src_idx + 3];
+            }
+        }
+    }
+
+    let nonzero = alpha.iter().filter(|&&p| p > 0).count();
+    if nonzero == 0 {
+        tracing::warn!("emoji '{ch}' rasterized to 0 pixels via CoreText");
+        return None;
+    }
+    tracing::debug!("emoji '{ch}' rasterized: {nonzero} non-zero pixels");
+    Some(alpha)
+}
+
 /// Resolve a font by family name via the system source, falling back to a list
 /// of absolute `.ttc` paths (the bundled macOS defaults). Returns the first
 /// loadable font.
@@ -125,8 +205,10 @@ impl GlyphAtlas {
 
         // Symbol fallback (Apple Symbols) — covers glyphs like ❯ (U+276F) that
         // Menlo lacks, so the prompt marker renders instead of blanking.
-        let symbol_font =
-            resolve_font("Apple Symbols", &["/System/Library/Fonts/Apple Symbols.ttf"]);
+        let symbol_font = resolve_font(
+            "Apple Symbols",
+            &["/System/Library/Fonts/Apple Symbols.ttf"],
+        );
 
         let font_size = font_config.size;
         let scaled_size = font_size * scale_factor as f32;
@@ -331,7 +413,14 @@ impl GlyphAtlas {
         } else {
             self.cell_width
         };
-        let pixels = Self::rasterize_glyph(font, ch, self.scaled_size, glyph_w, self.cell_height);
+        let pixels = Self::rasterize_glyph(
+            font,
+            ch,
+            self.scaled_size,
+            glyph_w,
+            self.cell_height,
+            is_wide,
+        );
 
         // Step 3: Upload to Metal texture
         Self::upload_region(
@@ -401,6 +490,47 @@ impl GlyphAtlas {
         })
     }
 
+    /// Compute the rasterization transform for a glyph.
+    ///
+    /// **CJK (is_wide=true):** the glyph is NOT horizontally stretched. A CJK
+    /// glyph's natural advance is ~1em but its slot is `2·cell_width` (≈1.2em);
+    /// stretching to fill the slot (the old behaviour) distorted every
+    /// character ~1.2× wider than the typeface intends. Instead we keep
+    /// `scale_x = 1.0` and horizontally center the glyph inside the slot — the
+    /// ~0.1em of side bearing on each side matches how PingFang / Apple's own
+    /// terminal stack render CJK.
+    ///
+    /// **Half-width (is_wide=false):** scale_x ≈ 1 (the monospace primary
+    /// advances `cell_width == glyph_w`), unchanged from before.
+    ///
+    /// The vertical transform is identical for both: Y-flip plus a descent
+    /// shift so descenders land inside the cell.
+    fn glyph_transform(
+        font: &Font,
+        glyph_id: u32,
+        scaled_size: f32,
+        glyph_w: u32,
+        is_wide: bool,
+    ) -> Transform2F {
+        let upem = font.metrics().units_per_em as f32;
+        let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
+
+        if is_wide {
+            // Center the glyph's natural advance inside the double-wide slot.
+            let advance_px = font
+                .advance(glyph_id)
+                .map(|a| a.x() * (scaled_size / upem))
+                .unwrap_or(0.0)
+                .max(0.0);
+            let x_offset = ((glyph_w as f32 - advance_px) / 2.0).max(0.0);
+            Transform2F::from_translation(Vector2F::new(x_offset, descent_px))
+                * Transform2F::from_scale(Vector2F::new(1.0, -1.0))
+        } else {
+            Transform2F::from_translation(Vector2F::new(0.0, descent_px))
+                * Transform2F::from_scale(Vector2F::new(1.0, -1.0))
+        }
+    }
+
     /// Rasterize a single glyph into a pixel buffer.
     /// Returns the pixel data ready for upload to the atlas texture.
     fn rasterize_glyph(
@@ -409,35 +539,25 @@ impl GlyphAtlas {
         scaled_size: f32,
         glyph_w: u32,
         cell_h: u32,
+        is_wide: bool,
     ) -> Vec<u8> {
         let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
+
+        // Emoji (color bitmap glyphs like 📁📄) cannot be rasterized by font-kit
+        // (it produces 0 pixels on A8). Use the CoreText/CG color path instead.
+        if is_emoji_char(ch) {
+            if let Some(alpha) = rasterize_emoji_alpha(font, ch, glyph_w, cell_h) {
+                return alpha;
+            }
+            // Fall through to font-kit if CoreText path fails.
+        }
+
         let mut canvas = Canvas::new(glyph_size, Format::A8);
 
         if let Some(glyph_id) = font.glyph_for_char(ch) {
-            // Y-flip + descent shift for upright glyphs inside the cell.
-            // See transform_probe test and rasterize_and_place comments for derivation.
-            let upem = font.metrics().units_per_em as f32;
-            let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
-
-            // Horizontal stretch: scale the glyph's natural advance to fill
-            // glyph_w. A full-width CJK glyph advances ~1em but its slot is
-            // 2·cell_width (≈1.2em); without this it leaves a right-side gap
-            // between every CJK character. The monospace primary font advances
-            // cell_width == glyph_w, so scale_x ≈ 1 (no distortion for ASCII).
-            let scale_x = font
-                .advance(glyph_id)
-                .map(|a| {
-                    let advance_px = a.x() * (scaled_size / upem);
-                    if advance_px > 0.0 {
-                        (glyph_w as f32 / advance_px).clamp(0.5, 2.0)
-                    } else {
-                        1.0
-                    }
-                })
-                .unwrap_or(1.0);
-
-            let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
-                * Transform2F::from_scale(Vector2F::new(scale_x, -1.0));
+            // See `glyph_transform`: CJK glyphs are centered (not stretched)
+            // inside the double-wide slot; half-width uses scale_x ≈ 1.
+            let transform = Self::glyph_transform(font, glyph_id, scaled_size, glyph_w, is_wide);
 
             let result = font.rasterize_glyph(
                 &mut canvas,
@@ -550,23 +670,10 @@ impl GlyphAtlas {
             // Shift down by the descent depth so descenders sit inside the cell; the
             // CAMetalLayer flips vertically, so this lifts the glyph off the screen-cell
             // bottom and stops the next row's opaque background from clipping descenders.
-            let upem = font.metrics().units_per_em as f32;
-            let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
-            // Horizontal stretch so full-width glyphs fill their slot (see
-            // rasterize_glyph); ~1 for the monospace primary font.
-            let scale_x = font
-                .advance(glyph_id)
-                .map(|a| {
-                    let advance_px = a.x() * (scaled_size / upem);
-                    if advance_px > 0.0 {
-                        (glyph_w as f32 / advance_px).clamp(0.5, 2.0)
-                    } else {
-                        1.0
-                    }
-                })
-                .unwrap_or(1.0);
-            let transform = Transform2F::from_translation(Vector2F::new(0.0, descent_px))
-                * Transform2F::from_scale(Vector2F::new(scale_x, -1.0));
+            //
+            // CJK glyphs: no horizontal stretch — centered in the slot instead
+            // (see `glyph_transform`). Half-width: scale_x ≈ 1, unchanged.
+            let transform = Self::glyph_transform(font, glyph_id, scaled_size, glyph_w, is_wide);
 
             let result = font.rasterize_glyph(
                 &mut canvas,
@@ -750,7 +857,7 @@ mod transform_probe {
         // prompt color/visibility depends on Menlo rendering it directly.)
         let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
         assert!(font.glyph_for_char('❯').is_some(), "Menlo must have ❯");
-        let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28);
+        let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28, false);
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
     }
@@ -810,5 +917,77 @@ mod transform_probe {
                 min_row
             );
         }
+    }
+
+    /// Horizontal ink extents (left_col, right_col) — non-zero pixel columns.
+    fn ink_x_extents(c: &Canvas) -> Option<(i32, i32)> {
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut any = false;
+        for y in 0..c.size.y() {
+            for x in 0..c.size.x() {
+                if c.pixels[(y as usize * c.stride) + x as usize] > 0 {
+                    any = true;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                }
+            }
+        }
+        if any {
+            Some((min_x, max_x))
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn cjk_glyph_not_stretched_and_centered() {
+        // CJK glyph '中' rasterized into a double-wide slot must NOT be
+        // horizontally stretched (old behaviour filled the full 2·cell_width,
+        // distorting every CJK char ~1.2×). It should sit roughly centered
+        // with side bearings on both edges.
+        let cjk = match Font::from_path("/System/Library/Fonts/PingFang.ttc", 0) {
+            Ok(f) => f,
+            Err(_) => {
+                eprintln!("PingFang.ttc not available on this system — skipping");
+                return;
+            }
+        };
+        // Match production cell geometry: Menlo cell_width=17 → CJK slot=34.
+        let (cw, ch_h) = (34i32, 34i32);
+        let scaled = 28.0f32;
+        let pixels = GlyphAtlas::rasterize_glyph(&cjk, '中', scaled, cw as u32, ch_h as u32, true);
+        // rasterize_glyph returns a Vec<u8>; build a Canvas-like view.
+        assert_eq!(pixels.len(), (cw * ch_h) as usize);
+        let mut probe_canvas = Canvas::new(Vector2I::new(cw, ch_h), Format::A8);
+        probe_canvas.pixels.copy_from_slice(&pixels);
+        let (left, right) =
+            ink_x_extents(&probe_canvas).expect("'中' must rasterize with ink in the CJK font");
+
+        // With no stretch, the glyph advance is ~1em ≈ 28px in a 34px slot.
+        // So ink should span well under 34px wide, and both side bearings
+        // (left > 0 AND right < cw-1) must be present — centering.
+        let ink_w = right - left + 1;
+        eprintln!("'中' ink x=[{left},{right}] width={ink_w} slot={cw}");
+        assert!(
+            ink_w < cw,
+            "'中' ink width {ink_w} >= slot {cw}; glyph is stretched (the bug)"
+        );
+        assert!(
+            left > 0,
+            "'中' has no left bearing (left={left}); not centered"
+        );
+        assert!(
+            right < cw - 1,
+            "'中' has no right bearing (right={right}); not centered"
+        );
+        // Symmetry: left and right bearings within a few px of each other.
+        let left_bearing = left;
+        let right_bearing = cw - 1 - right;
+        let asymmetry = (left_bearing - right_bearing).abs();
+        assert!(
+            asymmetry <= 4,
+            "'中' is off-center: left_bearing={left_bearing} right_bearing={right_bearing} (Δ={asymmetry})"
+        );
     }
 }

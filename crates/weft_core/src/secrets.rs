@@ -21,7 +21,10 @@ fn patterns() -> &'static [Regex] {
             // Slack tokens: xox[baprs]-...
             Regex::new(r"xox[baprs]-[A-Za-z0-9-]{10,}").unwrap(),
             // PEM private-key blocks (incl. RSA/EC/OPENSSH/PRIVATE KEY)
-            Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----").unwrap(),
+            Regex::new(
+                r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+            )
+            .unwrap(),
         ]
     })
 }
@@ -79,7 +82,8 @@ mod tests {
 
     #[test]
     fn masks_pem_private_key_block() {
-        let s = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
+        let s =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----";
         assert!(is_secret(s));
         let m = mask(s);
         assert!(!m.contains("MIIEowIBAAKCAQEA"));

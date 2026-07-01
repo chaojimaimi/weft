@@ -250,6 +250,23 @@ impl Editor {
         self.search.is_some()
     }
 
+    /// Record a submitted command into the in-memory history (newest-first).
+    /// Skips empty commands and exact-duplicates of the most recent entry.
+    /// Called by `Terminal::submit_command` so ↑/↓ navigation works.
+    pub fn push_history(&mut self, command: &str) {
+        let trimmed = command.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // Dedup against the newest entry only (not the whole list) — matches
+        // the common zsh `HIST_FIND_NO_DUPS` behaviour without surprising the
+        // user by removing older occurrences.
+        if self.history.first().is_some_and(|h| h == command) {
+            return;
+        }
+        self.history.insert(0, command.to_string());
+    }
+
     // ── history navigation (↑/↓) ───────────────────────────────────────
 
     pub fn history_prev(&mut self) {
@@ -691,6 +708,45 @@ mod tests {
     }
 
     #[test]
+    fn push_history_adds_commands_newest_first() {
+        let mut e = Editor::new();
+        assert!(e.history().is_empty());
+        e.push_history("ls");
+        e.push_history("git status");
+        e.push_history("pwd");
+        // newest-first
+        assert_eq!(e.history(), &["pwd", "git status", "ls"]);
+    }
+
+    #[test]
+    fn push_history_skips_empty_and_dedup_newest() {
+        let mut e = Editor::new();
+        e.push_history("ls");
+        e.push_history(""); // skipped
+        e.push_history("   "); // skipped (whitespace only)
+        e.push_history("ls"); // dedup against newest
+        assert_eq!(e.history(), &["ls"]);
+        e.push_history("pwd");
+        assert_eq!(e.history(), &["pwd", "ls"]);
+    }
+
+    #[test]
+    fn submit_command_pushes_to_history() {
+        // Verify that the Terminal wiring records submitted commands.
+        use crate::vt::Terminal;
+        let mut t = Terminal::new(24, 80);
+        // Simulate typing a command into the editor.
+        for c in "ls -la".chars() {
+            t.editor_mut().buffer.insert_char(c);
+        }
+        t.submit_command();
+        assert_eq!(t.editor().history(), &["ls -la"]);
+        // ↑ should now recall it.
+        t.editor_mut().history_prev();
+        assert_eq!(t.editor().text(), "ls -la");
+    }
+
+    #[test]
     fn search_finds_subsequence_match() {
         let mut e = editor_with_history(&["git status", "git push", "ls -la"]);
         e.search_start();
@@ -786,6 +842,7 @@ mod tests {
             label: label.into(),
             kind: MatchKind::Command,
             insert: insert.into(),
+            is_dir: false,
         }
     }
 
@@ -824,7 +881,7 @@ mod tests {
         let mut e = Editor::new();
         e.buffer.lines = vec!["ls".to_string()];
         e.buffer.cursor = (0, 2); // cursor at end of "ls"
-        // replace the whole word "ls" (cols 0..2) with the selected insert "lsof"
+                                  // replace the whole word "ls" (cols 0..2) with the selected insert "lsof"
         e.start_completion(vec![m("lsof", "lsof")], 0, 2);
         assert!(e.completion_accept());
         assert_eq!(e.buffer.lines[0], "lsof");
@@ -837,7 +894,7 @@ mod tests {
         let mut e = Editor::new();
         e.buffer.lines = vec!["echo ls more".to_string()];
         e.buffer.cursor = (0, 7); // cursor right after "ls"
-        // word "ls" occupies cols 5..7
+                                  // word "ls" occupies cols 5..7
         e.start_completion(vec![m("lsof", "lsof")], 5, 7);
         assert!(e.completion_accept());
         assert_eq!(e.buffer.lines[0], "echo lsof more");

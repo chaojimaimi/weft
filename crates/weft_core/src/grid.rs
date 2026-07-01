@@ -468,8 +468,10 @@ impl Grid {
         bg: CellColor,
         flags: CellFlags,
     ) {
-        // Reset scroll offset on new output
-        self.scroll_offset = 0;
+        // Note: scroll_offset reset is handled by the caller (Terminal::print)
+        // which knows the shell phase. Resetting here unconditionally would
+        // destroy the user's scroll position during AtPrompt idle when the
+        // shell re-renders its prompt.
 
         // Handle deferred wrap before writing
         if self.cursor.wrap_pending {
@@ -1796,14 +1798,16 @@ mod tests {
         }
         grid.scroll_up_history(3);
         assert_eq!(grid.scroll_offset, 3);
-        // Writing new output should reset scroll offset
+        // Grid-level write no longer resets scroll_offset — the Terminal
+        // (print path) manages that based on shell phase. Writing directly
+        // to the grid preserves the offset so the caller can decide.
         grid.write_char_with_attrs(
             'A',
             CellColor::Default,
             CellColor::Default,
             CellFlags::empty(),
         );
-        assert_eq!(grid.scroll_offset, 0);
+        assert_eq!(grid.scroll_offset, 3, "grid write preserves scroll_offset");
     }
 
     // ── Resize regression tests ──────────────────────────────────────

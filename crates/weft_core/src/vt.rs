@@ -3,7 +3,7 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
-use crate::blocks::BlockTracker;
+use crate::blocks::{BlockTracker, ShellPhase};
 use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
@@ -306,6 +306,10 @@ impl Terminal {
         let command = self.editor.text();
         self.command_from_editor = Some(command.clone());
         let bytes = build_submit_bytes(&command, self.bracketed_paste);
+        // Record into in-memory history so ↑/↓ navigation works. This is the
+        // only place commands enter the editor's history — without it the
+        // history vector stays empty and Up-arrow is a no-op.
+        self.editor.push_history(&command);
         self.editor.clear();
         bytes
     }
@@ -492,9 +496,15 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
-        // New PTY output: snap back to the live viewport so fresh content is
-        // visible instead of a stale scrollback view.
-        self.grid.scroll_offset = 0;
+        // Snap back to the live viewport for new content — EXCEPT when idle at
+        // an integrated prompt (AtPrompt). In that state the shell may emit
+        // prompt re-renders or async segments that would otherwise destroy
+        // the user's scroll position while they're reading history. During
+        // CommandExecuting (output streaming) and in non-integrated mode
+        // (plain grid terminal), new output always resets scroll.
+        if self.block_tracker.phase() != ShellPhase::AtPrompt {
+            self.grid.scroll_offset = 0;
+        }
 
         // Feed the printed char to the active command block's output capture.
         // The tracker self-gates on phase (only captures while
@@ -572,7 +582,32 @@ impl vte::Perform for Terminal {
             return;
         }
 
-        if col < num_cols {
+        // Write the character. Normally `col < num_cols` because the deferred-
+        // wrap / wide-char logic above keeps the cursor in bounds, but during a
+        // resize the grid narrows immediately while the PTY SIGWINCH is still
+        // in flight — the shell keeps emitting at the old width and the cursor
+        // can momentarily point past the last column. Instead of silently
+        // dropping those characters, wrap to the next line so nothing is lost.
+        // The shell will repaint correctly once it learns the new width.
+        let mut row = row;
+        let mut col = col;
+        if col >= num_cols {
+            self.grid.cursor.wrap_pending = false;
+            self.grid.cursor.col = 0;
+            let (_, bottom) = self.grid.scroll_region();
+            if self.grid.cursor.row == bottom {
+                self.grid.scroll_up(1);
+            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
+                self.grid.cursor.row += 1;
+            }
+            row = self.grid.cursor.row;
+            col = 0;
+            if row > 0 {
+                self.grid.viewport[row - 1].wrapped = true;
+            }
+        }
+
+        {
             let cell = &mut self.grid.viewport[row].cells[col];
             cell.character = c;
             cell.fg = self.attrs.fg;
@@ -927,6 +962,12 @@ impl vte::Perform for Terminal {
                         b"A" => {
                             self.shell_markers.push(ShellMarker::PromptStart);
                             self.block_tracker.on_prompt_start();
+                            // Clear the git branch: the precmd hook re-emits
+                            // OSC 9;git= if (and only if) the cwd is still a git
+                            // repo. Without this, leaving a repo keeps the stale
+                            // branch label forever (the hook sends nothing in a
+                            // non-git dir, so git_branch was never cleared).
+                            self.git_branch = None;
                             // Clear any stale submit flag so a missing 133;B
                             // (crashed / non-integrated sub-shell) can't pin the
                             // editor in passthrough forever.
@@ -1499,6 +1540,33 @@ mod tests {
         assert_eq!(t.grid().cell(1, 0).character, 'E');
     }
 
+    #[test]
+    fn print_after_narrowing_resize_does_not_drop_chars() {
+        // Simulates the resize race: shell wrote a full-width row at 10 cols,
+        // then the grid was narrowed to 5 while the PTY SIGWINCH is still in
+        // flight. Force the cursor past the new last column and print more —
+        // those chars must wrap onto the next line, not be discarded.
+        let mut t = Terminal::new(5, 10);
+        t.process(b"0123456789"); // fills row 0 at width 10
+        assert!(t.grid().cursor.wrap_pending);
+        // Narrow the grid (rewrap merges the single logical line into two).
+        t.resize(5, 5);
+        // The shell has NOT learned the new size yet and keeps printing at
+        // the cursor position, which now points past the last column.
+        // Force cursor to column 7 (past the new num_cols=5) as the old
+        // shell output would, then print — must wrap, not drop.
+        t.grid_mut().cursor.col = 7;
+        t.grid_mut().cursor.wrap_pending = false;
+        t.process(b"XY");
+        // No character should be lost: both 'X' and 'Y' must appear.
+        let found_x = (0..t.grid().num_rows)
+            .any(|r| (0..t.grid().num_cols).any(|c| t.grid().cell(r, c).character == 'X'));
+        let found_y = (0..t.grid().num_rows)
+            .any(|r| (0..t.grid().num_cols).any(|c| t.grid().cell(r, c).character == 'Y'));
+        assert!(found_x, "'X' must not be dropped on resize race");
+        assert!(found_y, "'Y' must not be dropped on resize race");
+    }
+
     // ── Scroll region ────────────────────────────────────────────
 
     #[test]
@@ -1533,6 +1601,24 @@ mod tests {
         let mut t = Terminal::new(24, 80);
         t.process(b"\x1b]7;not-a-uri\x1b\\");
         assert_eq!(t.cwd(), None);
+    }
+
+    #[test]
+    fn osc9_git_branch_set_then_cleared_on_prompt_start() {
+        // Shell hook emits OSC 9;git=<branch> only inside a repo.
+        let mut t = Terminal::new(24, 80);
+        // First prompt inside a git repo: hook sends OSC 9;git=main.
+        t.process(b"\x1b]9;git=main\x07");
+        assert_eq!(t.git_branch(), Some("main"));
+        // Next prompt: precmd runs again. PromptStart (133;A) must clear
+        // the branch first; if the cwd is still a repo the hook re-emits,
+        // but if it's now a non-git dir nothing arrives and the label
+        // correctly disappears.
+        t.process(b"\x1b]133;A\x07"); // no OSC 9 this time (non-git dir)
+        assert_eq!(t.git_branch(), None, "branch cleared on PromptStart");
+        // Returning to a git repo re-establishes it.
+        t.process(b"\x1b]9;git=develop\x07");
+        assert_eq!(t.git_branch(), Some("develop"));
     }
 
     #[test]

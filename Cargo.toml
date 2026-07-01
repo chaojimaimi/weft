@@ -37,6 +37,9 @@ unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 core-graphics-types = "0.1"
+core-graphics = "0.23"
+core-text = "20.1"
+core-foundation = "0.9"
 # Secret masking (v0.5 F8)
 regex = "1"
 # Persistence

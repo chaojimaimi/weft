@@ -19,6 +19,56 @@ use weft_core::selection::SelectionHandler;
 use weft_core::syntax::{self, TokenKind};
 use weft_core::vt::Terminal;
 
+/// Count how many visual rows a text line occupies when wrapped at `cols`
+/// columns. Wide characters consume 2 columns.
+fn wrapped_row_count(text: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    let mut rows = 1;
+    let mut col = 0usize;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if col + w > cols {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    rows.max(1)
+}
+
+/// Iterator yielding wrapped row chunks of `text` at `cols` columns. Each
+/// yielded `String` fits within `cols` columns (respecting wide-char widths).
+/// The first yielded chunk is the top row, subsequent chunks are continuation
+/// rows below it.
+fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
+    let mut chunks: Vec<String> = Vec::new();
+    if cols == 0 {
+        chunks.push(text.to_string());
+        return chunks.into_iter();
+    }
+    let mut current = String::new();
+    let mut col = 0usize;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if col + w > cols {
+            chunks.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        current.push(c);
+        col += w;
+    }
+    chunks.push(current);
+    chunks.into_iter()
+}
+
 /// Metal GPU renderer: draws the terminal Grid to screen.
 pub struct MetalRenderer {
     device: Device,
@@ -334,6 +384,7 @@ fragment float4 text_fragment(
         cursor_blink_on: bool,
         panel: Option<&PanelDrawParams>,
         prompt: Option<&PromptDrawParams>,
+        block_scroll: usize,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -402,6 +453,8 @@ fragment float4 text_fragment(
                     }
                 }
                 if let Some((completions, _)) = p.completions {
+                    // Emoji icons used by the popup (📁📄 via CoreText color path).
+                    missing.extend(['📁', '📄', '»']);
                     for m in completions {
                         missing.extend(m.label.chars());
                     }
@@ -411,7 +464,13 @@ fragment float4 text_fragment(
             // outputs, durations. Session blocks only — hydrated history stays
             // in the panel.
             if terminal.show_block_view() {
-                for b in terminal.block_tracker().session_blocks().iter().rev().take(64) {
+                for b in terminal
+                    .block_tracker()
+                    .session_blocks()
+                    .iter()
+                    .rev()
+                    .take(64)
+                {
                     missing.extend("❯ ".chars());
                     missing.extend(b.command.chars());
                     missing.extend(block_duration_str(b).chars());
@@ -453,6 +512,7 @@ fragment float4 text_fragment(
                     p.cwd,
                     terminal.git_branch(),
                     None,
+                    block_scroll,
                 )
             } else {
                 // CommandExecuting: full block view with the in-flight command
@@ -466,6 +526,7 @@ fragment float4 text_fragment(
                     None,
                     terminal.git_branch(),
                     terminal.block_tracker().in_flight(),
+                    block_scroll,
                 )
             };
             pending_hit_regions = regions;
@@ -485,6 +546,27 @@ fragment float4 text_fragment(
         // composites over terminal cells via the enabled alpha blend).
         if let Some(p) = panel {
             vertices.extend_from_slice(&self.build_panel_vertices(p));
+        }
+
+        // Scrollbar indicator: when the block view is scrolled up, draw a thin
+        // vertical bar on the right edge to signal there's more content above.
+        if show_blocks && block_scroll > 0 {
+            let ch_f = self.cell_height() as f32;
+            let bar_x = self.viewport.0 - self.padding_x * 0.5;
+            let bar_w = 3.0;
+            // The thumb sits near the top (scrolled up = viewing older content).
+            let thumb_h = ch_f * 3.0;
+            let thumb_y = self.padding_y;
+            let bar_color = [0.5, 0.5, 0.5, 0.5];
+            let (su, sv, suw, svh) = self.space_uv();
+            let bg_uv = [su, sv + svh, su + suw, sv];
+            push_quad(
+                &mut vertices,
+                [bar_x, thumb_y, bar_x + bar_w, thumb_y + thumb_h],
+                bg_uv,
+                [0.0; 4],
+                bar_color,
+            );
         }
 
         // Overlay the editor input box at the bottom (Editor mode only).
@@ -1172,7 +1254,14 @@ fragment float4 text_fragment(
         let prompt_str = "❯ ";
         let prompt_chars = 2;
         let prompt_c = [0.42, 0.85, 1.0, 1.0];
-        self.push_text(&mut verts, left, text_y0, prompt_str, prompt_c, prompt_chars);
+        self.push_text(
+            &mut verts,
+            left,
+            text_y0,
+            prompt_str,
+            prompt_c,
+            prompt_chars,
+        );
 
         // Editor buffer lines (line 0 starts after the prompt).
         for (i, line) in p.lines.iter().enumerate() {
@@ -1214,33 +1303,129 @@ fragment float4 text_fragment(
             }
         }
 
-        // Tab-completion dropdown, stacked above the input box (newest selected
-        // row nearest the box). A window of up to 8 candidates ending at the
-        // selected one; the selected row gets a highlight bar.
+        // Tab-completion dropdown — Warp-style floating window.
+        //
+        // Design:
+        //   • Dynamic width — sized to the longest visible label + suffix,
+        //     clamped to [25, 60% viewport cols] so it shrinks/grows with the
+        //     window. No label truncation under normal widths.
+        //   • Opaque background + border, covering the cwd line.
+        //   • Row layout: [icon] label  Type  (2-space gap, per-row — not
+        //     column-aligned across rows).
+        //   • Icons: 📁 (dir, amber) / 📄 (file, blue). Color emoji rendered
+        //     via CoreText (bypasses font-kit's A8 limitation for sbix bitmaps).
         if let Some((matches, selected)) = p.completions {
             if !matches.is_empty() && p.search.is_none() {
-                let max_rows = 8usize;
+                let label_color = [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0];
+                let sel_label_color = fg;
+                let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
+
+                let popup_bottom = box_y0;
+                let avail_rows = ((popup_bottom / ch).ceil() as usize).saturating_sub(1);
+                let max_rows = 8usize.min(avail_rows.max(1));
                 let start = selected.saturating_sub(max_rows - 1);
                 let end = (start + max_rows).min(matches.len());
-                let avail = box_cols.saturating_sub(1).max(1);
-                let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
-                let mut y = box_y0 - ch;
+                let shown = end - start;
+
+                // Dynamic width from the longest visible label.
+                let max_label_cols = matches[start..end]
+                    .iter()
+                    .map(|m| m.label.chars().count())
+                    .max()
+                    .unwrap_or(10);
+                let suffix_cols = 10usize;
+                let gap_cols = 2usize;
+                let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
+                let vp_cols = (vp_w / cw) as usize;
+                let popup_cols = popup_cols.clamp(25, vp_cols * 3 / 5);
+                let popup_w = popup_cols as f32 * cw;
+                let popup_x0 = box_x0;
+                let popup_x1 = (popup_x0 + popup_w).min(vp_w - self.padding_x);
+
+                let pad = cw * 0.5;
+                let icon_w = 2.0 * cw;
+                let label_x = popup_x0 + pad + icon_w;
+                let label_cols = max_label_cols; // max display width for labels
+
+                let popup_h = shown as f32 * ch + ch * 0.3;
+                let popup_top = popup_bottom - popup_h;
+                let border_c = [0.5, 0.5, 0.5, 0.35];
+                let popup_bg = [
+                    theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
+                    theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
+                    theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+                    1.0,
+                ];
+
+                push_quad(
+                    &mut verts,
+                    [popup_x0, popup_top, popup_x1, popup_bottom],
+                    bg_uv,
+                    [0.0; 4],
+                    popup_bg,
+                );
+                for (bx0, by0, bx1, by1) in [
+                    (popup_x0, popup_top, popup_x1, popup_top + 1.0),
+                    (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
+                    (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
+                    (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
+                ] {
+                    push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+                }
+
+                let mut y = popup_bottom - ch * 0.65;
                 for i in (start..end).rev() {
-                    if y < 0.0 {
+                    if y < popup_top {
                         break;
                     }
                     let is_sel = i == selected;
+                    let lcolor = if is_sel { sel_label_color } else { label_color };
                     if is_sel {
                         push_quad(
                             &mut verts,
-                            [box_x0, y, box_x1, y + ch],
+                            [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
                             bg_uv,
                             [0.0; 4],
-                            [prompt_c[0], prompt_c[1], prompt_c[2], 0.25],
+                            [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
                         );
                     }
-                    let color = if is_sel { fg } else { dim };
-                    self.push_text(&mut verts, box_x0 + cw, y, &matches[i].label, color, avail);
+                    let (icon, icon_color, suffix) = match matches[i].kind {
+                        weft_core::complete::MatchKind::Path => {
+                            if matches[i].is_dir {
+                                ("📁", [0.90, 0.72, 0.30, 1.0], "Directory")
+                            } else {
+                                ("📄", [0.45, 0.65, 0.90, 1.0], "File")
+                            }
+                        }
+                        weft_core::complete::MatchKind::History => {
+                            ("»", [0.60, 0.60, 0.60, 1.0], "History")
+                        }
+                        weft_core::complete::MatchKind::Command => {
+                            ("»", [0.55, 0.80, 0.55, 1.0], "Command")
+                        }
+                    };
+                    self.push_text(&mut verts, popup_x0 + pad, y, icon, icon_color, 3);
+                    self.push_text(
+                        &mut verts,
+                        label_x,
+                        y,
+                        &matches[i].label,
+                        lcolor,
+                        label_cols,
+                    );
+                    // Suffix follows the label with a fixed 2-space gap (per-row,
+                    // not column-aligned). Position = label_x + label_width + gap.
+                    let label_char_count = matches[i].label.chars().count();
+                    let suffix_x_row =
+                        label_x + (label_char_count.min(label_cols) + gap_cols) as f32 * cw;
+                    self.push_text(
+                        &mut verts,
+                        suffix_x_row,
+                        y,
+                        suffix,
+                        suffix_color,
+                        suffix_cols,
+                    );
                     y -= ch;
                 }
             }
@@ -1264,6 +1449,7 @@ fragment float4 text_fragment(
         cwd: Option<&str>,
         git_branch: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
+        block_scroll: usize,
     ) -> (Vec<f32>, Vec<(BlockId, f32, f32)>) {
         let mut verts = Vec::new();
         let mut hit_regions: Vec<(BlockId, f32, f32)> = Vec::new();
@@ -1301,6 +1487,12 @@ fragment float4 text_fragment(
         );
 
         let mut y = region_bottom_y - pitch;
+        // Lines to skip from the bottom up — implements scrollback in the
+        // block view. When the user scrolls up (`grid.scroll_offset > 0`),
+        // the newest block rows slide off the bottom and older rows appear
+        // from the top. We consume `skip` rows of the bottom-most content
+        // without drawing them before rendering begins.
+        let mut skip = block_scroll;
 
         // Live (in-flight) block at the bottom during CommandExecuting.
         if let Some(live) = live {
@@ -1308,26 +1500,58 @@ fragment float4 text_fragment(
                 if y < pad_y {
                     break;
                 }
-                self.push_text(&mut verts, left, y, line, fg, cols);
-                y -= pitch;
+                let vis_rows = wrapped_row_count(line, cols);
+                if skip >= vis_rows {
+                    skip -= vis_rows;
+                    continue;
+                }
+                let rows_to_skip = skip;
+                skip = 0;
+                // Collect wrapped chunks, then render bottom-up (last chunk at
+                // the lowest y). Since we build the layout upward, the LAST
+                // visual row of a wrapped line must be placed at the current
+                // `y` and earlier rows above it.
+                let chunks: Vec<String> = wrap_line_chunks(line, cols).skip(rows_to_skip).collect();
+                for chunk in chunks.iter().rev() {
+                    if y < pad_y {
+                        break;
+                    }
+                    self.push_text(&mut verts, left, y, chunk, fg, cols);
+                    y -= pitch;
+                }
             }
-            if y >= pad_y {
+            if skip == 0 && y >= pad_y {
                 self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
                 self.push_line_tokenized(&mut verts, cmd_x, y, live.command, fg, avail);
                 y -= pitch;
+            } else if skip > 0 {
+                skip = skip.saturating_sub(1);
             }
+            // gap + separator (not subject to skip — it's structural).
             y -= pitch;
-            if y >= pad_y {
+            if skip == 0 && y >= pad_y {
                 let ly = y + pitch * 0.5;
-                push_quad(&mut verts, [left, ly, right, ly + 1.5], bg_uv, [0.0; 4], separator);
+                push_quad(
+                    &mut verts,
+                    [left, ly, right, ly + 1.5],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
             }
         } else if let Some(cwd) = cwd {
             // Editor: divider ABOVE the cwd line (cwd grouped with the input
             // box, not the history), then the cwd text below the divider.
-            if y >= pad_y {
-                push_quad(&mut verts, [left, y, right, y + 1.5], bg_uv, [0.0; 4], separator);
+            if skip == 0 && y >= pad_y {
+                push_quad(
+                    &mut verts,
+                    [left, y, right, y + 1.5],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
                 let display = abbreviate_path(cwd);
                 let display = if let Some(b) = git_branch {
                     format!("{display} git:({b})")
@@ -1356,63 +1580,106 @@ fragment float4 text_fragment(
                 {
                     out_lines.pop();
                 }
+                // Render newest→oldest upward. Each logical line may wrap into
+                // several visual rows at the current column width. We render
+                // bottom-up: the LAST visual row of a wrapped line goes at the
+                // current `y`, earlier rows stack above it.
                 for line in out_lines.iter().rev() {
                     if y < pad_y {
                         break;
                     }
-                    self.push_text(&mut verts, left, y, line, fg, cols);
-                    y -= pitch;
+                    let vis_rows = wrapped_row_count(line, cols);
+                    if skip >= vis_rows {
+                        skip -= vis_rows;
+                        continue;
+                    }
+                    let rows_to_skip = skip;
+                    skip = 0;
+                    // Collect wrapped chunks (top→bottom order), then render
+                    // bottom-up so continuation rows land BELOW the first row.
+                    let chunks: Vec<String> =
+                        wrap_line_chunks(line, cols).skip(rows_to_skip).collect();
+                    for chunk in chunks.iter().rev() {
+                        if y < pad_y {
+                            break;
+                        }
+                        self.push_text(&mut verts, left, y, chunk, fg, cols);
+                        y -= pitch;
+                    }
                 }
             }
             // Command line: [chevron] ❯ command. The chevron (▸/▾) marks a
             // foldable block; its row is the click-toggle hit target.
             if y >= pad_y {
-                let (chev_w, avail_sub) = if foldable {
-                    let chev = if b.collapsed { "▸" } else { "▾" };
-                    self.push_text(&mut verts, left, y, chev, prompt_c, cols);
-                    (cw, 3)
+                if skip > 0 {
+                    skip = skip.saturating_sub(1);
                 } else {
-                    (0.0, 2)
-                };
-                self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
-                let cmd_x = left + chev_w + 2.0 * cw;
-                let avail = cols.saturating_sub(avail_sub).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, y, &b.command, fg, avail);
-                if foldable {
-                    hit_regions.push((b.id, y, y + pitch));
+                    let (chev_w, avail_sub) = if foldable {
+                        let chev = if b.collapsed { "▸" } else { "▾" };
+                        self.push_text(&mut verts, left, y, chev, prompt_c, cols);
+                        (cw, 3)
+                    } else {
+                        (0.0, 2)
+                    };
+                    self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
+                    let cmd_x = left + chev_w + 2.0 * cw;
+                    let avail = cols.saturating_sub(avail_sub).max(1);
+                    self.push_line_tokenized(&mut verts, cmd_x, y, &b.command, fg, avail);
+                    if foldable {
+                        hit_regions.push((b.id, y, y + pitch));
+                    }
+                    y -= pitch;
                 }
-                y -= pitch;
             }
-            // Header line (hidden when collapsed).
-            if !b.collapsed && y >= pad_y {
-                let dur = block_duration_str(b);
-                let bcwd = b
-                    .cwd
-                    .as_deref()
-                    .map(abbreviate_path)
-                    .unwrap_or_else(|| "~".to_string());
-                let header = if dur.is_empty() {
-                    bcwd
+            // Header line (always shown — collapsed blocks still need their
+            // cwd/duration label so the user knows what command ran where).
+            if y >= pad_y {
+                if skip > 0 {
+                    skip = skip.saturating_sub(1);
                 } else {
-                    format!("{bcwd} ({dur})")
-                };
-                self.push_text(&mut verts, left, y, &header, dim, cols);
-                y -= pitch;
+                    let dur = block_duration_str(b);
+                    let bcwd = b
+                        .cwd
+                        .as_deref()
+                        .map(abbreviate_path)
+                        .unwrap_or_else(|| "~".to_string());
+                    let header = if dur.is_empty() {
+                        bcwd
+                    } else {
+                        format!("{bcwd} ({dur})")
+                    };
+                    self.push_text(&mut verts, left, y, &header, dim, cols);
+                    y -= pitch;
+                }
             }
             // Separator rule + gap before the older block above.
             y -= pitch;
-            if y >= pad_y {
+            if skip == 0 && y >= pad_y {
                 let ly = y + pitch * 0.5;
-                push_quad(&mut verts, [left, ly, right, ly + 1.5], bg_uv, [0.0; 4], separator);
+                push_quad(
+                    &mut verts,
+                    [left, ly, right, ly + 1.5],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
             }
         }
 
         (verts, hit_regions)
     }
 
-    /// Lay out a string left-to-right as single-cell glyph quads. ASCII fast
-    /// path; wide chars compress to one cell (acceptable for panel labels).
-    /// Glyphs must already be in the atlas (warmed up by the caller).
+    /// Column width of a character (0 for zero-width combining marks,
+    /// 1 for ASCII/narrow, 2 for CJK full-width).
+    fn char_col_width(c: char) -> usize {
+        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    /// Lay out a string left-to-right, honoring wide-character (CJK) widths.
+    /// `max_cols` is a *column* budget (not a character count): a CJK char
+    /// consumes 2 columns, ASCII consumes 1. Glyphs must already be in the
+    /// atlas (warmed up by the caller). Text exceeding `max_cols` columns is
+    /// truncated (callers that need wrapping use `push_text_wrapped`).
     fn push_text(
         &self,
         vertices: &mut Vec<f32>,
@@ -1420,30 +1687,45 @@ fragment float4 text_fragment(
         y: f32,
         text: &str,
         fg: [f32; 4],
-        max_chars: usize,
+        max_cols: usize,
     ) {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
-        for (i, c) in text.chars().take(max_chars).enumerate() {
+        let mut col = 0usize;
+        let mut px = x;
+        for c in text.chars() {
+            let w = Self::char_col_width(c);
+            if w == 0 {
+                continue; // skip combining marks / zero-width
+            }
+            if col + w > max_cols {
+                break; // column budget exhausted
+            }
             let Some(g) = self.atlas.get(c) else {
+                col += w;
+                px += w as f32 * cw;
                 continue;
             };
             let (u, v) = g.uv_origin;
             let (uw, vh) = g.uv_size;
-            let cx = x + i as f32 * cw;
+            let cell_w = w as f32 * cw;
             push_quad(
                 vertices,
-                [cx, y, cx + cw, y + ch],
+                [px, y, px + cell_w, y + ch],
                 [u, v + vh, u + uw, v],
                 fg,
                 [0.0; 4],
             );
+            col += w;
+            px += cell_w;
         }
     }
 
+    /// Like `push_text` but wraps long text across multiple visual rows
     /// Lay out a line left-to-right, coloring each shell token by its kind
     /// (syntax highlight). `default_fg` is used for Whitespace/Default tokens.
-    /// Glyphs must already be in the atlas (warmed up by the caller).
+    /// Wide-character aware: CJK chars occupy 2 columns. Glyphs must already
+    /// be in the atlas (warmed up by the caller).
     fn push_line_tokenized(
         &self,
         vertices: &mut Vec<f32>,
@@ -1451,21 +1733,39 @@ fragment float4 text_fragment(
         y: f32,
         line: &str,
         default_fg: [f32; 4],
-        max_chars: usize,
+        max_cols: usize,
     ) {
         let cw = self.cell_width() as f32;
-        let mut cur_x = x;
-        let mut remaining = max_chars;
+        let mut col = 0usize;
+        let mut px = x;
         for token in syntax::tokenize(line) {
-            if remaining == 0 {
+            if col >= max_cols {
                 break;
             }
             let color = syntax_color(token.kind, default_fg);
-            let take = token.text.chars().count().min(remaining);
-            let text: String = token.text.chars().take(take).collect();
-            self.push_text(vertices, cur_x, y, &text, color, take);
-            cur_x += take as f32 * cw;
-            remaining -= take;
+            for c in token.text.chars() {
+                let w = Self::char_col_width(c);
+                if w == 0 {
+                    continue;
+                }
+                if col + w > max_cols {
+                    break;
+                }
+                if let Some(g) = self.atlas.get(c) {
+                    let (u, v) = g.uv_origin;
+                    let (uw, vh) = g.uv_size;
+                    let cell_w = w as f32 * cw;
+                    push_quad(
+                        vertices,
+                        [px, y, px + cell_w, y + self.cell_height() as f32],
+                        [u, v + vh, u + uw, v],
+                        color,
+                        [0.0; 4],
+                    );
+                    px += cell_w;
+                }
+                col += w;
+            }
         }
     }
 

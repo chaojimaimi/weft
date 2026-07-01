@@ -79,7 +79,10 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
-            tokens.push(Token::new(chars[start..i].iter().collect(), TokenKind::Whitespace));
+            tokens.push(Token::new(
+                chars[start..i].iter().collect(),
+                TokenKind::Whitespace,
+            ));
             continue;
         }
 
@@ -98,7 +101,10 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 }
                 i += 1;
             }
-            tokens.push(Token::new(chars[start..i].iter().collect(), TokenKind::String));
+            tokens.push(Token::new(
+                chars[start..i].iter().collect(),
+                TokenKind::String,
+            ));
             at_command_position = false;
             continue;
         }
@@ -108,7 +114,10 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             while i < chars.len() && is_operator_char(chars[i]) {
                 i += 1;
             }
-            tokens.push(Token::new(chars[start..i].iter().collect(), TokenKind::Operator));
+            tokens.push(Token::new(
+                chars[start..i].iter().collect(),
+                TokenKind::Operator,
+            ));
             at_command_position = true; // next word is a command
             continue;
         }
@@ -129,7 +138,10 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            tokens.push(Token::new(chars[start..i].iter().collect(), TokenKind::Variable));
+            tokens.push(Token::new(
+                chars[start..i].iter().collect(),
+                TokenKind::Variable,
+            ));
             at_command_position = false;
             continue;
         }
@@ -168,11 +180,7 @@ mod tests {
     fn command_with_flag() {
         assert_eq!(
             kinds("ls -la"),
-            vec![
-                TokenKind::Command,
-                TokenKind::Whitespace,
-                TokenKind::Flag,
-            ]
+            vec![TokenKind::Command, TokenKind::Whitespace, TokenKind::Flag,]
         );
     }
 
@@ -180,11 +188,7 @@ mod tests {
     fn command_with_path_arg() {
         assert_eq!(
             kinds("ls /tmp"),
-            vec![
-                TokenKind::Command,
-                TokenKind::Whitespace,
-                TokenKind::Path,
-            ]
+            vec![TokenKind::Command, TokenKind::Whitespace, TokenKind::Path,]
         );
     }
 
@@ -217,11 +221,7 @@ mod tests {
         // MVP: `--out=rv` is a single Flag span (`=` is a word char).
         assert_eq!(
             kinds("cmd --out=rv"),
-            vec![
-                TokenKind::Command,
-                TokenKind::Whitespace,
-                TokenKind::Flag,
-            ]
+            vec![TokenKind::Command, TokenKind::Whitespace, TokenKind::Flag,]
         );
     }
 
@@ -257,7 +257,10 @@ mod tests {
     fn escaped_quote_inside_string() {
         // one String token containing the escaped quote
         let toks = tokenize("echo \"a\\\"b\"");
-        let strings: Vec<&Token> = toks.iter().filter(|t| t.kind == TokenKind::String).collect();
+        let strings: Vec<&Token> = toks
+            .iter()
+            .filter(|t| t.kind == TokenKind::String)
+            .collect();
         assert_eq!(strings.len(), 1);
         assert_eq!(strings[0].text, "\"a\\\"b\"");
     }
@@ -267,11 +270,11 @@ mod tests {
         assert_eq!(
             kinds("a | b"),
             vec![
-                TokenKind::Command,   // a
+                TokenKind::Command, // a
                 TokenKind::Whitespace,
-                TokenKind::Operator,  // |
+                TokenKind::Operator, // |
                 TokenKind::Whitespace,
-                TokenKind::Command,   // b (command after pipe)
+                TokenKind::Command, // b (command after pipe)
             ]
         );
     }
@@ -297,11 +300,7 @@ mod tests {
         // ./run is path-like but it's the command position -> Command
         assert_eq!(
             kinds("./run --x"),
-            vec![
-                TokenKind::Command,
-                TokenKind::Whitespace,
-                TokenKind::Flag,
-            ]
+            vec![TokenKind::Command, TokenKind::Whitespace, TokenKind::Flag,]
         );
     }
 
@@ -336,6 +335,8 @@ mod tests {
     fn unclosed_quote_consumes_to_end() {
         // graceful: an unterminated quote reads to end-of-line as one String
         let toks = tokenize("echo \"oops");
-        assert!(toks.iter().any(|t| t.kind == TokenKind::String && t.text == "\"oops"));
+        assert!(toks
+            .iter()
+            .any(|t| t.kind == TokenKind::String && t.text == "\"oops"));
     }
 }

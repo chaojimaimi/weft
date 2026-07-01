@@ -33,11 +33,19 @@ pub struct Match {
     /// Text to replace the prefix with (may equal the label, or include a path
     /// dir-part / trailing `/` for directory completion).
     pub insert: String,
+    /// True when this is a filesystem directory (Path kind only). Used by the
+    /// renderer to draw a 📁/📄 icon in the Warp-style completion popup.
+    pub is_dir: bool,
 }
 
 impl Match {
     fn new(label: String, kind: MatchKind, insert: String) -> Self {
-        Self { label, kind, insert }
+        Self {
+            label,
+            kind,
+            insert,
+            is_dir: false,
+        }
     }
 }
 
@@ -138,11 +146,13 @@ fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
         } else {
             name.clone()
         };
-        out.push(Match::new(
+        let mut m = Match::new(
             display.clone(),
             MatchKind::Path,
             format!("{dir_part}{display}"),
-        ));
+        );
+        m.is_dir = is_dir;
+        out.push(m);
     }
     out
 }
@@ -174,8 +184,16 @@ mod tests {
 
     #[test]
     fn history_prefix_match() {
-        let history = vec!["ls -la".to_string(), "ls /tmp".to_string(), "cd".to_string()];
-        let ctx = CompleteCtx { cwd: NO_CWD, history: &history, path_bins: &[] };
+        let history = vec![
+            "ls -la".to_string(),
+            "ls /tmp".to_string(),
+            "cd".to_string(),
+        ];
+        let ctx = CompleteCtx {
+            cwd: NO_CWD,
+            history: &history,
+            path_bins: &[],
+        };
         let ms = complete("ls", &ctx);
         let labels: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
         assert_eq!(labels, vec!["ls -la", "ls /tmp"]);
@@ -185,14 +203,23 @@ mod tests {
     #[test]
     fn history_no_match_returns_empty_for_history() {
         let history = vec!["ls".to_string()];
-        let ctx = CompleteCtx { cwd: NO_CWD, history: &history, path_bins: &[] };
+        let ctx = CompleteCtx {
+            cwd: NO_CWD,
+            history: &history,
+            path_bins: &[],
+        };
         // exact prefix (len == prefix) is excluded; a non-matching prefix too.
         let ms: Vec<_> = complete("ls", &ctx)
             .into_iter()
             .filter(|m| m.kind == MatchKind::History)
             .collect();
-        assert!(ms.is_empty(), "exact-prefix history match should be excluded");
-        assert!(complete("zzz", &ctx).iter().all(|m| m.kind != MatchKind::History));
+        assert!(
+            ms.is_empty(),
+            "exact-prefix history match should be excluded"
+        );
+        assert!(complete("zzz", &ctx)
+            .iter()
+            .all(|m| m.kind != MatchKind::History));
     }
 
     #[test]
@@ -259,7 +286,11 @@ mod tests {
         let d = scratch_dir("dedup");
         fs::write(d.join("foo"), "").unwrap();
         let history = vec!["foo".to_string()];
-        let ctx = CompleteCtx { cwd: d.to_str().unwrap(), history: &history, path_bins: &[] };
+        let ctx = CompleteCtx {
+            cwd: d.to_str().unwrap(),
+            history: &history,
+            path_bins: &[],
+        };
         let ms = complete("fo", &ctx);
         let foo: Vec<_> = ms.iter().filter(|m| m.label == "foo").collect();
         assert_eq!(foo.len(), 1, "duplicate labels collapse to one");
@@ -269,7 +300,11 @@ mod tests {
     #[test]
     fn command_prefix_match() {
         let path_bins = vec!["ls".to_string(), "cat".to_string(), "grep".to_string()];
-        let ctx = CompleteCtx { cwd: NO_CWD, history: &[], path_bins: &path_bins };
+        let ctx = CompleteCtx {
+            cwd: NO_CWD,
+            history: &[],
+            path_bins: &path_bins,
+        };
         let ms = complete("l", &ctx);
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].label, "ls");
@@ -283,7 +318,11 @@ mod tests {
         fs::write(d.join("ab-path"), "").unwrap();
         let history = vec!["ab-history".to_string()];
         let path_bins = vec!["ab-cmd".to_string()];
-        let ctx = CompleteCtx { cwd: d.to_str().unwrap(), history: &history, path_bins: &path_bins };
+        let ctx = CompleteCtx {
+            cwd: d.to_str().unwrap(),
+            history: &history,
+            path_bins: &path_bins,
+        };
         let ms = complete("ab", &ctx);
         let kinds: Vec<MatchKind> = ms.iter().map(|m| m.kind).collect();
         assert_eq!(

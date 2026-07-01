@@ -7,7 +7,7 @@ mod glyph;
 mod renderer;
 
 use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
-use weft_core::blocks::BlockId;
+use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx};
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
@@ -96,6 +96,11 @@ struct App {
     panel_selection: usize,
     /// Id of the block whose output is expanded inline in the panel.
     panel_expanded: Option<BlockId>,
+    /// Block-view scroll offset (rows from the bottom). Independent of
+    /// `grid.scroll_offset` (which is for the grid/alt-screen path and
+    /// clamped to grid scrollback — the wrong proxy for block content).
+    /// This is what the mouse wheel / PgUp modifies in block view.
+    block_scroll_offset: usize,
 }
 
 impl App {
@@ -135,6 +140,7 @@ impl App {
             panel_query: String::new(),
             panel_selection: 0,
             panel_expanded: None,
+            block_scroll_offset: 0,
         }
     }
 
@@ -842,7 +848,6 @@ impl App {
         }
     }
 
-
     /// Count of blocks visible in the panel (newest-first, query-filtered).
     fn panel_visible_count(&self) -> usize {
         let Some(terminal) = &self.terminal else {
@@ -889,13 +894,36 @@ impl App {
             return;
         };
         let rows = terminal.grid().num_rows;
-        let grid = terminal.grid_mut();
-        match action {
-            Action::ScrollPageUp => grid.scroll_up_history(rows),
-            Action::ScrollPageDown => grid.scroll_down_history(rows),
-            Action::ScrollToTop => grid.scroll_to_top(),
-            Action::ScrollToBottom => grid.scroll_to_bottom(),
-            _ => {}
+        let cols = terminal.grid().num_cols;
+        // Block view uses a dedicated scroll offset.
+        if terminal.show_block_view() {
+            let (total, visible) = block_content_metrics(terminal, cols);
+            let max_scroll = total.saturating_sub(visible);
+            match action {
+                Action::ScrollPageUp => {
+                    self.block_scroll_offset = self
+                        .block_scroll_offset
+                        .saturating_add(rows)
+                        .min(max_scroll);
+                }
+                Action::ScrollPageDown => {
+                    self.block_scroll_offset = self.block_scroll_offset.saturating_sub(rows);
+                }
+                Action::ScrollToTop => {
+                    self.block_scroll_offset = max_scroll;
+                }
+                Action::ScrollToBottom => self.block_scroll_offset = 0,
+                _ => {}
+            }
+        } else {
+            let grid = terminal.grid_mut();
+            match action {
+                Action::ScrollPageUp => grid.scroll_up_history(rows),
+                Action::ScrollPageDown => grid.scroll_down_history(rows),
+                Action::ScrollToTop => grid.scroll_to_top(),
+                Action::ScrollToBottom => grid.scroll_to_bottom(),
+                _ => {}
+            }
         }
         self.request_redraw();
     }
@@ -1193,16 +1221,64 @@ impl App {
             return;
         }
 
+        // Alt-screen apps (less, vim, man, etc.) don't use mouse protocol but
+        // still benefit from wheel scroll: translate to Up/Down arrow key
+        // sequences so the pager scrolls its content natively.
+        if terminal.is_alt_screen_active() {
+            let up = match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
+                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
+            };
+            let key = if up { KeyCode::Up } else { KeyCode::Down };
+            let mut m = Modifiers::empty();
+            if self.mods.state().shift_key() {
+                m |= Modifiers::SHIFT;
+            }
+            let single = self.input_handler.encode_key(key, m);
+            if !single.is_empty() {
+                let mut batch = Vec::with_capacity(single.len() * lines);
+                for _ in 0..lines {
+                    batch.extend_from_slice(&single);
+                }
+                if let Some(pty) = &self.pty {
+                    let _ = pty.write_sync(&batch);
+                }
+            }
+            return;
+        }
+
         // Otherwise, scroll the terminal viewport
-        let grid = &mut terminal.grid_mut();
         let up = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
             winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
         };
-        if up {
-            grid.scroll_up_history(lines);
+        // Block view uses a dedicated scroll offset (not grid.scroll_offset,
+        // which is clamped to grid scrollback — the wrong proxy for block
+        // content like headers/commands/separators).
+        if terminal.show_block_view() {
+            // Cap scroll speed at 1 row per wheel notch in the block view.
+            // macOS trackpad inertia can send 3-4 lines per tick, which skips
+            // past content too fast for comfortable reading.
+            let scroll_lines = lines.min(1);
+            if up {
+                self.block_scroll_offset = self.block_scroll_offset.saturating_add(scroll_lines);
+                // Clamp: don't scroll past the oldest content. The visible
+                // viewport already holds `visible_rows` rows; total content
+                // is `total_rows`. Max scroll = total - visible.
+                let cols = terminal.grid().num_cols;
+                let (total, visible) = block_content_metrics(terminal, cols);
+                let max_scroll = total.saturating_sub(visible);
+                self.block_scroll_offset = self.block_scroll_offset.min(max_scroll);
+            } else {
+                self.block_scroll_offset = self.block_scroll_offset.saturating_sub(scroll_lines);
+            }
         } else {
-            grid.scroll_down_history(lines);
+            let grid = &mut terminal.grid_mut();
+            if up {
+                grid.scroll_up_history(lines);
+            } else {
+                grid.scroll_down_history(lines);
+            }
         }
         self.request_redraw();
     }
@@ -1423,7 +1499,22 @@ impl ApplicationHandler<AppEvent> for App {
                 Ok(store) => {
                     if let Some(terminal) = &mut self.terminal {
                         match store.recent(1000) {
-                            Ok(history) => terminal.block_tracker_mut().load_blocks(history),
+                            Ok(history) => {
+                                // Hydrate editor history from persisted commands so
+                                // ↑/↓ navigation works immediately on startup.
+                                // Blocks are oldest→newest; load_history reverses
+                                // to newest-first. Skip empty commands and strip
+                                // prompt artifacts (cwd path + ❯ marker) that
+                                // snapshot_command_line may have captured for
+                                // passthrough / non-editor sessions.
+                                let cmds: Vec<String> = history
+                                    .iter()
+                                    .map(|b| strip_prompt_prefix(&b.command))
+                                    .filter(|c| !c.trim().is_empty())
+                                    .collect();
+                                terminal.editor_mut().load_history(cmds);
+                                terminal.block_tracker_mut().load_blocks(history);
+                            }
                             Err(e) => warn!(error = %e, "failed to load block history"),
                         }
                     }
@@ -1513,8 +1604,19 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 self.pump_pty();
-                self.process_messages();
+                let had_output = self.process_messages();
                 self.update_cursor_blink();
+
+                // During command execution, new output streams in — snap the
+                // block view to the bottom so the user sees fresh content.
+                // (At prompt / idle, preserve the user's scroll position.)
+                if had_output {
+                    if let Some(t) = &self.terminal {
+                        if t.block_tracker().phase() == ShellPhase::CommandExecuting {
+                            self.block_scroll_offset = 0;
+                        }
+                    }
+                }
 
                 // If the grid row count drifted from what the terminal holds
                 // (font/padding/window-size change, or the one-time convergence
@@ -1590,6 +1692,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.cursor_blink_on,
                         panel.as_ref(),
                         prompt.as_ref(),
+                        self.block_scroll_offset,
                     );
                 }
 
@@ -1689,6 +1792,96 @@ impl ApplicationHandler<AppEvent> for App {
 /// The char-column range `(start, end)` of the word ending at the cursor
 /// column `col` (the partial token to complete), or `None` when the cursor
 /// sits on whitespace / an empty line. `end` == `col`.
+/// Strip prompt artifacts from a captured command string. When a command was
+/// captured via `snapshot_command_line()` (passthrough mode, or pre-editor
+/// sessions), the grid row includes the shell prompt — e.g.
+/// `~/projects/foo ❯ ls -la`. This strips everything up to and including the
+/// last prompt marker (❯ ❮ › $ % #) so only the command remains.
+///
+/// A marker is only recognized when followed by a space (so `$HOME` in a
+/// command is not mistaken for a `$` prompt).
+/// Estimate the total block-view content rows and the visible viewport rows
+/// for scroll clamping. This mirrors the row accounting in
+/// `build_block_view_vertices`: per block = output lines (wrapped at `cols`)
+/// + command line + header line + separator gap.
+fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize, usize) {
+    use weft_core::blocks::ShellPhase;
+
+    let blocks = terminal.block_tracker().session_blocks();
+    let mut total: usize = 0;
+    for b in blocks {
+        if !b.collapsed {
+            for line in b.output.lines() {
+                total += wrapped_row_count(line, cols);
+            }
+        }
+        total += 1; // command line
+        total += 1; // header line
+        total += 1; // separator gap
+    }
+    // Live block during CommandExecuting: output + command + gap.
+    if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
+        if let Some(live) = terminal.block_tracker().in_flight() {
+            for line in live.output.lines() {
+                total += wrapped_row_count(line, cols);
+            }
+            total += 2; // command + gap
+        }
+    } else {
+        // Editor mode: cwd header line.
+        total += 1;
+    }
+
+    // Visible rows: the block region height / cell height.
+    let renderer_cell_h = 1; // placeholder; computed from terminal grid rows
+    let grid_rows = terminal.grid().num_rows;
+    let visible = grid_rows.max(1);
+    let _ = renderer_cell_h;
+    (total, visible)
+}
+
+/// Count how many visual rows a text line occupies when wrapped at `cols`.
+fn wrapped_row_count(text: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    let mut rows = 1;
+    let mut col = 0usize;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if col + w > cols {
+            rows += 1;
+            col = 0;
+        }
+        col += w;
+    }
+    rows.max(1)
+}
+
+fn strip_prompt_prefix(s: &str) -> String {
+    // Patterns: "❯ ", "❮ ", "› ", "$ ", "% ", "# " — the marker + space.
+    let markers = ["❯ ", "❮ ", "› ", "$ ", "% ", "# "];
+    // Find the LAST marker occurrence (prompts may contain `$`/`#` in paths).
+    let mut best: Option<usize> = None;
+    for marker in &markers {
+        let mut search_from = 0;
+        while let Some(idx) = s[search_from..].find(marker) {
+            best = Some(best.map_or(search_from + idx, |b| b.max(search_from + idx)));
+            search_from += idx + marker.len();
+        }
+    }
+    if let Some(idx) = best {
+        let after = s[idx..].trim_start_matches(['❯', '❮', '›', '$', '%', '#', ' ']);
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    s.to_string()
+}
+
 fn word_at(line: &str, col: usize) -> Option<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     if chars.is_empty() {
@@ -1728,11 +1921,7 @@ fn scan_path_bins() -> Vec<String> {
         for dir in std::env::split_paths(&path) {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
-                    if entry
-                        .file_type()
-                        .map(|t| t.is_file())
-                        .unwrap_or(false)
-                    {
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                         if let Some(name) = entry.file_name().to_str() {
                             bins.insert(name.to_string());
                         }
@@ -1870,5 +2059,29 @@ mod tests {
         assert!(is_command_position("ls", 0));
         assert!(is_command_position("a | b", 4)); // "b" after pipe
         assert!(!is_command_position("ls -l", 3)); // "-l" is an arg
+    }
+
+    #[test]
+    fn strip_prompt_prefix_removes_cwd_and_marker() {
+        assert_eq!(strip_prompt_prefix("~/projects/foo ❯ ls -la"), "ls -la");
+        assert_eq!(strip_prompt_prefix("❯ echo hi"), "echo hi");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_keeps_plain_commands() {
+        assert_eq!(strip_prompt_prefix("git status"), "git status");
+        assert_eq!(strip_prompt_prefix("ls"), "ls");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_handles_root_prompts() {
+        assert_eq!(strip_prompt_prefix("# whoami"), "whoami");
+        assert_eq!(strip_prompt_prefix("user@host:~$ ls"), "ls");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_keeps_dollar_in_command() {
+        // `$HOME` should NOT be stripped (no space after $, it's part of cmd).
+        assert_eq!(strip_prompt_prefix("echo $HOME"), "echo $HOME");
     }
 }
