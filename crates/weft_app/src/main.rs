@@ -1719,7 +1719,6 @@ impl ApplicationHandler<AppEvent> for App {
                     let prompt =
                         if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
                             let search = terminal.editor().search_view();
-                            let completions = terminal.editor().completion_view();
                             Some(PromptDrawParams {
                                 cwd: terminal.cwd(),
                                 lines: &terminal.editor().buffer.lines,
@@ -1730,8 +1729,22 @@ impl ApplicationHandler<AppEvent> for App {
                                     Some(self.ime_preedit.as_str())
                                 },
                                 search,
-                                completions,
                             })
+                        } else {
+                            None
+                        };
+                    // Completion popup: passed separately from prompt (overlay
+                    // refactor commit 2 — split out from PromptDrawParams).
+                    let completions =
+                        if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
+                            let c = terminal.editor().completion_view();
+                            // Only show if search is not active (completion and
+                            // Ctrl+R search are mutually exclusive).
+                            if terminal.editor().search_view().is_some() {
+                                None
+                            } else {
+                                c
+                            }
                         } else {
                             None
                         };
@@ -1744,6 +1757,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.cursor_blink_on,
                         panel.as_ref(),
                         prompt.as_ref(),
+                        completions,
                         self.block_scroll_offset,
                     );
                 }

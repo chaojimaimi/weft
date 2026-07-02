@@ -398,6 +398,7 @@ fragment float4 text_fragment(
     }
 
     /// Draw the terminal Grid (and optional history panel) to screen.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         terminal: &Terminal,
@@ -405,6 +406,9 @@ fragment float4 text_fragment(
         cursor_blink_on: bool,
         panel: Option<&PanelDrawParams>,
         prompt: Option<&PromptDrawParams>,
+        // Completion popup candidates + selected index (split out from
+        // PromptDrawParams in overlay refactor commit 2).
+        completions: Option<(&[weft_core::complete::Match], usize)>,
         block_scroll: usize,
     ) {
         let drawable = match self.layer.next_drawable() {
@@ -473,13 +477,8 @@ fragment float4 text_fragment(
                         missing.extend(m.chars());
                     }
                 }
-                if let Some((completions, _)) = p.completions {
-                    // Emoji icons used by the popup (📁📄 via CoreText color path).
-                    missing.extend(['📁', '📄', '»']);
-                    for m in completions {
-                        missing.extend(m.label.chars());
-                    }
-                }
+                // Completion warm-up is handled separately in draw() after
+                // extracting the popup from the prompt params.
             }
             // Block-view (Editor mode + CommandExecuting overlay): commands,
             // outputs, durations. Session blocks only — hydrated history stays
@@ -593,6 +592,23 @@ fragment float4 text_fragment(
         // Overlay the editor input box at the bottom (Editor mode only).
         if let Some(p) = prompt {
             vertices.extend_from_slice(&self.build_prompt_vertices(p, cursor_blink_on));
+        }
+
+        // Completion popup (split out from prompt — overlay refactor commit 2).
+        // Positioned above the prompt input box using the same geometry.
+        if let Some((matches, selected)) = completions {
+            if !matches.is_empty() {
+                // Recompute box_top_y (same formula as build_prompt_vertices).
+                let ch_f = self.cell_height() as f32;
+                let vp_h = self.viewport.1;
+                let n_lines = prompt.map(|p| p.lines.len().max(1)).unwrap_or(1);
+                let box_h = ch_f * (n_lines as f32 + 2.0);
+                let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
+                let box_x0 = self.padding_x;
+                vertices.extend_from_slice(
+                    &self.build_completion_vertices(matches, selected, box_top_y, box_x0),
+                );
+            }
         }
 
         // Debug: log first row characters and verify vertex data
@@ -1324,137 +1340,147 @@ fragment float4 text_fragment(
             }
         }
 
-        // Tab-completion dropdown — Warp-style floating window.
-        //
-        // Design:
-        //   • Dynamic width — sized to the longest visible label + suffix,
-        //     clamped to [25, 60% viewport cols] so it shrinks/grows with the
-        //     window. No label truncation under normal widths.
-        //   • Opaque background + border, covering the cwd line.
-        //   • Row layout: [icon] label  Type  (2-space gap, per-row — not
-        //     column-aligned across rows).
-        //   • Icons: 📁 (dir, amber) / 📄 (file, blue). Color emoji rendered
-        //     via CoreText (bypasses font-kit's A8 limitation for sbix bitmaps).
-        if let Some((matches, selected)) = p.completions {
-            if !matches.is_empty() && p.search.is_none() {
-                let label_color = [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0];
-                let sel_label_color = fg;
-                let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
+        verts
+    }
 
-                let popup_bottom = box_y0;
-                let avail_rows = ((popup_bottom / ch).ceil() as usize).saturating_sub(1);
-                let max_rows = 8usize.min(avail_rows.max(1));
-                let start = selected.saturating_sub(max_rows - 1);
-                let end = (start + max_rows).min(matches.len());
-                let shown = end - start;
+    /// Build the Tab-completion dropdown as a floating popup above the prompt
+    /// input box. Split out from `build_prompt_vertices` for the overlay stack
+    /// refactor — the popup is now a separate overlay layer with its own
+    /// z-order (Completion) and hit-test regions.
+    ///
+    /// `anchor_y` is the prompt box's top edge (`box_y0`) — the popup sits
+    /// directly above it. This was previously computed inside
+    /// `build_prompt_vertices` as `popup_bottom = box_y0`.
+    fn build_completion_vertices(
+        &self,
+        matches: &[weft_core::complete::Match],
+        selected: usize,
+        anchor_y: f32,
+        box_x0: f32,
+    ) -> Vec<f32> {
+        let mut verts = Vec::new();
+        if matches.is_empty() {
+            return verts;
+        }
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
 
-                // Dynamic width from the longest visible label.
-                let max_label_cols = matches[start..end]
-                    .iter()
-                    .map(|m| Self::text_col_width(&m.label))
-                    .max()
-                    .unwrap_or(10);
-                let suffix_cols = 10usize;
-                let gap_cols = 2usize;
-                let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
-                let vp_cols = (vp_w / cw) as usize;
-                let popup_cols = popup_cols.clamp(25, vp_cols * 3 / 5);
-                let popup_w = popup_cols as f32 * cw;
-                let popup_x0 = box_x0;
-                let popup_x1 = (popup_x0 + popup_w).min(vp_w - self.padding_x);
+        let label_color = [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0];
+        let sel_label_color = fg;
+        let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
 
-                let pad = cw * 0.5;
-                let icon_w = 2.0 * cw;
-                let label_x = popup_x0 + pad + icon_w;
-                // Derive label_cols from the CLAMPED popup width so labels
-                // truncate instead of overflowing the right border. Budget:
-                // border(1) + icon(2) + label + gap(2) + suffix(10) + border(1).
-                let label_cols = popup_cols
-                    .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
-                    .max(5);
+        let popup_bottom = anchor_y;
+        let avail_rows = ((popup_bottom / ch).ceil() as usize).saturating_sub(1);
+        let max_rows = 8usize.min(avail_rows.max(1));
+        let start = selected.saturating_sub(max_rows - 1);
+        let end = (start + max_rows).min(matches.len());
+        let shown = end - start;
 
-                let popup_h = shown as f32 * ch + ch * 0.3;
-                let popup_top = popup_bottom - popup_h;
-                let border_c = [0.5, 0.5, 0.5, 0.35];
-                let popup_bg = [
-                    theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
-                    theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
-                    theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
-                    1.0,
-                ];
+        // Dynamic width from the longest visible label.
+        let max_label_cols = matches[start..end]
+            .iter()
+            .map(|m| Self::text_col_width(&m.label))
+            .max()
+            .unwrap_or(10);
+        let suffix_cols = 10usize;
+        let gap_cols = 2usize;
+        let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
+        let vp_cols = (vp_w / cw) as usize;
+        let popup_cols = popup_cols.clamp(25, vp_cols * 3 / 5);
+        let popup_w = popup_cols as f32 * cw;
+        let popup_x0 = box_x0;
+        let popup_x1 = (popup_x0 + popup_w).min(vp_w - self.padding_x);
 
+        let pad = cw * 0.5;
+        let icon_w = 2.0 * cw;
+        let label_x = popup_x0 + pad + icon_w;
+        let label_cols = popup_cols
+            .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
+            .max(5);
+
+        let popup_h = shown as f32 * ch + ch * 0.3;
+        let popup_top = popup_bottom - popup_h;
+        let border_c = [0.5, 0.5, 0.5, 0.35];
+        let popup_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+            1.0,
+        ];
+
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_top, popup_x1, popup_bottom],
+            bg_uv,
+            [0.0; 4],
+            popup_bg,
+        );
+        for (bx0, by0, bx1, by1) in [
+            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
+            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
+            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
+            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
+        ] {
+            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        }
+
+        let mut y = popup_bottom - ch * 0.65;
+        for i in (start..end).rev() {
+            if y < popup_top {
+                break;
+            }
+            let is_sel = i == selected;
+            let lcolor = if is_sel { sel_label_color } else { label_color };
+            if is_sel {
                 push_quad(
                     &mut verts,
-                    [popup_x0, popup_top, popup_x1, popup_bottom],
+                    [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
                     bg_uv,
                     [0.0; 4],
-                    popup_bg,
+                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
                 );
-                for (bx0, by0, bx1, by1) in [
-                    (popup_x0, popup_top, popup_x1, popup_top + 1.0),
-                    (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
-                    (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
-                    (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
-                ] {
-                    push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
-                }
-
-                let mut y = popup_bottom - ch * 0.65;
-                for i in (start..end).rev() {
-                    if y < popup_top {
-                        break;
-                    }
-                    let is_sel = i == selected;
-                    let lcolor = if is_sel { sel_label_color } else { label_color };
-                    if is_sel {
-                        push_quad(
-                            &mut verts,
-                            [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
-                            bg_uv,
-                            [0.0; 4],
-                            [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
-                        );
-                    }
-                    let (icon, icon_color, suffix) = match matches[i].kind {
-                        weft_core::complete::MatchKind::Path => {
-                            if matches[i].is_dir {
-                                ("📁", [0.90, 0.72, 0.30, 1.0], "Directory")
-                            } else {
-                                ("📄", [0.45, 0.65, 0.90, 1.0], "File")
-                            }
-                        }
-                        weft_core::complete::MatchKind::History => {
-                            ("»", [0.60, 0.60, 0.60, 1.0], "History")
-                        }
-                        weft_core::complete::MatchKind::Command => {
-                            ("»", [0.55, 0.80, 0.55, 1.0], "Command")
-                        }
-                    };
-                    self.push_text(&mut verts, popup_x0 + pad, y, icon, icon_color, 3);
-                    self.push_text(
-                        &mut verts,
-                        label_x,
-                        y,
-                        &matches[i].label,
-                        lcolor,
-                        label_cols,
-                    );
-                    // Suffix follows the label with a fixed 2-space gap (per-row,
-                    // not column-aligned). Position = label_x + label_width + gap.
-                    let label_col_w = Self::text_col_width(&matches[i].label);
-                    let suffix_x_row =
-                        label_x + (label_col_w.min(label_cols) + gap_cols) as f32 * cw;
-                    self.push_text(
-                        &mut verts,
-                        suffix_x_row,
-                        y,
-                        suffix,
-                        suffix_color,
-                        suffix_cols,
-                    );
-                    y -= ch;
-                }
             }
+            let (icon, icon_color, suffix) = match matches[i].kind {
+                weft_core::complete::MatchKind::Path => {
+                    if matches[i].is_dir {
+                        ("📁", [0.90, 0.72, 0.30, 1.0], "Directory")
+                    } else {
+                        ("📄", [0.45, 0.65, 0.90, 1.0], "File")
+                    }
+                }
+                weft_core::complete::MatchKind::History => {
+                    ("»", [0.60, 0.60, 0.60, 1.0], "History")
+                }
+                weft_core::complete::MatchKind::Command => {
+                    ("»", [0.55, 0.80, 0.55, 1.0], "Command")
+                }
+            };
+            self.push_text(&mut verts, popup_x0 + pad, y, icon, icon_color, 3);
+            self.push_text(
+                &mut verts,
+                label_x,
+                y,
+                &matches[i].label,
+                lcolor,
+                label_cols,
+            );
+            let label_col_w = Self::text_col_width(&matches[i].label);
+            let suffix_x_row = label_x + (label_col_w.min(label_cols) + gap_cols) as f32 * cw;
+            self.push_text(
+                &mut verts,
+                suffix_x_row,
+                y,
+                suffix,
+                suffix_color,
+                suffix_cols,
+            );
+            y -= ch;
         }
 
         verts
@@ -1937,9 +1963,6 @@ pub struct PromptDrawParams<'a> {
     /// `(query, selected_match)` when Ctrl+R search is active (replaces the
     /// normal prompt rendering).
     pub search: Option<(&'a str, Option<&'a str>)>,
-    /// `(matches, selected_index)` when Tab completion is active — rendered as
-    /// a dropdown above the input box.
-    pub completions: Option<(&'a [weft_core::complete::Match], usize)>,
 }
 
 /// Whether a block matches the panel search query (empty query = match all).

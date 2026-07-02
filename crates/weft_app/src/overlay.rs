@@ -2,18 +2,12 @@
 //! for all overlay UI layers (history panel, prompt input box, completion
 //! dropdown, and future Command Palette / context menu).
 //!
-//! ## Design
-//!
-//! Each overlay is an [`OverlayLayer`] with a z-order ([`OverlayZ`]), an input
-//! policy ([`OverlayInputPolicy`]), and content ([`OverlayContent`]). The
-//! [`OverlayStack`] is a **stack-local temporary** built per frame in the
-//! `RedrawRequested` handler via [`build_overlay_stack`] — it is NOT stored as
-//! an `App` field, to avoid self-referential borrow conflicts with
-//! `&mut self.renderer.draw()`.
-//!
 //! See `docs/superpowers/App:Renderer Overlay 架构重构设计.md` for the full
-//! design rationale and `docs/superpowers/specs/2026-07-02-overlay-refactor.md`
-//! (planned).
+//! design rationale.
+//!
+//! Types defined here are not yet wired into the render path (commits 3-4
+//! will migrate panel/prompt/completion/hit-test to use them).
+#![allow(dead_code)]
 
 use std::collections::HashSet;
 
@@ -179,8 +173,6 @@ impl OverlayWarmup for OverlayContent<'_> {
     }
 }
 
-/// Build the overlay stack for the current frame. This is a **free function**
-
 /// A rectangular region that responds to mouse input, tagged with its target.
 /// Produced by the renderer during vertex building, consumed by the app's
 /// mouse handler.
@@ -231,8 +223,6 @@ pub fn build_overlay_stack<'a>(
     terminal: &'a Terminal,
     viewport_width: f32,
     renderer_scale: f64,
-    cell_height: u32,
-    padding_y: f32,
     panel_open: bool,
     panel_query: &'a str,
     panel_selection: usize,
@@ -261,13 +251,6 @@ pub fn build_overlay_stack<'a>(
     // Prompt input box (Editor mode only).
     if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
         let search = terminal.editor().search_view();
-        let completions = terminal.editor().completion_view();
-
-        // Compute prompt box geometry (shared between prompt and completion
-        // anchoring). This replaces the duplicated box_h calculation that
-        // previously existed in both draw() and build_prompt_vertices().
-        // Commit 2 will use this to anchor the split-out completion layer.
-        let _ = (cell_height, padding_y);
 
         layers.push(OverlayLayer {
             kind: OverlayKind::Prompt,
@@ -283,13 +266,27 @@ pub fn build_overlay_stack<'a>(
                     Some(ime_preedit)
                 },
                 search,
-                // Commit 1: pass completions through to prompt for backward
-                // compat. Commit 2 will split this into a separate layer.
-                completions,
             }),
         });
 
-        // Commit 2 will add: if completions.is_some() → push Completion layer.
+        // Completion popup as a separate layer above the prompt.
+        let completions = terminal.editor().completion_view();
+        if let Some((matches, selected)) = completions {
+            if !matches.is_empty() && search.is_none() {
+                layers.push(OverlayLayer {
+                    kind: OverlayKind::Completion,
+                    z: OverlayZ::Completion,
+                    input_policy: OverlayInputPolicy::Passive,
+                    content: OverlayContent::Completion(CompletionDrawParams {
+                        matches,
+                        selected,
+                        // anchor_y is recalculated by the renderer from its
+                        // own viewport geometry (see draw() completion block).
+                        anchor_y: 0.0,
+                    }),
+                });
+            }
+        }
     }
 
     // v0.7预留：
