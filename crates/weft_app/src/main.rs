@@ -8,7 +8,7 @@ mod renderer;
 
 use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
 use weft_core::blocks::{BlockId, ShellPhase};
-use weft_core::complete::{complete, CompleteCtx};
+use weft_core::complete::{complete, CompleteCtx, CompletePosition};
 use weft_core::config::{Action, Config, KeyBindings};
 use weft_core::input::{
     encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
@@ -765,14 +765,43 @@ impl App {
         let Some(line_str) = line_owned.as_deref() else {
             return;
         };
-        let Some((ws, we)) = word_at(line_str, col) else {
-            return;
+
+        // Determine the word range and prefix. Normally this is the token left
+        // of the cursor. But when the cursor sits on whitespace after a command
+        // (e.g. `cd |`), word_at returns None — in that case, if we're at an
+        // argument position, treat it as an empty-prefix path completion so
+        // Tab lists all files/dirs in the cwd (matching Warp's behavior).
+        let (ws, we, prefix, is_cmd_pos): (usize, usize, String, bool) =
+            match word_at(line_str, col) {
+                Some((ws, we)) => {
+                    let prefix: String = line_str.chars().skip(ws).take(we - ws).collect();
+                    let is_cmd = is_command_position(line_str, ws);
+                    (ws, we, prefix, is_cmd)
+                }
+                None => {
+                    // Cursor on whitespace. Check if there's a command token
+                    // before the cursor (making this an argument position).
+                    // If so, start an empty-prefix path completion.
+                    let is_cmd = is_command_position(line_str, col);
+                    if is_cmd {
+                        return; // blank line or after operator — nothing to complete
+                    }
+                    (col, col, String::new(), false)
+                }
+            };
+
+        let position = if is_cmd_pos {
+            CompletePosition::Command
+        } else {
+            CompletePosition::Argument
         };
-        let prefix: String = line_str.chars().skip(ws).take(we - ws).collect();
-        if prefix.is_empty() {
+
+        // Skip empty prefix at command position (nothing to match).
+        if prefix.is_empty() && is_cmd_pos {
             return;
         }
-        let path_bins: Vec<String> = if is_command_position(line_str, ws) {
+
+        let path_bins: Vec<String> = if is_cmd_pos {
             self.path_bins.clone()
         } else {
             Vec::new()
@@ -782,7 +811,7 @@ impl App {
             history: &history,
             path_bins: &path_bins,
         };
-        let matches = complete(&prefix, &ctx);
+        let matches = complete(&prefix, &ctx, position);
         if matches.is_empty() {
             return;
         }
@@ -897,7 +926,14 @@ impl App {
         let cols = terminal.grid().num_cols;
         // Block view uses a dedicated scroll offset.
         if terminal.show_block_view() {
-            let (total, visible) = block_content_metrics(terminal, cols);
+            let (total, _) = block_content_metrics(terminal, cols);
+            // Compute visible rows from the renderer's actual geometry.
+            let prompt_lines = terminal.editor().buffer.lines.len();
+            let visible = self
+                .renderer
+                .as_ref()
+                .map(|r| r.block_visible_rows(prompt_lines))
+                .unwrap_or(rows);
             let max_scroll = total.saturating_sub(visible);
             match action {
                 Action::ScrollPageUp => {
@@ -1266,7 +1302,22 @@ impl App {
                 // viewport already holds `visible_rows` rows; total content
                 // is `total_rows`. Max scroll = total - visible.
                 let cols = terminal.grid().num_cols;
-                let (total, visible) = block_content_metrics(terminal, cols);
+                let (total, _) = block_content_metrics(terminal, cols);
+                // Compute visible rows from the renderer's actual geometry
+                // (pitch = ch * 1.1, region = viewport minus prompt box).
+                // The old code used grid().num_rows which overcounts because
+                // the block view uses a 10% taller line pitch and doesn't
+                // occupy the full viewport (prompt box eats space).
+                let prompt_lines = if let Some(t) = &self.terminal {
+                    t.editor().buffer.lines.len()
+                } else {
+                    1
+                };
+                let visible = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.block_visible_rows(prompt_lines))
+                    .unwrap_or(1);
                 let max_scroll = total.saturating_sub(visible);
                 self.block_scroll_offset = self.block_scroll_offset.min(max_scroll);
             } else {

@@ -5,6 +5,21 @@
 //! [`CompleteCtx`] (cwd, history, cached PATH binaries); this module is pure
 //! logic so it's fully unit-testable.
 
+/// Where the cursor sits relative to the command — decides which completion
+/// sources are consulted. At a command position we want history + executables;
+/// at an argument position we only want files/directories (Warp-style: Tab
+/// after `cd ` lists the cwd, never history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletePosition {
+    /// Line start or after a shell operator (`| & ; > <`): consult all three
+    /// sources (history, path, `$PATH` executables).
+    Command,
+    /// After a command + whitespace: consult filesystem paths only. No history
+    /// matches, no executable matches — you don't tab-complete a second
+    /// command inside an argument.
+    Argument,
+}
+
 /// Which source a completion [`Match`] came from. Drives its priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchKind {
@@ -58,29 +73,37 @@ pub struct CompleteCtx<'a> {
     pub path_bins: &'a [String],
 }
 
-/// Produce completion candidates for `prefix` given the context. History
-/// matches rank above Path, which ranks above Command; duplicates (same label)
-/// collapse to the higher-priority one. Capped at 50 results.
-pub fn complete(prefix: &str, ctx: &CompleteCtx) -> Vec<Match> {
+/// Produce completion candidates for `prefix` given the context and cursor
+/// position. At a [`CompletePosition::Command`] position, history matches rank
+/// above Path, which ranks above Command. At an [`CompletePosition::Argument`]
+/// position, only filesystem paths are consulted (no history, no executables).
+/// Duplicates (same label) collapse to the higher-priority one. Capped at 50
+/// results.
+pub fn complete(prefix: &str, ctx: &CompleteCtx, position: CompletePosition) -> Vec<Match> {
     let mut out: Vec<Match> = Vec::new();
 
-    // History: whole-line prefix matches (excluding exact duplicates of prefix).
-    for h in ctx.history {
-        if h.starts_with(prefix) && h.len() > prefix.len() {
-            out.push(Match::new(h.clone(), MatchKind::History, h.clone()));
+    // History and $PATH commands only make sense at a command position.
+    // After `cd ` you want files, not a historical `cd /tmp`.
+    if position == CompletePosition::Command {
+        // History: whole-line prefix matches (excluding exact duplicates of prefix).
+        for h in ctx.history {
+            if h.starts_with(prefix) && h.len() > prefix.len() {
+                out.push(Match::new(h.clone(), MatchKind::History, h.clone()));
+            }
+        }
+
+        // Command names ($PATH executables). The caller passes an empty
+        // path_bins when the cursor isn't at a command position, but we also
+        // gate here for safety.
+        for bin in ctx.path_bins {
+            if bin.starts_with(prefix) && bin.len() > prefix.len() {
+                out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
+            }
         }
     }
 
-    // Filesystem paths.
+    // Filesystem paths — always consulted (both command and argument positions).
     out.extend(path_matches(prefix, ctx.cwd));
-
-    // Command names ($PATH executables). The caller passes an empty path_bins
-    // when the cursor isn't at a command position, so no commands are scanned.
-    for bin in ctx.path_bins {
-        if bin.starts_with(prefix) && bin.len() > prefix.len() {
-            out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
-        }
-    }
 
     // Dedup by label, keeping the first (highest-priority) occurrence.
     let mut seen = std::collections::HashSet::new();
@@ -194,7 +217,7 @@ mod tests {
             history: &history,
             path_bins: &[],
         };
-        let ms = complete("ls", &ctx);
+        let ms = complete("ls", &ctx, CompletePosition::Command);
         let labels: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
         assert_eq!(labels, vec!["ls -la", "ls /tmp"]);
         assert!(ms.iter().all(|m| m.kind == MatchKind::History));
@@ -209,7 +232,7 @@ mod tests {
             path_bins: &[],
         };
         // exact prefix (len == prefix) is excluded; a non-matching prefix too.
-        let ms: Vec<_> = complete("ls", &ctx)
+        let ms: Vec<_> = complete("ls", &ctx, CompletePosition::Command)
             .into_iter()
             .filter(|m| m.kind == MatchKind::History)
             .collect();
@@ -217,7 +240,7 @@ mod tests {
             ms.is_empty(),
             "exact-prefix history match should be excluded"
         );
-        assert!(complete("zzz", &ctx)
+        assert!(complete("zzz", &ctx, CompletePosition::Command)
             .iter()
             .all(|m| m.kind != MatchKind::History));
     }
@@ -229,7 +252,7 @@ mod tests {
         fs::write(d.join("b.txt"), "").unwrap();
         fs::create_dir(d.join("sub")).unwrap();
         let ctx = path_ctx(d.to_str().unwrap());
-        let ms = complete("a", &ctx);
+        let ms = complete("a", &ctx, CompletePosition::Argument);
         let labels: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
         assert_eq!(labels, vec!["a.txt"]);
         assert!(ms[0].kind == MatchKind::Path);
@@ -241,7 +264,7 @@ mod tests {
         let d = scratch_dir("path_dir");
         fs::create_dir(d.join("sub")).unwrap();
         let ctx = path_ctx(d.to_str().unwrap());
-        let ms = complete("s", &ctx);
+        let ms = complete("s", &ctx, CompletePosition::Argument);
         assert_eq!(ms[0].label, "sub/");
         assert_eq!(ms[0].insert, "sub/");
     }
@@ -252,7 +275,7 @@ mod tests {
         fs::write(d.join("a"), "").unwrap();
         fs::write(d.join("b"), "").unwrap();
         let ctx = path_ctx(d.to_str().unwrap());
-        let ms = complete("", &ctx);
+        let ms = complete("", &ctx, CompletePosition::Argument);
         let labels: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
         assert!(labels.contains(&"a"));
         assert!(labels.contains(&"b"));
@@ -264,7 +287,7 @@ mod tests {
         fs::create_dir(d.join("sub")).unwrap();
         fs::write(d.join("sub").join("x.txt"), "").unwrap();
         let ctx = path_ctx(d.to_str().unwrap());
-        let ms = complete("sub/x", &ctx);
+        let ms = complete("sub/x", &ctx, CompletePosition::Argument);
         assert_eq!(ms[0].label, "x.txt");
         assert_eq!(ms[0].insert, "sub/x.txt");
     }
@@ -275,8 +298,12 @@ mod tests {
         fs::write(d.join(".secret"), "").unwrap();
         fs::write(d.join("visible"), "").unwrap();
         let ctx = path_ctx(d.to_str().unwrap());
-        assert!(complete("", &ctx).iter().all(|m| !m.label.starts_with('.')));
-        assert!(complete(".", &ctx).iter().any(|m| m.label == ".secret"));
+        assert!(complete("", &ctx, CompletePosition::Argument)
+            .iter()
+            .all(|m| !m.label.starts_with('.')));
+        assert!(complete(".", &ctx, CompletePosition::Argument)
+            .iter()
+            .any(|m| m.label == ".secret"));
     }
 
     #[test]
@@ -291,7 +318,7 @@ mod tests {
             history: &history,
             path_bins: &[],
         };
-        let ms = complete("fo", &ctx);
+        let ms = complete("fo", &ctx, CompletePosition::Command);
         let foo: Vec<_> = ms.iter().filter(|m| m.label == "foo").collect();
         assert_eq!(foo.len(), 1, "duplicate labels collapse to one");
         assert_eq!(foo[0].kind, MatchKind::History, "history outranks path");
@@ -305,7 +332,7 @@ mod tests {
             history: &[],
             path_bins: &path_bins,
         };
-        let ms = complete("l", &ctx);
+        let ms = complete("l", &ctx, CompletePosition::Command);
         assert_eq!(ms.len(), 1);
         assert_eq!(ms[0].label, "ls");
         assert_eq!(ms[0].kind, MatchKind::Command);
@@ -323,12 +350,81 @@ mod tests {
             history: &history,
             path_bins: &path_bins,
         };
-        let ms = complete("ab", &ctx);
+        let ms = complete("ab", &ctx, CompletePosition::Command);
         let kinds: Vec<MatchKind> = ms.iter().map(|m| m.kind).collect();
         assert_eq!(
             kinds,
             vec![MatchKind::History, MatchKind::Path, MatchKind::Command],
             "order must be History > Path > Command"
         );
+    }
+
+    // ── Bug fix tests: argument position ────────────────────────────────
+
+    #[test]
+    fn argument_position_excludes_history_and_commands() {
+        // Bug 2: `cd ` + Tab should show only files/dirs, never history or
+        // executables. Even if history has `cd /tmp` and path_bins has `cd`,
+        // an argument-position completion with prefix "" must yield only Path
+        // entries from the cwd.
+        let d = scratch_dir("arg_only");
+        fs::write(d.join("file_a"), "").unwrap();
+        fs::create_dir(d.join("dir_b")).unwrap();
+
+        let history = vec!["cd /tmp".to_string(), "cd ..".to_string()];
+        let path_bins = vec!["cd".to_string(), "cat".to_string()];
+        let ctx = CompleteCtx {
+            cwd: d.to_str().unwrap(),
+            history: &history,
+            path_bins: &path_bins,
+        };
+
+        let ms = complete("", &ctx, CompletePosition::Argument);
+        // No history, no commands — only Path.
+        assert!(
+            ms.iter().all(|m| m.kind == MatchKind::Path),
+            "argument position must exclude history and commands"
+        );
+        let labels: Vec<&str> = ms.iter().map(|m| m.label.as_str()).collect();
+        assert!(labels.contains(&"file_a"));
+        assert!(labels.contains(&"dir_b/"));
+    }
+
+    #[test]
+    fn argument_position_with_prefix_still_excludes_history() {
+        // `cd s` + Tab → should match only files starting with "s", never a
+        // history entry like `ssh ...`.
+        let d = scratch_dir("arg_prefix");
+        fs::write(d.join("src.rs"), "").unwrap();
+        let history = vec!["ssh user@host".to_string()];
+        let ctx = CompleteCtx {
+            cwd: d.to_str().unwrap(),
+            history: &history,
+            path_bins: &[],
+        };
+
+        let ms = complete("s", &ctx, CompletePosition::Argument);
+        assert!(ms.iter().all(|m| m.kind == MatchKind::Path));
+        assert_eq!(ms[0].label, "src.rs");
+    }
+
+    #[test]
+    fn command_position_still_includes_all_sources() {
+        // Regression: Command position should behave as before (all sources).
+        let d = scratch_dir("cmd_all");
+        fs::write(d.join("ab-file"), "").unwrap();
+        let history = vec!["ab-hist".to_string()];
+        let path_bins = vec!["ab-bin".to_string()];
+        let ctx = CompleteCtx {
+            cwd: d.to_str().unwrap(),
+            history: &history,
+            path_bins: &path_bins,
+        };
+
+        let ms = complete("ab", &ctx, CompletePosition::Command);
+        let kinds: Vec<MatchKind> = ms.iter().map(|m| m.kind).collect();
+        assert!(kinds.contains(&MatchKind::History));
+        assert!(kinds.contains(&MatchKind::Path));
+        assert!(kinds.contains(&MatchKind::Command));
     }
 }

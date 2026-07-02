@@ -366,6 +366,27 @@ fragment float4 text_fragment(
         self.scale
     }
 
+    /// How many block-view content rows (at `pitch = ch * 1.1`) fit in the
+    /// block region — the area above the prompt input box (editor mode) or the
+    /// full viewport (command-executing mode). The scroll handler clamps
+    /// `block_scroll_offset` to `total - visible`, so this must match the
+    /// renderer's actual capacity to avoid blank space when scrolling.
+    pub fn block_visible_rows(&self, prompt_lines: usize) -> usize {
+        let ch = self.cell_height() as f32;
+        let vp_h = self.viewport.1;
+        let pad_y = self.padding_y;
+        let pitch = ch * 1.1;
+        if ch <= 0.0 || vp_h <= 0.0 || pitch <= 0.0 {
+            return 1;
+        }
+        // Editor mode: block region is vp_h - pad_y - box_h, where box_h
+        // accounts for the prompt input box + its padding.
+        let box_h = ch * (prompt_lines.max(1) as f32 + 2.0);
+        let region_bottom = (vp_h - pad_y - box_h).max(0.0);
+        let region_h = (region_bottom - pad_y).max(0.0);
+        ((region_h / pitch).floor() as usize).max(1)
+    }
+
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
     /// live config reload when font family/size/line-height changes. Returns
     /// the new cell dimensions so the caller can recompute grid rows/cols and
@@ -1330,7 +1351,7 @@ fragment float4 text_fragment(
                 // Dynamic width from the longest visible label.
                 let max_label_cols = matches[start..end]
                     .iter()
-                    .map(|m| m.label.chars().count())
+                    .map(|m| Self::text_col_width(&m.label))
                     .max()
                     .unwrap_or(10);
                 let suffix_cols = 10usize;
@@ -1345,7 +1366,12 @@ fragment float4 text_fragment(
                 let pad = cw * 0.5;
                 let icon_w = 2.0 * cw;
                 let label_x = popup_x0 + pad + icon_w;
-                let label_cols = max_label_cols; // max display width for labels
+                // Derive label_cols from the CLAMPED popup width so labels
+                // truncate instead of overflowing the right border. Budget:
+                // border(1) + icon(2) + label + gap(2) + suffix(10) + border(1).
+                let label_cols = popup_cols
+                    .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
+                    .max(5);
 
                 let popup_h = shown as f32 * ch + ch * 0.3;
                 let popup_top = popup_bottom - popup_h;
@@ -1415,9 +1441,9 @@ fragment float4 text_fragment(
                     );
                     // Suffix follows the label with a fixed 2-space gap (per-row,
                     // not column-aligned). Position = label_x + label_width + gap.
-                    let label_char_count = matches[i].label.chars().count();
+                    let label_col_w = Self::text_col_width(&matches[i].label);
                     let suffix_x_row =
-                        label_x + (label_char_count.min(label_cols) + gap_cols) as f32 * cw;
+                        label_x + (label_col_w.min(label_cols) + gap_cols) as f32 * cw;
                     self.push_text(
                         &mut verts,
                         suffix_x_row,
@@ -1463,21 +1489,20 @@ fragment float4 text_fragment(
 
         let pad_x = self.padding_x;
         let pad_y = self.padding_y;
-        let left = pad_x; // flush to the content padding (Warp starts at the edge)
+        let left = pad_x;
         let right = vp_w - pad_x;
         let cols = (((right - left) / cw).max(1.0)) as usize;
-        // Slightly looser line pitch than the raw cell height for readability.
         let pitch = ch * 1.1;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // Vivid prompt color so ❯ reads as a distinct marker, not body text.
         let prompt_c = [0.42, 0.85, 1.0, 1.0];
         let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
         let separator = [0.65, 0.65, 0.65, 0.22];
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
+        // Background fill for the block region.
         push_quad(
             &mut verts,
             [0.0, 0.0, vp_w, region_bottom_y.max(0.0)],
@@ -1486,92 +1511,80 @@ fragment float4 text_fragment(
             theme_bg,
         );
 
-        let mut y = region_bottom_y - pitch;
-        // Lines to skip from the bottom up — implements scrollback in the
-        // block view. When the user scrolls up (`grid.scroll_offset > 0`),
-        // the newest block rows slide off the bottom and older rows appear
-        // from the top. We consume `skip` rows of the bottom-most content
-        // without drawing them before rendering begins.
-        let mut skip = block_scroll;
+        // ── Phase 1: Pre-layout all rows (bottom-to-top order) ───────────
+        //
+        // Instead of the old skip-and-render approach (which left blank space
+        // when scrolling), we flatten every content row into a list, then
+        // apply a pixel scroll offset and render only visible rows. This
+        // guarantees the viewport is always filled — scrolling slides the
+        // entire content block up/down as a unit (matching Warp's behavior).
+        //
+        // Each entry is (distance_from_bottom, row_data). Rows are ordered
+        // bottom-first (index 0 = closest to the input box).
 
-        // Live (in-flight) block at the bottom during CommandExecuting.
-        if let Some(live) = live {
-            for line in live.output.lines().rev() {
-                if y < pad_y {
-                    break;
-                }
-                let vis_rows = wrapped_row_count(line, cols);
-                if skip >= vis_rows {
-                    skip -= vis_rows;
-                    continue;
-                }
-                let rows_to_skip = skip;
-                skip = 0;
-                // Collect wrapped chunks, then render bottom-up (last chunk at
-                // the lowest y). Since we build the layout upward, the LAST
-                // visual row of a wrapped line must be placed at the current
-                // `y` and earlier rows above it.
-                let chunks: Vec<String> = wrap_line_chunks(line, cols).skip(rows_to_skip).collect();
-                for chunk in chunks.iter().rev() {
-                    if y < pad_y {
-                        break;
-                    }
-                    self.push_text(&mut verts, left, y, chunk, fg, cols);
-                    y -= pitch;
-                }
-            }
-            if skip == 0 && y >= pad_y {
-                self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
-                let cmd_x = left + 2.0 * cw;
-                let avail = cols.saturating_sub(2).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, y, live.command, fg, avail);
-                y -= pitch;
-            } else if skip > 0 {
-                skip = skip.saturating_sub(1);
-            }
-            // gap + separator (not subject to skip — it's structural).
-            y -= pitch;
-            if skip == 0 && y >= pad_y {
-                let ly = y + pitch * 0.5;
-                push_quad(
-                    &mut verts,
-                    [left, ly, right, ly + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-            }
-        } else if let Some(cwd) = cwd {
-            // Editor: divider ABOVE the cwd line (cwd grouped with the input
-            // box, not the history), then the cwd text below the divider.
-            if skip == 0 && y >= pad_y {
-                push_quad(
-                    &mut verts,
-                    [left, y, right, y + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-                let display = abbreviate_path(cwd);
-                let display = if let Some(b) = git_branch {
-                    format!("{display} git:({b})")
-                } else {
-                    display
-                };
-                if !display.is_empty() {
-                    self.push_text(&mut verts, left, y, &display, dim, cols);
-                }
-            }
-            y = region_bottom_y - 2.0 * pitch;
+        enum LaidRow<'a> {
+            /// Plain output text line.
+            Output(&'a str),
+            /// Command line: `[chevron] ❯ command`. `foldable` controls the
+            /// chevron; `block_id` tags the click-toggle hit region.
+            Command {
+                command: &'a str,
+                collapsed: bool,
+                foldable: bool,
+                block_id: BlockId,
+            },
+            /// Header line: `cwd (duration)`.
+            Header { text: String },
+            /// Separator rule (thin horizontal line between blocks).
+            Separator,
+            /// Live command (CommandExecuting mode): `❯ command`.
+            LiveCommand { command: &'a str },
+            /// CWD header (Editor mode): `~/path git:(branch)`.
+            CwdHeader { text: String },
         }
 
-        // Completed blocks, newest-first upward.
-        for b in blocks.iter().rev() {
-            if y < pad_y {
-                break;
+        let mut rows: Vec<f32> = Vec::new(); // y-distance from bottom
+        let mut row_data: Vec<LaidRow> = Vec::new();
+        let mut cursor_dist = 0.0; // accumulates upward from region_bottom_y
+
+        // Bottom: live block (CommandExecuting) or cwd header (Editor).
+        if let Some(live) = live {
+            // Output lines of the in-flight command.
+            for line in live.output.lines().rev() {
+                let vis_rows = wrapped_row_count(line, cols);
+                cursor_dist += vis_rows as f32 * pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Output(line));
             }
+            // Command line.
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::LiveCommand {
+                command: live.command,
+            });
+            // Separator.
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Separator);
+        } else if let Some(cwd) = cwd {
+            // Editor mode: cwd header + divider sit in the bottom area.
+            // These are NOT scrollable — they're fixed at the bottom (grouped
+            // with the input box). Reserve 2 rows of space.
+            cursor_dist = 2.0 * pitch;
+            let display = abbreviate_path(cwd);
+            let display = if let Some(b) = git_branch {
+                format!("{display} git:({b})")
+            } else {
+                display
+            };
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::CwdHeader { text: display });
+        }
+
+        // Completed blocks, newest-first.
+        for b in blocks.iter().rev() {
             let foldable = b.output.lines().any(|l| !l.trim().is_empty());
-            // Output lines (hidden when collapsed). Drop a trailing bare prompt.
+            // Output lines (hidden when collapsed). Drop trailing bare prompts.
             if !b.collapsed {
                 let mut out_lines: Vec<&str> = b.output.lines().collect();
                 while out_lines
@@ -1580,42 +1593,99 @@ fragment float4 text_fragment(
                 {
                     out_lines.pop();
                 }
-                // Render newest→oldest upward. Each logical line may wrap into
-                // several visual rows at the current column width. We render
-                // bottom-up: the LAST visual row of a wrapped line goes at the
-                // current `y`, earlier rows stack above it.
                 for line in out_lines.iter().rev() {
-                    if y < pad_y {
-                        break;
-                    }
                     let vis_rows = wrapped_row_count(line, cols);
-                    if skip >= vis_rows {
-                        skip -= vis_rows;
-                        continue;
-                    }
-                    let rows_to_skip = skip;
-                    skip = 0;
-                    // Collect wrapped chunks (top→bottom order), then render
-                    // bottom-up so continuation rows land BELOW the first row.
-                    let chunks: Vec<String> =
-                        wrap_line_chunks(line, cols).skip(rows_to_skip).collect();
-                    for chunk in chunks.iter().rev() {
-                        if y < pad_y {
-                            break;
-                        }
-                        self.push_text(&mut verts, left, y, chunk, fg, cols);
-                        y -= pitch;
-                    }
+                    cursor_dist += vis_rows as f32 * pitch;
+                    rows.push(cursor_dist);
+                    row_data.push(LaidRow::Output(line));
                 }
             }
-            // Command line: [chevron] ❯ command. The chevron (▸/▾) marks a
-            // foldable block; its row is the click-toggle hit target.
-            if y >= pad_y {
-                if skip > 0 {
-                    skip = skip.saturating_sub(1);
-                } else {
-                    let (chev_w, avail_sub) = if foldable {
-                        let chev = if b.collapsed { "▸" } else { "▾" };
+            // Command line.
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Command {
+                command: &b.command,
+                collapsed: b.collapsed,
+                foldable,
+                block_id: b.id,
+            });
+            // Header line.
+            let dur = block_duration_str(b);
+            let bcwd = b
+                .cwd
+                .as_deref()
+                .map(abbreviate_path)
+                .unwrap_or_else(|| "~".to_string());
+            let header = if dur.is_empty() {
+                bcwd
+            } else {
+                format!("{bcwd} ({dur})")
+            };
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Header { text: header });
+            // Separator + gap.
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Separator);
+        }
+
+        // ── Phase 2: Render with scroll offset ───────────────────────────
+        //
+        // scroll_px shifts content DOWNWARD (toward the bottom edge). At
+        // scroll=0 the bottom-most row sits at region_bottom_y - pitch. As
+        // scroll increases, older content slides into view from the top.
+
+        let scroll_px = (block_scroll as f32) * pitch;
+        let clip_top = pad_y;
+        let clip_bottom = region_bottom_y;
+
+        for (i, &dist) in rows.iter().enumerate() {
+            // `dist` is the distance from region_bottom_y to the TOP of this
+            // row's line. The row occupies [region_bottom_y - dist,
+            // region_bottom_y - dist + pitch]. With scroll, everything moves
+            // down by scroll_px.
+            let row_top_y = region_bottom_y - dist + scroll_px;
+            let row_bottom_y = row_top_y + pitch;
+
+            // Clipping: skip rows entirely outside the viewport.
+            if row_bottom_y < clip_top || row_top_y > clip_bottom {
+                continue;
+            }
+
+            // The baseline for text drawing is `row_top_y` (we push_text at
+            // the top edge of the cell, same convention as before).
+            let y = row_top_y;
+
+            match &row_data[i] {
+                LaidRow::Output(text) => {
+                    // Render wrapped chunks bottom-up within this row slot.
+                    let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
+                    // For a single-row line, draw at `y`. For multi-row, the
+                    // pre-layout already accounted for vis_rows*pitch, so this
+                    // row_top is the top of the entire wrapped block. We need
+                    // to draw each chunk at the correct sub-position.
+                    if chunks.len() <= 1 {
+                        self.push_text(&mut verts, left, y, text, fg, cols);
+                    } else {
+                        // Multi-line wrapped output: this dist covers the whole
+                        // block. Each chunk is one pitch apart, drawn top-down.
+                        for (ci, chunk) in chunks.iter().enumerate() {
+                            let cy = y + ci as f32 * pitch;
+                            if cy + ch > clip_top && cy < clip_bottom {
+                                self.push_text(&mut verts, left, cy, chunk, fg, cols);
+                            }
+                        }
+                    }
+                }
+                LaidRow::Command {
+                    command,
+                    collapsed,
+                    foldable,
+                    block_id,
+                } => {
+                    let (chev_w, avail_sub) = if *foldable {
+                        let chev = if *collapsed { "▸" } else { "▾" };
                         self.push_text(&mut verts, left, y, chev, prompt_c, cols);
                         (cw, 3)
                     } else {
@@ -1624,45 +1694,48 @@ fragment float4 text_fragment(
                     self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
                     let cmd_x = left + chev_w + 2.0 * cw;
                     let avail = cols.saturating_sub(avail_sub).max(1);
-                    self.push_line_tokenized(&mut verts, cmd_x, y, &b.command, fg, avail);
-                    if foldable {
-                        hit_regions.push((b.id, y, y + pitch));
+                    self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
+                    if *foldable {
+                        hit_regions.push((*block_id, y, y + pitch));
                     }
-                    y -= pitch;
                 }
-            }
-            // Header line (always shown — collapsed blocks still need their
-            // cwd/duration label so the user knows what command ran where).
-            if y >= pad_y {
-                if skip > 0 {
-                    skip = skip.saturating_sub(1);
-                } else {
-                    let dur = block_duration_str(b);
-                    let bcwd = b
-                        .cwd
-                        .as_deref()
-                        .map(abbreviate_path)
-                        .unwrap_or_else(|| "~".to_string());
-                    let header = if dur.is_empty() {
-                        bcwd
-                    } else {
-                        format!("{bcwd} ({dur})")
-                    };
-                    self.push_text(&mut verts, left, y, &header, dim, cols);
-                    y -= pitch;
+                LaidRow::Header { text } => {
+                    self.push_text(&mut verts, left, y, text, dim, cols);
                 }
-            }
-            // Separator rule + gap before the older block above.
-            y -= pitch;
-            if skip == 0 && y >= pad_y {
-                let ly = y + pitch * 0.5;
-                push_quad(
-                    &mut verts,
-                    [left, ly, right, ly + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
+                LaidRow::Separator => {
+                    let ly = y + pitch * 0.5;
+                    push_quad(
+                        &mut verts,
+                        [left, ly, right, ly + 1.5],
+                        bg_uv,
+                        [0.0; 4],
+                        separator,
+                    );
+                }
+                LaidRow::LiveCommand { command } => {
+                    self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
+                    let cmd_x = left + 2.0 * cw;
+                    let avail = cols.saturating_sub(2).max(1);
+                    self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
+                }
+                LaidRow::CwdHeader { text } => {
+                    // Editor-mode CWD: drawn at a fixed position near the
+                    // bottom (grouped with input box), not subject to scroll.
+                    // Only render if within clip range.
+                    let fixed_y = region_bottom_y - pitch;
+                    if fixed_y >= clip_top {
+                        push_quad(
+                            &mut verts,
+                            [left, fixed_y, right, fixed_y + 1.5],
+                            bg_uv,
+                            [0.0; 4],
+                            separator,
+                        );
+                        if !text.is_empty() {
+                            self.push_text(&mut verts, left, fixed_y, text, dim, cols);
+                        }
+                    }
+                }
             }
         }
 
@@ -1673,6 +1746,16 @@ fragment float4 text_fragment(
     /// 1 for ASCII/narrow, 2 for CJK full-width).
     fn char_col_width(c: char) -> usize {
         unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+
+    /// Total column width of a string — sum of each char's display width.
+    /// Use this instead of `chars().count()` whenever a width/position
+    /// calculation must match what `push_text` actually renders (CJK chars
+    /// occupy 2 columns each, not 1).
+    fn text_col_width(s: &str) -> usize {
+        s.chars()
+            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum()
     }
 
     /// Lay out a string left-to-right, honoring wide-character (CJK) widths.
