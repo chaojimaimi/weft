@@ -1589,20 +1589,38 @@ fragment float4 text_fragment(
             push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
         }
 
-        // Search query row.
+        // Banner / query row. When a sub-mode banner is active, show it
+        // instead of the normal search prompt.
         let query_y = popup_top + ch * 0.5;
-        let query_label = "> ";
-        self.push_text(
-            &mut verts,
-            popup_x0 + cw * 0.5,
-            query_y,
-            query_label,
-            prompt_c,
-            cols,
-        );
-        let qx = popup_x0 + cw * 0.5 + query_label.chars().count() as f32 * cw;
-        let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
-        self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
+        if !p.banner.is_empty() {
+            // Sub-mode: show banner + input buffer.
+            self.push_text(
+                &mut verts,
+                popup_x0 + cw * 0.5,
+                query_y,
+                p.banner,
+                prompt_c,
+                cols,
+            );
+            let banner_cols = Self::text_col_width(p.banner);
+            let input_x = popup_x0 + cw * 0.5 + (banner_cols + 1) as f32 * cw;
+            let avail = (((popup_x1 - input_x) / cw).max(1.0)) as usize;
+            self.push_text(&mut verts, input_x, query_y, p.submode_input, fg, avail);
+        } else {
+            // Normal search mode.
+            let query_label = "> ";
+            self.push_text(
+                &mut verts,
+                popup_x0 + cw * 0.5,
+                query_y,
+                query_label,
+                prompt_c,
+                cols,
+            );
+            let qx = popup_x0 + cw * 0.5 + query_label.chars().count() as f32 * cw;
+            let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
+            self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
+        }
 
         // Separator below query.
         let sep_y = query_y + ch;

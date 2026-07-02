@@ -84,6 +84,11 @@ pub struct PaletteDrawParams<'a> {
     pub selection: usize,
     /// Variable-fill form (Some = form mode, None = search mode).
     pub form: Option<&'a PaletteFormView<'a>>,
+    /// Sub-mode banner text (e.g. "New workflow — name:", "Edit deploy:",
+    /// "Delete 'sync'? (y/n)"). Empty string = normal search mode.
+    pub banner: &'a str,
+    /// Input buffer content for sub-modes (create/edit).
+    pub submode_input: &'a str,
 }
 
 /// A palette entry, rendered in the dropdown.
@@ -263,6 +268,8 @@ pub fn build_overlay_stack<'a>(
     palette_query: &'a str,
     palette_selection: usize,
     palette_entries: &'a [(String, String, &'a str)],
+    palette_banner: &'a str,
+    palette_submode_input: &'a str,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -364,7 +371,9 @@ pub fn build_overlay_stack<'a>(
                 query: palette_query,
                 entries: entry_views_box,
                 selection: palette_selection,
-                form: None, // Form mode handled separately by main.rs
+                form: None,
+                banner: palette_banner,
+                submode_input: palette_submode_input,
             }),
         });
     }

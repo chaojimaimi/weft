@@ -86,6 +86,8 @@ struct App {
     config: Config,
     /// Resolved keybindings (key + modifiers → action).
     keybindings: KeyBindings,
+    /// Current theme state for ToggleTheme builtin command (true = dark).
+    theme_is_dark: bool,
     /// SQLite store for command blocks. `None` when the cache dir is
     /// unavailable or opening failed (persistence is best-effort).
     block_store: Option<BlockStore>,
@@ -109,6 +111,8 @@ struct App {
     palette_results: Vec<PaletteEntry>,
     /// Active variable-fill form for a selected workflow (None = search mode).
     palette_form: Option<WorkflowForm>,
+    /// Palette sub-mode (Search / CreateWorkflow / EditWorkflow / ConfirmDelete).
+    palette_submode: PaletteSubMode,
     /// SQLite workflow store. `None` when the cache dir is unavailable.
     workflow_store: Option<weft_core::workflow::WorkflowStore>,
 
@@ -157,6 +161,36 @@ struct WorkflowForm {
     current_field: usize,
 }
 
+/// Sub-modes of the palette beyond normal search.
+enum PaletteSubMode {
+    /// Normal search/filter mode.
+    Search,
+    /// Creating a new workflow: guided step-by-step entry.
+    CreateWorkflow {
+        step: CreateStep,
+        buffer: String,
+        // Partially built workflow fields:
+        name: String,
+        command: String,
+    },
+    /// Editing an existing workflow's command.
+    EditWorkflow {
+        id: i64,
+        name: String,
+        buffer: String,
+    },
+    /// Confirming deletion of a workflow.
+    ConfirmDelete { id: i64, name: String },
+}
+
+/// Steps in the create-workflow guided entry.
+#[derive(PartialEq, Eq)]
+enum CreateStep {
+    Name,
+    Command,
+    Done,
+}
+
 impl App {
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let config = Config::load();
@@ -189,6 +223,7 @@ impl App {
             proxy,
             config,
             keybindings,
+            theme_is_dark: true, // default to dark theme
             block_store: None,
             panel_open: false,
             panel_query: String::new(),
@@ -199,6 +234,7 @@ impl App {
             palette_selection: 0,
             palette_results: Vec::new(),
             palette_form: None,
+            palette_submode: PaletteSubMode::Search,
             workflow_store: None,
             block_scroll_offset: 0,
         }
@@ -535,6 +571,7 @@ impl App {
                     self.palette_query.clear();
                     self.palette_selection = 0;
                     self.palette_form = None;
+                    self.palette_submode = PaletteSubMode::Search;
                     self.refresh_palette_results();
                 }
                 self.request_redraw();
@@ -652,6 +689,20 @@ impl App {
             return self.handle_palette_form_key(key, mods, text);
         }
 
+        // Route to sub-mode handler if not in Search.
+        match &self.palette_submode {
+            PaletteSubMode::CreateWorkflow { .. } => {
+                return self.handle_palette_create_key(key, text);
+            }
+            PaletteSubMode::EditWorkflow { .. } => {
+                return self.handle_palette_edit_key(key, text);
+            }
+            PaletteSubMode::ConfirmDelete { .. } => {
+                return self.handle_palette_delete_key(key);
+            }
+            PaletteSubMode::Search => {}
+        }
+
         match key {
             KeyCode::Escape => {
                 self.palette_open = false;
@@ -679,24 +730,287 @@ impl App {
                 true
             }
             KeyCode::Backspace => {
-                self.palette_query.pop();
+                // If query is empty and we were typing '>', clear it.
+                if self.palette_query.is_empty() {
+                    self.palette_submode = PaletteSubMode::Search;
+                } else {
+                    self.palette_query.pop();
+                    self.palette_selection = 0;
+                    self.refresh_palette_results();
+                }
+                self.request_redraw();
+                true
+            }
+            _ => {
+                let c = resolve_text_char(text, '\0', false);
+                if c == '\0' || c.is_control() {
+                    return false;
+                }
+
+                // Check for action shortcuts when a workflow is selected and
+                // query is empty (single-char commands).
+                if self.palette_query.is_empty() {
+                    let action = match c {
+                        '>' => Some("create"),
+                        'e' | 'E' => Some("edit"),
+                        'd' | 'D' => Some("delete"),
+                        'x' | 'X' => Some("export"),
+                        _ => None,
+                    };
+                    if let Some(act) = action {
+                        return self.handle_palette_action(act);
+                    }
+                }
+
+                self.palette_query.push(c);
                 self.palette_selection = 0;
                 self.refresh_palette_results();
                 self.request_redraw();
                 true
             }
-            _ => {
-                // Append typed character to query.
-                let c = resolve_text_char(text, '\0', false);
-                if c != '\0' && !c.is_control() {
-                    self.palette_query.push(c);
-                    self.palette_selection = 0;
-                    self.refresh_palette_results();
+        }
+    }
+
+    /// Handle a single-key palette action (create/edit/delete/export).
+    fn handle_palette_action(&mut self, action: &str) -> bool {
+        match action {
+            "create" => {
+                self.palette_submode = PaletteSubMode::CreateWorkflow {
+                    step: CreateStep::Name,
+                    buffer: String::new(),
+                    name: String::new(),
+                    command: String::new(),
+                };
+                self.request_redraw();
+                true
+            }
+            "edit" => {
+                if let Some(PaletteEntry::Workflow(wf)) =
+                    self.palette_results.get(self.palette_selection).cloned()
+                {
+                    self.palette_submode = PaletteSubMode::EditWorkflow {
+                        id: wf.id,
+                        name: wf.name.clone(),
+                        buffer: wf
+                            .steps
+                            .first()
+                            .map(|s| s.command.clone())
+                            .unwrap_or_default(),
+                    };
                     self.request_redraw();
-                    return true;
+                    true
+                } else {
+                    false
                 }
+            }
+            "delete" => {
+                if let Some(PaletteEntry::Workflow(wf)) =
+                    self.palette_results.get(self.palette_selection).cloned()
+                {
+                    self.palette_submode = PaletteSubMode::ConfirmDelete {
+                        id: wf.id,
+                        name: wf.name.clone(),
+                    };
+                    self.request_redraw();
+                    true
+                } else {
+                    false
+                }
+            }
+            "export" => {
+                if let Some(store) = &self.workflow_store {
+                    if let Some(PaletteEntry::Workflow(wf)) =
+                        self.palette_results.get(self.palette_selection)
+                    {
+                        match store.export_yaml(wf.id) {
+                            Ok(yaml) => {
+                                info!(workflow = %wf.name, "workflow YAML exported to log");
+                                tracing::debug!(yaml = %yaml, "exported workflow YAML");
+                            }
+                            Err(e) => warn!(error = %e, "failed to export workflow YAML"),
+                        }
+                    }
+                }
+                // Export doesn't change mode — stay in search.
                 false
             }
+            _ => false,
+        }
+    }
+
+    /// Handle keys in CreateWorkflow sub-mode (guided step-by-step entry).
+    fn handle_palette_create_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
+        let PaletteSubMode::CreateWorkflow {
+            step,
+            buffer,
+            name,
+            command,
+        } = &mut self.palette_submode
+        else {
+            return false;
+        };
+
+        match key {
+            KeyCode::Escape => {
+                self.palette_submode = PaletteSubMode::Search;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                match step {
+                    CreateStep::Name => {
+                        if buffer.is_empty() {
+                            return true; // ignore empty name
+                        }
+                        *name = std::mem::take(buffer);
+                        *step = CreateStep::Command;
+                        self.request_redraw();
+                        true
+                    }
+                    CreateStep::Command => {
+                        if buffer.is_empty() {
+                            return true;
+                        }
+                        *command = std::mem::take(buffer);
+                        *step = CreateStep::Done;
+
+                        // Create the workflow in the store.
+                        let wf = weft_core::workflow::Workflow {
+                            id: 0,
+                            name: name.clone(),
+                            description: "User-created workflow".into(),
+                            steps: vec![weft_core::workflow::WorkflowStep {
+                                command: command.clone(),
+                            }],
+                            variables: vec![],
+                            source: weft_core::workflow::WorkflowSource::Manual,
+                            use_count: 0,
+                            last_used_ms: 0,
+                        };
+                        if let Some(store) = &self.workflow_store {
+                            if let Err(e) = store.insert(&wf) {
+                                warn!(error = %e, "failed to save new workflow");
+                            } else {
+                                info!(name = %wf.name, "workflow created");
+                            }
+                        }
+
+                        // Return to search mode and refresh.
+                        self.palette_submode = PaletteSubMode::Search;
+                        self.palette_query.clear();
+                        self.refresh_palette_results();
+                        self.request_redraw();
+                        true
+                    }
+                    CreateStep::Done => true,
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                self.request_redraw();
+                true
+            }
+            _ => {
+                let c = resolve_text_char(text, '\0', false);
+                if c != '\0' && !c.is_control() {
+                    buffer.push(c);
+                    self.request_redraw();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Handle keys in EditWorkflow sub-mode.
+    fn handle_palette_edit_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
+        let (id, name) = match &self.palette_submode {
+            PaletteSubMode::EditWorkflow { id, name, .. } => (*id, name.clone()),
+            _ => return false,
+        };
+
+        match key {
+            KeyCode::Escape => {
+                self.palette_submode = PaletteSubMode::Search;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                let new_command = match &self.palette_submode {
+                    PaletteSubMode::EditWorkflow { buffer, .. } => buffer.clone(),
+                    _ => return false,
+                };
+
+                // Update the workflow in the store.
+                if let Some(store) = &self.workflow_store {
+                    if let Some(mut wf) = store.find_by_name(&name).unwrap_or(None) {
+                        if let Some(step) = wf.steps.first_mut() {
+                            step.command = new_command.clone();
+                        }
+                        if let Err(e) = store.update(&wf) {
+                            warn!(error = %e, "failed to update workflow");
+                        } else {
+                            info!(name = %name, "workflow updated");
+                        }
+                    }
+                }
+                let _ = id; // id already used via find_by_name
+                self.palette_submode = PaletteSubMode::Search;
+                self.palette_query.clear();
+                self.refresh_palette_results();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Backspace => {
+                if let PaletteSubMode::EditWorkflow { buffer, .. } = &mut self.palette_submode {
+                    buffer.pop();
+                }
+                self.request_redraw();
+                true
+            }
+            _ => {
+                let c = resolve_text_char(text, '\0', false);
+                if c != '\0' && !c.is_control() {
+                    if let PaletteSubMode::EditWorkflow { buffer, .. } = &mut self.palette_submode {
+                        buffer.push(c);
+                    }
+                    self.request_redraw();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Handle keys in ConfirmDelete sub-mode.
+    fn handle_palette_delete_key(&mut self, key: KeyCode) -> bool {
+        match key {
+            KeyCode::Escape => {
+                self.palette_submode = PaletteSubMode::Search;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                let (id, name) = match &self.palette_submode {
+                    PaletteSubMode::ConfirmDelete { id, name } => (*id, name.clone()),
+                    _ => return false,
+                };
+                if let Some(store) = &self.workflow_store {
+                    if let Err(e) = store.delete(id) {
+                        warn!(error = %e, "failed to delete workflow");
+                    } else {
+                        info!(name = %name, "workflow deleted");
+                    }
+                }
+                self.palette_submode = PaletteSubMode::Search;
+                self.palette_query.clear();
+                self.refresh_palette_results();
+                self.request_redraw();
+                true
+            }
+            _ => true, // consume all other keys in confirm mode
         }
     }
 
@@ -779,8 +1093,7 @@ impl App {
             PaletteEntry::Builtin(cmd) => {
                 match cmd {
                     BuiltinCmd::ToggleTheme => {
-                        // Cycle theme: dark ↔ light (simple toggle for now).
-                        tracing::info!("palette: toggle theme (not yet implemented)");
+                        self.toggle_theme();
                     }
                     BuiltinCmd::ToggleBlockPanel => {
                         self.execute_action(Action::ToggleBlockPanel);
@@ -1280,6 +1593,21 @@ impl App {
         let config = Config::load();
         self.apply_config(config);
         info!("config reloaded");
+    }
+
+    /// Toggle between dark and light themes at runtime.
+    fn toggle_theme(&mut self) {
+        self.theme_is_dark = !self.theme_is_dark;
+        let theme = if self.theme_is_dark {
+            weft_core::config::Theme::weft_dark()
+        } else {
+            weft_core::config::Theme::weft_light()
+        };
+        if let Some(r) = &mut self.renderer {
+            r.set_theme(theme);
+        }
+        info!(dark = self.theme_is_dark, "theme toggled");
+        self.request_redraw();
     }
 
     /// Apply a (possibly new) config: theme, font, keybindings, scrollback.
@@ -2046,6 +2374,25 @@ impl ApplicationHandler<AppEvent> for App {
                         })
                         .collect();
 
+                    // Compute palette banner + submode input from the sub-mode state.
+                    let (palette_banner, palette_submode_input) = match &self.palette_submode {
+                        PaletteSubMode::Search => (String::new(), String::new()),
+                        PaletteSubMode::CreateWorkflow { step, buffer, .. } => {
+                            let label = match step {
+                                CreateStep::Name => "New workflow — name:",
+                                CreateStep::Command => "New workflow — command (use {{var}}):",
+                                CreateStep::Done => "Creating...",
+                            };
+                            (label.to_string(), buffer.clone())
+                        }
+                        PaletteSubMode::EditWorkflow { name, buffer, .. } => {
+                            (format!("Edit '{name}':"), buffer.clone())
+                        }
+                        PaletteSubMode::ConfirmDelete { name, .. } => {
+                            (format!("Delete '{name}'? (y/n)"), String::new())
+                        }
+                    };
+
                     let overlays = crate::overlay::build_overlay_stack(
                         terminal,
                         renderer.viewport_width(),
@@ -2059,6 +2406,8 @@ impl ApplicationHandler<AppEvent> for App {
                         &self.palette_query,
                         self.palette_selection,
                         &palette_entries,
+                        &palette_banner,
+                        &palette_submode_input,
                     );
                     renderer.draw(
                         terminal,
