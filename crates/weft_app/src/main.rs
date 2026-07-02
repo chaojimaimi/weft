@@ -4,6 +4,7 @@
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 
 mod glyph;
+mod overlay;
 mod renderer;
 
 use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
