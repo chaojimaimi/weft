@@ -96,9 +96,9 @@ pub struct MetalRenderer {
     /// instantly. The window's own transparency flag is set at startup, so
     /// crossing the 1.0 boundary needs a relaunch.
     opacity: f32,
-    /// Last-rendered block click regions: (id, y_top, y_bottom) in physical
-    /// pixels, for fold toggle on click. Repopulated each Editor-mode draw.
-    pub block_hit_regions: Vec<(BlockId, f32, f32)>,
+    /// Last-rendered hit-test regions (foldable blocks, completion rows, etc.)
+    /// in physical pixels, for click dispatch. Repopulated each draw.
+    pub hit_regions: Vec<crate::overlay::HitRegion>,
 }
 
 impl MetalRenderer {
@@ -291,7 +291,7 @@ fragment float4 text_fragment(
             padding_x,
             padding_y,
             opacity,
-            block_hit_regions: Vec::new(),
+            hit_regions: Vec::new(),
         }
     }
 
@@ -397,18 +397,13 @@ fragment float4 text_fragment(
         (self.atlas.cell_width, self.atlas.cell_height)
     }
 
-    /// Draw the terminal Grid (and optional history panel) to screen.
-    #[allow(clippy::too_many_arguments)]
+    /// Draw the terminal Grid (and optional overlays) to screen.
     pub fn draw(
         &mut self,
         terminal: &Terminal,
         selection: &SelectionHandler,
         cursor_blink_on: bool,
-        panel: Option<&PanelDrawParams>,
-        prompt: Option<&PromptDrawParams>,
-        // Completion popup candidates + selected index (split out from
-        // PromptDrawParams in overlay refactor commit 2).
-        completions: Option<(&[weft_core::complete::Match], usize)>,
+        overlays: &crate::overlay::OverlayStack<'_>,
         block_scroll: usize,
     ) {
         let drawable = match self.layer.next_drawable() {
@@ -418,6 +413,34 @@ fragment float4 text_fragment(
 
         let grid = terminal.grid();
         let cursor = &grid.cursor;
+
+        // Extract overlay params from the stack. We look up each kind once;
+        // at most one of each exists per frame.
+        use crate::overlay::{OverlayContent, OverlayKind};
+        let panel = overlays.layers.iter().find_map(|l| {
+            if l.kind == OverlayKind::HistoryPanel {
+                if let OverlayContent::HistoryPanel(p) = &l.content {
+                    return Some(p);
+                }
+            }
+            None
+        });
+        let prompt = overlays.layers.iter().find_map(|l| {
+            if l.kind == OverlayKind::Prompt {
+                if let OverlayContent::Prompt(p) = &l.content {
+                    return Some(p);
+                }
+            }
+            None
+        });
+        let completions = overlays.layers.iter().find_map(|l| {
+            if l.kind == OverlayKind::Completion {
+                if let OverlayContent::Completion(c) = &l.content {
+                    return Some((c.matches, c.selected));
+                }
+            }
+            None
+        });
 
         // Clear color from the theme background, scaled by window opacity so a
         // transparent window's uncovered area shows the desktop.
@@ -521,7 +544,7 @@ fragment float4 text_fragment(
         let vp_h = self.viewport.1;
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
-        let mut pending_hit_regions: Vec<(BlockId, f32, f32)> = Vec::new();
+        let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
         let mut vertices = if show_blocks {
             let (v, regions) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
@@ -625,7 +648,7 @@ fragment float4 text_fragment(
             encoder.end_encoding();
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
-            self.block_hit_regions = pending_hit_regions;
+            self.hit_regions = pending_hit_regions;
             return;
         }
 
@@ -672,7 +695,7 @@ fragment float4 text_fragment(
 
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
-        self.block_hit_regions = pending_hit_regions;
+        self.hit_regions = pending_hit_regions;
     }
 
     /// Build vertex buffer from the terminal Grid.
@@ -1502,9 +1525,9 @@ fragment float4 text_fragment(
         git_branch: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
         block_scroll: usize,
-    ) -> (Vec<f32>, Vec<(BlockId, f32, f32)>) {
+    ) -> (Vec<f32>, Vec<crate::overlay::HitRegion>) {
         let mut verts = Vec::new();
-        let mut hit_regions: Vec<(BlockId, f32, f32)> = Vec::new();
+        let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
@@ -1719,7 +1742,13 @@ fragment float4 text_fragment(
                     let avail = cols.saturating_sub(avail_sub).max(1);
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
                     if *foldable {
-                        hit_regions.push((*block_id, y, y + pitch));
+                        hit_regions.push(crate::overlay::HitRegion {
+                            x0: 0.0,
+                            y0: y,
+                            x1: self.viewport.0,
+                            y1: y + pitch,
+                            target: crate::overlay::HitTarget::BlockFold(*block_id),
+                        });
                     }
                 }
                 LaidRow::Header { text } => {

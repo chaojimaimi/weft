@@ -7,7 +7,7 @@ mod glyph;
 mod overlay;
 mod renderer;
 
-use renderer::{block_matches_query, MetalRenderer, PanelDrawParams, PromptDrawParams};
+use renderer::{block_matches_query, MetalRenderer};
 use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx, CompletePosition};
 use weft_core::config::{Action, Config, KeyBindings};
@@ -1118,11 +1118,15 @@ impl App {
     /// Which foldable block (if any) owns the physical-pixel y in the last
     /// rendered block view. `None` outside the block view or off every block.
     fn block_at(&self, y: f32) -> Option<BlockId> {
-        let regions = self.renderer.as_ref()?.block_hit_regions.as_slice();
+        use crate::overlay::HitTarget;
+        let regions = self.renderer.as_ref()?.hit_regions.as_slice();
         regions
             .iter()
-            .find(|(_, top, bottom)| y >= *top && y <= *bottom)
-            .map(|(id, _, _)| *id)
+            .find(|r| r.contains(0.0, y))
+            .and_then(|r| match &r.target {
+                HitTarget::BlockFold(id) => Some(*id),
+                _ => None,
+            })
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
@@ -1700,64 +1704,24 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
-                    let panel = if self.panel_open {
-                        let width_px =
-                            (renderer.viewport_width() * 0.38).min(460.0 * renderer.scale() as f32);
-                        Some(PanelDrawParams {
-                            blocks: terminal.block_tracker().blocks(),
-                            width_px,
-                            query: &self.panel_query,
-                            selection: self.panel_selection,
-                            expanded_id: self.panel_expanded,
-                        })
-                    } else {
-                        None
-                    };
-                    // Editor input box: built only in Editor mode (hidden in
-                    // passthrough). cwd/lines/search borrow `terminal`; the
-                    // preedit borrows `self.ime_preedit` (a disjoint field).
-                    let prompt =
-                        if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
-                            let search = terminal.editor().search_view();
-                            Some(PromptDrawParams {
-                                cwd: terminal.cwd(),
-                                lines: &terminal.editor().buffer.lines,
-                                cursor: terminal.editor().buffer.cursor,
-                                preedit: if self.ime_preedit.is_empty() {
-                                    None
-                                } else {
-                                    Some(self.ime_preedit.as_str())
-                                },
-                                search,
-                            })
-                        } else {
-                            None
-                        };
-                    // Completion popup: passed separately from prompt (overlay
-                    // refactor commit 2 — split out from PromptDrawParams).
-                    let completions =
-                        if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
-                            let c = terminal.editor().completion_view();
-                            // Only show if search is not active (completion and
-                            // Ctrl+R search are mutually exclusive).
-                            if terminal.editor().search_view().is_some() {
-                                None
-                            } else {
-                                c
-                            }
-                        } else {
-                            None
-                        };
-                    // Hide the grid (shell) cursor while the editor owns input:
-                    // a blinking caret at the shell prompt misreads as "type
-                    // here". The input-box cursor is drawn by build_prompt_vertices.
+                    // Build the overlay stack from terminal + App state fields.
+                    // This is a free function (not an App method) to keep borrows
+                    // disjoint from &mut self.renderer.
+                    let overlays = crate::overlay::build_overlay_stack(
+                        terminal,
+                        renderer.viewport_width(),
+                        renderer.scale(),
+                        self.panel_open,
+                        &self.panel_query,
+                        self.panel_selection,
+                        self.panel_expanded,
+                        &self.ime_preedit,
+                    );
                     renderer.draw(
                         terminal,
                         &self.selection_handler,
                         self.cursor_blink_on,
-                        panel.as_ref(),
-                        prompt.as_ref(),
-                        completions,
+                        &overlays,
                         self.block_scroll_offset,
                     );
                 }
