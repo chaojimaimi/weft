@@ -103,6 +103,8 @@ pub struct MetalRenderer {
     popup_width_scale: f32,
     /// User-adjustable popup max visible rows.
     popup_max_rows: usize,
+    /// Context menu position + target block (F7). Set per-frame by the app.
+    pub context_menu_target: Option<(f32, f32, weft_core::blocks::BlockId)>,
 }
 
 impl MetalRenderer {
@@ -298,6 +300,7 @@ fragment float4 text_fragment(
             hit_regions: Vec::new(),
             popup_width_scale: 0.6,
             popup_max_rows: 8,
+            context_menu_target: None,
         }
     }
 
@@ -657,6 +660,11 @@ fragment float4 text_fragment(
         // Command Palette overlay (v0.7) — centered floating window.
         if let Some(p) = palette {
             vertices.extend_from_slice(&self.build_palette_vertices(p));
+        }
+
+        // Context menu overlay (F7) — drawn at mouse position.
+        if let Some((x, y, _block_id)) = &self.context_menu_target {
+            vertices.extend_from_slice(&self.build_context_menu_vertices(*x, *y));
         }
 
         // Debug: log first row characters and verify vertex data
@@ -1780,6 +1788,88 @@ fragment float4 text_fragment(
         let hint_y = popup_bottom - ch * 0.8;
         let hint = "Enter 执行  Tab 下一项  Esc 返回";
         self.push_text(&mut verts, popup_x0 + cw * 0.5, hint_y, hint, dim, 40);
+
+        verts
+    }
+
+    /// Build the right-click context menu (F7) as a small popup at (x, y).
+    fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        let separator = [0.65, 0.65, 0.65, 0.22];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+
+        let items = ["Copy Command", "Copy Output", "Toggle Fold"];
+        let item_h = ch * 1.2;
+        let menu_w = 180.0 * (self.scale as f32);
+        let menu_h = items.len() as f32 * item_h + ch * 0.4;
+
+        // Clamp to viewport.
+        let menu_x0 = x.min(vp_w - menu_w - 4.0);
+        let menu_y0 = y;
+        let menu_x1 = menu_x0 + menu_w;
+        let menu_y1 = menu_y0 + menu_h;
+
+        let popup_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
+            1.0,
+        ];
+        let border_c = [0.5, 0.5, 0.5, 0.35];
+
+        // Background.
+        push_quad(
+            &mut verts,
+            [menu_x0, menu_y0, menu_x1, menu_y1],
+            bg_uv,
+            [0.0; 4],
+            popup_bg,
+        );
+        // Border.
+        for (bx0, by0, bx1, by1) in [
+            (menu_x0, menu_y0, menu_x1, menu_y0 + 1.0),
+            (menu_x0, menu_y1 - 1.0, menu_x1, menu_y1),
+            (menu_x0, menu_y0, menu_x0 + 1.0, menu_y1),
+            (menu_x1 - 1.0, menu_y0, menu_x1, menu_y1),
+        ] {
+            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        }
+
+        // Items.
+        for (i, label) in items.iter().enumerate() {
+            let item_y = menu_y0 + ch * 0.2 + i as f32 * item_h;
+            let color = if i == items.len() - 1 {
+                prompt_c // "Toggle Fold" in accent
+            } else {
+                fg
+            };
+            self.push_text(
+                &mut verts,
+                menu_x0 + cw * 0.4,
+                item_y,
+                label,
+                color,
+                (menu_w / cw * 0.9) as usize,
+            );
+            // Separator between items (except last).
+            if i + 1 < items.len() {
+                let sep_y = item_y + item_h;
+                push_quad(
+                    &mut verts,
+                    [menu_x0 + 2.0, sep_y, menu_x1 - 2.0, sep_y + 1.0],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
+            }
+        }
 
         verts
     }

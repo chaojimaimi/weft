@@ -109,6 +109,8 @@ struct App {
     popup_max_rows: usize,
     /// Active drag operation on a popup border (None = no drag).
     drag_state: Option<DragState>,
+    /// Right-click context menu (F7). None when closed.
+    context_menu: Option<ContextMenu>,
     /// Live search query typed into the palette.
     palette_query: String,
     /// Selected index in the palette results.
@@ -137,6 +139,25 @@ enum DragTarget {
     /// Top border — adjusts height (max rows).
     Top,
 }
+
+/// Right-click context menu on a block (F7).
+#[allow(dead_code)]
+struct ContextMenu {
+    /// Target block for the menu actions.
+    block_id: BlockId,
+    /// Menu popup position (physical pixels).
+    x: f32,
+    y: f32,
+    /// Selected menu item index.
+    selection: usize,
+}
+
+/// Context menu item labels.
+const CONTEXT_MENU_ITEMS: &[(&str, &str)] = &[
+    ("Copy Command", "copy_command"),
+    ("Copy Output", "copy_output"),
+    ("Toggle Fold", "toggle_fold"),
+];
 
 /// Active popup border drag state.
 #[derive(Clone)]
@@ -264,6 +285,7 @@ impl App {
             popup_width_scale: 0.6,
             popup_max_rows: 8,
             drag_state: None,
+            context_menu: None,
             palette_query: String::new(),
             palette_selection: 0,
             palette_results: Vec::new(),
@@ -1812,6 +1834,12 @@ impl App {
         // Editor-mode block view: clicking a foldable block's command line
         // toggles its collapse (instead of starting a grid selection).
         if button == winit::event::MouseButton::Left {
+            // If context menu is open, handle click as menu selection.
+            if let Some(menu) = self.context_menu.take() {
+                self.execute_context_menu(&menu, x as f32, y as f32);
+                return;
+            }
+
             if let Some(id) = self.block_at(y as f32) {
                 if let Some(t) = self.terminal.as_mut() {
                     t.block_tracker_mut().toggle_collapse(id);
@@ -1846,6 +1874,25 @@ impl App {
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }
             winit::event::MouseButton::Right => {
+                // If context menu is open, right-click closes it.
+                if self.context_menu.is_some() {
+                    self.context_menu = None;
+                    self.request_redraw();
+                    return;
+                }
+
+                // Block view: open context menu on a block.
+                if let Some(id) = self.block_at(y as f32) {
+                    self.context_menu = Some(ContextMenu {
+                        block_id: id,
+                        x: x as f32,
+                        y: y as f32,
+                        selection: 0,
+                    });
+                    self.request_redraw();
+                    return;
+                }
+
                 if selecting {
                     // Right click: extend selection
                     if self.selection_handler.selection.is_none() {
@@ -1975,6 +2022,61 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Execute a context menu action based on click position.
+    fn execute_context_menu(&mut self, menu: &ContextMenu, click_x: f32, click_y: f32) {
+        let ch = self
+            .renderer
+            .as_ref()
+            .map(|r| r.cell_height() as f32)
+            .unwrap_or(16.0);
+        let item_h = ch * 1.2;
+
+        // Check if click is on a menu item.
+        for (i, (label, _action)) in CONTEXT_MENU_ITEMS.iter().enumerate() {
+            let item_y = menu.y + i as f32 * item_h;
+            let _ = label;
+            if click_y >= item_y && click_y < item_y + item_h && click_x >= menu.x {
+                // Execute the action.
+                let action = CONTEXT_MENU_ITEMS[i].1;
+                self.run_context_action(menu.block_id, action);
+                self.request_redraw();
+                return;
+            }
+        }
+        // Click outside menu items — just close (already taken).
+        self.request_redraw();
+    }
+
+    /// Run a context menu action on the target block.
+    fn run_context_action(&mut self, block_id: BlockId, action: &str) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+
+        match action {
+            "copy_command" | "copy_output" => {
+                let block = terminal
+                    .block_tracker()
+                    .session_blocks()
+                    .iter()
+                    .find(|b| b.id == block_id);
+                if let Some(b) = block {
+                    let text = if action == "copy_command" {
+                        &b.command
+                    } else {
+                        &b.output
+                    };
+                    clipboard_copy(text);
+                    info!(len = text.len(), "copied to clipboard");
+                }
+            }
+            "toggle_fold" => {
+                terminal.block_tracker_mut().toggle_collapse(block_id);
+            }
+            _ => {}
+        }
     }
 
     /// Handle scroll wheel.
@@ -2493,6 +2595,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
                     // Sync popup dimensions to renderer (user-adjustable via border drag).
                     renderer.set_popup_size(self.popup_width_scale, self.popup_max_rows);
+                    // Sync context menu target to renderer.
+                    renderer.context_menu_target =
+                        self.context_menu.as_ref().map(|m| (m.x, m.y, m.block_id));
 
                     // Build palette entries as (label, description, kind_label) tuples.
                     let palette_entries: Vec<(String, String, &str)> = self
