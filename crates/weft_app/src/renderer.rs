@@ -1511,80 +1511,93 @@ fragment float4 text_fragment(
             theme_bg,
         );
 
-        // ── Phase 1: Pre-layout all rows (bottom-to-top order) ───────────
+        // ── Fixed bottom area: CWD header (Editor mode) ──────────────────
         //
-        // Instead of the old skip-and-render approach (which left blank space
-        // when scrolling), we flatten every content row into a list, then
-        // apply a pixel scroll offset and render only visible rows. This
-        // guarantees the viewport is always filled — scrolling slides the
-        // entire content block up/down as a unit (matching Warp's behavior).
+        // In Editor mode the CWD line + divider is pinned to the bottom of
+        // the block region (directly above the input box). It NEVER scrolls —
+        // it's grouped with the input box, not with the scrollable history.
         //
-        // Each entry is (distance_from_bottom, row_data). Rows are ordered
-        // bottom-first (index 0 = closest to the input box).
+        // The scrollable content area starts ABOVE this fixed CWD line.
+        let content_bottom_y;
+        if let Some(cwd) = cwd {
+            if live.is_none() {
+                let fixed_y = region_bottom_y - pitch;
+                // Divider line.
+                push_quad(
+                    &mut verts,
+                    [left, fixed_y, right, fixed_y + 1.5],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
+                // CWD text (+ optional git branch).
+                let display = abbreviate_path(cwd);
+                let display = if let Some(b) = git_branch {
+                    format!("{display} git:({b})")
+                } else {
+                    display
+                };
+                if !display.is_empty() {
+                    self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
+                }
+                // Scrollable content starts above the CWD line.
+                content_bottom_y = region_bottom_y - 2.0 * pitch;
+            } else {
+                content_bottom_y = region_bottom_y;
+            }
+        } else {
+            content_bottom_y = region_bottom_y;
+        }
+
+        // ── Phase 1: Pre-layout scrollable content rows ──────────────────
+        //
+        // Flatten every history row into a list with its y-distance from
+        // `content_bottom_y`. Scrolling applies a pixel offset so the entire
+        // content slides as a unit (matching Warp). Only rows within the clip
+        // region are rendered — no blank space.
 
         enum LaidRow<'a> {
-            /// Plain output text line.
             Output(&'a str),
-            /// Command line: `[chevron] ❯ command`. `foldable` controls the
-            /// chevron; `block_id` tags the click-toggle hit region.
             Command {
                 command: &'a str,
                 collapsed: bool,
                 foldable: bool,
                 block_id: BlockId,
             },
-            /// Header line: `cwd (duration)`.
-            Header { text: String },
-            /// Separator rule (thin horizontal line between blocks).
+            Header {
+                text: String,
+            },
             Separator,
-            /// Live command (CommandExecuting mode): `❯ command`.
-            LiveCommand { command: &'a str },
-            /// CWD header (Editor mode): `~/path git:(branch)`.
-            CwdHeader { text: String },
+            LiveCommand {
+                command: &'a str,
+            },
         }
 
-        let mut rows: Vec<f32> = Vec::new(); // y-distance from bottom
+        let mut rows: Vec<f32> = Vec::new();
         let mut row_data: Vec<LaidRow> = Vec::new();
-        let mut cursor_dist = 0.0; // accumulates upward from region_bottom_y
+        let mut cursor_dist = 0.0;
 
-        // Bottom: live block (CommandExecuting) or cwd header (Editor).
+        // Bottom of scrollable content: live block (CommandExecuting) or
+        // nothing (Editor mode — CWD is already handled above).
         if let Some(live) = live {
-            // Output lines of the in-flight command.
             for line in live.output.lines().rev() {
                 let vis_rows = wrapped_row_count(line, cols);
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Output(line));
             }
-            // Command line.
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::LiveCommand {
                 command: live.command,
             });
-            // Separator.
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Separator);
-        } else if let Some(cwd) = cwd {
-            // Editor mode: cwd header + divider sit in the bottom area.
-            // These are NOT scrollable — they're fixed at the bottom (grouped
-            // with the input box). Reserve 2 rows of space.
-            cursor_dist = 2.0 * pitch;
-            let display = abbreviate_path(cwd);
-            let display = if let Some(b) = git_branch {
-                format!("{display} git:({b})")
-            } else {
-                display
-            };
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::CwdHeader { text: display });
         }
 
-        // Completed blocks, newest-first.
         for b in blocks.iter().rev() {
             let foldable = b.output.lines().any(|l| !l.trim().is_empty());
-            // Output lines (hidden when collapsed). Drop trailing bare prompts.
             if !b.collapsed {
                 let mut out_lines: Vec<&str> = b.output.lines().collect();
                 while out_lines
@@ -1600,7 +1613,6 @@ fragment float4 text_fragment(
                     row_data.push(LaidRow::Output(line));
                 }
             }
-            // Command line.
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Command {
@@ -1609,7 +1621,6 @@ fragment float4 text_fragment(
                 foldable,
                 block_id: b.id,
             });
-            // Header line.
             let dur = block_duration_str(b);
             let bcwd = b
                 .cwd
@@ -1624,52 +1635,38 @@ fragment float4 text_fragment(
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Header { text: header });
-            // Separator + gap.
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Separator);
         }
 
-        // ── Phase 2: Render with scroll offset ───────────────────────────
-        //
-        // scroll_px shifts content DOWNWARD (toward the bottom edge). At
-        // scroll=0 the bottom-most row sits at region_bottom_y - pitch. As
-        // scroll increases, older content slides into view from the top.
+        // ── Phase 2: Render scrollable content with offset ───────────────
 
         let scroll_px = (block_scroll as f32) * pitch;
         let clip_top = pad_y;
-        let clip_bottom = region_bottom_y;
+        let clip_bottom = content_bottom_y;
+
+        // Track the block whose content is at the top of the viewport (for
+        // the sticky header). We record the topmost visible block's command
+        // and cwd as we render.
+        let mut topmost_block_info: Option<(String, String)> = None;
 
         for (i, &dist) in rows.iter().enumerate() {
-            // `dist` is the distance from region_bottom_y to the TOP of this
-            // row's line. The row occupies [region_bottom_y - dist,
-            // region_bottom_y - dist + pitch]. With scroll, everything moves
-            // down by scroll_px.
-            let row_top_y = region_bottom_y - dist + scroll_px;
+            let row_top_y = content_bottom_y - dist + scroll_px;
             let row_bottom_y = row_top_y + pitch;
 
-            // Clipping: skip rows entirely outside the viewport.
             if row_bottom_y < clip_top || row_top_y > clip_bottom {
                 continue;
             }
 
-            // The baseline for text drawing is `row_top_y` (we push_text at
-            // the top edge of the cell, same convention as before).
             let y = row_top_y;
 
             match &row_data[i] {
                 LaidRow::Output(text) => {
-                    // Render wrapped chunks bottom-up within this row slot.
                     let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
-                    // For a single-row line, draw at `y`. For multi-row, the
-                    // pre-layout already accounted for vis_rows*pitch, so this
-                    // row_top is the top of the entire wrapped block. We need
-                    // to draw each chunk at the correct sub-position.
                     if chunks.len() <= 1 {
                         self.push_text(&mut verts, left, y, text, fg, cols);
                     } else {
-                        // Multi-line wrapped output: this dist covers the whole
-                        // block. Each chunk is one pitch apart, drawn top-down.
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             if cy + ch > clip_top && cy < clip_bottom {
@@ -1718,23 +1715,69 @@ fragment float4 text_fragment(
                     let avail = cols.saturating_sub(2).max(1);
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
                 }
-                LaidRow::CwdHeader { text } => {
-                    // Editor-mode CWD: drawn at a fixed position near the
-                    // bottom (grouped with input box), not subject to scroll.
-                    // Only render if within clip range.
-                    let fixed_y = region_bottom_y - pitch;
-                    if fixed_y >= clip_top {
-                        push_quad(
-                            &mut verts,
-                            [left, fixed_y, right, fixed_y + 1.5],
-                            bg_uv,
-                            [0.0; 4],
-                            separator,
-                        );
-                        if !text.is_empty() {
-                            self.push_text(&mut verts, left, fixed_y, text, dim, cols);
+            }
+
+            // Track the topmost visible block for the sticky header. We want
+            // the block whose content is closest to (but not below) the clip
+            // top. Since rows are ordered bottom-to-top, the LAST header/command
+            // row we see that's above clip_top wins.
+            if block_scroll > 0 && row_top_y <= clip_top + pitch {
+                if let LaidRow::Command { command, .. } = &row_data[i] {
+                    let cmd_str: &str = command;
+                    for b in blocks.iter().rev() {
+                        if b.command == cmd_str {
+                            topmost_block_info = Some((
+                                cmd_str.to_string(),
+                                b.cwd.as_deref().map(abbreviate_path).unwrap_or_default(),
+                            ));
+                            break;
                         }
                     }
+                }
+            }
+        }
+
+        // ── Sticky top header (when scrolled) ────────────────────────────
+        //
+        // Warp-style: when the block view is scrolled, the top of the viewport
+        // shows a sticky line with the command (and cwd) of the block whose
+        // output is currently at the top. This gives context about what output
+        // you're looking at without seeing the block's own header.
+        if block_scroll > 0 {
+            if let Some((cmd, block_cwd)) = &topmost_block_info {
+                let sticky_y = pad_y;
+                // Background bar (slightly different shade to distinguish).
+                let sticky_bg = [
+                    theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+                    theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+                    theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
+                    1.0,
+                ];
+                push_quad(
+                    &mut verts,
+                    [0.0, sticky_y, vp_w, sticky_y + pitch],
+                    bg_uv,
+                    [0.0; 4],
+                    sticky_bg,
+                );
+                // Bottom border for the sticky bar.
+                push_quad(
+                    &mut verts,
+                    [0.0, sticky_y + pitch, vp_w, sticky_y + pitch + 1.0],
+                    bg_uv,
+                    [0.0; 4],
+                    separator,
+                );
+                // Content: `❯ command  cwd` (command in prompt color, cwd in dim).
+                self.push_text(&mut verts, left, sticky_y, "❯ ", prompt_c, cols);
+                let cmd_x = left + 2.0 * cw;
+                let avail = cols.saturating_sub(2).max(1);
+                self.push_line_tokenized(&mut verts, cmd_x, sticky_y, cmd, fg, avail);
+                if !block_cwd.is_empty() {
+                    let cmd_cols = Self::text_col_width(cmd);
+                    let cwd_x = cmd_x + (cmd_cols + 2) as f32 * cw;
+                    let cwd_avail = cols.saturating_sub(2 + cmd_cols + 2).max(1);
+                    self.push_text(&mut verts, cwd_x, sticky_y, block_cwd, dim, cwd_avail);
                 }
             }
         }
