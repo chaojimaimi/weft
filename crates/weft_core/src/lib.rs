@@ -13,3 +13,4 @@ pub mod selection;
 pub mod shell;
 pub mod syntax;
 pub mod vt;
+pub mod workflow;
