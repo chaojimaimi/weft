@@ -103,6 +103,12 @@ struct App {
     // ── Command Palette (v0.7) ────────────────────────────────────────
     /// Whether the Cmd+P command palette overlay is shown.
     palette_open: bool,
+    /// Popup width scale (0.5–1.0 of viewport). User-adjustable via border drag.
+    popup_width_scale: f32,
+    /// Popup max visible rows. User-adjustable via border drag.
+    popup_max_rows: usize,
+    /// Active drag operation on a popup border (None = no drag).
+    drag_state: Option<DragState>,
     /// Live search query typed into the palette.
     palette_query: String,
     /// Selected index in the palette results.
@@ -121,6 +127,31 @@ struct App {
     /// clamped to grid scrollback — the wrong proxy for block content).
     /// This is what the mouse wheel / PgUp modifies in block view.
     block_scroll_offset: usize,
+}
+
+/// Which border is being dragged to resize a popup.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DragTarget {
+    /// Right border — adjusts width.
+    Right,
+    /// Top border — adjusts height (max rows).
+    Top,
+}
+
+/// Active popup border drag state.
+#[derive(Clone)]
+struct DragState {
+    target: DragTarget,
+    /// Starting mouse position for delta calculation.
+    start_x: f64,
+    start_y: f64,
+    /// Starting scale/rows for delta calculation.
+    start_scale: f32,
+    start_rows: usize,
+    /// Cell width at drag start (for delta→cols/rows conversion).
+    #[allow(dead_code)]
+    cell_w: f32,
+    cell_h: f32,
 }
 
 // ── Command Palette types ─────────────────────────────────────────────
@@ -230,6 +261,9 @@ impl App {
             panel_selection: 0,
             panel_expanded: None,
             palette_open: false,
+            popup_width_scale: 0.6,
+            popup_max_rows: 8,
+            drag_state: None,
             palette_query: String::new(),
             palette_selection: 0,
             palette_results: Vec::new(),
@@ -1767,6 +1801,14 @@ impl App {
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        // Check for popup border drag (completion or palette).
+        if button == winit::event::MouseButton::Left {
+            if let Some(drag) = self.check_popup_border_drag(x, y) {
+                self.drag_state = Some(drag);
+                return;
+            }
+        }
+
         // Editor-mode block view: clicking a foldable block's command line
         // toggles its collapse (instead of starting a grid selection).
         if button == winit::event::MouseButton::Left {
@@ -1821,8 +1863,14 @@ impl App {
     }
 
     /// Handle mouse release.
-    fn handle_mouse_release(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
-        let pos = self.pixel_to_grid(x, y);
+    fn handle_mouse_release(&mut self, _x: f64, _y: f64, button: winit::event::MouseButton) {
+        // End popup border drag if active.
+        if button == winit::event::MouseButton::Left && self.drag_state.is_some() {
+            self.drag_state = None;
+            return;
+        }
+
+        let pos = self.pixel_to_grid(_x, _y);
         self.selection_handler.end();
 
         let btn = match button {
@@ -1836,6 +1884,12 @@ impl App {
 
     /// Handle mouse movement.
     fn handle_mouse_move(&mut self, x: f64, y: f64) {
+        // Update popup drag if active (clone to avoid borrow conflict).
+        if let Some(drag) = self.drag_state.clone() {
+            self.update_popup_drag(x, y, &drag);
+            return;
+        }
+
         let pos = self.pixel_to_grid(x, y);
 
         if self.selection_handler.selecting {
@@ -1844,6 +1898,83 @@ impl App {
         }
 
         self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+    }
+
+    /// Check if a click (x, y) lands on a popup border drag handle.
+    /// Returns a DragState if so, enabling resize-drag.
+    fn check_popup_border_drag(&self, x: f64, y: f64) -> Option<DragState> {
+        let (cw, ch) = self
+            .renderer
+            .as_ref()
+            .map(|r| (r.cell_width() as f32, r.cell_height() as f32))
+            .unwrap_or((8.0, 16.0));
+        let vp_w = self
+            .renderer
+            .as_ref()
+            .map(|r| r.viewport_width())
+            .unwrap_or(800.0);
+        let hot_zone = 4.0; // px from the border
+
+        // Check if completion popup is active.
+        let popup_active = self.palette_open
+            || self
+                .terminal
+                .as_ref()
+                .map(|t| t.editor().is_completing())
+                .unwrap_or(false);
+
+        if !popup_active {
+            return None;
+        }
+
+        // Popup right border: popup_x1 ± hot_zone, y within popup range.
+        let popup_w = vp_w * self.popup_width_scale;
+        let popup_x1 = popup_w.min(vp_w - 8.0); // approximate right edge
+        let right_border = (x as f32 - popup_x1).abs() < hot_zone;
+        let top_border = y < (hot_zone + 4.0) as f64; // near top of viewport
+
+        let target = if right_border {
+            DragTarget::Right
+        } else if top_border {
+            DragTarget::Top
+        } else {
+            return None;
+        };
+
+        Some(DragState {
+            target,
+            start_x: x,
+            start_y: y,
+            start_scale: self.popup_width_scale,
+            start_rows: self.popup_max_rows,
+            cell_w: cw,
+            cell_h: ch,
+        })
+    }
+
+    /// Update popup dimensions during a border drag.
+    fn update_popup_drag(&mut self, x: f64, y: f64, drag: &DragState) {
+        match drag.target {
+            DragTarget::Right => {
+                // Width: delta-x adjusts the popup width scale.
+                let dx = (x - drag.start_x) as f32;
+                let vp_w = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.viewport_width())
+                    .unwrap_or(800.0);
+                let scale_delta = dx / vp_w;
+                self.popup_width_scale = (drag.start_scale + scale_delta).clamp(0.3, 0.95);
+            }
+            DragTarget::Top => {
+                // Height: delta-y (upward = more rows).
+                let dy = (drag.start_y - y) as f32;
+                let row_delta = (dy / drag.cell_h) as i32;
+                let new_rows = (drag.start_rows as i32 + row_delta).clamp(3, 20) as usize;
+                self.popup_max_rows = new_rows;
+            }
+        }
+        self.request_redraw();
     }
 
     /// Handle scroll wheel.
@@ -2360,6 +2491,9 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
+                    // Sync popup dimensions to renderer (user-adjustable via border drag).
+                    renderer.set_popup_size(self.popup_width_scale, self.popup_max_rows);
+
                     // Build palette entries as (label, description, kind_label) tuples.
                     let palette_entries: Vec<(String, String, &str)> = self
                         .palette_results

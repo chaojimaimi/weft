@@ -99,6 +99,10 @@ pub struct MetalRenderer {
     /// Last-rendered hit-test regions (foldable blocks, completion rows, etc.)
     /// in physical pixels, for click dispatch. Repopulated each draw.
     pub hit_regions: Vec<crate::overlay::HitRegion>,
+    /// User-adjustable popup width scale (0.3–0.95 of viewport width).
+    popup_width_scale: f32,
+    /// User-adjustable popup max visible rows.
+    popup_max_rows: usize,
 }
 
 impl MetalRenderer {
@@ -292,6 +296,8 @@ fragment float4 text_fragment(
             padding_y,
             opacity,
             hit_regions: Vec::new(),
+            popup_width_scale: 0.6,
+            popup_max_rows: 8,
         }
     }
 
@@ -300,6 +306,12 @@ fragment float4 text_fragment(
     /// the terminal palette, so no rebuild is needed).
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+    }
+
+    /// Set popup dimensions (from App drag state).
+    pub fn set_popup_size(&mut self, width_scale: f32, max_rows: usize) {
+        self.popup_width_scale = width_scale;
+        self.popup_max_rows = max_rows;
     }
 
     /// Content padding in physical pixels (logical config × scale).
@@ -1413,7 +1425,7 @@ fragment float4 text_fragment(
 
         let popup_bottom = anchor_y;
         let avail_rows = ((popup_bottom / ch).ceil() as usize).saturating_sub(1);
-        let max_rows = 8usize.min(avail_rows.max(1));
+        let max_rows = self.popup_max_rows.min(avail_rows.max(1));
         let start = selected.saturating_sub(max_rows - 1);
         let end = (start + max_rows).min(matches.len());
         let shown = end - start;
@@ -1427,8 +1439,8 @@ fragment float4 text_fragment(
         let suffix_cols = 10usize;
         let gap_cols = 2usize;
         let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
-        let vp_cols = (vp_w / cw) as usize;
-        let popup_cols = popup_cols.clamp(25, vp_cols * 3 / 5);
+        let popup_max_cols = ((vp_w * self.popup_width_scale) / cw) as usize;
+        let popup_cols = popup_cols.clamp(25, popup_max_cols.max(25));
         let popup_w = popup_cols as f32 * cw;
         let popup_x0 = box_x0;
         let popup_x1 = (popup_x0 + popup_w).min(vp_w - self.padding_x);
@@ -1556,7 +1568,7 @@ fragment float4 text_fragment(
         let cols = (((right - left) / cw).max(1.0)) as usize;
 
         // Layout: centered window in the upper portion of the viewport.
-        let popup_w = (vp_w * 0.6).clamp(400.0 * (self.scale as f32), 600.0 * (self.scale as f32));
+        let popup_w = vp_w * self.popup_width_scale;
         let popup_x0 = (vp_w - popup_w) / 2.0;
         let popup_x1 = popup_x0 + popup_w;
 
@@ -1566,7 +1578,7 @@ fragment float4 text_fragment(
         }
 
         // Search mode: query box + results list.
-        let max_results = 8usize.min(p.entries.len().max(1));
+        let max_results = self.popup_max_rows.min(p.entries.len().max(1));
         let shown = max_results.min(p.entries.len());
         let popup_h = (shown as f32 + 2.0) * ch + ch * 0.5; // +2 for header + padding
         let popup_top = vp_h * 0.15;
