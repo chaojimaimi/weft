@@ -174,6 +174,8 @@ pub enum Action {
     ScrollToBottom,
     #[serde(rename = "toggle_block_panel")]
     ToggleBlockPanel,
+    #[serde(rename = "toggle_command_palette")]
+    ToggleCommandPalette,
 }
 
 /// Resolved keybinding table: physical key + modifiers → action.
@@ -194,6 +196,7 @@ impl Default for KeyBindings {
             ("cmd+home", Action::ScrollToTop),
             ("cmd+end", Action::ScrollToBottom),
             ("cmd+shift+b", Action::ToggleBlockPanel),
+            ("cmd+p", Action::ToggleCommandPalette),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {

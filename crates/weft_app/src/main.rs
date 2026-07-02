@@ -97,11 +97,64 @@ struct App {
     panel_selection: usize,
     /// Id of the block whose output is expanded inline in the panel.
     panel_expanded: Option<BlockId>,
+
+    // ── Command Palette (v0.7) ────────────────────────────────────────
+    /// Whether the Cmd+P command palette overlay is shown.
+    palette_open: bool,
+    /// Live search query typed into the palette.
+    palette_query: String,
+    /// Selected index in the palette results.
+    palette_selection: usize,
+    /// Cached search results (workflows + builtin commands).
+    palette_results: Vec<PaletteEntry>,
+    /// Active variable-fill form for a selected workflow (None = search mode).
+    palette_form: Option<WorkflowForm>,
+    /// SQLite workflow store. `None` when the cache dir is unavailable.
+    workflow_store: Option<weft_core::workflow::WorkflowStore>,
+
     /// Block-view scroll offset (rows from the bottom). Independent of
     /// `grid.scroll_offset` (which is for the grid/alt-screen path and
     /// clamped to grid scrollback — the wrong proxy for block content).
     /// This is what the mouse wheel / PgUp modifies in block view.
     block_scroll_offset: usize,
+}
+
+// ── Command Palette types ─────────────────────────────────────────────
+
+/// A single entry in the palette results list.
+#[derive(Clone)]
+enum PaletteEntry {
+    Workflow(weft_core::workflow::Workflow),
+    Builtin(BuiltinCmd),
+}
+
+/// Built-in commands that appear in the palette.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BuiltinCmd {
+    ToggleTheme,
+    ToggleBlockPanel,
+    ReloadConfig,
+}
+
+impl BuiltinCmd {
+    fn label(&self) -> &'static str {
+        match self {
+            BuiltinCmd::ToggleTheme => "Toggle Theme",
+            BuiltinCmd::ToggleBlockPanel => "Toggle History Panel",
+            BuiltinCmd::ReloadConfig => "Reload Config",
+        }
+    }
+}
+
+/// Active variable-fill form for a selected workflow.
+#[allow(dead_code)]
+struct WorkflowForm {
+    workflow_id: i64,
+    workflow_name: String,
+    workflow_description: String,
+    var_names: Vec<String>,
+    var_values: Vec<String>,
+    current_field: usize,
 }
 
 impl App {
@@ -141,6 +194,12 @@ impl App {
             panel_query: String::new(),
             panel_selection: 0,
             panel_expanded: None,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selection: 0,
+            palette_results: Vec::new(),
+            palette_form: None,
+            workflow_store: None,
             block_scroll_offset: 0,
         }
     }
@@ -369,6 +428,11 @@ impl App {
             }
         }
 
+        // Command Palette (highest overlay priority — captures all keys when open).
+        if self.palette_open && self.handle_palette_key(key, m, text) {
+            return;
+        }
+
         // When the history panel is open, navigation/typing/search go to it
         // (not the shell). Modifier chords (cmd/ctrl/alt) still fall through so
         // keybindings like cmd+shift+b (toggle) keep working.
@@ -465,6 +529,17 @@ impl App {
                 self.request_redraw();
                 true
             }
+            Action::ToggleCommandPalette => {
+                self.palette_open = !self.palette_open;
+                if self.palette_open {
+                    self.palette_query.clear();
+                    self.palette_selection = 0;
+                    self.palette_form = None;
+                    self.refresh_palette_results();
+                }
+                self.request_redraw();
+                true
+            }
         }
     }
 
@@ -523,7 +598,241 @@ impl App {
         }
     }
 
-    /// Handle a key while in Editor input mode (the input box owns the prompt).
+    // ── Command Palette (v0.7) ──────────────────────────────────────────
+
+    /// Refresh the palette search results from the workflow store + builtin commands.
+    fn refresh_palette_results(&mut self) {
+        let mut results = Vec::new();
+
+        // Workflows from the store.
+        if let Some(store) = &self.workflow_store {
+            let workflows = if self.palette_query.is_empty() {
+                store.list().unwrap_or_default()
+            } else {
+                store.search(&self.palette_query, 50).unwrap_or_default()
+            };
+            for wf in workflows {
+                results.push(PaletteEntry::Workflow(wf));
+            }
+        }
+
+        // Builtin commands (filtered by query if non-empty).
+        let builtins = [
+            BuiltinCmd::ToggleTheme,
+            BuiltinCmd::ToggleBlockPanel,
+            BuiltinCmd::ReloadConfig,
+        ];
+        for b in &builtins {
+            let label = b.label();
+            if self.palette_query.is_empty()
+                || label
+                    .to_lowercase()
+                    .contains(&self.palette_query.to_lowercase())
+            {
+                results.push(PaletteEntry::Builtin(*b));
+            }
+        }
+
+        self.palette_results = results;
+        // Clamp selection.
+        if self.palette_selection >= self.palette_results.len() {
+            self.palette_selection = 0;
+        }
+    }
+
+    /// Handle a key while the Command Palette is open. Returns true if consumed.
+    fn handle_palette_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
+        // Let modifier chords fall through (so cmd+p can toggle closed).
+        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
+            return false;
+        }
+
+        // If we're in form mode (filling workflow variables), route differently.
+        if self.palette_form.is_some() {
+            return self.handle_palette_form_key(key, mods, text);
+        }
+
+        match key {
+            KeyCode::Escape => {
+                self.palette_open = false;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Up => {
+                if self.palette_selection > 0 {
+                    self.palette_selection -= 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Down => {
+                if self.palette_selection + 1 < self.palette_results.len() {
+                    self.palette_selection += 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.palette_results.get(self.palette_selection).cloned() {
+                    self.activate_palette_entry(entry);
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                self.palette_query.pop();
+                self.palette_selection = 0;
+                self.refresh_palette_results();
+                self.request_redraw();
+                true
+            }
+            _ => {
+                // Append typed character to query.
+                let c = resolve_text_char(text, '\0', false);
+                if c != '\0' && !c.is_control() {
+                    self.palette_query.push(c);
+                    self.palette_selection = 0;
+                    self.refresh_palette_results();
+                    self.request_redraw();
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Handle keys while in the workflow variable form sub-mode.
+    fn handle_palette_form_key(
+        &mut self,
+        key: KeyCode,
+        _mods: Modifiers,
+        text: Option<&str>,
+    ) -> bool {
+        match key {
+            KeyCode::Escape => {
+                // Return to search mode (keep palette open).
+                self.palette_form = None;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Tab => {
+                if let Some(form) = &mut self.palette_form {
+                    if form.current_field + 1 < form.var_names.len() {
+                        form.current_field += 1;
+                    } else {
+                        form.current_field = 0; // wrap
+                    }
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                // Execute the workflow with the filled variables.
+                let form = self.palette_form.take();
+                if let Some(form) = form {
+                    self.execute_workflow(form);
+                }
+                self.palette_open = false;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Backspace => {
+                if let Some(form) = &mut self.palette_form {
+                    if form.current_field < form.var_values.len() {
+                        form.var_values[form.current_field].pop();
+                    }
+                }
+                self.request_redraw();
+                true
+            }
+            _ => {
+                let c = resolve_text_char(text, '\0', false);
+                if c != '\0' && !c.is_control() {
+                    if let Some(form) = &mut self.palette_form {
+                        if form.current_field < form.var_values.len() {
+                            form.var_values[form.current_field].push(c);
+                        }
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Activate a palette entry: workflow → enter form mode, builtin → execute.
+    fn activate_palette_entry(&mut self, entry: PaletteEntry) {
+        match entry {
+            PaletteEntry::Workflow(wf) => {
+                let var_names = wf.all_var_names();
+                let var_count = var_names.len();
+                self.palette_form = Some(WorkflowForm {
+                    workflow_id: wf.id,
+                    workflow_name: wf.name.clone(),
+                    workflow_description: wf.description.clone(),
+                    var_names,
+                    var_values: vec![String::new(); var_count],
+                    current_field: 0,
+                });
+                self.request_redraw();
+            }
+            PaletteEntry::Builtin(cmd) => {
+                match cmd {
+                    BuiltinCmd::ToggleTheme => {
+                        // Cycle theme: dark ↔ light (simple toggle for now).
+                        tracing::info!("palette: toggle theme (not yet implemented)");
+                    }
+                    BuiltinCmd::ToggleBlockPanel => {
+                        self.execute_action(Action::ToggleBlockPanel);
+                    }
+                    BuiltinCmd::ReloadConfig => {
+                        self.execute_action(Action::ReloadConfig);
+                    }
+                }
+                self.palette_open = false;
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Execute a workflow: render variables → submit commands to PTY.
+    fn execute_workflow(&mut self, form: WorkflowForm) {
+        let Some(store) = &self.workflow_store else {
+            return;
+        };
+        let wf = store.find_by_name(&form.workflow_name).ok().flatten();
+        let Some(wf) = wf else {
+            return;
+        };
+
+        // Build variable values map.
+        let mut values = std::collections::HashMap::new();
+        for (name, val) in form.var_names.iter().zip(form.var_values.iter()) {
+            values.insert(name.clone(), val.clone());
+        }
+
+        match wf.render(&values) {
+            Ok(commands) => {
+                for cmd in &commands {
+                    if let Some(terminal) = &mut self.terminal {
+                        // Set the command text and submit via the editor path.
+                        terminal.editor_mut().buffer.set_text(cmd);
+                        let bytes = terminal.submit_command();
+                        if !bytes.is_empty() {
+                            if let Some(pty) = &self.pty {
+                                let _ = pty.write_sync(&bytes);
+                            }
+                        }
+                    }
+                }
+                // Update use count.
+                let _ = store.bump_use_count(wf.id);
+            }
+            Err(e) => {
+                warn!(error = %e, "workflow render failed");
+            }
+        }
+    }
     /// Returns true if consumed. Ctrl chords that aren't editor ops fall through
     /// (returns false) so Ctrl+C etc. still reach the PTY.
     fn handle_editor_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
@@ -1583,6 +1892,25 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
 
+        // Open the workflow DB (best-effort) and seed built-in templates on
+        // first launch.
+        self.workflow_store = weft_cache_dir().and_then(|cache| {
+            let path = cache.join("workflows.db");
+            match weft_core::workflow::WorkflowStore::open(&path) {
+                Ok(store) => {
+                    // Seed built-in workflows on first launch (count == 0).
+                    if let Ok(0) = store.count() {
+                        seed_workflows(&store);
+                    }
+                    Some(store)
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to open workflow store; workflows disabled");
+                    None
+                }
+            }
+        });
+
         // Cursor-blink timer: wake the loop ~2x/sec so the caret toggles
         // without a vsync busy-loop. Exits when the event loop drops the proxy.
         let blink_proxy = self.proxy.clone();
@@ -1704,9 +2032,20 @@ impl ApplicationHandler<AppEvent> for App {
                 }
 
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
-                    // Build the overlay stack from terminal + App state fields.
-                    // This is a free function (not an App method) to keep borrows
-                    // disjoint from &mut self.renderer.
+                    // Build palette entries as (label, description, kind_label) tuples.
+                    let palette_entries: Vec<(String, String, &str)> = self
+                        .palette_results
+                        .iter()
+                        .map(|e| match e {
+                            PaletteEntry::Workflow(wf) => {
+                                (wf.name.clone(), wf.description.clone(), "Workflow")
+                            }
+                            PaletteEntry::Builtin(b) => {
+                                (b.label().to_string(), String::new(), "Builtin")
+                            }
+                        })
+                        .collect();
+
                     let overlays = crate::overlay::build_overlay_stack(
                         terminal,
                         renderer.viewport_width(),
@@ -1716,6 +2055,10 @@ impl ApplicationHandler<AppEvent> for App {
                         self.panel_selection,
                         self.panel_expanded,
                         &self.ime_preedit,
+                        self.palette_open,
+                        &self.palette_query,
+                        self.palette_selection,
+                        &palette_entries,
                     );
                     renderer.draw(
                         terminal,
@@ -1941,6 +2284,81 @@ fn is_command_position(line: &str, word_start: usize) -> bool {
         return true;
     }
     matches!(chars[i - 1], '|' | '&' | ';' | '>' | '<')
+}
+
+/// Insert built-in workflow templates on first launch (empty DB).
+/// Insert built-in workflow templates on first launch (empty DB).
+#[allow(clippy::type_complexity)]
+fn seed_workflows(store: &weft_core::workflow::WorkflowStore) {
+    use weft_core::workflow::{Workflow, WorkflowSource, WorkflowStep, WorkflowVar};
+
+    let seeds: &[(&str, &str, &[&str], &[(bool, &str, &str, bool)])] = &[
+        // name, description, commands, vars: (is_default, name, default, required)
+        (
+            "sync",
+            "git pull current branch",
+            &["git pull origin $(git branch --show-current)"],
+            &[],
+        ),
+        (
+            "dev",
+            "start dev server",
+            &["cd {{project}} && npm run dev"],
+            &[(true, "project", ".", true)],
+        ),
+        (
+            "logs",
+            "tail service logs",
+            &["tail -f {{file}}"],
+            &[(true, "file", "/var/log/system.log", true)],
+        ),
+        (
+            "gst",
+            "git status + recent log",
+            &["git status -sb", "git log --oneline -5"],
+            &[],
+        ),
+        (
+            "dclean",
+            "prune dangling docker resources",
+            &["docker system prune -f"],
+            &[],
+        ),
+    ];
+
+    for (name, desc, cmds, vars) in seeds {
+        let workflow = Workflow {
+            id: 0,
+            name: (*name).into(),
+            description: (*desc).into(),
+            steps: cmds
+                .iter()
+                .map(|c| WorkflowStep {
+                    command: (*c).into(),
+                })
+                .collect(),
+            variables: vars
+                .iter()
+                .map(|(has_default, vname, vdefault, vreq)| WorkflowVar {
+                    name: (*vname).into(),
+                    description: String::new(),
+                    default: if *has_default {
+                        Some((*vdefault).into())
+                    } else {
+                        None
+                    },
+                    required: *vreq,
+                })
+                .collect(),
+            source: WorkflowSource::Manual,
+            use_count: 0,
+            last_used_ms: 0,
+        };
+        if let Err(e) = store.insert(&workflow) {
+            warn!(error = %e, workflow = name, "failed to seed workflow");
+        }
+    }
+    info!("seeded {} built-in workflows", seeds.len());
 }
 
 /// Scan `$PATH` for executable names (files, not dirs). Best-effort: unreadable

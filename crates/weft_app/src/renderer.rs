@@ -441,6 +441,14 @@ fragment float4 text_fragment(
             }
             None
         });
+        let palette = overlays.layers.iter().find_map(|l| {
+            if l.kind == OverlayKind::CommandPalette {
+                if let OverlayContent::CommandPalette(p) = &l.content {
+                    return Some(p);
+                }
+            }
+            None
+        });
 
         // Clear color from the theme background, scaled by window opacity so a
         // transparent window's uncovered area shows the desktop.
@@ -632,6 +640,11 @@ fragment float4 text_fragment(
                     &self.build_completion_vertices(matches, selected, box_top_y, box_x0),
                 );
             }
+        }
+
+        // Command Palette overlay (v0.7) — centered floating window.
+        if let Some(p) = palette {
+            vertices.extend_from_slice(&self.build_palette_vertices(p));
         }
 
         // Debug: log first row characters and verify vertex data
@@ -1505,6 +1518,238 @@ fragment float4 text_fragment(
             );
             y -= ch;
         }
+
+        verts
+    }
+
+    /// Build the Command Palette as a centered floating window. Renders a
+    /// search box at the top, a scrollable results list, and an optional
+    /// variable-fill form when a workflow is selected.
+    fn build_palette_vertices(&self, p: &crate::overlay::PaletteDrawParams<'_>) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let vp_h = self.viewport.1;
+        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
+            return verts;
+        }
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+        let separator = [0.65, 0.65, 0.65, 0.22];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+        let border_c = [0.5, 0.5, 0.5, 0.35];
+        let popup_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+            1.0,
+        ];
+
+        let pad_x = self.padding_x;
+        let left = pad_x;
+        let right = vp_w - pad_x;
+        let cols = (((right - left) / cw).max(1.0)) as usize;
+
+        // Layout: centered window in the upper portion of the viewport.
+        let popup_w = (vp_w * 0.6).clamp(400.0 * (self.scale as f32), 600.0 * (self.scale as f32));
+        let popup_x0 = (vp_w - popup_w) / 2.0;
+        let popup_x1 = popup_x0 + popup_w;
+
+        // If we're in form mode, render the form instead of the search list.
+        if let Some(form) = p.form {
+            return self.build_palette_form_vertices(form, popup_x0, popup_x1, vp_h);
+        }
+
+        // Search mode: query box + results list.
+        let max_results = 8usize.min(p.entries.len().max(1));
+        let shown = max_results.min(p.entries.len());
+        let popup_h = (shown as f32 + 2.0) * ch + ch * 0.5; // +2 for header + padding
+        let popup_top = vp_h * 0.15;
+        let popup_bottom = popup_top + popup_h;
+
+        // Background + border.
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_top, popup_x1, popup_bottom],
+            bg_uv,
+            [0.0; 4],
+            popup_bg,
+        );
+        for (bx0, by0, bx1, by1) in [
+            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
+            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
+            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
+            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
+        ] {
+            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        }
+
+        // Search query row.
+        let query_y = popup_top + ch * 0.5;
+        let query_label = "> ";
+        self.push_text(
+            &mut verts,
+            popup_x0 + cw * 0.5,
+            query_y,
+            query_label,
+            prompt_c,
+            cols,
+        );
+        let qx = popup_x0 + cw * 0.5 + query_label.chars().count() as f32 * cw;
+        let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
+        self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
+
+        // Separator below query.
+        let sep_y = query_y + ch;
+        push_quad(
+            &mut verts,
+            [popup_x0, sep_y, popup_x1, sep_y + 1.0],
+            bg_uv,
+            [0.0; 4],
+            separator,
+        );
+
+        // Results rows.
+        let start = p.selection.saturating_sub(max_results.saturating_sub(1));
+        let end = (start + max_results).min(p.entries.len());
+        let mut y = sep_y + ch;
+        for i in start..end {
+            if y + ch > popup_bottom {
+                break;
+            }
+            let is_sel = i == p.selection;
+            if is_sel {
+                push_quad(
+                    &mut verts,
+                    [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
+                );
+            }
+            let entry = &p.entries[i];
+            let lcolor = if is_sel { fg } else { dim };
+            let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
+
+            // Label + description.
+            let label_x = popup_x0 + cw * 0.5;
+            let label_avail = (((popup_x1 - label_x) / cw) as usize)
+                .saturating_sub(12)
+                .max(1);
+            self.push_text(&mut verts, label_x, y, entry.label, lcolor, label_avail);
+
+            // Kind suffix (right-aligned area).
+            let suffix_x = popup_x1 - cw * 0.5 - 10.0 * cw;
+            self.push_text(&mut verts, suffix_x, y, entry.kind_label, suffix_color, 10);
+            y += ch;
+        }
+
+        verts
+    }
+
+    /// Render the palette's variable-fill form (sub-mode when a workflow is selected).
+    fn build_palette_form_vertices(
+        &self,
+        form: &crate::overlay::PaletteFormView<'_>,
+        popup_x0: f32,
+        popup_x1: f32,
+        vp_h: f32,
+    ) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+        let border_c = [0.5, 0.5, 0.5, 0.35];
+        let popup_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+            1.0,
+        ];
+
+        let n_fields = form.fields.len();
+        let popup_h = (n_fields as f32 + 3.0) * ch + ch * 0.5;
+        let popup_top = vp_h * 0.15;
+        let popup_bottom = popup_top + popup_h;
+
+        // Background + border.
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_top, popup_x1, popup_bottom],
+            bg_uv,
+            [0.0; 4],
+            popup_bg,
+        );
+        for (bx0, by0, bx1, by1) in [
+            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
+            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
+            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
+            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
+        ] {
+            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        }
+
+        // Title row.
+        let title_y = popup_top + ch * 0.5;
+        let title = format!("{} — 填写参数", form.workflow_name);
+        self.push_text(
+            &mut verts,
+            popup_x0 + cw * 0.5,
+            title_y,
+            &title,
+            prompt_c,
+            40,
+        );
+
+        // Separator.
+        let sep_y = title_y + ch;
+        push_quad(
+            &mut verts,
+            [popup_x0, sep_y, popup_x1, sep_y + 1.0],
+            bg_uv,
+            [0.0; 4],
+            [0.65, 0.65, 0.65, 0.22],
+        );
+
+        // Fields.
+        let mut y = sep_y + ch;
+        for (name, value, is_current) in form.fields.iter() {
+            let label_text = format!("{name}: ");
+            let color = if *is_current { fg } else { dim };
+            self.push_text(&mut verts, popup_x0 + cw * 0.5, y, &label_text, color, 20);
+
+            // Value bracket area.
+            let val_x = popup_x0 + cw * 0.5 + 12.0 * cw;
+            if *is_current {
+                // Highlight the current field's value area.
+                push_quad(
+                    &mut verts,
+                    [val_x, y, popup_x1 - cw * 0.5, y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.15],
+                );
+            }
+            let val_avail = (((popup_x1 - cw * 0.5 - val_x) / cw).max(1.0)) as usize;
+            self.push_text(&mut verts, val_x, y, value, color, val_avail);
+
+            y += ch;
+        }
+
+        // Footer hint.
+        let hint_y = popup_bottom - ch * 0.8;
+        let hint = "Enter 执行  Tab 下一项  Esc 返回";
+        self.push_text(&mut verts, popup_x0 + cw * 0.5, hint_y, hint, dim, 40);
 
         verts
     }

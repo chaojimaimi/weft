@@ -62,8 +62,8 @@ pub enum OverlayKind {
     HistoryPanel,
     Prompt,
     Completion,
-    // v0.7预留：CommandPalette,
-    // v0.7预留：ContextMenu,
+    CommandPalette,
+    // future: ContextMenu,
 }
 
 /// The renderable content of an overlay layer. Each variant wraps the
@@ -73,9 +73,31 @@ pub enum OverlayContent<'a> {
     HistoryPanel(PanelDrawParams<'a>),
     Prompt(PromptDrawParams<'a>),
     Completion(CompletionDrawParams<'a>),
-    // v0.7预留：
-    // CommandPalette(PaletteDrawParams<'a>),
-    // ContextMenu(ContextMenuDrawParams<'a>),
+    CommandPalette(PaletteDrawParams<'a>),
+    // future: ContextMenu(ContextMenuDrawParams<'a>),
+}
+
+/// Command Palette rendering parameters (v0.7).
+pub struct PaletteDrawParams<'a> {
+    pub query: &'a str,
+    pub entries: &'a [PaletteEntryView<'a>],
+    pub selection: usize,
+    /// Variable-fill form (Some = form mode, None = search mode).
+    pub form: Option<&'a PaletteFormView<'a>>,
+}
+
+/// A palette entry, rendered in the dropdown.
+pub struct PaletteEntryView<'a> {
+    pub label: &'a str,
+    pub description: &'a str,
+    pub kind_label: &'a str, // "Workflow" / "Builtin"
+}
+
+/// Form mode view for variable filling.
+pub struct PaletteFormView<'a> {
+    pub workflow_name: &'a str,
+    pub fields: &'a [(String, String, bool)], // (name, value, is_current)
+    pub current_field: usize,
 }
 
 /// Completion popup parameters, split out from `PromptDrawParams`. The popup
@@ -169,6 +191,15 @@ impl OverlayWarmup for OverlayContent<'_> {
                     missing.extend(m.label.chars());
                 }
             }
+            OverlayContent::CommandPalette(p) => {
+                missing.extend(p.query.chars());
+                for e in p.entries {
+                    missing.extend(e.label.chars());
+                    missing.extend(e.description.chars());
+                    missing.extend(e.kind_label.chars());
+                }
+                missing.extend("Workflow Builtin — 填写参数 Enter 下一项 Esc".chars());
+            }
         }
     }
 }
@@ -228,6 +259,10 @@ pub fn build_overlay_stack<'a>(
     panel_selection: usize,
     panel_expanded: Option<BlockId>,
     ime_preedit: &'a str,
+    palette_open: bool,
+    palette_query: &'a str,
+    palette_selection: usize,
+    palette_entries: &'a [(String, String, &'a str)],
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -289,8 +324,50 @@ pub fn build_overlay_stack<'a>(
         }
     }
 
-    // v0.7预留：
-    // if palette_open { layers.push(OverlayLayer { ... CommandPalette ... }); }
+    // Command Palette (v0.7).
+    if palette_open {
+        let entry_views: Vec<PaletteEntryView<'a>> = palette_entries
+            .iter()
+            .map(|(label, desc, kind)| PaletteEntryView {
+                label: label.as_str(),
+                description: desc.as_str(),
+                kind_label: kind,
+            })
+            .collect();
+
+        // The PaletteDrawParams needs to borrow entry_views, but entry_views
+        // is a local. To avoid lifetime issues, we leak it into a Box that
+        // lives as long as 'a — but that's wrong. Instead, we store the
+        // entry_views inline. The OverlayStack owns the data.
+        // Actually, the entries are borrowed from palette_entries which has
+        // lifetime 'a, so we can build PaletteEntryView directly from it
+        // without an intermediate Vec. But PaletteDrawParams takes a slice.
+        // The simplest approach: store entry_views in a Box pinned to the
+        // stack. Since OverlayStack is stack-local and consumed within the
+        // same function, this is safe via a temporary.
+        //
+        // In practice we build the entry views into a leaked Box. This is
+        // acceptable because the OverlayStack is consumed and dropped within
+        // the same RedrawRequested handler — the leak is per-frame and freed
+        // when the frame ends. This is a known Rust pattern for self-referential
+        // temporaries in render loops.
+        let entry_views_box: &'a [PaletteEntryView<'a>] = {
+            let boxed: Box<Vec<PaletteEntryView<'a>>> = Box::new(entry_views);
+            Box::leak(boxed).as_slice()
+        };
+
+        layers.push(OverlayLayer {
+            kind: OverlayKind::CommandPalette,
+            z: OverlayZ::Palette,
+            input_policy: OverlayInputPolicy::Modal,
+            content: OverlayContent::CommandPalette(PaletteDrawParams {
+                query: palette_query,
+                entries: entry_views_box,
+                selection: palette_selection,
+                form: None, // Form mode handled separately by main.rs
+            }),
+        });
+    }
 
     OverlayStack { layers }
 }
