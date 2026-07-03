@@ -63,9 +63,15 @@ struct App {
     pty: Option<Pty>,
     /// Current keyboard modifier state, updated by ModifiersChanged events.
     mods: winit::event::Modifiers,
-    /// Cursor blink state.
+    /// Cursor blink state (grid view: hard on/off, period 1060ms).
     cursor_blink_on: bool,
-    /// Last cursor blink toggle time.
+    /// Cursor blink phase in radians [0, 2π) for the prompt signature breath
+    /// (v0.8 §0.3). Drives a smooth sin() alpha curve (0.25↔1.0) over a
+    /// 2400ms period, plus the amber glow halo. Updated per-frame from
+    /// elapsed time since `cursor_blink_time`.
+    cursor_blink_phase: f32,
+    /// Last cursor blink toggle time (shared anchor for both the grid-view
+    /// hard blink and the prompt signature breath).
     cursor_blink_time: std::time::Instant,
     /// IME preedit string (for CJK input).
     ime_preedit: String,
@@ -268,6 +274,7 @@ impl App {
             mods: winit::event::Modifiers::default(),
             pty: None,
             cursor_blink_on: true,
+            cursor_blink_phase: 0.0,
             cursor_blink_time: std::time::Instant::now(),
             ime_preedit: String::new(),
             last_mouse_x: 0.0,
@@ -2450,12 +2457,32 @@ impl App {
     }
 
     /// Update cursor blink state.
+    ///
+    /// Two independent mechanisms share the `cursor_blink_time` anchor:
+    /// - **Grid view**: hard on/off toggle every 530ms (unchanged v0.7 logic).
+    /// - **Prompt (Editor mode)**: smooth `sin()` breath over a 2400ms period
+    ///   (v0.8 §0.3 signature). The phase advances continuously and wraps at
+    ///   2π; the renderer maps it to an alpha curve 0.25↔1.0 + amber glow.
     fn update_cursor_blink(&mut self) {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.cursor_blink_time);
+
+        // Grid-view hard blink: toggle every 530ms (anchor reset on toggle).
         if elapsed >= std::time::Duration::from_millis(530) {
             self.cursor_blink_on = !self.cursor_blink_on;
             self.cursor_blink_time = now;
+        }
+
+        // Prompt signature breath: advance phase continuously.
+        // Period 2400ms → one full sin() cycle; phase stored in radians.
+        const PERIOD_MS: f64 = 2400.0;
+        let elapsed_ms = elapsed.as_millis() as f64;
+        // Each update advances phase by (elapsed_ms / PERIOD_MS) * 2π.
+        let delta = (elapsed_ms / PERIOD_MS) * std::f64::consts::TAU;
+        self.cursor_blink_phase += delta as f32;
+        // Wrap into [0, 2π) to avoid float drift over long sessions.
+        if self.cursor_blink_phase >= std::f32::consts::TAU {
+            self.cursor_blink_phase -= std::f32::consts::TAU;
         }
     }
 }
@@ -2832,6 +2859,7 @@ impl ApplicationHandler<AppEvent> for App {
                         terminal,
                         &self.selection_handler,
                         self.cursor_blink_on,
+                        self.cursor_blink_phase,
                         &overlays,
                         self.block_scroll_offset,
                     );

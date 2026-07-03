@@ -436,6 +436,7 @@ fragment float4 text_fragment(
         terminal: &Terminal,
         selection: &SelectionHandler,
         cursor_blink_on: bool,
+        cursor_blink_phase: f32,
         overlays: &crate::overlay::OverlayStack<'_>,
         block_scroll: usize,
     ) {
@@ -688,7 +689,7 @@ fragment float4 text_fragment(
 
         // Overlay the editor input box at the bottom (Editor mode only).
         if let Some(p) = prompt {
-            vertices.extend_from_slice(&self.build_prompt_vertices(p, cursor_blink_on));
+            vertices.extend_from_slice(&self.build_prompt_vertices(p, cursor_blink_phase));
         }
 
         // Completion popup (split out from prompt — overlay refactor commit 2).
@@ -1350,7 +1351,7 @@ fragment float4 text_fragment(
     /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
     /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
     /// after the grid so it composites on top via the enabled alpha blend.
-    fn build_prompt_vertices(&self, p: &PromptDrawParams, cursor_blink_on: bool) -> Vec<f32> {
+    fn build_prompt_vertices(&self, p: &PromptDrawParams, cursor_blink_phase: f32) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -1407,10 +1408,11 @@ fragment float4 text_fragment(
 
         // Prompt glyph only — cwd lives in the block history, not the input
         // box (Warp style), so the typed command never runs into the path.
-        // Vivid color so the marker reads distinctly (theme.cursor was too dim).
+        // v0.8 Quiet: prompt marker ❯ uses accent_dim (warm gray) so the
+        // UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
         let prompt_str = "❯ ";
         let prompt_chars = 2;
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
         self.push_text(
             &mut verts,
             left,
@@ -1443,15 +1445,36 @@ fragment float4 text_fragment(
         };
         let cx = text_start_x + cc as f32 * cw;
         let bar_w = (cw * 0.12).max(2.0);
-        if cursor_blink_on {
-            push_quad(
-                &mut verts,
-                [cx, cy, cx + bar_w, cy + ch],
-                bg_uv,
-                [0.0; 4],
-                accent,
-            );
-        }
+
+        // ── v0.8 signature: warm cursor breath + amber glow ─────────────
+        // Smooth sin() alpha over a 2400ms period (phase in radians).
+        // sin maps [0, 2π) → [-1, 1]; we remap to [0.25, 1.0] so the caret
+        // never fully disappears (calmer than hard on/off). The glow halo
+        // is a wider, very-low-alpha amber quad behind the caret that
+        // breathes in sync (peaks at ~0.25 alpha).
+        let s = cursor_blink_phase.sin(); // [-1, 1]
+        let caret_alpha = 0.625 + 0.375 * s; // → [0.25, 1.0]
+        let glow_alpha = 0.15 + 0.10 * s; // → [0.05, 0.25]
+        let accent_color = [accent[0], accent[1], accent[2], accent[3] * caret_alpha];
+        // Glow: a wider quad (~3× bar width, full cell height) behind the
+        // caret. Drawn first so the caret composites on top.
+        let glow_pad = bar_w * 1.5;
+        let glow_color = [accent[0], accent[1], accent[2], glow_alpha.max(0.0)];
+        push_quad(
+            &mut verts,
+            [cx - glow_pad, cy, cx + bar_w + glow_pad, cy + ch],
+            bg_uv,
+            [0.0; 4],
+            glow_color,
+        );
+        // Caret itself.
+        push_quad(
+            &mut verts,
+            [cx, cy, cx + bar_w, cy + ch],
+            bg_uv,
+            [0.0; 4],
+            accent_color,
+        );
 
         // IME preedit right after the cursor.
         if let Some(preedit) = p.preedit {
@@ -1566,7 +1589,8 @@ fragment float4 text_fragment(
         let vp_w = self.viewport.0;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
+        // v0.8 Quiet: accent_dim for the selected-row highlight tint.
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -1723,9 +1747,13 @@ fragment float4 text_fragment(
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
-        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
-        let separator = [0.65, 0.65, 0.65, 0.22];
+        // v0.8 Quiet direction: chevrons/prompt marks use accent_dim (warm gray)
+        // so the UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        // Header / cwd dim text: also accent_dim (Quiet — uniform dim chrome).
+        let dim = color_to_normalized(self.theme.accent_dim);
+        // Block separator: theme.separator (barely-visible warm dark).
+        let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
         let border_c = [0.5, 0.5, 0.5, 0.35];
@@ -1886,8 +1914,9 @@ fragment float4 text_fragment(
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
-        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
+        // v0.8 Quiet: accent_dim for highlight tint + dim text.
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        let dim = color_to_normalized(self.theme.accent_dim);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
         let border_c = [0.5, 0.5, 0.5, 0.35];
@@ -1983,8 +2012,9 @@ fragment float4 text_fragment(
         let vp_w = self.viewport.0;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
-        let separator = [0.65, 0.65, 0.65, 0.22];
+        // v0.8 Quiet: accent_dim for the selected-row highlight tint.
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -2100,9 +2130,13 @@ fragment float4 text_fragment(
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        let prompt_c = [0.42, 0.85, 1.0, 1.0];
-        let dim = [fg[0] * 0.55, fg[1] * 0.55, fg[2] * 0.55, 1.0];
-        let separator = [0.65, 0.65, 0.65, 0.22];
+        // v0.8 Quiet direction: chevrons/prompt marks use accent_dim (warm gray)
+        // so the UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
+        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        // Header / cwd dim text: also accent_dim (Quiet — uniform dim chrome).
+        let dim = color_to_normalized(self.theme.accent_dim);
+        // Block separator: theme.separator (barely-visible warm dark).
+        let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
