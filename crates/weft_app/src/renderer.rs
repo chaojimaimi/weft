@@ -114,6 +114,11 @@ pub struct MetalRenderer {
     /// draw when `show_block_view()` is true; cleared otherwise. Empty when the
     /// classic grid view is active (selection then uses Grid coordinates).
     pub block_view_rows: Vec<weft_core::selection::BlockViewRow>,
+    /// Layout context for the current frame (viewport + cell + padding + clip).
+    /// Constructed at the top of `draw()` and used by overlay builders to derive
+    /// coordinates from semantic methods instead of hand-rolled f32 math.
+    /// `None` before the first draw or after a resize before the next frame.
+    pub layout_ctx: Option<crate::layout::LayoutCtx>,
 }
 
 impl MetalRenderer {
@@ -313,6 +318,7 @@ fragment float4 text_fragment(
             completion_popup_rect: None,
             palette_popup_rect: None,
             block_view_rows: Vec::new(),
+            layout_ctx: None,
         }
     }
 
@@ -437,6 +443,20 @@ fragment float4 text_fragment(
             Some(d) => d,
             None => return,
         };
+
+        // Build this frame's LayoutCtx: the single source of truth for
+        // coordinate math in every overlay builder (v0.8 stage 1). Stored on
+        // self so methods that don't receive it directly can still access it
+        // during this draw; rebuilt every frame so resizes/padding changes
+        // take effect immediately.
+        let ctx = crate::layout::LayoutCtx::new(
+            self.viewport,
+            self.cell_width() as f32,
+            self.cell_height() as f32,
+            self.padding_x,
+            self.padding_y,
+        );
+        self.layout_ctx = Some(ctx);
 
         let grid = terminal.grid();
         let cursor = &grid.cursor;
@@ -643,13 +663,17 @@ fragment float4 text_fragment(
 
         // Scrollbar indicator: when the block view is scrolled up, draw a thin
         // vertical bar on the right edge to signal there's more content above.
+        // (Visual redesign — Warp-style thumb + auto-fade — is stage 3 / U6;
+        // here we only migrate coordinates to LayoutCtx/Spacing.)
         if show_blocks && block_scroll > 0 {
-            let ch_f = self.cell_height() as f32;
-            let bar_x = self.viewport.0 - self.padding_x * 0.5;
-            let bar_w = 3.0;
-            // The thumb sits near the top (scrolled up = viewing older content).
-            let thumb_h = ch_f * 3.0;
-            let thumb_y = self.padding_y;
+            use crate::layout::Spacing;
+            // bar_x: half a cell in from the right content edge.
+            let bar_x = ctx.right() - Spacing::sm(&ctx);
+            // bar_w: roughly a third of a cell (kept as before; U6 will thin it).
+            let bar_w = Spacing::xs(&ctx) + 1.0; // ~3px at 14pt
+                                                 // thumb sits near the top (scrolled up = viewing older content).
+            let thumb_h = Spacing::row_md(&ctx) * 3.0;
+            let thumb_y = ctx.top();
             let bar_color = [0.5, 0.5, 0.5, 0.5];
             let (su, sv, suw, svh) = self.space_uv();
             let bg_uv = [su, sv + svh, su + suw, sv];
