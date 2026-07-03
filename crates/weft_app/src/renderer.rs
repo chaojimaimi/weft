@@ -1459,7 +1459,21 @@ fragment float4 text_fragment(
         } else {
             left
         };
-        let cx = text_start_x + cc as f32 * cw;
+        // v0.8: cursor X must use the DISPLAY width of chars before the cursor,
+        // not the char count — CJK chars occupy 2 columns each, so `cc × cw`
+        // leaves the caret stranded mid-cell for input like "Weft项目设计.md".
+        // Sum the actual rendered columns of the first `cc` chars on this line.
+        let cursor_offset_cols = p
+            .lines
+            .get(cl)
+            .map(|line| {
+                line.chars()
+                    .take(cc)
+                    .map(Self::char_col_width)
+                    .sum::<usize>()
+            })
+            .unwrap_or(cc);
+        let cx = text_start_x + cursor_offset_cols as f32 * cw;
         let bar_w = (cw * 0.12).max(2.0);
 
         // ── v0.8 signature: warm cursor breath + amber glow ─────────────
