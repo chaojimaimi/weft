@@ -106,7 +106,7 @@ impl Workflow {
     ///
     /// Returns one rendered command string per step, in order.
     pub fn render(&self, values: &HashMap<String, String>) -> Result<Vec<String>, RenderError> {
-        // First pass: check that every required variable has a value or default.
+        // First pass: check that every required DECLARED variable has a value.
         for var in &self.variables {
             let has_value = values.contains_key(&var.name) || var.default.is_some();
             if !has_value && var.required {
@@ -114,17 +114,37 @@ impl Workflow {
             }
         }
 
-        // Second pass: replace {{var}} in each step.
+        // Build a lookup of declared variable defaults (name → default).
+        let declared_defaults: HashMap<&str, Option<&str>> = self
+            .variables
+            .iter()
+            .map(|v| (v.name.as_str(), v.default.as_deref()))
+            .collect();
+
+        // Second pass: replace ALL {{var}} in each step — both declared and
+        // discovered (from the command text). This handles workflows created
+        // via the UI editor which store variables: vec![] but have {{var}}
+        // placeholders in their commands.
         let mut rendered = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
             let mut cmd = step.command.clone();
-            for var in &self.variables {
+            // Collect all var names that appear in this step's command.
+            let var_names = {
+                let mut names = Vec::new();
+                scan_var_names(&step.command, &mut names);
+                names
+            };
+            for name in &var_names {
                 let val = values
-                    .get(&var.name)
+                    .get(name)
                     .cloned()
-                    .or_else(|| var.default.clone())
+                    .or_else(|| {
+                        declared_defaults
+                            .get(name.as_str())
+                            .and_then(|d| d.map(String::from))
+                    })
                     .unwrap_or_default();
-                cmd = cmd.replace(&format!("{{{{{}}}}}", var.name), &val);
+                cmd = cmd.replace(&format!("{{{{{}}}}}", name), &val);
             }
             rendered.push(cmd);
         }
@@ -444,6 +464,48 @@ mod tests {
         let w = wf("dev", "cd {{dir}}", vec![("dir", Some("."), true)]);
         let rendered = w.render(&HashMap::new()).unwrap();
         assert_eq!(rendered, vec!["cd ."]);
+    }
+
+    #[test]
+    fn render_substitutes_undeclared_vars_from_command() {
+        // Workflows created via the UI editor have variables: vec![] but
+        // may contain {{var}} placeholders. render() must still substitute
+        // them using values from the form.
+        let w = Workflow {
+            id: 0,
+            name: "test".into(),
+            description: String::new(),
+            steps: vec![WorkflowStep {
+                command: "echo {{msg}}".into(),
+            }],
+            variables: vec![], // empty — no declared variables
+            source: WorkflowSource::Manual,
+            use_count: 0,
+            last_used_ms: 0,
+        };
+        let mut values = HashMap::new();
+        values.insert("msg".to_string(), "hello".to_string());
+        let rendered = w.render(&values).unwrap();
+        assert_eq!(rendered, vec!["echo hello"]);
+    }
+
+    #[test]
+    fn render_undeclared_var_without_value_becomes_empty() {
+        // Undeclared var with no value → empty string (not required, no default).
+        let w = Workflow {
+            id: 0,
+            name: "test".into(),
+            description: String::new(),
+            steps: vec![WorkflowStep {
+                command: "echo [{{opt}}]".into(),
+            }],
+            variables: vec![],
+            source: WorkflowSource::Manual,
+            use_count: 0,
+            last_used_ms: 0,
+        };
+        let rendered = w.render(&HashMap::new()).unwrap();
+        assert_eq!(rendered, vec!["echo []"]);
     }
 
     #[test]

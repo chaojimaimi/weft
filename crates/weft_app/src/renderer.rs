@@ -105,6 +105,10 @@ pub struct MetalRenderer {
     popup_max_rows: usize,
     /// Context menu position + target block (F7). Set per-frame by the app.
     pub context_menu_target: Option<(f32, f32, weft_core::blocks::BlockId)>,
+    /// Last-rendered popup rectangles (completion + palette), for border
+    /// drag-resize hot-zone detection. None when the popup wasn't drawn.
+    pub completion_popup_rect: Option<[f32; 4]>, // [x0, y0, x1, y1]
+    pub palette_popup_rect: Option<[f32; 4]>,
 }
 
 impl MetalRenderer {
@@ -301,6 +305,8 @@ fragment float4 text_fragment(
             popup_width_scale: 0.6,
             popup_max_rows: 8,
             context_menu_target: None,
+            completion_popup_rect: None,
+            palette_popup_rect: None,
         }
     }
 
@@ -568,6 +574,9 @@ fragment float4 text_fragment(
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
+        // Reset popup rects — will be set by build_completion/palette_vertices.
+        self.completion_popup_rect = None;
+        self.palette_popup_rect = None;
         let mut vertices = if show_blocks {
             let (v, regions) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
@@ -651,15 +660,18 @@ fragment float4 text_fragment(
                 let box_h = ch_f * (n_lines as f32 + 2.0);
                 let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
                 let box_x0 = self.padding_x;
-                vertices.extend_from_slice(
-                    &self.build_completion_vertices(matches, selected, box_top_y, box_x0),
-                );
+                let (cv, rect) =
+                    self.build_completion_vertices(matches, selected, box_top_y, box_x0);
+                self.completion_popup_rect = rect;
+                vertices.extend_from_slice(&cv);
             }
         }
 
         // Command Palette overlay (v0.7) — centered floating window.
         if let Some(p) = palette {
-            vertices.extend_from_slice(&self.build_palette_vertices(p));
+            let (pv, rect) = self.build_palette_vertices(p);
+            self.palette_popup_rect = rect;
+            vertices.extend_from_slice(&pv);
         }
 
         // Context menu overlay (F7) — drawn at mouse position.
@@ -1407,16 +1419,18 @@ fragment float4 text_fragment(
     /// `anchor_y` is the prompt box's top edge (`box_y0`) — the popup sits
     /// directly above it. This was previously computed inside
     /// `build_prompt_vertices` as `popup_bottom = box_y0`.
+    /// Returns (vertices, popup_rect) where popup_rect is the bounding box
+    /// for border drag-resize hot-zone detection.
     fn build_completion_vertices(
         &self,
         matches: &[weft_core::complete::Match],
         selected: usize,
         anchor_y: f32,
         box_x0: f32,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, Option<[f32; 4]>) {
         let mut verts = Vec::new();
         if matches.is_empty() {
-            return verts;
+            return (verts, None);
         }
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -1539,20 +1553,26 @@ fragment float4 text_fragment(
             y -= ch;
         }
 
-        verts
+        // Return the popup rect for border drag-resize hot-zone detection.
+        let popup_rect = Some([popup_x0, popup_top, popup_x1, popup_bottom]);
+
+        (verts, popup_rect)
     }
 
     /// Build the Command Palette as a centered floating window. Renders a
     /// search box at the top, a scrollable results list, and an optional
     /// variable-fill form when a workflow is selected.
-    fn build_palette_vertices(&self, p: &crate::overlay::PaletteDrawParams<'_>) -> Vec<f32> {
+    fn build_palette_vertices(
+        &self,
+        p: &crate::overlay::PaletteDrawParams<'_>,
+    ) -> (Vec<f32>, Option<[f32; 4]>) {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return verts;
+            return (verts, None);
         }
 
         let theme_bg = color_to_normalized(self.theme.background);
@@ -1582,7 +1602,11 @@ fragment float4 text_fragment(
 
         // If we're in form mode, render the form instead of the search list.
         if let Some(form) = p.form {
-            return self.build_palette_form_vertices(form, popup_x0, popup_x1, vp_h);
+            let form_top = vp_h * 0.15;
+            let form_h = (form.fields.len() as f32 + 3.0) * ch + ch * 0.5;
+            let rect = Some([popup_x0, form_top, popup_x1, form_top + form_h]);
+            let v = self.build_palette_form_vertices(form, popup_x0, popup_x1, vp_h);
+            return (v, rect);
         }
 
         // Search mode: query box + results list.
@@ -1687,7 +1711,10 @@ fragment float4 text_fragment(
             y += ch;
         }
 
-        verts
+        // Return the popup rect for border drag-resize hot-zone detection.
+        let popup_rect = Some([popup_x0, popup_top, popup_x1, popup_bottom]);
+
+        (verts, popup_rect)
     }
 
     /// Render the palette's variable-fill form (sub-mode when a workflow is selected).

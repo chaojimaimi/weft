@@ -1003,6 +1003,11 @@ impl App {
                     if let Some(mut wf) = store.find_by_name(&name).unwrap_or(None) {
                         if let Some(step) = wf.steps.first_mut() {
                             step.command = new_command.clone();
+                        } else {
+                            // No steps — append the new command as the first step.
+                            wf.steps.push(weft_core::workflow::WorkflowStep {
+                                command: new_command.clone(),
+                            });
                         }
                         if let Err(e) = store.update(&wf) {
                             warn!(error = %e, "failed to update workflow");
@@ -1135,16 +1140,32 @@ impl App {
         match entry {
             PaletteEntry::Workflow(wf) => {
                 let var_names = wf.all_var_names();
-                let var_count = var_names.len();
-                self.palette_form = Some(WorkflowForm {
-                    workflow_id: wf.id,
-                    workflow_name: wf.name.clone(),
-                    workflow_description: wf.description.clone(),
-                    var_names,
-                    var_values: vec![String::new(); var_count],
-                    current_field: 0,
-                });
-                self.request_redraw();
+                if var_names.is_empty() {
+                    // No variables — execute immediately (skip the form).
+                    let form = WorkflowForm {
+                        workflow_id: wf.id,
+                        workflow_name: wf.name.clone(),
+                        workflow_description: wf.description.clone(),
+                        var_names: Vec::new(),
+                        var_values: Vec::new(),
+                        current_field: 0,
+                    };
+                    self.execute_workflow(form);
+                    self.palette_open = false;
+                    self.request_redraw();
+                } else {
+                    // Has variables — enter form-fill mode.
+                    let var_count = var_names.len();
+                    self.palette_form = Some(WorkflowForm {
+                        workflow_id: wf.id,
+                        workflow_name: wf.name.clone(),
+                        workflow_description: wf.description.clone(),
+                        var_names,
+                        var_values: vec![String::new(); var_count],
+                        current_field: 0,
+                    });
+                    self.request_redraw();
+                }
             }
             PaletteEntry::Builtin(cmd) => {
                 match cmd {
@@ -1660,7 +1681,11 @@ impl App {
             weft_core::config::Theme::weft_light()
         };
         if let Some(r) = &mut self.renderer {
-            r.set_theme(theme);
+            r.set_theme(theme.clone());
+        }
+        // Reseed the terminal's ANSI palette so existing cells recolor.
+        if let Some(t) = &mut self.terminal {
+            t.set_palette(theme.palette);
         }
         info!(dark = self.theme_is_dark, "theme toggled");
         self.request_redraw();
@@ -1949,54 +1974,51 @@ impl App {
 
     /// Check if a click (x, y) lands on a popup border drag handle.
     /// Returns a DragState if so, enabling resize-drag.
+    /// Uses the actual popup rectangles stored by the renderer (not
+    /// approximations), so hot-zone detection is accurate.
     fn check_popup_border_drag(&self, x: f64, y: f64) -> Option<DragState> {
-        let (cw, ch) = self
-            .renderer
-            .as_ref()
-            .map(|r| (r.cell_width() as f32, r.cell_height() as f32))
-            .unwrap_or((8.0, 16.0));
-        let vp_w = self
-            .renderer
-            .as_ref()
-            .map(|r| r.viewport_width())
-            .unwrap_or(800.0);
-        let hot_zone = 4.0; // px from the border
+        let renderer = self.renderer.as_ref()?;
+        let (cw, ch) = (renderer.cell_width() as f32, renderer.cell_height() as f32);
+        let hot_zone = 8.0; // px from the border (wider for usability)
 
-        // Check if completion popup is active.
-        let popup_active = self.palette_open
-            || self
-                .terminal
-                .as_ref()
-                .map(|t| t.editor().is_completing())
-                .unwrap_or(false);
-
-        if !popup_active {
-            return None;
+        // Gather all active popup rects (completion + palette).
+        let mut rects: Vec<[f32; 4]> = Vec::new();
+        if let Some(r) = renderer.completion_popup_rect {
+            rects.push(r);
+        }
+        if let Some(r) = renderer.palette_popup_rect {
+            rects.push(r);
         }
 
-        // Popup right border: popup_x1 ± hot_zone, y within popup range.
-        let popup_w = vp_w * self.popup_width_scale;
-        let popup_x1 = popup_w.min(vp_w - 8.0); // approximate right edge
-        let right_border = (x as f32 - popup_x1).abs() < hot_zone;
-        let top_border = y < (hot_zone + 4.0) as f64; // near top of viewport
+        let xf = x as f32;
+        let yf = y as f32;
 
-        let target = if right_border {
-            DragTarget::Right
-        } else if top_border {
-            DragTarget::Top
-        } else {
-            return None;
-        };
+        for &[rx0, ry0, rx1, ry1] in &rects {
+            // Right border: x near rx1, y within [ry0, ry1].
+            let on_right = (xf - rx1).abs() < hot_zone && yf >= ry0 && yf <= ry1;
+            // Top border: y near ry0, x within [rx0, rx1].
+            let on_top = (yf - ry0).abs() < hot_zone && xf >= rx0 && xf <= rx1;
 
-        Some(DragState {
-            target,
-            start_x: x,
-            start_y: y,
-            start_scale: self.popup_width_scale,
-            start_rows: self.popup_max_rows,
-            cell_w: cw,
-            cell_h: ch,
-        })
+            let target = if on_right {
+                DragTarget::Right
+            } else if on_top {
+                DragTarget::Top
+            } else {
+                continue;
+            };
+
+            return Some(DragState {
+                target,
+                start_x: x,
+                start_y: y,
+                start_scale: self.popup_width_scale,
+                start_rows: self.popup_max_rows,
+                cell_w: cw,
+                cell_h: ch,
+            });
+        }
+
+        None
     }
 
     /// Update popup dimensions during a border drag.
@@ -2032,11 +2054,11 @@ impl App {
             .map(|r| r.cell_height() as f32)
             .unwrap_or(16.0);
         let item_h = ch * 1.2;
+        let top_inset = ch * 0.2; // matches renderer's `menu_y0 + ch * 0.2`
 
         // Check if click is on a menu item.
-        for (i, (label, _action)) in CONTEXT_MENU_ITEMS.iter().enumerate() {
-            let item_y = menu.y + i as f32 * item_h;
-            let _ = label;
+        for (i, _label) in CONTEXT_MENU_ITEMS.iter().enumerate() {
+            let item_y = menu.y + top_inset + i as f32 * item_h;
             if click_y >= item_y && click_y < item_y + item_h && click_x >= menu.x {
                 // Execute the action.
                 let action = CONTEXT_MENU_ITEMS[i].1;
