@@ -14,9 +14,10 @@
 //! emoji_family = "Apple Color Emoji"
 //!
 //! [theme]
-//! name = "weft-dark"            # weft-dark | weft-light
-//! foreground = "#c8c8c8"        # optional inline overrides
-//! palette = ["#1a1a2e", "#cc5555", ...]   # optional, overrides ANSI 0-15
+//! name = "weft-warm"            # weft-warm | weft-light (weft-dark = legacy alias for weft-warm)
+//! foreground = "#e0d4c4"        # optional inline overrides
+//! accent = "#d4a574"            # v0.8: signature accent (amber)
+//! palette = ["#2a2420", "#c86858", ...]   # optional, overrides ANSI 0-15
 //!
 //! [window]
 //! width = 800
@@ -42,6 +43,32 @@ use crate::input::{KeyCode, Modifiers};
 
 // ── Theme (resolved colors the renderer needs) ─────────────────────────
 
+/// Syntax-highlight color palette (9 colors). Theme-driven so every theme
+/// can define its own command/flag/path/string colors; replaces the hardcoded
+/// `syntax_color()` from renderer.rs v0.5. Conventions match the "Warm
+/// Terminal" direction (v0.8 §0.3) but each theme fills its own values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyntaxColors {
+    /// Command name (first word, or after `|` / `&&` / `;`).
+    pub command: Color,
+    /// A flag: `-x` / `--flag`.
+    pub flag: Color,
+    /// A filesystem path (any word containing `/`).
+    pub path: Color,
+    /// A quoted string (`"…"` / `'…'`), including the quotes.
+    pub string: Color,
+    /// A numeric literal (`^[+-]?\d+(\.\d+)?$`).
+    pub number: Color,
+    /// A variable reference: `$VAR` / `${VAR}`.
+    pub variable: Color,
+    /// A shell operator: `|` `>` `<` `>>` `&&` `||` `;` `&`.
+    pub operator: Color,
+    /// A shell comment: `#` to end of line.
+    pub comment: Color,
+    /// Anything else (arguments, values) — usually == theme.foreground.
+    pub default: Color,
+}
+
 /// A fully-resolved theme: the colors the renderer paints with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Theme {
@@ -51,82 +78,139 @@ pub struct Theme {
     pub selection: Color,
     /// 256-color palette; slots 0-15 are the ANSI colors.
     pub palette: [Color; 256],
+    /// Signature accent color — prompt `❯`, scrollbar thumb, cursor glow.
+    /// Warm themes use amber (#d4a574); cool themes use blue/cyan.
+    pub accent: Color,
+    /// Dimmed accent — chevrons `▸▾`, completion hover, secondary chrome.
+    /// Quieter than `accent`; the "Quiet" direction uses this for UI skeleton
+    /// so the bones recede and text becomes the protagonist.
+    pub accent_dim: Color,
+    /// Block separator color. Subtle (low contrast) in the Quiet direction
+    /// — blocks separate by whitespace first, the line is barely visible.
+    pub separator: Color,
+    /// Syntax-highlight palette (replaces hardcoded syntax_color in renderer).
+    pub syntax: SyntaxColors,
 }
 
 impl Theme {
-    /// Built-in dark theme (default).
+    /// Built-in dark theme — **weft-warm** (v0.8 default).
+    ///
+    /// Warm-toned (deep brown bg `#221c18` + amber accent `#d4a574`), the
+    /// "Warm Terminal" direction (v0.8 §0.3). `weft_dark` is kept as a name
+    /// alias for backward compatibility (old configs that say `weft-dark`).
     pub fn weft_dark() -> Self {
+        Self::weft_warm()
+    }
+
+    /// v0.8 default theme: warm-toned dark. The weft visual identity.
+    pub fn weft_warm() -> Self {
         let mut palette = Color::standard_palette();
-        // Refined ANSI 0-15 for the dark theme.
+        // Refined ANSI 0-15 — warm-tuned (softer than pure primaries, with a
+        // slight amber bias to match the accent).
         let ansi = [
-            (35, 38, 52),    // 0 black
-            (204, 85, 85),   // 1 red
-            (138, 204, 92),  // 2 green
-            (218, 178, 92),  // 3 yellow
-            (92, 158, 218),  // 4 blue
-            (190, 132, 218), // 5 magenta
-            (92, 204, 204),  // 6 cyan
-            (200, 200, 200), // 7 white
-            (90, 96, 116),   // 8 bright black
-            (235, 110, 110), // 9 bright red
-            (170, 220, 120), // 10 bright green
-            (232, 196, 110), // 11 bright yellow
-            (120, 180, 235), // 12 bright blue
-            (210, 160, 235), // 13 bright magenta
-            (120, 220, 220), // 14 bright cyan
-            (235, 235, 235), // 15 bright white
+            (0x2a, 0x24, 0x20), // 0 black   (warm-tinted)
+            (0xc8, 0x68, 0x58), // 1 red     (brick, not pure red)
+            (0xb8, 0xc8, 0x78), // 2 green   (olive, not pure green)
+            (0xd4, 0xa5, 0x43), // 3 yellow  (warm honey)
+            (0xc4, 0xa0, 0xc8), // 4 blue    (dusty purple-blue for warmth)
+            (0xd4, 0x88, 0x70), // 5 magenta (warm coral)
+            (0xd4, 0xa5, 0x74), // 6 cyan    (amber — matches accent)
+            (0xe0, 0xd4, 0xc4), // 7 white   (warm cream)
+            (0x4a, 0x3f, 0x35), // 8 bright black (warm dark brown)
+            (0xe0, 0x88, 0x78), // 9 bright red
+            (0xd0, 0xe0, 0x90), // 10 bright green
+            (0xe8, 0xc8, 0x70), // 11 bright yellow
+            (0xd8, 0xc0, 0xe0), // 12 bright blue
+            (0xe8, 0xa8, 0x90), // 13 bright magenta
+            (0xe8, 0xc8, 0x9c), // 14 bright cyan
+            (0xf0, 0xe8, 0xdc), // 15 bright white
         ];
         for (i, (r, g, b)) in ansi.iter().enumerate() {
             palette[i] = Color::rgb(*r, *g, *b);
         }
         Self {
-            foreground: Color::rgb(200, 200, 200),
-            background: Color::rgb(23, 25, 35),
-            cursor: Color::rgb(235, 235, 235),
-            selection: Color::rgb(51, 102, 204),
+            foreground: Color::rgb(0xe0, 0xd4, 0xc4), // warm cream
+            background: Color::rgb(0x22, 0x1c, 0x18), // deep warm brown
+            cursor: Color::rgb(0xf0, 0xd4, 0xa8),     // amber-tinted white (glow anchor)
+            selection: Color::rgb(0x4a, 0x38, 0x25),  // warm dark brown
             palette,
+            accent: Color::rgb(0xd4, 0xa5, 0x74), // amber — signature
+            accent_dim: Color::rgb(0x7a, 0x6a, 0x58), // warm gray (chevrons, dim text)
+            separator: Color::rgb(0x4a, 0x3f, 0x35), // barely-visible warm dark
+            syntax: SyntaxColors {
+                command: Color::rgb(0xb8, 0xc8, 0x78),  // olive
+                flag: Color::rgb(0xd4, 0xa5, 0x74),     // amber (== accent)
+                path: Color::rgb(0xc8, 0x98, 0x58),     // terracotta
+                string: Color::rgb(0xd4, 0x88, 0x70),   // warm coral
+                number: Color::rgb(0xd4, 0xa5, 0x43),   // warm yellow
+                variable: Color::rgb(0xc4, 0xa0, 0xc8), // dusty purple
+                operator: Color::rgb(0xc8, 0x68, 0x58), // brick red
+                comment: Color::rgb(0x7a, 0x6a, 0x58),  // warm gray (== accent_dim)
+                default: Color::rgb(0xe0, 0xd4, 0xc4),  // == foreground
+            },
         }
     }
 
-    /// Built-in light theme.
+    /// Built-in light theme — warm-toned light variant of weft-warm.
     pub fn weft_light() -> Self {
         let mut palette = Color::standard_palette();
         let ansi = [
-            (40, 42, 54),    // 0 black
-            (190, 50, 50),   // 1 red
-            (60, 140, 60),   // 2 green
-            (170, 130, 40),  // 3 yellow
-            (50, 90, 180),   // 4 blue
-            (150, 70, 170),  // 5 magenta
-            (40, 140, 150),  // 6 cyan
-            (35, 38, 48),    // 7 white (text)
-            (130, 134, 146), // 8 bright black
-            (220, 90, 90),   // 9 bright red
-            (90, 180, 90),   // 10 bright green
-            (200, 160, 70),  // 11 bright yellow
-            (80, 130, 220),  // 12 bright blue
-            (180, 100, 200), // 13 bright magenta
-            (80, 180, 190),  // 14 bright cyan
-            (20, 22, 30),    // 15 bright white
+            (0x40, 0x38, 0x30), // 0 black
+            (0xa8, 0x48, 0x38), // 1 red
+            (0x6a, 0x80, 0x40), // 2 green
+            (0xa8, 0x78, 0x20), // 3 yellow
+            (0x80, 0x60, 0x90), // 4 blue
+            (0xa8, 0x60, 0x50), // 5 magenta
+            (0xa8, 0x78, 0x40), // 6 cyan (amber-ish)
+            (0x3a, 0x32, 0x28), // 7 white (text)
+            (0x80, 0x70, 0x60), // 8 bright black
+            (0xc0, 0x58, 0x48), // 9 bright red
+            (0x80, 0x98, 0x50), // 10 bright green
+            (0xc0, 0x88, 0x30), // 11 bright yellow
+            (0x98, 0x78, 0xa8), // 12 bright blue
+            (0xc0, 0x78, 0x68), // 13 bright magenta
+            (0xc0, 0x98, 0x50), // 14 bright cyan
+            (0x28, 0x20, 0x18), // 15 bright white
         ];
         for (i, (r, g, b)) in ansi.iter().enumerate() {
             palette[i] = Color::rgb(*r, *g, *b);
         }
         Self {
-            foreground: Color::rgb(35, 38, 48),
-            background: Color::rgb(245, 245, 240),
-            cursor: Color::rgb(35, 38, 48),
-            selection: Color::rgb(180, 200, 235),
+            foreground: Color::rgb(0x3a, 0x32, 0x28), // warm dark brown text
+            background: Color::rgb(0xf5, 0xf0, 0xe8), // warm cream-white
+            cursor: Color::rgb(0x8a, 0x60, 0x30),     // warm amber-brown
+            selection: Color::rgb(0xe0, 0xd0, 0xb8),  // warm tan
             palette,
+            accent: Color::rgb(0xa8, 0x70, 0x30), // amber (darker for light bg)
+            accent_dim: Color::rgb(0x8a, 0x78, 0x68), // warm gray
+            separator: Color::rgb(0xd0, 0xc4, 0xb0), // warm light gray
+            syntax: SyntaxColors {
+                command: Color::rgb(0x5a, 0x78, 0x30),  // olive green
+                flag: Color::rgb(0xa8, 0x70, 0x30),     // amber (== accent)
+                path: Color::rgb(0x9a, 0x68, 0x20),     // terracotta
+                string: Color::rgb(0xa8, 0x50, 0x40),   // warm coral
+                number: Color::rgb(0x9a, 0x70, 0x20),   // warm yellow
+                variable: Color::rgb(0x70, 0x50, 0x90), // dusty purple
+                operator: Color::rgb(0xa8, 0x48, 0x38), // brick red
+                comment: Color::rgb(0x8a, 0x78, 0x68),  // warm gray (== accent_dim)
+                default: Color::rgb(0x3a, 0x32, 0x28),  // == foreground
+            },
         }
     }
 
     /// Resolve a theme from config: pick the built-in base by name (default
-    /// `weft-dark`), then apply any inline hex overrides.
+    /// `weft-warm`), then apply any inline hex overrides.
+    ///
+    /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light`.
+    /// Unknown names fall back to `weft-warm` (the v0.8 default).
     pub fn resolve(cfg: &ThemeConfig) -> Self {
         let base = match cfg.name.as_str() {
             "weft-light" => Self::weft_light(),
-            _ => Self::weft_dark(),
+            // Both the v0.8 name and the legacy v0.7 name map to the warm
+            // default — old configs that say `weft-dark` keep working but
+            // now get the warm palette (the new visual identity).
+            "weft-warm" | "weft-dark" | "weft_dark" => Self::weft_warm(),
+            _ => Self::weft_warm(),
         };
         let mut theme = base;
         if let Some(c) = cfg.foreground.as_deref().and_then(parse_hex) {
@@ -140,6 +224,15 @@ impl Theme {
         }
         if let Some(c) = cfg.selection.as_deref().and_then(parse_hex) {
             theme.selection = c;
+        }
+        if let Some(c) = cfg.accent.as_deref().and_then(parse_hex) {
+            theme.accent = c;
+        }
+        if let Some(c) = cfg.accent_dim.as_deref().and_then(parse_hex) {
+            theme.accent_dim = c;
+        }
+        if let Some(c) = cfg.separator.as_deref().and_then(parse_hex) {
+            theme.separator = c;
         }
         for (i, hex) in cfg.palette.iter().enumerate() {
             if i >= 256 {
@@ -324,6 +417,12 @@ pub struct ThemeConfig {
     pub background: Option<String>,
     pub cursor: Option<String>,
     pub selection: Option<String>,
+    /// v0.8: signature accent (prompt ❯, scrollbar thumb, cursor glow).
+    pub accent: Option<String>,
+    /// v0.8: dimmed accent (chevrons, completion hover, secondary chrome).
+    pub accent_dim: Option<String>,
+    /// v0.8: block separator color.
+    pub separator: Option<String>,
     pub palette: Vec<String>,
 }
 
@@ -331,11 +430,14 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            name: "weft-dark".into(),
+            name: "weft-warm".into(),
             foreground: None,
             background: None,
             cursor: None,
             selection: None,
+            accent: None,
+            accent_dim: None,
+            separator: None,
             palette: Vec::new(),
         }
     }
@@ -500,7 +602,7 @@ mod tests {
     #[test]
     fn defaults_are_dark_menlo_10000() {
         let c = Config::default();
-        assert_eq!(c.theme.name, "weft-dark");
+        assert_eq!(c.theme.name, "weft-warm");
         assert_eq!(c.font.family, "Menlo");
         assert_eq!(c.font.size, 14.0);
         assert_eq!(c.scrollback.lines, 10_000);
@@ -515,7 +617,7 @@ mod tests {
     fn empty_toml_uses_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.font.family, "Menlo");
-        assert_eq!(c.theme.name, "weft-dark");
+        assert_eq!(c.theme.name, "weft-warm");
     }
 
     #[test]
@@ -556,7 +658,7 @@ name = "weft-light"
     #[test]
     fn theme_resolve_applies_overrides() {
         let cfg = ThemeConfig {
-            name: "weft-dark".into(),
+            name: "weft-dark".into(), // legacy alias → resolves to weft-warm
             foreground: Some("#abcdef".into()),
             palette: vec!["#112233".into(), "#445566".into()],
             ..Default::default()
@@ -565,6 +667,38 @@ name = "weft-light"
         assert_eq!(theme.foreground, Color::rgb(0xab, 0xcd, 0xef));
         assert_eq!(theme.palette[0], Color::rgb(0x11, 0x22, 0x33));
         assert_eq!(theme.palette[1], Color::rgb(0x44, 0x55, 0x66));
+        // v0.8: weft-dark alias resolves to weft-warm (amber accent #d4a574).
+        assert_eq!(theme.accent, Color::rgb(0xd4, 0xa5, 0x74));
+    }
+
+    #[test]
+    fn weft_warm_default_has_warm_palette() {
+        // v0.8 visual identity: warm brown bg + amber accent.
+        let t = Theme::weft_warm();
+        assert_eq!(t.background, Color::rgb(0x22, 0x1c, 0x18)); // warm brown
+        assert_eq!(t.accent, Color::rgb(0xd4, 0xa5, 0x74)); // amber
+        assert_eq!(t.accent_dim, Color::rgb(0x7a, 0x6a, 0x58)); // warm gray
+                                                                // Syntax: all 9 colors distinct from background.
+        let bg = t.background;
+        for c in [
+            t.syntax.command,
+            t.syntax.flag,
+            t.syntax.path,
+            t.syntax.string,
+            t.syntax.number,
+            t.syntax.variable,
+            t.syntax.operator,
+            t.syntax.comment,
+            t.syntax.default,
+        ] {
+            assert_ne!(c, bg, "syntax color must differ from background");
+        }
+        // flag == accent (design intent: flags carry the signature color).
+        assert_eq!(t.syntax.flag, t.accent);
+        // comment == accent_dim (Quiet: comments recede like dim chrome).
+        assert_eq!(t.syntax.comment, t.accent_dim);
+        // default == foreground.
+        assert_eq!(t.syntax.default, t.foreground);
     }
 
     #[test]
