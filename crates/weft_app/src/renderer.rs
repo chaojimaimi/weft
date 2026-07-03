@@ -109,6 +109,11 @@ pub struct MetalRenderer {
     /// drag-resize hot-zone detection. None when the popup wasn't drawn.
     pub completion_popup_rect: Option<[f32; 4]>, // [x0, y0, x1, y1]
     pub palette_popup_rect: Option<[f32; 4]>,
+    /// Last-rendered block-view rows (scroll-adjusted y bands + visible text),
+    /// for mouse hit-testing and selection in the block view. Repopulated each
+    /// draw when `show_block_view()` is true; cleared otherwise. Empty when the
+    /// classic grid view is active (selection then uses Grid coordinates).
+    pub block_view_rows: Vec<weft_core::selection::BlockViewRow>,
 }
 
 impl MetalRenderer {
@@ -307,6 +312,7 @@ fragment float4 text_fragment(
             context_menu_target: None,
             completion_popup_rect: None,
             palette_popup_rect: None,
+            block_view_rows: Vec::new(),
         }
     }
 
@@ -584,7 +590,7 @@ fragment float4 text_fragment(
         self.completion_popup_rect = None;
         self.palette_popup_rect = None;
         let mut vertices = if show_blocks {
-            let (v, regions) = if let Some(p) = prompt {
+            let (v, regions, bv_rows) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
                 let box_top_y = (vp_h - pad_y - box_h).max(0.0);
                 self.build_block_view_vertices(
@@ -594,6 +600,7 @@ fragment float4 text_fragment(
                     terminal.git_branch(),
                     None,
                     block_scroll,
+                    selection,
                 )
             } else {
                 // CommandExecuting: full block view with the in-flight command
@@ -608,11 +615,16 @@ fragment float4 text_fragment(
                     terminal.git_branch(),
                     terminal.block_tracker().in_flight(),
                     block_scroll,
+                    selection,
                 )
             };
             pending_hit_regions = regions;
+            self.block_view_rows = bv_rows;
             v
         } else {
+            // Grid view (alt-screen apps): clear the block-view row cache so
+            // hit-testing falls back to Grid coordinates.
+            self.block_view_rows.clear();
             self.build_grid_vertices(
                 grid,
                 terminal.palette(),
@@ -2029,6 +2041,7 @@ fragment float4 text_fragment(
     /// `live`, when `Some` (CommandExecuting), draws the in-flight command's
     /// streaming output at the bottom — so a long-running command (interactive
     /// `sudo su`) keeps the full history above it instead of reverting to raw.
+    #[allow(clippy::too_many_arguments)]
     fn build_block_view_vertices(
         &self,
         blocks: &[Block],
@@ -2037,15 +2050,21 @@ fragment float4 text_fragment(
         git_branch: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
         block_scroll: usize,
-    ) -> (Vec<f32>, Vec<crate::overlay::HitRegion>) {
+        selection: &weft_core::selection::SelectionHandler,
+    ) -> (
+        Vec<f32>,
+        Vec<crate::overlay::HitRegion>,
+        Vec<weft_core::selection::BlockViewRow>,
+    ) {
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
+        let mut bv_rows: Vec<weft_core::selection::BlockViewRow> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (verts, hit_regions);
+            return (verts, hit_regions, bv_rows);
         }
 
         let pad_x = self.padding_x;
@@ -2212,6 +2231,47 @@ fragment float4 text_fragment(
         // and cwd as we render.
         let mut topmost_block_info: Option<(String, String)> = None;
 
+        // Selection highlight: for a given row mid-y, look up the char range
+        // (in that row's text) that falls inside the active block-view
+        // selection. Returns None if the y is outside the selection. The
+        // snapshot rows share y-bands with this frame's layout (cloned at
+        // drag start); we key on y-band rather than a global index so wrapped
+        // multi-chunk Output rows highlight correctly per chunk.
+        let sel_bv = selection.block_view_selection.as_ref();
+        let selection_bg = color_to_normalized(self.theme.selection);
+        let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
+            let s = sel_bv?;
+            let snap_idx = s.rows.iter().position(|r| r.contains_y(row_mid_y))?;
+            let top = s.start.row_index.max(s.end.row_index);
+            let bottom = s.start.row_index.min(s.end.row_index);
+            if snap_idx < bottom || snap_idx > top {
+                return None;
+            }
+            let max_char = s.rows[snap_idx].text.chars().count();
+            let (c_start, c_end) = if top == bottom {
+                let lo = s.start.char_index.min(s.end.char_index).min(max_char);
+                let hi = s.start.char_index.max(s.end.char_index).min(max_char);
+                (lo, hi)
+            } else if snap_idx == top {
+                let anchor = if s.start.row_index >= s.end.row_index {
+                    s.start.char_index
+                } else {
+                    s.end.char_index
+                };
+                (0, anchor.min(max_char))
+            } else if snap_idx == bottom {
+                let anchor = if s.start.row_index >= s.end.row_index {
+                    s.end.char_index
+                } else {
+                    s.start.char_index
+                };
+                (anchor.min(max_char), max_char)
+            } else {
+                (0, max_char)
+            };
+            (c_end > c_start).then_some((c_start, c_end))
+        };
+
         for (i, &dist) in rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
             let row_bottom_y = row_top_y + pitch;
@@ -2226,13 +2286,56 @@ fragment float4 text_fragment(
                 LaidRow::Output(text) => {
                     let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
                     if chunks.len() <= 1 {
+                        // Selection highlight (under the text).
+                        if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                            self.push_block_view_highlight(
+                                &mut verts,
+                                left,
+                                y,
+                                ch,
+                                text,
+                                cs,
+                                ce,
+                                selection_bg,
+                                bg_uv,
+                            );
+                        }
                         self.push_text(&mut verts, left, y, text, fg, cols);
+                        // Record the row band for selection hit-testing.
+                        bv_rows.push(weft_core::selection::BlockViewRow {
+                            kind: weft_core::selection::BlockViewRowKind::Output,
+                            text: text.to_string(),
+                            block_id: None,
+                            y_top: y,
+                            y_bottom: y + pitch,
+                        });
                     } else {
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             if cy + ch > clip_top && cy < clip_bottom {
+                                if let Some((cs, ce)) = sel_range_for_y(cy + pitch * 0.5) {
+                                    self.push_block_view_highlight(
+                                        &mut verts,
+                                        left,
+                                        cy,
+                                        ch,
+                                        chunk,
+                                        cs,
+                                        ce,
+                                        selection_bg,
+                                        bg_uv,
+                                    );
+                                }
                                 self.push_text(&mut verts, left, cy, chunk, fg, cols);
                             }
+                            // Each wrapped sub-line is its own selectable band.
+                            bv_rows.push(weft_core::selection::BlockViewRow {
+                                kind: weft_core::selection::BlockViewRowKind::Output,
+                                text: chunk.clone(),
+                                block_id: None,
+                                y_top: cy,
+                                y_bottom: cy + pitch,
+                            });
                         }
                     }
                 }
@@ -2252,6 +2355,21 @@ fragment float4 text_fragment(
                     self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
                     let cmd_x = left + chev_w + 2.0 * cw;
                     let avail = cols.saturating_sub(avail_sub).max(1);
+                    // Selection highlight under the command text (excludes the
+                    // chevron/❯ prefix — those aren't part of the copyable text).
+                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                        self.push_block_view_highlight(
+                            &mut verts,
+                            cmd_x,
+                            y,
+                            ch,
+                            command,
+                            cs,
+                            ce,
+                            selection_bg,
+                            bg_uv,
+                        );
+                    }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
                     if *foldable {
                         hit_regions.push(crate::overlay::HitRegion {
@@ -2262,9 +2380,27 @@ fragment float4 text_fragment(
                             target: crate::overlay::HitTarget::BlockFold(*block_id),
                         });
                     }
+                    // Command row is selectable (copies the command text).
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Command,
+                        text: command.to_string(),
+                        block_id: Some(*block_id),
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
                 }
                 LaidRow::Header { text } => {
                     self.push_text(&mut verts, left, y, text, dim, cols);
+                    // Header is metadata, not selectable — but we still record
+                    // the band so hit-testing can return None cleanly instead
+                    // of falling through to a neighbouring row.
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Header,
+                        text: String::new(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
                 }
                 LaidRow::Separator => {
                     let ly = y + pitch * 0.5;
@@ -2275,12 +2411,39 @@ fragment float4 text_fragment(
                         [0.0; 4],
                         separator,
                     );
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Separator,
+                        text: String::new(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
                 }
                 LaidRow::LiveCommand { command } => {
                     self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
                     let cmd_x = left + 2.0 * cw;
                     let avail = cols.saturating_sub(2).max(1);
+                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                        self.push_block_view_highlight(
+                            &mut verts,
+                            cmd_x,
+                            y,
+                            ch,
+                            command,
+                            cs,
+                            ce,
+                            selection_bg,
+                            bg_uv,
+                        );
+                    }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::LiveCommand,
+                        text: command.to_string(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
                 }
             }
 
@@ -2349,7 +2512,7 @@ fragment float4 text_fragment(
             }
         }
 
-        (verts, hit_regions)
+        (verts, hit_regions, bv_rows)
     }
 
     /// Column width of a character (0 for zero-width combining marks,
@@ -2366,6 +2529,54 @@ fragment float4 text_fragment(
         s.chars()
             .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
             .sum()
+    }
+
+    /// Push a selection-highlight background quad for a character range of
+    /// `text`, honoring CJK double-width so the highlight exactly covers the
+    /// selected glyphs. Called before `push_text` so the text renders on top
+    /// of the highlight (matching grid-view selection rendering).
+    #[allow(clippy::too_many_arguments)]
+    fn push_block_view_highlight(
+        &self,
+        vertices: &mut Vec<f32>,
+        x_left: f32,
+        y_top: f32,
+        height: f32,
+        text: &str,
+        c_start: usize,
+        c_end: usize,
+        bg_color: [f32; 4],
+        bg_uv: [f32; 4],
+    ) {
+        if c_end <= c_start || text.is_empty() {
+            return;
+        }
+        let cw = self.cell_width() as f32;
+        let mut px = x_left;
+        let mut col = 0f32; // column units consumed
+        for (ci, c) in text.chars().enumerate() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if ci >= c_end {
+                break;
+            }
+            let cell_w = w as f32 * cw;
+            if ci >= c_start {
+                // This char is inside the highlight range.
+                push_quad(
+                    vertices,
+                    [px, y_top, px + cell_w, y_top + height],
+                    bg_uv,
+                    [0.0; 4], // fg mask: no text contribution (pure background)
+                    bg_color,
+                );
+            }
+            px += cell_w;
+            col += w as f32;
+            let _ = col; // (kept for symmetry with push_text's col accounting)
+        }
     }
 
     /// Lay out a string left-to-right, honoring wide-character (CJK) widths.

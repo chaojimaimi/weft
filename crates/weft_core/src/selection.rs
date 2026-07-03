@@ -165,6 +165,11 @@ pub struct SelectionHandler {
     pub selecting: bool,
     /// The selection mode for the current drag.
     pub mode: SelectionMode,
+    /// Block-view selection, used when the Warp-style block view is active.
+    /// Mutually exclusive with `selection` in practice (the app dispatches
+    /// based on `show_block_view()`), but kept as a separate field so the two
+    /// models don't entangle.
+    pub block_view_selection: Option<BlockViewSelection>,
 }
 
 impl SelectionHandler {
@@ -173,6 +178,7 @@ impl SelectionHandler {
             selection: None,
             selecting: false,
             mode: SelectionMode::Simple,
+            block_view_selection: None,
         }
     }
 
@@ -199,17 +205,195 @@ impl SelectionHandler {
     pub fn clear(&mut self) {
         self.selection = None;
         self.selecting = false;
+        self.block_view_selection = None;
     }
 
     /// Get the selected text from the grid.
     pub fn selected_text(&self, grid: &Grid) -> Option<String> {
         self.selection.as_ref().map(|sel| sel.text_from_grid(grid))
     }
+
+    // ── Block-view selection helpers ──────────────────────────────────
+
+    /// Start a block-view selection at `pos`, capturing the current row
+    /// snapshot (owned by the renderer) so subsequent text extraction is
+    /// consistent with what the user saw at drag start.
+    pub fn start_block_view(&mut self, pos: BlockViewPos, rows: Vec<BlockViewRow>) {
+        self.block_view_selection = Some(BlockViewSelection {
+            start: pos,
+            end: pos,
+            rows,
+        });
+        self.selecting = true;
+    }
+
+    /// Extend the active block-view selection endpoint (during drag).
+    pub fn extend_block_view(&mut self, pos: BlockViewPos) {
+        if let Some(sel) = &mut self.block_view_selection {
+            sel.end = pos;
+        }
+    }
+
+    /// Text from the active block-view selection, if any.
+    pub fn block_view_text(&self) -> Option<String> {
+        self.block_view_selection.as_ref().map(|sel| sel.text())
+    }
 }
 
 impl Default for SelectionHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Block-view selection ──────────────────────────────────────────────
+//
+// The classic `Selection` / `GridPos` model indexes the terminal Grid by
+// (row, col). In the Warp-style block view the visible content is laid out
+// from `Block.output` strings with a `pitch = cell_h * 1.1` row spacing plus
+// inserted Header / Separator / CWD rows and a scroll offset — so grid
+// coordinates and visible pixel positions no longer correspond, and a
+// grid-based copy lands on the wrong line (the user-visible "复制错位" bug).
+//
+// `BlockViewSelection` is a self-contained model driven by a snapshot of the
+// *visible* rows produced by the renderer (`BlockViewRow`). Hit-testing and
+// text extraction both operate on the same row list, so what you see is what
+// you copy.
+
+use crate::blocks::BlockId;
+
+/// Kind of a block-view row. Mirrors the renderer's internal `LaidRow` but
+/// lives in `weft_core` so the selection model has no dependency on the GUI
+/// crate. Only `Output` / `Command` rows carry selectable text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockViewRowKind {
+    Output,
+    Command,
+    Header,
+    Separator,
+    LiveCommand,
+}
+
+/// A single rendered row in the block view, captured at layout time. The y
+/// range is in physical pixels and already includes the scroll offset, so the
+/// hit-test is a simple range check.
+#[derive(Clone, Debug)]
+pub struct BlockViewRow {
+    pub kind: BlockViewRowKind,
+    /// Visible text of this row (post-wrap single line; empty for Separator).
+    pub text: String,
+    /// Owning block, if any (Command/Header/LiveCommand).
+    pub block_id: Option<BlockId>,
+    /// Top y of the row in physical pixels (scroll-adjusted).
+    pub y_top: f32,
+    /// Bottom y of the row (`y_top + pitch`).
+    pub y_bottom: f32,
+}
+
+impl BlockViewRow {
+    /// True if the kind carries selectable text.
+    pub fn is_selectable(&self) -> bool {
+        matches!(
+            self.kind,
+            BlockViewRowKind::Output | BlockViewRowKind::Command | BlockViewRowKind::LiveCommand
+        )
+    }
+
+    /// True if a physical-pixel y falls inside this row's band.
+    pub fn contains_y(&self, y: f32) -> bool {
+        y >= self.y_top && y < self.y_bottom
+    }
+}
+
+/// A character-cell position inside the block view, expressed as an index
+/// into the cached `BlockViewRow` list plus a char index into that row's
+/// `text`. Renderer-side hit-testing converts pixel (x, y) to this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockViewPos {
+    pub row_index: usize,
+    pub char_index: usize,
+}
+
+/// A selection over the block-view row snapshot. The `rows` vector is the
+/// layout captured when the drag started; text extraction walks it directly,
+/// bypassing the Grid entirely.
+#[derive(Clone, Debug)]
+pub struct BlockViewSelection {
+    pub start: BlockViewPos,
+    pub end: BlockViewPos,
+    pub rows: Vec<BlockViewRow>,
+}
+
+impl BlockViewSelection {
+    /// Extract the selected text by walking the captured row snapshot.
+    ///
+    /// Rows are laid out bottom-to-top (index 0 = closest to the input box);
+    /// text reads top-to-bottom, so we walk from the larger row_index (top)
+    /// down to the smaller one (bottom). `start` is the mouse-press anchor,
+    /// `end` is the current drag endpoint — their relative position determines
+    /// which side of each boundary row is included:
+    ///
+    /// - top row: from `0..top.char_index` (if start is the top anchor) or
+    ///   `top.char_index..max` (if start is the bottom anchor)
+    /// - bottom row: the complementary side
+    ///
+    /// Non-selectable rows in the range are skipped without contributing text
+    /// or a newline (the newline is added only between two selectable rows
+    /// that both contribute text).
+    pub fn text(&self) -> String {
+        if self.rows.is_empty() {
+            return String::new();
+        }
+        let last = self.rows.len() - 1;
+        let top = self.start.row_index.max(self.end.row_index).min(last);
+        let bottom = self.start.row_index.min(self.end.row_index).min(last);
+        if top < bottom {
+            return String::new();
+        }
+        // Which endpoint is the top one? Determines boundary-row slicing.
+        let (top_pos, bottom_pos) = if self.start.row_index >= self.end.row_index {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        };
+
+        let mut out = String::new();
+        let mut contributed = false; // track for newline insertion
+        for i in (bottom..=top).rev() {
+            let row = &self.rows[i];
+            if !row.is_selectable() || row.text.is_empty() {
+                continue;
+            }
+            let chars: Vec<char> = row.text.chars().collect();
+            let max_char = chars.len();
+            let (c_start, c_end) = if top == bottom {
+                // Single row: inclusive range between the two char indices.
+                let lo = top_pos.char_index.min(bottom_pos.char_index).min(max_char);
+                let hi = top_pos.char_index.max(bottom_pos.char_index).min(max_char);
+                (lo, hi)
+            } else if i == top {
+                // Top boundary: anchor at top → include [0, top_pos.char_index).
+                (0, top_pos.char_index.min(max_char))
+            } else if i == bottom {
+                // Bottom boundary: include [bottom_pos.char_index, max).
+                (bottom_pos.char_index.min(max_char), max_char)
+            } else {
+                // Middle row: entire text.
+                (0, max_char)
+            };
+            if c_end > c_start {
+                if contributed {
+                    out.push('\n');
+                }
+                out.extend(&chars[c_start..c_end]);
+                contributed = true;
+            } else if c_end == c_start && top == bottom {
+                // Empty single-row selection: still mark as contributed so
+                // nothing surprising happens, but yields empty string.
+                contributed = true;
+            }
+        }
+        out
     }
 }
 
@@ -316,5 +500,156 @@ mod tests {
         handler.clear();
         assert!(handler.selection.is_none());
         assert!(!handler.selecting);
+    }
+
+    // ── BlockViewSelection tests ───────────────────────────────────────
+    //
+    // The rows vector is laid out bottom-to-top (index 0 = closest to the
+    // input box). A drag from a higher index (top) to a lower index (bottom)
+    // selects text reading top-to-bottom.
+
+    fn bv_row(kind: BlockViewRowKind, text: &str, y_top: f32, y_bottom: f32) -> BlockViewRow {
+        BlockViewRow {
+            kind,
+            text: text.to_string(),
+            block_id: None,
+            y_top,
+            y_bottom,
+        }
+    }
+
+    fn bv_rows() -> Vec<BlockViewRow> {
+        // 5 rows, index 0 = bottom. Each row 20px tall.
+        vec![
+            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0), // idx 0 (bottom)
+            bv_row(BlockViewRowKind::Output, "hello", 20.0, 40.0), // idx 1
+            bv_row(BlockViewRowKind::Separator, "", 40.0, 60.0),  // idx 2 (skipped)
+            bv_row(BlockViewRowKind::Command, "echo hi", 60.0, 80.0), // idx 3
+            bv_row(BlockViewRowKind::Header, "~/proj", 80.0, 100.0), // idx 4 (top)
+        ]
+    }
+
+    #[test]
+    fn bv_single_row_partial() {
+        // Drag within row index 1 ("hello"), char 1..3 -> "el".
+        let rows = bv_rows();
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 1,
+                char_index: 1,
+            },
+            end: BlockViewPos {
+                row_index: 1,
+                char_index: 3,
+            },
+            rows,
+        };
+        assert_eq!(sel.text(), "el");
+    }
+
+    #[test]
+    fn bv_cross_row_skips_non_selectable() {
+        // Drag from row 3 ("echo hi") char 5 down to row 0 ("world") char 2.
+        // top = idx 3, top_pos.char_index = 5 -> [0,5) = "echo "
+        // idx 2 Separator skipped (no text, no newline)
+        // idx 1 "hello" whole
+        // bottom = idx 0, bottom_pos.char_index = 2 -> [2,5) = "rld"
+        // Newlines inserted only between consecutive selectable contributions.
+        let rows = bv_rows();
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 3,
+                char_index: 5,
+            },
+            end: BlockViewPos {
+                row_index: 0,
+                char_index: 2,
+            },
+            rows,
+        };
+        assert_eq!(sel.text(), "echo \nhello\nrld");
+    }
+
+    #[test]
+    fn bv_reversed_endpoints() {
+        // Same physical drag as above but with start/end swapped — text must
+        // still read top-to-bottom and match.
+        let rows = bv_rows();
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 0,
+                char_index: 2,
+            },
+            end: BlockViewPos {
+                row_index: 3,
+                char_index: 5,
+            },
+            rows,
+        };
+        assert_eq!(sel.text(), "echo \nhello\nrld");
+    }
+
+    #[test]
+    fn bv_empty_text_returns_empty() {
+        let rows = vec![];
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 0,
+                char_index: 0,
+            },
+            end: BlockViewPos {
+                row_index: 0,
+                char_index: 5,
+            },
+            rows,
+        };
+        assert_eq!(sel.text(), "");
+    }
+
+    #[test]
+    fn bv_char_index_clamped() {
+        // Out-of-range char index must clamp, not panic.
+        let rows = bv_rows();
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 1,
+                char_index: 100,
+            },
+            end: BlockViewPos {
+                row_index: 1,
+                char_index: 200,
+            },
+            rows,
+        };
+        // "hello" has 5 chars; both indices clamp to 5 -> empty slice.
+        assert_eq!(sel.text(), "");
+    }
+
+    #[test]
+    fn bv_handler_lifecycle() {
+        let mut h = SelectionHandler::new();
+        let rows = bv_rows();
+        // Press at idx 1 ("hello") char 0, drag to idx 0 ("world") char 3.
+        // top = idx 1, top_pos.char_index = 0 -> [0,0) empty (no contribution)
+        // bottom = idx 0, bottom_pos.char_index = 3 -> [3,5) = "ld"
+        h.start_block_view(
+            BlockViewPos {
+                row_index: 1,
+                char_index: 0,
+            },
+            rows.clone(),
+        );
+        assert!(h.selecting);
+        assert!(h.block_view_selection.is_some());
+        h.extend_block_view(BlockViewPos {
+            row_index: 0,
+            char_index: 3,
+        });
+        h.end();
+        assert!(!h.selecting);
+        let text = h.block_view_text().unwrap();
+        assert_eq!(text, "ld");
+        h.clear();
+        assert!(h.block_view_selection.is_none());
     }
 }

@@ -16,7 +16,9 @@ use weft_core::input::{
 };
 use weft_core::persistence::BlockStore;
 use weft_core::pty::{Pty, PtyEvent};
-use weft_core::selection::{GridPos, SelectionHandler, SelectionMode};
+use weft_core::selection::{
+    BlockViewPos, BlockViewRowKind, GridPos, SelectionHandler, SelectionMode,
+};
 use weft_core::shell::Integration;
 use weft_core::vt::Terminal;
 
@@ -1818,6 +1820,78 @@ impl App {
         GridPos::new(row, col)
     }
 
+    /// Convert pixel coordinates to a block-view position.
+    ///
+    /// Used in place of `pixel_to_grid` when `show_block_view()` is true: the
+    /// classic grid division (`y / cell_h`) does not match the block view's
+    /// `pitch = cell_h * 1.1` row spacing, inserted Header/Separator rows, the
+    /// pinned CWD bar, or the scroll offset, so a grid-coordinate copy landed
+    /// on the wrong line (the "复制错位" bug). This walks the renderer's cached
+    /// `block_view_rows` (scroll-adjusted y bands + visible text) and maps the
+    /// click to a char index in the matched row, honoring CJK double-width.
+    ///
+    /// Returns `None` if no row band contains `y` (e.g. on the CWD bar / input
+    /// box / outside the scroll region) or the matched row isn't selectable.
+    fn pixel_to_block_view_pos(&self, x: f64, y: f64) -> Option<BlockViewPos> {
+        let renderer = self.renderer.as_ref()?;
+        let cw = renderer.cell_width() as f64;
+        if cw <= 0.0 {
+            return None;
+        }
+        let left = renderer.padding_x() as f64;
+        let rows = renderer.block_view_rows.as_slice();
+        if rows.is_empty() {
+            return None;
+        }
+        // Find the row whose [y_top, y_bottom) contains y.
+        let row_index = rows.iter().position(|r| r.contains_y(y as f32))?;
+        let row = &rows[row_index];
+        if !matches!(
+            row.kind,
+            BlockViewRowKind::Output | BlockViewRowKind::Command | BlockViewRowKind::LiveCommand
+        ) {
+            return None;
+        }
+        // Map pixel x → char index by accumulating each char's display width.
+        // A click in the right half of a double-width cell rounds to that
+        // cell's index (so dragging across it selects the whole CJK char).
+        let mut col_cursor = 0usize; // column units consumed so far
+        let target_col = ((x - left) / cw).max(0.0) as usize;
+        for (ci, c) in row.text.chars().enumerate() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if w == 0 {
+                // Zero-width (combining mark): belongs to the previous cell,
+                // don't advance the column cursor.
+                continue;
+            }
+            // Click lands in this char if it's before the far edge of the cell.
+            // For double-width, the char occupies [col_cursor, col_cursor+2);
+            // a click anywhere in that range maps to this char.
+            if target_col < col_cursor + w {
+                return Some(BlockViewPos {
+                    row_index,
+                    char_index: ci,
+                });
+            }
+            col_cursor += w;
+        }
+        // Past the last char: clamp to end.
+        Some(BlockViewPos {
+            row_index,
+            char_index: row.text.chars().count(),
+        })
+    }
+
+    /// True when the block view is the active renderer (Editor mode, not in
+    /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
+    /// consistent.
+    fn block_view_active(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .map(|t| t.show_block_view())
+            .unwrap_or(false)
+    }
+
     /// True when the foreground program has grabbed the mouse (mouse reporting
     /// on) and the user is NOT holding Shift to force a selection. While true,
     /// clicks/drags are forwarded to the program and we must NOT start a visual
@@ -1874,28 +1948,49 @@ impl App {
             }
         }
 
-        let pos = self.pixel_to_grid(x, y);
         let selecting = !self.mouse_reporting_active();
+        let block_view = self.block_view_active();
 
         match button {
             winit::event::MouseButton::Left => {
                 if selecting {
-                    // Double-click: line selection; Triple-click: block selection
-                    // For simplicity: Shift+click = block, click = simple
-                    let mode = if self.mods.state().shift_key() {
-                        SelectionMode::Block
+                    if block_view {
+                        // Block view: hit-test against the cached visible-row
+                        // snapshot and start a block-view selection. The row
+                        // snapshot is cloned so the selection stays consistent
+                        // with what the user saw at drag start, even if a PTY
+                        // update re-lays-out the view mid-drag.
+                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
+                            let rows_snapshot = self
+                                .renderer
+                                .as_ref()
+                                .map(|r| r.block_view_rows.clone())
+                                .unwrap_or_default();
+                            self.selection_handler
+                                .start_block_view(bv_pos, rows_snapshot);
+                        }
                     } else {
-                        SelectionMode::Simple
-                    };
-                    self.selection_handler.start(pos, mode);
+                        // Grid view (alt-screen): classic grid selection.
+                        let pos = self.pixel_to_grid(x, y);
+                        let mode = if self.mods.state().shift_key() {
+                            SelectionMode::Block
+                        } else {
+                            SelectionMode::Simple
+                        };
+                        self.selection_handler.start(pos, mode);
+                    }
                 }
 
-                // If mouse protocol is active, send mouse event to PTY
-                self.send_mouse_event(MouseButton::Left, MouseAction::Press, pos);
+                // If mouse protocol is active, send mouse event to PTY.
+                // Always compute a grid pos for PTY mouse reporting (the
+                // foreground program speaks grid coordinates, not block rows).
+                let grid_pos = self.pixel_to_grid(x, y);
+                self.send_mouse_event(MouseButton::Left, MouseAction::Press, grid_pos);
             }
             winit::event::MouseButton::Middle => {
                 // Middle click: paste
                 self.paste_from_clipboard();
+                let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }
             winit::event::MouseButton::Right => {
@@ -1919,13 +2014,31 @@ impl App {
                 }
 
                 if selecting {
-                    // Right click: extend selection
-                    if self.selection_handler.selection.is_none() {
-                        self.selection_handler.start(pos, SelectionMode::Simple);
+                    // Right click: extend selection.
+                    if block_view {
+                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
+                            if self.selection_handler.block_view_selection.is_none() {
+                                let rows_snapshot = self
+                                    .renderer
+                                    .as_ref()
+                                    .map(|r| r.block_view_rows.clone())
+                                    .unwrap_or_default();
+                                self.selection_handler
+                                    .start_block_view(bv_pos, rows_snapshot);
+                            } else {
+                                self.selection_handler.extend_block_view(bv_pos);
+                            }
+                        }
                     } else {
-                        self.selection_handler.extend(pos);
+                        let pos = self.pixel_to_grid(x, y);
+                        if self.selection_handler.selection.is_none() {
+                            self.selection_handler.start(pos, SelectionMode::Simple);
+                        } else {
+                            self.selection_handler.extend(pos);
+                        }
                     }
                 }
+                let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Right, MouseAction::Press, pos);
             }
             _ => {}
@@ -1962,13 +2075,21 @@ impl App {
             return;
         }
 
-        let pos = self.pixel_to_grid(x, y);
-
         if self.selection_handler.selecting {
-            self.selection_handler.extend(pos);
-            self.request_redraw();
+            if self.block_view_active() {
+                if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
+                    self.selection_handler.extend_block_view(bv_pos);
+                    self.request_redraw();
+                }
+            } else {
+                let pos = self.pixel_to_grid(x, y);
+                self.selection_handler.extend(pos);
+                self.request_redraw();
+            }
         }
 
+        // PTY mouse reporting always speaks grid coordinates.
+        let pos = self.pixel_to_grid(x, y);
         self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
     }
 
@@ -2260,11 +2381,22 @@ impl App {
     }
 
     /// Copy selection to system clipboard.
+    ///
+    /// Dispatches on the active view: block view copies from the captured
+    /// `BlockViewSelection` row snapshot (what the user actually sees), grid
+    /// view copies from the terminal Grid. This split fixes the "复制错位"
+    /// bug where a grid-coordinate copy landed on the wrong line because the
+    /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
     fn copy_selection(&self) {
         let Some(terminal) = &self.terminal else {
             return;
         };
-        if let Some(text) = self.selection_handler.selected_text(terminal.grid()) {
+        let text = if terminal.show_block_view() {
+            self.selection_handler.block_view_text()
+        } else {
+            self.selection_handler.selected_text(terminal.grid())
+        };
+        if let Some(text) = text {
             if !text.is_empty() {
                 clipboard_copy(&text);
             }
@@ -2272,11 +2404,36 @@ impl App {
     }
 
     /// Paste from system clipboard.
-    fn paste_from_clipboard(&self) {
-        if let Some(text) = clipboard_paste() {
-            if text.is_empty() {
-                return;
+    ///
+    /// Two-path dispatch mirrors `Ime::Commit` (main.rs ~L2721): in Editor mode
+    /// the shell is taken over by weft and does not echo, so pasted bytes sent
+    /// to the PTY would vanish. Instead we insert the text directly into the
+    /// editor buffer. Passthrough mode forwards to the PTY as before (with
+    /// bracketed-paste wrapping when the shell supports it).
+    fn paste_from_clipboard(&mut self) {
+        let Some(text) = clipboard_paste() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+
+        let mode = self
+            .terminal
+            .as_ref()
+            .map(|t| t.effective_input_mode())
+            .unwrap_or(weft_core::input::InputMode::Passthrough);
+
+        if mode == weft_core::input::InputMode::Editor {
+            // Editor takeover: paste into the input box (same path as IME).
+            if let Some(t) = self.terminal.as_mut() {
+                for c in text.chars() {
+                    t.editor_mut().buffer.insert_char(c);
+                }
             }
+            self.request_redraw();
+        } else {
+            // Passthrough: forward to the PTY.
             let bracketed = self
                 .terminal
                 .as_ref()
