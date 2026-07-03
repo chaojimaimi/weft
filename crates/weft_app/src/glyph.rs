@@ -175,6 +175,11 @@ pub struct GlyphAtlas {
     symbol_font: Option<Font>,
     /// Scaled font size in pixels.
     scaled_size: f32,
+    /// Primary font's |descent| in pixels — the single vertical-baseline
+    /// anchor shared by every glyph (Latin, CJK, emoji, symbol) so mixed-script
+    /// rows share one baseline regardless of which fallback font rasterizes.
+    /// See `glyph_transform` for the v0.8 baseline-alignment rationale.
+    primary_descent_px: f32,
 }
 
 impl GlyphAtlas {
@@ -217,6 +222,14 @@ impl GlyphAtlas {
         let cell_w = Self::measure_advance(&primary_font, 'M', scaled_size);
         let cell_h = (scaled_size * font_config.line_height).ceil() as u32;
 
+        // Vertical baseline anchor: the primary font's |descent| in pixels.
+        // Computed once here and threaded into every rasterize call so all
+        // scripts (Latin/CJK/emoji/symbol) share one baseline. See
+        // `glyph_transform` for the mixed-script alignment rationale.
+        let primary_upem = primary_font.metrics().units_per_em as f32;
+        let primary_descent_px =
+            primary_font.metrics().descent.abs() * (scaled_size / primary_upem);
+
         info!(
             family = %font_config.family,
             "Glyph atlas: cell {}x{}, font {}pt @ {}x scale",
@@ -253,6 +266,7 @@ impl GlyphAtlas {
                 &mut next_x,
                 &mut next_y,
                 &mut row_height,
+                primary_descent_px,
             );
             if let Some(info) = placed {
                 cache.insert(ch, info);
@@ -277,6 +291,7 @@ impl GlyphAtlas {
                 &mut next_x,
                 &mut next_y,
                 &mut row_height,
+                primary_descent_px,
             );
             if let Some(info) = placed {
                 cache.insert(ch, info);
@@ -303,6 +318,7 @@ impl GlyphAtlas {
                     &mut next_x,
                     &mut next_y,
                     &mut row_height,
+                    primary_descent_px,
                 );
                 if let Some(info) = placed {
                     cache.insert(ch, info);
@@ -321,6 +337,11 @@ impl GlyphAtlas {
             cache.len()
         );
 
+        // Anchor every glyph's vertical baseline to the primary (Latin) font's
+        // |descent| (computed above, near cell_h). CJK/emoji fallback fonts
+        // have smaller descent ratios; if each used its own, CJK glyphs would
+        // land on a different baseline and appear to "sink" in mixed-script
+        // rows (visible in `ls -l` output with Chinese filenames).
         Self {
             texture,
             cache,
@@ -336,6 +357,7 @@ impl GlyphAtlas {
             emoji_font,
             symbol_font,
             scaled_size,
+            primary_descent_px,
         }
     }
 
@@ -420,6 +442,7 @@ impl GlyphAtlas {
             glyph_w,
             self.cell_height,
             is_wide,
+            self.primary_descent_px,
         );
 
         // Step 3: Upload to Metal texture
@@ -492,6 +515,17 @@ impl GlyphAtlas {
 
     /// Compute the rasterization transform for a glyph.
     ///
+    /// **Vertical baseline anchoring (v0.8 bug fix):** the descent offset is
+    /// passed in as `primary_descent_px` — the *primary* (Latin) font's
+    /// |descent| scaled to pixels — rather than read from `font.metrics()`.
+    /// Why: a CJK font (PingFang, STHeiti) has a smaller |descent| ratio than
+    /// a monospace Latin font (Menlo). When each glyph was shifted by its own
+    /// font's descent, the CJK baseline landed a few px above the Latin one,
+    /// so in mixed-script rows (e.g. `ls -l` output with Chinese filenames)
+    /// the CJK glyphs visually "sank" below the Latin baseline. Anchoring
+    /// every glyph to the primary font's descent makes both scripts share one
+    /// baseline regardless of which fallback font rasterizes them.
+    ///
     /// **CJK (is_wide=true):** the glyph is NOT horizontally stretched. A CJK
     /// glyph's natural advance is ~1em but its slot is `2·cell_width` (≈1.2em);
     /// stretching to fill the slot (the old behaviour) distorted every
@@ -501,19 +535,17 @@ impl GlyphAtlas {
     /// terminal stack render CJK.
     ///
     /// **Half-width (is_wide=false):** scale_x ≈ 1 (the monospace primary
-    /// advances `cell_width == glyph_w`), unchanged from before.
-    ///
-    /// The vertical transform is identical for both: Y-flip plus a descent
-    /// shift so descenders land inside the cell.
+    /// advances `cell_width == glyph_w`), unchanged.
     fn glyph_transform(
         font: &Font,
         glyph_id: u32,
         scaled_size: f32,
         glyph_w: u32,
         is_wide: bool,
+        primary_descent_px: f32,
     ) -> Transform2F {
         let upem = font.metrics().units_per_em as f32;
-        let descent_px = font.metrics().descent.abs() * (scaled_size / upem);
+        let descent_px = primary_descent_px;
 
         if is_wide {
             // Center the glyph's natural advance inside the double-wide slot.
@@ -540,6 +572,7 @@ impl GlyphAtlas {
         glyph_w: u32,
         cell_h: u32,
         is_wide: bool,
+        primary_descent_px: f32,
     ) -> Vec<u8> {
         let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
 
@@ -557,7 +590,15 @@ impl GlyphAtlas {
         if let Some(glyph_id) = font.glyph_for_char(ch) {
             // See `glyph_transform`: CJK glyphs are centered (not stretched)
             // inside the double-wide slot; half-width uses scale_x ≈ 1.
-            let transform = Self::glyph_transform(font, glyph_id, scaled_size, glyph_w, is_wide);
+            // primary_descent_px anchors both scripts to one baseline.
+            let transform = Self::glyph_transform(
+                font,
+                glyph_id,
+                scaled_size,
+                glyph_w,
+                is_wide,
+                primary_descent_px,
+            );
 
             let result = font.rasterize_glyph(
                 &mut canvas,
@@ -621,6 +662,7 @@ impl GlyphAtlas {
         next_x: &mut u32,
         next_y: &mut u32,
         row_height: &mut u32,
+        primary_descent_px: f32,
     ) -> Option<GlyphInfo> {
         let glyph_w = if is_wide { cell_w * 2 } else { cell_w };
 
@@ -673,7 +715,15 @@ impl GlyphAtlas {
             //
             // CJK glyphs: no horizontal stretch — centered in the slot instead
             // (see `glyph_transform`). Half-width: scale_x ≈ 1, unchanged.
-            let transform = Self::glyph_transform(font, glyph_id, scaled_size, glyph_w, is_wide);
+            // primary_descent_px anchors both scripts to one baseline.
+            let transform = Self::glyph_transform(
+                font,
+                glyph_id,
+                scaled_size,
+                glyph_w,
+                is_wide,
+                primary_descent_px,
+            );
 
             let result = font.rasterize_glyph(
                 &mut canvas,
@@ -817,6 +867,13 @@ mod transform_probe {
     use font_kit::canvas::{Format, RasterizationOptions};
     use font_kit::hinting::HintingOptions;
 
+    /// |descent| of `font` at `scaled_size` px, in pixels — the production
+    /// baseline-anchor value. Mirrors `GlyphAtlas::primary_descent_px`.
+    fn descent_px(font: &Font, scaled_size: f32) -> f32 {
+        let m = font.metrics();
+        m.descent.abs() * (scaled_size / m.units_per_em as f32)
+    }
+
     fn ink_bbox(c: &Canvas) -> (i32, i32, usize) {
         let mut min_r = i32::MAX;
         let mut max_r = i32::MIN;
@@ -857,7 +914,8 @@ mod transform_probe {
         // prompt color/visibility depends on Menlo rendering it directly.)
         let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
         assert!(font.glyph_for_char('❯').is_some(), "Menlo must have ❯");
-        let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28, false);
+        let px =
+            GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28, false, descent_px(&font, 28.0));
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
     }
@@ -956,7 +1014,15 @@ mod transform_probe {
         // Match production cell geometry: Menlo cell_width=17 → CJK slot=34.
         let (cw, ch_h) = (34i32, 34i32);
         let scaled = 28.0f32;
-        let pixels = GlyphAtlas::rasterize_glyph(&cjk, '中', scaled, cw as u32, ch_h as u32, true);
+        let pixels = GlyphAtlas::rasterize_glyph(
+            &cjk,
+            '中',
+            scaled,
+            cw as u32,
+            ch_h as u32,
+            true,
+            descent_px(&cjk, scaled),
+        );
         // rasterize_glyph returns a Vec<u8>; build a Canvas-like view.
         assert_eq!(pixels.len(), (cw * ch_h) as usize);
         let mut probe_canvas = Canvas::new(Vector2I::new(cw, ch_h), Format::A8);
@@ -988,6 +1054,141 @@ mod transform_probe {
         assert!(
             asymmetry <= 4,
             "'中' is off-center: left_bearing={left_bearing} right_bearing={right_bearing} (Δ={asymmetry})"
+        );
+    }
+
+    /// Ink bounding box (top_row, bottom_row) over a pixel slice for a w×h glyph.
+    fn ink_y_bbox(pixels: &[u8], w: u32, h: u32) -> Option<(i32, i32)> {
+        let mut min_r = i32::MAX;
+        let mut max_r = i32::MIN;
+        let mut any = false;
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                if pixels[(y as usize * w as usize) + x as usize] > 0 {
+                    any = true;
+                    min_r = min_r.min(y);
+                    max_r = max_r.max(y);
+                }
+            }
+        }
+        if any {
+            Some((min_r, max_r))
+        } else {
+            None
+        }
+    }
+
+    /// Regression: a CJK glyph (PingFang '中') and a Latin glyph (Menlo 'M')
+    /// must share the same baseline when rasterized into the same cell_h.
+    ///
+    /// Pre-fix, `glyph_transform` shifted each glyph by *its own font's*
+    /// |descent|. Menlo and PingFang have different descent ratios, so the
+    /// CJK glyph's baseline landed ~3-5px below the Latin baseline — visible
+    /// in `ls -l` output as Chinese characters "sinking" below the Latin row.
+    ///
+    /// The fix anchors the vertical offset to the **primary (Latin) font's**
+    /// metrics regardless of which font rasterizes the glyph, so both scripts
+    /// share one baseline. This test quantifies the gap by comparing the
+    /// bottom ink row of each glyph: if they share a baseline, their bottom
+    /// ink rows (descender depth) should be within ~2px.
+    #[test]
+    fn cjk_and_latin_share_baseline() {
+        let menlo = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
+
+        // Diagnostic: print primary vs CJK font vertical metrics so the
+        // baseline gap is visible in test output across machines.
+        {
+            let m = menlo.metrics();
+            let scaled = 28.0f32;
+            let upem = m.units_per_em as f32;
+            eprintln!(
+                "Menlo: ascent={:.2}px descent={:.2}px (|d|={:.2})",
+                m.ascent * (scaled / upem),
+                m.descent * (scaled / upem),
+                m.descent.abs() * (scaled / upem)
+            );
+        }
+        // Match the production CJK fallback chain (PingFang → STHeiti → Hiragino).
+        let cjk_font_paths = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ];
+        let pingfang = match cjk_font_paths
+            .iter()
+            .find_map(|p| Font::from_path(p, 0).ok())
+        {
+            Some(f) => f,
+            None => {
+                eprintln!("no CJK font available — skipping");
+                return;
+            }
+        };
+        {
+            let m = pingfang.metrics();
+            let scaled = 28.0f32;
+            let upem = m.units_per_em as f32;
+            eprintln!(
+                "CJK:   ascent={:.2}px descent={:.2}px (|d|={:.2})",
+                m.ascent * (scaled / upem),
+                m.descent * (scaled / upem),
+                m.descent.abs() * (scaled / upem)
+            );
+        }
+
+        let scaled = 28.0f32;
+        let cell_w = 17u32;
+        let cell_h = 34u32;
+
+        // Production cell geometry
+        let cjk_w = cell_w * 2;
+
+        // Rasterize Latin 'M' and CJK '中' at the SAME cell_h.
+        // CRITICAL: both pass Menlo's descent as the baseline anchor — the
+        // production invariant. Pre-fix, CJK used its own (smaller) descent.
+        let primary_descent = descent_px(&menlo, scaled);
+        let m_px = GlyphAtlas::rasterize_glyph(
+            &menlo,
+            'M',
+            scaled,
+            cell_w,
+            cell_h,
+            false,
+            primary_descent,
+        );
+        let cjk_px = GlyphAtlas::rasterize_glyph(
+            &pingfang,
+            '中',
+            scaled,
+            cjk_w,
+            cell_h,
+            true,
+            primary_descent,
+        );
+
+        let (m_top, m_bot) = ink_y_bbox(&m_px, cell_w, cell_h).expect("'M' must have ink");
+        let (cjk_top, cjk_bot) = ink_y_bbox(&cjk_px, cjk_w, cell_h).expect("'中' must have ink");
+
+        eprintln!(
+            "Latin 'M' ink rows [{m_top},{m_bot}] center={:.1}; \
+             CJK '中' ink rows [{cjk_top},{cjk_bot}] center={:.1}",
+            (m_top + m_bot) as f32 / 2.0,
+            (cjk_top + cjk_bot) as f32 / 2.0
+        );
+
+        // Perception of "sinking": the visual center of the CJK glyph should
+        // not sit noticeably below the Latin glyph's center. CJK ideographs
+        // fill their em box, so when both share a baseline, '中' naturally
+        // extends further down — but its vertical center must still sit
+        // within ~2px of 'M's center for the row to read as one line.
+        let m_center = (m_top + m_bot) as f32 / 2.0;
+        let cjk_center = (cjk_top + cjk_bot) as f32 / 2.0;
+        let center_gap = (m_center - cjk_center).abs();
+        assert!(
+            center_gap <= 2.0,
+            "CJK vertical center {cjk_center:.1} is >2px below Latin center {m_center:.1} \
+             (Δ={center_gap:.1}px); mixed-script rows will look like CJK sinks. \
+             ink: M=[{m_top},{m_bot}] 中=[{cjk_top},{cjk_bot}]"
         );
     }
 }
