@@ -1567,7 +1567,11 @@ fragment float4 text_fragment(
             .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
             .max(5);
 
-        let popup_h = shown as f32 * ch + ch * 0.7;
+        // Popup height: N rows + top padding (0.5ch for visual breathing room).
+        // The bottom edge is flush with the input box top (anchor_y).
+        // Each row occupies exactly `ch` pixels, starting from the bottom up.
+        let top_pad = ch * 0.5;
+        let popup_h = shown as f32 * ch + top_pad;
         let popup_top = popup_bottom - popup_h;
         let border_c = [0.5, 0.5, 0.5, 0.35];
         let popup_bg = [
@@ -1603,7 +1607,10 @@ fragment float4 text_fragment(
             bg_uv,
         );
 
-        let mut y = popup_bottom - ch * 0.65;
+        // Each row occupies exactly `ch` pixels. The bottom-most row starts at
+        // `popup_bottom - ch` and extends to `popup_bottom` — fully inside the
+        // popup. Subsequent rows step upward by `ch`.
+        let mut y = popup_bottom - ch;
         for i in (start..end).rev() {
             if y < popup_top {
                 break;
