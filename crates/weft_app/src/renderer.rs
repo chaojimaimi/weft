@@ -529,8 +529,14 @@ fragment float4 text_fragment(
                         missing.extend(m.chars());
                     }
                 }
-                // Completion warm-up is handled separately in draw() after
-                // extracting the popup from the prompt params.
+            }
+            // Completion popup warm-up: scan emoji icons + match labels.
+            if let Some((completions, _)) = completions {
+                // Emoji icons used by the popup (📁📄 via CoreText color path).
+                missing.extend(['📁', '📄', '»']);
+                for m in completions {
+                    missing.extend(m.label.chars());
+                }
             }
             // Block-view (Editor mode + CommandExecuting overlay): commands,
             // outputs, durations. Session blocks only — hydrated history stays
@@ -659,7 +665,17 @@ fragment float4 text_fragment(
                 let n_lines = prompt.map(|p| p.lines.len().max(1)).unwrap_or(1);
                 let box_h = ch_f * (n_lines as f32 + 2.0);
                 let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
-                let box_x0 = self.padding_x;
+                // Anchor popup left edge to the cursor's x position (Warp-style),
+                // not the window left padding. The prompt glyph "❯ " takes 2
+                // columns on line 0; subsequent lines start at the left edge.
+                let cw_f = self.cell_width() as f32;
+                let prompt_cols = prompt
+                    .map(|p| {
+                        let prompt_indent = if p.cursor.0 == 0 { 2 } else { 0 };
+                        (prompt_indent + p.cursor.1) as f32 * cw_f + self.padding_x
+                    })
+                    .unwrap_or(self.padding_x);
+                let box_x0 = prompt_cols;
                 let (cv, rect) =
                     self.build_completion_vertices(matches, selected, box_top_y, box_x0);
                 self.completion_popup_rect = rect;
@@ -1413,7 +1429,100 @@ fragment float4 text_fragment(
 
     /// Build the Tab-completion dropdown as a floating popup above the prompt
     /// input box. Split out from `build_prompt_vertices` for the overlay stack
-    /// refactor — the popup is now a separate overlay layer with its own
+    /// Draw a Warp-style resize drag handle on the right and/or top border
+    /// of a popup. The handle is two small triangles pointing inward, with a
+    /// short line between them — signaling "drag to resize".
+    fn draw_resize_handles(
+        &self,
+        verts: &mut Vec<f32>,
+        popup_x0: f32,
+        popup_top: f32,
+        popup_x1: f32,
+        popup_bottom: f32,
+        bg_uv: [f32; 4],
+    ) {
+        let handle_color = [0.6, 0.6, 0.6, 0.7];
+        let tri_size = 3.0; // half-size of each triangle
+        let line_len = 8.0; // length of the connecting line
+
+        // Right border handle: vertical grip at the vertical midpoint.
+        let mid_y = (popup_top + popup_bottom) / 2.0;
+        let rx = popup_x1;
+        // Upper triangle (pointing left/down toward center).
+        push_quad(
+            verts,
+            [
+                rx - tri_size,
+                mid_y - line_len - tri_size,
+                rx,
+                mid_y - line_len,
+            ],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+        // Lower triangle (pointing left/up toward center).
+        push_quad(
+            verts,
+            [
+                rx - tri_size,
+                mid_y + line_len,
+                rx,
+                mid_y + line_len + tri_size,
+            ],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+        // Connecting line.
+        push_quad(
+            verts,
+            [rx - 2.0, mid_y - line_len, rx, mid_y + line_len],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+
+        // Top border handle: horizontal grip at the horizontal midpoint.
+        let mid_x = (popup_x0 + popup_x1) / 2.0;
+        let ty = popup_top;
+        // Left triangle (pointing down/right toward center).
+        push_quad(
+            verts,
+            [
+                mid_x - line_len - tri_size,
+                ty,
+                mid_x - line_len,
+                ty + tri_size,
+            ],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+        // Right triangle (pointing down/left toward center).
+        push_quad(
+            verts,
+            [
+                mid_x + line_len,
+                ty,
+                mid_x + line_len + tri_size,
+                ty + tri_size,
+            ],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+        // Connecting line.
+        push_quad(
+            verts,
+            [mid_x - line_len, ty, mid_x + line_len, ty + 2.0],
+            bg_uv,
+            [0.0; 4],
+            handle_color,
+        );
+    }
+
+    /// Build the Tab-completion dropdown as a floating popup above the prompt
     /// z-order (Completion) and hit-test regions.
     ///
     /// `anchor_y` is the prompt box's top edge (`box_y0`) — the popup sits
@@ -1499,6 +1608,16 @@ fragment float4 text_fragment(
         ] {
             push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
         }
+
+        // Warp-style resize handles on right + top borders.
+        self.draw_resize_handles(
+            &mut verts,
+            popup_x0,
+            popup_top,
+            popup_x1,
+            popup_bottom,
+            bg_uv,
+        );
 
         let mut y = popup_bottom - ch * 0.65;
         for i in (start..end).rev() {
@@ -1632,6 +1751,16 @@ fragment float4 text_fragment(
         ] {
             push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
         }
+
+        // Warp-style resize handles on right + top borders.
+        self.draw_resize_handles(
+            &mut verts,
+            popup_x0,
+            popup_top,
+            popup_x1,
+            popup_bottom,
+            bg_uv,
+        );
 
         // Banner / query row. When a sub-mode banner is active, show it
         // instead of the normal search prompt.
