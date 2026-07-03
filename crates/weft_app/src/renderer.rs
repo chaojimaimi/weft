@@ -1441,81 +1441,65 @@ fragment float4 text_fragment(
         popup_bottom: f32,
         bg_uv: [f32; 4],
     ) {
-        let handle_color = [0.6, 0.6, 0.6, 0.7];
-        let tri_size = 3.0; // half-size of each triangle
-        let line_len = 8.0; // length of the connecting line
+        let handle_color = [0.55, 0.55, 0.55, 0.85];
+        let s = 4.0; // triangle half-size
+        let gap = 6.0; // gap between the two triangles (line length)
 
-        // Right border handle: vertical grip at the vertical midpoint.
+        // Right border: two triangles pointing inward (◀ ▶) + connecting line.
         let mid_y = (popup_top + popup_bottom) / 2.0;
         let rx = popup_x1;
-        // Upper triangle (pointing left/down toward center).
-        push_quad(
+        // Upper triangle: points toward center (tip at rx, base at rx-s).
+        push_triangle(
             verts,
-            [
-                rx - tri_size,
-                mid_y - line_len - tri_size,
-                rx,
-                mid_y - line_len,
-            ],
-            bg_uv,
-            [0.0; 4],
+            [rx - s, mid_y - gap - s],
+            [rx, mid_y - gap],
+            [rx - s, mid_y - gap],
             handle_color,
+            bg_uv,
         );
-        // Lower triangle (pointing left/up toward center).
-        push_quad(
+        // Lower triangle: points toward center.
+        push_triangle(
             verts,
-            [
-                rx - tri_size,
-                mid_y + line_len,
-                rx,
-                mid_y + line_len + tri_size,
-            ],
-            bg_uv,
-            [0.0; 4],
+            [rx - s, mid_y + gap + s],
+            [rx, mid_y + gap],
+            [rx - s, mid_y + gap],
             handle_color,
+            bg_uv,
         );
         // Connecting line.
         push_quad(
             verts,
-            [rx - 2.0, mid_y - line_len, rx, mid_y + line_len],
+            [rx - 1.5, mid_y - gap, rx, mid_y + gap],
             bg_uv,
             [0.0; 4],
             handle_color,
         );
 
-        // Top border handle: horizontal grip at the horizontal midpoint.
+        // Top border: two triangles pointing inward + connecting line.
         let mid_x = (popup_x0 + popup_x1) / 2.0;
         let ty = popup_top;
-        // Left triangle (pointing down/right toward center).
-        push_quad(
+        // Left triangle: points toward center (tip at mid_x-gap).
+        push_triangle(
             verts,
-            [
-                mid_x - line_len - tri_size,
-                ty,
-                mid_x - line_len,
-                ty + tri_size,
-            ],
-            bg_uv,
-            [0.0; 4],
+            [mid_x - gap - s, ty],
+            [mid_x - gap - s, ty + s],
+            [mid_x - gap, ty + s / 2.0],
             handle_color,
+            bg_uv,
         );
-        // Right triangle (pointing down/left toward center).
-        push_quad(
+        // Right triangle: points toward center.
+        push_triangle(
             verts,
-            [
-                mid_x + line_len,
-                ty,
-                mid_x + line_len + tri_size,
-                ty + tri_size,
-            ],
-            bg_uv,
-            [0.0; 4],
+            [mid_x + gap + s, ty],
+            [mid_x + gap + s, ty + s],
+            [mid_x + gap, ty + s / 2.0],
             handle_color,
+            bg_uv,
         );
         // Connecting line.
         push_quad(
             verts,
-            [mid_x - line_len, ty, mid_x + line_len, ty + 2.0],
+            [mid_x - gap, ty, mid_x + gap, ty + 1.5],
             bg_uv,
             [0.0; 4],
             handle_color,
@@ -1583,7 +1567,7 @@ fragment float4 text_fragment(
             .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
             .max(5);
 
-        let popup_h = shown as f32 * ch + ch * 0.3;
+        let popup_h = shown as f32 * ch + ch * 0.7;
         let popup_top = popup_bottom - popup_h;
         let border_c = [0.5, 0.5, 0.5, 0.35];
         let popup_bg = [
@@ -2551,6 +2535,27 @@ fn push_quad(vertices: &mut Vec<f32>, dst: [f32; 4], uv: [f32; 4], fg: [f32; 4],
     ] {
         vertices.extend_from_slice(&[
             x, y, u, v, fg[0], fg[1], fg[2], fg[3], bg[0], bg[1], bg[2], bg[3],
+        ]);
+    }
+}
+
+/// Push a filled triangle (3 vertices) into the vertex buffer. Uses the
+/// same vertex layout as `push_quad` (12 floats each).
+fn push_triangle(
+    vertices: &mut Vec<f32>,
+    p0: [f32; 2],
+    p1: [f32; 2],
+    p2: [f32; 2],
+    color: [f32; 4],
+    bg_uv: [f32; 4],
+) {
+    let [u0, v0, u1, v1] = bg_uv;
+    let mid_u = (u0 + u1) * 0.5;
+    let mid_v = (v0 + v1) * 0.5;
+    for [x, y] in [p0, p1, p2] {
+        vertices.extend_from_slice(&[
+            x, y, mid_u, mid_v, color[0], color[1], color[2], color[3], color[0], color[1],
+            color[2], color[3],
         ]);
     }
 }
