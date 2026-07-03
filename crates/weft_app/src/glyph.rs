@@ -16,7 +16,7 @@ use metal::{
 };
 use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use weft_core::config::FontConfig;
 
 /// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
@@ -102,18 +102,42 @@ fn rasterize_emoji_alpha(font: &Font, ch: char, glyph_w: u32, cell_h: u32) -> Op
 /// Resolve a font by family name via the system source, falling back to a list
 /// of absolute `.ttc` paths (the bundled macOS defaults). Returns the first
 /// loadable font.
+///
+/// Logging policy: a family-name miss is common and harmless on macOS —
+/// font-kit's `FamilyName::Title` lookup doesn't always index built-in fonts
+/// (Menlo, PingFang, Apple Color Emoji, Apple Symbols) on every locale / OS
+/// version, so the path fallback is the de-facto primary path in practice.
+/// Therefore:
+///   - family miss + path hit  → `debug!` (noise-free in normal runs)
+///   - family miss + path miss → `warn!` (genuine load failure worth surfacing)
 fn resolve_font(family: &str, fallback_paths: &[&str]) -> Option<Font> {
     if !family.is_empty() {
         if let Some(f) = load_by_family(family) {
             return Some(f);
         }
-        warn!(family, "font family not found; trying path fallback");
     }
+    // Family lookup missed (or was empty) — try the bundled paths. We log at
+    // debug here because the path fallback is expected to succeed; if every
+    // path also fails we escalate to warn below.
     for path in fallback_paths {
-        if let Ok(f) = Font::from_path(path, 0) {
-            return Some(f);
+        match Font::from_path(path, 0) {
+            Ok(f) => {
+                debug!(
+                    family,
+                    path, "font family not found; loaded via path fallback"
+                );
+                return Some(f);
+            }
+            Err(e) => {
+                debug!(family, path, error = %e, "path fallback failed");
+            }
         }
     }
+    warn!(
+        family,
+        fallback_count = fallback_paths.len(),
+        "font load failed: family not found and no path fallback succeeded"
+    );
     None
 }
 
