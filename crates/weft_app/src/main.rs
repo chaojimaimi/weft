@@ -4,6 +4,7 @@
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 
 mod glyph;
+mod layout;
 mod overlay;
 mod renderer;
 
