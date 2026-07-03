@@ -431,6 +431,7 @@ fragment float4 text_fragment(
     }
 
     /// Draw the terminal Grid (and optional overlays) to screen.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         terminal: &Terminal,
@@ -439,6 +440,9 @@ fragment float4 text_fragment(
         cursor_blink_phase: f32,
         overlays: &crate::overlay::OverlayStack<'_>,
         block_scroll: usize,
+        // v0.8 U6: block-content metrics (total_rows, visible_rows,
+        // max_scroll) for the dynamic scrollbar thumb. None in grid view.
+        scroll_metrics: Option<(usize, usize, usize)>,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -662,29 +666,41 @@ fragment float4 text_fragment(
             vertices.extend_from_slice(&self.build_panel_vertices(p));
         }
 
-        // Scrollbar indicator: when the block view is scrolled up, draw a thin
-        // vertical bar on the right edge to signal there's more content above.
-        // (Visual redesign — Warp-style thumb + auto-fade — is stage 3 / U6;
-        // here we only migrate coordinates to LayoutCtx/Spacing.)
-        if show_blocks && block_scroll > 0 {
-            use crate::layout::Spacing;
-            // bar_x: half a cell in from the right content edge.
-            let bar_x = ctx.right() - Spacing::sm(&ctx);
-            // bar_w: roughly a third of a cell (kept as before; U6 will thin it).
-            let bar_w = Spacing::xs(&ctx) + 1.0; // ~3px at 14pt
-                                                 // thumb sits near the top (scrolled up = viewing older content).
-            let thumb_h = Spacing::row_md(&ctx) * 3.0;
-            let thumb_y = ctx.top();
-            let bar_color = [0.5, 0.5, 0.5, 0.5];
-            let (su, sv, suw, svh) = self.space_uv();
-            let bg_uv = [su, sv + svh, su + suw, sv];
-            push_quad(
-                &mut vertices,
-                [bar_x, thumb_y, bar_x + bar_w, thumb_y + thumb_h],
-                bg_uv,
-                [0.0; 4],
-                bar_color,
-            );
+        // v0.8 U6 scrollbar: dynamic thumb position + height proportional to
+        // visible/total content. The thumb sits in a track spanning the block
+        // region; its vertical position reflects block_scroll (scrolled up →
+        // thumb near top). Color uses theme.accent_dim (Quiet — barely visible
+        // until you scroll). Only drawn when content overflows the viewport.
+        if show_blocks {
+            if let Some((total, visible, max_scroll)) = scroll_metrics {
+                if visible < total && max_scroll > 0 {
+                    use crate::layout::Spacing;
+                    let track_top = ctx.top();
+                    let track_h = ctx.height();
+                    let bar_x = ctx.right() - Spacing::sm(&ctx);
+                    let bar_w = Spacing::xs(&ctx) + 1.0; // ~3px at 14pt
+                                                         // Thumb height: proportional to visible/total, clamped to
+                                                         // [3 rows, track_h] so it's always grabbable.
+                    let min_thumb = Spacing::row_md(&ctx) * 3.0;
+                    let ratio = visible as f32 / total as f32;
+                    let thumb_h = (track_h * ratio).max(min_thumb).min(track_h);
+                    // Thumb Y: block_scroll counts UP from the bottom (0 =
+                    // viewing newest). Map so block_scroll=0 → thumb at bottom,
+                    // block_scroll=max_scroll → thumb at top.
+                    let scroll_ratio = block_scroll as f32 / max_scroll as f32;
+                    let thumb_y = track_top + (track_h - thumb_h) * (1.0 - scroll_ratio);
+                    let thumb_color = color_to_normalized(self.theme.accent_dim);
+                    let (su, sv, suw, svh) = self.space_uv();
+                    let bg_uv = [su, sv + svh, su + suw, sv];
+                    push_quad(
+                        &mut vertices,
+                        [bar_x, thumb_y, bar_x + bar_w, thumb_y + thumb_h],
+                        bg_uv,
+                        [0.0; 4],
+                        thumb_color,
+                    );
+                }
+            }
         }
 
         // Overlay the editor input box at the bottom (Editor mode only).
@@ -1710,16 +1726,13 @@ fragment float4 text_fragment(
                 lcolor,
                 label_cols,
             );
-            let label_col_w = Self::text_col_width(&matches[i].label);
-            let suffix_x_row = label_x + (label_col_w.min(label_cols) + gap_cols) as f32 * cw;
-            self.push_text(
-                &mut verts,
-                suffix_x_row,
-                y,
-                suffix,
-                suffix_color,
-                suffix_cols,
-            );
+            // v0.8 U4: suffix is globally aligned (not per-row). The column
+            // anchor derives from max_label_cols — the widest visible label —
+            // so every row's suffix starts at the same X. Was per-row
+            // `label_x + (this_row_label_w + gap) * cw`, which made suffixes
+            // stagger when labels had different widths.
+            let suffix_x = label_x + (max_label_cols.min(label_cols) + gap_cols) as f32 * cw;
+            self.push_text(&mut verts, suffix_x, y, suffix, suffix_color, suffix_cols);
             y -= ch;
         }
 

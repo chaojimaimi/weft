@@ -2855,6 +2855,19 @@ impl ApplicationHandler<AppEvent> for App {
                         &palette_banner,
                         &palette_submode_input,
                     );
+                    // v0.8 U6: compute block-content metrics for the dynamic
+                    // scrollbar thumb (total/visible/max_scroll). None in grid
+                    // view — the scrollbar only shows in block view anyway.
+                    let scroll_metrics = if terminal.show_block_view() {
+                        let cols = terminal.grid().num_cols;
+                        let (total, _) = block_content_metrics(terminal, cols);
+                        let prompt_lines = terminal.editor().buffer.lines.len();
+                        let visible = renderer.block_visible_rows(prompt_lines);
+                        let max_scroll = total.saturating_sub(visible);
+                        Some((total, visible, max_scroll))
+                    } else {
+                        None
+                    };
                     renderer.draw(
                         terminal,
                         &self.selection_handler,
@@ -2862,6 +2875,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.cursor_blink_phase,
                         &overlays,
                         self.block_scroll_offset,
+                        scroll_metrics,
                     );
                 }
 
