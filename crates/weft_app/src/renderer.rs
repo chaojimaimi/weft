@@ -1430,7 +1430,7 @@ fragment float4 text_fragment(
             } else {
                 (left, box_cols)
             };
-            self.push_line_tokenized(&mut verts, start_x, y, line, fg, max_chars);
+            self.push_line_tokenized(&mut verts, start_x, y, line, max_chars);
         }
 
         // Cursor bar at (line, col).
@@ -2394,7 +2394,7 @@ fragment float4 text_fragment(
                             bg_uv,
                         );
                     }
-                    self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
+                    self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
                     if *foldable {
                         hit_regions.push(crate::overlay::HitRegion {
                             x0: 0.0,
@@ -2460,7 +2460,7 @@ fragment float4 text_fragment(
                             bg_uv,
                         );
                     }
-                    self.push_line_tokenized(&mut verts, cmd_x, y, command, fg, avail);
+                    self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
                     bv_rows.push(weft_core::selection::BlockViewRow {
                         kind: weft_core::selection::BlockViewRowKind::LiveCommand,
                         text: command.to_string(),
@@ -2526,7 +2526,7 @@ fragment float4 text_fragment(
                 self.push_text(&mut verts, left, sticky_y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, sticky_y, cmd, fg, avail);
+                self.push_line_tokenized(&mut verts, cmd_x, sticky_y, cmd, avail);
                 if !block_cwd.is_empty() {
                     let cmd_cols = Self::text_col_width(cmd);
                     let cwd_x = cmd_x + (cmd_cols + 2) as f32 * cw;
@@ -2660,7 +2660,6 @@ fragment float4 text_fragment(
         x: f32,
         y: f32,
         line: &str,
-        default_fg: [f32; 4],
         max_cols: usize,
     ) {
         let cw = self.cell_width() as f32;
@@ -2670,7 +2669,7 @@ fragment float4 text_fragment(
             if col >= max_cols {
                 break;
             }
-            let color = syntax_color(token.kind, default_fg);
+            let color = syntax_color(token.kind, &self.theme);
             for c in token.text.chars() {
                 let w = Self::char_col_width(c);
                 if w == 0 {
@@ -2911,17 +2910,20 @@ unsafe fn set_layer_opaque(layer: &MetalLayer, opaque: bool) {
     let _: () = msg_send![layer_ptr, setOpaque: opaque];
 }
 
-/// Fixed syntax-highlight colors (v0.5 phase 1 — not theme-driven yet).
-/// Whitespace/Default fall back to `default_fg`.
-fn syntax_color(kind: TokenKind, default_fg: [f32; 4]) -> [f32; 4] {
+/// Theme-driven syntax-highlight color (v0.8 — replaces the hardcoded
+/// v0.5 palette). Resolves a `TokenKind` against `theme.syntax`.
+fn syntax_color(kind: TokenKind, theme: &weft_core::config::Theme) -> [f32; 4] {
+    let s = &theme.syntax;
     match kind {
-        TokenKind::Command => [0.55, 0.85, 0.55, 1.0], // green
-        TokenKind::Flag => [0.45, 0.85, 1.0, 1.0],     // cyan
-        TokenKind::Path => [0.85, 0.78, 0.45, 1.0],    // yellow/olive
-        TokenKind::String => [0.95, 0.55, 0.75, 1.0],  // magenta
-        TokenKind::Variable => [0.55, 0.7, 1.0, 1.0],  // blue
-        TokenKind::Operator => [0.95, 0.5, 0.5, 1.0],  // red
-        TokenKind::Whitespace | TokenKind::Default => default_fg,
+        TokenKind::Command => color_to_normalized(s.command),
+        TokenKind::Flag => color_to_normalized(s.flag),
+        TokenKind::Path => color_to_normalized(s.path),
+        TokenKind::String => color_to_normalized(s.string),
+        TokenKind::Number => color_to_normalized(s.number),
+        TokenKind::Variable => color_to_normalized(s.variable),
+        TokenKind::Operator => color_to_normalized(s.operator),
+        TokenKind::Comment => color_to_normalized(s.comment),
+        TokenKind::Whitespace | TokenKind::Default => color_to_normalized(s.default),
     }
 }
 
@@ -2931,22 +2933,30 @@ mod tests {
 
     #[test]
     fn syntax_color_distinct_and_default_fallback() {
-        let default = [1.0, 1.0, 1.0, 1.0];
-        let colors = [
-            syntax_color(TokenKind::Command, default),
-            syntax_color(TokenKind::Flag, default),
-            syntax_color(TokenKind::Path, default),
-            syntax_color(TokenKind::String, default),
-            syntax_color(TokenKind::Variable, default),
-            syntax_color(TokenKind::Operator, default),
+        // v0.8: syntax colors are now theme-driven. Verify the warm theme
+        // produces distinct colors for every token kind, and that
+        // Default/Whitespace resolve to theme.syntax.default.
+        let theme = weft_core::config::Theme::weft_warm();
+        let kinds = [
+            TokenKind::Command,
+            TokenKind::Flag,
+            TokenKind::Path,
+            TokenKind::String,
+            TokenKind::Number,
+            TokenKind::Variable,
+            TokenKind::Operator,
+            TokenKind::Comment,
         ];
+        let colors: Vec<[f32; 4]> = kinds.iter().map(|&k| syntax_color(k, &theme)).collect();
+        // All 8 should be distinct (no two token kinds share a color).
         for i in 0..colors.len() {
             for j in (i + 1)..colors.len() {
                 assert_ne!(colors[i], colors[j], "syntax colors at {i}/{j} collide");
             }
         }
-        // Default/Whitespace fall back to the provided default fg.
-        assert_eq!(syntax_color(TokenKind::Default, default), default);
-        assert_eq!(syntax_color(TokenKind::Whitespace, default), default);
+        // Default/Whitespace resolve to theme.syntax.default.
+        let default_c = color_to_normalized(theme.syntax.default);
+        assert_eq!(syntax_color(TokenKind::Default, &theme), default_c);
+        assert_eq!(syntax_color(TokenKind::Whitespace, &theme), default_c);
     }
 }
