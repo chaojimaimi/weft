@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weft SVG Verification</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    padding: 40px 20px;
+    text-align: center;
+  }
+  h1 { font-size: 22px; color: #f0f6fc; margin-bottom: 8px; }
+  .sub { color: #8b949e; margin-bottom: 40px; font-size: 13px; }
+  .compare {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 48px;
+    flex-wrap: wrap;
+    margin-bottom: 60px;
+  }
+  .box img, .box svg {
+    width: 280px; height: 280px;
+    display: block;
+    border-radius: 48px;
+  }
+  .box p { font-size: 13px; color: #58a6ff; margin-top: 10px; }
+  .arrow { font-size: 36px; color: #58a6ff; align-self: center; }
+  .sizes {
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .sbox { text-align: center; }
+  .sbox svg { display: block; }
+  .sbox p { margin-top: 8px; font-size: 11px; color: #8b949e; }
+</style>
+</head>
+<body>
+  <h1>SVG vs Original Comparison</h1>
+  <p class="sub">验证 SVG 矢量版本是否忠实还原了原图的网格圆点和发光 W</p>
+
+  <div class="compare">
+    <div class="box">
+      <img src="../weft-logo-01-woven-grid.jpg" alt="Original">
+      <p>Original (AI generated)</p>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="box">
+      <img src="weft-icon.svg" alt="SVG" style="background:#0b0e14;">
+      <p>SVG vector</p>
+    </div>
+  </div>
+
+  <div class="sizes">
+    <div class="sbox"><svg width="256" height="256" viewBox="0 0 1024 1024"><use href="weft-icon.svg#ic"/></svg><p>256px</p></div>
+    <div class="sbox"><svg width="128" height="128" viewBox="0 0 1024 1024"><use href="weft-icon.svg#ic"/></svg><p>128px</p></div>
+    <div class="sbox"><svg width="64" height="64" viewBox="0 0 1024 1024"><use href="weft-icon.svg#ic"/></svg><p>64px</p></div>
+    <div class="sbox"><svg width="32" height="32" viewBox="0 0 1024 1024"><use href="weft-icon.svg#ic"/></svg><p>32px</p></div>
+  </div>
+</body>
+</html>
