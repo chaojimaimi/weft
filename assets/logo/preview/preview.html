@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weft Logo - Final</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    padding: 40px 20px;
+    text-align: center;
+  }
+  h1 { font-size: 24px; color: #f0f6fc; margin-bottom: 8px; }
+  .subtitle { color: #8b949e; margin-bottom: 40px; font-size: 14px; }
+  .compare {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 40px;
+    flex-wrap: wrap;
+    margin-bottom: 60px;
+  }
+  .compare-item img {
+    width: 200px;
+    height: 200px;
+    object-fit: contain;
+    border-radius: 16px;
+  }
+  .compare-item p { font-size: 13px; color: #58a6ff; margin-top: 8px; }
+  .arrow { font-size: 32px; color: #58a6ff; }
+  .sizes {
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 32px;
+    flex-wrap: wrap;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  .size-item {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+  }
+  .size-item img {
+    display: block;
+    image-rendering: auto;
+  }
+  .size-item p {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #8b949e;
+  }
+  .note {
+    margin-top: 60px;
+    color: #8b949e;
+    font-size: 13px;
+  }
+</style>
+</head>
+<body>
+  <h1>Weft Logo - 01 Woven Grid</h1>
+  <p class="subtitle">对比验证：源文件 vs 最终输出</p>
+
+  <div class="compare">
+    <div class="compare-item">
+      <img src="../weft-logo-01-woven-grid.jpg" alt="Original">
+      <p>你选中的方案1 (原图)</p>
+    </div>
+    <div class="arrow">&#8594;</div>
+    <div class="compare-item">
+      <img src="weft-icon-1024.png" alt="Final 1024">
+      <p>最终输出 1024px</p>
+    </div>
+  </div>
+
+  <div class="sizes">
+    <div class="size-item">
+      <img src="weft-icon-256.png" width="256" height="256" alt="256">
+      <p>256x256</p>
+    </div>
+    <div class="size-item">
+      <img src="weft-icon-128.png" width="128" height="128" alt="128">
+      <p>128x128</p>
+    </div>
+    <div class="size-item">
+      <img src="weft-icon-64.png" width="64" height="64" alt="64">
+      <p>64x64</p>
+    </div>
+    <div class="size-item">
+      <img src="weft-icon-32.png" width="32" height="32" alt="32">
+      <p>32x32</p>
+    </div>
+  </div>
+
+  <p class="note">SVG 矢量版本: weft-icon.svg（可无限缩放，推荐网页使用）</p>
+</body>
+</html>
