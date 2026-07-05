@@ -132,7 +132,11 @@ impl Theme {
             foreground: Color::rgb(0xe0, 0xd4, 0xc4), // warm cream
             background: Color::rgb(0x22, 0x1c, 0x18), // deep warm brown
             cursor: Color::rgb(0xf0, 0xd4, 0xa8),     // amber-tinted white (glow anchor)
-            selection: Color::rgb(0x4a, 0x38, 0x25),  // warm dark brown
+            // Selection: warm amber tint at higher saturation than the
+            // previous #4a3825 (which was nearly indistinguishable from
+            // the #221c18 background — selection highlight was effectively
+            // invisible). v0.8 user testing flagged this.
+            selection: Color::rgb(0x8a, 0x5c, 0x28),
             palette,
             accent: Color::rgb(0xd4, 0xa5, 0x74), // amber — signature
             accent_dim: Color::rgb(0x7a, 0x6a, 0x58), // warm gray (chevrons, dim text)
@@ -198,13 +202,20 @@ impl Theme {
         }
     }
 
-    /// Resolve a theme from config: pick the built-in base by name (default
-    /// `weft-warm`), then apply any inline hex overrides.
+    /// Resolve a theme from config: pick the built-in base by `cfg.name`,
+    /// then apply any inline hex overrides.
     ///
     /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light`.
     /// Unknown names fall back to `weft-warm` (the v0.8 default).
     pub fn resolve(cfg: &ThemeConfig) -> Self {
-        let base = match cfg.name.as_str() {
+        Self::resolve_named(&cfg.name, cfg)
+    }
+
+    /// Resolve a theme by explicit name (v0.9 U-D1 — used by system-theme
+    /// follow to pick light/dark by appearance, ignoring `cfg.name`).
+    /// Applies the same inline overrides as [`resolve`].
+    pub fn resolve_named(name: &str, cfg: &ThemeConfig) -> Self {
+        let base = match name {
             "weft-light" => Self::weft_light(),
             // Both the v0.8 name and the legacy v0.7 name map to the warm
             // default — old configs that say `weft-dark` keep working but
@@ -269,6 +280,28 @@ pub enum Action {
     ToggleBlockPanel,
     #[serde(rename = "toggle_command_palette")]
     ToggleCommandPalette,
+    /// Increase font size (Cmd+=). Multiplies the active font size by 1.1,
+    /// clamped to 3× the configured base.
+    #[serde(rename = "zoom_in")]
+    ZoomIn,
+    /// Decrease font size (Cmd+-). Divides the active font size by 1.1,
+    /// clamped to 0.5× the configured base.
+    #[serde(rename = "zoom_out")]
+    ZoomOut,
+    /// Reset font size to the configured base (Cmd+0).
+    #[serde(rename = "zoom_reset")]
+    ZoomReset,
+    /// Open the in-grid search bar (Cmd+F). Typing debounces 150ms then
+    /// scans visible content + recent scrollback for matches.
+    #[serde(rename = "find_in_grid")]
+    FindInGrid,
+    /// Toggle between dark and light themes at runtime (Cmd+Shift+T).
+    /// Independent of `ReloadConfig` (Cmd+Shift+,): reload re-reads the
+    /// config file and resets the theme to whatever's named there, while
+    /// ToggleTheme flips the in-memory `theme_is_dark` flag without
+    /// touching disk.
+    #[serde(rename = "toggle_theme")]
+    ToggleTheme,
 }
 
 /// Resolved keybinding table: physical key + modifiers → action.
@@ -290,6 +323,11 @@ impl Default for KeyBindings {
             ("cmd+end", Action::ScrollToBottom),
             ("cmd+shift+b", Action::ToggleBlockPanel),
             ("cmd+p", Action::ToggleCommandPalette),
+            ("cmd+equals", Action::ZoomIn),
+            ("cmd+minus", Action::ZoomOut),
+            ("cmd+0", Action::ZoomReset),
+            ("cmd+f", Action::FindInGrid),
+            ("cmd+shift+t", Action::ToggleTheme),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {
@@ -424,6 +462,17 @@ pub struct ThemeConfig {
     /// v0.8: block separator color.
     pub separator: Option<String>,
     pub palette: Vec<String>,
+    /// v0.9 U-D1: follow macOS system appearance (light/dark). When true,
+    /// `light_name` / `dark_name` override `name` based on the current
+    /// system appearance. Manual `Cmd+Shift+T` toggle is a no-op while
+    /// this is enabled (the system overrides it on the next poll).
+    pub follow_system: bool,
+    /// v0.9 U-D1: theme name to use when system appearance is Light.
+    /// Defaults to "weft-light" when None.
+    pub light_name: Option<String>,
+    /// v0.9 U-D1: theme name to use when system appearance is Dark.
+    /// Defaults to "weft-warm" when None.
+    pub dark_name: Option<String>,
 }
 
 // Manual Default (deriving would give name = "").
@@ -439,6 +488,9 @@ impl Default for ThemeConfig {
             accent_dim: None,
             separator: None,
             palette: Vec::new(),
+            follow_system: false,
+            light_name: None,
+            dark_name: None,
         }
     }
 }
@@ -796,5 +848,39 @@ name = "weft-light"
         // default is false
         let d: Config = toml::from_str("").unwrap();
         assert!(!d.editor.submit_on_ctrl_enter);
+    }
+
+    #[test]
+    fn zoom_actions_have_default_keybindings() {
+        let kb = KeyBindings::default();
+        // Cmd+= → ZoomIn, Cmd+- → ZoomOut, Cmd+0 → ZoomReset.
+        assert_eq!(
+            kb.lookup(KeyCode::Char('='), Modifiers::SUPER),
+            Some(Action::ZoomIn)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('-'), Modifiers::SUPER),
+            Some(Action::ZoomOut)
+        );
+        assert_eq!(
+            kb.lookup(KeyCode::Char('0'), Modifiers::SUPER),
+            Some(Action::ZoomReset)
+        );
+    }
+
+    #[test]
+    fn zoom_actions_serde_roundtrip() {
+        // The serde rename must match what users would write in config.toml.
+        // Action only derives Deserialize (config is read-only), so we
+        // round-trip via a serde_json string (matching the rename attribute).
+        for (action, name) in [
+            (Action::ZoomIn, "zoom_in"),
+            (Action::ZoomOut, "zoom_out"),
+            (Action::ZoomReset, "zoom_reset"),
+        ] {
+            let s = format!("\"{name}\"");
+            let back: Action = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, action, "serde roundtrip failed for {name}");
+        }
     }
 }

@@ -119,6 +119,68 @@ pub struct MetalRenderer {
     /// coordinates from semantic methods instead of hand-rolled f32 math.
     /// `None` before the first draw or after a resize before the next frame.
     pub layout_ctx: Option<crate::layout::LayoutCtx>,
+    /// v0.8 B3 FindInGrid state — set per-frame by the app via `set_find_state`.
+    /// `None` when the find bar is closed. The renderer reads this to draw the
+    /// top banner + highlight the current match.
+    pub find_state: Option<FindDrawState>,
+    /// Last-rendered find popup button hit-test rects (physical pixels).
+    /// `None` when the find popup wasn't drawn this frame. Populated by
+    /// `build_find_vertices` each draw; the app reads it from
+    /// `handle_mouse_press` to route clicks on the up/down/case/regex buttons.
+    pub find_buttons: Option<FindButtons>,
+}
+
+/// Hit-test rectangles for the find popup's clickable buttons (physical
+/// pixels). Each `[x0, y0, x1, y1]` rect is the full clickable area of that
+/// button, including padding around the glyph. Set per-frame by the renderer
+/// in `build_find_vertices`; consumed by the app's mouse handler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FindButtons {
+    /// Up arrow (previous match). `None` when there are no matches to cycle.
+    pub up: Option<[f32; 4]>,
+    /// Down arrow (next match). `None` when there are no matches to cycle.
+    pub down: Option<[f32; 4]>,
+    /// "Aa" case-sensitive toggle.
+    pub case_sensitive: [f32; 4],
+    /// ".*" regex mode toggle.
+    pub regex: [f32; 4],
+}
+
+/// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
+#[derive(Clone, Debug, Default)]
+pub struct FindDrawState {
+    /// Live query string (rendered in the bar input).
+    pub query: String,
+    /// 1-based index of the current match, or 0 when there are no matches.
+    pub current: usize,
+    /// Total NAVIGABLE matches. In grid view this is grid matches; in block
+    /// view this is block matches (Enter cycles through them).
+    pub total: usize,
+    /// True when `total` hit MAX_MATCHES — surfaced as "too many matches".
+    pub truncated: bool,
+    /// Current GRID match's `(viewport_row, col, len_in_cells)` — `None` when
+    /// no match is selected or in block view. The renderer highlights this
+    /// rectangle.
+    pub highlight: Option<(usize, usize, usize)>,
+    /// Current BLOCK match's `(block_id, line, is_command, col, len)` — used
+    /// to highlight the match in block view. `None` in grid view or when no
+    /// match is selected.
+    pub block_highlight: Option<(u64, usize, bool, usize, usize)>,
+    /// Non-navigable matches found in block content (block view only). When
+    /// `total == 0` and this is > 0, the status shows "N matches in blocks"
+    /// so the user knows the search did find things (just not navigable).
+    pub block_matches: usize,
+    /// Regex mode toggle (v0.9 U-P2: now actually wired — when true, the
+    /// query is compiled as a `regex::Regex` and matched via `find_iter`).
+    /// When true, the ".*" indicator lights up in accent color.
+    pub regex_mode: bool,
+    /// Case-sensitive toggle. When true, the "Aa" indicator lights up in
+    /// accent color and the search matches exact character case.
+    pub case_sensitive: bool,
+    /// Regex compile error message (v0.9 U-P2). When `Some`, the FindUI
+    /// shows "invalid regex" in red instead of the match count. Cleared
+    /// when the query compiles successfully or regex mode is toggled off.
+    pub regex_error: Option<String>,
 }
 
 impl MetalRenderer {
@@ -319,6 +381,8 @@ fragment float4 text_fragment(
             palette_popup_rect: None,
             block_view_rows: Vec::new(),
             layout_ctx: None,
+            find_state: None,
+            find_buttons: None,
         }
     }
 
@@ -435,7 +499,7 @@ fragment float4 text_fragment(
     pub fn draw(
         &mut self,
         terminal: &Terminal,
-        selection: &SelectionHandler,
+        selection: &mut SelectionHandler,
         cursor_blink_on: bool,
         cursor_blink_phase: f32,
         overlays: &crate::overlay::OverlayStack<'_>,
@@ -596,6 +660,19 @@ fragment float4 text_fragment(
                     }
                 }
             }
+            // Find bar (Cmd+F): warm up the query + status text + button
+            // glyphs so CJK / other non-ASCII chars typed via IME render
+            // instead of leaving blank cells (the atlas only auto-warms
+            // grid/panel content; the find query is independent).
+            if let Some(find) = &self.find_state {
+                missing.extend("Find: ".chars());
+                missing.extend(find.query.chars());
+                // Button labels + status fragments.
+                missing.extend(['↑', '↓', 'A', 'a', '.', '*', '…']);
+                if let Some(err) = &find.regex_error {
+                    missing.extend(err.chars());
+                }
+            }
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
@@ -614,6 +691,8 @@ fragment float4 text_fragment(
         // Reset popup rects — will be set by build_completion/palette_vertices.
         self.completion_popup_rect = None;
         self.palette_popup_rect = None;
+        // Reset find button hit-test rects — set by build_find_vertices.
+        self.find_buttons = None;
         let mut vertices = if show_blocks {
             let (v, regions, bv_rows) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
@@ -705,7 +784,11 @@ fragment float4 text_fragment(
 
         // Overlay the editor input box at the bottom (Editor mode only).
         if let Some(p) = prompt {
-            vertices.extend_from_slice(&self.build_prompt_vertices(p, cursor_blink_phase));
+            vertices.extend_from_slice(&self.build_prompt_vertices(
+                p,
+                cursor_blink_phase,
+                cursor_blink_on,
+            ));
         }
 
         // Completion popup (split out from prompt — overlay refactor commit 2).
@@ -748,6 +831,16 @@ fragment float4 text_fragment(
             vertices.extend_from_slice(&self.build_context_menu_vertices(*x, *y));
         }
 
+        // FindInGrid bar (v0.8 B3) — top banner with query + match count,
+        // plus a yellow translucent highlight on the current match. Drawn
+        // last so it composites above all other overlays.
+        let mut find_btns: Option<FindButtons> = None;
+        if let Some(find) = &self.find_state.clone() {
+            let (find_verts, btns) = self.build_find_vertices(find);
+            vertices.extend_from_slice(&find_verts);
+            find_btns = Some(btns);
+        }
+
         // Debug: log first row characters and verify vertex data
         if vertices.is_empty() {
             let pass_desc = RenderPassDescriptor::new();
@@ -763,6 +856,7 @@ fragment float4 text_fragment(
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
             self.hit_regions = pending_hit_regions;
+            self.find_buttons = find_btns;
             return;
         }
 
@@ -810,6 +904,9 @@ fragment float4 text_fragment(
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
         self.hit_regions = pending_hit_regions;
+        // Store the find popup's button hit-test rects (computed during
+        // build_find_vertices) now that the drawable borrow has ended.
+        self.find_buttons = find_btns;
     }
 
     /// Build vertex buffer from the terminal Grid.
@@ -841,7 +938,14 @@ fragment float4 text_fragment(
         let default_fg = color_to_normalized(self.theme.foreground);
         let default_bg = color_to_normalized(self.theme.background);
         let cursor_color = color_to_normalized(self.theme.cursor);
-        let selection_bg = color_to_normalized(self.theme.selection);
+        let selection_bg = {
+            let mut c = color_to_normalized(self.theme.selection);
+            // Semi-transparent so the underlying text stays readable (v0.8
+            // user testing flagged the fully-opaque selection as obscuring
+            // the selected characters).
+            c[3] = 0.55;
+            c
+        };
 
         for row in 0..num_rows {
             for col in 0..num_cols {
@@ -1222,6 +1326,103 @@ fragment float4 text_fragment(
                         _ => {} // Block cursor handled above
                     }
                 }
+
+                // OSC 8 hyperlink underline: a thin cyan line at the cell's
+                // baseline. Click handling is in main.rs (Cmd+Click → open URL
+                // from the registry's side-map). Wide-char cells span 2 cols.
+                if cell.flags.contains(CellFlags::HYPERLINK) {
+                    let line_h = 1.5;
+                    let link_color = [0.36, 0.62, 0.94, 1.0]; // soft cyan
+                    let quad: [[f32; 12]; 6] = [
+                        [
+                            x0,
+                            y1 - line_h,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                        [
+                            x0,
+                            y1,
+                            0.0,
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                        [
+                            x1,
+                            y1,
+                            0.0,
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                        [
+                            x0,
+                            y1 - line_h,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                        [
+                            x1,
+                            y1,
+                            0.0,
+                            1.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                        [
+                            x1,
+                            y1 - line_h,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            0.0,
+                            link_color[0],
+                            link_color[1],
+                            link_color[2],
+                            link_color[3],
+                        ],
+                    ];
+                    for vertex in &quad {
+                        vertices.extend_from_slice(vertex);
+                    }
+                }
             }
         }
 
@@ -1367,7 +1568,12 @@ fragment float4 text_fragment(
     /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
     /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
     /// after the grid so it composites on top via the enabled alpha blend.
-    fn build_prompt_vertices(&self, p: &PromptDrawParams, cursor_blink_phase: f32) -> Vec<f32> {
+    fn build_prompt_vertices(
+        &self,
+        p: &PromptDrawParams,
+        cursor_blink_phase: f32,
+        cursor_blink_on: bool,
+    ) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -1377,14 +1583,34 @@ fragment float4 text_fragment(
             return verts;
         }
 
-        let n_lines = p.lines.len().max(1);
-        // Box height matches what `input_box_height_px` subtracted from the
-        // grid (one pad row + N text lines + one pad row) so they never gap.
-        let box_h = ch * (n_lines as f32 + 2.0);
-        let box_y1 = (vp_h - self.padding_y).max(0.0);
-        let box_y0 = (box_y1 - box_h).max(0.0);
-        let box_x0 = self.padding_x;
-        let box_x1 = (vp_w - self.padding_x).max(box_x0);
+        // v0.8: cursor X must use the DISPLAY width of chars before the cursor,
+        // not the char count — CJK chars occupy 2 columns each, so `cc × cw`
+        // leaves the caret stranded mid-cell for input like "Weft项目设计.md".
+        // Sum the actual rendered columns of the first `cc` chars on this line.
+        let (cl, cc) = p.cursor;
+        let cursor_offset_cols = p
+            .lines
+            .get(cl)
+            .map(|line| {
+                line.chars()
+                    .take(cc)
+                    .map(Self::char_col_width)
+                    .sum::<usize>()
+            })
+            .unwrap_or(cc);
+
+        // v0.8 stage 4: layout (box rect, text_y0, cursor X/Y, bar_w) is
+        // computed by the pure function in `layout.rs`. The renderer keeps
+        // responsibility for vertex building, theming, and text rasterization.
+        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+        let layout = crate::layout::layout_prompt(&ctx, p.lines.len(), cl, cursor_offset_cols);
+        let text_y0 = layout.text_y0;
+        let left = layout.left;
+        let box_cols = layout.box_cols;
+        let first_line_text_x = layout.first_line_text_x;
+        let cx = layout.cursor_x;
+        let cy = layout.cursor_y;
+        let bar_w = layout.bar_w;
 
         let theme_bg = color_to_normalized(self.theme.background);
         // The input area uses the SAME background as the window (Warp style —
@@ -1398,17 +1624,7 @@ fragment float4 text_fragment(
         let bg_uv = [su, sv + svh, su + suw, sv];
 
         // Uniform window background for the input area (no distinct panel).
-        push_quad(
-            &mut verts,
-            [box_x0, box_y0, box_x1, box_y1],
-            bg_uv,
-            [0.0; 4],
-            box_bg,
-        );
-
-        let text_y0 = box_y0 + ch; // first text row (below the top pad row)
-        let left = box_x0; // flush to the box edge (matches the block view)
-        let box_cols = (((box_x1 - left) / cw).max(1.0)) as usize;
+        push_quad(&mut verts, layout.box_rect, bg_uv, [0.0; 4], box_bg);
 
         // Ctrl+R search UI replaces the normal prompt.
         if let Some((query, selected)) = p.search {
@@ -1442,39 +1658,13 @@ fragment float4 text_fragment(
         for (i, line) in p.lines.iter().enumerate() {
             let y = text_y0 + i as f32 * ch;
             let (start_x, max_chars) = if i == 0 {
-                let sx = left + prompt_chars as f32 * cw;
                 let avail = box_cols.saturating_sub(prompt_chars).max(1);
-                (sx, avail)
+                (first_line_text_x, avail)
             } else {
                 (left, box_cols)
             };
             self.push_line_tokenized(&mut verts, start_x, y, line, max_chars);
         }
-
-        // Cursor bar at (line, col).
-        let (cl, cc) = p.cursor;
-        let cy = text_y0 + cl as f32 * ch;
-        let text_start_x = if cl == 0 {
-            left + prompt_chars as f32 * cw
-        } else {
-            left
-        };
-        // v0.8: cursor X must use the DISPLAY width of chars before the cursor,
-        // not the char count — CJK chars occupy 2 columns each, so `cc × cw`
-        // leaves the caret stranded mid-cell for input like "Weft项目设计.md".
-        // Sum the actual rendered columns of the first `cc` chars on this line.
-        let cursor_offset_cols = p
-            .lines
-            .get(cl)
-            .map(|line| {
-                line.chars()
-                    .take(cc)
-                    .map(Self::char_col_width)
-                    .sum::<usize>()
-            })
-            .unwrap_or(cc);
-        let cx = text_start_x + cursor_offset_cols as f32 * cw;
-        let bar_w = (cw * 0.12).max(2.0);
 
         // ── v0.8 signature: warm cursor breath + amber glow ─────────────
         // Smooth sin() alpha over a 2400ms period (phase in radians).
@@ -1482,7 +1672,15 @@ fragment float4 text_fragment(
         // never fully disappears (calmer than hard on/off). The glow halo
         // is a wider, very-low-alpha amber quad behind the caret that
         // breathes in sync (peaks at ~0.25 alpha).
-        let s = cursor_blink_phase.sin(); // [-1, 1]
+        //
+        // When `cursor_blink_on` is false (window unfocused OR user is
+        // actively selecting — see main.rs::RedrawRequested), the breath
+        // freezes at peak alpha so the caret stays visible but calm.
+        let s = if cursor_blink_on {
+            cursor_blink_phase.sin()
+        } else {
+            1.0_f32
+        };
         let caret_alpha = 0.625 + 0.375 * s; // → [0.25, 1.0]
         let glow_alpha = 0.15 + 0.10 * s; // → [0.05, 0.25]
         let accent_color = [accent[0], accent[1], accent[2], accent[3] * caret_alpha];
@@ -1614,9 +1812,7 @@ fragment float4 text_fragment(
         if matches.is_empty() {
             return (verts, None);
         }
-        let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
-        let vp_w = self.viewport.0;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
         // v0.8 Quiet: accent_dim for the selected-row highlight tint.
@@ -1628,41 +1824,40 @@ fragment float4 text_fragment(
         let sel_label_color = fg;
         let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
 
-        let popup_bottom = anchor_y;
-        let avail_rows = ((popup_bottom / ch).ceil() as usize).saturating_sub(1);
-        let max_rows = self.popup_max_rows.min(avail_rows.max(1));
-        let start = selected.saturating_sub(max_rows - 1);
-        let end = (start + max_rows).min(matches.len());
-        let shown = end - start;
-
-        // Dynamic width from the longest visible label.
+        // v0.8 stage 4: layout (window + popup rect + column anchors) is
+        // computed by the pure functions in `layout.rs`, so it can be unit-
+        // tested without the GPU. The renderer keeps responsibility for
+        // vertex building, theming, and text rasterization.
+        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+        let (start, end, _shown) = crate::layout::completion_window(
+            anchor_y,
+            ch,
+            self.popup_max_rows,
+            selected,
+            matches.len(),
+        );
         let max_label_cols = matches[start..end]
             .iter()
             .map(|m| Self::text_col_width(&m.label))
             .max()
             .unwrap_or(10);
-        let suffix_cols = 10usize;
-        let gap_cols = 2usize;
-        let popup_cols = 1 + 2 + max_label_cols + gap_cols + suffix_cols + 1;
-        let popup_max_cols = ((vp_w * self.popup_width_scale) / cw) as usize;
-        let popup_cols = popup_cols.clamp(25, popup_max_cols.max(25));
-        let popup_w = popup_cols as f32 * cw;
-        let popup_x0 = box_x0;
-        let popup_x1 = (popup_x0 + popup_w).min(vp_w - self.padding_x);
+        let layout = crate::layout::layout_completion(
+            &ctx,
+            start,
+            end,
+            max_label_cols,
+            anchor_y,
+            box_x0,
+            self.popup_width_scale,
+        );
 
-        let pad = cw * 0.5;
-        let icon_w = 2.0 * cw;
-        let label_x = popup_x0 + pad + icon_w;
-        let label_cols = popup_cols
-            .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
-            .max(5);
+        let [popup_x0, popup_top, popup_x1, popup_bottom] = layout.popup_rect;
+        let icon_x = layout.icon_x;
+        let label_x = layout.label_x;
+        let suffix_x = layout.suffix_x;
+        let label_cols = layout.label_cols;
+        let suffix_cols = layout.suffix_cols;
 
-        // Popup height: N rows + top padding (0.5ch for visual breathing room).
-        // The bottom edge is flush with the input box top (anchor_y).
-        // Each row occupies exactly `ch` pixels, starting from the bottom up.
-        let top_pad = ch * 0.5;
-        let popup_h = shown as f32 * ch + top_pad;
-        let popup_top = popup_bottom - popup_h;
         let border_c = [0.5, 0.5, 0.5, 0.35];
         let popup_bg = [
             theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
@@ -1671,13 +1866,7 @@ fragment float4 text_fragment(
             1.0,
         ];
 
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_top, popup_x1, popup_bottom],
-            bg_uv,
-            [0.0; 4],
-            popup_bg,
-        );
+        push_quad(&mut verts, layout.popup_rect, bg_uv, [0.0; 4], popup_bg);
         for (bx0, by0, bx1, by1) in [
             (popup_x0, popup_top, popup_x1, popup_top + 1.0),
             (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
@@ -1701,7 +1890,7 @@ fragment float4 text_fragment(
         // `popup_bottom - ch` and extends to `popup_bottom` — fully inside the
         // popup. Subsequent rows step upward by `ch`.
         let mut y = popup_bottom - ch;
-        for i in (start..end).rev() {
+        for i in (layout.start..layout.end).rev() {
             if y < popup_top {
                 break;
             }
@@ -1731,7 +1920,7 @@ fragment float4 text_fragment(
                     ("»", [0.55, 0.80, 0.55, 1.0], "Command")
                 }
             };
-            self.push_text(&mut verts, popup_x0 + pad, y, icon, icon_color, 3);
+            self.push_text(&mut verts, icon_x, y, icon, icon_color, 3);
             self.push_text(
                 &mut verts,
                 label_x,
@@ -1744,14 +1933,14 @@ fragment float4 text_fragment(
             // anchor derives from max_label_cols — the widest visible label —
             // so every row's suffix starts at the same X. Was per-row
             // `label_x + (this_row_label_w + gap) * cw`, which made suffixes
-            // stagger when labels had different widths.
-            let suffix_x = label_x + (max_label_cols.min(label_cols) + gap_cols) as f32 * cw;
+            // stagger when labels had different widths. The X coordinate
+            // itself comes from `layout.suffix_x` (precomputed in layout.rs).
             self.push_text(&mut verts, suffix_x, y, suffix, suffix_color, suffix_cols);
             y -= ch;
         }
 
         // Return the popup rect for border drag-resize hot-zone detection.
-        let popup_rect = Some([popup_x0, popup_top, popup_x1, popup_bottom]);
+        let popup_rect = Some(layout.popup_rect);
 
         (verts, popup_rect)
     }
@@ -1796,26 +1985,39 @@ fragment float4 text_fragment(
         let right = vp_w - pad_x;
         let cols = (((right - left) / cw).max(1.0)) as usize;
 
-        // Layout: centered window in the upper portion of the viewport.
-        let popup_w = vp_w * self.popup_width_scale;
-        let popup_x0 = (vp_w - popup_w) / 2.0;
-        let popup_x1 = popup_x0 + popup_w;
+        // v0.8 stage 4: layout (popup rect, query/sep/results Y, column
+        // anchors) is computed by the pure functions in `layout.rs`. The
+        // renderer keeps responsibility for vertex building, theming, and
+        // text rasterization.
+        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
 
         // If we're in form mode, render the form instead of the search list.
         if let Some(form) = p.form {
-            let form_top = vp_h * 0.15;
-            let form_h = (form.fields.len() as f32 + 3.0) * ch + ch * 0.5;
-            let rect = Some([popup_x0, form_top, popup_x1, form_top + form_h]);
-            let v = self.build_palette_form_vertices(form, popup_x0, popup_x1, vp_h);
-            return (v, rect);
+            let rect = crate::layout::layout_palette_form_rect(
+                &ctx,
+                form.fields.len(),
+                self.popup_width_scale,
+            );
+            let v = self.build_palette_form_vertices(form, rect[0], rect[2], vp_h);
+            return (v, Some(rect));
         }
 
         // Search mode: query box + results list.
-        let max_results = self.popup_max_rows.min(p.entries.len().max(1));
-        let shown = max_results.min(p.entries.len());
-        let popup_h = (shown as f32 + 2.0) * ch + ch * 0.5; // +2 for header + padding
-        let popup_top = vp_h * 0.15;
-        let popup_bottom = popup_top + popup_h;
+        let layout = crate::layout::layout_palette_search(
+            &ctx,
+            p.entries.len(),
+            p.selection,
+            self.popup_max_rows,
+            self.popup_width_scale,
+        );
+        let [popup_x0, popup_top, popup_x1, popup_bottom] = layout.popup_rect;
+        let query_y = layout.query_y;
+        let query_x = layout.query_x;
+        let sep_y = layout.sep_y;
+        let label_x = layout.label_x;
+        let suffix_x = layout.suffix_x;
+        let start = layout.start;
+        let end = layout.end;
 
         // Background + border.
         push_quad(
@@ -1846,39 +2048,23 @@ fragment float4 text_fragment(
 
         // Banner / query row. When a sub-mode banner is active, show it
         // instead of the normal search prompt.
-        let query_y = popup_top + ch * 0.5;
         if !p.banner.is_empty() {
             // Sub-mode: show banner + input buffer.
-            self.push_text(
-                &mut verts,
-                popup_x0 + cw * 0.5,
-                query_y,
-                p.banner,
-                prompt_c,
-                cols,
-            );
+            self.push_text(&mut verts, query_x, query_y, p.banner, prompt_c, cols);
             let banner_cols = Self::text_col_width(p.banner);
-            let input_x = popup_x0 + cw * 0.5 + (banner_cols + 1) as f32 * cw;
+            let input_x = query_x + (banner_cols + 1) as f32 * cw;
             let avail = (((popup_x1 - input_x) / cw).max(1.0)) as usize;
             self.push_text(&mut verts, input_x, query_y, p.submode_input, fg, avail);
         } else {
             // Normal search mode.
             let query_label = "> ";
-            self.push_text(
-                &mut verts,
-                popup_x0 + cw * 0.5,
-                query_y,
-                query_label,
-                prompt_c,
-                cols,
-            );
-            let qx = popup_x0 + cw * 0.5 + query_label.chars().count() as f32 * cw;
+            self.push_text(&mut verts, query_x, query_y, query_label, prompt_c, cols);
+            let qx = query_x + query_label.chars().count() as f32 * cw;
             let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
             self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
         }
 
         // Separator below query.
-        let sep_y = query_y + ch;
         push_quad(
             &mut verts,
             [popup_x0, sep_y, popup_x1, sep_y + 1.0],
@@ -1888,9 +2074,7 @@ fragment float4 text_fragment(
         );
 
         // Results rows.
-        let start = p.selection.saturating_sub(max_results.saturating_sub(1));
-        let end = (start + max_results).min(p.entries.len());
-        let mut y = sep_y + ch;
+        let mut y = layout.results_y;
         for i in start..end {
             if y + ch > popup_bottom {
                 break;
@@ -1910,22 +2094,18 @@ fragment float4 text_fragment(
             let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
 
             // Label + description.
-            let label_x = popup_x0 + cw * 0.5;
             let label_avail = (((popup_x1 - label_x) / cw) as usize)
                 .saturating_sub(12)
                 .max(1);
             self.push_text(&mut verts, label_x, y, entry.label, lcolor, label_avail);
 
             // Kind suffix (right-aligned area).
-            let suffix_x = popup_x1 - cw * 0.5 - 10.0 * cw;
             self.push_text(&mut verts, suffix_x, y, entry.kind_label, suffix_color, 10);
             y += ch;
         }
 
         // Return the popup rect for border drag-resize hot-zone detection.
-        let popup_rect = Some([popup_x0, popup_top, popup_x1, popup_bottom]);
-
-        (verts, popup_rect)
+        (verts, Some(layout.popup_rect))
     }
 
     /// Render the palette's variable-fill form (sub-mode when a workflow is selected).
@@ -2035,8 +2215,6 @@ fragment float4 text_fragment(
     fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
-        let ch = self.cell_height() as f32;
-        let vp_w = self.viewport.0;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
         // v0.8 Quiet: accent_dim for the selected-row highlight tint.
@@ -2046,15 +2224,15 @@ fragment float4 text_fragment(
         let bg_uv = [su, sv + svh, su + suw, sv];
 
         let items = ["Copy Command", "Copy Output", "Toggle Fold"];
-        let item_h = ch * 1.2;
-        let menu_w = 180.0 * (self.scale as f32);
-        let menu_h = items.len() as f32 * item_h + ch * 0.4;
 
-        // Clamp to viewport.
-        let menu_x0 = x.min(vp_w - menu_w - 4.0);
-        let menu_y0 = y;
-        let menu_x1 = menu_x0 + menu_w;
-        let menu_y1 = menu_y0 + menu_h;
+        // v0.8 stage 4: layout (menu rect, per-item Y, separators, text X)
+        // is computed by the pure function in `layout.rs`. The renderer keeps
+        // responsibility for vertex building, theming, and text rasterization.
+        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+        let layout = crate::layout::layout_context_menu(&ctx, x, y, self.scale as f32);
+        let [menu_x0, menu_y0, menu_x1, menu_y1] = layout.menu_rect;
+        let menu_w = menu_x1 - menu_x0;
+        let text_x = layout.text_x;
 
         let popup_bg = [
             theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
@@ -2065,13 +2243,7 @@ fragment float4 text_fragment(
         let border_c = [0.5, 0.5, 0.5, 0.35];
 
         // Background.
-        push_quad(
-            &mut verts,
-            [menu_x0, menu_y0, menu_x1, menu_y1],
-            bg_uv,
-            [0.0; 4],
-            popup_bg,
-        );
+        push_quad(&mut verts, layout.menu_rect, bg_uv, [0.0; 4], popup_bg);
         // Border.
         for (bx0, by0, bx1, by1) in [
             (menu_x0, menu_y0, menu_x1, menu_y0 + 1.0),
@@ -2084,7 +2256,7 @@ fragment float4 text_fragment(
 
         // Items.
         for (i, label) in items.iter().enumerate() {
-            let item_y = menu_y0 + ch * 0.2 + i as f32 * item_h;
+            let item_y = layout.item_y[i];
             let color = if i == items.len() - 1 {
                 prompt_c // "Toggle Fold" in accent
             } else {
@@ -2092,7 +2264,7 @@ fragment float4 text_fragment(
             };
             self.push_text(
                 &mut verts,
-                menu_x0 + cw * 0.4,
+                text_x,
                 item_y,
                 label,
                 color,
@@ -2100,7 +2272,7 @@ fragment float4 text_fragment(
             );
             // Separator between items (except last).
             if i + 1 < items.len() {
-                let sep_y = item_y + item_h;
+                let sep_y = layout.separator_ys[i];
                 push_quad(
                     &mut verts,
                     [menu_x0 + 2.0, sep_y, menu_x1 - 2.0, sep_y + 1.0],
@@ -2131,7 +2303,7 @@ fragment float4 text_fragment(
         git_branch: Option<&str>,
         live: Option<weft_core::blocks::InFlightBlock<'_>>,
         block_scroll: usize,
-        selection: &weft_core::selection::SelectionHandler,
+        selection: &mut weft_core::selection::SelectionHandler,
     ) -> (
         Vec<f32>,
         Vec<crate::overlay::HitRegion>,
@@ -2148,13 +2320,6 @@ fragment float4 text_fragment(
             return (verts, hit_regions, bv_rows);
         }
 
-        let pad_x = self.padding_x;
-        let pad_y = self.padding_y;
-        let left = pad_x;
-        let right = vp_w - pad_x;
-        let cols = (((right - left) / cw).max(1.0)) as usize;
-        let pitch = ch * 1.1;
-
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
         // v0.8 Quiet direction: chevrons/prompt marks use accent_dim (warm gray)
@@ -2166,6 +2331,21 @@ fragment float4 text_fragment(
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
+
+        // v0.8 stage 4: layout (pitch, left/right/cols, clip region, fixed
+        // CWD line position) is computed by the pure function in `layout.rs`.
+        // The renderer keeps responsibility for vertex building, theming,
+        // and text rasterization. Per-row Y is data-driven (each row's
+        // distance accumulates from the cumulative output line count of all
+        // blocks below it), so it stays in the renderer's render loop.
+        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+        let cwd_header_active = cwd.is_some() && live.is_none();
+        let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
+        let pitch = layout.pitch;
+        let left = layout.left;
+        let right = layout.right;
+        let cols = layout.cols;
+        let content_bottom_y = layout.clip_bottom;
 
         // Background fill for the block region.
         push_quad(
@@ -2183,10 +2363,9 @@ fragment float4 text_fragment(
         // it's grouped with the input box, not with the scrollable history.
         //
         // The scrollable content area starts ABOVE this fixed CWD line.
-        let content_bottom_y;
         if let Some(cwd) = cwd {
             if live.is_none() {
-                let fixed_y = region_bottom_y - pitch;
+                let fixed_y = layout.fixed_cwd_y;
                 // Divider line.
                 push_quad(
                     &mut verts,
@@ -2205,13 +2384,7 @@ fragment float4 text_fragment(
                 if !display.is_empty() {
                     self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
                 }
-                // Scrollable content starts above the CWD line.
-                content_bottom_y = region_bottom_y - 2.0 * pitch;
-            } else {
-                content_bottom_y = region_bottom_y;
             }
-        } else {
-            content_bottom_y = region_bottom_y;
         }
 
         // ── Phase 1: Pre-layout scrollable content rows ──────────────────
@@ -2222,7 +2395,11 @@ fragment float4 text_fragment(
         // region are rendered — no blank space.
 
         enum LaidRow<'a> {
-            Output(&'a str),
+            Output {
+                text: &'a str,
+                block_id: Option<BlockId>,
+                line: usize,
+            },
             Command {
                 command: &'a str,
                 collapsed: bool,
@@ -2245,11 +2422,29 @@ fragment float4 text_fragment(
         // Bottom of scrollable content: live block (CommandExecuting) or
         // nothing (Editor mode — CWD is already handled above).
         if let Some(live) = live {
-            for line in live.output.lines().rev() {
+            // Live block: line numbers start from 0 in the live output.
+            // Collect to Vec first because std::str::Lines doesn't impl
+            // DoubleEndedIterator (can't .rev() directly).
+            //
+            // v0.9 fix: cap the number of lines we layout per frame to avoid
+            // O(n) slowdown when a command produces huge output (e.g. 20K
+            // lines from a for-loop). Only the tail is visible anyway — older
+            // lines have scrolled off the top of the clip region.
+            const MAX_LAYOUT_LINES_LIVE: usize = 2000;
+            let all_lines: Vec<&str> = live.output.lines().collect();
+            let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
+            let live_lines: Vec<&str> = all_lines[skip..].to_vec();
+            let base_idx = skip;
+            for (i, line) in live_lines.iter().enumerate().rev() {
+                let line_idx = base_idx + i;
                 let vis_rows = wrapped_row_count(line, cols);
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
-                row_data.push(LaidRow::Output(line));
+                row_data.push(LaidRow::Output {
+                    text: line,
+                    block_id: None,
+                    line: line_idx,
+                });
             }
             cursor_dist += pitch;
             rows.push(cursor_dist);
@@ -2262,20 +2457,48 @@ fragment float4 text_fragment(
         }
 
         for b in blocks.iter().rev() {
-            let foldable = b.output.lines().any(|l| !l.trim().is_empty());
+            // v0.9 fix: limit the foldable check to the last 500 lines —
+            // checking all lines of a huge block (e.g. 20K-line for-loop)
+            // is O(n) per frame and the foldable flag only needs to know if
+            // ANY line has content, which is almost always true for the tail.
+            let foldable = b
+                .output
+                .lines()
+                .rev()
+                .take(500)
+                .any(|l| !l.trim().is_empty());
             if !b.collapsed {
                 let mut out_lines: Vec<&str> = b.output.lines().collect();
-                while out_lines
-                    .last()
-                    .is_some_and(|l| matches!(l.trim(), "%" | "$" | "#"))
-                {
+                // Trim trailing prompt lines AND empty lines. The shell often
+                // emits a trailing newline before the next prompt, which shows
+                // up as an empty line at the end of the block output. Without
+                // trimming, every block gets a visually uneven bottom margin
+                // (the "上窄下宽" complaint) and cross-block copy carries the
+                // empty line into the pasted text.
+                while out_lines.last().is_some_and(|l| {
+                    let t = l.trim();
+                    t.is_empty() || matches!(t, "%" | "$" | "#")
+                }) {
                     out_lines.pop();
                 }
-                for line in out_lines.iter().rev() {
+                // v0.9 fix: the previous 2000-line tail cap was removed — it
+                // broke find-highlight navigation for matches in earlier lines
+                // (the matched row wasn't in `row_data`, so the highlight
+                // check `bh.1 == *line` never matched). The render loop already
+                // skips rows outside the clip region, so laying out all lines
+                // doesn't add vertex cost; the only cost is the O(n) layout
+                // loop itself, which is cheap (Vec pushes, no per-row GPU work).
+                let base_idx = 0usize;
+                for (i, line) in out_lines.iter().enumerate().rev() {
+                    let line_idx = base_idx + i;
                     let vis_rows = wrapped_row_count(line, cols);
                     cursor_dist += vis_rows as f32 * pitch;
                     rows.push(cursor_dist);
-                    row_data.push(LaidRow::Output(line));
+                    row_data.push(LaidRow::Output {
+                        text: line,
+                        block_id: Some(b.id),
+                        line: line_idx,
+                    });
                 }
             }
             cursor_dist += pitch;
@@ -2308,7 +2531,7 @@ fragment float4 text_fragment(
         // ── Phase 2: Render scrollable content with offset ───────────────
 
         let scroll_px = (block_scroll as f32) * pitch;
-        let clip_top = pad_y;
+        let clip_top = layout.clip_top;
         let clip_bottom = content_bottom_y;
 
         // Track the block whose content is at the top of the viewport (for
@@ -2322,8 +2545,119 @@ fragment float4 text_fragment(
         // snapshot rows share y-bands with this frame's layout (cloned at
         // drag start); we key on y-band rather than a global index so wrapped
         // multi-chunk Output rows highlight correctly per chunk.
+        let selection_bg = {
+            let mut c = color_to_normalized(self.theme.selection);
+            // Semi-transparent so the underlying text stays readable (matches
+            // the grid-view selection alpha above).
+            c[3] = 0.55;
+            c
+        };
+        // Pre-pass: build bv_rows (y-bands + text) WITHOUT rendering, so we
+        // can sync the selection's row snapshot to the current frame before
+        // drawing highlights. This fixes the "selection stays at fixed screen
+        // position on scroll" bug — the snapshot's y-bands are refreshed to
+        // the current frame's layout, so the highlight tracks the content.
+        // NOTE: we do NOT clip here (unlike the render loop below). Including
+        // off-screen rows means sync_rows can always find a match by
+        // (block_id, text, kind) even when the selection spans content that
+        // has scrolled out of the viewport — without this, the proportional
+        // fallback would mis-map row_index and the highlight would jump to
+        // the wrong row.
+        for (i, &dist) in rows.iter().enumerate() {
+            let row_top_y = content_bottom_y - dist + scroll_px;
+            let row_bottom_y = row_top_y + pitch;
+            let _ = row_bottom_y; // unused (no clip in pre-pass)
+            let y = row_top_y;
+            match &row_data[i] {
+                LaidRow::Output {
+                    text,
+                    block_id,
+                    line: _,
+                } => {
+                    let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
+                    if chunks.len() <= 1 {
+                        bv_rows.push(weft_core::selection::BlockViewRow {
+                            kind: weft_core::selection::BlockViewRowKind::Output,
+                            text: text.to_string(),
+                            block_id: *block_id,
+                            y_top: y,
+                            y_bottom: y + pitch,
+                        });
+                    } else {
+                        for (ci, chunk) in chunks.iter().enumerate() {
+                            let cy = y + ci as f32 * pitch;
+                            bv_rows.push(weft_core::selection::BlockViewRow {
+                                kind: weft_core::selection::BlockViewRowKind::Output,
+                                text: chunk.clone(),
+                                block_id: *block_id,
+                                y_top: cy,
+                                y_bottom: cy + pitch,
+                            });
+                        }
+                    }
+                }
+                LaidRow::Command {
+                    command, block_id, ..
+                } => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Command,
+                        text: command.to_string(),
+                        block_id: Some(*block_id),
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
+                }
+                LaidRow::Header { text: _ } => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Header,
+                        text: String::new(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
+                }
+                LaidRow::Separator => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Separator,
+                        text: String::new(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
+                }
+                LaidRow::LiveCommand { command } => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::LiveCommand,
+                        text: command.to_string(),
+                        block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
+                }
+            }
+        }
+        // Sync the selection's row snapshot to the current frame's bv_rows.
+        // This remaps start/end row_index by matching (block_id, text, kind),
+        // so the highlight scrolls WITH the content instead of staying pinned
+        // to a stale screen y-position.
+        if let Some(sel) = selection.block_view_selection.as_mut() {
+            sel.sync_rows(bv_rows.clone());
+        }
+        // NOTE: we intentionally do NOT clear bv_rows here. The pre-pass above
+        // built the UNCLIPPED row list (visible + off-screen rows). The render
+        // loop below used to rebuild a CLIPPED version for hit-testing, but
+        // that created an index mismatch: sync_rows remaps the selection's
+        // row_index into the UNCLIPPED array, while the hit-test
+        // (pixel_to_block_view_pos) returned indices into the CLIPPED array.
+        // During a drag, extend_block_view received CLIPPED indices but the
+        // snapshot was UNCLIPPED — producing a wrong range. Using UNCLIPPED
+        // for both sync_rows AND hit-test keeps the indices consistent.
+        // The render loop no longer pushes to bv_rows (the pre-pass already
+        // has every row with the correct y-band + text).
+        // Re-borrow after the mutable sync above.
         let sel_bv = selection.block_view_selection.as_ref();
-        let selection_bg = color_to_normalized(self.theme.selection);
+        // Find highlight for block view: (block_id, line, is_command, col, len).
+        let find_block_highlight = self.find_state.as_ref().and_then(|f| f.block_highlight);
         let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
             let s = sel_bv?;
             let snap_idx = s.rows.iter().position(|r| r.contains_y(row_mid_y))?;
@@ -2338,23 +2672,41 @@ fragment float4 text_fragment(
                 let hi = s.start.char_index.max(s.end.char_index).min(max_char);
                 (lo, hi)
             } else if snap_idx == top {
+                // Top boundary: tail of row [anchor, max). Matches the text
+                // extraction in BlockViewSelection::text() — drag starts at
+                // the anchor and extends downward, so the top row contributes
+                // its tail, not its head.
                 let anchor = if s.start.row_index >= s.end.row_index {
                     s.start.char_index
                 } else {
                     s.end.char_index
-                };
-                (0, anchor.min(max_char))
-            } else if snap_idx == bottom {
-                let anchor = if s.start.row_index >= s.end.row_index {
-                    s.end.char_index
-                } else {
-                    s.start.char_index
                 };
                 (anchor.min(max_char), max_char)
+            } else if snap_idx == bottom {
+                // Bottom boundary: head of row [0, anchor).
+                let anchor = if s.start.row_index >= s.end.row_index {
+                    s.end.char_index
+                } else {
+                    s.start.char_index
+                };
+                (0, anchor.min(max_char))
             } else {
                 (0, max_char)
             };
             (c_end > c_start).then_some((c_start, c_end))
+        };
+        // True if a row band (mid-y) falls inside the selection's row range,
+        // regardless of whether the row carries selectable text. Used to
+        // fill Header/Separator rows with the selection color so the
+        // highlight reads as a continuous band instead of broken segments.
+        let row_in_selection = |row_mid_y: f32| -> bool {
+            let Some(s) = sel_bv else { return false };
+            let Some(snap_idx) = s.rows.iter().position(|r| r.contains_y(row_mid_y)) else {
+                return false;
+            };
+            let top = s.start.row_index.max(s.end.row_index);
+            let bottom = s.start.row_index.min(s.end.row_index);
+            snap_idx >= bottom && snap_idx <= top
         };
 
         for (i, &dist) in rows.iter().enumerate() {
@@ -2368,7 +2720,11 @@ fragment float4 text_fragment(
             let y = row_top_y;
 
             match &row_data[i] {
-                LaidRow::Output(text) => {
+                LaidRow::Output {
+                    text,
+                    block_id,
+                    line,
+                } => {
                     let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
                     if chunks.len() <= 1 {
                         // Selection highlight (under the text).
@@ -2385,15 +2741,25 @@ fragment float4 text_fragment(
                                 bg_uv,
                             );
                         }
+                        // Find highlight: if this row matches the current
+                        // block match, draw a yellow highlight at (col, len).
+                        if let Some(bh) = find_block_highlight {
+                            if bh.0 == block_id.map(|b| b.0).unwrap_or(0) && bh.1 == *line && !bh.2
+                            {
+                                let hx0 = left + bh.3 as f32 * cw;
+                                let hx1 = hx0 + bh.4 as f32 * cw;
+                                let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                                push_quad(
+                                    &mut verts,
+                                    [hx0, y, hx1, y + ch],
+                                    bg_uv,
+                                    [0.0; 4],
+                                    hl_bg,
+                                );
+                            }
+                        }
                         self.push_text(&mut verts, left, y, text, fg, cols);
-                        // Record the row band for selection hit-testing.
-                        bv_rows.push(weft_core::selection::BlockViewRow {
-                            kind: weft_core::selection::BlockViewRowKind::Output,
-                            text: text.to_string(),
-                            block_id: None,
-                            y_top: y,
-                            y_bottom: y + pitch,
-                        });
+                        // bv_rows entry is built by the pre-pass (UNCLIPPED).
                     } else {
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
@@ -2411,16 +2777,31 @@ fragment float4 text_fragment(
                                         bg_uv,
                                     );
                                 }
+                                // Find highlight for wrapped chunks: only
+                                // highlight on the first chunk (col is relative
+                                // to the original line).
+                                if ci == 0 {
+                                    if let Some(bh) = find_block_highlight {
+                                        if bh.0 == block_id.map(|b| b.0).unwrap_or(0)
+                                            && bh.1 == *line
+                                            && !bh.2
+                                        {
+                                            let hx0 = left + bh.3 as f32 * cw;
+                                            let hx1 = hx0 + bh.4 as f32 * cw;
+                                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                                            push_quad(
+                                                &mut verts,
+                                                [hx0, cy, hx1, cy + ch],
+                                                bg_uv,
+                                                [0.0; 4],
+                                                hl_bg,
+                                            );
+                                        }
+                                    }
+                                }
                                 self.push_text(&mut verts, left, cy, chunk, fg, cols);
                             }
-                            // Each wrapped sub-line is its own selectable band.
-                            bv_rows.push(weft_core::selection::BlockViewRow {
-                                kind: weft_core::selection::BlockViewRowKind::Output,
-                                text: chunk.clone(),
-                                block_id: None,
-                                y_top: cy,
-                                y_bottom: cy + pitch,
-                            });
+                            // Wrapped chunk's bv_rows entry is in the pre-pass.
                         }
                     }
                 }
@@ -2455,6 +2836,15 @@ fragment float4 text_fragment(
                             bg_uv,
                         );
                     }
+                    // Find highlight on command text.
+                    if let Some(bh) = find_block_highlight {
+                        if bh.0 == block_id.0 && bh.2 {
+                            let hx0 = cmd_x + bh.3 as f32 * cw;
+                            let hx1 = hx0 + bh.4 as f32 * cw;
+                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                            push_quad(&mut verts, [hx0, y, hx1, y + ch], bg_uv, [0.0; 4], hl_bg);
+                        }
+                    }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
                     if *foldable {
                         hit_regions.push(crate::overlay::HitRegion {
@@ -2465,29 +2855,36 @@ fragment float4 text_fragment(
                             target: crate::overlay::HitTarget::BlockFold(*block_id),
                         });
                     }
-                    // Command row is selectable (copies the command text).
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Command,
-                        text: command.to_string(),
-                        block_id: Some(*block_id),
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
+                    // Command row's bv_rows entry is in the pre-pass.
                 }
                 LaidRow::Header { text } => {
+                    // Fill the row band with selection color when this Header
+                    // row sits inside the active selection — otherwise the
+                    // highlight reads as broken segments between Command
+                    // and Output rows (Header isn't selectable, so
+                    // sel_range_for_y returns None here).
+                    if row_in_selection(y + pitch * 0.5) {
+                        push_quad(
+                            &mut verts,
+                            [left, y, right, y + pitch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
                     self.push_text(&mut verts, left, y, text, dim, cols);
-                    // Header is metadata, not selectable — but we still record
-                    // the band so hit-testing can return None cleanly instead
-                    // of falling through to a neighbouring row.
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Header,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
+                    // Header's bv_rows entry is in the pre-pass.
                 }
                 LaidRow::Separator => {
+                    if row_in_selection(y + pitch * 0.5) {
+                        push_quad(
+                            &mut verts,
+                            [left, y, right, y + pitch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
                     let ly = y + pitch * 0.5;
                     push_quad(
                         &mut verts,
@@ -2496,13 +2893,7 @@ fragment float4 text_fragment(
                         [0.0; 4],
                         separator,
                     );
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Separator,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
+                    // Separator's bv_rows entry is in the pre-pass.
                 }
                 LaidRow::LiveCommand { command } => {
                     self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
@@ -2522,13 +2913,7 @@ fragment float4 text_fragment(
                         );
                     }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::LiveCommand,
-                        text: command.to_string(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
+                    // LiveCommand's bv_rows entry is in the pre-pass.
                 }
             }
 
@@ -2560,7 +2945,7 @@ fragment float4 text_fragment(
         // you're looking at without seeing the block's own header.
         if block_scroll > 0 {
             if let Some((cmd, block_cwd)) = &topmost_block_info {
-                let sticky_y = pad_y;
+                let sticky_y = layout.clip_top;
                 // Background bar (slightly different shade to distinguish).
                 let sticky_bg = [
                     theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
@@ -2755,6 +3140,396 @@ fragment float4 text_fragment(
                 col += w;
             }
         }
+    }
+
+    /// Build the FindInGrid overlay (v0.8 B3): a Warp-style popup card in
+    /// the top-right corner showing the query + match count, plus a yellow
+    /// translucent highlight over the current match's cells.
+    ///
+    /// v0.8 user testing asked for a Warp-style independent popup (instead
+    /// of a full-width top banner) floating in the top-right corner. The
+    /// card is a layered surface: drop shadow + tinted background + 1px
+    /// border + accent-colored left stripe, with a single row of
+    /// "Find: <query>  <status>" inside. Auto-focus is already handled at
+    /// the app layer — `handle_find_key` captures keystrokes when `find_open`
+    /// is true, so the input is functionally focused whenever the popup is
+    /// visible.
+    ///
+    /// Drawing uses the same fg/bg vertex pipeline as the rest of the
+    /// renderer: text is sampled from the glyph atlas, card surfaces are
+    /// bg-only quads sampling the space glyph (mask 0 → solid bg color).
+    fn build_find_vertices(&self, find: &FindDrawState) -> (Vec<f32>, FindButtons) {
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let ctx = match &self.layout_ctx {
+            Some(c) => *c,
+            None => return (Vec::new(), FindButtons::default()),
+        };
+
+        let mut verts = Vec::new();
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv]; // V-flipped for layer
+
+        // ── Popup geometry ──────────────────────────────────────────────
+        // Target ~500px wide (Warp's default), capped by available content
+        // width so it never overflows the left edge. Height: at least one
+        // cell + 16px padding, at most 1.75× cell height for legibility.
+        let target_w = 500.0_f32;
+        let right_margin = 20.0;
+        let top_margin = 10.0;
+        let min_w = cw * 48.0; // v0.9 fix: wider min so query + buttons + status fit
+        let popup_w = target_w.min(ctx.width() - right_margin - 20.0).max(min_w);
+        let popup_h = (ch * 1.75).max(ch + 16.0);
+        let popup_x1 = ctx.right() - right_margin;
+        let popup_x0 = popup_x1 - popup_w;
+        let popup_y0 = ctx.top() + top_margin;
+        let popup_y1 = popup_y0 + popup_h;
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let accent = color_to_normalized(self.theme.accent);
+        let accent_dim = color_to_normalized(self.theme.accent_dim);
+        let sep = color_to_normalized(self.theme.separator);
+        let fg = color_to_normalized(self.theme.foreground);
+
+        // ── Drop shadow (offset translucent rect behind the card) ────────
+        let shadow_offset = 4.0;
+        push_quad(
+            &mut verts,
+            [
+                popup_x0 + shadow_offset,
+                popup_y0 + shadow_offset,
+                popup_x1 + shadow_offset,
+                popup_y1 + shadow_offset,
+            ],
+            bg_uv,
+            [0.0; 4],
+            [0.0, 0.0, 0.0, 0.45],
+        );
+
+        // ── Card background — theme-aware: darken for dark themes, lighten
+        // for light themes. Detect luminance from the bg so the popup always
+        // reads as a distinct floating surface against the grid. Near-opaque
+        // (0.97 alpha) to occlude underlying grid content. ─────────────────
+        let bg_lum = theme_bg[0] * 0.299 + theme_bg[1] * 0.587 + theme_bg[2] * 0.114;
+        let card_bg = if bg_lum < 0.35 {
+            // Dark theme — tint darker than the grid bg.
+            [
+                theme_bg[0] * 0.55 + 0.02,
+                theme_bg[1] * 0.55 + 0.02,
+                theme_bg[2] * 0.55 + 0.02,
+                0.97,
+            ]
+        } else {
+            // Light theme — tint lighter than the grid bg (towards pure white)
+            // so the card reads as elevated/sunken like a macOS popover.
+            [
+                (theme_bg[0] + (1.0 - theme_bg[0]) * 0.6).min(1.0),
+                (theme_bg[1] + (1.0 - theme_bg[1]) * 0.6).min(1.0),
+                (theme_bg[2] + (1.0 - theme_bg[2]) * 0.6).min(1.0),
+                0.97,
+            ]
+        };
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_y0, popup_x1, popup_y1],
+            bg_uv,
+            [0.0; 4],
+            card_bg,
+        );
+
+        // ── 1px border around the card (top/right/bottom/left) ──────────
+        let border_w = 1.0;
+        let border_bg = [sep[0], sep[1], sep[2], 0.9];
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_y0, popup_x1, popup_y0 + border_w],
+            bg_uv,
+            [0.0; 4],
+            border_bg,
+        );
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_y1 - border_w, popup_x1, popup_y1],
+            bg_uv,
+            [0.0; 4],
+            border_bg,
+        );
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_y0, popup_x0 + border_w, popup_y1],
+            bg_uv,
+            [0.0; 4],
+            border_bg,
+        );
+        push_quad(
+            &mut verts,
+            [popup_x1 - border_w, popup_y0, popup_x1, popup_y1],
+            bg_uv,
+            [0.0; 4],
+            border_bg,
+        );
+
+        // ── Accent-colored left stripe (3px) — v0.8 signature accent ────
+        // Replaces the previous top accent stripe so the popup still reads
+        // as branded without occupying vertical space at the card edge.
+        let stripe_w = 3.0;
+        push_quad(
+            &mut verts,
+            [
+                popup_x0 + border_w,
+                popup_y0 + border_w,
+                popup_x0 + border_w + stripe_w,
+                popup_y1 - border_w,
+            ],
+            bg_uv,
+            [0.0; 4],
+            [accent[0], accent[1], accent[2], 1.0],
+        );
+
+        // ── Match highlight (yellow translucent overlay on grid cells) ──
+        // Drawn over the grid content area, independent of the popup card.
+        if let Some((row, col, len)) = find.highlight {
+            let hx0 = ctx.col_x(col);
+            let hy0 = ctx.row_y(row);
+            let hx1 = hx0 + len as f32 * cw;
+            let hy1 = hy0 + ch;
+            // Soft yellow with 0.5 alpha so the underlying text stays readable.
+            push_quad(
+                &mut verts,
+                [hx0, hy0, hx1, hy1],
+                bg_uv,
+                [0.0; 4],
+                [0.95, 0.78, 0.20, 0.50],
+            );
+        }
+
+        // ── Popup text row ─────────────────────────────────────────────
+        // Layout (left to right):
+        //   [pad]Find: <query>│    <status> [↑][↓] [Aa] [.*][pad]
+        //   │ = blinking cursor at end of query
+        //   <status> = compact match count (right-aligned)
+        //   ↑/↓ = prev/next match buttons (clickable)
+        //   Aa = case-sensitive toggle (lit when case_sensitive is on)
+        //   .* = regex toggle indicator (lit when regex_mode is on)
+        //
+        // Button hit-test rects (with generous click padding) are stored in
+        // self.find_buttons for the app's mouse handler to read.
+        let inner_pad_x = 8.0;
+        let text_x0 = popup_x0 + border_w + stripe_w + inner_pad_x;
+        let text_x1 = popup_x1 - border_w - inner_pad_x;
+        let line_y = popup_y0 + border_w + ((popup_h - border_w * 2.0 - ch) * 0.5).max(0.0);
+        let right_x = text_x1;
+
+        // ── Right-aligned button cluster (rightmost first) ───────────────
+        // Each button: 2 chars wide glyph + 1 char gap on its left side.
+        // Click padding: extend the hit-test rect 2px above/below the line
+        // and 1px left/right so the clickable area is forgiving.
+        let btn_click_pad = 2.0;
+        let gap_cols = 1;
+        let gap_w = gap_cols as f32 * cw;
+
+        // ".*" regex toggle (rightmost).
+        let regex_label = ".*";
+        let regex_w = Self::text_col_width(regex_label);
+        let regex_text_w = regex_w as f32 * cw;
+        let regex_x = right_x - regex_text_w;
+        let regex_color = if find.regex_mode { accent } else { accent_dim };
+        self.push_text(
+            &mut verts,
+            regex_x,
+            line_y,
+            regex_label,
+            regex_color,
+            regex_w,
+        );
+        let regex_rect = [
+            regex_x - btn_click_pad,
+            line_y - btn_click_pad,
+            right_x + btn_click_pad,
+            line_y + ch + btn_click_pad,
+        ];
+
+        // "Aa" case-sensitive toggle.
+        let case_label = "Aa";
+        let case_w = Self::text_col_width(case_label);
+        let case_text_w = case_w as f32 * cw;
+        let case_x = regex_x - gap_w - case_text_w;
+        let case_color = if find.case_sensitive {
+            accent
+        } else {
+            accent_dim
+        };
+        self.push_text(&mut verts, case_x, line_y, case_label, case_color, case_w);
+        let case_rect = [
+            case_x - btn_click_pad,
+            line_y - btn_click_pad,
+            case_x + case_text_w + btn_click_pad,
+            line_y + ch + btn_click_pad,
+        ];
+
+        // "↓" down arrow (next match) — 1 char wide.
+        let down_label = "↓";
+        let down_w = Self::text_col_width(down_label);
+        let down_text_w = down_w as f32 * cw;
+        let down_x = case_x - gap_w - down_text_w;
+        let down_color = if find.total > 0 { accent_dim } else { sep };
+        self.push_text(&mut verts, down_x, line_y, down_label, down_color, down_w);
+        let down_rect = if find.total > 0 {
+            Some([
+                down_x - btn_click_pad,
+                line_y - btn_click_pad,
+                down_x + down_text_w + btn_click_pad,
+                line_y + ch + btn_click_pad,
+            ])
+        } else {
+            None
+        };
+
+        // "↑" up arrow (previous match) — 1 char wide.
+        let up_label = "↑";
+        let up_w = Self::text_col_width(up_label);
+        let up_text_w = up_w as f32 * cw;
+        let up_x = down_x - gap_w - up_text_w;
+        let up_color = if find.total > 0 { accent_dim } else { sep };
+        self.push_text(&mut verts, up_x, line_y, up_label, up_color, up_w);
+        let up_rect = if find.total > 0 {
+            Some([
+                up_x - btn_click_pad,
+                line_y - btn_click_pad,
+                up_x + up_text_w + btn_click_pad,
+                line_y + ch + btn_click_pad,
+            ])
+        } else {
+            None
+        };
+
+        // Store hit-test rects for the app's mouse handler. Returned to the
+        // caller (draw()) rather than written to `self` directly to avoid a
+        // borrow conflict with the Metal drawable (which borrows `self.layer`
+        // for the whole frame).
+        let buttons = FindButtons {
+            up: up_rect,
+            down: down_rect,
+            case_sensitive: case_rect,
+            regex: regex_rect,
+        };
+
+        // ── Status text (left of the up arrow, compact) ──────────────────
+        // Compact format to avoid overflow:
+        //   empty query → "" (nothing, keep it clean)
+        //   no matches   → "no matches  "
+        //   has matches  → "current/total  "
+        //   truncated    → "total+  "
+        //   block-only   → "N in blocks  "
+        //   regex error  → "invalid regex  " (red — v0.9 U-P2)
+        //
+        // v0.9 fix: if the status text would push `status_x` so far left that
+        // the query has < MIN_QUERY_BUDGET cols, skip rendering the status
+        // text entirely. The query visibility is more important than status.
+        let (status, status_color) = if find.regex_error.is_some() {
+            ("invalid regex  ".to_string(), accent)
+        } else if find.query.is_empty() {
+            (String::new(), accent_dim)
+        } else if find.truncated {
+            (format!("{}+  ", find.total), accent_dim)
+        } else if find.total == 0 {
+            if find.block_matches > 0 {
+                (format!("{} in blocks  ", find.block_matches), accent_dim)
+            } else {
+                ("no matches  ".to_string(), accent_dim)
+            }
+        } else {
+            (
+                format!("{}/{}  ", find.current.max(1), find.total),
+                accent_dim,
+            )
+        };
+        let status_w = Self::text_col_width(&status);
+        let status_x = up_x - gap_w - status_w as f32 * cw;
+        // Check if there's room for both status and a minimum-width query.
+        let query_start_x_test = text_x0 + Self::text_col_width("Find: ") as f32 * cw;
+        let avail_for_query = ((status_x - query_start_x_test) / cw).floor() as isize;
+        const MIN_QUERY_BUDGET: isize = 10;
+        let show_status = avail_for_query >= MIN_QUERY_BUDGET;
+        if show_status {
+            self.push_text(
+                &mut verts,
+                status_x,
+                line_y,
+                &status,
+                status_color,
+                status_w,
+            );
+        }
+
+        // ── "Find: " label ───────────────────────────────────────────────
+        let label = "Find: ";
+        let label_cols = Self::text_col_width(label);
+        self.push_text(&mut verts, text_x0, line_y, label, accent, label_cols);
+
+        // ── Query text (truncated from left to fit) ──────────────────────
+        // The cursor sits at the END of the query, so we show the tail when
+        // the query is too long (prepend "…" to indicate truncation).
+        let query_start_x = text_x0 + label_cols as f32 * cw;
+        // v0.9 fix: when status is hidden (show_status == false), the query
+        // extends to up_x (the left edge of the ↑ button). Otherwise it
+        // extends to status_x.
+        let query_right_x = if show_status { status_x } else { up_x };
+        let query_max_w = ((query_right_x - query_start_x) / cw).floor().max(0.0) as usize;
+        // Reserve 1 col for the cursor.
+        let query_budget = query_max_w.saturating_sub(1);
+        let query_full_w = Self::text_col_width(&find.query);
+        let (query_display, cursor_x): (String, f32) = if query_full_w <= query_budget {
+            // Full query fits — cursor goes right after the last char.
+            let cx = query_start_x + query_full_w as f32 * cw;
+            (find.query.clone(), cx)
+        } else {
+            // Truncate from left: walk chars in reverse, keep the tail.
+            let mut kept: Vec<char> = Vec::new();
+            let mut w = 1usize; // reserve 1 for "…"
+            for c in find.query.chars().rev() {
+                let cw_char = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                if w + cw_char > query_budget {
+                    break;
+                }
+                kept.push(c);
+                w += cw_char;
+            }
+            kept.reverse();
+            let mut s = String::from("…");
+            s.extend(kept.iter());
+            let cx = query_start_x + w as f32 * cw;
+            (s, cx)
+        };
+        let query_cols = Self::text_col_width(&query_display);
+        self.push_text(
+            &mut verts,
+            query_start_x,
+            line_y,
+            &query_display,
+            fg,
+            query_cols,
+        );
+
+        // ── Blinking cursor (vertical bar at end of query) ───────────────
+        // 600ms on, 600ms off — standard terminal cursor blink rate.
+        let blink_phase = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 1200)
+            .unwrap_or(0);
+        if blink_phase < 600 {
+            let cursor_w = 2.0_f32.max(cw * 0.12);
+            push_quad(
+                &mut verts,
+                [cursor_x, line_y, cursor_x + cursor_w, line_y + ch],
+                bg_uv,
+                [0.0; 4],
+                fg,
+            );
+        }
+
+        let _ = ch;
+        (verts, buttons)
     }
 
     /// UV rect of the space glyph (background-only quads need mask 0).

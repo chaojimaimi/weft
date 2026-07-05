@@ -23,6 +23,7 @@ unicode-width.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true
+regex.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
 
 [dev-dependencies]

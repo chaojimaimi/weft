@@ -2098,6 +2098,7 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
  "pathfinder_geometry",
+ "regex",
  "tokio",
  "tracing",
  "tracing-subscriber",

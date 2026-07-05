@@ -26,7 +26,14 @@ use std::time::SystemTime;
 /// `cat huge.log`. Beyond this the capture stops and the block is marked
 /// truncated. The grid already holds the full output for display; this only
 /// guards the detached snapshot used by search / persistence.
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// v0.9 fix: raised from 64 KiB to 1 MiB. The 64 KiB cap was too aggressive
+/// for real-world commands (e.g. `for i in $(seq 1 20000); do echo ...; done`
+/// hits it at ~3000 lines). 1 MiB covers typical log dumps / build outputs
+/// while keeping memory bounded (a 100-block session = 100 MiB worst case,
+/// acceptable for a desktop terminal). Block view layout is independently
+/// capped at 2000 visible lines per block in the renderer, so raising this
+/// doesn't affect rendering perf.
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Monotonically-increasing block identifier. Assigned by [`BlockTracker`],
 /// reused as the SQLite primary key (phase 3).
@@ -298,7 +305,7 @@ impl BlockTracker {
         let cwd = self.pending_cwd.take();
         let mut output = std::mem::take(&mut self.output_buf);
         if self.output_truncated {
-            output.push_str("\n…(output truncated, >64 KiB)");
+            output.push_str("\n…(output truncated, >1 MiB)");
         }
         self.output_truncated = false;
         // Mask secrets capture-side so the stored block (history / search /
@@ -471,7 +478,7 @@ mod tests {
 
         let block = t.blocks().last().unwrap();
         assert!(
-            block.output.ends_with("(output truncated, >64 KiB)"),
+            block.output.ends_with("(output truncated, >1 MiB)"),
             "expected truncation marker, got tail: …{}",
             &block.output[block.output.len().saturating_sub(40)..]
         );

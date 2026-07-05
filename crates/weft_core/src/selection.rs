@@ -372,11 +372,15 @@ impl BlockViewSelection {
                 let hi = top_pos.char_index.max(bottom_pos.char_index).min(max_char);
                 (lo, hi)
             } else if i == top {
-                // Top boundary: anchor at top → include [0, top_pos.char_index).
-                (0, top_pos.char_index.min(max_char))
+                // Top boundary: include [top_pos.char_index, max) — the part
+                // of the row BELOW the anchor (normal terminal selection: drag
+                // starts at the anchor and extends downward, so the top row
+                // contributes its tail, not its head).
+                (top_pos.char_index.min(max_char), max_char)
             } else if i == bottom {
-                // Bottom boundary: include [bottom_pos.char_index, max).
-                (bottom_pos.char_index.min(max_char), max_char)
+                // Bottom boundary: include [0, bottom_pos.char_index) — the
+                // part of the row ABOVE the drag endpoint.
+                (0, bottom_pos.char_index.min(max_char))
             } else {
                 // Middle row: entire text.
                 (0, max_char)
@@ -394,6 +398,54 @@ impl BlockViewSelection {
             }
         }
         out
+    }
+
+    /// Refresh the row snapshot to the current frame's rows and remap
+    /// `start`/`end` row_index by matching (block_id, text, kind). Rows that
+    /// scrolled off the visible region (not found in `new_rows`) are remapped
+    /// to the new row with the closest y-center — this keeps the selection
+    /// anchored to the same screen position instead of jumping to a
+    /// proportional index that may point at completely different content.
+    pub fn sync_rows(&mut self, new_rows: Vec<BlockViewRow>) {
+        let remap = |old_idx: usize| -> usize {
+            if old_idx >= self.rows.len() || new_rows.is_empty() {
+                return 0;
+            }
+            let old_row = &self.rows[old_idx];
+            // Exact match first (same block + text + kind).
+            if let Some(i) = new_rows.iter().position(|r| {
+                r.kind == old_row.kind && r.block_id == old_row.block_id && r.text == old_row.text
+            }) {
+                return i;
+            }
+            // Fallback: match by text only (handles rows whose block_id is
+            // None, like LiveCommand, or where block_id changed identity).
+            if let Some(i) = new_rows
+                .iter()
+                .position(|r| r.kind == old_row.kind && r.text == old_row.text)
+            {
+                return i;
+            }
+            // Row scrolled off — find the new row whose y-center is closest
+            // to the old row's y-center. This keeps the selection at roughly
+            // the same screen position instead of mapping to unrelated
+            // content via a proportional index.
+            let old_yc = (old_row.y_top + old_row.y_bottom) * 0.5;
+            let mut best = 0usize;
+            let mut best_d = f32::MAX;
+            for (i, r) in new_rows.iter().enumerate() {
+                let yc = (r.y_top + r.y_bottom) * 0.5;
+                let d = (yc - old_yc).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = i;
+                }
+            }
+            best
+        };
+        self.start.row_index = remap(self.start.row_index).min(new_rows.len().saturating_sub(1));
+        self.end.row_index = remap(self.end.row_index).min(new_rows.len().saturating_sub(1));
+        self.rows = new_rows;
     }
 }
 
@@ -550,10 +602,10 @@ mod tests {
     #[test]
     fn bv_cross_row_skips_non_selectable() {
         // Drag from row 3 ("echo hi") char 5 down to row 0 ("world") char 2.
-        // top = idx 3, top_pos.char_index = 5 -> [0,5) = "echo "
+        // top = idx 3, top_pos.char_index = 5 -> [5,7) = "hi" (tail of row)
         // idx 2 Separator skipped (no text, no newline)
         // idx 1 "hello" whole
-        // bottom = idx 0, bottom_pos.char_index = 2 -> [2,5) = "rld"
+        // bottom = idx 0, bottom_pos.char_index = 2 -> [0,2) = "wo" (head of row)
         // Newlines inserted only between consecutive selectable contributions.
         let rows = bv_rows();
         let sel = BlockViewSelection {
@@ -567,7 +619,7 @@ mod tests {
             },
             rows,
         };
-        assert_eq!(sel.text(), "echo \nhello\nrld");
+        assert_eq!(sel.text(), "hi\nhello\nwo");
     }
 
     #[test]
@@ -586,7 +638,7 @@ mod tests {
             },
             rows,
         };
-        assert_eq!(sel.text(), "echo \nhello\nrld");
+        assert_eq!(sel.text(), "hi\nhello\nwo");
     }
 
     #[test]
@@ -630,8 +682,8 @@ mod tests {
         let mut h = SelectionHandler::new();
         let rows = bv_rows();
         // Press at idx 1 ("hello") char 0, drag to idx 0 ("world") char 3.
-        // top = idx 1, top_pos.char_index = 0 -> [0,0) empty (no contribution)
-        // bottom = idx 0, bottom_pos.char_index = 3 -> [3,5) = "ld"
+        // top = idx 1, top_pos.char_index = 0 -> [0,5) = "hello" (full row)
+        // bottom = idx 0, bottom_pos.char_index = 3 -> [0,3) = "wor"
         h.start_block_view(
             BlockViewPos {
                 row_index: 1,
@@ -648,7 +700,7 @@ mod tests {
         h.end();
         assert!(!h.selecting);
         let text = h.block_view_text().unwrap();
-        assert_eq!(text, "ld");
+        assert_eq!(text, "hello\nwor");
         h.clear();
         assert!(h.block_view_selection.is_none());
     }

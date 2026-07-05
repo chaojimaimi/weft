@@ -6,6 +6,7 @@
 use crate::blocks::{BlockTracker, ShellPhase};
 use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use crate::hyperlink::HyperlinkRegistry;
 use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
 
 /// Current text attributes applied to newly printed characters.
@@ -85,6 +86,15 @@ pub struct Terminal {
     /// full UI; weft must answer or they degrade (claude falls back to a basic
     /// line mode with an unconstrained, roaming cursor).
     pending_output: Vec<u8>,
+    /// Active OSC 8 hyperlink (None = no link). Set by `OSC 8;params;URI ST`,
+    /// cleared by `OSC 8;; ST`. All cells printed while this is `Some(id)`
+    /// are tagged with `CellFlags::HYPERLINK` and linked to `id` in the
+    /// registry's side-map.
+    active_hyperlink_id: Option<u32>,
+    /// OSC 8 hyperlink registry — maps cell coords → id → URL. External to
+    /// the `Cell` struct so Cell stays at 24 bytes (only the 1-bit HYPERLINK
+    /// flag lives on the cell).
+    hyperlinks: HyperlinkRegistry,
 }
 
 impl Terminal {
@@ -119,6 +129,8 @@ impl Terminal {
             alt_active: false,
             saved_cursor: None,
             pending_output: Vec::new(),
+            active_hyperlink_id: None,
+            hyperlinks: HyperlinkRegistry::new(),
         }
     }
 
@@ -151,6 +163,34 @@ impl Terminal {
 
     pub fn editor_mut(&mut self) -> &mut Editor {
         &mut self.editor
+    }
+
+    /// Borrow the OSC 8 hyperlink registry (read-only). The renderer uses
+    /// this for Cmd+Click URL lookup.
+    pub fn hyperlinks(&self) -> &HyperlinkRegistry {
+        &self.hyperlinks
+    }
+
+    /// Drop all `(row, col) → URL` mappings. Called after a manual
+    /// `grid.scroll_offset` change (e.g. FindInGrid scrolling to a match):
+    /// the side-map is viewport-relative, so any scroll invalidates it.
+    pub fn clear_hyperlink_cell_map(&mut self) {
+        self.hyperlinks.clear_cell_map();
+    }
+
+    /// Scroll the grid up by `n` rows and invalidate the OSC 8 cell_map.
+    /// Required because the side-map keys are viewport-relative `(row, col)`
+    /// and shift on every scroll — leaving stale keys would make clicks
+    /// resolve to the wrong URL.
+    fn scroll_grid_up(&mut self, n: usize) {
+        self.grid.scroll_up(n);
+        self.hyperlinks.clear_cell_map();
+    }
+
+    /// Same as [`scroll_grid_up`](Self::scroll_grid_up) for scroll-down.
+    fn scroll_grid_down(&mut self, n: usize) {
+        self.grid.scroll_down(n);
+        self.hyperlinks.clear_cell_map();
     }
 
     pub fn cwd(&self) -> Option<&str> {
@@ -204,6 +244,10 @@ impl Terminal {
             self.alt_grid.cursor = Cursor::default();
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
             self.alt_active = true;
+            // OSC 8 state is viewport-relative — entering the alt screen
+            // invalidates any cell_map entries from the primary grid.
+            self.hyperlinks.clear_cell_map();
+            self.active_hyperlink_id = None;
         } else {
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
             if save_cursor_and_clear {
@@ -212,6 +256,9 @@ impl Terminal {
                 }
             }
             self.alt_active = false;
+            // Restoring the primary grid — alt-screen hyperlinks are gone.
+            self.hyperlinks.clear_cell_map();
+            self.active_hyperlink_id = None;
         }
         tracing::info!(
             active = self.alt_active,
@@ -520,7 +567,7 @@ impl vte::Perform for Terminal {
             self.grid.cursor.col = 0;
             let (_, bottom) = self.grid.scroll_region();
             if self.grid.cursor.row == bottom {
-                self.grid.scroll_up(1);
+                self.scroll_grid_up(1);
             } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
@@ -547,7 +594,7 @@ impl vte::Perform for Terminal {
             self.grid.cursor.col = 0;
             let (_, bottom) = self.grid.scroll_region();
             if self.grid.cursor.row == bottom {
-                self.grid.scroll_up(1);
+                self.scroll_grid_up(1);
             } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
@@ -564,6 +611,13 @@ impl vte::Perform for Terminal {
             cell.bg = self.attrs.bg;
             cell.flags = self.attrs.flags | CellFlags::DIRTY;
             cell.width = CellWidth::Full;
+            // OSC 8: tag the wrapped wide-char cell with the active hyperlink.
+            if let Some(id) = self.active_hyperlink_id {
+                cell.flags |= CellFlags::HYPERLINK;
+                self.hyperlinks.link_cell(new_row, new_col, id);
+            } else {
+                self.hyperlinks.unlink_cell(new_row, new_col);
+            }
             self.grid.viewport[new_row].mark_dirty(new_col);
 
             if new_col + 1 < num_cols {
@@ -596,7 +650,7 @@ impl vte::Perform for Terminal {
             self.grid.cursor.col = 0;
             let (_, bottom) = self.grid.scroll_region();
             if self.grid.cursor.row == bottom {
-                self.grid.scroll_up(1);
+                self.scroll_grid_up(1);
             } else if self.grid.cursor.row < self.grid.num_rows - 1 {
                 self.grid.cursor.row += 1;
             }
@@ -614,6 +668,20 @@ impl vte::Perform for Terminal {
             cell.bg = self.attrs.bg;
             cell.flags = self.attrs.flags | CellFlags::DIRTY;
             cell.width = width;
+
+            // OSC 8: tag the cell with HYPERLINK and record its (row,col)→id
+            // in the registry side-map. When the active hyperlink is None
+            // (overwriting a previously tagged cell), drop the side-map entry
+            // and clear the flag so the underline disappears.
+            if let Some(id) = self.active_hyperlink_id {
+                cell.flags |= CellFlags::HYPERLINK;
+                self.hyperlinks.link_cell(row, col, id);
+            } else {
+                if cell.flags.contains(CellFlags::HYPERLINK) {
+                    cell.flags.remove(CellFlags::HYPERLINK);
+                }
+                self.hyperlinks.unlink_cell(row, col);
+            }
 
             self.grid.viewport[row].mark_dirty(col);
             self.grid.cursor.col += width as usize;
@@ -659,7 +727,9 @@ impl vte::Perform for Terminal {
                     self.block_tracker.on_newline();
                 }
                 self.grid.carriage_return();
-                self.grid.index();
+                if self.grid.index() {
+                    self.hyperlinks.clear_cell_map();
+                }
             }
             0x0D => self.grid.carriage_return(),
             _ => tracing::trace!(byte, "unhandled execute"),
@@ -803,11 +873,11 @@ impl vte::Perform for Terminal {
             // Scrolling
             'S' => {
                 let n = param(params, 0, 1);
-                self.grid.scroll_up(if n == 0 { 1 } else { n as usize });
+                self.scroll_grid_up(if n == 0 { 1 } else { n as usize });
             }
             'T' => {
                 if intermediates.is_empty() {
-                    self.grid.scroll_down(param(params, 0, 1) as usize);
+                    self.scroll_grid_down(param(params, 0, 1) as usize);
                 }
             }
 
@@ -893,11 +963,24 @@ impl vte::Perform for Terminal {
         match (intermediates, byte) {
             (&[], 0x37) => self.grid.save_cursor(),    // DECSC
             (&[], 0x38) => self.grid.restore_cursor(), // DECRC
-            (&[], 0x44) => self.grid.index(),          // IND
-            (&[], 0x4D) => self.grid.reverse_index(),  // RI
+            (&[], 0x44) => {
+                // IND — index. May scroll the region; if so, OSC 8 cell_map
+                // entries (viewport-relative) go stale.
+                if self.grid.index() {
+                    self.hyperlinks.clear_cell_map();
+                }
+            }
+            (&[], 0x4D) => {
+                // RI — reverse index. Same scroll invalidation as IND.
+                if self.grid.reverse_index() {
+                    self.hyperlinks.clear_cell_map();
+                }
+            }
             (&[], 0x45) => {
-                // NEL
-                self.grid.index();
+                // NEL — next line. Same as CR+IND.
+                if self.grid.index() {
+                    self.hyperlinks.clear_cell_map();
+                }
                 self.grid.carriage_return();
             }
             (&[], 0x48) => self.grid.set_tabstop(), // HTS
@@ -954,6 +1037,27 @@ impl vte::Perform for Terminal {
                             self.git_branch = Some(branch.to_string());
                         }
                     }
+                }
+            }
+            "8" => {
+                // OSC 8 ; params ; URI ST — hyperlink.
+                //   `OSC 8 ; ; URI ST`     → start hyperlink to URI (no id).
+                //   `OSC 8 ; id=K ; URI ST`→ start hyperlink with id K (kitty
+                //                            extension; we dedup by URL anyway).
+                //   `OSC 8 ; ; ST`         → end hyperlink (empty URI).
+                // We dedup URLs in the registry and remember the active id;
+                // `print()` stamps cells with HYPERLINK while this is Some.
+                if params.len() >= 3 {
+                    let uri = std::str::from_utf8(params[2]).unwrap_or("");
+                    if uri.is_empty() {
+                        self.active_hyperlink_id = None;
+                    } else {
+                        let id = self.hyperlinks.register(uri.to_string());
+                        self.active_hyperlink_id = Some(id);
+                    }
+                } else {
+                    // OSC 8 ;; ST (no URI field) — clear.
+                    self.active_hyperlink_id = None;
                 }
             }
             "133" => {
@@ -1601,6 +1705,78 @@ mod tests {
         let mut t = Terminal::new(24, 80);
         t.process(b"\x1b]7;not-a-uri\x1b\\");
         assert_eq!(t.cwd(), None);
+    }
+
+    #[test]
+    fn osc8_hyperlink_tags_cells_and_resolves_url() {
+        // OSC 8 ; ; URI ST → start hyperlink. Subsequent printed cells get
+        // the HYPERLINK flag and resolve to URI via the registry.
+        let mut t = Terminal::new(24, 80);
+        t.process(b"\x1b]8;;https://weft.dev/a\x1b\\");
+        t.process(b"link");
+        t.process(b"\x1b]8;;\x1b\\"); // close
+        t.process(b"plain");
+
+        // The four cells of "link" should be tagged; "plain" should not.
+        let g = t.grid();
+        for (i, _) in "link".chars().enumerate() {
+            assert!(
+                g.cell(0, i)
+                    .flags
+                    .contains(crate::grid::CellFlags::HYPERLINK),
+                "cell {i} of 'link' should be HYPERLINK"
+            );
+        }
+        // 'p' of "plain" is at col 4 (after 4 chars of "link").
+        assert!(
+            !g.cell(0, 4)
+                .flags
+                .contains(crate::grid::CellFlags::HYPERLINK),
+            "cell after link close should NOT be HYPERLINK"
+        );
+
+        // Cmd+Click resolution: cell (0, 0) → URL.
+        assert_eq!(t.hyperlinks().url_at(0, 0), Some("https://weft.dev/a"));
+        assert_eq!(t.hyperlinks().url_at(0, 3), Some("https://weft.dev/a"));
+        // After close, the plain cell has no URL.
+        assert_eq!(t.hyperlinks().url_at(0, 4), None);
+    }
+
+    #[test]
+    fn osc8_dedups_identical_urls() {
+        let mut t = Terminal::new(24, 80);
+        // Two consecutive links to the same URL — registry dedups.
+        t.process(b"\x1b]8;;https://weft.dev/x\x1b\\");
+        t.process(b"a");
+        t.process(b"\x1b]8;;\x1b\\");
+        t.process(b"\x1b]8;;https://weft.dev/x\x1b\\");
+        t.process(b"b");
+        t.process(b"\x1b]8;;\x1b\\");
+
+        assert_eq!(t.hyperlinks().url_at(0, 0), Some("https://weft.dev/x"));
+        assert_eq!(t.hyperlinks().url_at(0, 1), Some("https://weft.dev/x"));
+    }
+
+    #[test]
+    fn osc8_cell_map_clears_on_scroll() {
+        // When content scrolls the viewport, the (row, col) → id map is
+        // invalidated. The HYPERLINK flag stays on cells (visual underline
+        // persists) but click resolution returns None — MVP trade-off.
+        let mut t = Terminal::new(3, 80);
+        t.process(b"\x1b]8;;https://weft.dev/s\x1b\\");
+        t.process(b"link\n");
+        t.process(b"\x1b]8;;\x1b\\");
+        // Emit enough lines to force a scroll.
+        t.process(b"line1\nline2\nline3");
+        // After scrolling, no cells should resolve to URLs.
+        for row in 0..3 {
+            for col in 0..10 {
+                assert!(
+                    t.hyperlinks().url_at(row, col).is_none(),
+                    "hyperlink at ({row},{col}) should be cleared after scroll"
+                );
+            }
+        }
     }
 
     #[test]

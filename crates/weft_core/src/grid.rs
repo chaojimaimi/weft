@@ -674,23 +674,37 @@ impl Grid {
     // ── Line feed / index ────────────────────────────────────────
 
     /// Index (ESC D / LF): move cursor down, scrolling at scroll_bottom.
-    pub fn index(&mut self) {
-        if self.cursor.row == self.scroll_bottom {
+    /// Move cursor down one row, scrolling the region if at the bottom.
+    /// Returns `true` if a scroll occurred (callers with viewport-relative
+    /// side state — e.g. OSC 8 cell_map — should invalidate it).
+    pub fn index(&mut self) -> bool {
+        let scrolled = if self.cursor.row == self.scroll_bottom {
             self.scroll_up(1);
+            true
         } else if self.cursor.row < self.num_rows - 1 {
             self.cursor.row += 1;
-        }
+            false
+        } else {
+            false
+        };
         self.cursor.wrap_pending = false;
+        scrolled
     }
 
     /// Reverse index (ESC M): move cursor up, scrolling at scroll_top.
-    pub fn reverse_index(&mut self) {
-        if self.cursor.row == self.scroll_top {
+    /// Returns `true` if a scroll occurred (see [`index`](Self::index)).
+    pub fn reverse_index(&mut self) -> bool {
+        let scrolled = if self.cursor.row == self.scroll_top {
             self.scroll_down(1);
+            true
         } else if self.cursor.row > 0 {
             self.cursor.row -= 1;
-        }
+            false
+        } else {
+            false
+        };
         self.cursor.wrap_pending = false;
+        scrolled
     }
 
     /// Move cursor to next line (newline).
@@ -1302,6 +1316,19 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cell_struct_stays_at_24_bytes() {
+        // v0.8 OSC 8 design constraint: hyperlink metadata lives in an
+        // external side-map (HyperlinkRegistry), NOT on Cell. If a future
+        // change pushes Cell past 24 bytes, this test fails — re-evaluate
+        // before adjusting the target. See docs/v0.8_PLAN.md §5.
+        assert!(
+            std::mem::size_of::<Cell>() <= 24,
+            "Cell must stay ≤ 24 bytes (HYPERLINK flag is a 1-bit side-state); got {}",
+            std::mem::size_of::<Cell>()
+        );
+    }
 
     #[test]
     fn grid_new_creates_correct_size() {
