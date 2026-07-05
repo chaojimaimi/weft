@@ -34,6 +34,10 @@ pub struct LayoutCtx {
     /// The content area starts below the tab bar + padding_y. 0 when no
     /// tab bar is drawn (single tab).
     pub chrome_top: f32,
+    /// v0.9 W5: Width of the left sidebar (history panel in sidebar mode) in
+    /// physical px. The content area starts to the right of the sidebar. 0 when
+    /// the panel is closed.
+    pub chrome_left: f32,
     /// Optional clip rectangle for nested overlays (children stay inside).
     /// `None` means "use the full content rect". Stored as `[x0, y0, x1, y1]`.
     pub clip: Option<Rect>,
@@ -56,14 +60,15 @@ impl LayoutCtx {
             padding_x,
             padding_y,
             chrome_top: 0.0,
+            chrome_left: 0.0,
             clip: None,
         }
     }
 
-    /// Left edge of the content area (= horizontal padding).
+    /// Left edge of the content area (= horizontal padding + chrome_left).
     #[inline]
     pub fn left(&self) -> f32 {
-        self.padding_x
+        self.padding_x + self.chrome_left
     }
 
     /// Right edge of the content area.
@@ -533,7 +538,7 @@ pub fn layout_prompt(
     let box_h = ch * (n_lines as f32 + 2.0);
     let box_y1 = (vp_h - ctx.padding_y).max(0.0);
     let box_y0 = (box_y1 - box_h).max(0.0);
-    let box_x0 = ctx.padding_x;
+    let box_x0 = ctx.left();
     let box_x1 = (vp_w - ctx.padding_x).max(box_x0);
 
     let text_y0 = box_y0 + ch;
@@ -610,7 +615,7 @@ pub fn layout_block_view(
     let vp_w = ctx.viewport.0;
 
     let pitch = ch * 1.1;
-    let left = ctx.padding_x;
+    let left = ctx.left();
     let right = vp_w - ctx.padding_x;
     let cols = (((right - left) / cw).max(1.0)) as usize;
 

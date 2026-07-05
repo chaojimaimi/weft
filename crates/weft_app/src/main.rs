@@ -708,6 +708,9 @@ impl App {
                     self.panel_selection = 0;
                     self.panel_expanded = None;
                 }
+                // v0.9 W5: resize grid for sidebar so the terminal content
+                // reflows beside the panel instead of being covered by it.
+                self.recompute_layout();
                 self.request_redraw();
                 true
             }
@@ -2643,7 +2646,15 @@ impl App {
             return (0, 0);
         };
         let size = window.inner_size();
-        let usable_w = size.width as f64 - 2.0 * renderer.padding_x() as f64;
+        // v0.9 W5: when the history panel is open it becomes a left sidebar
+        // that pushes terminal content right, so the grid/PTY must shrink by
+        // the sidebar width (chrome_left).
+        let chrome_left = if self.panel_open {
+            renderer.sidebar_width() as f64
+        } else {
+            0.0
+        };
+        let usable_w = size.width as f64 - 2.0 * renderer.padding_x() as f64 - chrome_left;
         // The grid/PTY is always the FULL window. The editor input box is an
         // overlay that covers the bottom rows in Editor mode — it never
         // changes the grid size, so editor↔passthrough transitions don't fire
@@ -2695,6 +2706,13 @@ impl App {
         // row N would resolve to N + ~1.5 (off-by-one-down) when the tab bar
         // is visible.
         let chrome_top = renderer.tab_bar_height() as f64;
+        // v0.9 W5: subtract sidebar width (chrome_left) so clicks map to the
+        // correct column when the history panel pushes the grid right.
+        let chrome_left = if self.panel_open {
+            renderer.sidebar_width() as f64
+        } else {
+            0.0
+        };
         // Clamp to valid grid bounds. A click past the right/bottom edge (e.g.
         // a drag-to-select ending at the window margin) would otherwise yield
         // col == num_cols / row == num_rows and panic text_from_grid on copy.
@@ -2703,7 +2721,7 @@ impl App {
             .as_ref()
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
             .unwrap_or((1, 1));
-        let col = (((x - renderer.padding_x() as f64) / cell_w).max(0.0) as usize)
+        let col = (((x - renderer.padding_x() as f64 - chrome_left) / cell_w).max(0.0) as usize)
             .min(num_cols.saturating_sub(1));
         let row = (((y - renderer.padding_y() as f64 - chrome_top) / cell_h).max(0.0) as usize)
             .min(num_rows.saturating_sub(1));
@@ -2745,7 +2763,14 @@ impl App {
         if cw <= 0.0 {
             return None;
         }
-        let left = renderer.padding_x() as f64;
+        // v0.9 W5: account for the left sidebar offset (chrome_left) so
+        // block-view clicks map to the correct char when the panel is open.
+        let chrome_left = if self.panel_open {
+            renderer.sidebar_width() as f64
+        } else {
+            0.0
+        };
+        let left = renderer.padding_x() as f64 + chrome_left;
         let rows = renderer.block_view_rows.as_slice();
         if rows.is_empty() {
             return None;
@@ -2915,10 +2940,10 @@ impl App {
         // TUI apps that captured the mouse.
         if button == winit::event::MouseButton::Left && self.panel_open {
             if let Some(renderer) = &self.renderer {
-                let vp_w = renderer.viewport_width();
-                let scale = renderer.scale() as f32;
-                let width_px = (vp_w * 0.38).min(460.0 * scale);
-                let panel_x = (vp_w - width_px).max(0.0);
+                // v0.9 W5: panel is now a LEFT sidebar anchored at x = 0 with
+                // width = sidebar_width().
+                let width_px = renderer.sidebar_width();
+                let panel_x = 0.0;
                 let ch = renderer.cell_height() as f64;
                 let xf = x as f32;
                 let yf = y;
@@ -2949,7 +2974,14 @@ impl App {
         if button == winit::event::MouseButton::Left && self.block_view_active() {
             if let Some(renderer) = &self.renderer {
                 let cw = renderer.cell_width() as f32;
-                let left = renderer.padding_x();
+                // v0.9 W5: account for the left sidebar offset so the chevron
+                // hit-test tracks the shifted block-view content.
+                let chrome_left = if self.panel_open {
+                    renderer.sidebar_width()
+                } else {
+                    0.0
+                };
+                let left = renderer.padding_x() + chrome_left;
                 let xf = x as f32;
                 let yf = y as f32;
                 // Check if click is in the chevron area (first cell of a
@@ -3957,7 +3989,14 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         0.0
                     };
-                    let usable_w = physical_size.width as f64 - 2.0 * pad_x;
+                    // v0.9 W5: subtract sidebar width when the panel is open so
+                    // the grid reflows beside the sidebar (mirrors grid_dims).
+                    let chrome_left = if self.panel_open {
+                        renderer.sidebar_width() as f64
+                    } else {
+                        0.0
+                    };
+                    let usable_w = physical_size.width as f64 - 2.0 * pad_x - chrome_left;
                     let usable_h = (physical_size.height as f64 - 2.0 * pad_y - tab_bar_h).max(0.0);
                     let new_cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
                     let new_rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;

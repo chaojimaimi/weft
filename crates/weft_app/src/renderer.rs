@@ -550,6 +550,12 @@ fragment float4 text_fragment(
         logical.clamp(24.0, 40.0) * self.scale as f32
     }
 
+    /// v0.9 W5: Left sidebar width in physical pixels (240 logical px × scale).
+    /// Used as `chrome_left` when the history panel is in sidebar mode.
+    pub fn sidebar_width(&self) -> f32 {
+        240.0 * self.scale as f32
+    }
+
     /// Draw the terminal Grid (and optional overlays) to screen.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
@@ -580,6 +586,18 @@ fragment float4 text_fragment(
             0.0
         };
 
+        // v0.9 W5: compute chrome_left (sidebar width) when the history panel
+        // is open — the panel becomes a left sidebar that pushes content right.
+        let panel_open = overlays
+            .layers
+            .iter()
+            .any(|l| l.kind == crate::overlay::OverlayKind::HistoryPanel);
+        let chrome_left = if panel_open {
+            self.sidebar_width()
+        } else {
+            0.0
+        };
+
         // Build this frame's LayoutCtx: the single source of truth for
         // coordinate math in every overlay builder (v0.8 stage 1). Stored on
         // self so methods that don't receive it directly can still access it
@@ -593,6 +611,7 @@ fragment float4 text_fragment(
             self.padding_y,
         );
         ctx.chrome_top = chrome_top;
+        ctx.chrome_left = chrome_left;
         self.layout_ctx = Some(ctx);
 
         let grid = terminal.grid();
@@ -873,12 +892,15 @@ fragment float4 text_fragment(
                 // not the window left padding. The prompt glyph "❯ " takes 2
                 // columns on line 0; subsequent lines start at the left edge.
                 let cw_f = self.cell_width() as f32;
+                // v0.9 W5: align the completion popup with the shifted prompt
+                // (padding_x + chrome_left) so it tracks the sidebar offset.
+                let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
                 let prompt_cols = prompt
                     .map(|p| {
                         let prompt_indent = if p.cursor.0 == 0 { 2 } else { 0 };
-                        (prompt_indent + p.cursor.1) as f32 * cw_f + self.padding_x
+                        (prompt_indent + p.cursor.1) as f32 * cw_f + self.padding_x + chrome_left
                     })
-                    .unwrap_or(self.padding_x);
+                    .unwrap_or(self.padding_x + chrome_left);
                 let box_x0 = prompt_cols;
                 let (cv, rect) =
                     self.build_completion_vertices(matches, selected, box_top_y, box_x0);
@@ -1035,7 +1057,8 @@ fragment float4 text_fragment(
                     continue;
                 }
 
-                let x = self.padding_x + col as f32 * cw;
+                let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+                let x = self.padding_x + chrome_left + col as f32 * cw;
                 // v0.9 H1 fix: shift grid down by chrome_top (tab bar height)
                 // so the first row isn't covered by the tab bar. The LayoutCtx
                 // is set on self at the top of draw(); chrome_top is 0 when
@@ -1521,13 +1544,14 @@ fragment float4 text_fragment(
     fn build_panel_vertices(&self, p: &PanelDrawParams) -> Vec<f32> {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
-        let vp_w = self.viewport.0;
+        let _vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         let width_px = p.width_px;
         if width_px <= 0.0 || cw <= 0.0 || ch <= 0.0 {
             return Vec::new();
         }
-        let panel_x = (vp_w - width_px).max(0.0);
+        // v0.9 W5: panel is now a LEFT sidebar — anchor to the left edge.
+        let panel_x = 0.0;
         let panel_cols = ((width_px / cw) as usize).max(1);
         let mut vertices = Vec::new();
 
@@ -1549,9 +1573,12 @@ fragment float4 text_fragment(
         let (su, sv, suw, svh) = self.space_uv();
         // V-swap to match grid rendering (CAMetalLayer flip compensation).
         let bg_uv = [su, sv + svh, su + suw, sv];
+        // v0.9 W5: start the panel bg below the tab bar (chrome_top) so it
+        // doesn't cover the tab bar, mirroring the content area.
+        let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
         push_quad(
             &mut vertices,
-            [panel_x, 0.0, panel_x + width_px, vp_h],
+            [panel_x, chrome_top, panel_x + width_px, vp_h],
             bg_uv,
             [0.0; 4],
             panel_bg,
