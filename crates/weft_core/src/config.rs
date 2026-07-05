@@ -302,6 +302,20 @@ pub enum Action {
     /// touching disk.
     #[serde(rename = "toggle_theme")]
     ToggleTheme,
+    /// Open a new tab (Cmd+T). Spawns a fresh shell session and switches
+    /// to it.
+    #[serde(rename = "new_tab")]
+    NewTab,
+    /// Close the current tab (Cmd+W). If this was the last tab, the app
+    /// exits.
+    #[serde(rename = "close_tab")]
+    CloseTab,
+    /// Switch to the next tab (Cmd+Shift+] or Cmd+Shift+Right).
+    #[serde(rename = "next_tab")]
+    NextTab,
+    /// Switch to the previous tab (Cmd+Shift+[ or Cmd+Shift+Left).
+    #[serde(rename = "prev_tab")]
+    PrevTab,
 }
 
 /// Resolved keybinding table: physical key + modifiers → action.
@@ -328,6 +342,11 @@ impl Default for KeyBindings {
             ("cmd+0", Action::ZoomReset),
             ("cmd+f", Action::FindInGrid),
             ("cmd+shift+t", Action::ToggleTheme),
+            // v0.9 H1: tab management shortcuts.
+            ("cmd+t", Action::NewTab),
+            ("cmd+w", Action::CloseTab),
+            ("cmd+shift+right_bracket", Action::NextTab),
+            ("cmd+shift+left_bracket", Action::PrevTab),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {
@@ -628,6 +647,8 @@ fn parse_key_token(tok: &str) -> Option<KeyCode> {
         "minus" | "hyphen" => Some(KeyCode::Char('-')),
         "plus" => Some(KeyCode::Char('+')),
         "equals" => Some(KeyCode::Char('=')),
+        "left_bracket" | "lbracket" => Some(KeyCode::Char('[')),
+        "right_bracket" | "rbracket" => Some(KeyCode::Char(']')),
         _ => {
             // f1..=f12
             if let Some(n) = lower.strip_prefix('f') {

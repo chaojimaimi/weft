@@ -128,6 +128,37 @@ pub struct MetalRenderer {
     /// `build_find_vertices` each draw; the app reads it from
     /// `handle_mouse_press` to route clicks on the up/down/case/regex buttons.
     pub find_buttons: Option<FindButtons>,
+    /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
+    /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
+    /// each draw when `tab_bar.tab_count > 1`; cleared otherwise. The app
+    /// reads this from `handle_mouse_press` to route tab clicks.
+    pub tab_hits: Vec<TabHit>,
+    /// v0.9 W2: block currently highlighted in the terminal view (set from
+    /// the history panel click). The renderer draws an accent border around
+    /// this block in block view. Cleared by the app after 1.5s.
+    pub panel_highlight: Option<BlockId>,
+}
+
+/// v0.9 H1: Tab bar state passed to the renderer each frame.
+#[derive(Clone, Default)]
+pub struct TabBarDrawState {
+    /// Number of open tabs.
+    pub tab_count: usize,
+    /// Index of the active tab (0-based).
+    pub active_tab: usize,
+    /// Tab labels (e.g., shell cwd basename or "Tab N").
+    pub labels: Vec<String>,
+}
+
+/// v0.9 H1: Hit-test rect for a tab label + close button.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TabHit {
+    /// Full clickable rect of the tab label area: `[x0, y0, x1, y1]`.
+    pub tab_rect: [f32; 4],
+    /// Clickable rect of the close "×" button: `[x0, y0, x1, y1]`.
+    pub close_rect: [f32; 4],
+    /// Tab index (0-based) this hit corresponds to.
+    pub index: usize,
 }
 
 /// Hit-test rectangles for the find popup's clickable buttons (physical
@@ -383,6 +414,8 @@ fragment float4 text_fragment(
             layout_ctx: None,
             find_state: None,
             find_buttons: None,
+            tab_hits: Vec::new(),
+            panel_highlight: None,
         }
     }
 
@@ -430,6 +463,21 @@ fragment float4 text_fragment(
     #[allow(dead_code)]
     pub fn background(&self) -> Color {
         self.theme.background
+    }
+
+    /// Current resolved theme (for applying to new tabs etc.).
+    pub fn theme(&self) -> &Theme {
+        &self.theme
+    }
+
+    /// Viewport dimensions (width, height) in physical pixels.
+    pub fn viewport(&self) -> (f32, f32) {
+        self.viewport
+    }
+
+    /// Cell size (width, height) in physical pixels.
+    pub fn cell_size(&self) -> (f32, f32) {
+        (self.atlas.cell_width as f32, self.atlas.cell_height as f32)
     }
 
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
@@ -494,6 +542,14 @@ fragment float4 text_fragment(
         (self.atlas.cell_width, self.atlas.cell_height)
     }
 
+    /// v0.9 H1: Tab bar height in physical pixels. Only drawn when there
+    /// are 2+ tabs. Roughly 1.5× cell height, clamped to [24, 40] logical
+    /// pixels (× scale for physical).
+    pub fn tab_bar_height(&self) -> f32 {
+        let logical = self.cell_height() as f32 / self.scale as f32 * 1.5;
+        logical.clamp(24.0, 40.0) * self.scale as f32
+    }
+
     /// Draw the terminal Grid (and optional overlays) to screen.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
@@ -507,10 +563,21 @@ fragment float4 text_fragment(
         // v0.8 U6: block-content metrics (total_rows, visible_rows,
         // max_scroll) for the dynamic scrollbar thumb. None in grid view.
         scroll_metrics: Option<(usize, usize, usize)>,
+        // v0.9 H1: tab bar state. When tab_count > 1 the tab bar is drawn
+        // at the top of the window and the content area is shifted down.
+        tab_bar: &TabBarDrawState,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,
+        };
+
+        // v0.9 H1: compute chrome_top (tab bar height) and set it on the
+        // LayoutCtx so all content is shifted below the tab bar.
+        let chrome_top = if tab_bar.tab_count > 1 {
+            self.tab_bar_height()
+        } else {
+            0.0
         };
 
         // Build this frame's LayoutCtx: the single source of truth for
@@ -518,13 +585,14 @@ fragment float4 text_fragment(
         // self so methods that don't receive it directly can still access it
         // during this draw; rebuilt every frame so resizes/padding changes
         // take effect immediately.
-        let ctx = crate::layout::LayoutCtx::new(
+        let mut ctx = crate::layout::LayoutCtx::new(
             self.viewport,
             self.cell_width() as f32,
             self.cell_height() as f32,
             self.padding_x,
             self.padding_y,
         );
+        ctx.chrome_top = chrome_top;
         self.layout_ctx = Some(ctx);
 
         let grid = terminal.grid();
@@ -841,6 +909,17 @@ fragment float4 text_fragment(
             find_btns = Some(btns);
         }
 
+        // v0.9 H1: Tab bar — drawn at the top of the window when there are
+        // 2+ tabs. The content area is already shifted down by `chrome_top`
+        // in the LayoutCtx, so this draws in the space above the content.
+        if tab_bar.tab_count > 1 {
+            let (tab_verts, hits) = self.build_tab_bar_vertices(tab_bar);
+            vertices.extend_from_slice(&tab_verts);
+            self.tab_hits = hits;
+        } else {
+            self.tab_hits.clear();
+        }
+
         // Debug: log first row characters and verify vertex data
         if vertices.is_empty() {
             let pass_desc = RenderPassDescriptor::new();
@@ -957,7 +1036,12 @@ fragment float4 text_fragment(
                 }
 
                 let x = self.padding_x + col as f32 * cw;
-                let y = self.padding_y + row as f32 * ch;
+                // v0.9 H1 fix: shift grid down by chrome_top (tab bar height)
+                // so the first row isn't covered by the tab bar. The LayoutCtx
+                // is set on self at the top of draw(); chrome_top is 0 when
+                // there's only one tab (no tab bar drawn).
+                let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+                let y = self.padding_y + chrome_top + row as f32 * ch;
 
                 // Determine cell colors (resolve the cell's color-origin against
                 // the palette / theme defaults).
@@ -2982,6 +3066,75 @@ fragment float4 text_fragment(
             }
         }
 
+        // v0.9 W2: draw an accent border around the panel-highlighted block.
+        // The highlight is armed by `scroll_to_panel_selection()` for 1.5s
+        // after a panel click. We scan the laid-out rows to find the y-range
+        // of rows belonging to the highlighted block (Output + Command rows),
+        // then draw a rounded accent border around that range.
+        if let Some(hl_id) = self.panel_highlight {
+            let mut hl_top: Option<f32> = None;
+            let mut hl_bottom: Option<f32> = None;
+            for (i, &dist) in rows.iter().enumerate() {
+                let row_top_y = content_bottom_y - dist + scroll_px;
+                let row_bottom_y = row_top_y + pitch;
+                // Check if this row belongs to the highlighted block.
+                let belongs = match &row_data[i] {
+                    LaidRow::Output { block_id, .. } => *block_id == Some(hl_id),
+                    LaidRow::Command { block_id, .. } => *block_id == hl_id,
+                    _ => false,
+                };
+                if belongs {
+                    hl_top = Some(match hl_top {
+                        Some(t) => t.min(row_top_y),
+                        None => row_top_y,
+                    });
+                    hl_bottom = Some(match hl_bottom {
+                        Some(b) => b.max(row_bottom_y),
+                        None => row_bottom_y,
+                    });
+                }
+            }
+            // Clamp to clip region.
+            if let (Some(top), Some(bottom)) = (hl_top, hl_bottom) {
+                let y0 = top.max(clip_top);
+                let y1 = bottom.min(clip_bottom);
+                if y1 > y0 {
+                    let accent = color_to_normalized(self.theme.accent);
+                    let accent_alpha = [accent[0], accent[1], accent[2], 0.85];
+                    let border_w = 2.0 * self.scale as f32;
+                    // Four-sided border.
+                    push_quad(
+                        &mut verts,
+                        [left - border_w, y0, right + border_w, y0 + border_w],
+                        bg_uv,
+                        [0.0; 4],
+                        accent_alpha,
+                    );
+                    push_quad(
+                        &mut verts,
+                        [left - border_w, y1 - border_w, right + border_w, y1],
+                        bg_uv,
+                        [0.0; 4],
+                        accent_alpha,
+                    );
+                    push_quad(
+                        &mut verts,
+                        [left - border_w, y0, left, y1],
+                        bg_uv,
+                        [0.0; 4],
+                        accent_alpha,
+                    );
+                    push_quad(
+                        &mut verts,
+                        [right, y0, right + border_w, y1],
+                        bg_uv,
+                        [0.0; 4],
+                        accent_alpha,
+                    );
+                }
+            }
+        }
+
         (verts, hit_regions, bv_rows)
     }
 
@@ -3543,6 +3696,141 @@ fragment float4 text_fragment(
             })
             .unwrap_or((0.0, 0.0, 0.0, 0.0))
     }
+
+    /// v0.9 H1: Build the tab bar vertices (background + tab labels + close
+    /// buttons). Returns `(vertices, tab_hits)` where `tab_hits` is the
+    /// click hit-test data for the app's mouse handler.
+    ///
+    /// Layout:
+    /// - Tab bar spans the full viewport width at the top.
+    /// - Each tab is ~16 cells wide, with a 1px divider between tabs.
+    /// - Active tab gets a brighter background + accent underline.
+    /// - Close "×" button at the right of each tab.
+    fn build_tab_bar_vertices(&self, tab_bar: &TabBarDrawState) -> (Vec<f32>, Vec<TabHit>) {
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let bar_h = self.tab_bar_height();
+        let vp_w = self.viewport.0;
+        let pad_x = self.padding_x;
+
+        let bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.accent);
+
+        // Tab bar background: slightly darker (dark theme) or lighter (light
+        // theme) than the main background, same as the find popup formula.
+        let bar_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
+            // Dark theme — dim the background.
+            [bg[0] * 0.85, bg[1] * 0.85, bg[2] * 0.85, 1.0]
+        } else {
+            // Light theme — lighten.
+            [
+                bg[0] + (1.0 - bg[0]) * 0.5,
+                bg[1] + (1.0 - bg[1]) * 0.5,
+                bg[2] + (1.0 - bg[2]) * 0.5,
+                1.0,
+            ]
+        };
+
+        let mut vertices = Vec::new();
+        let mut hits = Vec::new();
+
+        // Bar background.
+        push_quad(
+            &mut vertices,
+            [0.0, 0.0, vp_w, bar_h],
+            [0.0; 4],
+            [0.0; 4],
+            bar_bg,
+        );
+
+        // Tab layout: each tab is 16 cells wide, 1px divider between tabs.
+        let tab_w = cw * 16.0;
+        let close_w = cw * 2.0; // "×" button area
+        let label_w = tab_w - close_w;
+        let y0 = 0.0f32;
+        let y1 = bar_h;
+
+        for i in 0..tab_bar.tab_count {
+            let x0 = pad_x + i as f32 * tab_w;
+            let x1 = x0 + tab_w;
+            let is_active = i == tab_bar.active_tab;
+
+            // Tab background: active tab gets the main bg color (stands out
+            // from the dimmed bar bg); inactive tabs are transparent (show
+            // the bar bg).
+            let tab_bg = if is_active {
+                [bg[0], bg[1], bg[2], 1.0]
+            } else {
+                [0.0; 4] // transparent — shows bar_bg underneath
+            };
+            if is_active {
+                push_quad(&mut vertices, [x0, y0, x1, y1], [0.0; 4], [0.0; 4], tab_bg);
+                // Active tab accent underline (2px at the bottom).
+                push_quad(
+                    &mut vertices,
+                    [x0, y1 - 2.0, x1, y1],
+                    [0.0; 4],
+                    [0.0; 4],
+                    accent,
+                );
+            }
+
+            // Divider between tabs (1px).
+            if i > 0 {
+                push_quad(
+                    &mut vertices,
+                    [x0, y0, x0 + 1.0, y1],
+                    [0.0; 4],
+                    [0.0; 4],
+                    [fg[0] * 0.2, fg[1] * 0.2, fg[2] * 0.2, 0.5],
+                );
+            }
+
+            // Tab label (truncated to fit label_w).
+            let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
+            let max_cols = (label_w / cw) as usize;
+            let display = truncate_str(label, max_cols.saturating_sub(1));
+            let label_color = if is_active {
+                fg
+            } else {
+                [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0]
+            };
+            self.push_text(
+                &mut vertices,
+                x0 + cw * 0.5,
+                y0 + (bar_h - ch) * 0.5,
+                &display,
+                label_color,
+                max_cols,
+            );
+
+            // Close "×" button at the right.
+            let close_x0 = x0 + label_w;
+            let close_x1 = x1;
+            let close_color = if is_active {
+                fg
+            } else {
+                [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
+            };
+            self.push_text(
+                &mut vertices,
+                close_x0 + cw * 0.5,
+                y0 + (bar_h - ch) * 0.5,
+                "×",
+                close_color,
+                1,
+            );
+
+            hits.push(TabHit {
+                tab_rect: [x0, y0, x1, y1],
+                close_rect: [close_x0, y0, close_x1, y1],
+                index: i,
+            });
+        }
+
+        (vertices, hits)
+    }
 }
 
 /// What the sidebar history panel should draw. Built by the app only when the
@@ -3638,7 +3926,7 @@ fn push_triangle(
 }
 
 /// How many block rows fit below the title (in whole grid rows).
-fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
+pub(crate) fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
     if cell_h == 0 {
         return 0;
     }

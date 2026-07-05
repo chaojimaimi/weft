@@ -8,24 +8,22 @@ mod glyph;
 mod layout;
 mod overlay;
 mod renderer;
+mod tab;
 
-use renderer::{block_matches_query, FindDrawState, MetalRenderer};
+use renderer::{
+    block_matches_query, visible_panel_rows, FindDrawState, MetalRenderer, TabBarDrawState,
+};
+use tab::Tab;
 use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx, CompletePosition};
 use weft_core::config::{Action, Config, KeyBindings};
-use weft_core::input::{
-    encode_paste, InputHandler, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol,
-};
+use weft_core::input::{encode_paste, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol};
 use weft_core::persistence::BlockStore;
-use weft_core::pty::{Pty, PtyEvent};
-use weft_core::selection::{
-    BlockViewPos, BlockViewRowKind, GridPos, SelectionHandler, SelectionMode,
-};
+use weft_core::selection::{BlockViewPos, BlockViewRowKind, GridPos, SelectionMode};
 use weft_core::shell::Integration;
 use weft_core::vt::Terminal;
 
-use crossbeam_channel::{Receiver, Sender};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
@@ -34,7 +32,7 @@ use winit::window::{Window, WindowAttributes};
 
 // ── Messages between threads ─────────────────────────────────────────
 
-enum AppMsg {
+pub(crate) enum AppMsg {
     PtyOutput(Vec<u8>),
     PtyExit(Result<i32, String>),
 }
@@ -45,7 +43,7 @@ enum AppMsg {
 /// the loop redraws only when there is actual work — instead of busy-looping
 /// at vsync and pinning a CPU core.
 #[derive(Debug)]
-enum AppEvent {
+pub(crate) enum AppEvent {
     Wake,
     /// Config file changed on disk — reload and re-apply live.
     ConfigReload,
@@ -56,12 +54,10 @@ enum AppEvent {
 struct App {
     window: Option<Window>,
     renderer: Option<MetalRenderer>,
-    terminal: Option<Terminal>,
-    input_handler: InputHandler,
-    selection_handler: SelectionHandler,
-    msg_rx: Receiver<AppMsg>,
-    msg_tx: Sender<AppMsg>,
-    pty: Option<Pty>,
+    /// v0.9 H1: per-tab session state. The active tab is `tabs[active_tab]`.
+    /// Currently always has exactly one tab; Stage 2 adds Cmd+T/W multi-tab.
+    tabs: Vec<Tab>,
+    active_tab: usize,
     /// Current keyboard modifier state, updated by ModifiersChanged events.
     mods: winit::event::Modifiers,
     /// Cursor blink state (grid view: hard on/off, period 1060ms).
@@ -74,8 +70,6 @@ struct App {
     /// Last cursor blink toggle time (shared anchor for both the grid-view
     /// hard blink and the prompt signature breath).
     cursor_blink_time: std::time::Instant,
-    /// IME preedit string (for CJK input).
-    ime_preedit: String,
     /// Last known mouse position for click/scroll handling.
     last_mouse_x: f64,
     last_mouse_y: f64,
@@ -84,7 +78,6 @@ struct App {
     /// immediately on each Resized event for smooth animation; only the
     /// PTY SIGWINCH is debounced to prevent the shell from fighting cursor
     /// position during rapid cascades.
-    pending_pty_resize: Option<(usize, usize)>,
     last_resize_instant: std::time::Instant,
     /// Cached `$PATH` executable names for Tab completion (scanned once at
     /// startup; empty if completion is disabled).
@@ -117,6 +110,12 @@ struct App {
     panel_selection: usize,
     /// Id of the block whose output is expanded inline in the panel.
     panel_expanded: Option<BlockId>,
+    /// v0.9 W2: block currently highlighted in the terminal because the user
+    /// clicked its row in the history panel. The renderer draws an accent
+    /// border around this block. Cleared after 1.5s.
+    panel_highlight: Option<BlockId>,
+    /// When the panel highlight expires. Polled from the redraw path.
+    panel_highlight_until: Option<std::time::Instant>,
 
     // ── Command Palette (v0.7) ────────────────────────────────────────
     /// Whether the Cmd+P command palette overlay is shown.
@@ -199,12 +198,6 @@ struct App {
     /// True when a find query is in-flight on the worker. Used to suppress
     /// redundant submits while a scan is running.
     find_worker_busy: bool,
-
-    /// Block-view scroll offset (rows from the bottom). Independent of
-    /// `grid.scroll_offset` (which is for the grid/alt-screen path and
-    /// clamped to grid scrollback — the wrong proxy for block content).
-    /// This is what the mouse wheel / PgUp modifies in block view.
-    block_scroll_offset: usize,
 }
 
 /// Which border is being dragged to resize a popup.
@@ -233,6 +226,9 @@ const CONTEXT_MENU_ITEMS: &[(&str, &str)] = &[
     ("Copy Command", "copy_command"),
     ("Copy Output", "copy_output"),
     ("Toggle Fold", "toggle_fold"),
+    // v0.9 W4: send the block's command to the input box for re-editing
+    // (Warp-style "rerun" — user can tweak parameters before pressing Enter).
+    ("Send to Input", "send_to_input"),
 ];
 
 /// Active popup border drag state.
@@ -333,6 +329,16 @@ enum FindButtonAction {
 }
 
 impl App {
+    /// Immutable borrow of the active tab.
+    fn tab(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// Mutable borrow of the active tab.
+    fn tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
         let config = Config::load();
         info!(
@@ -342,24 +348,17 @@ impl App {
             "config loaded"
         );
         let keybindings = config.keybindings();
-        let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             window: None,
             renderer: None,
-            terminal: None,
-            input_handler: InputHandler::new(),
-            selection_handler: SelectionHandler::new(),
-            msg_rx,
-            msg_tx,
+            tabs: Vec::new(),
+            active_tab: 0,
             mods: winit::event::Modifiers::default(),
-            pty: None,
             cursor_blink_on: true,
             cursor_blink_phase: 0.0,
             cursor_blink_time: std::time::Instant::now(),
-            ime_preedit: String::new(),
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
-            pending_pty_resize: None,
             last_resize_instant: std::time::Instant::now(),
             path_bins: scan_path_bins(),
             proxy,
@@ -373,6 +372,8 @@ impl App {
             panel_query: String::new(),
             panel_selection: 0,
             panel_expanded: None,
+            panel_highlight: None,
+            panel_highlight_until: None,
             palette_open: false,
             popup_width_scale: 0.6,
             popup_max_rows: 8,
@@ -399,168 +400,66 @@ impl App {
             find_worker: find_worker::FindWorker::spawn(),
             find_regex_error: None,
             find_worker_busy: false,
-            block_scroll_offset: 0,
         }
     }
 
     fn spawn_pty(&mut self, rows: usize, cols: usize) {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-
-        // Shell integration: redirect the shell's rc lookup so it sources our
-        // OSC 133 hooks itself (no PTY-stdin injection → no echo). Returns the
-        // env overrides to set on the child; falls back to empty on any error.
-        let env = shell_integration_env(&shell);
-        let env_refs: Vec<(&str, &str)> =
-            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-
-        let wake_proxy = self.proxy.clone();
-        let pty = match Pty::spawn_with_args(
-            &shell,
-            &[],
-            (rows as u16, cols as u16),
-            &env_refs,
-            move || {
-                let _ = wake_proxy.send_event(AppEvent::Wake);
-            },
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Failed to spawn PTY: {e}");
-                return;
-            }
-        };
-
-        self.terminal = Some(Terminal::with_scrollback(
-            rows,
-            cols,
-            self.config.scrollback.lines,
-        ));
-        info!(rows, cols, "initial terminal size");
-        self.pty = Some(pty);
+        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy);
+        self.tabs.push(tab);
     }
 
-    /// Non-blocking drain of PTY events into channel.
+    /// Non-blocking drain of PTY events into channel. Drains ALL tabs per
+    /// frame (v0.9 H1 decision: background tabs keep their PTY buffers
+    /// flushed so switching to them is instant; only the active tab is
+    /// rendered).
     fn pump_pty(&mut self) {
-        let Some(pty) = &mut self.pty else { return };
-        let tx = self.msg_tx.clone();
-        // v0.9 fix: cap the number of PTY events drained per frame so the
-        // msg_rx channel doesn't grow unboundedly during huge output bursts
-        // (e.g. 20K-line for-loop). Combined with the 64KB process budget in
-        // `process_messages`, this keeps the render thread responsive. Excess
-        // events stay in the PTY's internal event_rx and are drained next frame.
-        const MAX_EVENTS_PER_FRAME: usize = 64;
-        let mut count = 0usize;
-        loop {
-            match pty.try_recv() {
-                Ok(PtyEvent::Output(data)) => {
-                    if tx.send(AppMsg::PtyOutput(data)).is_err() {
-                        break;
-                    }
-                }
-                Ok(PtyEvent::Exit(code)) => {
-                    let _ = tx.send(AppMsg::PtyExit(code));
-                    break;
-                }
-                Err(_) => break,
-            }
-            count += 1;
-            if count >= MAX_EVENTS_PER_FRAME {
-                break;
-            }
+        for tab in &mut self.tabs {
+            tab.pump_pty();
         }
     }
 
     fn process_messages(&mut self) -> bool {
-        let mut need_redraw = false;
-
-        // v0.9 fix: cap the bytes processed per frame so a large PTY burst
-        // (e.g. `for i in $(seq 1 20000); do echo ...; done`) doesn't block
-        // the render thread for seconds. The leftover stays in the channel
-        // and is drained on the next redraw. 64KB/frame ≈ 1ms of VT parsing,
-        // keeping the UI responsive while still making forward progress.
-        const MAX_BYTES_PER_FRAME: usize = 64 * 1024;
-        let mut bytes_this_frame = 0usize;
-
-        while bytes_this_frame < MAX_BYTES_PER_FRAME {
-            let msg = match self.msg_rx.try_recv() {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            match msg {
-                AppMsg::PtyOutput(data) => {
-                    tracing::trace!("PTY output: {} bytes", data.len());
-                    // If this chunk would blow the budget, process only the
-                    // prefix and re-queue the rest by pushing it back. The
-                    // channel is unbounded so re-queue always succeeds.
-                    let remaining_budget = MAX_BYTES_PER_FRAME - bytes_this_frame;
-                    if data.len() > remaining_budget {
-                        let head = data[..remaining_budget].to_vec();
-                        let tail = data[remaining_budget..].to_vec();
-                        // Push the tail back to the front by sending it as a
-                        // new message — it will be drained next frame.
-                        let _ = self.msg_tx.send(AppMsg::PtyOutput(tail));
-                        let mut response = Vec::new();
-                        if let Some(terminal) = &mut self.terminal {
-                            terminal.process(&head);
-                            response = terminal.take_response();
-                            need_redraw = true;
-                        }
-                        if !response.is_empty() {
-                            if let Some(pty) = &self.pty {
-                                if let Err(e) = pty.write_sync(&response) {
-                                    warn!(error = %e, "failed to write terminal response");
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    bytes_this_frame += data.len();
-                    let mut response = Vec::new();
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.process(&data);
-                        response = terminal.take_response();
-                        need_redraw = true;
-                    }
-                    // Write any terminal-query responses (DA/DSR/size reports)
-                    // back to the PTY so TUIs get their capability answers.
-                    if !response.is_empty() {
-                        if let Some(pty) = &self.pty {
-                            if let Err(e) = pty.write_sync(&response) {
-                                warn!(error = %e, "failed to write terminal response");
-                            }
-                        }
-                    }
-                }
-                AppMsg::PtyExit(code) => {
-                    info!("Shell exited: {:?}", code);
+        let mut any_redraw = false;
+        let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
+        for i in 0..self.tabs.len() {
+            let (alive, drained, need_redraw) = self.tabs[i].process_messages();
+            if !alive {
+                // Shell exited on tab `i`. For now (Stage 2) we only exit
+                // the app when the LAST tab's shell exits. A closed tab
+                // via Cmd+W is handled by `close_tab`, not here.
+                if self.tabs.len() <= 1 {
                     return false;
                 }
+                // Otherwise: remove the exited tab and switch to the prev.
+                self.tabs.remove(i);
+                if self.active_tab >= self.tabs.len() {
+                    self.active_tab = self.tabs.len() - 1;
+                }
+                info!(closed = i, active = self.active_tab, "tab shell exited");
+                break;
+            }
+            drained_blocks.extend(drained);
+            if need_redraw {
+                any_redraw = true;
             }
         }
-
-        // Persist any command blocks finished during this batch (synchronous:
-        // local SQLite inserts are fast; volume is one block per command).
-        if let Some(store) = &self.block_store {
-            if let Some(terminal) = &mut self.terminal {
-                for block in terminal.block_tracker_mut().drain_unpersisted() {
-                    if let Err(e) = store.insert(&block) {
+        if !drained_blocks.is_empty() {
+            if let Some(store) = &self.block_store {
+                for block in &drained_blocks {
+                    if let Err(e) = store.insert(block) {
                         warn!(error = %e, "failed to persist block");
                     }
                 }
             }
         }
-
-        if need_redraw {
+        if any_redraw {
             self.request_redraw();
         }
-
         true
     }
 
     fn request_redraw(&self) {
-        if let (Some(window), Some(_renderer), Some(_terminal)) =
-            (&self.window, &self.renderer, &self.terminal)
-        {
+        if let (Some(window), Some(_renderer)) = (&self.window, &self.renderer) {
             window.request_redraw();
         }
     }
@@ -571,7 +470,7 @@ impl App {
         mods: winit::event::Modifiers,
         text: Option<&str>,
     ) {
-        if self.terminal.is_none() {
+        if self.tab().terminal.is_none() {
             return;
         }
 
@@ -723,18 +622,21 @@ impl App {
         // (writes the command); Shift+Enter grows the box. Drops back to
         // passthrough automatically in alt-screen / command-running / SSH.
         let input_mode = self
+            .tab()
             .terminal
             .as_ref()
             .map(|t| t.effective_input_mode())
             .unwrap_or(weft_core::input::InputMode::Passthrough);
         if input_mode == weft_core::input::InputMode::Editor {
             let prev_lines = self
+                .tab()
                 .terminal
                 .as_ref()
                 .map(|t| t.editor().line_count())
                 .unwrap_or(1);
             let consumed = self.handle_editor_key(key, m, text);
             let new_lines = self
+                .tab()
                 .terminal
                 .as_ref()
                 .map(|t| t.editor().line_count())
@@ -748,24 +650,26 @@ impl App {
             }
         }
 
-        self.input_handler.app_cursor_keys = self
+        let app_cursor_keys = self
+            .tab()
             .terminal
             .as_ref()
             .map(|t| t.app_cursor_keys)
             .unwrap_or(false);
+        self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
 
-        let bytes = self.input_handler.encode_key(key, m);
+        let bytes = self.tab().input_handler.encode_key(key, m);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
         // send for each key, including whether DECCKM/app-cursor mode is on.
         tracing::debug!(
             ?key,
             ?m,
-            app_cursor_keys = self.input_handler.app_cursor_keys,
+            app_cursor_keys = self.tab().input_handler.app_cursor_keys,
             ?bytes,
             "key → pty"
         );
         if !bytes.is_empty() {
-            if let Some(pty) = &self.pty {
+            if let Some(pty) = &self.tab().pty {
                 if let Err(e) = pty.write_sync(&bytes) {
                     warn!("Failed to write to PTY: {e}");
                 }
@@ -810,6 +714,11 @@ impl App {
             Action::ToggleCommandPalette => {
                 self.palette_open = !self.palette_open;
                 if self.palette_open {
+                    // v0.9 fix: opening the palette closes the find bar (and
+                    // vice versa) so only one modal owns keyboard input at a
+                    // time. Without this, Cmd+F then Cmd+P leaves both
+                    // popups open and keystrokes go to the wrong one.
+                    self.close_find();
                     self.palette_query.clear();
                     self.palette_selection = 0;
                     self.palette_form = None;
@@ -826,6 +735,8 @@ impl App {
             Action::FindInGrid => {
                 self.find_open = !self.find_open;
                 if self.find_open {
+                    // v0.9 fix: opening find closes the palette (see above).
+                    self.close_palette();
                     self.find_query.clear();
                     self.find_matches.clear();
                     self.find_index = 0;
@@ -844,6 +755,19 @@ impl App {
             }
             Action::ToggleTheme => {
                 self.toggle_theme();
+                true
+            }
+            Action::NewTab => {
+                self.new_tab();
+                true
+            }
+            Action::CloseTab => self.close_tab(),
+            Action::NextTab => {
+                self.next_tab();
+                true
+            }
+            Action::PrevTab => {
+                self.prev_tab();
                 true
             }
         }
@@ -905,6 +829,40 @@ impl App {
     }
 
     // ── Command Palette (v0.7) ──────────────────────────────────────────
+
+    /// v0.9: close the find bar and reset its state. Used when another modal
+    /// (palette, panel, …) opens so only one owns keyboard input.
+    fn close_find(&mut self) {
+        if !self.find_open {
+            return;
+        }
+        self.find_open = false;
+        self.find_query.clear();
+        self.find_matches.clear();
+        self.find_index = 0;
+        self.find_truncated = false;
+        self.find_block_matches.clear();
+        self.find_block_index = 0;
+        self.find_block_truncated = false;
+        self.find_regex_mode = false;
+        self.find_case_sensitive = false;
+        self.find_last_key = None;
+        self.find_regex_error = None;
+        self.find_worker_busy = false;
+    }
+
+    /// v0.9: close the command palette and reset its state. Used when
+    /// another modal (find bar, …) opens so only one owns keyboard input.
+    fn close_palette(&mut self) {
+        if !self.palette_open {
+            return;
+        }
+        self.palette_open = false;
+        self.palette_query.clear();
+        self.palette_selection = 0;
+        self.palette_form = None;
+        self.palette_submode = PaletteSubMode::Search;
+    }
 
     /// Refresh the palette search results from the workflow store + builtin commands.
     fn refresh_palette_results(&mut self) {
@@ -1229,7 +1187,11 @@ impl App {
         }
         self.find_last_key = None;
 
-        let Some(term) = self.terminal.as_ref() else {
+        // Access the active tab's terminal via direct field indexing so the
+        // borrow is split to `self.tabs` — the find_* fields below can then
+        // be mutated without a borrow conflict (going through `self.tab()`
+        // would borrow all of `self`).
+        let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
             return;
         };
 
@@ -1261,7 +1223,7 @@ impl App {
         // block view. This is fast (String scanning) and the matches are
         // needed immediately for the FindUI count.
         // v0.9 U-P2: pass is_regex so regex mode works in block view too.
-        if self.block_view_active() {
+        if term.show_block_view() {
             let blocks = term.block_tracker().session_blocks();
             let mut block_matches = match weft_core::find::find_in_blocks(
                 blocks,
@@ -1381,7 +1343,7 @@ impl App {
         if self.block_view_active() && !self.find_block_matches.is_empty() {
             let bm = self.find_block_matches.get(self.find_block_index).cloned();
             let Some(bm) = bm else { return };
-            let Some(term) = self.terminal.as_ref() else {
+            let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
                 return;
             };
             // Find the block's index in session_blocks to compute its row
@@ -1449,14 +1411,14 @@ impl App {
             let (total, _) = block_content_metrics(term, cols);
             let max_scroll = total.saturating_sub(visible);
             let target = rows_from_bottom.saturating_sub(visible / 2).min(max_scroll);
-            self.block_scroll_offset = target;
+            self.tabs[self.active_tab].block_scroll_offset = target;
             return;
         }
         // Grid view: scroll grid to bring the match to the middle row.
         let Some(m) = self.find_matches.get(self.find_index).copied() else {
             return;
         };
-        let Some(term) = self.terminal.as_mut() else {
+        let Some(term) = self.tabs[self.active_tab].terminal.as_mut() else {
             return;
         };
         let grid = term.grid_mut();
@@ -1783,12 +1745,13 @@ impl App {
         match wf.render(&values) {
             Ok(commands) => {
                 for cmd in &commands {
-                    if let Some(terminal) = &mut self.terminal {
+                    let tab = &mut self.tabs[self.active_tab];
+                    if let Some(terminal) = &mut tab.terminal {
                         // Set the command text and submit via the editor path.
                         terminal.editor_mut().buffer.set_text(cmd);
                         let bytes = terminal.submit_command();
                         if !bytes.is_empty() {
-                            if let Some(pty) = &self.pty {
+                            if let Some(pty) = &tab.pty {
                                 let _ = pty.write_sync(&bytes);
                             }
                         }
@@ -1810,7 +1773,7 @@ impl App {
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
-            let consumed = if let Some(t) = self.terminal.as_mut() {
+            let consumed = if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                 let e = t.editor_mut();
                 match key {
                     Char('a') => {
@@ -1850,13 +1813,13 @@ impl App {
         }
 
         // Ctrl+R search mode intercepts printable/backspace/enter/esc/arrows.
-        let searching = self
+        let searching = self.tabs[self.active_tab]
             .terminal
             .as_ref()
             .map(|t| t.editor().is_searching())
             .unwrap_or(false);
         if searching {
-            if let Some(t) = self.terminal.as_mut() {
+            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                 let e = t.editor_mut();
                 match key {
                     Char(c) => {
@@ -1892,7 +1855,7 @@ impl App {
         // Tab-completion mode: Tab cycles, Enter accepts (no submit), Up/Down
         // navigate, Esc cancels. Any other key cancels and falls through to
         // normal editing (so typing/deleting ends the session).
-        let completing = self
+        let completing = self.tabs[self.active_tab]
             .terminal
             .as_ref()
             .map(|t| t.editor().is_completing())
@@ -1945,13 +1908,13 @@ impl App {
                 };
                 if do_submit {
                     self.editor_submit();
-                } else if let Some(t) = self.terminal.as_mut() {
+                } else if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.split_newline();
                 }
                 true
             }
             Char(c) => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut()
                         .buffer
                         .insert_char(resolve_text_char(text, c, shift));
@@ -1959,43 +1922,43 @@ impl App {
                 true
             }
             Backspace => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.delete_backspace();
                 }
                 true
             }
             Delete => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.delete_forward();
                 }
                 true
             }
             Left => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.move_left();
                 }
                 true
             }
             Right => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.move_right();
                 }
                 true
             }
             Home => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.move_line_home();
                 }
                 true
             }
             End => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.move_line_end();
                 }
                 true
             }
             Up => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     let e = t.editor_mut();
                     if e.buffer.cursor.0 == 0 {
                         e.history_prev();
@@ -2008,7 +1971,7 @@ impl App {
                 true
             }
             Down => {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     let e = t.editor_mut();
                     let last = e.buffer.line_count() - 1;
                     if e.buffer.cursor.0 == last {
@@ -2030,7 +1993,7 @@ impl App {
 
     fn editor_start_completion(&mut self) {
         // Gather context under an immutable borrow, then mutate the editor.
-        let (line_owned, col, cwd, history) = match self.terminal.as_ref() {
+        let (line_owned, col, cwd, history) = match self.tabs[self.active_tab].terminal.as_ref() {
             Some(t) => {
                 let line_idx = t.editor().buffer.cursor.0;
                 let col = t.editor().buffer.cursor.1;
@@ -2094,7 +2057,7 @@ impl App {
         if matches.is_empty() {
             return;
         }
-        let Some(t) = self.terminal.as_mut() else {
+        let Some(t) = self.tabs[self.active_tab].terminal.as_mut() else {
             return;
         };
         let e = t.editor_mut();
@@ -2108,25 +2071,25 @@ impl App {
     }
 
     fn editor_completion_next(&mut self) {
-        if let Some(t) = self.terminal.as_mut() {
+        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
             t.editor_mut().completion_next();
         }
     }
 
     fn editor_completion_prev(&mut self) {
-        if let Some(t) = self.terminal.as_mut() {
+        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
             t.editor_mut().completion_prev();
         }
     }
 
     fn editor_completion_accept(&mut self) {
-        if let Some(t) = self.terminal.as_mut() {
+        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
             t.editor_mut().completion_accept();
         }
     }
 
     fn editor_completion_cancel(&mut self) {
-        if let Some(t) = self.terminal.as_mut() {
+        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
             t.editor_mut().completion_cancel();
         }
     }
@@ -2134,23 +2097,23 @@ impl App {
     /// Submit the editor's command: write PTY bytes (and any terminal query
     /// response) and locally block the editor through the Enter→preexec window.
     fn editor_submit(&mut self) {
-        let bytes = self
+        let bytes = self.tabs[self.active_tab]
             .terminal
             .as_mut()
             .map(|t| t.submit_command())
             .unwrap_or_default();
         if !bytes.is_empty() {
-            if let Some(pty) = &self.pty {
+            if let Some(pty) = &self.tabs[self.active_tab].pty {
                 let _ = pty.write_sync(&bytes);
             }
         }
-        let resp = self
+        let resp = self.tabs[self.active_tab]
             .terminal
             .as_mut()
             .map(|t| t.take_response())
             .unwrap_or_default();
         if !resp.is_empty() {
-            if let Some(pty) = &self.pty {
+            if let Some(pty) = &self.tabs[self.active_tab].pty {
                 let _ = pty.write_sync(&resp);
             }
         }
@@ -2162,13 +2125,13 @@ impl App {
         // the view stays scrolled up on history. Snapping here, at submit
         // time, guarantees the user sees the result regardless of how fast
         // the command completes.
-        self.block_scroll_offset = 0;
+        self.tabs[self.active_tab].block_scroll_offset = 0;
         self.request_redraw();
     }
 
     /// Count of blocks visible in the panel (newest-first, query-filtered).
     fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = &self.terminal else {
+        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
             return 0;
         };
         let blocks = terminal.block_tracker().blocks();
@@ -2193,7 +2156,7 @@ impl App {
 
     /// The [`BlockId`] of the currently selected panel row, if any.
     fn panel_selected_block_id(&self) -> Option<BlockId> {
-        let terminal = self.terminal.as_ref()?;
+        let terminal = self.tabs[self.active_tab].terminal.as_ref()?;
         let visible = terminal.grid().num_rows;
         terminal
             .block_tracker()
@@ -2206,9 +2169,71 @@ impl App {
             .map(|b| b.id)
     }
 
+    /// v0.9 W2: scroll the terminal's block view so the panel-selected block
+    /// is visible, and arm a 1.5s accent highlight. Called when the user
+    /// clicks a row in the history panel (or presses Cmd+Enter while the
+    /// panel is open).
+    fn scroll_to_panel_selection(&mut self) {
+        let block_id = match self.panel_selected_block_id() {
+            Some(id) => id,
+            None => return,
+        };
+        // Only meaningful in block view (grid view has no block layout).
+        if !self.block_view_active() {
+            return;
+        }
+        let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
+            return;
+        };
+        let blocks = term.block_tracker().session_blocks();
+        let block_idx = blocks.iter().position(|b| b.id == block_id);
+        let Some(block_idx) = block_idx else { return };
+
+        // Count rows from the bottom up to the target block's command line.
+        // Layout (bottom→top): Output[N-1] at row 0, …, Output[0] at row
+        // N-1, Command at row N, Header at row N+1, Separator at row N+2.
+        // For each block BELOW the target (i.e. with higher index), add its
+        // full height (3 + output_lines).
+        let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
+            if b.collapsed {
+                return 0;
+            }
+            let mut lines: Vec<&str> = b.output.lines().collect();
+            while lines.last().is_some_and(|l| {
+                let t = l.trim();
+                t.is_empty() || matches!(t, "%" | "$" | "#")
+            }) {
+                lines.pop();
+            }
+            lines.len()
+        };
+        let mut rows_from_bottom = 0usize;
+        for (i, b) in blocks.iter().enumerate().rev() {
+            if i == block_idx {
+                break;
+            }
+            rows_from_bottom += 3 + trim_output_lines(b);
+        }
+        // Position the block's command line at ~1/3 from the bottom of the
+        // viewport so the user sees the command + most of its output above.
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let visible = renderer.block_visible_rows(1);
+        let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
+        self.tabs[self.active_tab].block_scroll_offset = target;
+
+        // Arm the highlight: accent border around the block for 1.5s.
+        self.panel_highlight = Some(block_id);
+        self.panel_highlight_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
+        self.request_redraw();
+    }
+
     /// Local scrollback navigation (page up/down, top, bottom).
     fn scroll_action(&mut self, action: Action) {
-        let Some(terminal) = &mut self.terminal else {
+        let tab = &mut self.tabs[self.active_tab];
+        let Some(terminal) = &mut tab.terminal else {
             return;
         };
         let rows = terminal.grid().num_rows;
@@ -2226,18 +2251,16 @@ impl App {
             let max_scroll = total.saturating_sub(visible);
             match action {
                 Action::ScrollPageUp => {
-                    self.block_scroll_offset = self
-                        .block_scroll_offset
-                        .saturating_add(rows)
-                        .min(max_scroll);
+                    tab.block_scroll_offset =
+                        tab.block_scroll_offset.saturating_add(rows).min(max_scroll);
                 }
                 Action::ScrollPageDown => {
-                    self.block_scroll_offset = self.block_scroll_offset.saturating_sub(rows);
+                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(rows);
                 }
                 Action::ScrollToTop => {
-                    self.block_scroll_offset = max_scroll;
+                    tab.block_scroll_offset = max_scroll;
                 }
-                Action::ScrollToBottom => self.block_scroll_offset = 0,
+                Action::ScrollToBottom => tab.block_scroll_offset = 0,
                 _ => {}
             }
         } else {
@@ -2261,7 +2284,172 @@ impl App {
         info!("config reloaded");
     }
 
-    /// Toggle between dark and light themes at runtime.
+    // ── v0.9 H1: Tab management ────────────────────────────────────────
+
+    /// Get the current (rows, cols) of the active tab's terminal, falling
+    /// back to the renderer's viewport estimate if the terminal is not yet
+    /// initialized.
+    fn current_size(&self) -> (usize, usize) {
+        if let Some(t) = &self.tabs[self.active_tab].terminal {
+            let grid = t.grid();
+            return (grid.num_rows, grid.num_cols);
+        }
+        // Fallback: derive from renderer viewport.
+        if let Some(r) = &self.renderer {
+            let (w, h) = r.viewport();
+            let cw = r.cell_size();
+            let cols = (w / cw.0).max(1.0) as usize;
+            let rows = (h / cw.1).max(1.0) as usize;
+            return (rows, cols);
+        }
+        (24, 80)
+    }
+
+    /// Cmd+T — open a new tab with a fresh shell session and switch to it.
+    fn new_tab(&mut self) {
+        let (rows, cols) = self.current_size();
+        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy);
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        // Apply the current theme palette to the new terminal so it matches
+        // the window's renderer theme (the atlas is shared per-window, not
+        // per-tab — no atlas rebuild needed).
+        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
+            if let Some(r) = &self.renderer {
+                t.set_palette(r.theme().palette);
+            }
+        }
+        info!(tab_idx = self.active_tab, "new tab created");
+        self.refresh_find_for_active_tab();
+        self.request_redraw();
+    }
+
+    /// Cmd+W — close the current tab. Returns `false` (exit app) if this
+    /// was the last tab; otherwise switches to the previous tab and
+    /// returns `true`.
+    fn close_tab(&mut self) -> bool {
+        if self.tabs.len() <= 1 {
+            // Last tab closed → exit the app.
+            info!("closing last tab, exiting app");
+            return false;
+        }
+        let removed_idx = self.active_tab;
+        let _tab = self.tabs.remove(removed_idx);
+        // Switch to the previous tab (or wrap to last).
+        if self.active_tab > 0 {
+            self.active_tab -= 1;
+        } else {
+            self.active_tab = self.tabs.len() - 1;
+        }
+        info!(closed = removed_idx, active = self.active_tab, "tab closed");
+        self.refresh_find_for_active_tab();
+        self.request_redraw();
+        true
+    }
+
+    /// v0.9 H1 Stage 4: re-bind the global find state to the active tab.
+    ///
+    /// Find query / regex / case-sensitive flags stay global (convenient for
+    /// searching the same term across tabs), but the matches must come from
+    /// the active tab's content — otherwise switching tabs shows the previous
+    /// tab's match coordinates, which point at the wrong rows/blocks.
+    ///
+    /// Called from `new_tab` / `close_tab` / `next_tab` / `prev_tab`. When
+    /// the find bar is closed or the query is empty this is a no-op.
+    fn refresh_find_for_active_tab(&mut self) {
+        if !self.find_open || self.find_query.is_empty() {
+            return;
+        }
+        // Drop any results still queued from the old tab's scan. Without this
+        // drain, `poll_find_worker_results` would apply the stale `Partial`/
+        // `Complete` results to the new active tab on the next frame.
+        while self.find_worker.try_recv_result().is_some() {}
+        self.find_worker_busy = false;
+        // Clear stale matches so the FindUI count resets to 0 until the new
+        // search completes.
+        self.find_matches.clear();
+        self.find_truncated = false;
+        self.find_index = 0;
+        self.find_block_matches.clear();
+        self.find_block_truncated = false;
+        self.find_block_index = 0;
+        self.find_regex_error = None;
+        // Arm the debounce so `maybe_refresh_find_results` re-submits the
+        // query against the new active tab's snapshot on the next redraw.
+        self.find_last_key = Some(std::time::Instant::now());
+    }
+
+    /// Cmd+Shift+] — switch to the next tab (wraps around).
+    fn next_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        info!(active = self.active_tab, "switched to next tab");
+        self.refresh_find_for_active_tab();
+        self.request_redraw();
+    }
+
+    /// Cmd+Shift+[ — switch to the previous tab (wraps around).
+    fn prev_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        self.active_tab = if self.active_tab == 0 {
+            self.tabs.len() - 1
+        } else {
+            self.active_tab - 1
+        };
+        info!(active = self.active_tab, "switched to prev tab");
+        self.refresh_find_for_active_tab();
+        self.request_redraw();
+    }
+
+    /// Build the `TabBarDrawState` for the renderer from the current tab list.
+    /// Tab labels are the cwd basename (or "Tab N" when no cwd is set).
+    fn tab_bar_state(&self) -> TabBarDrawState {
+        let labels: Vec<String> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let cwd = tab
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.cwd())
+                    .and_then(|c| c.rsplit('/').next().map(|s| s.to_string()));
+                // v0.9 W1: when a command is running, append "· <cmd>" to the
+                // cwd basename so the user can see at a glance what each tab
+                // is doing (e.g. "~/weft · cargo", "~/logs · tail -f"). The
+                // command is truncated to 12 chars so labels stay short.
+                let cmd = tab
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.block_tracker().in_flight())
+                    .map(|f| f.command);
+                match (cwd, cmd) {
+                    (Some(cwd), Some(cmd)) => {
+                        let cmd_short: String = cmd.chars().take(12).collect();
+                        let suffix = if cmd.chars().count() > 12 { "…" } else { "" };
+                        format!("{} · {}{}", cwd, cmd_short, suffix)
+                    }
+                    (Some(cwd), None) => cwd,
+                    (None, Some(cmd)) => {
+                        let cmd_short: String = cmd.chars().take(12).collect();
+                        let suffix = if cmd.chars().count() > 12 { "…" } else { "" };
+                        format!("Tab {} · {}{}", i + 1, cmd_short, suffix)
+                    }
+                    (None, None) => format!("Tab {}", i + 1),
+                }
+            })
+            .collect();
+        TabBarDrawState {
+            tab_count: self.tabs.len(),
+            active_tab: self.active_tab,
+            labels,
+        }
+    }
+
     fn toggle_theme(&mut self) {
         // v0.9 U-D1: when `follow_system` is enabled, manual toggle is a
         // no-op — the system appearance wins on the next poll.
@@ -2279,7 +2467,7 @@ impl App {
             r.set_theme(theme.clone());
         }
         // Reseed the terminal's ANSI palette so existing cells recolor.
-        if let Some(t) = &mut self.terminal {
+        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             t.set_palette(theme.palette);
         }
         info!(dark = self.theme_is_dark, "theme toggled");
@@ -2295,7 +2483,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = &mut self.terminal {
+        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             t.set_palette(theme.palette);
         }
         self.theme_is_dark = dark;
@@ -2369,7 +2557,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = &mut self.terminal {
+        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             t.set_palette(theme.palette);
         }
 
@@ -2412,7 +2600,7 @@ impl App {
         self.keybindings = config.keybindings();
 
         // Scrollback capacity.
-        if let Some(t) = &mut self.terminal {
+        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             let cols = t.grid().num_cols;
             t.grid_mut()
                 .scrollback
@@ -2482,11 +2670,11 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.resize(window, size);
         }
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
             terminal.resize(new_rows, new_cols);
             info!(rows = new_rows, cols = new_cols, "terminal resized");
         }
-        self.pending_pty_resize = Some((new_rows, new_cols));
+        self.tabs[self.active_tab].pending_pty_resize = Some((new_rows, new_cols));
         self.last_resize_instant = std::time::Instant::now();
     }
 
@@ -2500,17 +2688,24 @@ impl App {
         // Subtract content padding first so clicks map to the padded grid.
         let cell_w = renderer.cell_width() as f64;
         let cell_h = renderer.cell_height() as f64;
+        // v0.9 H1: subtract tab bar height (chrome_top) so clicks map to the
+        // correct grid row. The grid is rendered at
+        // `padding_y + chrome_top + row * cell_h`, so the inverse is
+        // `(y - padding_y - chrome_top) / cell_h`. Without this, a click on
+        // row N would resolve to N + ~1.5 (off-by-one-down) when the tab bar
+        // is visible.
+        let chrome_top = renderer.tab_bar_height() as f64;
         // Clamp to valid grid bounds. A click past the right/bottom edge (e.g.
         // a drag-to-select ending at the window margin) would otherwise yield
         // col == num_cols / row == num_rows and panic text_from_grid on copy.
-        let (num_rows, num_cols) = self
+        let (num_rows, num_cols) = self.tabs[self.active_tab]
             .terminal
             .as_ref()
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
             .unwrap_or((1, 1));
         let col = (((x - renderer.padding_x() as f64) / cell_w).max(0.0) as usize)
             .min(num_cols.saturating_sub(1));
-        let row = (((y - renderer.padding_y() as f64) / cell_h).max(0.0) as usize)
+        let row = (((y - renderer.padding_y() as f64 - chrome_top) / cell_h).max(0.0) as usize)
             .min(num_rows.saturating_sub(1));
         GridPos::new(row, col)
     }
@@ -2520,7 +2715,7 @@ impl App {
     /// the cell_map has been invalidated by a scroll (MVP trade-off: links
     /// in scrolled-off content aren't clickable).
     fn hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let terminal = self.terminal.as_ref()?;
+        let terminal = self.tabs[self.active_tab].terminal.as_ref()?;
         // Block view uses a separate scrollable layout — skip OSC 8 there.
         if self.block_view_active() {
             return None;
@@ -2598,7 +2793,8 @@ impl App {
     /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
     /// consistent.
     fn block_view_active(&self) -> bool {
-        self.terminal
+        self.tabs[self.active_tab]
+            .terminal
             .as_ref()
             .map(|t| t.show_block_view())
             .unwrap_or(false)
@@ -2613,7 +2809,8 @@ impl App {
         if self.mods.state().shift_key() {
             return false; // Shift = force terminal selection
         }
-        self.terminal
+        self.tabs[self.active_tab]
+            .terminal
             .as_ref()
             .map(|t| t.mouse_protocol != MouseProtocol::Off)
             .unwrap_or(false)
@@ -2663,6 +2860,119 @@ impl App {
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        // v0.9 H1: Tab bar click handling — check before everything else so
+        // tab clicks work even inside TUI apps that captured the mouse. Only
+        // left-clicks on the tab bar are handled here.
+        if button == winit::event::MouseButton::Left && self.tabs.len() > 1 {
+            if let Some(renderer) = &self.renderer {
+                let bar_h = renderer.tab_bar_height();
+                if y as f32 <= bar_h {
+                    // Click is in the tab bar region. Check hit-test rects.
+                    let xf = x as f32;
+                    let yf = y as f32;
+                    for hit in &renderer.tab_hits {
+                        // Check close button first (it's inside the tab rect).
+                        let [cx0, cy0, cx1, cy1] = hit.close_rect;
+                        if xf >= cx0 && xf < cx1 && yf >= cy0 && yf < cy1 {
+                            // Close this tab.
+                            let idx = hit.index;
+                            // If closing the active tab, switch first.
+                            if idx == self.active_tab {
+                                if self.close_tab() {
+                                    // App continues with remaining tabs.
+                                }
+                            } else {
+                                // Close a background tab — remove and adjust index.
+                                self.tabs.remove(idx);
+                                if idx < self.active_tab {
+                                    self.active_tab -= 1;
+                                }
+                                self.request_redraw();
+                            }
+                            return;
+                        }
+                        // Check tab label rect.
+                        let [tx0, ty0, tx1, ty1] = hit.tab_rect;
+                        if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
+                            if self.active_tab != hit.index {
+                                self.active_tab = hit.index;
+                                // v0.9 H1 Stage 4 fix: re-bind find state to
+                                // the new active tab so matches come from its
+                                // content, not the previous tab's.
+                                self.refresh_find_for_active_tab();
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                    return; // Click in tab bar but not on any tab — consume.
+                }
+            }
+        }
+
+        // v0.9 W2: history panel click → select row + scroll terminal to block.
+        // Handled before PTY mouse reporting so panel clicks work even inside
+        // TUI apps that captured the mouse.
+        if button == winit::event::MouseButton::Left && self.panel_open {
+            if let Some(renderer) = &self.renderer {
+                let vp_w = renderer.viewport_width();
+                let scale = renderer.scale() as f32;
+                let width_px = (vp_w * 0.38).min(460.0 * scale);
+                let panel_x = (vp_w - width_px).max(0.0);
+                let ch = renderer.cell_height() as f64;
+                let xf = x as f32;
+                let yf = y;
+                if xf >= panel_x && xf < panel_x + width_px && yf > 0.0 {
+                    // List starts at y = ch * 1.9, row height = ch * 1.1.
+                    let list_top = ch * 1.9;
+                    let row_h = ch * 1.1;
+                    if yf >= list_top {
+                        let clicked = ((yf - list_top) / row_h) as usize;
+                        let max_rows =
+                            visible_panel_rows(renderer.viewport().1, renderer.cell_height());
+                        if clicked < max_rows {
+                            self.panel_selection = clicked;
+                            self.clamp_panel_selection();
+                            // Scroll terminal to the selected block + highlight.
+                            self.scroll_to_panel_selection();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // v0.9 W3: block collapse/expand — click the chevron (▸/▾) at the
+        // left of a Command row to toggle. The chevron occupies the first
+        // cell of the Command row; only foldable blocks draw it, but
+        // toggling a non-foldable block is harmless (no output to hide).
+        if button == winit::event::MouseButton::Left && self.block_view_active() {
+            if let Some(renderer) = &self.renderer {
+                let cw = renderer.cell_width() as f32;
+                let left = renderer.padding_x();
+                let xf = x as f32;
+                let yf = y as f32;
+                // Check if click is in the chevron area (first cell of a
+                // Command row).
+                if xf >= left && xf < left + cw {
+                    for row in &renderer.block_view_rows {
+                        if row.kind == weft_core::selection::BlockViewRowKind::Command
+                            && yf >= row.y_top
+                            && yf < row.y_bottom
+                        {
+                            if let Some(bid) = row.block_id {
+                                if let Some(term) = self.tabs[self.active_tab].terminal.as_mut() {
+                                    term.block_tracker_mut().toggle_collapse(bid);
+                                    self.request_redraw();
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // OSC 8 hyperlink Cmd+Click: open the URL tagged on the clicked cell
         // via the registry's side-map. Bypasses normal selection / PTY mouse
         // reporting so Cmd+Click works even inside TUI apps that captured the
@@ -2720,7 +3030,7 @@ impl App {
             }
 
             if let Some(id) = self.block_at(y as f32) {
-                if let Some(t) = self.terminal.as_mut() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.block_tracker_mut().toggle_collapse(id);
                     self.request_redraw();
                 }
@@ -2746,14 +3056,15 @@ impl App {
                                 .as_ref()
                                 .map(|r| r.block_view_rows.clone())
                                 .unwrap_or_default();
-                            self.selection_handler
+                            self.tabs[self.active_tab]
+                                .selection_handler
                                 .start_block_view(bv_pos, rows_snapshot);
                         } else {
                             // Click missed every selectable row (e.g. on the
                             // prompt box, CWD bar, or empty padding). Clear the
                             // existing selection so the user gets visual
                             // feedback that the previous selection is gone.
-                            self.selection_handler.clear();
+                            self.tabs[self.active_tab].selection_handler.clear();
                         }
                     } else {
                         // Grid view (alt-screen): classic grid selection.
@@ -2763,7 +3074,9 @@ impl App {
                         } else {
                             SelectionMode::Simple
                         };
-                        self.selection_handler.start(pos, mode);
+                        self.tabs[self.active_tab]
+                            .selection_handler
+                            .start(pos, mode);
                     }
                 }
 
@@ -2803,24 +3116,37 @@ impl App {
                     // Right click: extend selection.
                     if block_view {
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            if self.selection_handler.block_view_selection.is_none() {
+                            if self.tabs[self.active_tab]
+                                .selection_handler
+                                .block_view_selection
+                                .is_none()
+                            {
                                 let rows_snapshot = self
                                     .renderer
                                     .as_ref()
                                     .map(|r| r.block_view_rows.clone())
                                     .unwrap_or_default();
-                                self.selection_handler
+                                self.tabs[self.active_tab]
+                                    .selection_handler
                                     .start_block_view(bv_pos, rows_snapshot);
                             } else {
-                                self.selection_handler.extend_block_view(bv_pos);
+                                self.tabs[self.active_tab]
+                                    .selection_handler
+                                    .extend_block_view(bv_pos);
                             }
                         }
                     } else {
                         let pos = self.pixel_to_grid(x, y);
-                        if self.selection_handler.selection.is_none() {
-                            self.selection_handler.start(pos, SelectionMode::Simple);
+                        if self.tabs[self.active_tab]
+                            .selection_handler
+                            .selection
+                            .is_none()
+                        {
+                            self.tabs[self.active_tab]
+                                .selection_handler
+                                .start(pos, SelectionMode::Simple);
                         } else {
-                            self.selection_handler.extend(pos);
+                            self.tabs[self.active_tab].selection_handler.extend(pos);
                         }
                     }
                 }
@@ -2842,7 +3168,7 @@ impl App {
         }
 
         let pos = self.pixel_to_grid(_x, _y);
-        self.selection_handler.end();
+        self.tabs[self.active_tab].selection_handler.end();
 
         let btn = match button {
             winit::event::MouseButton::Left => MouseButton::Left,
@@ -2861,15 +3187,17 @@ impl App {
             return;
         }
 
-        if self.selection_handler.selecting {
+        if self.tabs[self.active_tab].selection_handler.selecting {
             if self.block_view_active() {
                 if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                    self.selection_handler.extend_block_view(bv_pos);
+                    self.tabs[self.active_tab]
+                        .selection_handler
+                        .extend_block_view(bv_pos);
                     self.request_redraw();
                 }
             } else {
                 let pos = self.pixel_to_grid(x, y);
-                self.selection_handler.extend(pos);
+                self.tabs[self.active_tab].selection_handler.extend(pos);
                 self.request_redraw();
             }
         }
@@ -2980,7 +3308,7 @@ impl App {
 
     /// Run a context menu action on the target block.
     fn run_context_action(&mut self, block_id: BlockId, action: &str) {
-        let Some(terminal) = &mut self.terminal else {
+        let Some(terminal) = &mut self.tabs[self.active_tab].terminal else {
             return;
         };
 
@@ -3004,12 +3332,47 @@ impl App {
             "toggle_fold" => {
                 terminal.block_tracker_mut().toggle_collapse(block_id);
             }
+            // W4: copy the block's command into the editor buffer so the user
+            // can tweak parameters and re-submit (Warp-style "rerun"). Only
+            // takes effect at the prompt — when a command is running or an
+            // alt-screen app is active, the editor isn't the effective input
+            // mode, so we silently no-op rather than stashing text the user
+            // would see resurface unexpectedly when the prompt returns.
+            "send_to_input" => {
+                if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
+                    // Clone first to release the immutable borrow on
+                    // `terminal.block_tracker()` before `editor_mut()`.
+                    let cmd = terminal
+                        .block_tracker()
+                        .session_blocks()
+                        .iter()
+                        .find(|b| b.id == block_id)
+                        .map(|b| b.command.clone());
+                    if let Some(cmd) = cmd {
+                        if !cmd.is_empty() {
+                            terminal.editor_mut().buffer.set_text(&cmd);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     /// Handle scroll wheel.
     fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta, x: f64, y: f64) {
+        // v0.9 fix: drain pending PTY messages BEFORE checking alt-screen
+        // state. When `less` (or any alt-screen app) starts, the enter
+        // sequence (`\x1b[?1049h`) is still in the channel until the next
+        // `process_messages` call. Without this drain, the first wheel
+        // events see `alt_active = false` and fall through to the
+        // viewport-scroll branch (which does nothing on alt screen). After
+        // a keyboard event triggers a redraw → process_messages → alt_active
+        // becomes true, the wheel starts working — which matches the user
+        // report "scrolling works only after pressing a key".
+        self.pump_pty();
+        self.process_messages();
+
         let lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, v) => {
                 if v > 0.0 {
@@ -3032,12 +3395,22 @@ impl App {
             return;
         }
 
-        let Some(terminal) = &mut self.terminal else {
-            return;
+        // Short-lived immutable borrow to read the mode flags up-front —
+        // avoids holding a long-lived mutable borrow of `terminal` across
+        // later accesses to `block_scroll_offset`, `renderer`, etc.
+        let (mouse_protocol_active, alt_screen_active, block_view) = {
+            let Some(t) = &self.tabs[self.active_tab].terminal else {
+                return;
+            };
+            (
+                t.mouse_protocol != MouseProtocol::Off,
+                t.is_alt_screen_active(),
+                t.show_block_view(),
+            )
         };
 
         // Check if mouse protocol is active — forward scroll to PTY
-        if terminal.mouse_protocol != MouseProtocol::Off {
+        if mouse_protocol_active {
             let up = match delta {
                 winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
                 winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
@@ -3053,8 +3426,11 @@ impl App {
             if self.mods.state().control_key() {
                 m |= Modifiers::CONTROL;
             }
-            if let Some(bytes) = self.input_handler.encode_scroll(up, pos.col, pos.row, m) {
-                if let Some(pty) = &self.pty {
+            if let Some(bytes) = self.tabs[self.active_tab]
+                .input_handler
+                .encode_scroll(up, pos.col, pos.row, m)
+            {
+                if let Some(pty) = &self.tabs[self.active_tab].pty {
                     let _ = pty.write_sync(&bytes);
                 }
             }
@@ -3064,7 +3440,7 @@ impl App {
         // Alt-screen apps (less, vim, man, etc.) don't use mouse protocol but
         // still benefit from wheel scroll: translate to Up/Down arrow key
         // sequences so the pager scrolls its content natively.
-        if terminal.is_alt_screen_active() {
+        if alt_screen_active {
             let up = match delta {
                 winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
                 winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
@@ -3074,13 +3450,13 @@ impl App {
             if self.mods.state().shift_key() {
                 m |= Modifiers::SHIFT;
             }
-            let single = self.input_handler.encode_key(key, m);
+            let single = self.tabs[self.active_tab].input_handler.encode_key(key, m);
             if !single.is_empty() {
                 let mut batch = Vec::with_capacity(single.len() * lines);
                 for _ in 0..lines {
                     batch.extend_from_slice(&single);
                 }
-                if let Some(pty) = &self.pty {
+                if let Some(pty) = &self.tabs[self.active_tab].pty {
                     let _ = pty.write_sync(&batch);
                 }
             }
@@ -3095,44 +3471,52 @@ impl App {
         // Block view uses a dedicated scroll offset (not grid.scroll_offset,
         // which is clamped to grid scrollback — the wrong proxy for block
         // content like headers/commands/separators).
-        if terminal.show_block_view() {
+        if block_view {
             // Cap scroll speed at 1 row per wheel notch in the block view.
             // macOS trackpad inertia can send 3-4 lines per tick, which skips
             // past content too fast for comfortable reading.
             let scroll_lines = lines.min(1);
-            if up {
-                self.block_scroll_offset = self.block_scroll_offset.saturating_add(scroll_lines);
-                // Clamp: don't scroll past the oldest content. The visible
-                // viewport already holds `visible_rows` rows; total content
-                // is `total_rows`. Max scroll = total - visible.
-                let cols = terminal.grid().num_cols;
-                let (total, _) = block_content_metrics(terminal, cols);
-                // Compute visible rows from the renderer's actual geometry
-                // (pitch = ch * 1.1, region = viewport minus prompt box).
-                // The old code used grid().num_rows which overcounts because
-                // the block view uses a 10% taller line pitch and doesn't
-                // occupy the full viewport (prompt box eats space).
-                let prompt_lines = if let Some(t) = &self.terminal {
-                    t.editor().buffer.lines.len()
-                } else {
-                    1
+            // Compute metrics via a short-lived immutable borrow of `terminal`
+            // so we can later mutate `block_scroll_offset` (same Tab, but a
+            // disjoint field — allowed once the immutable borrow ends).
+            let (total, prompt_lines) = {
+                let Some(t) = &self.tabs[self.active_tab].terminal else {
+                    return;
                 };
-                let visible = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.block_visible_rows(prompt_lines))
-                    .unwrap_or(1);
-                let max_scroll = total.saturating_sub(visible);
-                self.block_scroll_offset = self.block_scroll_offset.min(max_scroll);
+                let cols = t.grid().num_cols;
+                let (total, _) = block_content_metrics(t, cols);
+                (total, t.editor().buffer.lines.len())
+            };
+            // Compute visible rows from the renderer's actual geometry
+            // (pitch = ch * 1.1, region = viewport minus prompt box).
+            // The old code used grid().num_rows which overcounts because
+            // the block view uses a 10% taller line pitch and doesn't
+            // occupy the full viewport (prompt box eats space).
+            let visible = self
+                .renderer
+                .as_ref()
+                .map(|r| r.block_visible_rows(prompt_lines))
+                .unwrap_or(1);
+            let max_scroll = total.saturating_sub(visible);
+            if up {
+                self.tabs[self.active_tab].block_scroll_offset = self.tabs[self.active_tab]
+                    .block_scroll_offset
+                    .saturating_add(scroll_lines)
+                    .min(max_scroll);
             } else {
-                self.block_scroll_offset = self.block_scroll_offset.saturating_sub(scroll_lines);
+                self.tabs[self.active_tab].block_scroll_offset = self.tabs[self.active_tab]
+                    .block_scroll_offset
+                    .saturating_sub(scroll_lines);
             }
         } else {
-            let grid = &mut terminal.grid_mut();
-            if up {
-                grid.scroll_up_history(lines);
-            } else {
-                grid.scroll_down_history(lines);
+            // Grid view scroll — needs mutable terminal.
+            if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
+                let grid = &mut terminal.grid_mut();
+                if up {
+                    grid.scroll_up_history(lines);
+                } else {
+                    grid.scroll_down_history(lines);
+                }
             }
         }
         self.request_redraw();
@@ -3140,7 +3524,7 @@ impl App {
 
     /// Send a mouse event to the PTY if mouse protocol is active.
     fn send_mouse_event(&self, button: MouseButton, action: MouseAction, pos: GridPos) {
-        let Some(terminal) = &self.terminal else {
+        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
             return;
         };
         if terminal.mouse_protocol == MouseProtocol::Off {
@@ -3156,11 +3540,11 @@ impl App {
         if self.mods.state().control_key() {
             m |= Modifiers::CONTROL;
         }
-        if let Some(bytes) = self
+        if let Some(bytes) = self.tabs[self.active_tab]
             .input_handler
             .encode_mouse(button, action, pos.col, pos.row, m)
         {
-            if let Some(pty) = &self.pty {
+            if let Some(pty) = &self.tabs[self.active_tab].pty {
                 let _ = pty.write_sync(&bytes);
             }
         }
@@ -3174,13 +3558,17 @@ impl App {
     /// bug where a grid-coordinate copy landed on the wrong line because the
     /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
     fn copy_selection(&self) {
-        let Some(terminal) = &self.terminal else {
+        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
             return;
         };
         let text = if terminal.show_block_view() {
-            self.selection_handler.block_view_text()
+            self.tabs[self.active_tab]
+                .selection_handler
+                .block_view_text()
         } else {
-            self.selection_handler.selected_text(terminal.grid())
+            self.tabs[self.active_tab]
+                .selection_handler
+                .selected_text(terminal.grid())
         };
         if let Some(text) = text {
             if !text.is_empty() {
@@ -3204,7 +3592,7 @@ impl App {
             return;
         }
 
-        let mode = self
+        let mode = self.tabs[self.active_tab]
             .terminal
             .as_ref()
             .map(|t| t.effective_input_mode())
@@ -3215,7 +3603,7 @@ impl App {
             // split on \n (insert_char rejects control chars including \n,
             // so we must drive split_newline explicitly to preserve line
             // breaks). \r is dropped to handle CRLF paste from external apps.
-            if let Some(t) = self.terminal.as_mut() {
+            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                 let buf = &mut t.editor_mut().buffer;
                 for c in text.chars() {
                     if c == '\n' {
@@ -3228,13 +3616,13 @@ impl App {
             self.request_redraw();
         } else {
             // Passthrough: forward to the PTY.
-            let bracketed = self
+            let bracketed = self.tabs[self.active_tab]
                 .terminal
                 .as_ref()
                 .map(|t| t.bracketed_paste)
                 .unwrap_or(false);
             let bytes = encode_paste(&text, bracketed);
-            if let Some(pty) = &self.pty {
+            if let Some(pty) = &self.tabs[self.active_tab].pty {
                 if let Err(e) = pty.write_sync(&bytes) {
                     warn!("Failed to paste to PTY: {e}");
                 }
@@ -3462,7 +3850,7 @@ impl ApplicationHandler<AppEvent> for App {
             let path = cache.join("blocks.db");
             match BlockStore::open(&path) {
                 Ok(store) => {
-                    if let Some(terminal) = &mut self.terminal {
+                    if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
                         match store.recent(1000) {
                             Ok(history) => {
                                 // Hydrate editor history from persisted commands so
@@ -3561,8 +3949,16 @@ impl ApplicationHandler<AppEvent> for App {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let pad_x = renderer.padding_x() as f64;
                     let pad_y = renderer.padding_y() as f64;
+                    // v0.9 H1: subtract tab bar height from usable height when
+                    // there are 2+ tabs. The tab bar only appears with multiple
+                    // tabs; with a single tab the full height is usable.
+                    let tab_bar_h = if self.tabs.len() > 1 {
+                        renderer.tab_bar_height() as f64
+                    } else {
+                        0.0
+                    };
                     let usable_w = physical_size.width as f64 - 2.0 * pad_x;
-                    let usable_h = (physical_size.height as f64 - 2.0 * pad_y).max(0.0);
+                    let usable_h = (physical_size.height as f64 - 2.0 * pad_y - tab_bar_h).max(0.0);
                     let new_cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
                     let new_rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
 
@@ -3570,18 +3966,19 @@ impl ApplicationHandler<AppEvent> for App {
                         // Update renderer viewport immediately
                         renderer.resize(window, physical_size);
 
-                        // Resize grid immediately for smooth animation.
-                        // The rewrap is fast (<1ms) so doing it on every
-                        // intermediate event is fine.
-                        if let Some(terminal) = &mut self.terminal {
-                            terminal.resize(new_rows, new_cols);
-                            info!(rows = new_rows, cols = new_cols, "terminal resized (event)");
+                        // Resize ALL tabs' grids immediately for smooth
+                        // animation. The rewrap is fast (<1ms) so doing it
+                        // on every intermediate event is fine. Background
+                        // tabs also need resizing so their content wraps
+                        // correctly when switched to.
+                        for tab in &mut self.tabs {
+                            if let Some(terminal) = &mut tab.terminal {
+                                terminal.resize(new_rows, new_cols);
+                            }
+                            // Debounce the PTY SIGWINCH for each tab.
+                            tab.pending_pty_resize = Some((new_rows, new_cols));
                         }
-
-                        // Debounce only the PTY SIGWINCH to prevent the
-                        // shell from fighting cursor position during rapid
-                        // resize cascades (~40 events during maximize).
-                        self.pending_pty_resize = Some((new_rows, new_cols));
+                        info!(rows = new_rows, cols = new_cols, "all tabs resized (event)");
                         self.last_resize_instant = std::time::Instant::now();
                     }
                 }
@@ -3602,9 +3999,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // block view to the bottom so the user sees fresh content.
                 // (At prompt / idle, preserve the user's scroll position.)
                 if had_output {
-                    if let Some(t) = &self.terminal {
+                    if let Some(t) = &self.tabs[self.active_tab].terminal {
                         if t.block_tracker().phase() == ShellPhase::CommandExecuting {
-                            self.block_scroll_offset = 0;
+                            self.tabs[self.active_tab].block_scroll_offset = 0;
                         }
                     }
                 }
@@ -3615,7 +4012,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // transitions no longer cause drift: the grid is always
                 // full-window and the input box is a non-resizing overlay.
                 let desired_rows = self.grid_dims().0;
-                let current_rows = self
+                let current_rows = self.tabs[self.active_tab]
                     .terminal
                     .as_ref()
                     .map(|t| t.grid().num_rows)
@@ -3624,21 +4021,39 @@ impl ApplicationHandler<AppEvent> for App {
                     self.recompute_layout();
                 }
 
-                // Flush debounced PTY resize after the cascade settles
-                // (100ms of no new resize events). The grid was already
-                // resized immediately in the Resized handler.
-                if let Some((rows, cols)) = self.pending_pty_resize {
-                    if self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100) {
-                        if let Some(pty) = &self.pty {
-                            if let Err(e) = pty.resize(rows as u16, cols as u16) {
-                                warn!("PTY resize failed: {e}");
+                // Flush debounced PTY resize for ALL tabs after the cascade
+                // settles (100ms of no new resize events). The grids were
+                // already resized immediately in the Resized handler —
+                // this only sends the SIGWINCH to each shell.
+                if self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100) {
+                    for tab in &mut self.tabs {
+                        if let Some((rows, cols)) = tab.pending_pty_resize.take() {
+                            if let Some(pty) = &tab.pty {
+                                if let Err(e) = pty.resize(rows as u16, cols as u16) {
+                                    warn!("PTY resize failed: {e}");
+                                }
                             }
                         }
-                        self.pending_pty_resize = None;
                     }
                 }
 
-                if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &self.terminal) {
+                // v0.9 H1: borrow the active Tab once and access its fields
+                // (terminal / ime_preedit / selection_handler / block_scroll_offset)
+                // as disjoint field borrows. Indexing `self.tabs[i]` repeatedly
+                // would prevent Rust from splitting borrows across the
+                // `&tab.terminal` (immutable) and `&mut tab.selection_handler`
+                // (mutable) needed by `renderer.draw`. `self.tabs` and
+                // `self.renderer` are disjoint fields of `App`, so both can be
+                // mutably borrowed at once.
+                let active = self.active_tab;
+                // Compute the tab bar state BEFORE borrowing `self.tabs`
+                // mutably below: `tab_bar_state()` reads `self.tabs[*]`
+                // labels and would conflict with `&mut self.tabs[active]`.
+                // The returned `TabBarDrawState` is owned and lives for the
+                // whole draw call.
+                let tab_bar = self.tab_bar_state();
+                let tab = &mut self.tabs[active];
+                if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
                     // Sync popup dimensions to renderer (user-adjustable via border drag).
                     renderer.set_popup_size(self.popup_width_scale, self.popup_max_rows);
                     // Sync context menu target to renderer.
@@ -3686,7 +4101,7 @@ impl ApplicationHandler<AppEvent> for App {
                         &self.panel_query,
                         self.panel_selection,
                         self.panel_expanded,
-                        &self.ime_preedit,
+                        &tab.ime_preedit,
                         self.palette_open,
                         &self.palette_query,
                         self.palette_selection,
@@ -3765,23 +4180,32 @@ impl ApplicationHandler<AppEvent> for App {
                         None
                     };
                     renderer.find_state = find_state;
+                    // v0.9 W2: expire panel highlight after 1.5s.
+                    if let Some(until) = self.panel_highlight_until {
+                        if std::time::Instant::now() >= until {
+                            self.panel_highlight = None;
+                            self.panel_highlight_until = None;
+                        }
+                    }
+                    renderer.panel_highlight = self.panel_highlight;
                     // Pause cursor blink while the user is actively selecting
                     // OR while a selection is visible (not yet cleared). A
                     // moving or persistent selection is the focus of attention;
                     // a blinking caret distracts. Resumes when the selection
                     // is cleared (click on empty area / prompt / Esc).
-                    let has_selection = self.selection_handler.selecting
-                        || self.selection_handler.block_view_selection.is_some()
-                        || self.selection_handler.selection.is_some();
+                    let has_selection = tab.selection_handler.selecting
+                        || tab.selection_handler.block_view_selection.is_some()
+                        || tab.selection_handler.selection.is_some();
                     let blink_on = self.cursor_blink_on && !has_selection;
                     renderer.draw(
                         terminal,
-                        &mut self.selection_handler,
+                        &mut tab.selection_handler,
                         blink_on,
                         self.cursor_blink_phase,
                         &overlays,
-                        self.block_scroll_offset,
+                        tab.block_scroll_offset,
                         scroll_metrics,
+                        &tab_bar,
                     );
                 }
 
@@ -3822,10 +4246,10 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     winit::event::Ime::Preedit(text, _cursor) => {
-                        self.ime_preedit = text;
+                        self.tabs[self.active_tab].ime_preedit = text;
                     }
                     winit::event::Ime::Commit(text) => {
-                        self.ime_preedit.clear();
+                        self.tabs[self.active_tab].ime_preedit.clear();
                         if !text.is_empty() {
                             // v0.9 fix: when the Find bar is open, IME
                             // committed text goes into the find query, not
@@ -3836,14 +4260,14 @@ impl ApplicationHandler<AppEvent> for App {
                                 self.find_last_key = Some(std::time::Instant::now());
                                 self.request_redraw();
                             } else {
-                                let mode = self
+                                let mode = self.tabs[self.active_tab]
                                     .terminal
                                     .as_ref()
                                     .map(|t| t.effective_input_mode())
                                     .unwrap_or(weft_core::input::InputMode::Passthrough);
                                 if mode == weft_core::input::InputMode::Editor {
                                     // Editor takeover: composed text goes into the box.
-                                    if let Some(t) = self.terminal.as_mut() {
+                                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                                         for c in text.chars() {
                                             t.editor_mut().buffer.insert_char(c);
                                         }
@@ -3851,13 +4275,13 @@ impl ApplicationHandler<AppEvent> for App {
                                     self.request_redraw();
                                 } else {
                                     // Passthrough: send committed text to the PTY.
-                                    let bracketed = self
+                                    let bracketed = self.tabs[self.active_tab]
                                         .terminal
                                         .as_ref()
                                         .map(|t| t.bracketed_paste)
                                         .unwrap_or(false);
                                     let bytes = encode_paste(&text, bracketed);
-                                    if let Some(pty) = &self.pty {
+                                    if let Some(pty) = &self.tabs[self.active_tab].pty {
                                         let _ = pty.write_sync(&bytes);
                                     }
                                 }
@@ -3865,7 +4289,7 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     winit::event::Ime::Disabled => {
-                        self.ime_preedit.clear();
+                        self.tabs[self.active_tab].ime_preedit.clear();
                     }
                     _ => {}
                 }
@@ -4166,7 +4590,7 @@ fn weft_cache_dir() -> Option<std::path::PathBuf> {
 /// Returns `KEY=VALUE` overrides to pass to the PTY. On any setup failure it
 /// logs a warning and returns empty — the shell still launches, just without
 /// integration.
-fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
+pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
     let plan = Integration::from_shell(shell);
     if !plan.is_supported() {
         return Vec::new();

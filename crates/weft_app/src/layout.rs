@@ -30,6 +30,10 @@ pub struct LayoutCtx {
     /// Content padding in physical pixels (logical config value × scale).
     pub padding_x: f32,
     pub padding_y: f32,
+    /// v0.9 H1: Height of the tab bar at the top of the window (physical px).
+    /// The content area starts below the tab bar + padding_y. 0 when no
+    /// tab bar is drawn (single tab).
+    pub chrome_top: f32,
     /// Optional clip rectangle for nested overlays (children stay inside).
     /// `None` means "use the full content rect". Stored as `[x0, y0, x1, y1]`.
     pub clip: Option<Rect>,
@@ -51,6 +55,7 @@ impl LayoutCtx {
             cell_h,
             padding_x,
             padding_y,
+            chrome_top: 0.0,
             clip: None,
         }
     }
@@ -67,10 +72,10 @@ impl LayoutCtx {
         self.viewport.0 - self.padding_x
     }
 
-    /// Top edge of the content area (= vertical padding).
+    /// Top edge of the content area (= tab bar + vertical padding).
     #[inline]
     pub fn top(&self) -> f32 {
-        self.padding_y
+        self.padding_y + self.chrome_top
     }
 
     /// Bottom edge of the content area.
@@ -85,7 +90,7 @@ impl LayoutCtx {
         self.right() - self.left()
     }
 
-    /// Content height (viewport minus 2× vertical padding).
+    /// Content height (viewport minus 2× vertical padding, minus tab bar).
     #[inline]
     pub fn height(&self) -> f32 {
         self.bottom() - self.top()
@@ -609,7 +614,11 @@ pub fn layout_block_view(
     let right = vp_w - ctx.padding_x;
     let cols = (((right - left) / cw).max(1.0)) as usize;
 
-    let clip_top = ctx.padding_y;
+    // v0.9 H1: clip_top must include chrome_top (tab bar height) so the
+    // sticky header and scrollable content start below the tab bar. ctx.top()
+    // = padding_y + chrome_top; when there's no tab bar, chrome_top is 0 and
+    // this reduces to the old `ctx.padding_y`.
+    let clip_top = ctx.top();
     let (content_bottom_y, fixed_cwd_y) = if cwd_header_active {
         // Editor mode: CWD line + divider pinned to the bottom; scrollable
         // content sits ABOVE the CWD line (2 pitches up: one for CWD text,
