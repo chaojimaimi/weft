@@ -202,11 +202,65 @@ impl Theme {
         }
     }
 
+    /// v0.9 W2+: Warp-style dark theme.
+    ///
+    /// Inspired by Warp's default "Warp Dark" palette: cool dark background,
+    /// coral-red accent (`#ff5d38`), and a saturated syntax palette tuned
+    /// for readability on a dark canvas. Sits alongside `weft_warm` as a
+    /// first-class built-in — set `name = "warp"` (or `"warp-dark"`) in
+    /// `[theme]` to use it.
+    pub fn warp_dark() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Warp-tuned cool palette with a coral accent bias.
+        let ansi = [
+            (0x1b, 0x1b, 0x28), // 0 black   (cool dark, == background)
+            (0xff, 0x5d, 0x38), // 1 red     (Warp coral — accent)
+            (0x3e, 0xd9, 0xa4), // 2 green   (mint)
+            (0xff, 0xc7, 0x4a), // 3 yellow  (warm yellow)
+            (0x5a, 0xb9, 0xf8), // 4 blue    (sky)
+            (0xb3, 0x87, 0xff), // 5 magenta (lavender)
+            (0x5a, 0xb9, 0xf8), // 6 cyan    (== blue for harmony)
+            (0xd9, 0xd9, 0xe3), // 7 white   (cool off-white, == foreground)
+            (0x3a, 0x3a, 0x52), // 8 bright black (muted purple-gray)
+            (0xff, 0x8a, 0x6a), // 9 bright red
+            (0x6a, 0xe8, 0xb8), // 10 bright green
+            (0xff, 0xe0, 0x8a), // 11 bright yellow
+            (0x8a, 0xc8, 0xff), // 12 bright blue
+            (0xc8, 0xa8, 0xff), // 13 bright magenta
+            (0x8a, 0xc8, 0xff), // 14 bright cyan
+            (0xf0, 0xf0, 0xf8), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xd9, 0xd9, 0xe3), // cool off-white
+            background: Color::rgb(0x1b, 0x1b, 0x28), // deep cool dark
+            cursor: Color::rgb(0xff, 0x5d, 0x38),     // coral (glow anchor)
+            selection: Color::rgb(0x3a, 0x3a, 0x5a),  // translucent purple
+            palette,
+            accent: Color::rgb(0xff, 0x5d, 0x38), // Warp coral — signature
+            accent_dim: Color::rgb(0x7a, 0x4a, 0x3a), // dim coral
+            separator: Color::rgb(0x2a, 0x2a, 0x40), // cool dark purple
+            syntax: SyntaxColors {
+                command: Color::rgb(0xd9, 0xd9, 0xe3),  // == foreground
+                flag: Color::rgb(0xff, 0x5d, 0x38),     // coral (== accent)
+                path: Color::rgb(0x5a, 0xb9, 0xf8),     // sky blue
+                string: Color::rgb(0xc7, 0xa5, 0x5c),   // warm yellow
+                number: Color::rgb(0xff, 0xc7, 0x4a),   // bright yellow
+                variable: Color::rgb(0xb3, 0x87, 0xff), // lavender
+                operator: Color::rgb(0x7a, 0x7a, 0x90), // cool gray
+                comment: Color::rgb(0x5a, 0x5a, 0x72),  // muted purple-gray
+                default: Color::rgb(0xd9, 0xd9, 0xe3),  // == foreground
+            },
+        }
+    }
+
     /// Resolve a theme from config: pick the built-in base by `cfg.name`,
     /// then apply any inline hex overrides.
     ///
-    /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light`.
-    /// Unknown names fall back to `weft-warm` (the v0.8 default).
+    /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light` /
+    /// `warp` / `warp-dark`. Unknown names fall back to `weft-warm`.
     pub fn resolve(cfg: &ThemeConfig) -> Self {
         Self::resolve_named(&cfg.name, cfg)
     }
@@ -221,6 +275,8 @@ impl Theme {
             // default — old configs that say `weft-dark` keep working but
             // now get the warm palette (the new visual identity).
             "weft-warm" | "weft-dark" | "weft_dark" => Self::weft_warm(),
+            // v0.9 W2+: Warp-style dark theme.
+            "warp" | "warp-dark" | "warp_dark" => Self::warp_dark(),
             _ => Self::weft_warm(),
         };
         let mut theme = base;
@@ -784,6 +840,65 @@ name = "weft-light"
             ..Default::default()
         };
         assert_eq!(Theme::resolve(&cfg), Theme::weft_dark());
+    }
+
+    #[test]
+    fn warp_theme_resolves_by_name() {
+        // v0.9 W2+: "warp" and "warp-dark" both resolve to the Warp dark theme.
+        let cfg = ThemeConfig {
+            name: "warp".into(),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        assert_eq!(theme, Theme::warp_dark());
+        // Also test the dashed alias.
+        let cfg2 = ThemeConfig {
+            name: "warp-dark".into(),
+            ..Default::default()
+        };
+        assert_eq!(Theme::resolve(&cfg2), Theme::warp_dark());
+    }
+
+    #[test]
+    fn warp_theme_has_coral_accent_and_distinct_syntax() {
+        // v0.9 W2+: Warp's signature coral accent + 9 distinct syntax colors.
+        let t = Theme::warp_dark();
+        // Coral accent (#ff5d38) is the Warp signature.
+        assert_eq!(t.accent, Color::rgb(0xff, 0x5d, 0x38));
+        // flag == accent (consistent with weft_warm's design intent).
+        assert_eq!(t.syntax.flag, t.accent);
+        // default == foreground.
+        assert_eq!(t.syntax.default, t.foreground);
+        // All 9 syntax colors distinct from background (must be visible).
+        let bg = t.background;
+        for c in [
+            t.syntax.command,
+            t.syntax.flag,
+            t.syntax.path,
+            t.syntax.string,
+            t.syntax.number,
+            t.syntax.variable,
+            t.syntax.operator,
+            t.syntax.comment,
+            t.syntax.default,
+        ] {
+            assert_ne!(c, bg, "syntax color must differ from background");
+        }
+    }
+
+    #[test]
+    fn warp_theme_supports_inline_overrides() {
+        // v0.9 W2+: inline overrides apply on top of the warp base, just like
+        // weft-warm. Verifies resolve_named() applies cfg overrides to warp.
+        let cfg = ThemeConfig {
+            name: "warp".into(),
+            accent: Some("#00ff00".into()),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        assert_eq!(theme.accent, Color::rgb(0x00, 0xff, 0x00));
+        // Background is still the warp default (override only touched accent).
+        assert_eq!(theme.background, Color::rgb(0x1b, 0x1b, 0x28));
     }
 
     #[test]

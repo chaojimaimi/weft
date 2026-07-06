@@ -159,6 +159,10 @@ pub struct TabBarDrawState {
     pub active_tab: usize,
     /// Tab labels (e.g., shell cwd basename or "Tab N").
     pub labels: Vec<String>,
+    /// v0.9 W1+: index of the tab currently hovered by the mouse (0-based),
+    /// or `None` when the cursor isn't over any tab. Used to show the close
+    /// "×" button on hover (Warp-style) — active tab always shows "×".
+    pub hovered_tab: Option<usize>,
 }
 
 /// v0.9 H1: Hit-test rect for a tab label + close button.
@@ -4067,22 +4071,28 @@ fragment float4 text_fragment(
                 max_cols,
             );
 
-            // Close "×" button at the right.
+            // Close "×" button at the right. v0.9 W1+: only show on hover
+            // (Warp-style) — active tab always shows × so the user can close
+            // the current tab without hovering first. Inactive tabs show ×
+            // only when hovered_tab == Some(i).
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
-            let close_color = if is_active {
-                fg
-            } else {
-                [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
-            };
-            self.push_text(
-                &mut vertices,
-                close_x0 + cw * 0.5,
-                y0 + (bar_h - ch) * 0.5,
-                "×",
-                close_color,
-                1,
-            );
+            let is_hovered = tab_bar.hovered_tab == Some(i);
+            if is_active || is_hovered {
+                let close_color = if is_active {
+                    fg
+                } else {
+                    [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
+                };
+                self.push_text(
+                    &mut vertices,
+                    close_x0 + cw * 0.5,
+                    y0 + (bar_h - ch) * 0.5,
+                    "×",
+                    close_color,
+                    1,
+                );
+            }
 
             hits.push(TabHit {
                 tab_rect: [x0, y0, x1, y1],

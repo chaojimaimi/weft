@@ -58,6 +58,11 @@ struct App {
     /// Currently always has exactly one tab; Stage 2 adds Cmd+T/W multi-tab.
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// v0.9 W1+: index of the tab currently hovered by the mouse, or `None`
+    /// when the cursor is outside the tab bar. Drives the Warp-style
+    /// hover-to-show close "×" button. Reset on tab close/switch and on
+    /// `CursorLeft` (mouse leaves the window).
+    hovered_tab: Option<usize>,
     /// Current keyboard modifier state, updated by ModifiersChanged events.
     mods: winit::event::Modifiers,
     /// Cursor blink state (grid view: hard on/off, period 1060ms).
@@ -367,6 +372,7 @@ impl App {
             renderer: None,
             tabs: Vec::new(),
             active_tab: 0,
+            hovered_tab: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
             cursor_blink_phase: 0.0,
@@ -2442,6 +2448,10 @@ impl App {
         }
         let removed_idx = self.active_tab;
         let _tab = self.tabs.remove(removed_idx);
+        // v0.9 W1+: clear hover state — tab indices shift after removal, so
+        // a stale hovered_tab would point at the wrong tab. The next
+        // CursorMoved will recompute it.
+        self.hovered_tab = None;
         // Switch to the previous tab (or wrap to last).
         if self.active_tab > 0 {
             self.active_tab -= 1;
@@ -2562,6 +2572,7 @@ impl App {
             tab_count: self.tabs.len(),
             active_tab: self.active_tab,
             labels,
+            hovered_tab: self.hovered_tab,
         }
     }
 
@@ -2573,11 +2584,18 @@ impl App {
             return;
         }
         self.theme_is_dark = !self.theme_is_dark;
-        let theme = if self.theme_is_dark {
-            weft_core::config::Theme::weft_dark()
+        // v0.9 W2+ fix: route through resolve_named (not the raw constructor)
+        // so inline `[theme]` overrides AND non-default theme names (e.g.
+        // `name = "warp"`) survive a Cmd+Shift+T toggle. Previously this
+        // called Theme::weft_dark()/weft_light() directly, which silently
+        // dropped user customizations on every toggle.
+        let cfg = &self.config.theme;
+        let name = if self.theme_is_dark {
+            cfg.dark_name.as_deref().unwrap_or("weft-warm")
         } else {
-            weft_core::config::Theme::weft_light()
+            cfg.light_name.as_deref().unwrap_or("weft-light")
         };
+        let theme = weft_core::config::Theme::resolve_named(name, cfg);
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
@@ -2585,7 +2603,7 @@ impl App {
         if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             t.set_palette(theme.palette);
         }
-        info!(dark = self.theme_is_dark, "theme toggled");
+        info!(dark = self.theme_is_dark, name, "theme toggled");
         self.request_redraw();
     }
 
@@ -3159,6 +3177,7 @@ impl App {
                                 if idx < self.active_tab {
                                     self.active_tab -= 1;
                                 }
+                                self.hovered_tab = None;
                                 self.request_redraw();
                             }
                             return;
@@ -3173,6 +3192,7 @@ impl App {
                                 // content, not the previous tab's.
                                 self.refresh_find_for_active_tab();
                             }
+                            self.hovered_tab = None;
                             self.request_redraw();
                             return;
                         }
@@ -3577,6 +3597,33 @@ impl App {
         if let Some(drag) = self.drag_state.clone() {
             self.update_popup_drag(x, y, &drag);
             return;
+        }
+
+        // v0.9 W1+: tab bar hover detection — show close "×" on the hovered
+        // tab (Warp-style). Only active when more than one tab is open (the
+        // bar is hidden for a single tab). Reads `tab_hits` populated during
+        // the last draw; layout is stable between mouse moves at rest.
+        if self.tabs.len() > 1 {
+            let new_hover: Option<usize> = if let Some(renderer) = &self.renderer {
+                let bar_h = renderer.tab_bar_height();
+                let yf = y as f32;
+                if yf <= bar_h {
+                    let xf = x as f32;
+                    renderer
+                        .tab_hits
+                        .iter()
+                        .find(|h| xf >= h.tab_rect[0] && xf < h.tab_rect[2])
+                        .map(|h| h.index)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if new_hover != self.hovered_tab {
+                self.hovered_tab = new_hover;
+                self.request_redraw();
+            }
         }
 
         // v0.9: extend editor drag-selection inside the prompt box.
@@ -4715,6 +4762,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.last_mouse_x = position.x;
                 self.last_mouse_y = position.y;
                 self.handle_mouse_move(position.x, position.y);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // v0.9 W1+: clear tab hover state when the mouse leaves the
+                // window, so the close "×" doesn't stay visible on a tab that
+                // is no longer hovered.
+                if self.hovered_tab.is_some() {
+                    self.hovered_tab = None;
+                    self.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.handle_scroll(delta, self.last_mouse_x, self.last_mouse_y);
