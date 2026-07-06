@@ -1611,44 +1611,118 @@ fragment float4 text_fragment(
         let green = [0.53, 0.80, 0.36, 1.0];
         let red = [0.85, 0.36, 0.36, 1.0];
 
-        // Search box row: "Search:" label + the live query text.
-        // v0.9 W5: Y offset includes chrome_top so content starts below the tab bar.
-        let content_top = chrome_top + ch * 0.4;
+        // v0.9 fix: Warp-style search input field — a distinct rounded-look
+        // box with its own background and border, so it reads as an input
+        // field rather than blending into the panel. When focused, the border
+        // turns accent color and a blinking cursor is drawn.
+        let field_pad_x = cw * 0.5;
+        // v0.9 fix: add a "History" header above the search field for a
+        // clearer panel identity (Warp-style section title).
+        let header_y = chrome_top + ch * 0.4;
         self.push_text(
             &mut vertices,
             panel_x + cw * 0.5,
-            content_top,
-            "Search:",
-            dim,
+            header_y,
+            "History",
+            fg,
             panel_cols,
         );
-        let query_x = panel_x + cw * 0.5 + "Search: ".chars().count() as f32 * cw;
-        self.push_text(&mut vertices, query_x, content_top, p.query, fg, panel_cols);
+        let field_pad_y = ch * 1.6;
+        let field_x0 = panel_x + field_pad_x;
+        let field_y0 = chrome_top + field_pad_y;
+        let field_x1 = panel_x + width_px - field_pad_x;
+        let field_h = ch * 1.4;
+        let field_y1 = field_y0 + field_h;
+        // Input field background: slightly lighter than panel bg.
+        let field_bg = [
+            panel_bg[0] + (1.0 - panel_bg[0]) * 0.08,
+            panel_bg[1] + (1.0 - panel_bg[1]) * 0.08,
+            panel_bg[2] + (1.0 - panel_bg[2]) * 0.08,
+            1.0,
+        ];
+        push_quad(
+            &mut vertices,
+            [field_x0, field_y0, field_x1, field_y1],
+            bg_uv,
+            [0.0; 4],
+            field_bg,
+        );
+        // Border: accent when focused, dim separator otherwise.
+        let border_color = if p.search_focused {
+            color_to_normalized(self.theme.accent_dim)
+        } else {
+            separator_color
+        };
+        let border_w = if p.search_focused { 2.0 } else { 1.0 };
+        // Top border
+        push_quad(
+            &mut vertices,
+            [field_x0, field_y0, field_x1, field_y0 + border_w],
+            bg_uv,
+            [0.0; 4],
+            border_color,
+        );
+        // Bottom border
+        push_quad(
+            &mut vertices,
+            [field_x0, field_y1 - border_w, field_x1, field_y1],
+            bg_uv,
+            [0.0; 4],
+            border_color,
+        );
+        // Left border
+        push_quad(
+            &mut vertices,
+            [field_x0, field_y0, field_x0 + border_w, field_y1],
+            bg_uv,
+            [0.0; 4],
+            border_color,
+        );
+        // Right border
+        push_quad(
+            &mut vertices,
+            [field_x1 - border_w, field_y0, field_x1, field_y1],
+            bg_uv,
+            [0.0; 4],
+            border_color,
+        );
 
-        // v0.9 fix: draw an accent underline beneath the search box when it
-        // has keyboard focus, so the user knows typed text goes to the filter.
+        // Text inside the field: show query, or placeholder "Search…" when empty.
+        let text_y = field_y0 + (field_h - ch) * 0.5;
+        let text_x = field_x0 + cw * 0.4;
+        let text_cols = ((field_x1 - text_x - cw * 0.4) / cw) as usize;
+        if p.query.is_empty() {
+            self.push_text(&mut vertices, text_x, text_y, "Search…", dim, text_cols);
+        } else {
+            self.push_text(&mut vertices, text_x, text_y, p.query, fg, text_cols);
+        }
+
+        // Blinking cursor at the end of the query text when focused.
         if p.search_focused {
-            let accent = color_to_normalized(self.theme.accent_dim);
-            let underline_y = chrome_top + ch * 1.5;
-            push_quad(
-                &mut vertices,
-                [
-                    panel_x + cw * 0.25,
-                    underline_y,
-                    panel_x + width_px - cw * 0.25,
-                    underline_y + 2.0,
-                ],
-                bg_uv,
-                [0.0; 4],
-                accent,
-            );
+            let blink_phase = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() % 1200)
+                .unwrap_or(0);
+            if blink_phase < 600 {
+                let query_w = p.query.chars().count() as f32 * cw;
+                let cursor_x = text_x + query_w;
+                let cursor_w = 2.0_f32.max(cw * 0.12);
+                push_quad(
+                    &mut vertices,
+                    [cursor_x, text_y, cursor_x + cursor_w, text_y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    fg,
+                );
+            }
         }
 
         // Display list: newest-first, filtered by query (capped to fit).
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
         let display = panel_display(p.blocks, p.query, max_rows);
         let row_h = ch * 1.1;
-        let mut y = chrome_top + ch * 1.9;
+        // v0.9 fix: list starts below the search field + gap.
+        let mut y = field_y1 + ch * 0.4;
         let mut drawn = 0usize;
 
         for (i, block) in display.iter().enumerate() {

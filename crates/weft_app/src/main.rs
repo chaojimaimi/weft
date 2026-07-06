@@ -2999,14 +2999,21 @@ impl App {
                 let xf = x as f32;
                 let yf = y;
                 if xf >= panel_x && xf < panel_x + width_px && yf > 0.0 {
-                    // Search box occupies y in [chrome_top, chrome_top + ch*1.9).
-                    // List starts at y = chrome_top + ch * 1.9, row height = ch * 1.1.
-                    let search_top = chrome_top;
-                    let list_top = chrome_top + ch * 1.9;
+                    // v0.9 fix: match the renderer's Warp-style panel layout:
+                    //   header  at chrome_top + ch*0.4
+                    //   search  at chrome_top + ch*1.6, height ch*1.4
+                    //   list    at chrome_top + ch*1.6 + ch*1.4 + ch*0.4
+                    let field_pad_y = ch * 1.6;
+                    let field_h = ch * 1.4;
+                    let search_top = chrome_top + field_pad_y;
+                    let search_bottom = chrome_top + field_pad_y + field_h;
+                    let list_top = chrome_top + field_pad_y + field_h + ch * 0.4;
                     let row_h = ch * 1.1;
                     if yf >= list_top {
-                        // Click on a history row: unfocus search, select row.
-                        self.panel_search_focused = false;
+                        // Click on a history row: select it AND focus the
+                        // panel so Up/Down keys navigate the list (Warp-style:
+                        // clicking anywhere in the sidebar focuses it).
+                        self.panel_search_focused = true;
                         let clicked = ((yf - list_top) / row_h) as usize;
                         let max_rows =
                             visible_panel_rows(renderer.viewport().1, renderer.cell_height());
@@ -3017,8 +3024,8 @@ impl App {
                             self.scroll_to_panel_selection();
                             return;
                         }
-                    } else if yf >= search_top {
-                        // Click in the search box area: focus it so keyboard
+                    } else if yf >= search_top && yf < search_bottom {
+                        // Click in the search input field: focus it so keyboard
                         // input goes to panel_query (bug 6 fix).
                         self.panel_search_focused = true;
                         self.request_redraw();
@@ -3119,23 +3126,13 @@ impl App {
             }
         }
 
-        // Editor-mode block view: clicking a foldable block's command line
-        // toggles its collapse (instead of starting a grid selection).
+        // If context menu is open, handle click as menu selection.
+        // (v0.9 fix: removed the "click any block to fold" handler that
+        // prevented text selection on block output. Folding is now solely
+        // via the chevron click handler above — W3.)
         if button == winit::event::MouseButton::Left {
-            // If context menu is open, handle click as menu selection.
             if let Some(menu) = self.context_menu.take() {
                 self.execute_context_menu(&menu, x as f32, y as f32);
-                return;
-            }
-
-            if let Some(id) = self.block_at(y as f32) {
-                // Only completed blocks (with a BlockId) can be folded.
-                if let Some(bid) = id {
-                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                        t.block_tracker_mut().toggle_collapse(bid);
-                        self.request_redraw();
-                    }
-                }
                 return;
             }
         }

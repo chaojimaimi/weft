@@ -458,6 +458,7 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
     let cw = ctx.cell_w;
     let ch = ctx.cell_h;
     let vp_w = ctx.viewport.0;
+    let vp_h = ctx.viewport.1;
 
     let item_h = ch * 1.2;
     let menu_w = 180.0 * scale;
@@ -465,7 +466,13 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
 
     // Clamp so the right edge stays inside the viewport (with 4px gutter).
     let menu_x0 = x.min(vp_w - menu_w - 4.0).max(0.0);
-    let menu_y0 = y;
+    // v0.9 fix: if the menu would extend below the viewport, flip it upward
+    // so it opens above the click point instead of being clipped.
+    let menu_y0 = if y + menu_h > vp_h - 4.0 {
+        (y - menu_h).max(4.0)
+    } else {
+        y
+    };
     let menu_x1 = menu_x0 + menu_w;
     let menu_y1 = menu_y0 + menu_h;
 
@@ -1013,6 +1020,29 @@ mod tests {
         let layout = layout_context_menu(&ctx, -50.0, 100.0, 2.0);
         assert!(layout.menu_rect[0] >= 0.0);
         assert!((layout.menu_rect[0] - 0.0).abs() < 1e-3);
+    }
+
+    /// v0.9 fix: when the click is near the bottom of the viewport, the menu
+    /// flips upward so it doesn't get clipped.
+    #[test]
+    fn context_menu_flips_upward_near_bottom() {
+        let ctx = sample_ctx(); // vp_h = 1200
+        let scale = 2.0; // menu_h = 4 * (16.8*1.2) + 16.8*0.4 = 87.36
+                         // Click at y=1180 (near bottom): 1180 + 87.36 = 1267.36 > 1196 → flip.
+        let layout = layout_context_menu(&ctx, 100.0, 1180.0, scale);
+        // menu_y0 = 1180 - 87.36 = 1092.64
+        assert!((layout.menu_rect[1] - 1092.64).abs() < 1e-3);
+        assert!(layout.menu_rect[3] <= 1200.0 - 4.0 + 1e-3);
+    }
+
+    /// When there's enough space below, the menu opens downward (no flip).
+    #[test]
+    fn context_menu_opens_downward_with_space() {
+        let ctx = sample_ctx();
+        let scale = 2.0;
+        // Click at y=500: 500 + 87.36 = 587.36 < 1196 → no flip.
+        let layout = layout_context_menu(&ctx, 100.0, 500.0, scale);
+        assert!((layout.menu_rect[1] - 500.0).abs() < 1e-3);
     }
 
     // ── Prompt layout (stage 4 — U2) ────────────────────────────────────
