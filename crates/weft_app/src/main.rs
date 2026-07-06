@@ -3069,10 +3069,10 @@ impl App {
                     let list_top = chrome_top + field_pad_y + field_h + ch * 0.4;
                     let row_h = ch * 1.1;
                     if yf >= list_top {
-                        // Click on a history row: select it AND send the
-                        // command to the prompt editor (Warp-style: single
-                        // click to rerun). Also focus the panel so Up/Down
-                        // keys navigate the list.
+                        // Click on a history row: select it AND focus the
+                        // panel so Up/Down keys navigate the list (Warp-style).
+                        // The command is sent to the prompt ONLY on Enter —
+                        // clicking just selects + scrolls (bug 3 fix).
                         self.panel_search_focused = true;
                         let clicked = ((yf - list_top) / row_h) as usize;
                         let max_rows =
@@ -3082,8 +3082,6 @@ impl App {
                             self.clamp_panel_selection();
                             // Scroll terminal to the selected block + highlight.
                             self.scroll_to_panel_selection();
-                            // v0.9 fix: send the command to the prompt input.
-                            self.send_panel_selection_to_input();
                             return;
                         }
                     } else if yf >= search_top && yf < search_bottom {

@@ -769,6 +769,18 @@ fragment float4 text_fragment(
                     missing.extend(err.chars());
                 }
             }
+            // v0.9 fix: warm up the command palette (Cmd+P) query + banner
+            // + submode input so CJK / other non-ASCII chars typed via IME
+            // render instead of leaving blank cells (same rationale as the
+            // find bar above).
+            if let Some(p) = palette {
+                missing.extend("> ".chars());
+                missing.extend(p.query.chars());
+                if !p.banner.is_empty() {
+                    missing.extend(p.banner.chars());
+                }
+                missing.extend(p.submode_input.chars());
+            }
             // v0.9 fix: warm up the tab bar close button "×" and separator
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
