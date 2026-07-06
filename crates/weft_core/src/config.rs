@@ -256,11 +256,168 @@ impl Theme {
         }
     }
 
+    /// v0.9 W2+: Dracula theme.
+    ///
+    /// The most famous dark theme ever created (Zeno Rocha). Color values
+    /// taken from the official palette (https://draculatheme.com/palette).
+    /// Set `name = "dracula"` in `[theme]` to use it.
+    pub fn dracula() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Dracula official palette.
+        let ansi = [
+            (0x28, 0x2a, 0x36), // 0 black   (== background)
+            (0xff, 0x55, 0x55), // 1 red
+            (0x50, 0xfa, 0x7b), // 2 green
+            (0xf1, 0xfa, 0x8c), // 3 yellow
+            (0xbd, 0x93, 0xf9), // 4 blue    (Dracula "purple")
+            (0xff, 0x79, 0xc6), // 5 magenta (Dracula "pink")
+            (0x8b, 0xe9, 0xfd), // 6 cyan
+            (0xf8, 0xf8, 0xf2), // 7 white   (== foreground)
+            (0x62, 0x72, 0xa4), // 8 bright black (Dracula "comment")
+            (0xff, 0x55, 0x55), // 9 bright red
+            (0x50, 0xfa, 0x7b), // 10 bright green
+            (0xf1, 0xfa, 0x8c), // 11 bright yellow
+            (0xbd, 0x93, 0xf9), // 12 bright blue
+            (0xff, 0x79, 0xc6), // 13 bright magenta
+            (0x8b, 0xe9, 0xfd), // 14 bright cyan
+            (0xff, 0xff, 0xff), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xf8, 0xf8, 0xf2),
+            background: Color::rgb(0x28, 0x2a, 0x36),
+            cursor: Color::rgb(0xbd, 0x93, 0xf9),    // purple
+            selection: Color::rgb(0x44, 0x47, 0x5a), // current line
+            palette,
+            accent: Color::rgb(0xbd, 0x93, 0xf9), // Dracula purple
+            accent_dim: Color::rgb(0x62, 0x72, 0xa4), // comment color
+            separator: Color::rgb(0x44, 0x47, 0x5a), // current line
+            syntax: SyntaxColors {
+                command: Color::rgb(0xf8, 0xf8, 0xf2),  // == foreground
+                flag: Color::rgb(0xff, 0x79, 0xc6),     // pink
+                path: Color::rgb(0x8b, 0xe9, 0xfd),     // cyan
+                string: Color::rgb(0xf1, 0xfa, 0x8c),   // yellow
+                number: Color::rgb(0xbd, 0x93, 0xf9),   // purple
+                variable: Color::rgb(0xff, 0xb8, 0x6c), // orange
+                operator: Color::rgb(0xff, 0x55, 0x55), // red
+                comment: Color::rgb(0x62, 0x72, 0xa4),  // comment
+                default: Color::rgb(0xf8, 0xf8, 0xf2),  // == foreground
+            },
+        }
+    }
+
+    /// v0.9 W2+: Solarized Dark theme.
+    ///
+    /// Ethan Schoonover's precision-engineered palette. Color values taken
+    /// from the official spec (https://ethanschoonover.com/solarized).
+    /// Set `name = "solarized-dark"` in `[theme]` to use it.
+    pub fn solarized_dark() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Solarized accent colors mapped to standard ANSI slots.
+        let ansi = [
+            (0x07, 0x36, 0x42), // 0 black   (base02)
+            (0xdc, 0x32, 0x2f), // 1 red
+            (0x85, 0x99, 0x00), // 2 green
+            (0xb5, 0x89, 0x00), // 3 yellow
+            (0x26, 0x8b, 0xd2), // 4 blue
+            (0xd3, 0x36, 0x82), // 5 magenta
+            (0x2a, 0xa1, 0x98), // 6 cyan
+            (0xee, 0xe8, 0xd5), // 7 white   (base2)
+            (0x00, 0x2b, 0x36), // 8 bright black (base03)
+            (0xcb, 0x4b, 0x16), // 9 bright red (orange)
+            (0x58, 0x6e, 0x75), // 10 bright green (base01)
+            (0x83, 0x94, 0x96), // 11 bright yellow (base0)
+            (0x93, 0xa1, 0xa1), // 12 bright blue (base1)
+            (0x6c, 0x71, 0xc4), // 13 bright magenta (violet)
+            (0x07, 0x36, 0x42), // 14 bright cyan (== base02 for harmony)
+            (0xfd, 0xf6, 0xe3), // 15 bright white (base3)
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0x93, 0xa1, 0xa1), // base1 (preferred text)
+            background: Color::rgb(0x00, 0x2b, 0x36), // base03
+            cursor: Color::rgb(0x93, 0xa1, 0xa1),     // base1
+            selection: Color::rgb(0x07, 0x36, 0x42),  // base02
+            palette,
+            accent: Color::rgb(0x26, 0x8b, 0xd2), // blue (Solarized accent)
+            accent_dim: Color::rgb(0x58, 0x6e, 0x75), // base01
+            separator: Color::rgb(0x07, 0x36, 0x42), // base02
+            syntax: SyntaxColors {
+                command: Color::rgb(0x93, 0xa1, 0xa1),  // base1
+                flag: Color::rgb(0x26, 0x8b, 0xd2),     // blue
+                path: Color::rgb(0x2a, 0xa1, 0x98),     // cyan
+                string: Color::rgb(0x85, 0x99, 0x00),   // green
+                number: Color::rgb(0xb5, 0x89, 0x00),   // yellow (magenta)
+                variable: Color::rgb(0x6c, 0x71, 0xc4), // violet
+                operator: Color::rgb(0xdc, 0x32, 0x2f), // red
+                comment: Color::rgb(0x58, 0x6e, 0x75),  // base01
+                default: Color::rgb(0x93, 0xa1, 0xa1),  // base1
+            },
+        }
+    }
+
+    /// v0.9 W2+: Gruvbox Dark theme.
+    ///
+    /// morhetz's "retro groove" pastel palette. Color values taken from the
+    /// official 256palette script (https://github.com/morhetz/gruvbox).
+    /// Set `name = "gruvbox-dark"` in `[theme]` to use it.
+    pub fn gruvbox_dark() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Gruvbox dark palette.
+        let ansi = [
+            (0x28, 0x28, 0x28), // 0 black   (bg)
+            (0xcc, 0x24, 0x1d), // 1 red
+            (0x98, 0x97, 0x1a), // 2 green
+            (0xd7, 0x99, 0x21), // 3 yellow
+            (0x45, 0x85, 0x88), // 4 blue
+            (0xb1, 0x62, 0x86), // 5 magenta
+            (0x68, 0x9d, 0x6a), // 6 cyan
+            (0xa8, 0x99, 0x84), // 7 white   (fg4)
+            (0x92, 0x83, 0x74), // 8 bright black (gray)
+            (0xfb, 0x49, 0x34), // 9 bright red
+            (0xb8, 0xbb, 0x26), // 10 bright green
+            (0xfa, 0xbd, 0x2f), // 11 bright yellow
+            (0x83, 0xa5, 0x98), // 12 bright blue
+            (0xd3, 0x86, 0x9b), // 13 bright magenta
+            (0x8e, 0xc0, 0x7c), // 14 bright cyan
+            (0xeb, 0xdb, 0xb2), // 15 bright white (fg)
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xeb, 0xdb, 0xb2), // fg
+            background: Color::rgb(0x28, 0x28, 0x28), // bg
+            cursor: Color::rgb(0xeb, 0xdb, 0xb2),     // fg
+            selection: Color::rgb(0x3c, 0x38, 0x36),  // bg2
+            palette,
+            accent: Color::rgb(0xfe, 0x80, 0x19), // orange (Gruvbox accent)
+            accent_dim: Color::rgb(0x92, 0x83, 0x74), // gray
+            separator: Color::rgb(0x3c, 0x38, 0x36), // bg2
+            syntax: SyntaxColors {
+                command: Color::rgb(0xeb, 0xdb, 0xb2),  // fg
+                flag: Color::rgb(0xfe, 0x80, 0x19),     // orange
+                path: Color::rgb(0x83, 0xa5, 0x98),     // blue
+                string: Color::rgb(0xb8, 0xbb, 0x26),   // green
+                number: Color::rgb(0xd3, 0x86, 0x9b),   // purple
+                variable: Color::rgb(0xfa, 0xbd, 0x2f), // yellow
+                operator: Color::rgb(0xfb, 0x49, 0x34), // red
+                comment: Color::rgb(0x92, 0x83, 0x74),  // gray
+                default: Color::rgb(0xeb, 0xdb, 0xb2),  // fg
+            },
+        }
+    }
+
     /// Resolve a theme from config: pick the built-in base by `cfg.name`,
     /// then apply any inline hex overrides.
     ///
     /// Recognized names: `weft-warm` / `weft-dark` (alias) / `weft-light` /
-    /// `warp` / `warp-dark`. Unknown names fall back to `weft-warm`.
+    /// `warp` / `warp-dark` / `dracula` / `solarized-dark` / `gruvbox-dark`.
+    /// Unknown names fall back to `weft-warm`.
     pub fn resolve(cfg: &ThemeConfig) -> Self {
         Self::resolve_named(&cfg.name, cfg)
     }
@@ -268,6 +425,11 @@ impl Theme {
     /// Resolve a theme by explicit name (v0.9 U-D1 — used by system-theme
     /// follow to pick light/dark by appearance, ignoring `cfg.name`).
     /// Applies the same inline overrides as [`resolve`].
+    ///
+    /// v0.9 W2+: when `name` doesn't match any built-in, attempts to load a
+    /// theme file from `~/.config/weft/themes/<name>.{toml,yaml,yml}`. File
+    /// schema mirrors the `[theme]` section of `config.toml`. If no file is
+    /// found, falls back to `weft_warm` (the v0.8 default).
     pub fn resolve_named(name: &str, cfg: &ThemeConfig) -> Self {
         let base = match name {
             "weft-light" => Self::weft_light(),
@@ -277,7 +439,14 @@ impl Theme {
             "weft-warm" | "weft-dark" | "weft_dark" => Self::weft_warm(),
             // v0.9 W2+: Warp-style dark theme.
             "warp" | "warp-dark" | "warp_dark" => Self::warp_dark(),
-            _ => Self::weft_warm(),
+            // v0.9 W2+: Classic community themes.
+            "dracula" => Self::dracula(),
+            "solarized-dark" | "solarized_dark" | "solarized" => Self::solarized_dark(),
+            "gruvbox-dark" | "gruvbox_dark" | "gruvbox" => Self::gruvbox_dark(),
+            other => match Self::load_from_file(other) {
+                Some(t) => t,
+                None => Self::weft_warm(),
+            },
         };
         let mut theme = base;
         if let Some(c) = cfg.foreground.as_deref().and_then(parse_hex) {
@@ -310,6 +479,117 @@ impl Theme {
             }
         }
         theme
+    }
+
+    /// v0.9 W2+: Load a custom theme from a file.
+    ///
+    /// Searches `~/.config/weft/themes/` (or `$XDG_CONFIG_HOME/weft/themes/`)
+    /// for `<name>.toml`, `<name>.yaml`, or `<name>.yml`. The file's schema
+    /// mirrors the `[theme]` section of `config.toml` — the same fields
+    /// (`foreground`, `background`, `accent`, `palette`, etc.) are read and
+    /// applied on top of the `weft_warm` base. This lets users drop in a
+    /// community theme file (e.g. iTerm2 color schemes converted to TOML)
+    /// without modifying weft's source.
+    ///
+    /// Returns `None` (with a `warn!` log) when:
+    ///   - the themes directory doesn't exist or can't be read
+    ///   - no file matching `<name>.*` is found
+    ///   - the file fails to parse
+    ///
+    /// # File format
+    /// TOML example (`~/.config/weft/themes/my-theme.toml`):
+    /// ```toml
+    /// background = "#1e1e2e"
+    /// foreground = "#cdd6f4"
+    /// accent = "#cba6f7"
+    /// palette = ["#1e1e2e", "#f38ba8", "#a6e3a1", ...]
+    /// ```
+    ///
+    /// YAML example (`my-theme.yaml`):
+    /// ```yaml
+    /// background: "#1e1e2e"
+    /// foreground: "#cdd6f4"
+    /// accent: "#cba6f7"
+    /// palette:
+    ///   - "#1e1e2e"
+    ///   - "#f38ba8"
+    /// ```
+    pub fn load_from_file(name: &str) -> Option<Self> {
+        let dir = Self::themes_dir()?;
+        Self::load_from_dir(&dir, name)
+    }
+
+    /// v0.9 W2+: Internal loader that reads from an explicit `dir`. Used by
+    /// [`load_from_file`] (which resolves the dir from env) and by unit
+    /// tests (which pass a tempdir). See [`load_from_file`] for the file
+    /// format and resolution semantics.
+    fn load_from_dir(dir: &std::path::Path, name: &str) -> Option<Self> {
+        // Try each supported extension in order: toml, yaml, yml.
+        for ext in ["toml", "yaml", "yml"] {
+            let path = dir.join(format!("{name}.{ext}"));
+            if !path.exists() {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to read theme file",
+                    );
+                    return None;
+                }
+            };
+            // Parse according to extension. TOML reuses ThemeConfig serde
+            // (which derives Deserialize). YAML uses serde_yaml.
+            let file_cfg: ThemeConfig = match ext {
+                "toml" => match toml::from_str(&text) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to parse theme file as TOML",
+                        );
+                        return None;
+                    }
+                },
+                "yaml" | "yml" => match serde_yaml::from_str(&text) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to parse theme file as YAML",
+                        );
+                        return None;
+                    }
+                },
+                _ => unreachable!(),
+            };
+            tracing::info!(
+                path = %path.display(),
+                "loaded custom theme from file",
+            );
+            // The file's own inline overrides are applied by reusing the
+            // resolve pipeline with the file's ThemeConfig. Base on weft_warm
+            // so unspecified fields get sensible defaults.
+            return Some(Self::resolve_named("weft-warm", &file_cfg));
+        }
+        // No file matched — silently fall back (user may have just typed a
+        // built-in name we don't recognize yet, so don't warn here).
+        None
+    }
+
+    /// The themes directory: `$XDG_CONFIG_HOME/weft/themes/` or
+    /// `~/.config/weft/themes/`. `None` when neither env var is set.
+    pub fn themes_dir() -> Option<PathBuf> {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(xdg).join("weft").join("themes"));
+        }
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".config").join("weft").join("themes"))
     }
 }
 
@@ -899,6 +1179,175 @@ name = "weft-light"
         assert_eq!(theme.accent, Color::rgb(0x00, 0xff, 0x00));
         // Background is still the warp default (override only touched accent).
         assert_eq!(theme.background, Color::rgb(0x1b, 0x1b, 0x28));
+    }
+
+    #[test]
+    fn classic_themes_resolve_by_name() {
+        // v0.9 W2+: Dracula / Solarized Dark / Gruvbox Dark resolve by name
+        // and match their constructors.
+        for (name, expected) in [
+            ("dracula", Theme::dracula()),
+            ("solarized-dark", Theme::solarized_dark()),
+            ("solarized_dark", Theme::solarized_dark()),
+            ("solarized", Theme::solarized_dark()),
+            ("gruvbox-dark", Theme::gruvbox_dark()),
+            ("gruvbox_dark", Theme::gruvbox_dark()),
+            ("gruvbox", Theme::gruvbox_dark()),
+        ] {
+            let cfg = ThemeConfig {
+                name: name.into(),
+                ..Default::default()
+            };
+            assert_eq!(Theme::resolve(&cfg), expected, "name = {name}");
+        }
+    }
+
+    #[test]
+    fn classic_themes_have_distinct_accent_and_visible_syntax() {
+        // v0.9 W2+: each classic theme has a signature accent and all syntax
+        // colors differ from the background (must be visible).
+        for (name, theme) in [
+            ("dracula", Theme::dracula()),
+            ("solarized-dark", Theme::solarized_dark()),
+            ("gruvbox-dark", Theme::gruvbox_dark()),
+        ] {
+            // accent must differ from background (otherwise it's invisible).
+            assert_ne!(
+                theme.accent, theme.background,
+                "{name}: accent must differ from background"
+            );
+            // every syntax color must differ from background.
+            let bg = theme.background;
+            for c in [
+                theme.syntax.command,
+                theme.syntax.flag,
+                theme.syntax.path,
+                theme.syntax.string,
+                theme.syntax.number,
+                theme.syntax.variable,
+                theme.syntax.operator,
+                theme.syntax.comment,
+                theme.syntax.default,
+            ] {
+                assert_ne!(
+                    c, bg,
+                    "{name}: syntax color {c:?} must differ from background"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dracula_signature_colors() {
+        // v0.9 W2+: verify Dracula's signature palette values.
+        let t = Theme::dracula();
+        assert_eq!(t.background, Color::rgb(0x28, 0x2a, 0x36));
+        assert_eq!(t.foreground, Color::rgb(0xf8, 0xf8, 0xf2));
+        assert_eq!(t.accent, Color::rgb(0xbd, 0x93, 0xf9)); // purple
+        assert_eq!(t.syntax.flag, Color::rgb(0xff, 0x79, 0xc6)); // pink
+    }
+
+    #[test]
+    fn solarized_signature_colors() {
+        // v0.9 W2+: verify Solarized Dark's signature base03/base1/blue accent.
+        let t = Theme::solarized_dark();
+        assert_eq!(t.background, Color::rgb(0x00, 0x2b, 0x36)); // base03
+        assert_eq!(t.foreground, Color::rgb(0x93, 0xa1, 0xa1)); // base1
+        assert_eq!(t.accent, Color::rgb(0x26, 0x8b, 0xd2)); // blue
+    }
+
+    #[test]
+    fn gruvbox_signature_colors() {
+        // v0.9 W2+: verify Gruvbox Dark's signature bg/fg/orange accent.
+        let t = Theme::gruvbox_dark();
+        assert_eq!(t.background, Color::rgb(0x28, 0x28, 0x28));
+        assert_eq!(t.foreground, Color::rgb(0xeb, 0xdb, 0xb2));
+        assert_eq!(t.accent, Color::rgb(0xfe, 0x80, 0x19)); // orange
+    }
+
+    #[test]
+    fn load_theme_from_toml_file() {
+        // v0.9 W2+: load a custom theme from a .toml file. Uses a unique
+        // temp dir (process id + counter) to avoid parallel-test collisions.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weft-theme-test-{id}-toml"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.toml"),
+            "foreground = \"#abcdef\"\nbackground = \"#112233\"\naccent = \"#ff0000\"\n",
+        )
+        .unwrap();
+
+        let theme = Theme::load_from_dir(&dir, "custom").expect("should load custom.toml");
+        assert_eq!(theme.foreground, Color::rgb(0xab, 0xcd, 0xef));
+        assert_eq!(theme.background, Color::rgb(0x11, 0x22, 0x33));
+        assert_eq!(theme.accent, Color::rgb(0xff, 0x00, 0x00));
+        // Unspecified fields (cursor, syntax, palette) inherit from weft_warm base.
+        let warm = Theme::weft_warm();
+        assert_eq!(theme.cursor, warm.cursor);
+        assert_eq!(theme.syntax.command, warm.syntax.command);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_theme_from_yaml_file() {
+        // v0.9 W2+: load a custom theme from a .yaml file.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weft-theme-test-{id}-yaml"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.yaml"),
+            "foreground: \"#abcdef\"\nbackground: \"#112233\"\naccent: \"#ff0000\"\n",
+        )
+        .unwrap();
+
+        let theme = Theme::load_from_dir(&dir, "custom").expect("should load custom.yaml");
+        assert_eq!(theme.foreground, Color::rgb(0xab, 0xcd, 0xef));
+        assert_eq!(theme.background, Color::rgb(0x11, 0x22, 0x33));
+        assert_eq!(theme.accent, Color::rgb(0xff, 0x00, 0x00));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_theme_missing_file_returns_none() {
+        // v0.9 W2+: when no file matches, returns None (falls back to default).
+        let dir = std::env::temp_dir().join("weft-theme-test-nonexistent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = Theme::load_from_dir(&dir, "does-not-exist");
+        assert!(result.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_theme_with_palette_override() {
+        // v0.9 W2+: palette array in theme file overrides ANSI slots.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("weft-theme-test-{id}-palette"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pal.toml"),
+            "palette = [\"#000000\", \"#ff0000\", \"#00ff00\"]\n",
+        )
+        .unwrap();
+
+        let theme = Theme::load_from_dir(&dir, "pal").expect("should load pal.toml");
+        assert_eq!(theme.palette[0], Color::rgb(0x00, 0x00, 0x00));
+        assert_eq!(theme.palette[1], Color::rgb(0xff, 0x00, 0x00));
+        assert_eq!(theme.palette[2], Color::rgb(0x00, 0xff, 0x00));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
