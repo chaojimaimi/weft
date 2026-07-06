@@ -4064,12 +4064,17 @@ pub struct PromptDrawParams<'a> {
 
 /// Whether a block matches the panel search query (empty query = match all).
 /// Shared by the renderer (list layout) and the app (selection clamping).
+///
+/// v0.9 fix: only match the command line, NOT the output. Matching output
+/// caused false positives (e.g. searching "ls" matched `git pull` whose output
+/// contained "ls"; searching "wha" matched `claude`/`git status` whose output
+/// contained "wha"). Warp's history search only filters by command line.
 pub fn block_matches_query(block: &Block, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let q = query.to_lowercase();
-    block.command.to_lowercase().contains(&q) || block.output.to_lowercase().contains(&q)
+    block.command.to_lowercase().contains(&q)
 }
 
 /// Newest-first, query-filtered block list capped to `max` entries. Shared by
