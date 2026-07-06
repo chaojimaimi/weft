@@ -137,6 +137,10 @@ pub struct MetalRenderer {
     /// the history panel click). The renderer draws an accent border around
     /// this block in block view. Cleared by the app after 1.5s.
     pub panel_highlight: Option<BlockId>,
+    /// v0.9: cached cursor-blink state for the current frame, so overlay
+    /// builders (palette, panel) can draw a blinking caret without it being
+    /// threaded through every helper signature.
+    cursor_blink_on: bool,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -416,6 +420,7 @@ fragment float4 text_fragment(
             find_buttons: None,
             tab_hits: Vec::new(),
             panel_highlight: None,
+            cursor_blink_on: true,
         }
     }
 
@@ -577,9 +582,13 @@ fragment float4 text_fragment(
             Some(d) => d,
             None => return,
         };
+        // v0.9: cache the blink state so overlay builders can draw a caret.
+        self.cursor_blink_on = cursor_blink_on;
 
         // v0.9 H1: compute chrome_top (tab bar height) and set it on the
-        // LayoutCtx so all content is shifted below the tab bar.
+        // LayoutCtx so all content is shifted below the tab bar. The bar is
+        // only drawn when more than one tab is open (single tab hides it,
+        // matching the previous design).
         let chrome_top = if tab_bar.tab_count > 1 {
             self.tab_bar_height()
         } else {
@@ -935,9 +944,10 @@ fragment float4 text_fragment(
             find_btns = Some(btns);
         }
 
-        // v0.9 H1: Tab bar — drawn at the top of the window when there are
-        // 2+ tabs. The content area is already shifted down by `chrome_top`
-        // in the LayoutCtx, so this draws in the space above the content.
+        // v0.9 H1: Tab bar — drawn at the top of the window. The content
+        // area is already shifted down by `chrome_top` in the LayoutCtx, so
+        // this draws in the space above the content. Only drawn when more
+        // than one tab is open (single tab hides the bar).
         if tab_bar.tab_count > 1 {
             let (tab_verts, hits) = self.build_tab_bar_vertices(tab_bar);
             vertices.extend_from_slice(&tab_verts);
@@ -2294,6 +2304,20 @@ fragment float4 text_fragment(
             let qx = query_x + query_label.chars().count() as f32 * cw;
             let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
             self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
+            // v0.9 fix: blinking caret at end of query so the user sees the
+            // input focus (matches the find bar + panel search box behavior).
+            if self.cursor_blink_on {
+                let qcols = Self::text_col_width(p.query);
+                let cx = qx + qcols as f32 * cw;
+                let accent = color_to_normalized(self.theme.accent);
+                push_quad(
+                    &mut verts,
+                    [cx, query_y, cx + cw * 0.15, query_y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    accent,
+                );
+            }
         }
 
         // Separator below query.

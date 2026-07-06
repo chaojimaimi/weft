@@ -821,16 +821,9 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                // Toggle inline expansion of the selected block's output.
-                let selected_id = self.panel_selected_block_id();
-                if let Some(id) = selected_id {
-                    self.panel_expanded = if self.panel_expanded == Some(id) {
-                        None
-                    } else {
-                        Some(id)
-                    };
-                    self.request_redraw();
-                }
+                // v0.9 fix: send the selected command to the prompt input
+                // (Warp-style: Enter on a history entry reruns the command).
+                self.send_panel_selection_to_input();
                 true
             }
             KeyCode::Char(c) if !c.is_control() => {
@@ -1167,6 +1160,33 @@ impl App {
                 self.find_block_index = len - 1;
             } else {
                 self.find_block_index -= 1;
+            }
+            // v0.9 fix: auto-expand the block containing the current match so
+            // the highlighted hit is visible. If a match is inside a folded
+            // block's output, expanding it reveals the matching line. Command
+            // matches are always visible (the command line shows even when
+            // folded), so only expand for output matches.
+            let need_expand = self
+                .find_block_matches
+                .get(self.find_block_index)
+                .map(|bm| !bm.is_command)
+                .unwrap_or(false);
+            if need_expand {
+                if let Some(bm) = self.find_block_matches.get(self.find_block_index) {
+                    if let Some(term) = self.tabs[self.active_tab].terminal.as_mut() {
+                        let block = term
+                            .block_tracker()
+                            .session_blocks()
+                            .iter()
+                            .find(|b| b.id == bm.block_id)
+                            .cloned();
+                        if let Some(b) = block {
+                            if b.collapsed {
+                                term.block_tracker_mut().toggle_collapse(b.id);
+                            }
+                        }
+                    }
+                }
             }
             self.scroll_to_current_find_match();
             self.request_redraw();
@@ -2192,6 +2212,43 @@ impl App {
             .map(|b| b.id)
     }
 
+    /// v0.9 fix: send the panel's currently-selected command to the prompt
+    /// editor (Warp-style "click/Enter to rerun"). Looks up the block by id,
+    /// strips any prompt prefix, and sets the editor buffer. Silently no-ops
+    /// when not at the prompt (command running / alt-screen active) to avoid
+    /// stashing text that would resurface unexpectedly.
+    fn send_panel_selection_to_input(&mut self) {
+        let block_id = match self.panel_selected_block_id() {
+            Some(id) => id,
+            None => return,
+        };
+        // Borrow the terminal immutably to find the command, then release
+        // before mutating the editor.
+        let cmd: Option<String> = {
+            let Some(t) = &self.tabs[self.active_tab].terminal else {
+                return;
+            };
+            if t.effective_input_mode() != weft_core::input::InputMode::Editor {
+                return;
+            }
+            t.block_tracker()
+                .blocks()
+                .iter()
+                .find(|b| b.id == block_id)
+                .map(|b| strip_prompt_prefix(&b.command))
+        };
+        if let Some(cmd) = cmd {
+            if !cmd.is_empty() {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                    t.editor_mut().buffer.set_text(&cmd);
+                }
+                // Unfocus the panel so the editor gets subsequent keystrokes.
+                self.panel_search_focused = false;
+                self.request_redraw();
+            }
+        }
+    }
+
     /// v0.9 W2: scroll the terminal's block view so the panel-selected block
     /// is visible, and arm a 1.5s accent highlight. Called when the user
     /// clicks a row in the history panel (or presses Cmd+Enter while the
@@ -2742,8 +2799,9 @@ impl App {
         // `padding_y + chrome_top + row * cell_h`, so the inverse is
         // `(y - padding_y - chrome_top) / cell_h`. Without this, a click on
         // row N would resolve to N + ~1.5 (off-by-one-down) when the tab bar
-        // is visible.
-        let chrome_top = renderer.tab_bar_height() as f64;
+        // is visible. Read from layout_ctx so it matches the renderer's
+        // conditional (chrome_top = 0 when single tab hides the bar).
+        let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0) as f64;
         // v0.9 W5: subtract sidebar width (chrome_left) so clicks map to the
         // correct column when the history panel pushes the grid right.
         let chrome_left = if self.panel_open {
@@ -2934,7 +2992,8 @@ impl App {
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
         // v0.9 H1: Tab bar click handling — check before everything else so
         // tab clicks work even inside TUI apps that captured the mouse. Only
-        // left-clicks on the tab bar are handled here.
+        // left-clicks on the tab bar are handled here, and only when more
+        // than one tab is open (single tab hides the bar).
         if button == winit::event::MouseButton::Left && self.tabs.len() > 1 {
             if let Some(renderer) = &self.renderer {
                 let bar_h = renderer.tab_bar_height();
@@ -3010,9 +3069,10 @@ impl App {
                     let list_top = chrome_top + field_pad_y + field_h + ch * 0.4;
                     let row_h = ch * 1.1;
                     if yf >= list_top {
-                        // Click on a history row: select it AND focus the
-                        // panel so Up/Down keys navigate the list (Warp-style:
-                        // clicking anywhere in the sidebar focuses it).
+                        // Click on a history row: select it AND send the
+                        // command to the prompt editor (Warp-style: single
+                        // click to rerun). Also focus the panel so Up/Down
+                        // keys navigate the list.
                         self.panel_search_focused = true;
                         let clicked = ((yf - list_top) / row_h) as usize;
                         let max_rows =
@@ -3022,6 +3082,8 @@ impl App {
                             self.clamp_panel_selection();
                             // Scroll terminal to the selected block + highlight.
                             self.scroll_to_panel_selection();
+                            // v0.9 fix: send the command to the prompt input.
+                            self.send_panel_selection_to_input();
                             return;
                         }
                     } else if yf >= search_top && yf < search_bottom {
@@ -3041,26 +3103,29 @@ impl App {
             }
         }
 
-        // v0.9 W3: block collapse/expand — click the chevron (▸/▾) at the
-        // left of a Command row to toggle. The chevron occupies the first
-        // cell of the Command row; only foldable blocks draw it, but
-        // toggling a non-foldable block is harmless (no output to hide).
+        // v0.9 W3: block collapse/expand — click anywhere on a Command row to
+        // toggle fold. The entire command line is a fold toggle (Warp-style);
+        // Output rows are NOT fold toggles so text selection still works there.
+        // Only foldable blocks (those with output) are affected; toggling a
+        // non-foldable block is harmless (no output to hide).
         if button == winit::event::MouseButton::Left && self.block_view_active() {
             if let Some(renderer) = &self.renderer {
-                let cw = renderer.cell_width() as f32;
-                // v0.9 W5: account for the left sidebar offset so the chevron
-                // hit-test tracks the shifted block-view content.
+                // v0.9 W5: account for the left sidebar offset so the hit-test
+                // tracks the shifted block-view content.
                 let chrome_left = if self.panel_open {
                     renderer.sidebar_width()
                 } else {
                     0.0
                 };
-                let left = renderer.padding_x() + chrome_left;
+                let content_left = renderer.padding_x() + chrome_left;
+                let content_right = renderer.viewport().0 - renderer.padding_x();
                 let xf = x as f32;
                 let yf = y as f32;
-                // Check if click is in the chevron area (first cell of a
-                // Command row).
-                if xf >= left && xf < left + cw {
+                // v0.9 fix: the entire Command row (full content width) is a
+                // fold toggle, not just the first cell (chevron). This matches
+                // the user's request: "click the command line to fold, click
+                // other rows (output) does not fold."
+                if xf >= content_left && xf < content_right {
                     for row in &renderer.block_view_rows {
                         if row.kind == weft_core::selection::BlockViewRowKind::Command
                             && yf >= row.y_top
@@ -4075,8 +4140,8 @@ impl ApplicationHandler<AppEvent> for App {
                     let pad_x = renderer.padding_x() as f64;
                     let pad_y = renderer.padding_y() as f64;
                     // v0.9 H1: subtract tab bar height from usable height when
-                    // there are 2+ tabs. The tab bar only appears with multiple
-                    // tabs; with a single tab the full height is usable.
+                    // more than one tab is open. With a single tab the bar is
+                    // hidden (matches the previous design).
                     let tab_bar_h = if self.tabs.len() > 1 {
                         renderer.tab_bar_height() as f64
                     } else {
@@ -4379,7 +4444,14 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     winit::event::Ime::Preedit(text, _cursor) => {
-                        self.tabs[self.active_tab].ime_preedit = text;
+                        // v0.9 fix: when a modal input (find/palette/panel) is
+                        // active, suppress the terminal preedit so the IME
+                        // composition doesn't render in the prompt editor.
+                        if self.find_open || self.palette_open || self.panel_search_focused {
+                            self.tabs[self.active_tab].ime_preedit.clear();
+                        } else {
+                            self.tabs[self.active_tab].ime_preedit = text;
+                        }
                     }
                     winit::event::Ime::Commit(text) => {
                         self.tabs[self.active_tab].ime_preedit.clear();
@@ -4391,6 +4463,19 @@ impl ApplicationHandler<AppEvent> for App {
                             if self.find_open {
                                 self.find_query.push_str(&text);
                                 self.find_last_key = Some(std::time::Instant::now());
+                                self.request_redraw();
+                            } else if self.palette_open {
+                                // v0.9 fix: route IME commit to the command
+                                // palette query so CJK input works there too.
+                                self.palette_query.push_str(&text);
+                                self.palette_selection = 0;
+                                self.refresh_palette_results();
+                                self.request_redraw();
+                            } else if self.panel_open && self.panel_search_focused {
+                                // v0.9 fix: route IME commit to the panel
+                                // (sidebar) search box when it's focused.
+                                self.panel_query.push_str(&text);
+                                self.clamp_panel_selection();
                                 self.request_redraw();
                             } else {
                                 let mode = self.tabs[self.active_tab]
