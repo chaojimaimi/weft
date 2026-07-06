@@ -104,7 +104,7 @@ pub struct MetalRenderer {
     /// User-adjustable popup max visible rows.
     popup_max_rows: usize,
     /// Context menu position + target block (F7). Set per-frame by the app.
-    pub context_menu_target: Option<(f32, f32, weft_core::blocks::BlockId)>,
+    pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>)>,
     /// Last-rendered popup rectangles (completion + palette), for border
     /// drag-resize hot-zone detection. None when the popup wasn't drawn.
     pub completion_popup_rect: Option<[f32; 4]>, // [x0, y0, x1, y1]
@@ -1559,15 +1559,18 @@ fragment float4 text_fragment(
         let panel_cols = ((width_px / cw) as usize).max(1);
         let mut vertices = Vec::new();
 
-        // Translucent panel background: a darkened theme bg drawn as a bg-only
-        // quad sampling the space glyph (mask 0 → shader emits pure bg color).
+        // v0.9 fix: opaque panel background (Warp-style). The previous
+        // semi-transparent bg (alpha 0.94) layered a shadow over the terminal
+        // content, looking muddy. Warp's sidebar is a solid surface — use a
+        // slightly darkened theme bg at full opacity for a clean break.
         let theme_bg = color_to_normalized(self.theme.background);
         let panel_bg = [
-            theme_bg[0] * 0.45,
-            theme_bg[1] * 0.45,
-            theme_bg[2] * 0.45,
-            0.94,
+            theme_bg[0] * 0.52,
+            theme_bg[1] * 0.52,
+            theme_bg[2] * 0.52,
+            1.0,
         ];
+        let separator_color = color_to_normalized(self.theme.separator);
         let sel_bg = [
             theme_bg[0] + (1.0 - theme_bg[0]) * 0.18,
             theme_bg[1] + (1.0 - theme_bg[1]) * 0.18,
@@ -1586,6 +1589,21 @@ fragment float4 text_fragment(
             bg_uv,
             [0.0; 4],
             panel_bg,
+        );
+
+        // v0.9 fix: 1px separator on the right edge (Warp-style divider)
+        // so the sidebar reads as a distinct surface, not floating content.
+        push_quad(
+            &mut vertices,
+            [
+                panel_x + width_px - 1.0,
+                chrome_top,
+                panel_x + width_px,
+                vp_h,
+            ],
+            bg_uv,
+            [0.0; 4],
+            separator_color,
         );
 
         let fg = color_to_normalized(self.theme.foreground);
@@ -1659,7 +1677,11 @@ fragment float4 text_fragment(
             let dur = block_duration_str(block);
             let dur_len = dur.chars().count();
             let cmd_cols = panel_cols.saturating_sub(dur_len + 2).max(1);
-            let label = truncate_str(&block.command, cmd_cols);
+            // v0.9 fix: strip prompt prefix so old blocks (captured via
+            // snapshot_command_line) show just the command, matching the
+            // clean format of editor-submitted commands.
+            let cleaned = strip_prompt_prefix(&block.command);
+            let label = truncate_str(&cleaned, cmd_cols);
             self.push_text(
                 &mut vertices,
                 panel_x + cw * 0.5,
@@ -2986,7 +3008,9 @@ fragment float4 text_fragment(
                             push_quad(&mut verts, [hx0, y, hx1, y + ch], bg_uv, [0.0; 4], hl_bg);
                         }
                     }
-                    self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
+                    // v0.9 fix: strip prompt prefix for display consistency.
+                    let cleaned_cmd = strip_prompt_prefix(command);
+                    self.push_line_tokenized(&mut verts, cmd_x, y, &cleaned_cmd, avail);
                     if *foldable {
                         hit_regions.push(crate::overlay::HitRegion {
                             x0: 0.0,
@@ -4042,6 +4066,37 @@ fn truncate_str(s: &str, max: usize) -> String {
     t
 }
 
+/// v0.9 fix: strip a shell prompt prefix from a captured command line.
+///
+/// `snapshot_command_line` grabs the whole prompt row when the command wasn't
+/// submitted via the editor (e.g. before shell integration is ready, or loaded
+/// from an old DB). This produces strings like `andylee@AndyHQ weft % echo hi`
+/// instead of just `echo hi`. We only strip when the command contains `@`
+/// (a `user@host` prompt signature) — this avoids false positives on commands
+/// like `echo 50% done` or `echo $HOME`. When the `@` is found, we take the
+/// last `% `/`$ `/`# ` occurrence as the prompt→command boundary.
+fn strip_prompt_prefix(command: &str) -> String {
+    let trimmed = command.trim_start();
+    // Only attempt stripping when a user@host prompt signature is present.
+    if !trimmed.contains('@') {
+        return trimmed.to_string();
+    }
+    let prompts = ["% ", "$ ", "# "];
+    let mut best: Option<usize> = None;
+    for p in &prompts {
+        let mut start = 0;
+        while let Some(idx) = trimmed[start..].find(p) {
+            let abs = start + idx;
+            best = Some(abs + p.len());
+            start = abs + p.len();
+        }
+    }
+    match best {
+        Some(idx) => trimmed[idx..].trim().to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
 /// Convert a grid Color to normalized RGBA floats.
 fn color_to_normalized(color: Color) -> [f32; 4] {
     [
@@ -4146,5 +4201,41 @@ mod tests {
         let default_c = color_to_normalized(theme.syntax.default);
         assert_eq!(syntax_color(TokenKind::Default, &theme), default_c);
         assert_eq!(syntax_color(TokenKind::Whitespace, &theme), default_c);
+    }
+
+    #[test]
+    fn strip_prompt_prefix_zsh() {
+        assert_eq!(
+            strip_prompt_prefix("andylee@AndyHQ weft % echo first"),
+            "echo first"
+        );
+    }
+
+    #[test]
+    fn strip_prompt_prefix_bash() {
+        assert_eq!(
+            strip_prompt_prefix("andylee@host:~/proj $ echo hi"),
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn strip_prompt_prefix_root() {
+        assert_eq!(strip_prompt_prefix("root@host:~# ls -la"), "ls -la");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_already_clean() {
+        // Clean commands (no prompt) pass through unchanged.
+        assert_eq!(strip_prompt_prefix("echo first"), "echo first");
+        assert_eq!(strip_prompt_prefix("ls -la /tmp"), "ls -la /tmp");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_no_at_sign_passes_through() {
+        // Commands without @ (no user@host prompt) pass through unchanged,
+        // even if they contain % or $ characters.
+        assert_eq!(strip_prompt_prefix("echo 50% done"), "echo 50% done");
+        assert_eq!(strip_prompt_prefix("# comment line"), "# comment line");
     }
 }

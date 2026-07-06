@@ -216,8 +216,9 @@ enum DragTarget {
 /// Right-click context menu on a block (F7).
 #[allow(dead_code)]
 struct ContextMenu {
-    /// Target block for the menu actions.
-    block_id: BlockId,
+    /// Target block for the menu actions. `None` means the target is the
+    /// in-flight (running) command, which has no finalized BlockId yet.
+    block_id: Option<BlockId>,
     /// Menu popup position (physical pixels).
     x: f32,
     y: f32,
@@ -1785,6 +1786,14 @@ impl App {
         use weft_core::input::{KeyCode::*, Modifiers};
         let shift = mods.contains(Modifiers::SHIFT);
 
+        // v0.9 fix: Cmd (SUPER) chords are app-level shortcuts (copy/paste/
+        // tab/panel…), not editor input. If a Cmd chord reaches here it
+        // means no keybinding matched — drop it instead of inserting the
+        // character into the editor (e.g. Cmd+Shift+V was inserting 'V').
+        if mods.contains(Modifiers::SUPER) {
+            return false;
+        }
+
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
             let consumed = if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
@@ -2438,19 +2447,17 @@ impl App {
                     }
                 });
                 // v0.9 W1: when a command is running, show "cwd · cmd". When
-                // idle, show the last completed command (from the most recent
-                // block) so even fast commands like echo are visible.
+                // idle, show only the cwd basename. (Previous version showed
+                // the last completed command, but that kept the label stuck
+                // on "cwd · cmd" forever after any command — e.g. "sleep 5"
+                // never reverted, and "cd /" showed "/ · cd /". The running
+                // indicator is enough; completed commands live in the history
+                // panel and block view.)
                 let cmd: Option<String> = tab
                     .terminal
                     .as_ref()
                     .and_then(|t| t.block_tracker().in_flight())
-                    .map(|f| f.command.to_string())
-                    .or_else(|| {
-                        tab.terminal
-                            .as_ref()
-                            .and_then(|t| t.block_tracker().session_blocks().last())
-                            .map(|b| b.command.clone())
-                    });
+                    .map(|f| f.command.to_string());
                 match (cwd, cmd) {
                     (Some(cwd), Some(cmd)) => {
                         let cmd_short: String = cmd.chars().take(16).collect();
@@ -2874,16 +2881,25 @@ impl App {
 
     /// Which foldable block (if any) owns the physical-pixel y in the last
     /// rendered block view. `None` outside the block view or off every block.
-    fn block_at(&self, y: f32) -> Option<BlockId> {
-        use crate::overlay::HitTarget;
-        let regions = self.renderer.as_ref()?.hit_regions.as_slice();
-        regions
-            .iter()
-            .find(|r| r.contains(0.0, y))
-            .and_then(|r| match &r.target {
-                HitTarget::BlockFold(id) => Some(*id),
-                _ => None,
-            })
+    /// Find the block at vertical position `y`. Returns `Some(id)` for
+    /// completed blocks, `Some(None)` for the in-flight (running) command,
+    /// or `None` when not on a block row.
+    fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
+        let rows = &self.renderer.as_ref()?.block_view_rows;
+        // Find the row whose y-range contains `y`. Prefer Command/LiveCommand
+        // rows; Output rows fall back to their owning block.
+        for row in rows {
+            if y >= row.y_top && y < row.y_bottom {
+                use weft_core::selection::BlockViewRowKind;
+                match row.kind {
+                    BlockViewRowKind::Command => return Some(row.block_id),
+                    BlockViewRowKind::LiveCommand => return Some(None),
+                    BlockViewRowKind::Output => return Some(row.block_id),
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 
     /// Hit-test the find popup's clickable buttons. Returns the action the
@@ -3113,9 +3129,12 @@ impl App {
             }
 
             if let Some(id) = self.block_at(y as f32) {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.block_tracker_mut().toggle_collapse(id);
-                    self.request_redraw();
+                // Only completed blocks (with a BlockId) can be folded.
+                if let Some(bid) = id {
+                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                        t.block_tracker_mut().toggle_collapse(bid);
+                        self.request_redraw();
+                    }
                 }
                 return;
             }
@@ -3183,7 +3202,9 @@ impl App {
                     return;
                 }
 
-                // Block view: open context menu on a block.
+                // Block view: open context menu on a block. block_at now
+                // supports both completed blocks (including those with no
+                // output) and the in-flight (running) command.
                 if let Some(id) = self.block_at(y as f32) {
                     self.context_menu = Some(ContextMenu {
                         block_id: id,
@@ -3390,18 +3411,33 @@ impl App {
     }
 
     /// Run a context menu action on the target block.
-    fn run_context_action(&mut self, block_id: BlockId, action: &str) {
+    /// `block_id` is `None` for the in-flight (running) command.
+    fn run_context_action(&mut self, block_id: Option<BlockId>, action: &str) {
         let Some(terminal) = &mut self.tabs[self.active_tab].terminal else {
             return;
         };
 
         match action {
             "copy_command" | "copy_output" => {
+                // For in-flight blocks, copy from the live command/output.
+                if block_id.is_none() {
+                    if let Some(live) = terminal.block_tracker().in_flight() {
+                        let text = if action == "copy_command" {
+                            live.command.to_string()
+                        } else {
+                            live.output.to_string()
+                        };
+                        clipboard_copy(&text);
+                        info!(len = text.len(), "copied in-flight to clipboard");
+                    }
+                    return;
+                }
+                let bid = block_id.unwrap();
                 let block = terminal
                     .block_tracker()
                     .session_blocks()
                     .iter()
-                    .find(|b| b.id == block_id);
+                    .find(|b| b.id == bid);
                 if let Some(b) = block {
                     let text = if action == "copy_command" {
                         &b.command
@@ -3413,7 +3449,10 @@ impl App {
                 }
             }
             "toggle_fold" => {
-                terminal.block_tracker_mut().toggle_collapse(block_id);
+                if let Some(bid) = block_id {
+                    terminal.block_tracker_mut().toggle_collapse(bid);
+                }
+                // In-flight blocks can't be folded (no finalized block yet).
             }
             // W4: copy the block's command into the editor buffer so the user
             // can tweak parameters and re-submit (Warp-style "rerun"). Only
@@ -3423,14 +3462,20 @@ impl App {
             // would see resurface unexpectedly when the prompt returns.
             "send_to_input" => {
                 if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
-                    // Clone first to release the immutable borrow on
-                    // `terminal.block_tracker()` before `editor_mut()`.
-                    let cmd = terminal
-                        .block_tracker()
-                        .session_blocks()
-                        .iter()
-                        .find(|b| b.id == block_id)
-                        .map(|b| b.command.clone());
+                    // Clone first to release the immutable borrow before editor_mut().
+                    let cmd = if let Some(bid) = block_id {
+                        terminal
+                            .block_tracker()
+                            .session_blocks()
+                            .iter()
+                            .find(|b| b.id == bid)
+                            .map(|b| b.command.clone())
+                    } else {
+                        terminal
+                            .block_tracker()
+                            .in_flight()
+                            .map(|f| f.command.to_string())
+                    };
                     if let Some(cmd) = cmd {
                         if !cmd.is_empty() {
                             terminal.editor_mut().buffer.set_text(&cmd);

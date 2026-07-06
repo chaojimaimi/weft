@@ -330,6 +330,9 @@ impl Default for KeyBindings {
         let pairs: &[(&str, Action)] = &[
             ("cmd+c", Action::Copy),
             ("cmd+v", Action::Paste),
+            // v0.9 fix: Cmd+Shift+V also pastes (common terminal convention;
+            // matches macOS "Paste and Match Style" habit).
+            ("cmd+shift+v", Action::Paste),
             ("cmd+shift+comma", Action::ReloadConfig),
             ("shift+page_up", Action::ScrollPageUp),
             ("shift+page_down", Action::ScrollPageDown),
@@ -819,6 +822,11 @@ name = "weft-light"
         assert_eq!(copy, Some(Action::Copy));
         assert_eq!(
             kb.lookup(KeyCode::Char('v'), Modifiers::SUPER),
+            Some(Action::Paste)
+        );
+        // v0.9 fix: Cmd+Shift+V also pastes.
+        assert_eq!(
+            kb.lookup(KeyCode::Char('v'), Modifiers::SUPER | Modifiers::SHIFT),
             Some(Action::Paste)
         );
     }
