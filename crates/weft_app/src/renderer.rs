@@ -760,6 +760,10 @@ fragment float4 text_fragment(
                     missing.extend(err.chars());
                 }
             }
+            // v0.9 fix: warm up the tab bar close button "×" and separator
+            // chars so they render instead of being silently skipped by
+            // push_text (which drops chars not in the atlas).
+            missing.extend(['×', '·', '…']);
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
@@ -1590,22 +1594,43 @@ fragment float4 text_fragment(
         let red = [0.85, 0.36, 0.36, 1.0];
 
         // Search box row: "Search:" label + the live query text.
+        // v0.9 W5: Y offset includes chrome_top so content starts below the tab bar.
+        let content_top = chrome_top + ch * 0.4;
         self.push_text(
             &mut vertices,
             panel_x + cw * 0.5,
-            ch * 0.4,
+            content_top,
             "Search:",
             dim,
             panel_cols,
         );
         let query_x = panel_x + cw * 0.5 + "Search: ".chars().count() as f32 * cw;
-        self.push_text(&mut vertices, query_x, ch * 0.4, p.query, fg, panel_cols);
+        self.push_text(&mut vertices, query_x, content_top, p.query, fg, panel_cols);
+
+        // v0.9 fix: draw an accent underline beneath the search box when it
+        // has keyboard focus, so the user knows typed text goes to the filter.
+        if p.search_focused {
+            let accent = color_to_normalized(self.theme.accent_dim);
+            let underline_y = chrome_top + ch * 1.5;
+            push_quad(
+                &mut vertices,
+                [
+                    panel_x + cw * 0.25,
+                    underline_y,
+                    panel_x + width_px - cw * 0.25,
+                    underline_y + 2.0,
+                ],
+                bg_uv,
+                [0.0; 4],
+                accent,
+            );
+        }
 
         // Display list: newest-first, filtered by query (capped to fit).
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
         let display = panel_display(p.blocks, p.query, max_rows);
         let row_h = ch * 1.1;
-        let mut y = ch * 1.9;
+        let mut y = chrome_top + ch * 1.9;
         let mut drawn = 0usize;
 
         for (i, block) in display.iter().enumerate() {
@@ -2334,7 +2359,12 @@ fragment float4 text_fragment(
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        let items = ["Copy Command", "Copy Output", "Toggle Fold"];
+        let items = [
+            "Copy Command",
+            "Copy Output",
+            "Toggle Fold",
+            "Send to Input",
+        ];
 
         // v0.8 stage 4: layout (menu rect, per-item Y, separators, text X)
         // is computed by the pure function in `layout.rs`. The renderer keeps
@@ -2368,8 +2398,8 @@ fragment float4 text_fragment(
         // Items.
         for (i, label) in items.iter().enumerate() {
             let item_y = layout.item_y[i];
-            let color = if i == items.len() - 1 {
-                prompt_c // "Toggle Fold" in accent
+            let color = if i >= items.len() - 2 {
+                prompt_c // "Toggle Fold" + "Send to Input" in accent
             } else {
                 fg
             };
@@ -3739,6 +3769,9 @@ fragment float4 text_fragment(
         let bar_h = self.tab_bar_height();
         let vp_w = self.viewport.0;
         let pad_x = self.padding_x;
+        // v0.9 W5: shift tab bar right by chrome_left (sidebar width) so
+        // tabs don't overlap the left sidebar.
+        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
 
         let bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
@@ -3762,7 +3795,7 @@ fragment float4 text_fragment(
         let mut vertices = Vec::new();
         let mut hits = Vec::new();
 
-        // Bar background.
+        // Bar background (full width, including sidebar area for visual continuity).
         push_quad(
             &mut vertices,
             [0.0, 0.0, vp_w, bar_h],
@@ -3771,15 +3804,16 @@ fragment float4 text_fragment(
             bar_bg,
         );
 
-        // Tab layout: each tab is 16 cells wide, 1px divider between tabs.
-        let tab_w = cw * 16.0;
+        // Tab layout: each tab is 20 cells wide, 1px divider between tabs.
+        // v0.9 fix: increased from 16→20 cells so "weft · sleep 5" fits.
+        let tab_w = cw * 20.0;
         let close_w = cw * 2.0; // "×" button area
         let label_w = tab_w - close_w;
         let y0 = 0.0f32;
         let y1 = bar_h;
 
         for i in 0..tab_bar.tab_count {
-            let x0 = pad_x + i as f32 * tab_w;
+            let x0 = chrome_left + pad_x + i as f32 * tab_w;
             let x1 = x0 + tab_w;
             let is_active = i == tab_bar.active_tab;
 
@@ -3873,6 +3907,9 @@ pub struct PanelDrawParams<'a> {
     pub selection: usize,
     /// Id of the block whose output is expanded inline (None = all collapsed).
     pub expanded_id: Option<BlockId>,
+    /// v0.9 fix: whether the search box has keyboard focus (draws accent
+    /// underline so the user knows typing will go to the filter).
+    pub search_focused: bool,
 }
 
 /// What the bottom editor input box should draw (v0.5 editor takeover). Built

@@ -445,11 +445,11 @@ pub struct ContextMenuLayout {
     /// Outer menu rect `[x0, y0, x1, y1]`.
     pub menu_rect: Rect,
     /// Per-item Y (top edge). Length = items.len().
-    pub item_y: [f32; 3],
+    pub item_y: [f32; 4],
     /// X of the item label text.
     pub text_x: f32,
     /// Y of the separator after item `i` (None for the last item).
-    pub separator_ys: [f32; 2],
+    pub separator_ys: [f32; 3],
 }
 
 /// Compute the context menu layout. `(x, y)` is the click anchor. The menu
@@ -461,7 +461,7 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
 
     let item_h = ch * 1.2;
     let menu_w = 180.0 * scale;
-    let menu_h = 3.0 * item_h + ch * 0.4;
+    let menu_h = 4.0 * item_h + ch * 0.4;
 
     // Clamp so the right edge stays inside the viewport (with 4px gutter).
     let menu_x0 = x.min(vp_w - menu_w - 4.0).max(0.0);
@@ -473,8 +473,9 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
         menu_y0 + ch * 0.2,
         menu_y0 + ch * 0.2 + item_h,
         menu_y0 + ch * 0.2 + 2.0 * item_h,
+        menu_y0 + ch * 0.2 + 3.0 * item_h,
     ];
-    let separator_ys = [item_y[0] + item_h, item_y[1] + item_h];
+    let separator_ys = [item_y[0] + item_h, item_y[1] + item_h, item_y[2] + item_h];
     let text_x = menu_x0 + cw * 0.4;
 
     ContextMenuLayout {
@@ -967,22 +968,25 @@ mod tests {
         let scale = 2.0;
         let layout = layout_context_menu(&ctx, x, y, scale);
 
-        // menu_w = 180 * 2 = 360; menu_h = 3 * (16.8*1.2) + 16.8*0.4
-        //                  = 3 * 20.16 + 6.72 = 60.48 + 6.72 = 67.2
+        // menu_w = 180 * 2 = 360; menu_h = 4 * (16.8*1.2) + 16.8*0.4
+        //                  = 4 * 20.16 + 6.72 = 80.64 + 6.72 = 87.36
         // 800 + 360 = 1160 ≤ 1600 - 4 → no clamp
         assert!((layout.menu_rect[0] - 800.0).abs() < 1e-3);
         assert!((layout.menu_rect[1] - 600.0).abs() < 1e-3);
         assert!((layout.menu_rect[2] - 1160.0).abs() < 1e-3);
-        assert!((layout.menu_rect[3] - 667.2).abs() < 1e-3);
+        assert!((layout.menu_rect[3] - 687.36).abs() < 1e-3);
         // item_y[0] = 600 + 0.2*16.8 = 603.36
         // item_y[1] = 603.36 + 20.16 = 623.52
         // item_y[2] = 603.36 + 40.32 = 643.68
+        // item_y[3] = 603.36 + 60.48 = 663.84
         assert!((layout.item_y[0] - 603.36).abs() < 1e-3);
         assert!((layout.item_y[1] - 623.52).abs() < 1e-3);
         assert!((layout.item_y[2] - 643.68).abs() < 1e-3);
-        // separator_ys = [item_y[0]+20.16, item_y[1]+20.16]
+        assert!((layout.item_y[3] - 663.84).abs() < 1e-3);
+        // separator_ys = [item_y[0]+20.16, item_y[1]+20.16, item_y[2]+20.16]
         assert!((layout.separator_ys[0] - 623.52).abs() < 1e-3);
         assert!((layout.separator_ys[1] - 643.68).abs() < 1e-3);
+        assert!((layout.separator_ys[2] - 663.84).abs() < 1e-3);
         // text_x = menu_x0 + 0.4*cw = 800 + 2.88 = 802.88
         assert!((layout.text_x - 802.88).abs() < 1e-3);
     }

@@ -110,6 +110,10 @@ struct App {
     panel_selection: usize,
     /// Id of the block whose output is expanded inline in the panel.
     panel_expanded: Option<BlockId>,
+    /// v0.9 fix: whether the panel search box has keyboard focus. When true,
+    /// typed text goes to `panel_query` instead of the editor. Toggled by
+    /// clicking the search box area at the top of the sidebar.
+    panel_search_focused: bool,
     /// v0.9 W2: block currently highlighted in the terminal because the user
     /// clicked its row in the history panel. The renderer draws an accent
     /// border around this block. Cleared after 1.5s.
@@ -372,6 +376,7 @@ impl App {
             panel_query: String::new(),
             panel_selection: 0,
             panel_expanded: None,
+            panel_search_focused: false,
             panel_highlight: None,
             panel_highlight_until: None,
             palette_open: false,
@@ -610,10 +615,12 @@ impl App {
             return;
         }
 
-        // When the history panel is open, navigation/typing/search go to it
-        // (not the shell). Modifier chords (cmd/ctrl/alt) still fall through so
-        // keybindings like cmd+shift+b (toggle) keep working.
-        if self.panel_open && self.handle_panel_key(key, m) {
+        // v0.9 fix: panel search box has click-to-focus. When focused, typed
+        // text goes to the panel query (filtering the history list) instead
+        // of the editor. Esc unfocuses; clicking elsewhere also unfocuses.
+        // This preserves sidebar-mode editor input while making the search
+        // box functional (bug 6: "no search box / can't search").
+        if self.panel_open && self.panel_search_focused && self.handle_panel_key(key, m) {
             return;
         }
 
@@ -707,6 +714,7 @@ impl App {
                     self.panel_query.clear();
                     self.panel_selection = 0;
                     self.panel_expanded = None;
+                    self.panel_search_focused = false;
                 }
                 // v0.9 W5: resize grid for sidebar so the terminal content
                 // reflows beside the panel instead of being covered by it.
@@ -776,17 +784,20 @@ impl App {
         }
     }
 
-    /// Handle a key while the history panel is open. Returns true if consumed
-    /// (search typing / arrow nav / expand / close). Modifier chords fall
-    /// through (returns false) so keybindings still work.
+    /// Handle a key while the panel search box is focused. Returns true if
+    /// consumed (search typing / arrow nav / expand / unfocus). Modifier
+    /// chords fall through (returns false) so keybindings still work.
     fn handle_panel_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
         // Let cmd/ctrl/alt chords pass through to keybindings / PTY.
         if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
             return false;
         }
         match key {
+            // v0.9 fix: Esc unfocuses the search box instead of closing the
+            // panel. The panel itself closes via the Cmd+Shift+B keybinding
+            // or by clicking outside the sidebar.
             KeyCode::Escape => {
-                self.panel_open = false;
+                self.panel_search_focused = false;
                 self.request_redraw();
                 true
             }
@@ -2416,30 +2427,40 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                let cwd = tab
-                    .terminal
-                    .as_ref()
-                    .and_then(|t| t.cwd())
-                    .and_then(|c| c.rsplit('/').next().map(|s| s.to_string()));
-                // v0.9 W1: when a command is running, append "· <cmd>" to the
-                // cwd basename so the user can see at a glance what each tab
-                // is doing (e.g. "~/weft · cargo", "~/logs · tail -f"). The
-                // command is truncated to 12 chars so labels stay short.
-                let cmd = tab
+                // v0.9 fix: handle root path "/" — rsplit('/').next() on "/"
+                // returns "" (empty string). Fall back to "/" for root.
+                let cwd = tab.terminal.as_ref().and_then(|t| t.cwd()).map(|c| {
+                    let base = c.rsplit('/').next().unwrap_or("");
+                    if base.is_empty() {
+                        "/".to_string()
+                    } else {
+                        base.to_string()
+                    }
+                });
+                // v0.9 W1: when a command is running, show "cwd · cmd". When
+                // idle, show the last completed command (from the most recent
+                // block) so even fast commands like echo are visible.
+                let cmd: Option<String> = tab
                     .terminal
                     .as_ref()
                     .and_then(|t| t.block_tracker().in_flight())
-                    .map(|f| f.command);
+                    .map(|f| f.command.to_string())
+                    .or_else(|| {
+                        tab.terminal
+                            .as_ref()
+                            .and_then(|t| t.block_tracker().session_blocks().last())
+                            .map(|b| b.command.clone())
+                    });
                 match (cwd, cmd) {
                     (Some(cwd), Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(12).collect();
-                        let suffix = if cmd.chars().count() > 12 { "…" } else { "" };
+                        let cmd_short: String = cmd.chars().take(16).collect();
+                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
                         format!("{} · {}{}", cwd, cmd_short, suffix)
                     }
                     (Some(cwd), None) => cwd,
                     (None, Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(12).collect();
-                        let suffix = if cmd.chars().count() > 12 { "…" } else { "" };
+                        let cmd_short: String = cmd.chars().take(16).collect();
+                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
                         format!("Tab {} · {}{}", i + 1, cmd_short, suffix)
                     }
                     (None, None) => format!("Tab {}", i + 1),
@@ -2681,11 +2702,21 @@ impl App {
         if let Some(renderer) = &mut self.renderer {
             renderer.resize(window, size);
         }
-        if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
-            terminal.resize(new_rows, new_cols);
-            info!(rows = new_rows, cols = new_cols, "terminal resized");
+        // v0.9 W5: resize every tab's terminal so non-active tabs also pick
+        // up the new chrome_left (sidebar open/close shifts the grid). Only
+        // the active tab sends a PTY resize immediately; background tabs get
+        // their PTY resize on activation (refresh_grid_for_active_tab).
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if let Some(terminal) = &mut tab.terminal {
+                terminal.resize(new_rows, new_cols);
+                if i == self.active_tab {
+                    info!(rows = new_rows, cols = new_cols, "terminal resized");
+                }
+            }
+            if i == self.active_tab {
+                tab.pending_pty_resize = Some((new_rows, new_cols));
+            }
         }
-        self.tabs[self.active_tab].pending_pty_resize = Some((new_rows, new_cols));
         self.last_resize_instant = std::time::Instant::now();
     }
 
@@ -2945,13 +2976,21 @@ impl App {
                 let width_px = renderer.sidebar_width();
                 let panel_x = 0.0;
                 let ch = renderer.cell_height() as f64;
+                // v0.9 fix: list_top must include chrome_top (tab bar height)
+                // to match the renderer's panel content offset. Without this,
+                // row clicks were misaligned by one tab-bar height.
+                let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0) as f64;
                 let xf = x as f32;
                 let yf = y;
                 if xf >= panel_x && xf < panel_x + width_px && yf > 0.0 {
-                    // List starts at y = ch * 1.9, row height = ch * 1.1.
-                    let list_top = ch * 1.9;
+                    // Search box occupies y in [chrome_top, chrome_top + ch*1.9).
+                    // List starts at y = chrome_top + ch * 1.9, row height = ch * 1.1.
+                    let search_top = chrome_top;
+                    let list_top = chrome_top + ch * 1.9;
                     let row_h = ch * 1.1;
                     if yf >= list_top {
+                        // Click on a history row: unfocus search, select row.
+                        self.panel_search_focused = false;
                         let clicked = ((yf - list_top) / row_h) as usize;
                         let max_rows =
                             visible_panel_rows(renderer.viewport().1, renderer.cell_height());
@@ -2962,6 +3001,18 @@ impl App {
                             self.scroll_to_panel_selection();
                             return;
                         }
+                    } else if yf >= search_top {
+                        // Click in the search box area: focus it so keyboard
+                        // input goes to panel_query (bug 6 fix).
+                        self.panel_search_focused = true;
+                        self.request_redraw();
+                        return;
+                    }
+                } else {
+                    // Click outside the panel: unfocus search (but keep panel open).
+                    if self.panel_search_focused {
+                        self.panel_search_focused = false;
+                        self.request_redraw();
                     }
                 }
             }
@@ -4140,6 +4191,7 @@ impl ApplicationHandler<AppEvent> for App {
                         &self.panel_query,
                         self.panel_selection,
                         self.panel_expanded,
+                        self.panel_search_focused,
                         &tab.ime_preedit,
                         self.palette_open,
                         &self.palette_query,

@@ -257,12 +257,13 @@ impl HitRegion {
 #[allow(clippy::too_many_arguments)]
 pub fn build_overlay_stack<'a>(
     terminal: &'a Terminal,
-    viewport_width: f32,
+    _viewport_width: f32,
     renderer_scale: f64,
     panel_open: bool,
     panel_query: &'a str,
     panel_selection: usize,
     panel_expanded: Option<BlockId>,
+    panel_search_focused: bool,
     ime_preedit: &'a str,
     palette_open: bool,
     palette_query: &'a str,
@@ -275,7 +276,9 @@ pub fn build_overlay_stack<'a>(
 
     // History panel (Cmd+Shift+B).
     if panel_open {
-        let width_px = (viewport_width * 0.38).min(460.0 * renderer_scale as f32);
+        // v0.9 W5: panel width must match renderer's sidebar_width() (240×scale)
+        // so chrome_left == panel width and content isn't covered.
+        let width_px = 240.0 * renderer_scale as f32;
         layers.push(OverlayLayer {
             kind: OverlayKind::HistoryPanel,
             z: OverlayZ::Panel,
@@ -286,6 +289,7 @@ pub fn build_overlay_stack<'a>(
                 query: panel_query,
                 selection: panel_selection,
                 expanded_id: panel_expanded,
+                search_focused: panel_search_focused,
             }),
         });
     }
