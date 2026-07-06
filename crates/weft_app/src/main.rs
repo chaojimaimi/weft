@@ -120,6 +120,9 @@ struct App {
     panel_highlight: Option<BlockId>,
     /// When the panel highlight expires. Polled from the redraw path.
     panel_highlight_until: Option<std::time::Instant>,
+    /// v0.9: timestamp + row of the last panel row click, for detecting
+    /// double-clicks (which send the command to the prompt).
+    panel_last_click: Option<(std::time::Instant, usize)>,
 
     // ── Command Palette (v0.7) ────────────────────────────────────────
     /// Whether the Cmd+P command palette overlay is shown.
@@ -380,6 +383,7 @@ impl App {
             panel_search_focused: false,
             panel_highlight: None,
             panel_highlight_until: None,
+            panel_last_click: None,
             palette_open: false,
             popup_width_scale: 0.6,
             popup_max_rows: 8,
@@ -3071,17 +3075,29 @@ impl App {
                     if yf >= list_top {
                         // Click on a history row: select it AND focus the
                         // panel so Up/Down keys navigate the list (Warp-style).
-                        // The command is sent to the prompt ONLY on Enter —
-                        // clicking just selects + scrolls (bug 3 fix).
+                        // Single click only selects + scrolls + highlights
+                        // the block; double-click (or Enter) sends the command
+                        // to the prompt editor.
                         self.panel_search_focused = true;
                         let clicked = ((yf - list_top) / row_h) as usize;
                         let max_rows =
                             visible_panel_rows(renderer.viewport().1, renderer.cell_height());
                         if clicked < max_rows {
+                            // v0.9: detect double-click on the same row.
+                            let now = std::time::Instant::now();
+                            let is_double = self
+                                .panel_last_click
+                                .map(|(t, row)| t.elapsed() < std::time::Duration::from_millis(400) && row == clicked)
+                                .unwrap_or(false);
+                            self.panel_last_click = Some((now, clicked));
                             self.panel_selection = clicked;
                             self.clamp_panel_selection();
                             // Scroll terminal to the selected block + highlight.
                             self.scroll_to_panel_selection();
+                            if is_double {
+                                // Double-click: send the command to the prompt.
+                                self.send_panel_selection_to_input();
+                            }
                             return;
                         }
                     } else if yf >= search_top && yf < search_bottom {
