@@ -279,6 +279,7 @@ enum PaletteEntry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BuiltinCmd {
     ToggleTheme,
+    SelectTheme,
     ToggleBlockPanel,
     ReloadConfig,
 }
@@ -287,6 +288,7 @@ impl BuiltinCmd {
     fn label(&self) -> &'static str {
         match self {
             BuiltinCmd::ToggleTheme => "Toggle Theme",
+            BuiltinCmd::SelectTheme => "Select Theme",
             BuiltinCmd::ToggleBlockPanel => "Toggle History Panel",
             BuiltinCmd::ReloadConfig => "Reload Config",
         }
@@ -324,6 +326,10 @@ enum PaletteSubMode {
     },
     /// Confirming deletion of a workflow.
     ConfirmDelete { id: i64, name: String },
+    /// v0.9 W2+: Theme picker sub-mode. `themes` holds resolvable theme names
+    /// (built-ins + custom files from ~/.config/weft/themes/). `buffer` is
+    /// the filter query. `selection` reuses `palette_selection`.
+    SelectTheme { buffer: String, themes: Vec<String> },
 }
 
 /// Steps in the create-workflow guided entry.
@@ -909,6 +915,7 @@ impl App {
         // Builtin commands (filtered by query if non-empty).
         let builtins = [
             BuiltinCmd::ToggleTheme,
+            BuiltinCmd::SelectTheme,
             BuiltinCmd::ToggleBlockPanel,
             BuiltinCmd::ReloadConfig,
         ];
@@ -952,6 +959,9 @@ impl App {
             }
             PaletteSubMode::ConfirmDelete { .. } => {
                 return self.handle_palette_delete_key(key);
+            }
+            PaletteSubMode::SelectTheme { .. } => {
+                return self.handle_palette_select_theme_key(key, text);
             }
             PaletteSubMode::Search => {}
         }
@@ -1765,15 +1775,31 @@ impl App {
                 match cmd {
                     BuiltinCmd::ToggleTheme => {
                         self.toggle_theme();
+                        self.palette_open = false;
+                    }
+                    BuiltinCmd::SelectTheme => {
+                        // v0.9 W2+: enter theme picker sub-mode instead of
+                        // closing the palette. List built-in themes + custom
+                        // theme files from ~/.config/weft/themes/.
+                        let themes = self.available_theme_names();
+                        self.palette_submode = PaletteSubMode::SelectTheme {
+                            buffer: String::new(),
+                            themes,
+                        };
+                        self.palette_query.clear();
+                        self.palette_selection = 0;
+                        self.refresh_theme_picker_results();
+                        // NOTE: do NOT close the palette — user must pick.
                     }
                     BuiltinCmd::ToggleBlockPanel => {
                         self.execute_action(Action::ToggleBlockPanel);
+                        self.palette_open = false;
                     }
                     BuiltinCmd::ReloadConfig => {
                         self.execute_action(Action::ReloadConfig);
+                        self.palette_open = false;
                     }
                 }
-                self.palette_open = false;
                 self.request_redraw();
             }
         }
@@ -2622,6 +2648,180 @@ impl App {
         self.theme_is_dark = dark;
         info!(dark, name, "theme applied");
         self.request_redraw();
+    }
+
+    /// v0.9 W2+: List all resolvable theme names for the picker.
+    ///
+    /// Returns built-in names (sorted by display order, not alphabetically)
+    /// followed by custom theme files discovered in
+    /// `~/.config/weft/themes/` (stem of `.toml`/`.yaml`/`.yml` files).
+    /// Built-ins are returned in a curated order (defaults first, then
+    /// classic themes, then community themes) so the picker shows the most
+    /// useful themes at the top.
+    fn available_theme_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = [
+            "weft-warm",
+            "weft-light",
+            "warp",
+            "dracula",
+            "solarized-dark",
+            "gruvbox-dark",
+            "nord",
+            "tokyo-night",
+            "catppuccin",
+            "one-dark",
+            "monokai-pro",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Append custom theme file stems from the themes dir (if any).
+        if let Some(dir) = weft_core::config::Theme::themes_dir() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut customs: Vec<String> = Vec::new();
+                for entry in entries.flatten() {
+                    if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                        // Skip names that collide with built-ins.
+                        if !names.iter().any(|n| n == stem) {
+                            customs.push(stem.to_string());
+                        }
+                    }
+                }
+                customs.sort();
+                names.extend(customs);
+            }
+        }
+        names
+    }
+
+    /// v0.9 W2+: Rebuild `palette_results` for the theme picker sub-mode.
+    ///
+    /// Filters `themes` by the buffer (case-insensitive substring) and
+    /// pushes each as a `PaletteEntry::Builtin(BuiltinCmd::SelectTheme)` —
+    /// but the renderer projection (in `draw()`) maps each to a
+    /// `(theme_name, "", "Theme")` tuple via the sub-mode check, so the
+    /// picker rows show theme names with a "Theme" suffix label.
+    fn refresh_theme_picker_results(&mut self) {
+        let (buffer, themes) = match &self.palette_submode {
+            PaletteSubMode::SelectTheme { buffer, themes } => (buffer.clone(), themes.clone()),
+            _ => return,
+        };
+        let q = buffer.to_lowercase();
+        let mut results: Vec<PaletteEntry> = Vec::new();
+        for name in &themes {
+            if q.is_empty() || name.to_lowercase().contains(&q) {
+                // We reuse PaletteEntry::Builtin(SelectTheme) as a sentinel;
+                // the renderer projection distinguishes themes by sub-mode.
+                results.push(PaletteEntry::Builtin(BuiltinCmd::SelectTheme));
+            }
+        }
+        self.palette_results = results;
+        if self.palette_selection >= self.palette_results.len() {
+            self.palette_selection = 0;
+        }
+    }
+
+    /// v0.9 W2+: Handle keyboard input in the theme picker sub-mode.
+    ///
+    /// - Up/Down: navigate the filtered theme list.
+    /// - Enter: apply the selected theme (dark heuristic: name ends with
+    ///   `-dark`/`-night` or contains "dracula"/"nord"/"tokyo"/"monokai"
+    ///   → dark; otherwise treat as light). The palette closes after apply.
+    /// - Escape: return to Search sub-mode (does not close the palette).
+    /// - Backspace: pop the filter buffer; if empty, return to Search.
+    /// - Printable char: append to the filter buffer and refresh.
+    fn handle_palette_select_theme_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
+        let (buffer, themes) = match &self.palette_submode {
+            PaletteSubMode::SelectTheme { buffer, themes } => (buffer.clone(), themes.clone()),
+            _ => return false,
+        };
+
+        // Helper: given the current filtered selection index, resolve back to
+        // the actual theme name from the full `themes` list.
+        let selected_name = |sel: usize, buf: &str| -> Option<String> {
+            let q = buf.to_lowercase();
+            themes
+                .iter()
+                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                .nth(sel)
+                .cloned()
+        };
+
+        match key {
+            KeyCode::Escape => {
+                // Return to search mode (keep palette open).
+                self.palette_submode = PaletteSubMode::Search;
+                self.palette_query.clear();
+                self.palette_selection = 0;
+                self.refresh_palette_results();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Up => {
+                if self.palette_selection > 0 {
+                    self.palette_selection -= 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Down => {
+                if self.palette_selection + 1 < self.palette_results.len() {
+                    self.palette_selection += 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                if let Some(name) = selected_name(self.palette_selection, &buffer) {
+                    // Heuristic: classify as dark unless the name clearly
+                    // indicates a light theme. Affects follow_system parity.
+                    let dark = !matches!(
+                        name.as_str(),
+                        "weft-light" | "solarized-light" | "gruvbox-light"
+                    );
+                    self.apply_theme_by_name(&name, dark);
+                    self.palette_open = false;
+                    self.palette_submode = PaletteSubMode::Search;
+                    self.palette_query.clear();
+                    self.request_redraw();
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if buffer.is_empty() {
+                    // Exit sub-mode back to search.
+                    self.palette_submode = PaletteSubMode::Search;
+                    self.palette_query.clear();
+                    self.palette_selection = 0;
+                    self.refresh_palette_results();
+                } else {
+                    // Pop filter char.
+                    if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette_submode {
+                        buffer.pop();
+                        let buf = buffer.clone();
+                        self.palette_selection = 0;
+                        self.refresh_theme_picker_results();
+                        // refresh_theme_picker_results reads buffer from self.
+                        let _ = buf; // silence unused
+                    }
+                }
+                self.request_redraw();
+                true
+            }
+            _ => {
+                let c = resolve_text_char(text, '\0', false);
+                if c == '\0' || c.is_control() {
+                    return false;
+                }
+                if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette_submode {
+                    buffer.push(c);
+                    self.palette_selection = 0;
+                    self.refresh_theme_picker_results();
+                }
+                self.request_redraw();
+                true
+            }
+        }
     }
 
     /// v0.9 U-D1: Poll the macOS system appearance and switch theme if it
@@ -4582,18 +4782,36 @@ impl ApplicationHandler<AppEvent> for App {
                         self.context_menu.as_ref().map(|m| (m.x, m.y, m.block_id));
 
                     // Build palette entries as (label, description, kind_label) tuples.
-                    let palette_entries: Vec<(String, String, &str)> = self
-                        .palette_results
-                        .iter()
-                        .map(|e| match e {
-                            PaletteEntry::Workflow(wf) => {
-                                (wf.name.clone(), wf.description.clone(), "Workflow")
-                            }
-                            PaletteEntry::Builtin(b) => {
-                                (b.label().to_string(), String::new(), "Builtin")
-                            }
-                        })
-                        .collect();
+                    // v0.9 W2+: in SelectTheme sub-mode, project theme names
+                    // (filtered from the full list) instead of the generic
+                    // "Select Theme" builtin label.
+                    let palette_entries: Vec<(String, String, &str)> =
+                        if matches!(self.palette_submode, PaletteSubMode::SelectTheme { .. }) {
+                            let (buffer, themes) = match &self.palette_submode {
+                                PaletteSubMode::SelectTheme { buffer, themes } => {
+                                    (buffer.clone(), themes.clone())
+                                }
+                                _ => unreachable!(),
+                            };
+                            let q = buffer.to_lowercase();
+                            themes
+                                .iter()
+                                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
+                                .map(|n| (n.clone(), String::new(), "Theme"))
+                                .collect()
+                        } else {
+                            self.palette_results
+                                .iter()
+                                .map(|e| match e {
+                                    PaletteEntry::Workflow(wf) => {
+                                        (wf.name.clone(), wf.description.clone(), "Workflow")
+                                    }
+                                    PaletteEntry::Builtin(b) => {
+                                        (b.label().to_string(), String::new(), "Builtin")
+                                    }
+                                })
+                                .collect()
+                        };
 
                     // Compute palette banner + submode input from the sub-mode state.
                     let (palette_banner, palette_submode_input) = match &self.palette_submode {
@@ -4611,6 +4829,9 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         PaletteSubMode::ConfirmDelete { name, .. } => {
                             (format!("Delete '{name}'? (y/n)"), String::new())
+                        }
+                        PaletteSubMode::SelectTheme { buffer, .. } => {
+                            ("Select theme:".to_string(), buffer.clone())
                         }
                     };
 

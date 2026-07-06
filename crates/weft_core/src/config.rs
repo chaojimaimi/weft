@@ -412,6 +412,260 @@ impl Theme {
         }
     }
 
+    /// v0.9 W2+: Nord theme.
+    ///
+    /// Arctic, north-bluish color palette (arcticicestudio, MIT). Official
+    /// palette: https://www.nordtheme.com/docs/colors-and-palettes.
+    /// Set `name = "nord"` in `[theme]` to use it.
+    pub fn nord() -> Self {
+        let mut palette = Color::standard_palette();
+        // ANSI 0-15 — Nord official palette.
+        let ansi = [
+            (0x2e, 0x34, 0x40), // 0 black   (nord0 polar night)
+            (0xbf, 0x61, 0x6a), // 1 red     (nord11 aurora)
+            (0xa3, 0xbe, 0x8c), // 2 green   (nord14)
+            (0xeb, 0xcb, 0x8b), // 3 yellow  (nord13)
+            (0x81, 0xa1, 0xc1), // 4 blue    (nord9 frost)
+            (0xb4, 0x8e, 0xad), // 5 magenta (nord15)
+            (0x88, 0xc0, 0xd0), // 6 cyan    (nord8 frost light)
+            (0xe5, 0xe9, 0xf0), // 7 white   (nord5 snow storm)
+            (0x4c, 0x56, 0x6a), // 8 bright black (nord3)
+            (0xbf, 0x61, 0x6a), // 9 bright red
+            (0xa3, 0xbe, 0x8c), // 10 bright green
+            (0xeb, 0xcb, 0x8b), // 11 bright yellow
+            (0x81, 0xa1, 0xc1), // 12 bright blue
+            (0xb4, 0x8e, 0xad), // 13 bright magenta
+            (0x8f, 0xbc, 0xbb), // 14 bright cyan (nord7)
+            (0xec, 0xef, 0xf4), // 15 bright white (nord6)
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xd8, 0xde, 0xe9), // nord4
+            background: Color::rgb(0x2e, 0x34, 0x40), // nord0
+            cursor: Color::rgb(0xd8, 0xde, 0xe9),     // nord4
+            selection: Color::rgb(0x43, 0x4c, 0x5e),  // nord2
+            palette,
+            accent: Color::rgb(0x88, 0xc0, 0xd0), // nord8 (frost light)
+            accent_dim: Color::rgb(0x4c, 0x56, 0x6a), // nord3
+            separator: Color::rgb(0x3b, 0x42, 0x52), // nord1
+            syntax: SyntaxColors {
+                command: Color::rgb(0xd8, 0xde, 0xe9),  // nord4
+                flag: Color::rgb(0x88, 0xc0, 0xd0),     // nord8 cyan-blue
+                path: Color::rgb(0x81, 0xa1, 0xc1),     // nord9 frost
+                string: Color::rgb(0xa3, 0xbe, 0x8c),   // nord14 green
+                number: Color::rgb(0xeb, 0xcb, 0x8b),   // nord13 yellow
+                variable: Color::rgb(0xb4, 0x8e, 0xad), // nord15 purple
+                operator: Color::rgb(0xbf, 0x61, 0x6a), // nord11 red
+                comment: Color::rgb(0x61, 0x69, 0x80),  // nord3 dimmed
+                default: Color::rgb(0xd8, 0xde, 0xe9),  // nord4
+            },
+        }
+    }
+
+    /// v0.9 W2+: Tokyo Night theme.
+    ///
+    /// A clean, dark color scheme inspired by Tokyo city lights (enkia, MIT).
+    /// Official: https://github.com/tokyo-night/tokyo-night-vscode-theme.
+    /// Set `name = "tokyo-night"` in `[theme]` to use it.
+    pub fn tokyo_night() -> Self {
+        let mut palette = Color::standard_palette();
+        let ansi = [
+            (0x15, 0x16, 0x23), // 0 black   (bg darker)
+            (0xf7, 0x76, 0x8e), // 1 red
+            (0x9e, 0xce, 0x6a), // 2 green
+            (0xe0, 0xaf, 0x68), // 3 yellow
+            (0x7a, 0xa2, 0xf7), // 4 blue
+            (0xbb, 0x9a, 0xf7), // 5 magenta
+            (0x7d, 0xcf, 0xff), // 6 cyan
+            (0xa9, 0xb1, 0xd6), // 7 white   (fg)
+            (0x41, 0x42, 0x5a), // 8 bright black (comment)
+            (0xf7, 0x76, 0x8e), // 9 bright red
+            (0x9e, 0xce, 0x6a), // 10 bright green
+            (0xe0, 0xaf, 0x68), // 11 bright yellow
+            (0x7a, 0xa2, 0xf7), // 12 bright blue
+            (0xbb, 0x9a, 0xf7), // 13 bright magenta
+            (0x7d, 0xcf, 0xff), // 14 bright cyan
+            (0xc0, 0xca, 0xf5), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xa9, 0xb1, 0xd6),
+            background: Color::rgb(0x1a, 0x1b, 0x26),
+            cursor: Color::rgb(0xc0, 0xca, 0xf5),
+            selection: Color::rgb(0x28, 0x34, 0x57),
+            palette,
+            accent: Color::rgb(0x7a, 0xa2, 0xf7),     // blue
+            accent_dim: Color::rgb(0x56, 0x5f, 0x89), // comment
+            separator: Color::rgb(0x16, 0x18, 0x2a),
+            syntax: SyntaxColors {
+                command: Color::rgb(0xa9, 0xb1, 0xd6),  // fg
+                flag: Color::rgb(0x7a, 0xa2, 0xf7),     // blue
+                path: Color::rgb(0x7d, 0xcf, 0xff),     // cyan
+                string: Color::rgb(0x9e, 0xce, 0x6a),   // green
+                number: Color::rgb(0xff, 0x9e, 0x64),   // orange
+                variable: Color::rgb(0xbb, 0x9a, 0xf7), // magenta
+                operator: Color::rgb(0xf7, 0x76, 0x8e), // red
+                comment: Color::rgb(0x56, 0x5f, 0x89),  // comment
+                default: Color::rgb(0xa9, 0xb1, 0xd6),  // fg
+            },
+        }
+    }
+
+    /// v0.9 W2+: Catppuccin Mocha theme.
+    ///
+    /// Soothing pastel theme — the dark Mocha flavor (Catppuccin org, MIT).
+    /// Official: https://catppuccin.com/palette. Set `name = "catppuccin"` in
+    /// `[theme]` to use it.
+    pub fn catppuccin_mocha() -> Self {
+        let mut palette = Color::standard_palette();
+        let ansi = [
+            (0x1e, 0x1e, 0x2e), // 0 black   (base)
+            (0xf3, 0x8b, 0xa8), // 1 red
+            (0xa6, 0xe3, 0xa1), // 2 green
+            (0xf9, 0xe2, 0xaf), // 3 yellow
+            (0x89, 0xb4, 0xfa), // 4 blue
+            (0xcb, 0xa6, 0xf7), // 5 magenta (mauve)
+            (0x94, 0xe2, 0xd5), // 6 cyan    (teal)
+            (0xcd, 0xd6, 0xf4), // 7 white   (text)
+            (0x6c, 0x70, 0x86), // 8 bright black (overlay0)
+            (0xf3, 0x8b, 0xa8), // 9 bright red
+            (0xa6, 0xe3, 0xa1), // 10 bright green
+            (0xf9, 0xe2, 0xaf), // 11 bright yellow
+            (0x89, 0xb4, 0xfa), // 12 bright blue
+            (0xcb, 0xa6, 0xf7), // 13 bright magenta
+            (0x94, 0xe2, 0xd5), // 14 bright cyan
+            (0xff, 0xff, 0xff), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xcd, 0xd6, 0xf4), // text
+            background: Color::rgb(0x1e, 0x1e, 0x2e), // base
+            cursor: Color::rgb(0xf5, 0xe0, 0xdc),     // rosewater
+            selection: Color::rgb(0x45, 0x47, 0x5a),  // surface1
+            palette,
+            accent: Color::rgb(0xcb, 0xa6, 0xf7),     // mauve
+            accent_dim: Color::rgb(0x6c, 0x70, 0x86), // overlay0
+            separator: Color::rgb(0x31, 0x32, 0x44),  // surface0
+            syntax: SyntaxColors {
+                command: Color::rgb(0xcd, 0xd6, 0xf4),  // text
+                flag: Color::rgb(0xcb, 0xa6, 0xf7),     // mauve
+                path: Color::rgb(0x89, 0xb4, 0xfa),     // blue
+                string: Color::rgb(0xa6, 0xe3, 0xa1),   // green
+                number: Color::rgb(0xfa, 0xb3, 0x87),   // peach
+                variable: Color::rgb(0xf9, 0xe2, 0xaf), // yellow
+                operator: Color::rgb(0xf3, 0x8b, 0xa8), // red
+                comment: Color::rgb(0x6c, 0x70, 0x86),  // overlay0
+                default: Color::rgb(0xcd, 0xd6, 0xf4),  // text
+            },
+        }
+    }
+
+    /// v0.9 W2+: One Dark theme.
+    ///
+    /// Atom's iconic dark color scheme (MIT). Set `name = "one-dark"` in
+    /// `[theme]` to use it.
+    pub fn one_dark() -> Self {
+        let mut palette = Color::standard_palette();
+        let ansi = [
+            (0x28, 0x2c, 0x34), // 0 black   (bg)
+            (0xe0, 0x6c, 0x75), // 1 red
+            (0x98, 0xc3, 0x79), // 2 green
+            (0xe5, 0xc0, 0x7b), // 3 yellow
+            (0x61, 0xaf, 0xef), // 4 blue
+            (0xc6, 0x78, 0xdd), // 5 magenta (purple)
+            (0x56, 0xb6, 0xc2), // 6 cyan
+            (0xab, 0xb2, 0xbf), // 7 white   (fg)
+            (0x5c, 0x63, 0x70), // 8 bright black (comment)
+            (0xe0, 0x6c, 0x75), // 9 bright red
+            (0x98, 0xc3, 0x79), // 10 bright green
+            (0xe5, 0xc0, 0x7b), // 11 bright yellow
+            (0x61, 0xaf, 0xef), // 12 bright blue
+            (0xc6, 0x78, 0xdd), // 13 bright magenta
+            (0x56, 0xb6, 0xc2), // 14 bright cyan
+            (0xff, 0xff, 0xff), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xab, 0xb2, 0xbf),
+            background: Color::rgb(0x28, 0x2c, 0x34),
+            cursor: Color::rgb(0xab, 0xb2, 0xbf),    // fg
+            selection: Color::rgb(0x3e, 0x44, 0x51), // current line
+            palette,
+            accent: Color::rgb(0x61, 0xaf, 0xef),     // blue
+            accent_dim: Color::rgb(0x5c, 0x63, 0x70), // comment
+            separator: Color::rgb(0x3e, 0x44, 0x51),
+            syntax: SyntaxColors {
+                command: Color::rgb(0xab, 0xb2, 0xbf),  // fg
+                flag: Color::rgb(0xc6, 0x78, 0xdd),     // purple
+                path: Color::rgb(0x56, 0xb6, 0xc2),     // cyan
+                string: Color::rgb(0x98, 0xc3, 0x79),   // green
+                number: Color::rgb(0xd1, 0x9a, 0x66),   // orange
+                variable: Color::rgb(0xe5, 0xc0, 0x7b), // yellow
+                operator: Color::rgb(0xe0, 0x6c, 0x75), // red
+                comment: Color::rgb(0x5c, 0x63, 0x70),  // comment
+                default: Color::rgb(0xab, 0xb2, 0xbf),  // fg
+            },
+        }
+    }
+
+    /// v0.9 W2+: Monokai Pro theme.
+    ///
+    /// Sublime Text's premium dark theme — classic vibrant palette (MIT).
+    /// Set `name = "monokai-pro"` in `[theme]` to use it.
+    pub fn monokai_pro() -> Self {
+        let mut palette = Color::standard_palette();
+        let ansi = [
+            (0x2d, 0x2a, 0x2e), // 0 black   (bg)
+            (0xff, 0x61, 0x88), // 1 red
+            (0xa9, 0xdc, 0x76), // 2 green
+            (0xff, 0xd8, 0x66), // 3 yellow
+            (0xfc, 0x98, 0x67), // 4 orange (Monokai uses orange in slot 4)
+            (0xab, 0x9d, 0xf2), // 5 magenta (purple)
+            (0x78, 0xdc, 0xe8), // 6 cyan
+            (0xfc, 0xfc, 0xfa), // 7 white   (fg)
+            (0x72, 0x70, 0x72), // 8 bright black (comment)
+            (0xff, 0x61, 0x88), // 9 bright red
+            (0xa9, 0xdc, 0x76), // 10 bright green
+            (0xff, 0xd8, 0x66), // 11 bright yellow
+            (0xfc, 0x98, 0x67), // 12 bright orange
+            (0xab, 0x9d, 0xf2), // 13 bright magenta
+            (0x78, 0xdc, 0xe8), // 14 bright cyan
+            (0xff, 0xff, 0xff), // 15 bright white
+        ];
+        for (i, (r, g, b)) in ansi.iter().enumerate() {
+            palette[i] = Color::rgb(*r, *g, *b);
+        }
+        Self {
+            foreground: Color::rgb(0xfc, 0xfc, 0xfa),
+            background: Color::rgb(0x2d, 0x2a, 0x2e),
+            cursor: Color::rgb(0xfc, 0xfc, 0xfa),
+            selection: Color::rgb(0x40, 0x3e, 0x41),
+            palette,
+            accent: Color::rgb(0xff, 0xd8, 0x66), // yellow (Monokai signature)
+            accent_dim: Color::rgb(0x72, 0x70, 0x72), // comment
+            separator: Color::rgb(0x40, 0x3e, 0x41),
+            syntax: SyntaxColors {
+                command: Color::rgb(0xfc, 0xfc, 0xfa),  // fg
+                flag: Color::rgb(0xff, 0x61, 0x88),     // red
+                path: Color::rgb(0x78, 0xdc, 0xe8),     // cyan
+                string: Color::rgb(0xa9, 0xdc, 0x76),   // green
+                number: Color::rgb(0xab, 0x9d, 0xf2),   // purple
+                variable: Color::rgb(0xab, 0x9d, 0xf2), // purple
+                operator: Color::rgb(0xff, 0x61, 0x88), // red
+                comment: Color::rgb(0x72, 0x70, 0x72),  // comment
+                default: Color::rgb(0xfc, 0xfc, 0xfa),  // fg
+            },
+        }
+    }
+
     /// Resolve a theme from config: pick the built-in base by `cfg.name`,
     /// then apply any inline hex overrides.
     ///
@@ -443,6 +697,12 @@ impl Theme {
             "dracula" => Self::dracula(),
             "solarized-dark" | "solarized_dark" | "solarized" => Self::solarized_dark(),
             "gruvbox-dark" | "gruvbox_dark" | "gruvbox" => Self::gruvbox_dark(),
+            // v0.9 W2+: Community classic themes.
+            "nord" => Self::nord(),
+            "tokyo-night" | "tokyo_night" => Self::tokyo_night(),
+            "catppuccin" | "catppuccin-mocha" | "catppuccin_mocha" => Self::catppuccin_mocha(),
+            "one-dark" | "one_dark" | "onedark" => Self::one_dark(),
+            "monokai-pro" | "monokai_pro" | "monokai" => Self::monokai_pro(),
             other => match Self::load_from_file(other) {
                 Some(t) => t,
                 None => Self::weft_warm(),
@@ -1263,6 +1523,102 @@ name = "weft-light"
         assert_eq!(t.background, Color::rgb(0x28, 0x28, 0x28));
         assert_eq!(t.foreground, Color::rgb(0xeb, 0xdb, 0xb2));
         assert_eq!(t.accent, Color::rgb(0xfe, 0x80, 0x19)); // orange
+    }
+
+    #[test]
+    fn community_themes_resolve_by_name() {
+        // v0.9 W2+: Nord / Tokyo Night / Catppuccin / One Dark / Monokai Pro.
+        for (name, expected) in [
+            ("nord", Theme::nord()),
+            ("tokyo-night", Theme::tokyo_night()),
+            ("tokyo_night", Theme::tokyo_night()),
+            ("catppuccin", Theme::catppuccin_mocha()),
+            ("catppuccin-mocha", Theme::catppuccin_mocha()),
+            ("one-dark", Theme::one_dark()),
+            ("one_dark", Theme::one_dark()),
+            ("onedark", Theme::one_dark()),
+            ("monokai-pro", Theme::monokai_pro()),
+            ("monokai_pro", Theme::monokai_pro()),
+            ("monokai", Theme::monokai_pro()),
+        ] {
+            let cfg = ThemeConfig {
+                name: name.into(),
+                ..Default::default()
+            };
+            assert_eq!(Theme::resolve(&cfg), expected, "name = {name}");
+        }
+    }
+
+    #[test]
+    fn community_themes_have_visible_syntax() {
+        // v0.9 W2+: each community theme has accent != bg and all syntax
+        // colors differ from background.
+        for (name, theme) in [
+            ("nord", Theme::nord()),
+            ("tokyo-night", Theme::tokyo_night()),
+            ("catppuccin", Theme::catppuccin_mocha()),
+            ("one-dark", Theme::one_dark()),
+            ("monokai-pro", Theme::monokai_pro()),
+        ] {
+            assert_ne!(
+                theme.accent, theme.background,
+                "{name}: accent must differ from background"
+            );
+            let bg = theme.background;
+            for c in [
+                theme.syntax.command,
+                theme.syntax.flag,
+                theme.syntax.path,
+                theme.syntax.string,
+                theme.syntax.number,
+                theme.syntax.variable,
+                theme.syntax.operator,
+                theme.syntax.comment,
+                theme.syntax.default,
+            ] {
+                assert_ne!(c, bg, "{name}: syntax color must differ from background");
+            }
+        }
+    }
+
+    #[test]
+    fn nord_signature_colors() {
+        let t = Theme::nord();
+        assert_eq!(t.background, Color::rgb(0x2e, 0x34, 0x40)); // nord0
+        assert_eq!(t.foreground, Color::rgb(0xd8, 0xde, 0xe9)); // nord4
+        assert_eq!(t.accent, Color::rgb(0x88, 0xc0, 0xd0)); // nord8 frost
+    }
+
+    #[test]
+    fn tokyo_night_signature_colors() {
+        let t = Theme::tokyo_night();
+        assert_eq!(t.background, Color::rgb(0x1a, 0x1b, 0x26));
+        assert_eq!(t.foreground, Color::rgb(0xa9, 0xb1, 0xd6));
+        assert_eq!(t.accent, Color::rgb(0x7a, 0xa2, 0xf7)); // blue
+    }
+
+    #[test]
+    fn catppuccin_signature_colors() {
+        let t = Theme::catppuccin_mocha();
+        assert_eq!(t.background, Color::rgb(0x1e, 0x1e, 0x2e)); // base
+        assert_eq!(t.foreground, Color::rgb(0xcd, 0xd6, 0xf4)); // text
+        assert_eq!(t.accent, Color::rgb(0xcb, 0xa6, 0xf7)); // mauve
+    }
+
+    #[test]
+    fn one_dark_signature_colors() {
+        let t = Theme::one_dark();
+        assert_eq!(t.background, Color::rgb(0x28, 0x2c, 0x34));
+        assert_eq!(t.foreground, Color::rgb(0xab, 0xb2, 0xbf));
+        assert_eq!(t.accent, Color::rgb(0x61, 0xaf, 0xef)); // blue
+    }
+
+    #[test]
+    fn monokai_pro_signature_colors() {
+        let t = Theme::monokai_pro();
+        assert_eq!(t.background, Color::rgb(0x2d, 0x2a, 0x2e));
+        assert_eq!(t.foreground, Color::rgb(0xfc, 0xfc, 0xfa));
+        assert_eq!(t.accent, Color::rgb(0xff, 0xd8, 0x66)); // yellow
     }
 
     #[test]
