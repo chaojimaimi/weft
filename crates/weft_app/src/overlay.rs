@@ -271,6 +271,7 @@ pub fn build_overlay_stack<'a>(
     palette_entries: &'a [(String, String, &'a str)],
     palette_banner: &'a str,
     palette_submode_input: &'a str,
+    prompt_selection: Option<((usize, usize), (usize, usize))>,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -312,6 +313,7 @@ pub fn build_overlay_stack<'a>(
                     Some(ime_preedit)
                 },
                 search,
+                selection: prompt_selection,
             }),
         });
 

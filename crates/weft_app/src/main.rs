@@ -114,6 +114,9 @@ struct App {
     /// typed text goes to `panel_query` instead of the editor. Toggled by
     /// clicking the search box area at the top of the sidebar.
     panel_search_focused: bool,
+    /// v0.9: when true, the next mouse drag in the prompt box should extend
+    /// the editor selection (mouse is dragging inside the prompt box).
+    prompt_dragging: bool,
     /// v0.9 W2: block currently highlighted in the terminal because the user
     /// clicked its row in the history panel. The renderer draws an accent
     /// border around this block. Cleared after 1.5s.
@@ -139,6 +142,9 @@ struct App {
     palette_query: String,
     /// Selected index in the palette results.
     palette_selection: usize,
+    /// v0.9: last click in the palette results list (time + row index) for
+    /// double-click detection. Double-click runs the entry immediately.
+    palette_last_click: Option<(std::time::Instant, usize)>,
     /// Cached search results (workflows + builtin commands).
     palette_results: Vec<PaletteEntry>,
     /// Active variable-fill form for a selected workflow (None = search mode).
@@ -381,6 +387,7 @@ impl App {
             panel_selection: 0,
             panel_expanded: None,
             panel_search_focused: false,
+            prompt_dragging: false,
             panel_highlight: None,
             panel_highlight_until: None,
             panel_last_click: None,
@@ -391,6 +398,7 @@ impl App {
             context_menu: None,
             palette_query: String::new(),
             palette_selection: 0,
+            palette_last_click: None,
             palette_results: Vec::new(),
             palette_form: None,
             palette_submode: PaletteSubMode::Search,
@@ -1818,6 +1826,17 @@ impl App {
             return false;
         }
 
+        // v0.9: any non-Cmd editor key clears the mouse-drag selection so
+        // typing replaces the selection. Cmd+C is handled above (returns
+        // false) so it won't clear the selection — copy still works.
+        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+            if t.editor().buffer.has_selection() {
+                t.editor_mut().buffer.clear_selection();
+                self.request_redraw();
+            }
+        }
+        self.prompt_dragging = false;
+
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
             let consumed = if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
@@ -2245,6 +2264,10 @@ impl App {
             if !cmd.is_empty() {
                 if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
                     t.editor_mut().buffer.set_text(&cmd);
+                    // v0.9: select all so Cmd+C copies the command without
+                    // needing a drag-select first. The user can still adjust
+                    // the selection by clicking in the prompt box.
+                    t.editor_mut().buffer.select_all();
                 }
                 // Unfocus the panel so the editor gets subsequent keystrokes.
                 self.panel_search_focused = false;
@@ -2914,6 +2937,73 @@ impl App {
         })
     }
 
+    /// v0.9: map a physical-pixel click (inside the prompt input box) to an
+    /// editor buffer position `(line, char_col)`. Returns None when the
+    /// renderer/prompt isn't available or the click is outside the box.
+    ///
+    /// The prompt box layout (from `layout_prompt`):
+    ///   - line 0 starts at `first_line_text_x` (after the "❯ " glyph)
+    ///   - lines 1+ start at `left` (= `box_x0`)
+    ///   - each line is `cell_h` tall, starting at `text_y0`
+    fn pixel_to_editor_pos(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        use unicode_width::UnicodeWidthChar;
+        let renderer = self.renderer.as_ref()?;
+        let ctx = renderer.layout_ctx?;
+        let cw = ctx.cell_w as f64;
+        let ch = ctx.cell_h as f64;
+        if cw <= 0.0 || ch <= 0.0 {
+            return None;
+        }
+        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
+            return None;
+        };
+        if terminal.effective_input_mode() != weft_core::input::InputMode::Editor {
+            return None;
+        }
+        let lines = &terminal.editor().buffer.lines;
+        if lines.is_empty() {
+            return None;
+        }
+        // Recompute the prompt geometry (matches layout_prompt).
+        let n_lines = lines.len().max(1);
+        let box_h = ch * (n_lines as f64 + 2.0);
+        let box_y1 = (ctx.viewport.1 as f64 - ctx.padding_y as f64).max(0.0);
+        let box_y0 = (box_y1 - box_h).max(0.0);
+        let text_y0 = box_y0 + ch;
+        let left = ctx.left() as f64;
+        let prompt_chars = 2usize;
+        let first_line_text_x = left + prompt_chars as f64 * cw;
+        // Which line was clicked? (clamped to [0, n_lines-1])
+        let mut line = ((y - text_y0) / ch) as isize;
+        if line < 0 {
+            line = 0;
+        }
+        let line = (line as usize).min(n_lines - 1);
+        // X origin for this line.
+        let text_x = if line == 0 { first_line_text_x } else { left };
+        // Column offset in display units.
+        let disp_col = ((x - text_x) / cw).max(0.0) as usize;
+        // Walk the line's chars, accumulating display widths, to find the
+        // char index whose cumulative width first exceeds disp_col.
+        let line_str = &lines[line];
+        let mut col_cursor = 0usize;
+        for (ci, c) in line_str.chars().enumerate() {
+            let w = UnicodeWidthChar::width(c).unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if disp_col < col_cursor + w {
+                // For double-width chars, clicking the right half advances
+                // past the char (so drag-select lands after it).
+                let char_idx = if disp_col > col_cursor { ci + 1 } else { ci };
+                return Some((line, char_idx));
+            }
+            col_cursor += w;
+        }
+        // Past the last char: clamp to end of line.
+        Some((line, line_str.chars().count()))
+    }
+
     /// True when the block view is the active renderer (Editor mode, not in
     /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
     /// consistent.
@@ -2991,6 +3081,53 @@ impl App {
             return Some(FindButtonAction::ToggleRegex);
         }
         None
+    }
+
+    /// v0.9: map a physical-pixel click to a palette results-list row
+    /// index. Returns `Some(idx)` when the click lands inside a visible
+    /// results row, `None` otherwise (outside the popup, on the query/banner
+    /// row, in workflow form mode, or below the last visible row). Border-drag
+    /// clicks are handled earlier by `check_popup_border_drag`, so they never
+    /// reach here.
+    ///
+    /// Geometry is recomputed via `layout_palette_search` to match
+    /// `build_palette_vertices` exactly — `palette_popup_rect` alone isn't
+    /// enough because we need `results_y` and the visible `start..end` window.
+    fn palette_row_at(&self, x: f64, y: f64) -> Option<usize> {
+        // Form mode (workflow variable fill) has no results list to click.
+        if self.palette_form.is_some() {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        // Popup must have been rendered last frame.
+        renderer.palette_popup_rect?;
+        let ctx = renderer.layout_ctx?;
+        let cw = ctx.cell_w;
+        let ch = ctx.cell_h;
+        if cw <= 0.0 || ch <= 0.0 {
+            return None;
+        }
+        let layout = crate::layout::layout_palette_search(
+            &ctx,
+            self.palette_results.len(),
+            self.palette_selection,
+            self.popup_max_rows,
+            self.popup_width_scale,
+        );
+        let [px0, _py0, px1, _py1] = layout.popup_rect;
+        let xf = x as f32;
+        let yf = y as f32;
+        // Click must be inside the popup horizontally and below the separator
+        // (i.e. on the results list, not the query/banner row above it).
+        if xf < px0 || xf >= px1 || yf < layout.results_y {
+            return None;
+        }
+        let row = ((yf - layout.results_y) / ch) as usize;
+        let idx = layout.start + row;
+        if idx >= layout.end {
+            return None;
+        }
+        Some(idx)
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
@@ -3087,7 +3224,10 @@ impl App {
                             let now = std::time::Instant::now();
                             let is_double = self
                                 .panel_last_click
-                                .map(|(t, row)| t.elapsed() < std::time::Duration::from_millis(400) && row == clicked)
+                                .map(|(t, row)| {
+                                    t.elapsed() < std::time::Duration::from_millis(400)
+                                        && row == clicked
+                                })
                                 .unwrap_or(false);
                             self.panel_last_click = Some((now, clicked));
                             self.panel_selection = clicked;
@@ -3117,29 +3257,24 @@ impl App {
             }
         }
 
-        // v0.9 W3: block collapse/expand — click anywhere on a Command row to
-        // toggle fold. The entire command line is a fold toggle (Warp-style);
-        // Output rows are NOT fold toggles so text selection still works there.
-        // Only foldable blocks (those with output) are affected; toggling a
-        // non-foldable block is harmless (no output to hide).
+        // v0.9 W3 (revised): block collapse/expand — only clicking the chevron
+        // (▸/▾ in the first cell of a Command row) toggles fold. Clicking the
+        // rest of the command line starts a normal text selection instead, so
+        // the user can select/copy command text. This reverts the earlier
+        // "click anywhere on the command line folds" behavior.
         if button == winit::event::MouseButton::Left && self.block_view_active() {
             if let Some(renderer) = &self.renderer {
-                // v0.9 W5: account for the left sidebar offset so the hit-test
-                // tracks the shifted block-view content.
                 let chrome_left = if self.panel_open {
                     renderer.sidebar_width()
                 } else {
                     0.0
                 };
                 let content_left = renderer.padding_x() + chrome_left;
-                let content_right = renderer.viewport().0 - renderer.padding_x();
+                let cw = renderer.cell_width() as f32;
                 let xf = x as f32;
                 let yf = y as f32;
-                // v0.9 fix: the entire Command row (full content width) is a
-                // fold toggle, not just the first cell (chevron). This matches
-                // the user's request: "click the command line to fold, click
-                // other rows (output) does not fold."
-                if xf >= content_left && xf < content_right {
+                // Chevron occupies the first cell [content_left, content_left + cw).
+                if xf >= content_left && xf < content_left + cw {
                     for row in &renderer.block_view_rows {
                         if row.kind == weft_core::selection::BlockViewRowKind::Command
                             && yf >= row.y_top
@@ -3205,6 +3340,32 @@ impl App {
             }
         }
 
+        // v0.9: Command Palette mouse interaction — click inside the popup
+        // (but not on the border drag zone) selects the entry; double-click
+        // runs it immediately. Mirrors the history panel's click/double-click
+        // pattern so the user doesn't have to press Enter.
+        if button == winit::event::MouseButton::Left && self.palette_open {
+            if let Some(clicked_idx) = self.palette_row_at(x, y) {
+                let now = std::time::Instant::now();
+                let is_double = self
+                    .palette_last_click
+                    .map(|(t, row)| {
+                        t.elapsed() < std::time::Duration::from_millis(400) && row == clicked_idx
+                    })
+                    .unwrap_or(false);
+                self.palette_last_click = Some((now, clicked_idx));
+                if is_double {
+                    if let Some(entry) = self.palette_results.get(clicked_idx).cloned() {
+                        self.activate_palette_entry(entry);
+                    }
+                } else {
+                    self.palette_selection = clicked_idx;
+                    self.request_redraw();
+                }
+                return;
+            }
+        }
+
         // If context menu is open, handle click as menu selection.
         // (v0.9 fix: removed the "click any block to fold" handler that
         // prevented text selection on block output. Folding is now solely
@@ -3214,6 +3375,41 @@ impl App {
                 self.execute_context_menu(&menu, x as f32, y as f32);
                 return;
             }
+        }
+
+        // v0.9: click inside the prompt input box → position the editor
+        // cursor at the clicked char and start a mouse-drag selection (so
+        // the user can select/copy part of the command). Clicks outside the
+        // prompt box clear any active editor selection.
+        if button == winit::event::MouseButton::Left {
+            let in_prompt = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.prompt_box_rect.get())
+                .map(|[x0, y0, x1, y1]| {
+                    let xf = x as f32;
+                    let yf = y as f32;
+                    xf >= x0 && xf <= x1 && yf >= y0 && yf <= y1
+                })
+                .unwrap_or(false);
+            if in_prompt {
+                if let Some(pos) = self.pixel_to_editor_pos(x, y) {
+                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                        t.editor_mut().buffer.start_selection(pos);
+                    }
+                    self.prompt_dragging = true;
+                    // Clear any block/grid selection so Cmd+C targets the editor.
+                    self.tabs[self.active_tab].selection_handler.clear();
+                    self.request_redraw();
+                }
+                return;
+            } else if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                if t.editor().buffer.has_selection() {
+                    t.editor_mut().buffer.clear_selection();
+                    self.request_redraw();
+                }
+            }
+            self.prompt_dragging = false;
         }
 
         let selecting = !self.mouse_reporting_active();
@@ -3347,6 +3543,22 @@ impl App {
             return;
         }
 
+        // v0.9: end editor drag-selection (the selection itself stays so
+        // Cmd+C can copy it).
+        if button == winit::event::MouseButton::Left && self.prompt_dragging {
+            self.prompt_dragging = false;
+            // A click without drag (anchor == cursor) leaves an empty
+            // selection — clear it so the caret shows normally.
+            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                if !t.editor().buffer.has_selection() {
+                    // has_selection returns false when anchor==cursor, so
+                    // explicitly clear the anchor to drop the empty selection.
+                    t.editor_mut().buffer.clear_selection();
+                }
+            }
+            self.request_redraw();
+        }
+
         let pos = self.pixel_to_grid(_x, _y);
         self.tabs[self.active_tab].selection_handler.end();
 
@@ -3365,6 +3577,16 @@ impl App {
         if let Some(drag) = self.drag_state.clone() {
             self.update_popup_drag(x, y, &drag);
             return;
+        }
+
+        // v0.9: extend editor drag-selection inside the prompt box.
+        if self.prompt_dragging {
+            if let Some(pos) = self.pixel_to_editor_pos(x, y) {
+                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+                    t.editor_mut().buffer.extend_selection(pos);
+                    self.request_redraw();
+                }
+            }
         }
 
         if self.tabs[self.active_tab].selection_handler.selecting {
@@ -3765,6 +3987,14 @@ impl App {
         let Some(terminal) = &self.tabs[self.active_tab].terminal else {
             return;
         };
+        // v0.9: editor drag-selection (or select-all after double-click→send-
+        // to-prompt) takes priority — Cmd+C copies the selected editor text.
+        if let Some(text) = terminal.editor().buffer.selected_text() {
+            if !text.is_empty() {
+                clipboard_copy(&text);
+                return;
+            }
+        }
         let text = if terminal.show_block_view() {
             self.tabs[self.active_tab]
                 .selection_handler
@@ -4010,6 +4240,29 @@ impl ApplicationHandler<AppEvent> for App {
         }
 
         let win = &self.config.window;
+        // v0.9 U-D1: resolve the startup theme honoring `follow_system` so
+        // the window opens with the correct color from frame 0 (no dark→light
+        // flash). `Config::theme()` ignores follow_system; this mirrors the
+        // logic in `apply_config` / `poll_system_appearance`.
+        let startup_theme = if self.config.theme.follow_system {
+            let dark = unsafe { system_appearance_is_dark() };
+            let name = if dark {
+                self.config
+                    .theme
+                    .dark_name
+                    .clone()
+                    .unwrap_or_else(|| "weft-warm".to_string())
+            } else {
+                self.config
+                    .theme
+                    .light_name
+                    .clone()
+                    .unwrap_or_else(|| "weft-light".to_string())
+            };
+            weft_core::config::Theme::resolve_named(&name, &self.config.theme)
+        } else {
+            self.config.theme()
+        };
         let attrs = WindowAttributes::default()
             .with_title(&win.title)
             .with_inner_size(winit::dpi::LogicalSize::new(
@@ -4025,7 +4278,7 @@ impl ApplicationHandler<AppEvent> for App {
         let renderer = MetalRenderer::new(
             &window,
             self.config.font.clone(),
-            self.config.theme(),
+            startup_theme,
             (win.padding_x, win.padding_y),
             win.opacity,
         );
@@ -4047,6 +4300,16 @@ impl ApplicationHandler<AppEvent> for App {
         self.spawn_pty(init_rows, init_cols);
         self.window = Some(window);
         self.renderer = Some(renderer);
+
+        // v0.9 U-D1: seed the appearance tracker so the first
+        // `poll_system_appearance` (1s after launch) doesn't re-apply the
+        // same theme and cause a flicker. The startup theme above already
+        // queried the system appearance, so we record it as "known".
+        if self.config.theme.follow_system {
+            let dark = unsafe { system_appearance_is_dark() };
+            self.last_system_appearance_dark = Some(dark);
+            self.theme_is_dark = dark;
+        }
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
@@ -4320,6 +4583,7 @@ impl ApplicationHandler<AppEvent> for App {
                         &palette_entries,
                         &palette_banner,
                         &palette_submode_input,
+                        terminal.editor().buffer.selection_range(),
                     );
                     // v0.8 U6: compute block-content metrics for the dynamic
                     // scrollbar thumb (total/visible/max_scroll). None in grid
@@ -4503,7 +4767,11 @@ impl ApplicationHandler<AppEvent> for App {
                                         for c in text.chars() {
                                             t.editor_mut().buffer.insert_char(c);
                                         }
+                                        // v0.9: IME input clears the editor
+                                        // selection (typing replaces it).
+                                        t.editor_mut().buffer.clear_selection();
                                     }
+                                    self.prompt_dragging = false;
                                     self.request_redraw();
                                 } else {
                                     // Passthrough: send committed text to the PTY.

@@ -10,6 +10,11 @@
 pub struct EditorBuffer {
     pub lines: Vec<String>,
     pub cursor: (usize, usize),
+    /// v0.9: anchor for mouse-drag selection (click-drag in the prompt box).
+    /// `None` = no active selection. The selection spans between `cursor`
+    /// and `selection_anchor` (order-independent). Cleared by any cursor
+    /// movement key or text edit, and by `clear_selection`.
+    pub selection_anchor: Option<(usize, usize)>,
 }
 
 impl EditorBuffer {
@@ -17,6 +22,7 @@ impl EditorBuffer {
         Self {
             lines: vec![String::new()],
             cursor: (0, 0),
+            selection_anchor: None,
         }
     }
 
@@ -96,6 +102,7 @@ impl EditorBuffer {
         let last_idx = self.lines.len().saturating_sub(1);
         let last_len = self.lines.last().map(|s| s.chars().count()).unwrap_or(0);
         self.cursor = (last_idx, last_len);
+        self.selection_anchor = None;
     }
 
     pub fn delete_forward(&mut self) {
@@ -163,6 +170,87 @@ impl EditorBuffer {
         let tail: String = self.lines[line].drain(byte..).collect();
         self.lines.insert(line + 1, tail);
         self.cursor = (line + 1, 0);
+        self.selection_anchor = None;
+    }
+
+    // ── v0.9: mouse selection ──────────────────────────────────────────
+
+    /// Begin a mouse selection at `pos` (line, col). Sets the anchor and
+    /// moves the cursor to `pos` so a drag extends from anchor→cursor.
+    pub fn start_selection(&mut self, pos: (usize, usize)) {
+        self.selection_anchor = Some(pos);
+        self.cursor = pos;
+    }
+
+    /// Extend the active selection by moving the cursor to `pos`. The anchor
+    /// stays put. No-op when there's no active selection.
+    pub fn extend_selection(&mut self, pos: (usize, usize)) {
+        if self.selection_anchor.is_some() {
+            self.cursor = pos;
+        }
+    }
+
+    /// Select the entire buffer (used by select-all / Cmd+A).
+    pub fn select_all(&mut self) {
+        let last_idx = self.lines.len().saturating_sub(1);
+        let last_len = self.lines.last().map(|s| s.chars().count()).unwrap_or(0);
+        self.selection_anchor = Some((0, 0));
+        self.cursor = (last_idx, last_len);
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_anchor.is_some()
+    }
+
+    /// The (start, end) range of the active selection, in document order
+    /// (start <= end). Returns None when there's no selection or the
+    /// selection is empty (anchor == cursor).
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection_anchor?;
+        let (a, b) = if Self::pos_le(anchor, self.cursor) {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        };
+        if a == b {
+            return None;
+        }
+        Some((a, b))
+    }
+
+    /// Lexicographic comparison: true when `p` is at or before `q`.
+    fn pos_le(p: (usize, usize), q: (usize, usize)) -> bool {
+        p.0 < q.0 || (p.0 == q.0 && p.1 <= q.1)
+    }
+
+    /// Selected text, lines joined by `\n`. None when there's no selection.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sl, sc), (el, ec)) = self.selection_range()?;
+        if sl == el {
+            return Some(
+                self.lines[sl]
+                    .chars()
+                    .skip(sc)
+                    .take(ec.saturating_sub(sc))
+                    .collect(),
+            );
+        }
+        let mut out = String::new();
+        // First line: from sc to end.
+        out.extend(self.lines[sl].chars().skip(sc));
+        out.push('\n');
+        // Middle lines: whole.
+        for line in &self.lines[sl + 1..el] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        // Last line: 0..ec.
+        out.extend(self.lines[el].chars().take(ec));
+        Some(out)
     }
 }
 

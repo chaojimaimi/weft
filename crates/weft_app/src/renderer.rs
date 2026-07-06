@@ -7,6 +7,7 @@ use metal::{
     RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
 };
 use objc2::msg_send;
+use std::cell::Cell;
 use tracing::info;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -141,6 +142,12 @@ pub struct MetalRenderer {
     /// builders (palette, panel) can draw a blinking caret without it being
     /// threaded through every helper signature.
     cursor_blink_on: bool,
+    /// v0.9: last-rendered prompt input box rect `[x0, y0, x1, y1]` in
+    /// physical pixels. Used by the app to detect clicks on the prompt box
+    /// (for select-all-then-copy). None when no prompt was drawn this frame.
+    /// Uses `Cell` for interior mutability — `draw` holds an immutable borrow
+    /// of `self.layer` (from `next_drawable`) so `&mut self` is unavailable.
+    pub prompt_box_rect: Cell<Option<[f32; 4]>>,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -421,6 +428,7 @@ fragment float4 text_fragment(
             tab_hits: Vec::new(),
             panel_highlight: None,
             cursor_blink_on: true,
+            prompt_box_rect: Cell::new(None),
         }
     }
 
@@ -901,6 +909,8 @@ fragment float4 text_fragment(
                 cursor_blink_phase,
                 cursor_blink_on,
             ));
+        } else {
+            self.prompt_box_rect.set(None);
         }
 
         // Completion popup (split out from prompt — overlay refactor commit 2).
@@ -1834,6 +1844,7 @@ fragment float4 text_fragment(
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
+            self.prompt_box_rect.set(None);
             return verts;
         }
 
@@ -1858,6 +1869,11 @@ fragment float4 text_fragment(
         // responsibility for vertex building, theming, and text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
         let layout = crate::layout::layout_prompt(&ctx, p.lines.len(), cl, cursor_offset_cols);
+        // v0.9: cache the prompt box rect so the app can detect clicks on it
+        // (for select-all-then-copy after double-click sends a command here).
+        // Uses Cell for interior mutability — `draw` holds an immutable borrow
+        // of `self.layer` (from next_drawable) so `&mut self` is unavailable.
+        self.prompt_box_rect.set(Some(layout.box_rect));
         let text_y0 = layout.text_y0;
         let left = layout.left;
         let box_cols = layout.box_cols;
@@ -1909,6 +1925,54 @@ fragment float4 text_fragment(
         );
 
         // Editor buffer lines (line 0 starts after the prompt).
+        // v0.9: draw a selection highlight for the active mouse-drag range.
+        // The selection spans `((sl,sc),(el,ec))` in document order; we render
+        // per-line quads so partial selections (and multi-line ones) show up.
+        let sel_bg = color_to_normalized(self.theme.selection);
+        if let Some(((sl, sc), (el, ec))) = p.selection {
+            for i in sl..=el {
+                let Some(line) = p.lines.get(i) else {
+                    continue;
+                };
+                let y = text_y0 + i as f32 * ch;
+                let (line_start_x, max_chars) = if i == 0 {
+                    let avail = box_cols.saturating_sub(prompt_chars).max(1);
+                    (first_line_text_x, avail)
+                } else {
+                    (left, box_cols)
+                };
+                // Char column range within this line.
+                let col_start = if i == sl { sc } else { 0 };
+                let col_end = if i == el { ec } else { line.chars().count() };
+                if col_start >= col_end {
+                    continue;
+                }
+                // Convert char columns → display columns (CJK = 2 cells).
+                let chars: Vec<char> = line.chars().collect();
+                let disp_start: usize = chars
+                    .iter()
+                    .take(col_start)
+                    .map(|c| Self::char_col_width(*c))
+                    .sum();
+                let disp_len: usize = chars
+                    .iter()
+                    .skip(col_start)
+                    .take(col_end - col_start)
+                    .map(|c| Self::char_col_width(*c))
+                    .sum();
+                let disp_len = disp_len.min(max_chars.saturating_sub(disp_start));
+                if disp_len > 0 {
+                    let x0 = line_start_x + disp_start as f32 * cw;
+                    push_quad(
+                        &mut verts,
+                        [x0, y, x0 + disp_len as f32 * cw, y + ch],
+                        bg_uv,
+                        [0.0; 4],
+                        sel_bg,
+                    );
+                }
+            }
+        }
         for (i, line) in p.lines.iter().enumerate() {
             let y = text_y0 + i as f32 * ch;
             let (start_x, max_chars) = if i == 0 {
@@ -3122,10 +3186,13 @@ fragment float4 text_fragment(
                     let cleaned_cmd = strip_prompt_prefix(command);
                     self.push_line_tokenized(&mut verts, cmd_x, y, &cleaned_cmd, avail);
                     if *foldable {
+                        // v0.9 (revised): the fold hit region covers only the
+                        // chevron cell, not the whole command line — so the
+                        // rest of the line can be click-drag-selected for copy.
                         hit_regions.push(crate::overlay::HitRegion {
-                            x0: 0.0,
+                            x0: left,
                             y0: y,
-                            x1: self.viewport.0,
+                            x1: left + cw,
                             y1: y + pitch,
                             target: crate::overlay::HitTarget::BlockFold(*block_id),
                         });
@@ -4060,6 +4127,9 @@ pub struct PromptDrawParams<'a> {
     /// `(query, selected_match)` when Ctrl+R search is active (replaces the
     /// normal prompt rendering).
     pub search: Option<(&'a str, Option<&'a str>)>,
+    /// v0.9: active mouse-drag selection range `((start_line, start_col),
+    /// (end_line, end_col))` in document order, or None when no selection.
+    pub selection: Option<((usize, usize), (usize, usize))>,
 }
 
 /// Whether a block matches the panel search query (empty query = match all).
@@ -4069,12 +4139,45 @@ pub struct PromptDrawParams<'a> {
 /// caused false positives (e.g. searching "ls" matched `git pull` whose output
 /// contained "ls"; searching "wha" matched `claude`/`git status` whose output
 /// contained "wha"). Warp's history search only filters by command line.
+///
+/// v0.9 fix: match against the prompt-stripped command, not the raw grid
+/// snapshot. `block.command` may include the full prompt line (e.g.
+/// `user@host weft git:(main) % ls`) when the command was captured via
+/// `snapshot_command_line` rather than the editor. Searching "git" would
+/// match every command run inside a git repo. Stripping the prompt first
+/// ensures only the actual command text is searched.
+///
+/// v0.9 fix (round 5): match only the command name (first token), via
+/// case-insensitive **substring** (fuzzy) match.
+///
+/// Earlier iterations tried prefix/separator matching across all tokens, but
+/// that conflated the command with its arguments. The cleanest semantic — and
+/// the one matching Warp's history search — is: the query is a substring of
+/// the command *name* (the first whitespace-separated token after stripping
+/// the prompt).
+///
+/// Examples (query → command):
+///   - "git"  → "git status"      ✅ (command name "git" contains "git")
+///   - "git"  → "gitconfig"        ✅ (command name "gitconfig" contains "git")
+///   - "git"  → "cd GitHub/"       ❌ (command name "cd" doesn't contain "git")
+///   - "ls"   → "ls -al /test"     ✅ (command name "ls" contains "ls")
+///   - "l"    → "ls -al /test"     ✅ (command name "ls" contains "l")
+///   - "al"   → "ls -al /test"     ❌ ("al" is in the argument, not "ls")
+///
+/// Arguments are intentionally excluded: otherwise "git" would match
+/// `cd GitHub/` (lowercased "github/" contains "git") — exactly the false
+/// positive we're trying to avoid.
 pub fn block_matches_query(block: &Block, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
     let q = query.to_lowercase();
-    block.command.to_lowercase().contains(&q)
+    let cleaned = strip_prompt_prefix(&block.command);
+    // Only the command name (first token) participates in matching.
+    match cleaned.split_whitespace().next() {
+        Some(cmd_name) => cmd_name.to_lowercase().contains(&q),
+        None => false,
+    }
 }
 
 /// Newest-first, query-filtered block list capped to `max` entries. Shared by
@@ -4352,5 +4455,106 @@ mod tests {
         // even if they contain % or $ characters.
         assert_eq!(strip_prompt_prefix("echo 50% done"), "echo 50% done");
         assert_eq!(strip_prompt_prefix("# comment line"), "# comment line");
+    }
+
+    // ── block_matches_query (v0.9 round 5: command-name substring match) ──
+    fn mk_block(cmd: &str) -> Block {
+        Block {
+            id: BlockId(1),
+            command: cmd.to_string(),
+            cwd: None,
+            output: String::new(),
+            exit_code: None,
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn panel_search_git_matches_git_commands() {
+        // "git" matches the command name "git" (exact or as substring).
+        assert!(block_matches_query(&mk_block("git status"), "git"));
+        assert!(block_matches_query(
+            &mk_block("git push origin main"),
+            "git"
+        ));
+        assert!(block_matches_query(&mk_block("git"), "git"));
+        // Case-insensitive.
+        assert!(block_matches_query(&mk_block("GIT STATUS"), "git"));
+        assert!(block_matches_query(&mk_block("Git Status"), "git"));
+    }
+
+    #[test]
+    fn panel_search_git_matches_fuzzy_substring() {
+        // v0.9 round 5: fuzzy substring match on the command name.
+        // "git" matches "gitconfig" because the command name contains "git".
+        assert!(block_matches_query(&mk_block("gitconfig"), "git"));
+        assert!(block_matches_query(
+            &mk_block("gitconfig --global user.name"),
+            "git"
+        ));
+        // Partial substring: "gi" matches "git status".
+        assert!(block_matches_query(&mk_block("git status"), "gi"));
+        // "it" matches "git status" (substring of command name "git").
+        assert!(block_matches_query(&mk_block("git status"), "it"));
+    }
+
+    #[test]
+    fn panel_search_git_rejects_argument_only_match() {
+        // v0.9 round 5: arguments don't participate in matching.
+        // "git" must NOT match "cd GitHub/" — command name is "cd", which
+        // doesn't contain "git"; even though the argument "GitHub/" contains
+        // "git" after lowercasing, arguments are excluded from matching.
+        assert!(!block_matches_query(&mk_block("cd GitHub/"), "git"));
+        assert!(!block_matches_query(&mk_block("cd github/"), "git"));
+        // "git" is not in the command name "cd".
+        assert!(!block_matches_query(&mk_block("cd github"), "git"));
+    }
+
+    #[test]
+    fn panel_search_ls_rejects_argument_substring() {
+        // v0.9 round 5: "al" is in the argument "-al", not in the command
+        // name "ls" — must NOT match.
+        assert!(!block_matches_query(&mk_block("ls -al /test"), "al"));
+        // But "ls" matches the command name, and "l" matches as a substring.
+        assert!(block_matches_query(&mk_block("ls -al /test"), "ls"));
+        assert!(block_matches_query(&mk_block("ls -al /test"), "l"));
+        assert!(block_matches_query(&mk_block("ls"), "ls"));
+    }
+
+    #[test]
+    fn panel_search_skills_rejects_when_command_is_cd() {
+        // Regression: "ls" must NOT match "cd andrej-karpathy-skills" —
+        // command name is "cd", arguments are excluded from matching.
+        assert!(!block_matches_query(
+            &mk_block("cd andrej-karpathy-skills"),
+            "ls"
+        ));
+    }
+
+    #[test]
+    fn panel_search_cd_matches_cd_command() {
+        // "cd" matches the command name "cd" even when the argument contains
+        // a coincidental substring.
+        assert!(block_matches_query(&mk_block("cd GitHub/"), "cd"));
+        assert!(block_matches_query(&mk_block("cd .."), "cd"));
+    }
+
+    #[test]
+    fn panel_search_empty_query_matches_all() {
+        assert!(block_matches_query(&mk_block("git status"), ""));
+        assert!(block_matches_query(&mk_block("ls -l"), ""));
+    }
+
+    #[test]
+    fn panel_search_strips_prompt_prefix() {
+        // The query runs against the prompt-stripped command, so a user@host
+        // prompt prefix doesn't leak into matching.
+        let b = mk_block("andylee@AndyHQ weft % git status");
+        assert!(block_matches_query(&b, "git"));
+        // "weft" is part of the prompt (cwd), not the command — must not match
+        // the stripped command "git status".
+        assert!(!block_matches_query(&b, "weft"));
     }
 }
