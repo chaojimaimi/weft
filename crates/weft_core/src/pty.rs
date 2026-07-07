@@ -266,9 +266,8 @@ impl Pty {
         // Get the foreground process group of the PTY.
         let mut pgrp: nix::libc::pid_t = 0;
         // SAFETY: TIOCGPGRP writes a pid_t into the provided pointer.
-        let ret = unsafe {
-            nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCGPGRP, &mut pgrp)
-        };
+        let ret =
+            unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCGPGRP, &mut pgrp) };
         if ret < 0 || pgrp <= 0 {
             tracing::warn!("TIOCGPGRP failed — cannot send SIGINT");
             return false;
@@ -281,6 +280,23 @@ impl Pty {
         }
         tracing::info!(pgrp, "sent SIGINT to foreground process group");
         true
+    }
+
+    /// v1.0 fix: Flush the PTY's kernel-side read buffer and drain queued
+    /// output events from the internal channel.
+    ///
+    /// Called after Ctrl+C to discard stale output from the interrupted
+    /// command. Without this, weft would continue processing the remaining
+    /// ~7MB of seq output in the buffer for many frames, making the UI
+    /// appear frozen even though the command was already interrupted.
+    pub fn flush_input(&mut self) {
+        // Flush kernel PTY read buffer (slave→master direction).
+        // SAFETY: tcflush is a safe ioctl that discards pending data.
+        unsafe {
+            nix::libc::tcflush(self.master.as_raw_fd(), nix::libc::TCIFLUSH);
+        }
+        // Drain queued output events from the internal channel.
+        while self.event_rx.try_recv().is_ok() {}
     }
 
     /// Receive the next PTY event (output or exit).

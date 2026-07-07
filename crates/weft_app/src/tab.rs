@@ -124,6 +124,31 @@ impl Tab {
         }
     }
 
+    /// v1.0 fix: Flush all stale PTY output after Ctrl+C.
+    ///
+    /// Discards pending output in both the kernel PTY buffer and the
+    /// internal message channel. Called after `send_interrupt()` so the UI
+    /// can respond immediately instead of spending many frames processing
+    /// the interrupted command's remaining output (e.g. ~7MB from
+    /// `seq 1 10000000`).
+    ///
+    /// `PtyExit` events are preserved — they signal shell exit and must not
+    /// be lost.
+    pub fn flush_pty_output(&mut self) {
+        // Flush kernel PTY read buffer + drain Pty's internal event channel.
+        if let Some(pty) = &mut self.pty {
+            pty.flush_input();
+        }
+        // Drain queued AppMsg::PtyOutput messages from msg_rx.
+        // PtyExit is re-queued — must not be lost.
+        while let Ok(msg) = self.msg_rx.try_recv() {
+            if let AppMsg::PtyExit(code) = msg {
+                let _ = self.msg_tx.send(AppMsg::PtyExit(code));
+            }
+            // PtyOutput → discard (stale output from interrupted command)
+        }
+    }
+
     /// Process queued messages into the terminal. Returns
     /// `(alive, drained_blocks, need_redraw)`.
     /// `alive=false` when the shell exited. `drained_blocks` are finished

@@ -755,7 +755,8 @@ impl App {
             "key → pty"
         );
         if !bytes.is_empty() {
-            if let Some(pty) = &self.tab().pty {
+            let is_ctrl_c = bytes.len() == 1 && bytes[0] == 0x03;
+            if is_ctrl_c {
                 // v1.0 fix: Ctrl+C (0x03) special path. When the PTY write
                 // buffer is full (e.g. a command like `seq 1 1000000` is
                 // producing output faster than weft can drain), write_sync
@@ -763,22 +764,21 @@ impl App {
                 // bypass the PTY and send SIGINT directly to the foreground
                 // process group via TIOCGPGRP + killpg(SIGINT). This is a
                 // kernel-level signal that doesn't depend on PTY buffer state.
-                let is_ctrl_c = bytes.len() == 1 && bytes[0] == 0x03;
-                if is_ctrl_c {
-                    // v1.0 fix: Try PTY write first (needed for apps like
-                    // vim/less that intercept 0x03). Then ALSO send SIGINT to
-                    // the foreground process group as a fallback — if the PTY
-                    // write was dropped (EAGAIN due to full buffer), SIGINT is
-                    // the actual delivery mechanism. If the PTY write
-                    // succeeded, SIGINT to the foreground process group is
-                    // harmless (it's the standard Ctrl+C behavior; the shell
-                    // ignores SIGINT while a foreground command runs).
+                if let Some(pty) = &self.tab().pty {
                     let _ = pty.write_sync(&bytes);
                     pty.send_interrupt();
-                } else {
-                    if let Err(e) = pty.write_sync(&bytes) {
-                        warn!("Failed to write to PTY: {e}");
-                    }
+                }
+                // v1.0 fix: Flush stale PTY output so the UI responds
+                // immediately. Without this, weft would spend many frames
+                // processing the interrupted command's remaining output
+                // (e.g. ~7MB from `seq 1 10000000`), making the UI appear
+                // frozen even though the command was already interrupted.
+                // PtyExit events are preserved (see flush_pty_output).
+                self.tab_mut().flush_pty_output();
+                self.request_redraw();
+            } else if let Some(pty) = &self.tab().pty {
+                if let Err(e) = pty.write_sync(&bytes) {
+                    warn!("Failed to write to PTY: {e}");
                 }
             }
         }
