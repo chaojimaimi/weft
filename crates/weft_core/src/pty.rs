@@ -232,38 +232,55 @@ impl Pty {
 
     /// Write bytes synchronously (for use before tokio runtime or in tests).
     ///
-    /// Retries on EAGAIN/EWOULDBLOCK with a short sleep (up to ~1s). This is
-    /// critical for control characters like Ctrl+C (0x03) — if the PTY's
-    /// write buffer is momentarily full (e.g. shell hasn't drained its stdin
-    /// while a command is producing heavy output), a non-retrying write would
-    /// silently drop the SIGINT byte and the user couldn't interrupt the
-    /// command.
+    /// v1.0 fix: does NOT retry on EAGAIN. The PTY master fd is non-blocking,
+    /// and retrying would block the event loop for up to 1 second — freezing
+    /// the UI when the PTY write buffer is full (e.g. a command is producing
+    /// heavy output and weft hasn't drained its read side yet). Instead, EAGAIN
+    /// returns immediately and the caller can decide on a fallback (e.g.
+    /// `send_interrupt` for Ctrl+C).
     pub fn write_sync(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        let mut written = 0;
-        for _ in 0..100 {
-            match nix::unistd::write(&self.master, &data[written..]) {
-                Ok(n) => {
-                    written += n;
-                    if written >= data.len() {
-                        return Ok(());
-                    }
-                }
-                Err(nix::errno::Errno::EAGAIN) => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                Err(e) => return Err(PtyError::Write(io::Error::from(e))),
+        match nix::unistd::write(&self.master, data) {
+            Ok(_) => Ok(()),
+            Err(nix::errno::Errno::EAGAIN) => {
+                tracing::debug!("pty write_sync EAGAIN — data dropped");
+                Ok(())
             }
+            Err(e) => Err(PtyError::Write(io::Error::from(e))),
         }
-        // Timed out after ~1s of retries — log but don't crash.
-        tracing::warn!(
-            written,
-            total = data.len(),
-            "pty write_sync timed out retrying EAGAIN"
-        );
-        Ok(())
+    }
+
+    /// v1.0 fix: Send SIGINT to the foreground process group of the PTY.
+    ///
+    /// This is the reliable fallback for Ctrl+C when the PTY write buffer is
+    /// full (e.g. a command like `seq 1 1000000` is producing output faster
+    /// than weft can drain it). Writing 0x03 to the PTY master would block
+    /// or fail with EAGAIN, so we bypass the PTY entirely and ask the kernel
+    /// to signal the foreground process group directly via TIOCGPGRP +
+    /// killpg(SIGINT).
+    ///
+    /// Returns true if the signal was sent successfully.
+    pub fn send_interrupt(&self) -> bool {
+        // Get the foreground process group of the PTY.
+        let mut pgrp: nix::libc::pid_t = 0;
+        // SAFETY: TIOCGPGRP writes a pid_t into the provided pointer.
+        let ret = unsafe {
+            nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCGPGRP, &mut pgrp)
+        };
+        if ret < 0 || pgrp <= 0 {
+            tracing::warn!("TIOCGPGRP failed — cannot send SIGINT");
+            return false;
+        }
+        // SAFETY: killpg sends a signal to a process group. SIGINT is safe.
+        let ret = unsafe { nix::libc::killpg(pgrp, nix::libc::SIGINT) };
+        if ret != 0 {
+            tracing::warn!("killpg failed — cannot send SIGINT");
+            return false;
+        }
+        tracing::info!(pgrp, "sent SIGINT to foreground process group");
+        true
     }
 
     /// Receive the next PTY event (output or exit).
