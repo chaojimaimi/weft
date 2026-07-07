@@ -242,9 +242,14 @@ pub struct MetalRenderer {
     pub find_buttons: Option<FindButtons>,
     /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
     /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
-    /// each draw when `tab_bar.tab_count > 1`; cleared otherwise. The app
+    /// each draw when `tab_bar.tab_counts > 1`; cleared otherwise. The app
     /// reads this from `handle_mouse_press` to route tab clicks.
     pub tab_hits: Vec<TabHit>,
+    /// v1.0 S1-b: Last-rendered Settings panel hit-test rects (tabs, theme
+    /// rows, footer buttons). Populated by `build_settings_vertices` each
+    /// draw when the panel is open; cleared otherwise. The app reads this
+    /// from `handle_mouse_press` to route settings clicks.
+    pub settings_hits: Vec<SettingsHit>,
     /// v0.9 W2: block currently highlighted in the terminal view (set from
     /// the history panel click). The renderer draws an accent border around
     /// this block in block view. Cleared by the app after 1.5s.
@@ -381,6 +386,36 @@ pub struct TabHit {
     pub close_rect: [f32; 4],
     /// Tab index (0-based) this hit corresponds to.
     pub index: usize,
+}
+
+/// v1.0 S1-b: Hit-test rect for a clickable region inside the Settings panel.
+/// Repopulated each frame by `build_settings_vertices` (matching the layout
+/// it just rendered) and consumed by the app's `handle_mouse_press` to
+/// dispatch clicks on tabs, theme rows, and footer buttons.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingsHit {
+    /// What this region refers to — drives the click action.
+    pub kind: SettingsHitKind,
+    /// Clickable rect in physical pixels: `[x0, y0, x1, y1]`.
+    pub rect: [f32; 4],
+}
+
+/// v1.0 S1-b: Identifies what a [`SettingsHit`] region targets. `Tab`/`Theme`
+/// carry the index so the click handler can update the cursor / pick a value
+/// without recomputing layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsHitKind {
+    /// A tab-bar entry (Appearance / Font / Keybindings / Window).
+    Tab(crate::overlay::SettingsTab),
+    /// A theme row in the Appearance tab (0-based index).
+    Theme(usize),
+    /// Footer "esc close" pair — click closes the panel without saving.
+    CloseButton,
+    /// Footer "⌘⏎ save" pair — click persists the draft and closes the panel.
+    SaveButton,
+    /// Footer "⏎ apply" pair — click persists the draft but keeps the panel
+    /// open so the user can keep editing.
+    ApplyButton,
 }
 
 /// Hit-test rectangles for the find popup's clickable buttons (physical
@@ -717,6 +752,7 @@ fragment float4 text_fragment(
             find_state: None,
             find_buttons: None,
             tab_hits: Vec::new(),
+            settings_hits: Vec::new(),
             panel_highlight: None,
             cursor_blink_on: true,
             prompt_box_rect: Cell::new(None),
@@ -1204,6 +1240,9 @@ fragment float4 text_fragment(
         self.settings_popup_rect = None;
         // Reset find button hit-test rects — set by build_find_vertices.
         self.find_buttons = None;
+        // v1.0 S1-b: clear stale settings hit-test rects — repopulated by
+        // build_settings_vertices only when the panel is open this frame.
+        self.settings_hits.clear();
         // v1.0 P1.5-B1: Grid cells render as instances (instanced pipeline);
         // overlays + block view render as legacy vertices. In grid view,
         // `instances` carries the cells and `vertices` carries only overlays;
@@ -1361,8 +1400,9 @@ fragment float4 text_fragment(
 
         // v1.0 S1: Settings panel (Cmd+,) — centered modal overlay.
         if let Some(s) = settings {
-            let (sv, rect) = self.build_settings_vertices(*s);
+            let (sv, rect, hits) = self.build_settings_vertices(*s);
             self.settings_popup_rect = rect;
+            self.settings_hits = hits;
             vertices.extend_from_slice(&sv);
         }
 
@@ -3244,16 +3284,17 @@ fragment float4 text_fragment(
     fn build_settings_vertices(
         &self,
         s: crate::overlay::SettingsDrawParams<'_>,
-    ) -> (Vec<f32>, Option<[f32; 4]>) {
+    ) -> (Vec<f32>, Option<[f32; 4]>, Vec<SettingsHit>) {
         use crate::overlay::SettingsTab;
 
         let mut verts = Vec::new();
+        let mut hits: Vec<SettingsHit> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (verts, None);
+            return (verts, None, hits);
         }
 
         let theme_bg = color_to_normalized(self.theme.background);
@@ -3364,6 +3405,13 @@ fragment float4 text_fragment(
                 );
             }
             self.push_text(&mut verts, tx0 + cw * 0.5, y, label, color, content_cols);
+            // v1.0 S1-b: register a hit region for the whole tab cell so
+            // clicks anywhere in the tab switch tabs (matching the
+            // underline's visual span).
+            hits.push(SettingsHit {
+                kind: SettingsHitKind::Tab(*tab),
+                rect: [tx0, y, tx0 + tab_w, y + ch],
+            });
         }
         y += ch * 1.5;
 
@@ -3377,12 +3425,42 @@ fragment float4 text_fragment(
         );
 
         // Content area: render the active tab.
-        let content_top = y + ch * 0.5;
         // v1.0 fix: move footer up from ch*0.8 to ch*1.5 so it sits between
         // the separator line and the bottom border with balanced spacing.
         let footer_y = box_y1 - ch * 1.5;
         let content_bottom = footer_y - ch * 0.5;
-        let content_h = content_bottom - content_top;
+        let content_base = y + ch * 0.5;
+
+        // v1.0 S2: error bar at the top of the content area when a save
+        // failed. Renders a red background strip with the error message,
+        // pushing the rest of the content down by one row so nothing
+        // overlaps. Cleared by save_settings_draft on the next successful
+        // save (or by closing the panel).
+        let content_top = if let Some(err) = s.error {
+            let err_bg = [0.65, 0.18, 0.18, 1.0];
+            push_quad(
+                &mut verts,
+                [content_x0, content_base, content_x1, content_base + ch],
+                bg_uv,
+                [0.0; 4],
+                err_bg,
+            );
+            // ⚠ prefix in white, then the message (truncated to fit).
+            let msg = format!("\u{26a0} {}", err);
+            self.push_text(
+                &mut verts,
+                content_x0 + cw * 0.3,
+                content_base,
+                &msg,
+                [1.0, 1.0, 1.0, 1.0],
+                content_cols,
+            );
+            content_base + ch
+        } else {
+            content_base
+        };
+        // Recompute max_rows after the error bar so content doesn't overflow.
+        let content_h = (content_bottom - content_top).max(0.0);
         let max_rows = (content_h / ch).max(1.0) as usize;
 
         match s.active_tab {
@@ -3415,6 +3493,12 @@ fragment float4 text_fragment(
                         label_color,
                         content_cols,
                     );
+                    // v1.0 S1-b: hit-test row so a click selects + applies
+                    // the theme (matching Enter's behavior on that row).
+                    hits.push(SettingsHit {
+                        kind: SettingsHitKind::Theme(i),
+                        rect: [content_x0, row_y, content_x1, row_y + ch],
+                    });
                 }
             }
             SettingsTab::Font => {
@@ -3501,25 +3585,41 @@ fragment float4 text_fragment(
         // footer is slightly more prominent than the body text — the
         // narrow Unicode symbols (⏎ ⇥ ⌘) otherwise make the footer feel
         // smaller than the body even though both use the same cell size.
-        let pairs: [(&str, &str); 5] = [
-            ("↑↓", "navigate"),
-            ("⏎", "apply"),
-            ("⇥", "switch"),
-            ("esc", "close"),
-            ("⌘⏎", "save"),
+        // v1.0 S1-b/S2: the apply / close / save pairs register clickable
+        // hit regions so mouse users can hit those actions directly. The
+        // navigate / switch / adjust pairs are hints only (no click target).
+        let pairs: [(&str, &str, Option<SettingsHitKind>); 6] = [
+            ("↑↓", "navigate", None),
+            ("⏎", "apply", Some(SettingsHitKind::ApplyButton)),
+            ("⇥", "switch", None),
+            ("←→", "adjust", None),
+            ("esc", "close", Some(SettingsHitKind::CloseButton)),
+            ("⌘⏎", "save", Some(SettingsHitKind::SaveButton)),
         ];
         let mut fx = content_x0;
         let gap = cw * 1.5; // gap between pairs (5x intra-pair gap)
         let inner = cw * 0.3; // gap between key and description within a pair
         let scale = 1.1;
-        for (key, desc) in &pairs {
+        let footer_h = ch * scale;
+        for (key, desc, hit_kind) in &pairs {
+            let pair_x0 = fx;
             self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
             fx += cw * scale * Self::text_col_width(key) as f32 + inner;
             self.push_text_scaled(&mut verts, fx, footer_y, desc, label_c, content_cols, scale);
             fx += cw * scale * Self::text_col_width(desc) as f32 + gap;
+            // Register the clickable rect for apply / close / save. The
+            // rect spans from the pair's first glyph to just before the
+            // inter-pair gap, and one footer row in height.
+            if let Some(kind) = hit_kind {
+                let pair_x1 = fx - gap;
+                hits.push(SettingsHit {
+                    kind: *kind,
+                    rect: [pair_x0, footer_y, pair_x1, footer_y + footer_h],
+                });
+            }
         }
 
-        (verts, Some([box_x0, box_y0, box_x1, box_y1]))
+        (verts, Some([box_x0, box_y0, box_x1, box_y1]), hits)
     }
 
     /// Build the right-click context menu (F7) as a small popup at (x, y).

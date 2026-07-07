@@ -250,6 +250,10 @@ struct App {
     settings_draft: weft_core::config::Config,
     /// True when the draft has unsaved changes (drives the "Save?" hint).
     settings_dirty: bool,
+    /// v1.0 S2: Last save error message. `None` when the most recent save
+    /// succeeded (or no save has been attempted). Surfaced as a red banner
+    /// at the top of the panel so the user sees why Apply/Save didn't work.
+    settings_error: Option<String>,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
@@ -488,6 +492,7 @@ impl App {
             settings_selection: 0,
             settings_draft: weft_core::config::Config::default(),
             settings_dirty: false,
+            settings_error: None,
             should_exit: false,
         }
     }
@@ -918,6 +923,7 @@ impl App {
                     self.settings_tab = crate::overlay::SettingsTab::Appearance;
                     self.settings_selection = 0;
                     self.settings_dirty = false;
+                    self.settings_error = None;
                 }
                 self.request_redraw();
                 true
@@ -1180,17 +1186,7 @@ impl App {
 
         // Cmd+Enter: save draft to disk & close.
         if mods.contains(Modifiers::SUPER) && key == KeyCode::Enter {
-            if self.settings_dirty {
-                if let Err(e) = self.settings_draft.save() {
-                    tracing::warn!(error = ?e, "failed to save settings draft");
-                }
-                // Apply the new config immediately so theme/font changes
-                // take effect without a restart. reload_config() reads the
-                // freshly-saved file and calls apply_config(), which
-                // rebuilds the renderer theme + atlas.
-                self.reload_config();
-            }
-            self.settings_open = false;
+            self.save_settings_draft(true);
             self.request_redraw();
             return true;
         }
@@ -1205,6 +1201,7 @@ impl App {
             KeyCode::Escape => {
                 // Close without saving (discard draft).
                 self.settings_open = false;
+                self.settings_error = None;
                 self.request_redraw();
                 true
             }
@@ -1241,7 +1238,115 @@ impl App {
                 self.request_redraw();
                 true
             }
+            // v1.0 S1-c: ←/→ nudges the value of the selected row in the
+            // Font / Window tabs (no-op in Appearance/Keybindings which are
+            // pick-list tabs). The step sizes and clamps match what the
+            // renderer's footer hint advertises ("←→ adjust").
+            KeyCode::Left | KeyCode::Right => {
+                let delta = if key == KeyCode::Left { -1 } else { 1 };
+                self.adjust_settings_value(delta);
+                self.request_redraw();
+                true
+            }
             _ => false,
+        }
+    }
+
+    /// v1.0 S2: Persist the working draft to disk and reload the live config
+    /// so theme/font/padding changes take effect immediately. When `close`
+    /// is true the panel is dismissed; the Apply button passes false so the
+    /// user can keep editing. Failures (e.g. unset `HOME`, read-only config
+    /// dir) are surfaced via [`settings_error`] instead of just being logged.
+    fn save_settings_draft(&mut self, close: bool) {
+        if self.settings_dirty {
+            if let Err(e) = self.settings_draft.save() {
+                tracing::warn!(error = ?e, "failed to save settings draft");
+                self.settings_error = Some(e.to_string());
+                // Don't close on failure — the user needs to see the error.
+                return;
+            }
+            // Apply the new config immediately so theme/font changes
+            // take effect without a restart. reload_config() reads the
+            // freshly-saved file and calls apply_config(), which
+            // rebuilds the renderer theme + atlas.
+            self.reload_config();
+            self.settings_dirty = false;
+            self.settings_error = None;
+        }
+        if close {
+            self.settings_open = false;
+            self.settings_error = None;
+        }
+    }
+
+    /// v1.0 S1-c: Adjust the value of the currently-selected row in the
+    /// active tab by `delta` (±1). Font/Window rows map to numeric fields;
+    /// the Font family row cycles through a fixed list of common macOS
+    /// monospace families. No-op for Appearance/Keybindings (pick-list tabs).
+    fn adjust_settings_value(&mut self, delta: i32) {
+        use crate::overlay::SettingsTab;
+        match self.settings_tab {
+            SettingsTab::Font => match self.settings_selection {
+                0 => {
+                    // Family: cycle Menlo → Monaco → SF Mono → System → Menlo.
+                    const FAMILIES: &[&str] = &["Menlo", "Monaco", "SF Mono", "System"];
+                    let cur = FAMILIES
+                        .iter()
+                        .position(|f| *f == self.settings_draft.font.family)
+                        .unwrap_or(0);
+                    let next = (cur as i32 + delta).rem_euclid(FAMILIES.len() as i32) as usize;
+                    self.settings_draft.font.family = FAMILIES[next].to_string();
+                    self.settings_dirty = true;
+                }
+                1 => {
+                    // Size: ±0.5 pt, clamped to [8.0, 24.0].
+                    self.settings_draft.font.size =
+                        (self.settings_draft.font.size + delta as f32 * 0.5).clamp(8.0, 24.0);
+                    self.settings_dirty = true;
+                }
+                2 => {
+                    // Line height: ±0.05, clamped to [1.0, 1.5].
+                    self.settings_draft.font.line_height = (self.settings_draft.font.line_height
+                        + delta as f32 * 0.05)
+                        .clamp(1.0, 1.5);
+                    self.settings_dirty = true;
+                }
+                _ => {}
+            },
+            SettingsTab::Window => match self.settings_selection {
+                0 => {
+                    // Opacity: ±0.05, clamped to [0.5, 1.0].
+                    self.settings_draft.window.opacity =
+                        (self.settings_draft.window.opacity + delta as f32 * 0.05).clamp(0.5, 1.0);
+                    self.settings_dirty = true;
+                }
+                1 => {
+                    // Padding X: ±1 cell, clamped to [0, 20].
+                    self.settings_draft.window.padding_x =
+                        ((self.settings_draft.window.padding_x as i32 + delta).max(0) as u32)
+                            .min(20);
+                    self.settings_dirty = true;
+                }
+                2 => {
+                    // Padding Y: ±1 cell, clamped to [0, 20].
+                    self.settings_draft.window.padding_y =
+                        ((self.settings_draft.window.padding_y as i32 + delta).max(0) as u32)
+                            .min(20);
+                    self.settings_dirty = true;
+                }
+                3 => {
+                    // Scrollback: ±1000 lines, clamped to [1000, 100000].
+                    self.settings_draft.scrollback.lines =
+                        ((self.settings_draft.scrollback.lines as i32 + delta * 1000).max(1000)
+                            as usize)
+                            .min(100000);
+                    self.settings_dirty = true;
+                }
+                _ => {}
+            },
+            SettingsTab::Appearance | SettingsTab::Keybindings => {
+                // Pick-list tabs — ←/→ has no meaning here.
+            }
         }
     }
 
@@ -1250,9 +1355,14 @@ impl App {
         use crate::overlay::SettingsTab;
         match self.settings_tab {
             SettingsTab::Appearance => self.settings_theme_views().len(),
-            SettingsTab::Font => 4, // family, size, cjk_family, emoji_family
+            // v1.0 S1-d: must match the rows rendered by build_settings_vertices
+            // (Family / Size / Line height). Out-of-sync values let ↑↓ walk
+            // past the rendered rows.
+            SettingsTab::Font => 3,
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
-            SettingsTab::Window => 5, // opacity, padding_x, padding_y, width, height
+            // v1.0 S1-d: Opacity / Padding X / Padding Y / Scrollback — match
+            // the four rows rendered by build_settings_vertices.
+            SettingsTab::Window => 4,
         }
     }
 
@@ -3770,6 +3880,64 @@ impl App {
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        // v1.0 S1-b: Settings panel click handling — checked first so
+        // settings clicks work even inside TUI apps that captured the mouse
+        // (the panel is modal and overlays everything). When the panel is
+        // open, ALL left-clicks are either dispatched to a hit region or
+        // consumed (clicks outside any region do nothing — they don't fall
+        // through to the terminal / PTY).
+        if button == winit::event::MouseButton::Left && self.settings_open {
+            if let Some(renderer) = &self.renderer {
+                let xf = x as f32;
+                let yf = y as f32;
+                for hit in &renderer.settings_hits {
+                    let [x0, y0, x1, y1] = hit.rect;
+                    if xf >= x0 && xf < x1 && yf >= y0 && yf < y1 {
+                        use crate::renderer::SettingsHitKind;
+                        match hit.kind {
+                            SettingsHitKind::Tab(tab) => {
+                                if self.settings_tab != tab {
+                                    self.settings_tab = tab;
+                                    self.settings_selection = 0;
+                                }
+                            }
+                            SettingsHitKind::Theme(i) => {
+                                self.settings_selection = i;
+                                self.apply_settings_selection();
+                            }
+                            SettingsHitKind::CloseButton => {
+                                self.settings_open = false;
+                                self.settings_error = None;
+                            }
+                            SettingsHitKind::SaveButton => {
+                                self.save_settings_draft(true);
+                            }
+                            SettingsHitKind::ApplyButton => {
+                                self.save_settings_draft(false);
+                            }
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
+                // Click inside the panel's bounding box but not on any
+                // hit region — still consume the event so the click doesn't
+                // fall through to the terminal underneath.
+                if let Some([bx0, by0, bx1, by1]) = renderer.settings_popup_rect {
+                    if xf >= bx0 && xf < bx1 && yf >= by0 && yf < by1 {
+                        return;
+                    }
+                }
+                // Click outside the panel — close it (Warp-style: clicking
+                // outside dismisses modal overlays). This matches the
+                // behavior of the Command Palette.
+                self.settings_open = false;
+                self.settings_error = None;
+                self.request_redraw();
+                return;
+            }
+        }
+
         // v0.9 H1: Tab bar click handling — check before everything else so
         // tab clicks work even inside TUI apps that captured the mouse. Only
         // left-clicks on the tab bar are handled here, and only when more
@@ -5433,6 +5601,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.settings_draft.window.padding_y,
                         self.settings_draft.scrollback.lines,
                         &settings_keybindings,
+                        self.settings_error.as_deref(),
                     );
                     // v0.8 U6: compute block-content metrics for the dynamic
                     // scrollbar thumb (total/visible/max_scroll). None in grid
@@ -6058,9 +6227,9 @@ fn first_run_welcome() -> Option<String> {
     let banner = "\x1b[2m# Welcome to Weft v1.0\x1b[0m\n\
 \x1b[2m# Core shortcuts:\x1b[0m\n\
 \x1b[2m#   Cmd+T        New tab      Cmd+W  Close tab\x1b[0m\n\
-\x1b[2m#   Cmd+D        Split pane   Cmd+[/]  Cycle tabs\x1b[0m\n\
+\x1b[2m#   Cmd+Shift+[  Prev tab     Cmd+Shift+]  Next tab\x1b[0m\n\
 \x1b[2m#   Cmd+P        Command palette (fuzzy)\x1b[0m\n\
-\x1b[2m#   Cmd+F        Find         Cmd+Shift+S  Toggle sidebar\x1b[0m\n\
+\x1b[2m#   Cmd+F        Find         Cmd+Shift+B  Toggle sidebar\x1b[0m\n\
 \x1b[2m#   Cmd+,        Settings     Cmd+Shift+T  Cycle theme\x1b[0m\n\
 \x1b[2m# Block view groups commands and output. Type a command and press Enter.\x1b[0m\n";
     // Leading space keeps this out of zsh history (HIST_IGNORE_SPACE default).

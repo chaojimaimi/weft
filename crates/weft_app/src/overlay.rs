@@ -158,6 +158,10 @@ pub struct SettingsDrawParams<'a> {
     pub scrollback_lines: usize,
     /// Keybindings to display (read-only in v1.0).
     pub keybindings: &'a [SettingsKeybindingView],
+    /// v1.0 S2: Last save error message. `None` when the most recent save
+    /// succeeded (or no save has been attempted). Surfaced as a red banner
+    /// at the top of the panel.
+    pub error: Option<&'a str>,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -298,9 +302,15 @@ impl OverlayWarmup for OverlayContent<'_> {
                 // now uses Unicode symbols ⏎ (U+23CE), ⇥ (U+21E5), ⌘ (U+2318)
                 // which are not otherwise present in the atlas — without
                 // warming they render as blank cells.
-                missing.extend("↑↓⏎⇥⌘esc navigate apply switch close save".chars());
+                // v1.0 S1-c/S2: added ←→ (U+2190/U+2192) for the adjust hint
+                // and ⚠ (U+26A0) for the save-error banner.
+                missing.extend("↑↓⏎⇥⌘←→esc navigate apply switch adjust close save".chars());
+                missing.insert('\u{26a0}');
                 missing.extend(s.theme_name.chars());
                 missing.extend(s.font_family.chars());
+                if let Some(err) = s.error {
+                    missing.extend(err.chars());
+                }
                 for t in s.themes {
                     missing.extend(t.label.chars());
                 }
@@ -389,6 +399,7 @@ pub fn build_overlay_stack<'a>(
     settings_window_padding_y: u32,
     settings_scrollback_lines: usize,
     settings_keybindings: &'a [SettingsKeybindingView],
+    settings_error: Option<&'a str>,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -520,6 +531,7 @@ pub fn build_overlay_stack<'a>(
                 window_padding_y: settings_window_padding_y,
                 scrollback_lines: settings_scrollback_lines,
                 keybindings: settings_keybindings,
+                error: settings_error,
             }),
         });
     }
@@ -721,6 +733,7 @@ mod tests {
             window_padding_y: 0,
             scrollback_lines: 10_000,
             keybindings: &kbs,
+            error: None,
         };
         let mut missing = HashSet::new();
         OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -759,6 +772,7 @@ mod tests {
                         window_padding_y: 0,
                         scrollback_lines: 10_000,
                         keybindings: &[],
+                        error: None,
                     }),
                 },
             ],
