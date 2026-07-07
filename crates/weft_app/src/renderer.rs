@@ -2,9 +2,9 @@
 
 use core_graphics_types::geometry::CGSize;
 use metal::{
-    CompileOptions, Device, MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
-    MTLResourceOptions, MTLStoreAction, MTLVertexFormat, MetalLayer, RenderPassDescriptor,
-    RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
+    CompileOptions, Device, MTLClearColor, MTLIndexType, MTLLoadAction, MTLPixelFormat,
+    MTLPrimitiveType, MTLResourceOptions, MTLStoreAction, MTLVertexFormat, MetalLayer,
+    RenderPassDescriptor, RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
 };
 use objc2::msg_send;
 use std::cell::{Cell, RefCell};
@@ -317,6 +317,24 @@ pub struct MetalRenderer {
     /// v1.0 P1.5-B0: Capacity of each buffer in the ring (in bytes). When
     /// vertex data exceeds this, a new larger buffer is allocated.
     vertex_buffer_capacity: Cell<u64>,
+    /// v1.0 P1.5-B1: Instanced render pipeline for grid cells. Renders
+    /// each cell as a single 64-byte instance (origin/size/uv/fg/bg) drawn
+    /// against a static 4-vertex quad + 6-index buffer, replacing the
+    /// legacy 6-vertex-per-cell emission (~288 B/cell).
+    instanced_pipeline: metal::RenderPipelineState,
+    /// v1.0 P1.5-B1: Static index buffer for the unit quad (6 u16 indices).
+    /// Bound once per grid draw; never resized.
+    index_buffer: metal::Buffer,
+    /// v1.0 P1.5-B1: Triple-buffered instance data ring. Each frame writes
+    /// the active tab's grid instances into one buffer; the previous two
+    /// buffers stay alive so the GPU can finish reading them.
+    instance_ring: RefCell<Vec<metal::Buffer>>,
+    /// v1.0 P1.5-B1: Current index into `instance_ring`. Advanced each
+    /// frame; the buffer at this index is reused (grown if needed).
+    instance_ring_idx: Cell<usize>,
+    /// v1.0 P1.5-B1: Capacity of each buffer in `instance_ring` (bytes).
+    /// When instance data exceeds this, a new larger buffer is allocated.
+    instance_capacity: Cell<u64>,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -480,6 +498,52 @@ vertex TextVertexOut text_vertex(
     return out;
 }
 
+// v1.0 P1.5-B1: Instanced vertex shader for grid cells. Each instance is
+// one cell: a quad (4 verts indexed as 0,1,2,0,2,3) with per-instance
+// origin/size/uv_rect/fg/bg. Corners are derived from `vertex_id` so no
+// static vertex buffer is needed — only the index buffer + instance buffer.
+// Replaces the 6-vertex-per-cell emission (~288 B/cell) with a single
+// 64-byte instance, ~4.5x smaller per-frame upload.
+struct CellInstance {
+    float2 origin;    // top-left pixel position
+    float2 size;      // pixel width/height
+    float4 uv_rect;   // (u0, v0, u1, v1) — V already swapped for layer flip
+    float4 fg;        // RGBA
+    float4 bg;        // RGBA
+};
+
+vertex TextVertexOut text_vertex_instanced(
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]],
+    constant float2& viewport_size [[buffer(1)]],
+    constant CellInstance* instances [[buffer(2)]]
+) {
+    TextVertexOut out;
+    // vid ∈ {0,1,2,3} via indexed draw (index buffer [0,1,2,0,2,3]).
+    // Corners: 0=TL (0,0), 1=BL (0,1), 2=BR (1,1), 3=TR (1,0).
+    float2 corner;
+    switch (vid) {
+        case 0: corner = float2(0.0, 0.0); break;
+        case 1: corner = float2(0.0, 1.0); break;
+        case 2: corner = float2(1.0, 1.0); break;
+        default: corner = float2(1.0, 0.0); break;
+    }
+    CellInstance inst = instances[iid];
+    float2 position = inst.origin + corner * inst.size;
+    float2 tex_coord = float2(
+        mix(inst.uv_rect.x, inst.uv_rect.z, corner.x),
+        mix(inst.uv_rect.y, inst.uv_rect.w, corner.y)
+    );
+    float2 clip = (position / viewport_size) * 2.0 - 1.0;
+    clip.y = -clip.y;
+    out.position = float4(clip, 0.0, 1.0);
+    out.tex_coord = tex_coord;
+    out.fg_color = inst.fg;
+    out.bg_color = inst.bg;
+    out.is_bg = 0.0;
+    return out;
+}
+
 fragment float4 text_fragment(
     TextVertexOut in [[stage_in]],
     texture2d<float> atlas [[texture(0)]],
@@ -541,6 +605,39 @@ fragment float4 text_fragment(
         let pipeline = device
             .new_render_pipeline_state(&pipeline_desc)
             .expect("Failed to create render pipeline");
+
+        // v1.0 P1.5-B1: Instanced pipeline for grid cells. No vertex
+        // descriptor — the instanced vertex shader derives corner position
+        // from `vertex_id` and pulls per-cell data from the instance buffer
+        // at slot 2. Reuses the same fragment shader (atlas sampling +
+        // fg/bg blend) and color attachment config as the legacy pipeline.
+        let instanced_vertex_fn = library.get_function("text_vertex_instanced", None).unwrap();
+        let instanced_desc = RenderPipelineDescriptor::new();
+        instanced_desc.set_vertex_function(Some(&instanced_vertex_fn));
+        instanced_desc.set_fragment_function(Some(&fragment_fn));
+        let instanced_color_att = instanced_desc.color_attachments().object_at(0).unwrap();
+        instanced_color_att.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        instanced_color_att.set_blending_enabled(true);
+        instanced_color_att.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        instanced_color_att
+            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        instanced_color_att.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        instanced_color_att
+            .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        let instanced_pipeline = device
+            .new_render_pipeline_state(&instanced_desc)
+            .expect("Failed to create instanced render pipeline");
+
+        // v1.0 P1.5-B1: Static index buffer for the unit quad: two triangles
+        // (TL-BL-BR, TL-BR-TR) indexing 4 corner vertices. The vertex shader
+        // maps vertex_id 0..3 → corner (0,0), (0,1), (1,1), (1,0). Created
+        // once at startup; reused for every grid draw.
+        let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let index_buffer = device.new_buffer_with_data(
+            indices.as_ptr() as *const _,
+            (indices.len() * std::mem::size_of::<u16>()) as u64,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
+        );
 
         // Create and configure Metal layer
         // IMPORTANT: drawable_size must be in PHYSICAL PIXELS, not logical points
@@ -616,6 +713,11 @@ fragment float4 text_fragment(
             vertex_buffer_ring: RefCell::new(Vec::new()),
             vertex_buffer_ring_idx: Cell::new(0),
             vertex_buffer_capacity: Cell::new(0),
+            instanced_pipeline,
+            index_buffer,
+            instance_ring: RefCell::new(Vec::new()),
+            instance_ring_idx: Cell::new(0),
+            instance_capacity: Cell::new(0),
         }
     }
 
@@ -1062,7 +1164,12 @@ fragment float4 text_fragment(
         self.settings_popup_rect = None;
         // Reset find button hit-test rects — set by build_find_vertices.
         self.find_buttons = None;
-        let mut vertices = if show_blocks {
+        // v1.0 P1.5-B1: Grid cells render as instances (instanced pipeline);
+        // overlays + block view render as legacy vertices. In grid view,
+        // `instances` carries the cells and `vertices` carries only overlays;
+        // in block view, `instances` is empty and `vertices` carries everything.
+        let mut instances: Vec<f32> = Vec::new();
+        let mut vertices: Vec<f32> = if show_blocks {
             let (v, regions, bv_rows) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
                 let box_top_y = (vp_h - pad_y - box_h).max(0.0);
@@ -1096,16 +1203,19 @@ fragment float4 text_fragment(
             v
         } else {
             // Grid view (alt-screen apps): clear the block-view row cache so
-            // hit-testing falls back to Grid coordinates.
+            // hit-testing falls back to Grid coordinates. Build per-cell
+            // instances (P1.5-B1) into `instances`; overlays go into
+            // `vertices` (appended below).
             self.block_view_rows.clear();
-            self.build_grid_vertices(
+            instances = self.build_grid_instances(
                 grid,
                 terminal.palette(),
                 cursor,
                 selection,
                 terminal.cursor_visible && cursor_blink_on && prompt.is_none(),
                 terminal.cursor_style,
-            )
+            );
+            Vec::new()
         };
 
         // Overlay the history panel on top of the grid (drawn after, so it
@@ -1243,8 +1353,10 @@ fragment float4 text_fragment(
             self.tab_hits.clear();
         }
 
-        // Debug: log first row characters and verify vertex data
-        if vertices.is_empty() {
+        // v1.0 P1.5-B1: early-exit only when BOTH instances (grid) and
+        // vertices (overlays / block view) are empty. In grid view with no
+        // overlays, `vertices` is empty but `instances` carries the cells.
+        if vertices.is_empty() && instances.is_empty() {
             let pass_desc = RenderPassDescriptor::new();
             let color_att = pass_desc.color_attachments().object_at(0).unwrap();
             color_att.set_texture(Some(drawable.texture()));
@@ -1266,58 +1378,111 @@ fragment float4 text_fragment(
         // Avoids per-frame `new_buffer_with_data` allocation (~540KB/frame).
         // Reuses buffers across frames; only allocates when capacity is
         // exceeded (e.g. on first frame or after resize to a larger grid).
+        // v1.0 P1.5-B1: skip upload when `vertices` is empty (grid view with
+        // no overlays); only the instance buffer is uploaded in that case.
         let vertex_data_size = (vertices.len() * std::mem::size_of::<f32>()) as u64;
-        let mut ring = self.vertex_buffer_ring.borrow_mut();
-        let ring_idx = self.vertex_buffer_ring_idx.get();
-        let cur_capacity = self.vertex_buffer_capacity.get();
+        let mut ring_idx: usize = 0;
+        if vertex_data_size > 0 {
+            let mut ring = self.vertex_buffer_ring.borrow_mut();
+            ring_idx = self.vertex_buffer_ring_idx.get();
+            let cur_capacity = self.vertex_buffer_capacity.get();
 
-        // Grow the ring buffer if needed (or allocate on first frame).
-        if ring.is_empty() || vertex_data_size > cur_capacity {
-            // New capacity: 1.5x the needed size, rounded up to 4KB boundary.
-            let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
-            let new_buffer = self
-                .device
-                .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-            // Copy any existing smaller buffer's content into the new one
-            // (not needed here — we write fresh data below — but ensures
-            // the buffer is ready for use).
-            if ring_idx < ring.len() {
-                ring[ring_idx] = new_buffer;
-            } else {
-                ring.push(new_buffer);
+            // Grow the ring buffer if needed (or allocate on first frame).
+            if ring.is_empty() || vertex_data_size > cur_capacity {
+                // New capacity: 1.5x the needed size, rounded up to 4KB boundary.
+                let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
+                let new_buffer = self
+                    .device
+                    .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
+                if ring_idx < ring.len() {
+                    ring[ring_idx] = new_buffer;
+                } else {
+                    ring.push(new_buffer);
+                }
+                self.vertex_buffer_capacity.set(new_capacity);
             }
-            self.vertex_buffer_capacity.set(new_capacity);
-        }
-        // Ensure ring has at least 3 buffers for triple-buffering.
-        while ring.len() < 3 {
-            let cap = self.vertex_buffer_capacity.get().max(4096);
-            ring.push(
-                self.device
-                    .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
-            );
-        }
-
-        // Write vertex data into the current ring buffer.
-        let buffer = &ring[ring_idx];
-        {
-            let ptr = buffer.contents() as *mut u8;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    vertices.as_ptr() as *const u8,
-                    ptr,
-                    vertex_data_size as usize,
+            // Ensure ring has at least 3 buffers for triple-buffering.
+            while ring.len() < 3 {
+                let cap = self.vertex_buffer_capacity.get().max(4096);
+                ring.push(
+                    self.device
+                        .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
                 );
             }
-            // did_modify_range signals the GPU to re-read this region.
-            buffer.did_modify_range(metal::NSRange {
-                location: 0,
-                length: vertex_data_size,
-            });
+
+            // Write vertex data into the current ring buffer.
+            let buffer = &ring[ring_idx];
+            {
+                let ptr = buffer.contents() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vertices.as_ptr() as *const u8,
+                        ptr,
+                        vertex_data_size as usize,
+                    );
+                }
+                // did_modify_range signals the GPU to re-read this region.
+                buffer.did_modify_range(metal::NSRange {
+                    location: 0,
+                    length: vertex_data_size,
+                });
+            }
+
+            // Advance ring index for next frame (triple-buffer rotation).
+            self.vertex_buffer_ring_idx.set((ring_idx + 1) % ring.len());
         }
 
-        // Advance ring index for next frame (triple-buffer rotation).
-        self.vertex_buffer_ring_idx.set((ring_idx + 1) % ring.len());
-        drop(ring); // release borrow before immutable self access below
+        // v1.0 P1.5-B1: Upload instance buffer via triple-buffered ring.
+        // Same pattern as the vertex ring: 3 rotating buffers, grown on
+        // demand, written via copy_nonoverlapping + did_modify_range.
+        // Each instance is 16 floats (64 bytes) — for a 80×30 grid that's
+        // ~150KB/frame vs the old ~540KB vertex buffer.
+        let instance_data_size = (instances.len() * std::mem::size_of::<f32>()) as u64;
+        let mut instance_ring_idx: usize = 0;
+        if instance_data_size > 0 {
+            let mut ring = self.instance_ring.borrow_mut();
+            instance_ring_idx = self.instance_ring_idx.get();
+            let cur_capacity = self.instance_capacity.get();
+
+            if ring.is_empty() || instance_data_size > cur_capacity {
+                let new_capacity = (instance_data_size * 3 / 2).div_ceil(4096) * 4096;
+                let new_buffer = self
+                    .device
+                    .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
+                if instance_ring_idx < ring.len() {
+                    ring[instance_ring_idx] = new_buffer;
+                } else {
+                    ring.push(new_buffer);
+                }
+                self.instance_capacity.set(new_capacity);
+            }
+            while ring.len() < 3 {
+                let cap = self.instance_capacity.get().max(4096);
+                ring.push(
+                    self.device
+                        .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
+                );
+            }
+
+            let buffer = &ring[instance_ring_idx];
+            {
+                let ptr = buffer.contents() as *mut u8;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        instances.as_ptr() as *const u8,
+                        ptr,
+                        instance_data_size as usize,
+                    );
+                }
+                buffer.did_modify_range(metal::NSRange {
+                    location: 0,
+                    length: instance_data_size,
+                });
+            }
+
+            self.instance_ring_idx
+                .set((instance_ring_idx + 1) % ring.len());
+        }
 
         // v1.0 P1.5-B0: Use set_vertex_bytes for viewport uniform (8 bytes)
         // instead of allocating a new MTLBuffer every frame. This is the
@@ -1398,25 +1563,62 @@ fragment float4 text_fragment(
 
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
 
-        encoder.set_render_pipeline_state(&self.pipeline);
-        // v1.0 P1.5-B0: Use the ring buffer instead of per-frame allocation.
-        let ring = self.vertex_buffer_ring.borrow();
-        let cur_idx = if ring_idx == 0 {
-            ring.len() - 1
-        } else {
-            ring_idx - 1
-        };
-        encoder.set_vertex_buffer(0, Some(&ring[cur_idx]), 0);
-        // v1.0 P1.5-B0: set_vertex_bytes for viewport (8 bytes << 4KB limit).
-        encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
-
+        // v1.0 P1.5-B1: Draw 1 — grid instances (instanced pipeline). Each
+        // instance is one cell (or cursor/hyperlink decoration); the static
+        // index buffer + shader-side corner derivation mean only the
+        // instance buffer changes per frame.
         let tex = self.atlas.texture();
-        encoder.set_fragment_texture(0, Some(tex));
-        encoder.set_fragment_sampler_state(0, Some(&self.sampler));
+        if instance_data_size > 0 {
+            encoder.set_render_pipeline_state(&self.instanced_pipeline);
+            // Instance buffer at slot 2 (matches `[[buffer(2)]]` in shader).
+            let ring = self.instance_ring.borrow();
+            let cur = if instance_ring_idx == 0 {
+                ring.len() - 1
+            } else {
+                instance_ring_idx - 1
+            };
+            encoder.set_vertex_buffer(2, Some(&ring[cur]), 0);
+            // Viewport uniform at slot 1 (set_vertex_bytes, 8 bytes).
+            encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
+            // Atlas + sampler (shared with legacy path — bound once here
+            // because Metal retains fragment bindings across pipeline switches
+            // within the same encoder).
+            encoder.set_fragment_texture(0, Some(tex));
+            encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-        let vertex_count = vertices.len() / 12;
-        if vertex_count > 0 {
-            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
+            let instance_count = instances.len() / 16;
+            encoder.draw_indexed_primitives_instanced(
+                MTLPrimitiveType::Triangle,
+                6, // index count (two triangles)
+                MTLIndexType::UInt16,
+                &self.index_buffer,
+                0, // index buffer offset
+                instance_count as u64,
+            );
+        }
+
+        // v1.0 P1.5-B1: Draw 2 — overlays / block view (legacy pipeline).
+        // Uses the per-vertex descriptor (3×float4, stride 48) + B0 ring.
+        if vertex_data_size > 0 {
+            encoder.set_render_pipeline_state(&self.pipeline);
+            let ring = self.vertex_buffer_ring.borrow();
+            let cur = if ring_idx == 0 {
+                ring.len() - 1
+            } else {
+                ring_idx - 1
+            };
+            encoder.set_vertex_buffer(0, Some(&ring[cur]), 0);
+            // v1.0 P1.5-B0: set_vertex_bytes for viewport (8 bytes << 4KB limit).
+            encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
+            // Atlas + sampler may already be bound from the instance draw;
+            // rebind defensively in case only this path runs (block view).
+            encoder.set_fragment_texture(0, Some(tex));
+            encoder.set_fragment_sampler_state(0, Some(&self.sampler));
+
+            let vertex_count = vertices.len() / 12;
+            if vertex_count > 0 {
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
+            }
         }
         encoder.end_encoding();
 
@@ -1453,8 +1655,13 @@ fragment float4 text_fragment(
         self.find_buttons = find_btns;
     }
 
-    /// Build vertex buffer from the terminal Grid.
-    fn build_grid_vertices(
+    /// v1.0 P1.5-B1: Build per-cell instance data for the grid. Each cell
+    /// becomes a single 64-byte instance (origin/size/uv_rect/fg/bg) drawn
+    /// against a static 4-vertex quad + 6-index buffer. Replaces the old
+    /// 6-vertex-per-cell emission (~288 B/cell) — ~4.5x smaller per-frame
+    /// upload. The per-row cache (`grid_row_cache`) stores instance floats
+    /// (16 per cell) instead of vertex floats (72 per cell).
+    fn build_grid_instances(
         &self,
         grid: &weft_core::grid::Grid,
         palette: &[Color; 256],
@@ -1613,7 +1820,9 @@ fragment float4 text_fragment(
         }
 
         for &row in &rows_to_rebuild {
-            let mut vertices = Vec::with_capacity(num_cols * 72);
+            // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
+            // for cursor bar/underline + hyperlink underline decorations.
+            let mut instances = Vec::with_capacity(num_cols * 16 + 48);
             for col in 0..num_cols {
                 let cell = grid.cell(row, col);
 
@@ -1715,97 +1924,19 @@ fragment float4 text_fragment(
                 let x1 = x + cell_render_width;
                 let y1 = y + ch;
 
-                // Two triangles: TL-BL-BR, TL-BR-TR
-                let quad: [[f32; 12]; 6] = [
-                    [
-                        x0,
-                        y0,
-                        u0,
-                        v0,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                    [
-                        x0,
-                        y1,
-                        u0,
-                        v1,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                    [
-                        x1,
-                        y1,
-                        u1,
-                        v1,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                    [
-                        x0,
-                        y0,
-                        u0,
-                        v0,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                    [
-                        x1,
-                        y1,
-                        u1,
-                        v1,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                    [
-                        x1,
-                        y0,
-                        u1,
-                        v0,
-                        final_fg[0],
-                        final_fg[1],
-                        final_fg[2],
-                        final_fg[3],
-                        final_bg[0],
-                        final_bg[1],
-                        final_bg[2],
-                        final_bg[3],
-                    ],
-                ];
-
-                for vertex in &quad {
-                    vertices.extend_from_slice(vertex);
-                }
+                // v1.0 P1.5-B1: emit one instance per cell. The V-swap
+                // (`(v0, v1) = (v1, v0)` above) is stored directly in the
+                // instance's uv_rect: corner.y=0 (top of cell) samples v0
+                // (bottom of glyph in atlas space), compensating for the
+                // CAMetalLayer vertical flip — same convention as the old
+                // per-vertex emission.
+                push_cell_instance(
+                    &mut instances,
+                    [x0, y0, x1, y1],
+                    [u0, v0, u1, v1],
+                    final_fg,
+                    final_bg,
+                );
 
                 // Draw bar/underline cursor overlay
                 if is_cursor && show_cursor {
@@ -1813,187 +1944,26 @@ fragment float4 text_fragment(
                         CursorStyle::Bar | CursorStyle::BlinkingBar => {
                             let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
                             let bar_w = bar_w.max(1.0).min(cw * 0.15);
-                            let quad: [[f32; 12]; 6] = [
-                                [
-                                    x0,
-                                    y0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0 + bar_w,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0,
-                                    y0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0 + bar_w,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0 + bar_w,
-                                    y0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                            ];
-                            for vertex in &quad {
-                                vertices.extend_from_slice(vertex);
-                            }
+                            // v1.0 P1.5-B1: decoration instance. UV rect
+                            // (0,0,0,1) samples the atlas at u=0 (empty)
+                            // so mask=0 → only bg (cursor color) shows.
+                            push_cell_instance(
+                                &mut instances,
+                                [x0, y0, x0 + bar_w, y1],
+                                [0.0, 0.0, 0.0, 1.0],
+                                [0.0; 4],
+                                cursor_color,
+                            );
                         }
                         CursorStyle::Underline | CursorStyle::BlinkingUnderline => {
                             let line_h = 2.0;
-                            let quad: [[f32; 12]; 6] = [
-                                [
-                                    x0,
-                                    y1 - line_h,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x1,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x0,
-                                    y1 - line_h,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x1,
-                                    y1,
-                                    0.0,
-                                    1.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                                [
-                                    x1,
-                                    y1 - line_h,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    cursor_color[0],
-                                    cursor_color[1],
-                                    cursor_color[2],
-                                    cursor_color[3],
-                                ],
-                            ];
-                            for vertex in &quad {
-                                vertices.extend_from_slice(vertex);
-                            }
+                            push_cell_instance(
+                                &mut instances,
+                                [x0, y1 - line_h, x1, y1],
+                                [0.0, 0.0, 0.0, 1.0],
+                                [0.0; 4],
+                                cursor_color,
+                            );
                         }
                         _ => {} // Block cursor handled above
                     }
@@ -2005,105 +1975,23 @@ fragment float4 text_fragment(
                 if cell.flags.contains(CellFlags::HYPERLINK) {
                     let line_h = 1.5;
                     let link_color = [0.36, 0.62, 0.94, 1.0]; // soft cyan
-                    let quad: [[f32; 12]; 6] = [
-                        [
-                            x0,
-                            y1 - line_h,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                        [
-                            x0,
-                            y1,
-                            0.0,
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                        [
-                            x1,
-                            y1,
-                            0.0,
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                        [
-                            x0,
-                            y1 - line_h,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                        [
-                            x1,
-                            y1,
-                            0.0,
-                            1.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                        [
-                            x1,
-                            y1 - line_h,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            0.0,
-                            link_color[0],
-                            link_color[1],
-                            link_color[2],
-                            link_color[3],
-                        ],
-                    ];
-                    for vertex in &quad {
-                        vertices.extend_from_slice(vertex);
-                    }
+                    push_cell_instance(
+                        &mut instances,
+                        [x0, y1 - line_h, x1, y1],
+                        [0.0, 0.0, 0.0, 1.0],
+                        [0.0; 4],
+                        link_color,
+                    );
                 }
             }
-            // v1.0 P0-b: store this row's vertices into the cache.
-            cache[row] = vertices;
+            // v1.0 P1.5-B1: store this row's instances into the cache.
+            cache[row] = instances;
         }
 
-        // v1.0 P0-b: flatten the per-row cache into a single vertex buffer.
+        // v1.0 P0-b: flatten the per-row cache into a single instance buffer.
         // Clean rows are reused from the previous frame; dirty rows were
-        // rebuilt above. This replaces the old per-frame full-grid iteration.
-        let mut out = Vec::with_capacity(num_rows * num_cols * 72);
+        // rebuilt above. Each cell is 16 floats (one CellInstance).
+        let mut out = Vec::with_capacity(num_rows * num_cols * 16);
         for rv in cache.iter() {
             out.extend_from_slice(rv);
         }
@@ -5228,6 +5116,43 @@ fn push_quad(vertices: &mut Vec<f32>, dst: [f32; 4], uv: [f32; 4], fg: [f32; 4],
             x, y, u, v, fg[0], fg[1], fg[2], fg[3], bg[0], bg[1], bg[2], bg[3],
         ]);
     }
+}
+
+/// v1.0 P1.5-B1: Push a single grid-cell instance (16 floats = 64 bytes).
+/// Layout matches the Metal `CellInstance` struct: origin(2) + size(2) +
+/// uv_rect(4) + fg(4) + bg(4). The instance is rendered against a static
+/// 4-vertex unit quad indexed as [0,1,2,0,2,3] — the shader maps
+/// vertex_id 0..3 to corners (0,0), (0,1), (1,1), (1,0) and scales by
+/// `size`/offsets by `origin`. Compared to `push_quad` (6 verts × 12 floats
+/// = 72 floats = 288 B per cell), this emits 16 floats = 64 B per cell, a
+/// 4.5x reduction in per-frame upload size.
+fn push_cell_instance(
+    instances: &mut Vec<f32>,
+    dst: [f32; 4],
+    uv: [f32; 4],
+    fg: [f32; 4],
+    bg: [f32; 4],
+) {
+    let [x0, y0, x1, y1] = dst;
+    let [u0, v0, u1, v1] = uv;
+    instances.extend_from_slice(&[
+        x0,
+        y0,
+        x1 - x0,
+        y1 - y0,
+        u0,
+        v0,
+        u1,
+        v1,
+        fg[0],
+        fg[1],
+        fg[2],
+        fg[3],
+        bg[0],
+        bg[1],
+        bg[2],
+        bg[3],
+    ]);
 }
 
 /// Push a filled triangle (3 vertices) into the vertex buffer. Uses the
