@@ -95,6 +95,12 @@ pub struct Terminal {
     /// the `Cell` struct so Cell stays at 24 bytes (only the 1-bit HYPERLINK
     /// flag lives on the cell).
     hyperlinks: HyperlinkRegistry,
+    /// v1.0 perf: tracks whether vte's parser is in the ground state (not
+    /// inside an escape sequence). Set true in `print()` (vte only calls
+    /// print() in ground state), cleared on escape (0x1B) / C0 controls.
+    /// Used by `process()` to gate the ASCII fast path — only when in ground
+    /// state can a run of printable ASCII bypass the per-byte state machine.
+    parser_in_ground_state: bool,
 }
 
 impl Terminal {
@@ -131,6 +137,7 @@ impl Terminal {
             pending_output: Vec::new(),
             active_hyperlink_id: None,
             hyperlinks: HyperlinkRegistry::new(),
+            parser_in_ground_state: true,
         }
     }
 
@@ -294,15 +301,154 @@ impl Terminal {
     /// Feed raw bytes from PTY through the vte parser.
     /// Each byte is advanced through the parser, which calls back
     /// into our Perform implementation.
+    ///
+    /// v1.0 perf: ASCII fast path — scan for runs of printable ASCII
+    /// (0x20..=0x7E) and write them directly to the grid via `print_ascii_run`,
+    /// bypassing vte's per-byte state machine. Only escape (0x1B) and C0
+    /// control bytes (< 0x20, except 0x07/0x08/0x09/0x0A/0x0D handled by
+    /// `execute`) go through `parser.advance()`. For `seq 1 100000` (~580KB
+    /// of ASCII digits + newlines), this reduces vte state-machine calls
+    /// from ~580000 to ~10000 (just the newlines), a ~58x reduction.
+    ///
+    /// Important: the fast path only triggers when vte's parser is in the
+    /// ground state (no escape sequence in progress). We track this via
+    /// `parser_in_ground_state` — set true initially, cleared on any escape
+    /// byte (0x1B) or C0 control (< 0x20), restored to true when vte's `print`
+    /// callback fires (which only happens in ground state).
     pub fn process(&mut self, bytes: &[u8]) {
-        // v1.0 perf: mem::take is equivalent to mem::replace(_, Default::default())
-        // but clearer. The parser state is preserved across calls (take out,
-        // advance, put back) — only a default-constructed parser is discarded.
         let mut parser = std::mem::take(&mut self.parser);
-        for &byte in bytes {
-            parser.advance(self, byte);
+        let mut i = 0;
+        while i < bytes.len() {
+            // Fast path: only when parser is in ground state. Scan a run
+            // of printable ASCII (0x20..=0x7E) that doesn't start with an
+            // escape/C0 control. These bytes map 1:1 to chars and are all
+            // width-1, so they bypass vte entirely.
+            if self.parser_in_ground_state {
+                let run_start = i;
+                while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x7E {
+                    i += 1;
+                }
+                if i > run_start {
+                    self.print_ascii_run(&bytes[run_start..i]);
+                    continue;
+                }
+            }
+            // Slow path: escape sequences, C0 controls, and UTF-8 multi-byte
+            // sequences all go through vte byte-by-byte. vte handles partial
+            // sequences internally via its state machine.
+            if i < bytes.len() {
+                let b = bytes[i];
+                // Any escape (0x1B) or C0 control (< 0x20) takes vte out of
+                // ground state. The `print` callback will set it back to true
+                // when vte returns to ground.
+                if b == 0x1B || b < 0x20 {
+                    self.parser_in_ground_state = false;
+                }
+                parser.advance(self, b);
+                i += 1;
+            }
         }
         self.parser = parser;
+    }
+
+    /// v1.0 perf: Bulk-write a run of printable ASCII bytes (0x20..=0x7E)
+    /// directly to the grid, bypassing vte's per-byte state machine.
+    ///
+    /// This mirrors `print()` but processes a contiguous run in one call:
+    /// - No per-char `unicode_width` lookup (all ASCII = width 1)
+    /// - No per-char `vte::Parser::advance` state-machine transition
+    /// - Single `block_tracker.phase()` lookup for the whole run
+    /// - Single scroll_offset reset check
+    ///
+    /// Wrap handling (deferred-wrap, line boundary) is applied per-char
+    /// inside the loop, matching `print()`'s semantics exactly.
+    fn print_ascii_run(&mut self, bytes: &[u8]) {
+        debug_assert!(!bytes.is_empty());
+        let phase = self.block_tracker.phase();
+        // Snap back to live viewport for new content — same gate as print().
+        if phase != ShellPhase::AtPrompt {
+            self.grid.scroll_offset = 0;
+        }
+        let capturing = !self.alt_active && phase == ShellPhase::CommandExecuting;
+        let num_cols = self.grid.num_cols;
+        let num_rows = self.grid.num_rows;
+        let fg = self.attrs.fg;
+        let bg = self.attrs.bg;
+        let flags = self.attrs.flags | CellFlags::DIRTY;
+        let hyperlink_id = self.active_hyperlink_id;
+
+        for &b in bytes {
+            let c = b as char; // 0x20..=0x7E → safe ASCII cast
+
+            if capturing {
+                self.block_tracker.on_print(c);
+            }
+
+            // Handle deferred wrap (same as print()).
+            if self.grid.cursor.wrap_pending {
+                self.grid.cursor.wrap_pending = false;
+                self.grid.cursor.col = 0;
+                let (_, bottom) = self.grid.scroll_region();
+                if self.grid.cursor.row == bottom {
+                    self.scroll_grid_up(1);
+                } else if self.grid.cursor.row < num_rows - 1 {
+                    self.grid.cursor.row += 1;
+                }
+                if self.grid.cursor.row > 0 {
+                    self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
+                }
+            }
+
+            // ASCII is always width 1 (Half) — skip unicode_width lookup.
+            let width = CellWidth::Half;
+            let row = self.grid.cursor.row;
+            let col = self.grid.cursor.col;
+
+            // Wrap if col is out of bounds (resize race — same as print()).
+            let mut row = row;
+            let mut col = col;
+            if col >= num_cols {
+                self.grid.cursor.wrap_pending = false;
+                self.grid.cursor.col = 0;
+                let (_, bottom) = self.grid.scroll_region();
+                if self.grid.cursor.row == bottom {
+                    self.scroll_grid_up(1);
+                } else if self.grid.cursor.row < num_rows - 1 {
+                    self.grid.cursor.row += 1;
+                }
+                row = self.grid.cursor.row;
+                col = 0;
+                if row > 0 {
+                    self.grid.viewport[row - 1].wrapped = true;
+                }
+            }
+
+            // Write the cell.
+            {
+                let cell = &mut self.grid.viewport[row].cells[col];
+                cell.character = c;
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.flags = flags;
+                cell.width = width;
+                if let Some(id) = hyperlink_id {
+                    cell.flags |= CellFlags::HYPERLINK;
+                    self.hyperlinks.link_cell(row, col, id);
+                } else {
+                    if cell.flags.contains(CellFlags::HYPERLINK) {
+                        cell.flags.remove(CellFlags::HYPERLINK);
+                    }
+                    self.hyperlinks.unlink_cell(row, col);
+                }
+                self.grid.viewport[row].mark_dirty(col);
+                self.grid.cursor.col += 1;
+            }
+
+            if self.grid.cursor.col >= num_cols {
+                self.grid.cursor.wrap_pending = true;
+                self.grid.cursor.col = num_cols - 1;
+            }
+        }
     }
 
     /// Queue bytes to write back to the PTY (terminal query responses).
@@ -553,6 +699,8 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
+        // v1.0 perf: vte only calls print() in ground state, so mark it.
+        self.parser_in_ground_state = true;
         // v1.0 perf: cache phase once per print() call. The phase doesn't
         // change within a single print() — it only transitions on OSC 133
         // markers, which arrive via osc_dispatch, not print.

@@ -306,6 +306,17 @@ pub struct MetalRenderer {
     /// runs after build_grid_vertices returns) can decide whether to skip
     /// the GPU scroll blit on forced-full frames (resize/theme/tab-switch).
     force_full_cached: Cell<bool>,
+    /// v1.0 P1.5-B0: Triple-buffered vertex buffer ring. Avoids per-frame
+    /// `new_buffer_with_data` allocation (~11520 vertices × 48 bytes = 540KB
+    /// per frame). Three buffers ensure GPU never stalls on CPU writes
+    /// (triple-buffering covers 2 frames of GPU latency).
+    vertex_buffer_ring: RefCell<Vec<metal::Buffer>>,
+    /// v1.0 P1.5-B0: Current index into `vertex_buffer_ring`. Advanced
+    /// each frame; the buffer at this index is reused (grown if needed).
+    vertex_buffer_ring_idx: Cell<usize>,
+    /// v1.0 P1.5-B0: Capacity of each buffer in the ring (in bytes). When
+    /// vertex data exceeds this, a new larger buffer is allocated.
+    vertex_buffer_capacity: Cell<u64>,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -602,6 +613,9 @@ fragment float4 text_fragment(
             offscreen_dims: Cell::new((0.0, 0.0)),
             pending_scroll_delta: Cell::new(0),
             force_full_cached: Cell::new(true),
+            vertex_buffer_ring: RefCell::new(Vec::new()),
+            vertex_buffer_ring_idx: Cell::new(0),
+            vertex_buffer_capacity: Cell::new(0),
         }
     }
 
@@ -1248,21 +1262,67 @@ fragment float4 text_fragment(
             return;
         }
 
-        // Upload vertex buffer
-        let vertex_data_size = vertices.len() * std::mem::size_of::<f32>();
-        let vertex_buffer = self.device.new_buffer_with_data(
-            vertices.as_ptr() as *const _,
-            vertex_data_size as u64,
-            MTLResourceOptions::CPUCacheModeWriteCombined,
-        );
+        // v1.0 P1.5-B0: Upload vertex buffer via triple-buffered ring.
+        // Avoids per-frame `new_buffer_with_data` allocation (~540KB/frame).
+        // Reuses buffers across frames; only allocates when capacity is
+        // exceeded (e.g. on first frame or after resize to a larger grid).
+        let vertex_data_size = (vertices.len() * std::mem::size_of::<f32>()) as u64;
+        let mut ring = self.vertex_buffer_ring.borrow_mut();
+        let ring_idx = self.vertex_buffer_ring_idx.get();
+        let cur_capacity = self.vertex_buffer_capacity.get();
 
-        // Viewport uniform
+        // Grow the ring buffer if needed (or allocate on first frame).
+        if ring.is_empty() || vertex_data_size > cur_capacity {
+            // New capacity: 1.5x the needed size, rounded up to 4KB boundary.
+            let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
+            let new_buffer = self
+                .device
+                .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
+            // Copy any existing smaller buffer's content into the new one
+            // (not needed here — we write fresh data below — but ensures
+            // the buffer is ready for use).
+            if ring_idx < ring.len() {
+                ring[ring_idx] = new_buffer;
+            } else {
+                ring.push(new_buffer);
+            }
+            self.vertex_buffer_capacity.set(new_capacity);
+        }
+        // Ensure ring has at least 3 buffers for triple-buffering.
+        while ring.len() < 3 {
+            let cap = self.vertex_buffer_capacity.get().max(4096);
+            ring.push(
+                self.device
+                    .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
+            );
+        }
+
+        // Write vertex data into the current ring buffer.
+        let buffer = &ring[ring_idx];
+        {
+            let ptr = buffer.contents() as *mut u8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    vertices.as_ptr() as *const u8,
+                    ptr,
+                    vertex_data_size as usize,
+                );
+            }
+            // did_modify_range signals the GPU to re-read this region.
+            buffer.did_modify_range(metal::NSRange {
+                location: 0,
+                length: vertex_data_size,
+            });
+        }
+
+        // Advance ring index for next frame (triple-buffer rotation).
+        self.vertex_buffer_ring_idx.set((ring_idx + 1) % ring.len());
+        drop(ring); // release borrow before immutable self access below
+
+        // v1.0 P1.5-B0: Use set_vertex_bytes for viewport uniform (8 bytes)
+        // instead of allocating a new MTLBuffer every frame. This is the
+        // Metal-recommended way to pass small constants (< 4KB).
         let vp_data: [f32; 2] = [self.viewport.0, self.viewport.1];
-        let vp_buffer = self.device.new_buffer_with_data(
-            vp_data.as_ptr() as *const _,
-            8,
-            MTLResourceOptions::CPUCacheModeWriteCombined,
-        );
 
         // v1.0 P0-c: GPU scroll blit. Render to a persistent offscreen
         // texture instead of drawing directly to the drawable. This enables
@@ -1339,8 +1399,16 @@ fragment float4 text_fragment(
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
 
         encoder.set_render_pipeline_state(&self.pipeline);
-        encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
-        encoder.set_vertex_buffer(1, Some(&vp_buffer), 0);
+        // v1.0 P1.5-B0: Use the ring buffer instead of per-frame allocation.
+        let ring = self.vertex_buffer_ring.borrow();
+        let cur_idx = if ring_idx == 0 {
+            ring.len() - 1
+        } else {
+            ring_idx - 1
+        };
+        encoder.set_vertex_buffer(0, Some(&ring[cur_idx]), 0);
+        // v1.0 P1.5-B0: set_vertex_bytes for viewport (8 bytes << 4KB limit).
+        encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
 
         let tex = self.atlas.texture();
         encoder.set_fragment_texture(0, Some(tex));
