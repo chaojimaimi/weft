@@ -279,6 +279,26 @@ pub struct MetalRenderer {
     /// differently (block/bar/underline overlay), so both the old and new
     /// cursor rows must be rebuilt when the cursor moves or blinks.
     prev_cursor_row: Cell<Option<usize>>,
+    /// v1.0 P1.5-B2: Previous frame's cursor column. Together with
+    /// `prev_cursor_row` and `prev_show_cursor`, detects cursor stability
+    /// so the cursor row can be skipped when nothing moved or blinked.
+    prev_cursor_col: Cell<Option<usize>>,
+    /// v1.0 P1.5-B2: Previous frame's `show_cursor` parameter (encodes
+    /// `cursor_visible && cursor_blink_on && prompt.is_none()`). When this
+    /// flips (blink toggle / focus change / prompt open-close), the cursor
+    /// row must be rebuilt to add or remove the cursor overlay.
+    prev_show_cursor: Cell<bool>,
+    /// v1.0 P1.5-B2: Set by `build_grid_instances` when no rows needed
+    /// rebuilding this frame (no dirty rows, no cursor change, no scroll).
+    /// `draw()` reads this to skip instance upload + draw call, relying on
+    /// the offscreen `Load` action to preserve the previous frame's grid
+    /// content. Saves the per-row rebuild loop + flatten memcpy + GPU
+    /// upload for idle frames (target: < 0.5ms no-op frame).
+    instances_unchanged: Cell<bool>,
+    /// v1.0 P1.5-B2: Previous frame's `show_blocks` flag. When the view mode
+    /// switches between block view and grid view (alt screen enter/exit), the
+    /// grid_row_cache and offscreen content are stale — force a full rebuild.
+    prev_show_blocks: Cell<bool>,
     /// v1.0 P0-b: Cached grid dimensions (rows × cols) for cache invalidation
     /// on resize.
     grid_cache_dims: Cell<(usize, usize)>,
@@ -704,6 +724,12 @@ fragment float4 text_fragment(
             grid_row_cache: RefCell::new(Vec::new()),
             force_full_grid: Cell::new(true),
             prev_cursor_row: Cell::new(None),
+            prev_cursor_col: Cell::new(None),
+            // Start true so the first frame forces a rebuild (no previous
+            // cursor state to compare against).
+            prev_show_cursor: Cell::new(true),
+            instances_unchanged: Cell::new(false),
+            prev_show_blocks: Cell::new(false),
             grid_cache_dims: Cell::new((0, 0)),
             prev_scroll_offset: Cell::new(0),
             offscreen_texture: RefCell::new(None),
@@ -761,9 +787,14 @@ fragment float4 text_fragment(
 
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
     /// tab switch, selection change, or any event that invalidates the
-    /// per-row vertex cache.
-    pub fn force_full_grid_redraw(&mut self) {
+    /// per-row vertex cache. Takes `&self` (not `&mut self`) because it only
+    /// touches `Cell` fields — needed so it can be called from within `draw()`
+    /// while a `drawable` borrow is alive.
+    pub fn force_full_grid_redraw(&self) {
         self.force_full_grid.set(true);
+        // v1.0 P1.5-B2: a forced redraw means instances WILL change — clear
+        // the unchanged flag so draw() doesn't skip the instance draw call.
+        self.instances_unchanged.set(false);
     }
 
     /// Set popup dimensions (from App drag state).
@@ -1157,6 +1188,14 @@ fragment float4 text_fragment(
         let vp_h = self.viewport.1;
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
+        // v1.0 P1.5-B2: when the view mode switches (alt screen enter/exit),
+        // the grid_row_cache and offscreen content are stale — force a full
+        // rebuild. Without this, an idle frame after the switch could set
+        // instances_unchanged=true and blit the wrong view's content.
+        if show_blocks != self.prev_show_blocks.get() {
+            self.force_full_grid_redraw();
+        }
+        self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
         // Reset popup rects — will be set by build_completion/palette/settings_vertices.
         self.completion_popup_rect = None;
@@ -1357,16 +1396,46 @@ fragment float4 text_fragment(
         // vertices (overlays / block view) are empty. In grid view with no
         // overlays, `vertices` is empty but `instances` carries the cells.
         if vertices.is_empty() && instances.is_empty() {
-            let pass_desc = RenderPassDescriptor::new();
-            let color_att = pass_desc.color_attachments().object_at(0).unwrap();
-            color_att.set_texture(Some(drawable.texture()));
-            color_att.set_load_action(MTLLoadAction::Clear);
-            color_att.set_store_action(MTLStoreAction::Store);
-            color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
-
+            // v1.0 P1.5-B2: if instances didn't change this frame (no dirty
+            // rows, no cursor toggle, no scroll) and the offscreen texture
+            // is available, the previous frame's grid content is still valid
+            // on the offscreen. Just blit offscreen → drawable — no render
+            // pass, no vertex upload, no draw calls. This is the idle-frame
+            // fast path (target: < 0.5ms).
+            let unchanged = self.instances_unchanged.get();
+            let has_offscreen = unchanged && self.ensure_offscreen_texture();
             let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_render_command_encoder(pass_desc);
-            encoder.end_encoding();
+            if has_offscreen {
+                let blit = command_buffer.new_blit_command_encoder();
+                let cache = self.offscreen_texture.borrow();
+                let src_tex = cache.as_ref().unwrap();
+                blit.copy_from_texture(
+                    src_tex,
+                    0,
+                    0,
+                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                    metal::MTLSize {
+                        width: self.viewport.0 as u64,
+                        height: self.viewport.1 as u64,
+                        depth: 1,
+                    },
+                    drawable.texture(),
+                    0,
+                    0,
+                    metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                );
+                blit.end_encoding();
+            } else {
+                // No previous content to preserve — clear to background.
+                let pass_desc = RenderPassDescriptor::new();
+                let color_att = pass_desc.color_attachments().object_at(0).unwrap();
+                color_att.set_texture(Some(drawable.texture()));
+                color_att.set_load_action(MTLLoadAction::Clear);
+                color_att.set_store_action(MTLStoreAction::Store);
+                color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+                let encoder = command_buffer.new_render_command_encoder(pass_desc);
+                encoder.end_encoding();
+            }
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
             self.hit_regions = pending_hit_regions;
@@ -1775,21 +1844,33 @@ fragment float4 text_fragment(
         }
 
         // Determine which rows need rebuilding.
+        // v1.0 P1.5-B2: only rebuild the cursor row when its state actually
+        // changed (blink toggle, move, or show/hide). Previously the cursor
+        // row was rebuilt every frame — wasteful for steady (non-blinking)
+        // cursors or idle terminals where nothing changes. `show_cursor`
+        // already encodes blink phase (caller passes
+        // `cursor_visible && cursor_blink_on && prompt.is_none()`), so a
+        // stable `show_cursor` + stable position means the cached cursor
+        // cell is still correct.
+        let cursor_changed = force_full
+            || self.prev_show_cursor.get() != show_cursor
+            || self.prev_cursor_row.get() != Some(cursor.row)
+            || self.prev_cursor_col.get() != Some(cursor.col);
         let mut rows_to_rebuild: Vec<usize> = if force_full {
             (0..num_rows).collect()
         } else {
             let mut dirty: Vec<usize> = grid.dirty_rows().map(|(r, _)| r).collect();
-            // Cursor row: the cursor cell renders differently (block/bar/
-            // underline overlay), so it must be rebuilt every frame to
-            // reflect blink state and cursor movement.
-            if !dirty.contains(&cursor.row) {
-                dirty.push(cursor.row);
-            }
-            // Previous cursor row: when the cursor moves, the old row loses
-            // its cursor overlay and must be rebuilt to show plain content.
-            if let Some(prev) = self.prev_cursor_row.get() {
-                if prev != cursor.row && !dirty.contains(&prev) {
-                    dirty.push(prev);
+            if cursor_changed {
+                if !dirty.contains(&cursor.row) {
+                    dirty.push(cursor.row);
+                }
+                // Previous cursor row: when the cursor moves, the old row
+                // loses its cursor overlay and must be rebuilt to show plain
+                // content.
+                if let Some(prev) = self.prev_cursor_row.get() {
+                    if prev != cursor.row && !dirty.contains(&prev) {
+                        dirty.push(prev);
+                    }
                 }
             }
             dirty
@@ -1798,6 +1879,8 @@ fragment float4 text_fragment(
         // Update cached state for next frame's comparison.
         self.force_full_grid.set(false);
         self.prev_cursor_row.set(Some(cursor.row));
+        self.prev_cursor_col.set(Some(cursor.col));
+        self.prev_show_cursor.set(show_cursor);
         self.prev_scroll_offset.set(grid.scroll_offset);
         self.grid_cache_dims.set((num_rows, num_cols));
 
@@ -1818,6 +1901,19 @@ fragment float4 text_fragment(
                 }
             }
         }
+
+        // v1.0 P1.5-B2: if no rows need rebuilding this frame, skip the
+        // per-cell loop + flatten memcpy + GPU upload entirely. The draw()
+        // method reads `instances_unchanged` and relies on the offscreen
+        // render pass's `Load` action to preserve the previous frame's grid
+        // content. This is the key optimization for idle frames: no terminal
+        // output, no cursor blink toggle, no scroll → no work.
+        if rows_to_rebuild.is_empty() {
+            drop(cache);
+            self.instances_unchanged.set(true);
+            return Vec::new();
+        }
+        self.instances_unchanged.set(false);
 
         for &row in &rows_to_rebuild {
             // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
