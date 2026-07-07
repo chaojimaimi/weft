@@ -1192,7 +1192,8 @@ fragment float4 text_fragment(
         // the grid_row_cache and offscreen content are stale — force a full
         // rebuild. Without this, an idle frame after the switch could set
         // instances_unchanged=true and blit the wrong view's content.
-        if show_blocks != self.prev_show_blocks.get() {
+        let view_switched = show_blocks != self.prev_show_blocks.get();
+        if view_switched {
             self.force_full_grid_redraw();
         }
         self.prev_show_blocks.set(show_blocks);
@@ -1457,16 +1458,28 @@ fragment float4 text_fragment(
             let cur_capacity = self.vertex_buffer_capacity.get();
 
             // Grow the ring buffer if needed (or allocate on first frame).
-            if ring.is_empty() || vertex_data_size > cur_capacity {
-                // New capacity: 1.5x the needed size, rounded up to 4KB boundary.
+            if ring.is_empty() {
+                // First frame: allocate 3 buffers with initial capacity.
                 let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
-                let new_buffer = self
-                    .device
-                    .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-                if ring_idx < ring.len() {
-                    ring[ring_idx] = new_buffer;
-                } else {
-                    ring.push(new_buffer);
+                for _ in 0..3 {
+                    ring.push(
+                        self.device.new_buffer(
+                            new_capacity,
+                            MTLResourceOptions::CPUCacheModeWriteCombined,
+                        ),
+                    );
+                }
+                self.vertex_buffer_capacity.set(new_capacity);
+            } else if vertex_data_size > cur_capacity {
+                // Grow: ALL buffers must be recreated at the new capacity.
+                // Only replacing ring[ring_idx] would leave the other two at
+                // the old (smaller) capacity, causing a buffer overflow when
+                // the ring rotates to them on subsequent frames.
+                let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
+                for buf in ring.iter_mut() {
+                    *buf = self
+                        .device
+                        .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
                 }
                 self.vertex_buffer_capacity.set(new_capacity);
             }
@@ -1513,15 +1526,25 @@ fragment float4 text_fragment(
             instance_ring_idx = self.instance_ring_idx.get();
             let cur_capacity = self.instance_capacity.get();
 
-            if ring.is_empty() || instance_data_size > cur_capacity {
+            if ring.is_empty() {
+                // First frame: allocate 3 buffers with initial capacity.
                 let new_capacity = (instance_data_size * 3 / 2).div_ceil(4096) * 4096;
-                let new_buffer = self
-                    .device
-                    .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-                if instance_ring_idx < ring.len() {
-                    ring[instance_ring_idx] = new_buffer;
-                } else {
-                    ring.push(new_buffer);
+                for _ in 0..3 {
+                    ring.push(
+                        self.device.new_buffer(
+                            new_capacity,
+                            MTLResourceOptions::CPUCacheModeWriteCombined,
+                        ),
+                    );
+                }
+                self.instance_capacity.set(new_capacity);
+            } else if instance_data_size > cur_capacity {
+                // Grow: recreate ALL buffers (see vertex ring comment above).
+                let new_capacity = (instance_data_size * 3 / 2).div_ceil(4096) * 4096;
+                for buf in ring.iter_mut() {
+                    *buf = self
+                        .device
+                        .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
                 }
                 self.instance_capacity.set(new_capacity);
             }
@@ -1617,14 +1640,41 @@ fragment float4 text_fragment(
             // content — P0-b only re-renders dirty rows, so Clear would wipe
             // non-dirty rows to background, causing blank/flickering content.
             // When blitting, Load preserves the blitted scroll content.
-            if self.force_full_cached.get() {
+            //
+            // Flicker fix (Step 1): block view always rebuilds ALL vertices
+            // every frame (no incremental path), so Load is correct in steady
+            // state — Clear would briefly wipe the screen to background
+            // between the clear and the redraw, which is the visible flicker.
+            // Grid view keeps using force_full_cached to decide Clear vs Load.
+            //
+            // CRITICAL: must also Clear when force_full_grid is set (new/resize
+            // offscreen texture with UNDEFINED content). Without this, Load
+            // reads garbage → severe flicker + potential GPU issues. This flag
+            // is set by ensure_offscreen_texture on (re)creation. Block view
+            // must clear it here because it doesn't call build_grid_instances
+            // (which clears it in grid view).
+            //
+            // v1.0 P1.5-B0 fix: removed `self.prev_show_blocks.get()` from the
+            // condition. Block view now uses Load (incremental rendering) just
+            // like grid view — the always-Clear was a workaround for the ring
+            // bug (ring_idx-1) and itself caused flicker. With the ring bug
+            // fixed, Load is correct for block view too.
+            let need_clear = view_switched
+                || self.force_full_grid.get()
+                || (!self.prev_show_blocks.get() && self.force_full_cached.get());
+            if need_clear {
                 color_att.set_load_action(MTLLoadAction::Clear);
                 color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+                // Block view path doesn't go through build_grid_instances,
+                // so force_full_grid would never be cleared — clear it here.
+                self.force_full_grid.set(false);
             } else {
                 color_att.set_load_action(MTLLoadAction::Load);
             }
         } else {
             color_att.set_texture(Some(drawable.texture()));
+            // No offscreen: block view uses Clear+redraw (same as grid view)
+            // because drawable Load after present is undefined in Metal.
             color_att.set_load_action(MTLLoadAction::Clear);
             color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
         }
@@ -1641,11 +1691,9 @@ fragment float4 text_fragment(
             encoder.set_render_pipeline_state(&self.instanced_pipeline);
             // Instance buffer at slot 2 (matches `[[buffer(2)]]` in shader).
             let ring = self.instance_ring.borrow();
-            let cur = if instance_ring_idx == 0 {
-                ring.len() - 1
-            } else {
-                instance_ring_idx - 1
-            };
+            // v1.0 P1.5-B0 fix: render the buffer we just wrote this frame
+            // (ring[instance_ring_idx]), NOT instance_ring_idx-1.
+            let cur = instance_ring_idx;
             encoder.set_vertex_buffer(2, Some(&ring[cur]), 0);
             // Viewport uniform at slot 1 (set_vertex_bytes, 8 bytes).
             encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
@@ -1671,11 +1719,10 @@ fragment float4 text_fragment(
         if vertex_data_size > 0 {
             encoder.set_render_pipeline_state(&self.pipeline);
             let ring = self.vertex_buffer_ring.borrow();
-            let cur = if ring_idx == 0 {
-                ring.len() - 1
-            } else {
-                ring_idx - 1
-            };
+            // v1.0 P1.5-B0 fix: render the buffer we just wrote this frame
+            // (ring[ring_idx]), NOT ring_idx-1 (which is last frame's buffer
+            // and caused content-change flicker in block view).
+            let cur = ring_idx;
             encoder.set_vertex_buffer(0, Some(&ring[cur]), 0);
             // v1.0 P1.5-B0: set_vertex_bytes for viewport (8 bytes << 4KB limit).
             encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
