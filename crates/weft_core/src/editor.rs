@@ -6,7 +6,10 @@
 
 /// A multi-line text buffer with a cursor. `cursor.0` = line index,
 /// `cursor.1` = char column within that line (0..=line_char_count).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// v1.0 H4: derives `Serialize`/`Deserialize` so tab sessions can be
+/// persisted to SQLite and restored on startup.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditorBuffer {
     pub lines: Vec<String>,
     pub cursor: (usize, usize),

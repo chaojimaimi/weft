@@ -70,7 +70,7 @@ impl Pty {
     ///
     /// `args` are passed as additional arguments to the program.
     pub fn spawn<W: Fn() + Send + 'static>(shell: &str, size: (u16, u16), wake: W) -> Result<Self> {
-        Self::spawn_with_args(shell, &[], size, &[], wake)
+        Self::spawn_with_args(shell, &[], size, &[], None, wake)
     }
 
     /// Spawn a process inside a PTY with additional arguments and env overrides.
@@ -79,11 +79,17 @@ impl Pty {
     /// environment for the child. When non-empty the child is launched with
     /// `execve` (explicit env, no `PATH` search — `program` should be absolute);
     /// when empty it uses `execvp` (inherits env, searches `PATH`) as before.
+    ///
+    /// `cwd` — if `Some(path)`, the child `chdir`s to `path` before exec, so the
+    /// shell starts in that directory without needing to send a `cd` command
+    /// (which would pollute shell history and the block tracker). `PWD` env var
+    /// is also set so shell integration OSC 7 reports the correct cwd.
     pub fn spawn_with_args<W: Fn() + Send + 'static>(
         program: &str,
         args: &[&str],
         size: (u16, u16),
         extra_env: &[(&str, &str)],
+        cwd: Option<&str>,
         wake: W,
     ) -> Result<Self> {
         let winsize = Winsize {
@@ -97,7 +103,16 @@ impl Pty {
         // here, in the parent, so the forked child of a multi-threaded tokio
         // runtime never takes the env write-lock (which can deadlock across
         // fork). The child then just `execve`s with these pre-built bytes.
-        let env_cstrings = build_child_env(extra_env);
+        // v1.0: if cwd is set, inject PWD so shell integration's OSC 7
+        // reports the correct cwd and `~` expansion works.
+        let mut env_with_cwd: Vec<(&str, String)> =
+            extra_env.iter().map(|(k, v)| (*k, v.to_string())).collect();
+        if let Some(c) = cwd {
+            env_with_cwd.push(("PWD", c.to_string()));
+        }
+        let env_refs_cwd: Vec<(&str, &str)> =
+            env_with_cwd.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let env_cstrings = build_child_env(&env_refs_cwd);
 
         // SAFETY: forkpty is safe to call — it creates a PTY pair and forks.
         // The child immediately execs, so there are no shared resources to corrupt.
@@ -105,6 +120,11 @@ impl Pty {
 
         match result {
             ForkptyResult::Child => {
+                // v1.0: chdir to the requested cwd before exec so the shell
+                // starts in the right directory without a `cd` command.
+                if let Some(c) = cwd {
+                    let _ = unistd::chdir(c);
+                }
                 // Child process: exec the program with arguments.
                 let prog_cstr = std::ffi::CString::new(program)
                     .expect("program path must not contain null bytes");
@@ -476,7 +496,7 @@ mod tests {
     /// Uses `sleep 0` (exits immediately with code 0).
     #[tokio::test]
     async fn detects_child_exit() {
-        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], || {})
+        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], None, || {})
             .expect("failed to spawn PTY");
 
         // Collect events until we get an Exit.
@@ -519,6 +539,7 @@ mod tests {
             &[],
             (24, 80),
             &[("WEFT_TEST_OVERRIDE", "sentinel-12345")],
+            None,
             || {},
         )
         .expect("failed to spawn PTY");

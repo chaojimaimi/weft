@@ -351,13 +351,19 @@ pub fn find_in_snapshot(
                 }
             }
         } else {
-            // Substring path.
+            // Substring path. When case-insensitive, compare lowercased chars.
             let mut i = 0;
             while i + needle_chars.len() <= chars.len() {
                 let matches_here = chars[i..i + needle_chars.len()]
                     .iter()
                     .zip(needle_chars.iter())
-                    .all(|((c, _), n)| c == n);
+                    .all(|((c, _), n)| {
+                        if case_sensitive {
+                            c == n
+                        } else {
+                            c.to_ascii_lowercase() == *n
+                        }
+                    });
                 if matches_here {
                     // col = cumulative cell width of chars before position i
                     let col: usize = chars[..i].iter().map(|(_, w)| *w as usize).sum();

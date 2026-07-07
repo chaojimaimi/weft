@@ -29,11 +29,18 @@ pub struct Tab {
 
 impl Tab {
     /// Create a new tab with an PTY + Terminal pair at the given size.
+    ///
+    /// `cwd` — if `Some(path)`, the shell starts in that directory (via
+    /// `chdir` in the child process before exec). Pass `None` to inherit
+    /// the weft process's cwd. Using `chdir` instead of sending a `cd`
+    /// command keeps the initial tab clean — no `cd` appears in the
+    /// terminal, shell history, or block tracker.
     pub fn new(
         rows: usize,
         cols: usize,
         scrollback_lines: usize,
         proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
+        cwd: Option<&str>,
     ) -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
         let env = crate::shell_integration_env(&shell);
@@ -46,6 +53,7 @@ impl Tab {
             &[],
             (rows as u16, cols as u16),
             &env_refs,
+            cwd,
             move || {
                 let _ = wake_proxy.send_event(AppEvent::Wake);
             },
@@ -188,5 +196,107 @@ impl Tab {
     #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.terminal.is_some() && self.pty.is_some()
+    }
+
+    /// v1.0 H4: Serialize this tab's UI state to a [`TabSnapshot`] for
+    /// SQLite persistence. Returns `None` when the terminal is missing
+    /// (PTY spawn failed — nothing worth persisting).
+    ///
+    /// The PTY itself is NOT serialized (impossible to revive). On
+    /// restore, the tab shows the saved editor draft + block history;
+    /// the user presses Enter to spawn a fresh shell in the saved cwd.
+    pub fn to_snapshot(&self, position: usize) -> Option<weft_core::persistence::TabSnapshot> {
+        let terminal = self.terminal.as_ref()?;
+        let cwd = terminal.cwd().map(|s| s.to_string());
+        let editor_buffer =
+            weft_core::persistence::TabSnapshot::encode_editor_buffer(&terminal.editor().buffer);
+        let shell_phase = match terminal.block_tracker().phase() {
+            weft_core::blocks::ShellPhase::NotIntegrated => "NotIntegrated",
+            weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
+            weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
+        };
+        Some(weft_core::persistence::TabSnapshot {
+            position,
+            cwd,
+            block_scroll_offset: self.block_scroll_offset,
+            editor_buffer,
+            shell_phase: shell_phase.to_string(),
+        })
+    }
+
+    /// v1.0 H4: Restore the editor draft + block-scroll offset from a
+    /// [`TabSnapshot`]. Called after [`Tab::new`] to apply the saved
+    /// state. The PTY + terminal are already initialized by `new`;
+    /// this just rehydrates the editor buffer and scroll offset.
+    ///
+    /// Returns `false` if the snapshot's editor buffer JSON was invalid
+    /// (the tab stays usable with an empty editor — same as a fresh tab).
+    pub fn restore_from_snapshot(&mut self, snap: &weft_core::persistence::TabSnapshot) -> bool {
+        self.block_scroll_offset = snap.block_scroll_offset;
+        let Some(terminal) = self.terminal.as_mut() else {
+            return false;
+        };
+        match weft_core::persistence::TabSnapshot::decode_editor_buffer(&snap.editor_buffer) {
+            Some(buf) => {
+                terminal.editor_mut().buffer = buf;
+                true
+            }
+            None => {
+                tracing::warn!("failed to deserialize editor buffer; using empty");
+                false
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_tab_is_not_alive() {
+        let t = Tab::empty();
+        assert!(!t.is_alive());
+    }
+
+    #[test]
+    fn empty_tab_has_no_terminal() {
+        let t = Tab::empty();
+        assert!(t.terminal.is_none());
+        assert!(t.pty.is_none());
+    }
+
+    #[test]
+    fn empty_tab_pump_pty_is_noop() {
+        let mut t = Tab::empty();
+        // Should not panic — just returns early since pty is None.
+        t.pump_pty();
+    }
+
+    #[test]
+    fn empty_tab_process_messages_returns_empty() {
+        let mut t = Tab::empty();
+        let (alive, drained, need_redraw) = t.process_messages();
+        assert!(alive);
+        assert!(drained.is_empty());
+        assert!(!need_redraw);
+    }
+
+    #[test]
+    fn empty_tab_has_zero_block_scroll() {
+        let t = Tab::empty();
+        assert_eq!(t.block_scroll_offset, 0);
+    }
+
+    #[test]
+    fn empty_tab_has_no_pending_resize() {
+        let t = Tab::empty();
+        assert!(t.pending_pty_resize.is_none());
+    }
+
+    #[test]
+    fn empty_tab_has_empty_ime_preedit() {
+        let t = Tab::empty();
+        assert!(t.ime_preedit.is_empty());
     }
 }

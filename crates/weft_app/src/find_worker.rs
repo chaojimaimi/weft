@@ -206,3 +206,108 @@ fn scan_chunk(
     }
     matches
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use weft_core::find::FindSnapshot;
+
+    fn snap(rows: &[&str]) -> Arc<FindSnapshot> {
+        let rows: Vec<Vec<(char, u8)>> = rows
+            .iter()
+            .map(|r| r.chars().map(|c| (c, 1u8)).collect())
+            .collect();
+        Arc::new(FindSnapshot { rows, num_cols: 80 })
+    }
+
+    #[test]
+    fn scan_chunk_finds_simple_query() {
+        let s = snap(&["hello world", "foo bar"]);
+        let m = scan_chunk(&s, 0, 2, "world", false, false);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].row, 0);
+        assert_eq!(m[0].col, 6);
+        assert_eq!(m[0].len, 5);
+    }
+
+    #[test]
+    fn scan_chunk_rebases_row_indices() {
+        let s = snap(&["a", "b", "hello", "c"]);
+        // Scan chunk starting at row 2.
+        let m = scan_chunk(&s, 2, 4, "hello", false, false);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].row, 2);
+    }
+
+    #[test]
+    fn scan_chunk_case_insensitive_default() {
+        let s = snap(&["Hello World"]);
+        let m = scan_chunk(&s, 0, 1, "hello", false, false);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].row, 0);
+    }
+
+    #[test]
+    fn scan_chunk_case_sensitive() {
+        let s = snap(&["Hello World"]);
+        // Case-sensitive: "hello" should NOT match "Hello".
+        let m = scan_chunk(&s, 0, 1, "hello", true, false);
+        assert_eq!(m.len(), 0);
+        // "Hello" should match.
+        let m = scan_chunk(&s, 0, 1, "Hello", true, false);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn scan_chunk_empty_query_returns_empty() {
+        let s = snap(&["hello", "world"]);
+        let m = scan_chunk(&s, 0, 2, "", false, false);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn scan_chunk_regex_mode() {
+        let s = snap(&["abc123def", "xyz"]);
+        let m = scan_chunk(&s, 0, 2, r"\d+", false, true);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].row, 0);
+        assert_eq!(m[0].col, 3);
+        assert_eq!(m[0].len, 3);
+    }
+
+    #[test]
+    fn find_worker_spawn_and_complete() {
+        let worker = FindWorker::spawn();
+        let s = snap(&["hello world", "foo"]);
+        worker.submit("world".to_string(), false, false, s);
+        // Poll for up to ~2s waiting for Complete.
+        let mut got_complete = false;
+        for _ in 0..200 {
+            if let Some(FindResult::Complete { matches, .. }) = worker.try_recv_result() {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].row, 0);
+                got_complete = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got_complete, "worker should send Complete");
+    }
+
+    #[test]
+    fn find_worker_regex_invalid() {
+        let worker = FindWorker::spawn();
+        let s = snap(&["hello"]);
+        worker.submit("(unclosed".to_string(), false, true, s);
+        let mut got_err = false;
+        for _ in 0..200 {
+            if let Some(FindResult::RegexInvalid(_)) = worker.try_recv_result() {
+                got_err = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got_err, "worker should send RegexInvalid");
+    }
+}

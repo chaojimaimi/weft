@@ -38,6 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 toml = "0.8"
+toml_edit = "0.22"
 core-graphics-types = "0.1"
 core-graphics = "0.23"
 core-text = "20.1"

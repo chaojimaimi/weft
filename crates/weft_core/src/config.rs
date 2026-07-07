@@ -738,6 +738,38 @@ impl Theme {
                 theme.palette[i] = c;
             }
         }
+        // v1.0 S5: apply per-syntax-token color overrides on top of the base
+        // theme's SyntaxColors. Each field is an optional hex string; absent
+        // fields retain the base theme's value.
+        if let Some(syn) = cfg.syntax.as_ref() {
+            if let Some(c) = syn.command.as_deref().and_then(parse_hex) {
+                theme.syntax.command = c;
+            }
+            if let Some(c) = syn.flag.as_deref().and_then(parse_hex) {
+                theme.syntax.flag = c;
+            }
+            if let Some(c) = syn.path.as_deref().and_then(parse_hex) {
+                theme.syntax.path = c;
+            }
+            if let Some(c) = syn.string.as_deref().and_then(parse_hex) {
+                theme.syntax.string = c;
+            }
+            if let Some(c) = syn.number.as_deref().and_then(parse_hex) {
+                theme.syntax.number = c;
+            }
+            if let Some(c) = syn.variable.as_deref().and_then(parse_hex) {
+                theme.syntax.variable = c;
+            }
+            if let Some(c) = syn.operator.as_deref().and_then(parse_hex) {
+                theme.syntax.operator = c;
+            }
+            if let Some(c) = syn.comment.as_deref().and_then(parse_hex) {
+                theme.syntax.comment = c;
+            }
+            if let Some(c) = syn.default.as_deref().and_then(parse_hex) {
+                theme.syntax.default = c;
+            }
+        }
         theme
     }
 
@@ -912,6 +944,10 @@ pub enum Action {
     /// Switch to the previous tab (Cmd+Shift+[ or Cmd+Shift+Left).
     #[serde(rename = "prev_tab")]
     PrevTab,
+    /// v1.0 S1: Open the Settings panel (Cmd+,). Modal overlay with tabs
+    /// for Appearance / Font / Keybindings / Window.
+    #[serde(rename = "toggle_settings")]
+    ToggleSettings,
 }
 
 /// Resolved keybinding table: physical key + modifiers → action.
@@ -946,6 +982,8 @@ impl Default for KeyBindings {
             ("cmd+w", Action::CloseTab),
             ("cmd+shift+right_bracket", Action::NextTab),
             ("cmd+shift+left_bracket", Action::PrevTab),
+            // v1.0 S1: Settings panel (macOS-standard Cmd+,).
+            ("cmd+comma", Action::ToggleSettings),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {
@@ -1018,6 +1056,214 @@ impl Config {
         }
     }
 
+    /// v1.0 S2: Save config to disk, preserving comments and unknown fields.
+    ///
+    /// Uses `toml_edit` so existing comments and layout survive the write.
+    /// Only writes fields that differ from their defaults — fields the user
+    /// never customized are left untouched (or omitted if the file is new).
+    /// Writes atomically: the new content is written to `<path>.tmp` first,
+    /// then renamed over `<path>`.
+    ///
+    /// Returns an error when:
+    ///   - the config path can't be resolved (`HOME`/`XDG_CONFIG_HOME` unset)
+    ///   - the parent directory can't be created
+    ///   - the temp-file write or rename fails
+    pub fn save(&self) -> Result<(), ConfigSaveError> {
+        let path = Self::config_path().ok_or(ConfigSaveError::NoConfigPath)?;
+        self.save_to_path(&path)
+    }
+
+    /// v1.0 S2: Save config to an explicit path. Used by [`save`] and by
+    /// tests (which pass a tempdir path).
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), ConfigSaveError> {
+        // Read the existing file as a toml_edit document (preserves comments
+        // and unknown fields). If the file doesn't exist or fails to parse,
+        // start from an empty document.
+        let existing = std::fs::read_to_string(path).ok();
+        let mut doc: toml_edit::DocumentMut = existing
+            .as_deref()
+            .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+            .unwrap_or_default();
+
+        // [font] section.
+        let default_font = FontConfig::default();
+        let font_entry = doc.entry("font").or_insert_with(toml_edit::table);
+        if font_entry.is_none() {
+            *font_entry = toml_edit::table();
+        }
+        let font = font_entry.as_table_mut().expect("font is a table");
+        set_string_if_diff(font, "family", &self.font.family, &default_font.family);
+        set_f32_if_diff(font, "size", self.font.size, default_font.size);
+        set_string_if_diff(
+            font,
+            "cjk_family",
+            &self.font.cjk_family,
+            &default_font.cjk_family,
+        );
+        set_string_if_diff(
+            font,
+            "emoji_family",
+            &self.font.emoji_family,
+            &default_font.emoji_family,
+        );
+        set_f32_if_diff(
+            font,
+            "line_height",
+            self.font.line_height,
+            default_font.line_height,
+        );
+
+        // [theme] section.
+        let default_theme = ThemeConfig::default();
+        let theme_entry = doc.entry("theme").or_insert_with(toml_edit::table);
+        if theme_entry.is_none() {
+            *theme_entry = toml_edit::table();
+        }
+        let theme = theme_entry.as_table_mut().expect("theme is a table");
+        set_string_if_diff(theme, "name", &self.theme.name, &default_theme.name);
+        set_opt_string(theme, "foreground", &self.theme.foreground);
+        set_opt_string(theme, "background", &self.theme.background);
+        set_opt_string(theme, "cursor", &self.theme.cursor);
+        set_opt_string(theme, "selection", &self.theme.selection);
+        set_opt_string(theme, "accent", &self.theme.accent);
+        set_opt_string(theme, "accent_dim", &self.theme.accent_dim);
+        set_opt_string(theme, "separator", &self.theme.separator);
+        // palette: only write if non-empty (non-default).
+        if !self.theme.palette.is_empty() {
+            let mut arr = toml_edit::Array::new();
+            for hex in &self.theme.palette {
+                arr.push(hex.as_str());
+            }
+            theme["palette"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+        }
+        // follow_system: only write if non-default (true).
+        if self.theme.follow_system {
+            theme["follow_system"] = toml_edit::value(true);
+        } else if theme.contains_key("follow_system") {
+            theme["follow_system"] = toml_edit::value(false);
+        }
+        // light_name / dark_name: write if set.
+        if let Some(ln) = &self.theme.light_name {
+            theme["light_name"] = toml_edit::value(ln.as_str());
+        }
+        if let Some(dn) = &self.theme.dark_name {
+            theme["dark_name"] = toml_edit::value(dn.as_str());
+        }
+        // [theme.syntax] subsection.
+        if let Some(syn) = &self.theme.syntax {
+            let mut syntax_table = toml_edit::table();
+            let st = syntax_table.as_table_mut().unwrap();
+            set_opt_string(st, "command", &syn.command);
+            set_opt_string(st, "flag", &syn.flag);
+            set_opt_string(st, "path", &syn.path);
+            set_opt_string(st, "string", &syn.string);
+            set_opt_string(st, "number", &syn.number);
+            set_opt_string(st, "variable", &syn.variable);
+            set_opt_string(st, "operator", &syn.operator);
+            set_opt_string(st, "comment", &syn.comment);
+            set_opt_string(st, "default", &syn.default);
+            // Only write the [theme.syntax] table if at least one field is
+            // set (avoid emitting an empty `[theme.syntax]` section).
+            if st.iter().count() > 0 {
+                theme["syntax"] = syntax_table;
+            }
+        }
+
+        // [window] section.
+        let default_window = WindowConfig::default();
+        let window_entry = doc.entry("window").or_insert_with(toml_edit::table);
+        if window_entry.is_none() {
+            *window_entry = toml_edit::table();
+        }
+        let window = window_entry.as_table_mut().expect("window is a table");
+        set_u32_if_diff(window, "width", self.window.width, default_window.width);
+        set_u32_if_diff(window, "height", self.window.height, default_window.height);
+        set_string_if_diff(window, "title", &self.window.title, &default_window.title);
+        set_f32_if_diff(
+            window,
+            "opacity",
+            self.window.opacity,
+            default_window.opacity,
+        );
+        set_u32_if_diff(
+            window,
+            "padding_x",
+            self.window.padding_x,
+            default_window.padding_x,
+        );
+        set_u32_if_diff(
+            window,
+            "padding_y",
+            self.window.padding_y,
+            default_window.padding_y,
+        );
+
+        // [scrollback] section.
+        let default_scrollback = ScrollbackConfig::default();
+        let scrollback_entry = doc.entry("scrollback").or_insert_with(toml_edit::table);
+        if scrollback_entry.is_none() {
+            *scrollback_entry = toml_edit::table();
+        }
+        let scrollback = scrollback_entry
+            .as_table_mut()
+            .expect("scrollback is a table");
+        set_usize_if_diff(
+            scrollback,
+            "lines",
+            self.scrollback.lines,
+            default_scrollback.lines,
+        );
+
+        // [editor] section.
+        if self.editor.submit_on_ctrl_enter {
+            let editor_entry = doc.entry("editor").or_insert_with(toml_edit::table);
+            if editor_entry.is_none() {
+                *editor_entry = toml_edit::table();
+            }
+            let editor = editor_entry.as_table_mut().expect("editor is a table");
+            editor["submit_on_ctrl_enter"] = toml_edit::value(true);
+        }
+
+        // [keybindings] section.
+        if !self.keybindings.is_empty() {
+            let mut kb_table = toml_edit::table();
+            let kt = kb_table.as_table_mut().unwrap();
+            for (binding, action) in &self.keybindings {
+                let action_str = match action {
+                    Action::Copy => "copy",
+                    Action::Paste => "paste",
+                    Action::ReloadConfig => "reload_config",
+                    Action::ScrollPageUp => "scroll_page_up",
+                    Action::ScrollPageDown => "scroll_page_down",
+                    Action::ScrollToTop => "scroll_to_top",
+                    Action::ScrollToBottom => "scroll_to_bottom",
+                    Action::ToggleBlockPanel => "toggle_block_panel",
+                    Action::ToggleCommandPalette => "toggle_command_palette",
+                    Action::ZoomIn => "zoom_in",
+                    Action::ZoomOut => "zoom_out",
+                    Action::ZoomReset => "zoom_reset",
+                    Action::FindInGrid => "find_in_grid",
+                    Action::ToggleTheme => "toggle_theme",
+                    Action::NewTab => "new_tab",
+                    Action::CloseTab => "close_tab",
+                    Action::NextTab => "next_tab",
+                    Action::PrevTab => "prev_tab",
+                    Action::ToggleSettings => "toggle_settings",
+                };
+                kt.insert(binding, toml_edit::value(action_str));
+            }
+            doc["keybindings"] = kb_table;
+        }
+
+        // Atomic write: <path>.tmp → rename → <path>.
+        let parent = path.parent().ok_or(ConfigSaveError::NoParentDir)?;
+        std::fs::create_dir_all(parent).map_err(ConfigSaveError::Io)?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, doc.to_string()).map_err(ConfigSaveError::Io)?;
+        std::fs::rename(&tmp, path).map_err(ConfigSaveError::Io)?;
+        Ok(())
+    }
+
     /// The config file path: `$XDG_CONFIG_HOME/weft/config.toml`, else
     /// `~/.config/weft/config.toml`. `None` when neither env var is set.
     pub fn config_path() -> Option<PathBuf> {
@@ -1041,6 +1287,96 @@ impl Config {
     pub fn keybindings(&self) -> KeyBindings {
         KeyBindings::from_overrides(&self.keybindings)
     }
+}
+
+/// v1.0 S2: Error returned by [`Config::save`].
+#[derive(Debug)]
+pub enum ConfigSaveError {
+    /// Neither `HOME` nor `XDG_CONFIG_HOME` is set, so the config path
+    /// can't be resolved.
+    NoConfigPath,
+    /// The config path has no parent directory (shouldn't happen in
+    /// practice, but handle it gracefully).
+    NoParentDir,
+    /// An I/O error occurred while creating the parent dir, writing the
+    /// temp file, or renaming it over the target.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for ConfigSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoConfigPath => write!(
+                f,
+                "cannot save config: HOME and XDG_CONFIG_HOME are both unset"
+            ),
+            Self::NoParentDir => write!(f, "config path has no parent directory"),
+            Self::Io(e) => write!(f, "config save failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+// ── toml_edit helper functions (S2) ─────────────────────────────────────
+
+/// Set a string field in a toml_edit table. If the new value differs from
+/// the default, write it; if it equals the default, remove any existing
+/// entry so the default takes effect on reload.
+fn set_string_if_diff(table: &mut toml_edit::Table, key: &str, new: &str, default: &str) {
+    if new == default {
+        // v1.0 fix: remove the key so the default takes effect on reload.
+        // Previously this returned early without touching the table, leaving
+        // any old value in the file — so saving `name = "weft-warm"` (the
+        // default) didn't clear a previously-saved `name = "solarized-dark"`.
+        if table.contains_key(key) {
+            table.remove(key);
+        }
+        return;
+    }
+    table.insert(key, toml_edit::value(new));
+}
+
+/// Set an optional string field. If `new` is `Some`, write it; if `None`,
+/// remove any existing entry for the key (the override is cleared).
+fn set_opt_string(table: &mut toml_edit::Table, key: &str, new: &Option<String>) {
+    match new {
+        Some(s) => {
+            table.insert(key, toml_edit::value(s.as_str()));
+        }
+        None => {
+            // Don't forcibly remove — the user may have a comment they want
+            // to keep. Just leave any existing entry in place.
+        }
+    }
+}
+
+fn set_f32_if_diff(table: &mut toml_edit::Table, key: &str, new: f32, default: f32) {
+    if (new - default).abs() < f32::EPSILON {
+        return;
+    }
+    table.insert(key, toml_edit::value(f64::from(new)));
+}
+
+fn set_u32_if_diff(table: &mut toml_edit::Table, key: &str, new: u32, default: u32) {
+    if new == default {
+        return;
+    }
+    table.insert(key, toml_edit::value(i64::from(new)));
+}
+
+fn set_usize_if_diff(table: &mut toml_edit::Table, key: &str, new: usize, default: usize) {
+    if new == default {
+        return;
+    }
+    table.insert(key, toml_edit::value(i64::try_from(new).unwrap_or(0)));
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1091,6 +1427,28 @@ pub struct ThemeConfig {
     /// v0.9 U-D1: theme name to use when system appearance is Dark.
     /// Defaults to "weft-warm" when None.
     pub dark_name: Option<String>,
+    /// v1.0 S5: per-syntax-token color overrides. Each field is an optional
+    /// hex string (`"#rrggbb"`); when present it overrides the base theme's
+    /// `SyntaxColors` field of the same name. Applied after the inline
+    /// color overrides in [`Theme::resolve_named`].
+    pub syntax: Option<SyntaxConfig>,
+}
+
+/// v1.0 S5: TOML-facing syntax color overrides. All fields optional; absent
+/// fields inherit from the resolved base theme. Mirrors the 9 fields of
+/// [`SyntaxColors`].
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SyntaxConfig {
+    pub command: Option<String>,
+    pub flag: Option<String>,
+    pub path: Option<String>,
+    pub string: Option<String>,
+    pub number: Option<String>,
+    pub variable: Option<String>,
+    pub operator: Option<String>,
+    pub comment: Option<String>,
+    pub default: Option<String>,
 }
 
 // Manual Default (deriving would give name = "").
@@ -1109,6 +1467,7 @@ impl Default for ThemeConfig {
             follow_system: false,
             light_name: None,
             dark_name: None,
+            syntax: None,
         }
     }
 }
@@ -1831,5 +2190,356 @@ name = "weft-light"
             let back: Action = serde_json::from_str(&s).unwrap();
             assert_eq!(back, action, "serde roundtrip failed for {name}");
         }
+    }
+
+    // ── v1.0 S5: [theme.syntax] config override tests ─────────────────
+
+    #[test]
+    fn syntax_config_default_is_all_none() {
+        let s = SyntaxConfig::default();
+        assert!(s.command.is_none());
+        assert!(s.flag.is_none());
+        assert!(s.path.is_none());
+        assert!(s.string.is_none());
+        assert!(s.number.is_none());
+        assert!(s.variable.is_none());
+        assert!(s.operator.is_none());
+        assert!(s.comment.is_none());
+        assert!(s.default.is_none());
+    }
+
+    #[test]
+    fn theme_config_syntax_defaults_none() {
+        // ThemeConfig::default() should leave syntax as None (no overrides).
+        let cfg = ThemeConfig::default();
+        assert!(cfg.syntax.is_none());
+    }
+
+    #[test]
+    fn syntax_override_parses_from_toml() {
+        let toml_text = r##"
+[theme]
+name = "weft-warm"
+
+[theme.syntax]
+command = "#ff0000"
+flag = "#00ff00"
+path = "#0000ff"
+"##;
+        let c: Config = toml::from_str(toml_text).unwrap();
+        let syn = c.theme.syntax.expect("syntax section should parse");
+        assert_eq!(syn.command.as_deref(), Some("#ff0000"));
+        assert_eq!(syn.flag.as_deref(), Some("#00ff00"));
+        assert_eq!(syn.path.as_deref(), Some("#0000ff"));
+        // Unspecified fields are None.
+        assert!(syn.string.is_none());
+        assert!(syn.number.is_none());
+        assert!(syn.comment.is_none());
+    }
+
+    #[test]
+    fn syntax_override_applies_to_resolved_theme() {
+        // v1.0 S5: [theme.syntax] fields override the base theme's
+        // SyntaxColors. Specified fields change; unspecified fields retain
+        // the base theme's value.
+        let warm = Theme::weft_warm();
+        let cfg = ThemeConfig {
+            name: "weft-warm".into(),
+            syntax: Some(SyntaxConfig {
+                command: Some("#ff0000".into()),
+                flag: Some("#00ff00".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        // Overridden fields.
+        assert_eq!(theme.syntax.command, Color::rgb(0xff, 0x00, 0x00));
+        assert_eq!(theme.syntax.flag, Color::rgb(0x00, 0xff, 0x00));
+        // Unspecified fields inherit from the base theme.
+        assert_eq!(theme.syntax.path, warm.syntax.path);
+        assert_eq!(theme.syntax.string, warm.syntax.string);
+        assert_eq!(theme.syntax.comment, warm.syntax.comment);
+        assert_eq!(theme.syntax.default, warm.syntax.default);
+    }
+
+    #[test]
+    fn syntax_override_all_nine_fields() {
+        let cfg = ThemeConfig {
+            name: "weft-warm".into(),
+            syntax: Some(SyntaxConfig {
+                command: Some("#111111".into()),
+                flag: Some("#222222".into()),
+                path: Some("#333333".into()),
+                string: Some("#444444".into()),
+                number: Some("#555555".into()),
+                variable: Some("#666666".into()),
+                operator: Some("#777777".into()),
+                comment: Some("#888888".into()),
+                default: Some("#999999".into()),
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        assert_eq!(theme.syntax.command, Color::rgb(0x11, 0x11, 0x11));
+        assert_eq!(theme.syntax.flag, Color::rgb(0x22, 0x22, 0x22));
+        assert_eq!(theme.syntax.path, Color::rgb(0x33, 0x33, 0x33));
+        assert_eq!(theme.syntax.string, Color::rgb(0x44, 0x44, 0x44));
+        assert_eq!(theme.syntax.number, Color::rgb(0x55, 0x55, 0x55));
+        assert_eq!(theme.syntax.variable, Color::rgb(0x66, 0x66, 0x66));
+        assert_eq!(theme.syntax.operator, Color::rgb(0x77, 0x77, 0x77));
+        assert_eq!(theme.syntax.comment, Color::rgb(0x88, 0x88, 0x88));
+        assert_eq!(theme.syntax.default, Color::rgb(0x99, 0x99, 0x99));
+    }
+
+    #[test]
+    fn syntax_override_works_with_inline_color_override() {
+        // v1.0 S5: [theme.syntax] composes with inline color overrides —
+        // both apply, and they touch independent fields.
+        let cfg = ThemeConfig {
+            name: "weft-warm".into(),
+            accent: Some("#abcdef".into()),
+            syntax: Some(SyntaxConfig {
+                command: Some("#ff0000".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        // Inline accent override.
+        assert_eq!(theme.accent, Color::rgb(0xab, 0xcd, 0xef));
+        // Syntax override.
+        assert_eq!(theme.syntax.command, Color::rgb(0xff, 0x00, 0x00));
+        // Unspecified syntax fields inherit base.
+        let warm = Theme::weft_warm();
+        assert_eq!(theme.syntax.flag, warm.syntax.flag);
+    }
+
+    #[test]
+    fn syntax_override_invalid_hex_is_silently_ignored() {
+        // v1.0 S5: an invalid hex string is skipped (parse_hex returns None),
+        // leaving the base theme's value intact. This matches the behavior of
+        // the existing inline color overrides.
+        let warm = Theme::weft_warm();
+        let cfg = ThemeConfig {
+            name: "weft-warm".into(),
+            syntax: Some(SyntaxConfig {
+                command: Some("not-a-color".into()),
+                flag: Some("#00ff00".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        // Invalid command override → retained from base.
+        assert_eq!(theme.syntax.command, warm.syntax.command);
+        // Valid flag override → applied.
+        assert_eq!(theme.syntax.flag, Color::rgb(0x00, 0xff, 0x00));
+    }
+
+    #[test]
+    fn syntax_override_applies_to_all_themes() {
+        // v1.0 S5: syntax overrides apply regardless of the base theme name.
+        // Verify with warp_dark.
+        let warp = Theme::warp_dark();
+        let cfg = ThemeConfig {
+            name: "warp".into(),
+            syntax: Some(SyntaxConfig {
+                command: Some("#abcdef".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let theme = Theme::resolve(&cfg);
+        assert_eq!(theme.syntax.command, Color::rgb(0xab, 0xcd, 0xef));
+        // Unspecified fields inherit from warp base.
+        assert_eq!(theme.syntax.flag, warp.syntax.flag);
+        assert_eq!(theme.syntax.path, warp.syntax.path);
+    }
+
+    // ── v1.0 S2: Config::save() tests ──────────────────────────────────
+
+    fn unique_tmp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("weft-config-save-{pid}-{id}-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    #[test]
+    fn save_default_config_creates_empty_file() {
+        // Saving a default Config should produce a parseable file (with no
+        // sections, since nothing differs from defaults).
+        let path = unique_tmp_path("default");
+        let cfg = Config::default();
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Default config writes nothing (all fields match defaults).
+        // The file should be valid TOML (possibly empty).
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.font.family, "Menlo");
+        assert_eq!(reloaded.theme.name, "weft-warm");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_and_reload_roundtrip() {
+        // A Config with non-default fields should survive a save → reload
+        // cycle.
+        let path = unique_tmp_path("roundtrip");
+        let cfg = Config {
+            font: FontConfig {
+                family: "Monaco".into(),
+                size: 16.0,
+                ..Default::default()
+            },
+            theme: ThemeConfig {
+                name: "warp".into(),
+                accent: Some("#ff0000".into()),
+                syntax: Some(SyntaxConfig {
+                    command: Some("#abcdef".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            window: WindowConfig {
+                width: 1024,
+                height: 768,
+                ..Default::default()
+            },
+            scrollback: ScrollbackConfig { lines: 50_000 },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.font.family, "Monaco");
+        assert_eq!(reloaded.font.size, 16.0);
+        assert_eq!(reloaded.theme.name, "warp");
+        assert_eq!(reloaded.theme.accent.as_deref(), Some("#ff0000"));
+        assert_eq!(
+            reloaded.theme.syntax.as_ref().unwrap().command.as_deref(),
+            Some("#abcdef")
+        );
+        assert_eq!(reloaded.window.width, 1024);
+        assert_eq!(reloaded.window.height, 768);
+        assert_eq!(reloaded.scrollback.lines, 50_000);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_preserves_user_comments() {
+        // v1.0 S2: toml_edit preserves comments. Write a file with a comment,
+        // save over it, and verify the comment survives.
+        let path = unique_tmp_path("comments");
+        std::fs::write(
+            &path,
+            "# this is my comment\n[font]\nfamily = \"Menlo\"\nsize = 14.0\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            font: FontConfig {
+                size: 18.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# this is my comment"),
+            "comment should be preserved: {text}"
+        );
+        assert!(text.contains("size = 18"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_preserves_unknown_fields() {
+        // v1.0 S2: unknown fields the user added should survive the save.
+        let path = unique_tmp_path("unknown");
+        std::fs::write(
+            &path,
+            "[font]\nsize = 14.0\n\n[unknown_section]\nfoo = \"bar\"\n",
+        )
+        .unwrap();
+        let cfg = Config::default();
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("foo = \"bar\""),
+            "unknown field should survive"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_only_writes_non_default_fields() {
+        // v1.0 S2: fields that match defaults shouldn't appear in the output
+        // (keeps the file clean for a fresh save).
+        let path = unique_tmp_path("nondefault");
+        let cfg = Config {
+            font: FontConfig {
+                size: 18.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        // size should be written (non-default).
+        assert!(text.contains("size = 18"));
+        // family should NOT be written (matches default "Menlo").
+        assert!(
+            !text.contains("family = \"Menlo\""),
+            "default family should not be written"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_creates_parent_dir() {
+        // v1.0 S2: save should create the parent directory if it doesn't
+        // exist.
+        let dir =
+            std::env::temp_dir().join(format!("weft-config-save-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("a/b/c/config.toml");
+        let cfg = Config::default();
+        cfg.save_to_path(&nested).expect("save should succeed");
+        assert!(nested.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_error_display() {
+        // v1.0 S2: ConfigSaveError should have a useful Display impl.
+        let e = ConfigSaveError::NoConfigPath;
+        assert!(format!("{e}").contains("HOME"));
+        let e = ConfigSaveError::NoParentDir;
+        assert!(format!("{e}").contains("parent"));
+        let e = ConfigSaveError::Io(std::io::Error::from_raw_os_error(13));
+        assert!(format!("{e}").contains("config save failed"));
+    }
+
+    #[test]
+    fn toggle_settings_has_default_keybinding() {
+        // v1.0 S1: Cmd+, opens Settings.
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char(','), Modifiers::SUPER),
+            Some(Action::ToggleSettings)
+        );
+    }
+
+    #[test]
+    fn toggle_settings_serde_roundtrip() {
+        let s = "\"toggle_settings\"";
+        let back: Action = serde_json::from_str(s).unwrap();
+        assert_eq!(back, Action::ToggleSettings);
     }
 }

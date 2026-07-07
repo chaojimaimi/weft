@@ -47,6 +47,8 @@ pub(crate) enum AppEvent {
     Wake,
     /// Config file changed on disk — reload and re-apply live.
     ConfigReload,
+    /// v1.0 H4: Periodic 30s timer fired — persist tab snapshots.
+    TabsAutoSave,
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -58,6 +60,10 @@ struct App {
     /// Currently always has exactly one tab; Stage 2 adds Cmd+T/W multi-tab.
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// v1.0 P0-b: tab index that was drawn last frame. When this differs
+    /// from `active_tab`, the renderer's per-row grid cache is stale (built
+    /// from a different terminal's grid) — force a full redraw.
+    prev_drawn_tab: usize,
     /// v0.9 W1+: index of the tab currently hovered by the mouse, or `None`
     /// when the cursor is outside the tab bar. Drives the Warp-style
     /// hover-to-show close "×" button. Reset on tab close/switch and on
@@ -96,6 +102,11 @@ struct App {
     keybindings: KeyBindings,
     /// Current theme state for ToggleTheme builtin command (true = dark).
     theme_is_dark: bool,
+    /// v1.0: the user's preferred dark theme name, remembered across
+    /// Cmd+Shift+T toggles so toggling dark→light→dark returns to the
+    /// user's chosen dark theme (e.g. "solarized-dark") instead of the
+    /// default "weft-warm".
+    preferred_dark_theme: String,
     /// v0.9 U-D1: last queried macOS system appearance (None = not yet
     /// queried). When `[theme] follow_system = true`, polled once per
     /// second in `poll_system_appearance` and the theme is hot-swapped
@@ -216,6 +227,23 @@ struct App {
     /// True when a find query is in-flight on the worker. Used to suppress
     /// redundant submits while a scan is running.
     find_worker_busy: bool,
+
+    // ── Settings panel (v1.0 S1, Cmd+,) ───────────────────────────────
+    /// Whether the Settings overlay is open.
+    settings_open: bool,
+    /// Which tab is active (Appearance / Font / Keybindings / Window).
+    settings_tab: crate::overlay::SettingsTab,
+    /// Row cursor in the active tab's content area.
+    settings_selection: usize,
+    /// The working config copy the user edits in the panel. Applied on Enter
+    /// (save) or discarded on Esc. Initialized from the live config when the
+    /// panel opens.
+    settings_draft: weft_core::config::Config,
+    /// True when the draft has unsaved changes (drives the "Save?" hint).
+    settings_dirty: bool,
+    /// v1.0 H4: set to true when the user closes the last tab — the main
+    /// event loop checks this and calls `event_loop.exit()`.
+    should_exit: bool,
 }
 
 /// Which border is being dragged to resize a popup.
@@ -373,11 +401,25 @@ impl App {
             "config loaded"
         );
         let keybindings = config.keybindings();
+        // v1.0: extract preferred_dark_theme before moving config into Self.
+        let preferred_dark_theme = {
+            let name = &config.theme.name;
+            if !name.contains("light") && !name.is_empty() {
+                name.clone()
+            } else {
+                config
+                    .theme
+                    .dark_name
+                    .clone()
+                    .unwrap_or_else(|| "weft-warm".into())
+            }
+        };
         Self {
             window: None,
             renderer: None,
             tabs: Vec::new(),
             active_tab: 0,
+            prev_drawn_tab: 0,
             hovered_tab: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
@@ -391,6 +433,7 @@ impl App {
             config,
             keybindings,
             theme_is_dark: true, // default to dark theme
+            preferred_dark_theme,
             last_system_appearance_dark: None,
             last_appearance_check: std::time::Instant::now(),
             block_store: None,
@@ -430,11 +473,17 @@ impl App {
             find_worker: find_worker::FindWorker::spawn(),
             find_regex_error: None,
             find_worker_busy: false,
+            settings_open: false,
+            settings_tab: crate::overlay::SettingsTab::Appearance,
+            settings_selection: 0,
+            settings_draft: weft_core::config::Config::default(),
+            settings_dirty: false,
+            should_exit: false,
         }
     }
 
     fn spawn_pty(&mut self, rows: usize, cols: usize) {
-        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy);
+        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
         self.tabs.push(tab);
     }
 
@@ -634,6 +683,11 @@ impl App {
             return;
         }
 
+        // v1.0 S1: Settings panel (modal — captures all keys when open).
+        if self.settings_open && self.handle_settings_key(key, m, text) {
+            return;
+        }
+
         // FindInGrid bar (just below palette in priority — both close on Esc
         // and capture typed text into their respective inputs).
         if self.find_open && self.handle_find_key(key, m, text) {
@@ -754,7 +808,9 @@ impl App {
                     // vice versa) so only one modal owns keyboard input at a
                     // time. Without this, Cmd+F then Cmd+P leaves both
                     // popups open and keystrokes go to the wrong one.
+                    // v1.0 S1: also close the Settings panel.
                     self.close_find();
+                    self.close_settings();
                     self.palette_query.clear();
                     self.palette_selection = 0;
                     self.palette_form = None;
@@ -772,7 +828,9 @@ impl App {
                 self.find_open = !self.find_open;
                 if self.find_open {
                     // v0.9 fix: opening find closes the palette (see above).
+                    // v1.0 S1: also close the Settings panel.
                     self.close_palette();
+                    self.close_settings();
                     self.find_query.clear();
                     self.find_matches.clear();
                     self.find_index = 0;
@@ -804,6 +862,22 @@ impl App {
             }
             Action::PrevTab => {
                 self.prev_tab();
+                true
+            }
+            Action::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                if self.settings_open {
+                    // Mutual exclusion: close other modals.
+                    self.close_palette();
+                    self.close_find();
+                    // Initialize the working draft from the live config so
+                    // edits in the panel don't immediately apply.
+                    self.settings_draft = self.config.clone();
+                    self.settings_tab = crate::overlay::SettingsTab::Appearance;
+                    self.settings_selection = 0;
+                    self.settings_dirty = false;
+                }
+                self.request_redraw();
                 true
             }
         }
@@ -894,6 +968,17 @@ impl App {
         self.palette_selection = 0;
         self.palette_form = None;
         self.palette_submode = PaletteSubMode::Search;
+    }
+
+    /// v1.0 S1: close the Settings panel, discarding any unsaved draft
+    /// changes. Used when another modal opens so only one owns keyboard
+    /// input.
+    fn close_settings(&mut self) {
+        if !self.settings_open {
+            return;
+        }
+        self.settings_open = false;
+        self.settings_dirty = false;
     }
 
     /// Refresh the palette search results from the workflow store + builtin commands.
@@ -1032,6 +1117,229 @@ impl App {
                 true
             }
         }
+    }
+
+    // ── Settings panel (v1.0 S1, Cmd+,) ────────────────────────────────
+
+    /// v1.0 S1: Handle a key while the Settings panel is open. Returns
+    /// true if consumed. Modal — captures all non-modifier-chord keys so
+    /// the panel owns keyboard input while visible.
+    ///
+    /// Key map:
+    /// - `Esc` → close without saving (discard draft)
+    /// - `Tab` → cycle to next tab
+    /// - `↑` / `↓` → navigate selection within the active tab
+    /// - `Enter` → apply selected row (e.g. pick a theme); marks the draft
+    ///   dirty; does NOT close the panel
+    /// - `Cmd+Enter` → save draft to disk & close
+    /// - other chords with Cmd/Ctrl/Alt fall through to keybindings
+    fn handle_settings_key(&mut self, key: KeyCode, mods: Modifiers, _text: Option<&str>) -> bool {
+        use crate::overlay::SettingsTab;
+
+        // Cmd+Enter: save draft to disk & close.
+        if mods.contains(Modifiers::SUPER) && key == KeyCode::Enter {
+            if self.settings_dirty {
+                if let Err(e) = self.settings_draft.save() {
+                    tracing::warn!(error = ?e, "failed to save settings draft");
+                }
+                // Apply the new config immediately so theme/font changes
+                // take effect without a restart. reload_config() reads the
+                // freshly-saved file and calls apply_config(), which
+                // rebuilds the renderer theme + atlas.
+                self.reload_config();
+            }
+            self.settings_open = false;
+            self.request_redraw();
+            return true;
+        }
+
+        // Let other modifier chords fall through (so Cmd+, can toggle
+        // closed, Cmd+Q still quits, etc.).
+        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
+            return false;
+        }
+
+        match key {
+            KeyCode::Escape => {
+                // Close without saving (discard draft).
+                self.settings_open = false;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Tab => {
+                // Cycle to the next tab (wraps around).
+                let tabs = SettingsTab::ALL;
+                let idx = tabs
+                    .iter()
+                    .position(|t| *t == self.settings_tab)
+                    .unwrap_or(0);
+                self.settings_tab = tabs[(idx + 1) % tabs.len()];
+                self.settings_selection = 0;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Up => {
+                if self.settings_selection > 0 {
+                    self.settings_selection -= 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Down => {
+                let max = self.settings_tab_row_count().saturating_sub(1);
+                if self.settings_selection < max {
+                    self.settings_selection += 1;
+                }
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                // Apply the selected row in the active tab to the draft.
+                self.apply_settings_selection();
+                self.request_redraw();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// v1.0 S1: Number of selectable rows in the active Settings tab.
+    fn settings_tab_row_count(&self) -> usize {
+        use crate::overlay::SettingsTab;
+        match self.settings_tab {
+            SettingsTab::Appearance => self.settings_theme_views().len(),
+            SettingsTab::Font => 4, // family, size, cjk_family, emoji_family
+            SettingsTab::Keybindings => self.settings_keybinding_views().len(),
+            SettingsTab::Window => 5, // opacity, padding_x, padding_y, width, height
+        }
+    }
+
+    /// v1.0 S1: Apply the currently-selected row in the active tab to the
+    /// draft. In v1.0 only the Appearance tab is interactive (theme
+    /// selection); the other tabs are read-only display.
+    fn apply_settings_selection(&mut self) {
+        use crate::overlay::SettingsTab;
+        match self.settings_tab {
+            SettingsTab::Appearance => {
+                if let Some(view) = self
+                    .settings_theme_views()
+                    .get(self.settings_selection)
+                    .copied()
+                {
+                    if self.settings_draft.theme.name != view.name {
+                        self.settings_draft.theme.name = view.name.to_string();
+                        // Disable follow_system so the user's explicit theme
+                        // choice takes precedence over the system appearance.
+                        // Otherwise apply_config would ignore `name` and pick
+                        // the theme from system light/dark mode.
+                        self.settings_draft.theme.follow_system = false;
+                        // v1.0: remember the user's preferred dark theme so
+                        // Cmd+Shift+T can toggle back to it. If the selected
+                        // theme is dark (name doesn't contain "light"), update
+                        // preferred_dark_theme.
+                        if !view.name.contains("light") {
+                            self.preferred_dark_theme = view.name.to_string();
+                        }
+                        self.settings_dirty = true;
+                    }
+                }
+            }
+            SettingsTab::Font | SettingsTab::Keybindings | SettingsTab::Window => {
+                // Read-only in v1.0 — no edits from keyboard.
+            }
+        }
+    }
+
+    /// v1.0 S1: The list of built-in themes for the Appearance tab. The
+    /// order matches `Theme::resolve_named`'s match arms so the list
+    /// stays in sync with the resolver.
+    fn settings_theme_views(&self) -> Vec<crate::overlay::SettingsThemeView> {
+        use crate::overlay::SettingsThemeView;
+        vec![
+            SettingsThemeView {
+                name: "weft-warm",
+                label: "Weft Warm (default)",
+            },
+            SettingsThemeView {
+                name: "weft-light",
+                label: "Weft Light",
+            },
+            SettingsThemeView {
+                name: "warp",
+                label: "Warp Dark",
+            },
+            SettingsThemeView {
+                name: "dracula",
+                label: "Dracula",
+            },
+            SettingsThemeView {
+                name: "solarized-dark",
+                label: "Solarized Dark",
+            },
+            SettingsThemeView {
+                name: "gruvbox-dark",
+                label: "Gruvbox Dark",
+            },
+            SettingsThemeView {
+                name: "nord",
+                label: "Nord",
+            },
+            SettingsThemeView {
+                name: "tokyo-night",
+                label: "Tokyo Night",
+            },
+            SettingsThemeView {
+                name: "catppuccin",
+                label: "Catppuccin Mocha",
+            },
+            SettingsThemeView {
+                name: "one-dark",
+                label: "One Dark",
+            },
+            SettingsThemeView {
+                name: "monokai-pro",
+                label: "Monokai Pro",
+            },
+        ]
+    }
+
+    /// v1.0 S1: The list of keybinding rows for the Keybindings tab
+    /// (read-only display). Built from the resolved keybinding table.
+    fn settings_keybinding_views(&self) -> Vec<crate::overlay::SettingsKeybindingView> {
+        use crate::overlay::SettingsKeybindingView;
+        // Reverse-lookup: action → chord. The keybindings map is
+        // (KeyCode, Modifiers) → Action, so we iterate and collect.
+        let mut views = Vec::new();
+        for (chord, action) in &self.keybindings.map {
+            let label = match action {
+                weft_core::config::Action::Copy => "Copy",
+                weft_core::config::Action::Paste => "Paste",
+                weft_core::config::Action::ReloadConfig => "Reload Config",
+                weft_core::config::Action::ScrollPageUp => "Scroll Page Up",
+                weft_core::config::Action::ScrollPageDown => "Scroll Page Down",
+                weft_core::config::Action::ScrollToTop => "Scroll To Top",
+                weft_core::config::Action::ScrollToBottom => "Scroll To Bottom",
+                weft_core::config::Action::ToggleBlockPanel => "Toggle Block Panel",
+                weft_core::config::Action::ToggleCommandPalette => "Command Palette",
+                weft_core::config::Action::ZoomIn => "Zoom In",
+                weft_core::config::Action::ZoomOut => "Zoom Out",
+                weft_core::config::Action::ZoomReset => "Zoom Reset",
+                weft_core::config::Action::FindInGrid => "Find In Grid",
+                weft_core::config::Action::ToggleTheme => "Toggle Theme",
+                weft_core::config::Action::NewTab => "New Tab",
+                weft_core::config::Action::CloseTab => "Close Tab",
+                weft_core::config::Action::NextTab => "Next Tab",
+                weft_core::config::Action::PrevTab => "Previous Tab",
+                weft_core::config::Action::ToggleSettings => "Settings",
+            };
+            views.push(SettingsKeybindingView {
+                action: label.to_string(),
+                binding: chord_label(chord.0, chord.1),
+            });
+        }
+        // Sort by action label for stable display.
+        views.sort_by(|a, b| a.action.cmp(&b.action));
+        views
     }
 
     /// Handle a single-key palette action (create/edit/delete/export).
@@ -2447,7 +2755,8 @@ impl App {
     /// Cmd+T — open a new tab with a fresh shell session and switch to it.
     fn new_tab(&mut self) {
         let (rows, cols) = self.current_size();
-        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy);
+        // New tabs inherit the weft process's cwd (None = no chdir).
+        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         // Apply the current theme palette to the new terminal so it matches
@@ -2460,6 +2769,9 @@ impl App {
         }
         info!(tab_idx = self.active_tab, "new tab created");
         self.refresh_find_for_active_tab();
+        // v1.0 H4: persist immediately so a crash before the 30s auto-save
+        // doesn't lose the new tab.
+        self.save_all_tabs();
         self.request_redraw();
     }
 
@@ -2468,9 +2780,13 @@ impl App {
     /// returns `true`.
     fn close_tab(&mut self) -> bool {
         if self.tabs.len() <= 1 {
-            // Last tab closed → exit the app.
+            // Last tab closed → exit the app. Set the flag so the event
+            // loop can call `event_loop.exit()` (we can't call it here
+            // because we don't have access to the ActiveEventLoop).
             info!("closing last tab, exiting app");
-            return false;
+            self.save_all_tabs();
+            self.should_exit = true;
+            return true;
         }
         let removed_idx = self.active_tab;
         let _tab = self.tabs.remove(removed_idx);
@@ -2485,9 +2801,31 @@ impl App {
             self.active_tab = self.tabs.len() - 1;
         }
         info!(closed = removed_idx, active = self.active_tab, "tab closed");
+        // v1.0 H4: persist the updated tab list so the closed tab stays
+        // closed on restart.
+        self.save_all_tabs();
         self.refresh_find_for_active_tab();
         self.request_redraw();
         true
+    }
+
+    /// v1.0 H4: Serialize all live tabs to the SQLite `tabs` table so the
+    /// session layout (cwd + editor drafts) survives restarts. Best-effort:
+    /// failures are logged but don't interrupt the caller. The PTY itself
+    /// is NOT persisted (impossible to revive); only UI state is saved.
+    pub fn save_all_tabs(&self) {
+        let Some(store) = &self.block_store else {
+            return;
+        };
+        let snaps: Vec<_> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tab)| tab.to_snapshot(i))
+            .collect();
+        if let Err(e) = store.save_tabs(&snaps) {
+            tracing::warn!(error = %e, "failed to save tab snapshots");
+        }
     }
 
     /// v0.9 H1 Stage 4: re-bind the global find state to the active tab.
@@ -2556,14 +2894,19 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                // v0.9 fix: handle root path "/" — rsplit('/').next() on "/"
-                // returns "" (empty string). Fall back to "/" for root.
+                // v1.0 fix: show full path when short (≤ 20 chars, e.g.
+                // "/tmp", "/usr/local"), otherwise show basename only to
+                // keep the tab label compact. Root "/" is kept as-is.
                 let cwd = tab.terminal.as_ref().and_then(|t| t.cwd()).map(|c| {
-                    let base = c.rsplit('/').next().unwrap_or("");
-                    if base.is_empty() {
-                        "/".to_string()
+                    if c.len() <= 20 {
+                        c.to_string()
                     } else {
-                        base.to_string()
+                        let base = c.rsplit('/').next().unwrap_or("");
+                        if base.is_empty() {
+                            "/".to_string()
+                        } else {
+                            base.to_string()
+                        }
                     }
                 });
                 // v0.9 W1: when a command is running, show "cwd · cmd". When
@@ -2603,33 +2946,45 @@ impl App {
     }
 
     fn toggle_theme(&mut self) {
-        // v0.9 U-D1: when `follow_system` is enabled, manual toggle is a
-        // no-op — the system appearance wins on the next poll.
+        // v1.0: Cmd+Shift+T now cycles through ALL built-in themes
+        // (not just dark↔light). Find the current theme in the list and
+        // advance to the next one, wrapping around at the end.
         if self.config.theme.follow_system {
-            info!("toggle_theme ignored: follow_system is enabled");
-            return;
+            self.config.theme.follow_system = false;
+            info!("follow_system disabled by manual toggle");
         }
-        self.theme_is_dark = !self.theme_is_dark;
-        // v0.9 W2+ fix: route through resolve_named (not the raw constructor)
-        // so inline `[theme]` overrides AND non-default theme names (e.g.
-        // `name = "warp"`) survive a Cmd+Shift+T toggle. Previously this
-        // called Theme::weft_dark()/weft_light() directly, which silently
-        // dropped user customizations on every toggle.
-        let cfg = &self.config.theme;
-        let name = if self.theme_is_dark {
-            cfg.dark_name.as_deref().unwrap_or("weft-warm")
-        } else {
-            cfg.light_name.as_deref().unwrap_or("weft-light")
-        };
-        let theme = weft_core::config::Theme::resolve_named(name, cfg);
+        let themes = self.settings_theme_views();
+        let current = &self.config.theme.name;
+        // Find current theme index; default to 0 if not found.
+        let idx = themes.iter().position(|t| t.name == current).unwrap_or(0);
+        let next = &themes[(idx + 1) % themes.len()];
+        let name = next.name.to_string();
+        // Determine if the new theme is dark (for theme_is_dark tracking).
+        let is_light = name.contains("light");
+        self.theme_is_dark = !is_light;
+        if !is_light {
+            self.preferred_dark_theme = name.clone();
+        }
+        // Update config.theme.name so the Settings panel reflects the
+        // currently active theme after a toggle.
+        self.config.theme.name = name.clone();
+        // v1.0 fix: sync settings_draft so the Settings panel shows the
+        // current theme when toggling while the panel is open.
+        if self.settings_open {
+            self.settings_draft.theme.name = name.clone();
+        }
+        let theme = weft_core::config::Theme::resolve_named(&name, &self.config.theme);
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        // Reseed the terminal's ANSI palette so existing cells recolor.
-        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
-            t.set_palette(theme.palette);
+        // Reseed ALL tabs' palettes, not just the active one — otherwise
+        // switching tabs shows the old theme's ANSI colors.
+        for tab in &mut self.tabs {
+            if let Some(t) = &mut tab.terminal {
+                t.set_palette(theme.palette);
+            }
         }
-        info!(dark = self.theme_is_dark, name, "theme toggled");
+        info!(dark = self.theme_is_dark, name, "theme cycled");
         self.request_redraw();
     }
 
@@ -2646,6 +3001,12 @@ impl App {
             t.set_palette(theme.palette);
         }
         self.theme_is_dark = dark;
+        // v1.0: sync config.theme.name + preferred_dark_theme so Settings
+        // panel and Cmd+Shift+T stay in sync with the palette picker.
+        self.config.theme.name = name.to_string();
+        if dark {
+            self.preferred_dark_theme = name.to_string();
+        }
         info!(dark, name, "theme applied");
         self.request_redraw();
     }
@@ -2892,6 +3253,13 @@ impl App {
         }
         if let Some(t) = &mut self.tabs[self.active_tab].terminal {
             t.set_palette(theme.palette);
+        }
+        // v1.0: sync preferred_dark_theme from the freshly loaded config.
+        let cfg_name = &config.theme.name;
+        if !cfg_name.contains("light") && !cfg_name.is_empty() {
+            self.preferred_dark_theme = cfg_name.clone();
+        } else if let Some(dn) = &config.theme.dark_name {
+            self.preferred_dark_theme = dn.clone();
         }
 
         // Font — rebuild the atlas (cell dimensions may change → recompute).
@@ -4471,13 +4839,19 @@ impl ApplicationHandler<AppEvent> for App {
     /// Cross-thread wake-up (PTY output or blink timer): schedule one redraw.
     /// The pump/process/draw happens in `WindowEvent::RedrawRequested`, so we
     /// avoid the vsync busy-loop while still reacting promptly to output.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: AppEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::Wake => self.request_redraw(),
             AppEvent::ConfigReload => {
                 self.reload_config();
                 self.request_redraw();
             }
+            AppEvent::TabsAutoSave => {
+                self.save_all_tabs();
+            }
+        }
+        if self.should_exit {
+            event_loop.exit();
         }
     }
 
@@ -4594,6 +4968,91 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
 
+        // v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
+        // session layout survives restarts. The first tab (spawned above by
+        // spawn_pty) is replaced if saved snapshots exist; otherwise it stays
+        // as a fresh shell. The PTY itself is NOT revived — each restored tab
+        // gets a fresh shell, with the editor draft rehydrated.
+        //
+        // v1.0 fix: cwd is restored via `chdir` in the child process before
+        // exec (Pty::spawn_with_args `cwd` param), NOT by sending a `cd`
+        // command. Sending `cd` polluted the terminal, shell history, and
+        // block tracker with a spurious `cd <cwd>` block. With chdir the
+        // shell starts in the right directory silently — the initial tab
+        // stays clean. If the saved cwd equals the weft process's cwd (the
+        // common case when launching from the same directory), no rebuild
+        // is needed — the initial tab already has the right cwd.
+        if let Some(store) = &self.block_store {
+            match store.load_tabs() {
+                Ok(snaps) if !snaps.is_empty() => {
+                    info!(count = snaps.len(), "restoring saved tab snapshots");
+                    let (rows, cols) = self.current_size();
+                    let total = snaps.len();
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    let weft_cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    for (i, snap) in snaps.iter().enumerate() {
+                        let saved_cwd = snap.cwd.clone();
+                        // Filter: only apply cwd if non-empty, != $HOME, and
+                        // != the weft process's current cwd (the last check
+                        // avoids a needless tab rebuild in the common case of
+                        // launching from the same directory).
+                        let cwd_to_apply = saved_cwd
+                            .as_deref()
+                            .filter(|c| !c.is_empty() && *c != home && *c != weft_cwd);
+                        if i == 0 {
+                            // First tab: rebuild with chdir only if a different
+                            // cwd is needed; otherwise reuse the existing tab
+                            // (already spawned with weft's cwd).
+                            if cwd_to_apply.is_some() {
+                                self.tabs[0] = Tab::new(
+                                    rows,
+                                    cols,
+                                    self.config.scrollback.lines,
+                                    &self.proxy,
+                                    cwd_to_apply,
+                                );
+                                if let Some(t) = &mut self.tabs[0].terminal {
+                                    if let Some(r) = &self.renderer {
+                                        t.set_palette(r.theme().palette);
+                                    }
+                                }
+                            }
+                            self.tabs[0].restore_from_snapshot(snap);
+                        } else {
+                            let mut tab = Tab::new(
+                                rows,
+                                cols,
+                                self.config.scrollback.lines,
+                                &self.proxy,
+                                cwd_to_apply,
+                            );
+                            tab.restore_from_snapshot(snap);
+                            if let Some(t) = &mut tab.terminal {
+                                if let Some(r) = &self.renderer {
+                                    t.set_palette(r.theme().palette);
+                                }
+                            }
+                            self.tabs.push(tab);
+                        }
+                    }
+                    // Clear saved tabs so a crash during the session doesn't
+                    // re-restore stale state on the next launch — the periodic
+                    // auto-save will re-persist the live state.
+                    let _ = store.clear_tabs();
+                    self.active_tab = 0;
+                    info!(restored = total, "tab snapshots restored");
+                }
+                Ok(_) => {
+                    // No saved tabs — fresh launch, keep the initial tab.
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load tab snapshots; starting fresh");
+                }
+            }
+        }
+
         // Open the workflow DB (best-effort) and seed built-in templates on
         // first launch.
         self.workflow_store = weft_cache_dir().and_then(|cache| {
@@ -4643,6 +5102,19 @@ impl ApplicationHandler<AppEvent> for App {
             });
         }
 
+        // v1.0 H4: periodic auto-save (every 30s) so a crash doesn't lose
+        // the tab layout + editor drafts. Best-effort — failures are logged
+        // inside `save_all_tabs`. Runs on a background thread, wakes the loop
+        // via AppEvent::TabsAutoSave (handled synchronously on the main
+        // thread, which owns `&mut self`).
+        let save_proxy = self.proxy.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            if save_proxy.send_event(AppEvent::TabsAutoSave).is_err() {
+                break; // event loop exited
+            }
+        });
+
         self.request_redraw();
     }
 
@@ -4655,6 +5127,9 @@ impl ApplicationHandler<AppEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Window closed");
+                // v1.0 H4: persist tab state so the session restores on
+                // next launch.
+                self.save_all_tabs();
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
@@ -4773,8 +5248,21 @@ impl ApplicationHandler<AppEvent> for App {
                 // The returned `TabBarDrawState` is owned and lives for the
                 // whole draw call.
                 let tab_bar = self.tab_bar_state();
+                // v1.0 S1: compute Settings panel view data before the
+                // mutable `tab` borrow below — settings_theme_views() and
+                // settings_keybinding_views() borrow self immutably, which
+                // would conflict with &mut self.tabs[active].
+                let settings_themes = self.settings_theme_views();
+                let settings_keybindings = self.settings_keybinding_views();
                 let tab = &mut self.tabs[active];
+                // v1.0 P0-b: when the active tab changed since the last frame,
+                // the renderer's per-row grid cache is stale — force a full
+                // redraw before drawing.
+                let tab_changed = active != self.prev_drawn_tab;
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
+                    if tab_changed {
+                        renderer.force_full_grid_redraw();
+                    }
                     // Sync popup dimensions to renderer (user-adjustable via border drag).
                     renderer.set_popup_size(self.popup_width_scale, self.popup_max_rows);
                     // Sync context menu target to renderer.
@@ -4835,6 +5323,9 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     };
 
+                    // v1.0 S1: build Settings panel overlay stack. The
+                    // settings_themes and settings_keybindings Vecs were
+                    // computed before the mutable `tab` borrow above.
                     let overlays = crate::overlay::build_overlay_stack(
                         terminal,
                         renderer.viewport_width(),
@@ -4852,6 +5343,19 @@ impl ApplicationHandler<AppEvent> for App {
                         &palette_banner,
                         &palette_submode_input,
                         terminal.editor().buffer.selection_range(),
+                        self.settings_open,
+                        self.settings_tab,
+                        self.settings_selection,
+                        &self.settings_draft.theme.name,
+                        &settings_themes,
+                        &self.settings_draft.font.family,
+                        self.settings_draft.font.size,
+                        self.settings_draft.font.line_height,
+                        self.settings_draft.window.opacity,
+                        self.settings_draft.window.padding_x,
+                        self.settings_draft.window.padding_y,
+                        self.settings_draft.scrollback.lines,
+                        &settings_keybindings,
                     );
                     // v0.8 U6: compute block-content metrics for the dynamic
                     // scrollbar thumb (total/visible/max_scroll). None in grid
@@ -4951,6 +5455,15 @@ impl ApplicationHandler<AppEvent> for App {
                         scroll_metrics,
                         &tab_bar,
                     );
+                }
+
+                // v1.0 P0-b: clear the grid's per-row dirty flags now that
+                // the renderer has consumed them. The next frame will mark
+                // rows dirty only if new PTY output / cursor movement changes
+                // them, enabling incremental rendering.
+                self.prev_drawn_tab = active;
+                if let Some(t) = &mut tab.terminal {
+                    t.grid_mut().clear_all_dirty();
                 }
 
                 // No busy-loop redraw here: the PTY reader thread and the
@@ -5079,6 +5592,10 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             _ => {}
+        }
+        // v1.0 H4: check should_exit flag (set by close_tab on last tab).
+        if self.should_exit {
+            event_loop.exit();
         }
     }
 }
@@ -5341,6 +5858,55 @@ fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
     } else {
         fallback
     }
+}
+
+/// v1.0 S1: Format a `(KeyCode, Modifiers)` pair as a human-readable chord
+/// string (e.g. "cmd+c", "shift+page_up", "cmd+shift+t"). Used by the
+/// Settings panel's Keybindings tab.
+fn chord_label(key: weft_core::input::KeyCode, mods: weft_core::input::Modifiers) -> String {
+    use weft_core::input::{KeyCode, Modifiers};
+    let mut parts: Vec<&str> = Vec::new();
+    if mods.contains(Modifiers::SUPER) {
+        parts.push("cmd");
+    }
+    if mods.contains(Modifiers::SHIFT) {
+        parts.push("shift");
+    }
+    if mods.contains(Modifiers::ALT) {
+        parts.push("alt");
+    }
+    if mods.contains(Modifiers::CONTROL) {
+        parts.push("ctrl");
+    }
+    let key_str = match key {
+        KeyCode::Char(c) => {
+            // Lowercase letters for chord display (cmd+c not cmd+C).
+            return {
+                let mut s = parts.join("+");
+                if !s.is_empty() {
+                    s.push('+');
+                }
+                s.push(c.to_ascii_lowercase());
+                s
+            };
+        }
+        KeyCode::Enter => "enter",
+        KeyCode::Backspace => "backspace",
+        KeyCode::Tab => "tab",
+        KeyCode::Escape => "esc",
+        KeyCode::Up => "up",
+        KeyCode::Down => "down",
+        KeyCode::Left => "left",
+        KeyCode::Right => "right",
+        KeyCode::Home => "home",
+        KeyCode::End => "end",
+        KeyCode::PageUp => "page_up",
+        KeyCode::PageDown => "page_down",
+        KeyCode::Delete => "delete",
+        _ => "other",
+    };
+    parts.push(key_str);
+    parts.join("+")
 }
 
 /// Resolve weft's cache dir: `$XDG_CACHE_HOME/weft`, else `~/.cache/weft`.

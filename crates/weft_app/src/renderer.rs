@@ -7,7 +7,9 @@ use metal::{
     RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
 };
 use objc2::msg_send;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use tracing::info;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -19,28 +21,6 @@ use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 use weft_core::syntax::{self, TokenKind};
 use weft_core::vt::Terminal;
-
-/// Count how many visual rows a text line occupies when wrapped at `cols`
-/// columns. Wide characters consume 2 columns.
-fn wrapped_row_count(text: &str, cols: usize) -> usize {
-    if cols == 0 {
-        return 1;
-    }
-    let mut rows = 1;
-    let mut col = 0usize;
-    for c in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if w == 0 {
-            continue;
-        }
-        if col + w > cols {
-            rows += 1;
-            col = 0;
-        }
-        col += w;
-    }
-    rows.max(1)
-}
 
 /// Iterator yielding wrapped row chunks of `text` at `cols` columns. Each
 /// yielded `String` fits within `cols` columns (respecting wide-char widths).
@@ -68,6 +48,134 @@ fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
     }
     chunks.push(current);
     chunks.into_iter()
+}
+
+// ── v1.0 P0-a: Block layout cache ──────────────────────────────────────
+//
+// Finished blocks have immutable `output` (it's a detached snapshot), so
+// the per-line wrapping computation (`wrapped_row_count` / `wrap_line_chunks`)
+// only needs to run once per block — unless `cols` changes (resize) or the
+// block's content/collapse state changes. This cache eliminates the
+// O(total_output_chars) per-frame cost reintroduced when the
+// `MAX_LAYOUT_LINES` cap was removed from historical blocks.
+//
+// The live in-flight block is NOT cached (its output streams every frame).
+
+/// Pre-computed wrapping data for a single output line of a block.
+#[derive(Clone)]
+struct CachedLine {
+    /// 0-based line index within the block's output (before trimming).
+    idx: usize,
+    /// Byte offset of this line's start within `block.output`.
+    byte_start: usize,
+    /// Byte offset of this line's end (exclusive) within `block.output`.
+    byte_end: usize,
+    /// Pre-wrapped chunks (owned via `Rc` for cheap sharing between the
+    /// cache and the per-frame `LaidRow` entries). Usually 1 element;
+    /// more for lines that exceed `cols` columns.
+    chunks: Rc<[String]>,
+}
+
+/// Cached layout for a single finished block.
+#[derive(Clone)]
+struct CachedBlockLayout {
+    /// Snapshot of `block.output.len()` — if the current block's output
+    /// length differs, the cache is stale.
+    output_len: usize,
+    /// Snapshot of `block.command.len()`.
+    command_len: usize,
+    /// Snapshot of `block.collapsed` — toggling invalidates.
+    collapsed: bool,
+    /// `cols` used to compute wrapping — resize invalidates.
+    cols: usize,
+    /// Whether the block has any non-empty output lines (cached foldable
+    /// check, avoids re-scanning the last 500 lines every frame).
+    foldable: bool,
+    /// Pre-trimmed, pre-wrapped line metadata. Trailing empty/prompt lines
+    /// are already removed, matching the original trimming logic.
+    lines: Vec<CachedLine>,
+}
+
+/// Per-renderer block layout cache. Keyed by `BlockId.0`.
+#[derive(Default)]
+struct BlockLayoutCache {
+    entries: HashMap<u64, CachedBlockLayout>,
+}
+
+impl BlockLayoutCache {
+    /// Ensure `block` has a cached layout for `cols`. Recomputes only if
+    /// the block is new, its output/command changed, `collapsed` was
+    /// toggled, or `cols` changed (resize).
+    fn ensure_cached(&mut self, block: &Block, cols: usize) {
+        let id = block.id.0;
+        let needs_rebuild = match self.entries.get(&id) {
+            None => true,
+            Some(c) => {
+                c.output_len != block.output.len()
+                    || c.command_len != block.command.len()
+                    || c.collapsed != block.collapsed
+                    || c.cols != cols
+            }
+        };
+        if needs_rebuild {
+            self.entries.insert(id, compute_block_layout(block, cols));
+        }
+    }
+
+    fn get(&self, id: u64) -> &CachedBlockLayout {
+        self.entries
+            .get(&id)
+            .expect("ensure_cached must be called before get")
+    }
+}
+
+/// Compute the layout for a single block (expensive — call once, then cache).
+fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
+    // Foldable: does the block have ANY non-empty output line in the last 500?
+    let foldable = block
+        .output
+        .lines()
+        .rev()
+        .take(500)
+        .any(|l| !l.trim().is_empty());
+
+    // Collect raw lines and trim trailing empty/prompt lines.
+    let raw_lines: Vec<&str> = block.output.lines().collect();
+    let mut trimmed_len = raw_lines.len();
+    while trimmed_len > 0 {
+        let t = raw_lines[trimmed_len - 1].trim();
+        if t.is_empty() || matches!(t, "%" | "$" | "#") {
+            trimmed_len -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Pre-compute wrapped chunks for each surviving line.
+    let lines: Vec<CachedLine> = raw_lines[..trimmed_len]
+        .iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let byte_start = line.as_ptr() as usize - block.output.as_ptr() as usize;
+            let byte_end = byte_start + line.len();
+            let chunks: Rc<[String]> = Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
+            CachedLine {
+                idx,
+                byte_start,
+                byte_end,
+                chunks,
+            }
+        })
+        .collect();
+
+    CachedBlockLayout {
+        output_len: block.output.len(),
+        command_len: block.command.len(),
+        collapsed: block.collapsed,
+        cols,
+        foldable,
+        lines,
+    }
 }
 
 /// Metal GPU renderer: draws the terminal Grid to screen.
@@ -110,6 +218,9 @@ pub struct MetalRenderer {
     /// drag-resize hot-zone detection. None when the popup wasn't drawn.
     pub completion_popup_rect: Option<[f32; 4]>, // [x0, y0, x1, y1]
     pub palette_popup_rect: Option<[f32; 4]>,
+    /// v1.0 S1: Last-rendered Settings panel rect (physical pixels).
+    /// `None` when the panel wasn't drawn this frame.
+    pub settings_popup_rect: Option<[f32; 4]>,
     /// Last-rendered block-view rows (scroll-adjusted y bands + visible text),
     /// for mouse hit-testing and selection in the block view. Repopulated each
     /// draw when `show_block_view()` is true; cleared otherwise. Empty when the
@@ -148,6 +259,33 @@ pub struct MetalRenderer {
     /// Uses `Cell` for interior mutability — `draw` holds an immutable borrow
     /// of `self.layer` (from `next_drawable`) so `&mut self` is unavailable.
     pub prompt_box_rect: Cell<Option<[f32; 4]>>,
+    /// v1.0 P0-a: Cache for block view layouts. Eliminates redundant O(n)
+    /// per-frame wrapping computation for finished historical blocks.
+    /// Uses `RefCell` because `draw()` holds an immutable borrow of
+    /// `self.layer` (from `next_drawable`) across the entire frame, so
+    /// `&mut self` is unavailable for cache mutation.
+    block_layout_cache: RefCell<BlockLayoutCache>,
+    /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
+    /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
+    /// the previous frame. Eliminates per-frame iteration of all
+    /// `num_rows × num_cols` cells when only a few rows changed (typical
+    /// terminal output: 1-3 rows per frame).
+    grid_row_cache: RefCell<Vec<Vec<f32>>>,
+    /// v1.0 P0-b: Force a full grid redraw on the next draw. Set by the caller
+    /// on resize / theme / tab switch / selection change. Cleared after the
+    /// full redraw is performed.
+    force_full_grid: Cell<bool>,
+    /// v1.0 P0-b: Previous frame's cursor row. The cursor cell renders
+    /// differently (block/bar/underline overlay), so both the old and new
+    /// cursor rows must be rebuilt when the cursor moves or blinks.
+    prev_cursor_row: Cell<Option<usize>>,
+    /// v1.0 P0-b: Cached grid dimensions (rows × cols) for cache invalidation
+    /// on resize.
+    grid_cache_dims: Cell<(usize, usize)>,
+    /// v1.0 P0-b: Previous frame's scroll offset. When the user scrolls
+    /// scrollback, the rendered cells come from history (not dirty-tracked),
+    /// so a full redraw is needed.
+    prev_scroll_offset: Cell<usize>,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -425,6 +563,7 @@ fragment float4 text_fragment(
             context_menu_target: None,
             completion_popup_rect: None,
             palette_popup_rect: None,
+            settings_popup_rect: None,
             block_view_rows: Vec::new(),
             layout_ctx: None,
             find_state: None,
@@ -433,6 +572,12 @@ fragment float4 text_fragment(
             panel_highlight: None,
             cursor_blink_on: true,
             prompt_box_rect: Cell::new(None),
+            block_layout_cache: RefCell::new(BlockLayoutCache::default()),
+            grid_row_cache: RefCell::new(Vec::new()),
+            force_full_grid: Cell::new(true),
+            prev_cursor_row: Cell::new(None),
+            grid_cache_dims: Cell::new((0, 0)),
+            prev_scroll_offset: Cell::new(0),
         }
     }
 
@@ -441,6 +586,15 @@ fragment float4 text_fragment(
     /// the terminal palette, so no rebuild is needed).
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
+        // Colors are baked into cached vertices — force a full rebuild.
+        self.force_full_grid.set(true);
+    }
+
+    /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
+    /// tab switch, selection change, or any event that invalidates the
+    /// per-row vertex cache.
+    pub fn force_full_grid_redraw(&mut self) {
+        self.force_full_grid.set(true);
     }
 
     /// Set popup dimensions (from App drag state).
@@ -673,6 +827,15 @@ fragment float4 text_fragment(
             }
             None
         });
+        // v1.0 S1: Settings panel (Cmd+,).
+        let settings = overlays.layers.iter().find_map(|l| {
+            if l.kind == OverlayKind::Settings {
+                if let OverlayContent::Settings(s) = &l.content {
+                    return Some(s);
+                }
+            }
+            None
+        });
 
         // Clear color from the theme background, scaled by window opacity so a
         // transparent window's uncovered area shows the desktop.
@@ -793,6 +956,12 @@ fragment float4 text_fragment(
                 }
                 missing.extend(p.submode_input.chars());
             }
+            // v1.0 S1: warm up the Settings panel (Cmd+,) — tab labels,
+            // status text, theme names, font family, keybinding strings.
+            if let Some(s) = settings {
+                use crate::overlay::OverlayWarmup;
+                OverlayContent::Settings(*s).warm_chars(&mut missing);
+            }
             // v0.9 fix: warm up the tab bar close button "×" and separator
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
@@ -812,9 +981,10 @@ fragment float4 text_fragment(
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
-        // Reset popup rects — will be set by build_completion/palette_vertices.
+        // Reset popup rects — will be set by build_completion/palette/settings_vertices.
         self.completion_popup_rect = None;
         self.palette_popup_rect = None;
+        self.settings_popup_rect = None;
         // Reset find button hit-test rects — set by build_find_vertices.
         self.find_buttons = None;
         let mut vertices = if show_blocks {
@@ -872,8 +1042,9 @@ fragment float4 text_fragment(
         // v0.8 U6 scrollbar: dynamic thumb position + height proportional to
         // visible/total content. The thumb sits in a track spanning the block
         // region; its vertical position reflects block_scroll (scrolled up →
-        // thumb near top). Color uses theme.accent_dim (Quiet — barely visible
-        // until you scroll). Only drawn when content overflows the viewport.
+        // thumb near top). v1.0: color uses label_c (was accent_dim —
+        // invisible in Nord/Warp themes). Still subtle but always readable.
+        // Only drawn when content overflows the viewport.
         if show_blocks {
             if let Some((total, visible, max_scroll)) = scroll_metrics {
                 if visible < total && max_scroll > 0 {
@@ -892,7 +1063,15 @@ fragment float4 text_fragment(
                     // block_scroll=max_scroll → thumb at top.
                     let scroll_ratio = block_scroll as f32 / max_scroll as f32;
                     let thumb_y = track_top + (track_h - thumb_h) * (1.0 - scroll_ratio);
-                    let thumb_color = color_to_normalized(self.theme.accent_dim);
+                    // v1.0: label_c (70% fg + 30% bg) — was accent_dim.
+                    let fg_v = color_to_normalized(self.theme.foreground);
+                    let bg_v = color_to_normalized(self.theme.background);
+                    let thumb_color = [
+                        fg_v[0] * 0.70 + bg_v[0] * 0.30,
+                        fg_v[1] * 0.70 + bg_v[1] * 0.30,
+                        fg_v[2] * 0.70 + bg_v[2] * 0.30,
+                        1.0,
+                    ];
                     let (su, sv, suw, svh) = self.space_uv();
                     let bg_uv = [su, sv + svh, su + suw, sv];
                     push_quad(
@@ -953,6 +1132,13 @@ fragment float4 text_fragment(
             let (pv, rect) = self.build_palette_vertices(p);
             self.palette_popup_rect = rect;
             vertices.extend_from_slice(&pv);
+        }
+
+        // v1.0 S1: Settings panel (Cmd+,) — centered modal overlay.
+        if let Some(s) = settings {
+            let (sv, rect) = self.build_settings_vertices(*s);
+            self.settings_popup_rect = rect;
+            vertices.extend_from_slice(&sv);
         }
 
         // Context menu overlay (F7) — drawn at mouse position.
@@ -1073,22 +1259,137 @@ fragment float4 text_fragment(
         let num_rows = grid.num_rows;
         let num_cols = grid.num_cols;
 
-        let mut vertices = Vec::with_capacity(num_rows * num_cols * 72);
-
         // Theme-derived colors (resolved per-frame from the active theme).
         let default_fg = color_to_normalized(self.theme.foreground);
         let default_bg = color_to_normalized(self.theme.background);
         let cursor_color = color_to_normalized(self.theme.cursor);
+        // v1.0 fix: use an accent-based blend (35% accent + 65% background)
+        // for the selection color. The old approach used `theme.selection`
+        // directly, but many themes had selection colors too close to the
+        // background (e.g. solarized-dark: bg #002b36, selection #073642 —
+        // nearly invisible at 55% opacity). The accent color is designed
+        // to contrast with the background, so blending it in ensures the
+        // selection is visible across ALL themes. Each theme gets a
+        // different selection tint because the accent varies per theme.
         let selection_bg = {
-            let mut c = color_to_normalized(self.theme.selection);
-            // Semi-transparent so the underlying text stays readable (v0.8
-            // user testing flagged the fully-opaque selection as obscuring
-            // the selected characters).
-            c[3] = 0.55;
+            let accent = color_to_normalized(self.theme.accent);
+            let mut c = [
+                accent[0] * 0.35 + default_bg[0] * 0.65,
+                accent[1] * 0.35 + default_bg[1] * 0.65,
+                accent[2] * 0.35 + default_bg[2] * 0.65,
+                1.0,
+            ];
+            // Semi-transparent so the underlying text stays readable.
+            c[3] = 0.60;
             c
         };
 
-        for row in 0..num_rows {
+        // v1.0 P0-b: incremental grid rendering. Instead of iterating every
+        // cell every frame, we cache per-row vertices and only rebuild rows
+        // that changed (dirty-tracked by Grid). A full redraw is forced when:
+        //   - the caller signals a global change (resize/theme/tab-switch)
+        //   - the grid scrolled (scroll_offset differs → scrollback cells shown)
+        //   - the grid dimensions changed (resize reflow)
+        // Cursor row is always rebuilt (blink / move changes the cursor cell).
+        let force_full = self.force_full_grid.get()
+            || grid.scroll_offset != self.prev_scroll_offset.get()
+            || self.grid_cache_dims.get() != (num_rows, num_cols)
+            // Selection overlay changes cell colors — rebuild all rows while
+            // a selection is active or being dragged.
+            || selection.selection.is_some()
+            || selection.selecting;
+
+        // v1.0 P0-c: CPU-side cache shift for viewport scrolls. When the
+        // terminal scrolls (newline at bottom), the viewport rows shift up
+        // by N — the previously-rendered content at rows 0..rows-N is now
+        // at rows N..rows. Instead of rebuilding all rows, we shift the
+        // per-row vertex cache to match and only rebuild the newly exposed
+        // rows (empty cache entries).
+        //
+        // Key correctness: pre-scroll cell writes set dirty_occ on those
+        // rows, which moves WITH the rows during scroll_up. So dirty rows
+        // are still detected and rebuilt even after the cache shift.
+        let pending_scroll = grid.take_pending_scroll();
+        if !force_full && pending_scroll != 0 {
+            let mut cache = self.grid_row_cache.borrow_mut();
+            if cache.len() == num_rows {
+                if pending_scroll > 0 {
+                    // Scroll up: rows moved up, new blank rows at bottom.
+                    let d = pending_scroll as usize;
+                    if d < cache.len() {
+                        cache.drain(0..d);
+                        for _ in 0..d {
+                            cache.push(Vec::new());
+                        }
+                    } else {
+                        for c in cache.iter_mut() {
+                            c.clear();
+                        }
+                    }
+                } else {
+                    // Scroll down: rows moved down, new blank rows at top.
+                    let d = (-pending_scroll) as usize;
+                    if d < cache.len() {
+                        for _ in 0..d {
+                            cache.insert(0, Vec::new());
+                        }
+                        cache.truncate(num_rows);
+                    } else {
+                        for c in cache.iter_mut() {
+                            c.clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Determine which rows need rebuilding.
+        let mut rows_to_rebuild: Vec<usize> = if force_full {
+            (0..num_rows).collect()
+        } else {
+            let mut dirty: Vec<usize> = grid.dirty_rows().map(|(r, _)| r).collect();
+            // Cursor row: the cursor cell renders differently (block/bar/
+            // underline overlay), so it must be rebuilt every frame to
+            // reflect blink state and cursor movement.
+            if !dirty.contains(&cursor.row) {
+                dirty.push(cursor.row);
+            }
+            // Previous cursor row: when the cursor moves, the old row loses
+            // its cursor overlay and must be rebuilt to show plain content.
+            if let Some(prev) = self.prev_cursor_row.get() {
+                if prev != cursor.row && !dirty.contains(&prev) {
+                    dirty.push(prev);
+                }
+            }
+            dirty
+        };
+
+        // Update cached state for next frame's comparison.
+        self.force_full_grid.set(false);
+        self.prev_cursor_row.set(Some(cursor.row));
+        self.prev_scroll_offset.set(grid.scroll_offset);
+        self.grid_cache_dims.set((num_rows, num_cols));
+
+        // Build vertices for dirty rows only. We build into a local Vec
+        // (not the RefCell) to avoid holding a RefMut while accessing self
+        // fields (atlas, layout_ctx, etc.) inside the per-cell loop.
+        let mut cache = self.grid_row_cache.borrow_mut();
+        if cache.len() != num_rows {
+            cache.resize(num_rows, Vec::new());
+        }
+
+        // v1.0 P0-c: after cache shift, add rows with empty cache entries
+        // (newly exposed by scroll) to the rebuild set.
+        if !force_full && pending_scroll != 0 {
+            for (i, rv) in cache.iter().enumerate() {
+                if rv.is_empty() && !rows_to_rebuild.contains(&i) {
+                    rows_to_rebuild.push(i);
+                }
+            }
+        }
+
+        for &row in &rows_to_rebuild {
+            let mut vertices = Vec::with_capacity(num_cols * 72);
             for col in 0..num_cols {
                 let cell = grid.cell(row, col);
 
@@ -1571,9 +1872,18 @@ fragment float4 text_fragment(
                     }
                 }
             }
+            // v1.0 P0-b: store this row's vertices into the cache.
+            cache[row] = vertices;
         }
 
-        vertices
+        // v1.0 P0-b: flatten the per-row cache into a single vertex buffer.
+        // Clean rows are reused from the previous frame; dirty rows were
+        // rebuilt above. This replaces the old per-frame full-grid iteration.
+        let mut out = Vec::with_capacity(num_rows * num_cols * 72);
+        for rv in cache.iter() {
+            out.extend_from_slice(rv);
+        }
+        out
     }
 
     /// Build vertices for the right-side history panel overlay: a translucent
@@ -1595,24 +1905,26 @@ fragment float4 text_fragment(
         let panel_cols = ((width_px / cw) as usize).max(1);
         let mut vertices = Vec::new();
 
-        // v0.9 fix: opaque panel background (Warp-style). The previous
-        // semi-transparent bg (alpha 0.94) layered a shadow over the terminal
-        // content, looking muddy. Warp's sidebar is a solid surface — use a
-        // slightly darkened theme bg at full opacity for a clean break.
+        // v1.0 Warp-style: opaque panel background, slightly darkened.
         let theme_bg = color_to_normalized(self.theme.background);
         let panel_bg = [
-            theme_bg[0] * 0.52,
-            theme_bg[1] * 0.52,
-            theme_bg[2] * 0.52,
+            theme_bg[0] * 0.55,
+            theme_bg[1] * 0.55,
+            theme_bg[2] * 0.55,
             1.0,
         ];
         let separator_color = color_to_normalized(self.theme.separator);
-        let sel_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.18,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.18,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.18,
-            0.95,
-        ];
+        // v1.0: accent-based selection highlight (consistent with grid/block).
+        // v1.0 P3: α 0.95→1.0 to match Settings/Palette selection_bg.
+        let sel_bg = {
+            let accent = color_to_normalized(self.theme.accent);
+            [
+                accent[0] * 0.35 + theme_bg[0] * 0.65,
+                accent[1] * 0.35 + theme_bg[1] * 0.65,
+                accent[2] * 0.35 + theme_bg[2] * 0.65,
+                1.0,
+            ]
+        };
         let (su, sv, suw, svh) = self.space_uv();
         // V-swap to match grid rendering (CAMetalLayer flip compensation).
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -1643,7 +1955,14 @@ fragment float4 text_fragment(
         );
 
         let fg = color_to_normalized(self.theme.foreground);
-        let dim = [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0];
+        // v1.0 P0: replace fg*0.6 dim with label_c (70% fg + 30% bg) —
+        // consistent with Settings/Palette/Find and always readable.
+        let dim = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
         let green = [0.53, 0.80, 0.36, 1.0];
         let red = [0.85, 0.36, 0.36, 1.0];
 
@@ -1683,9 +2002,10 @@ fragment float4 text_fragment(
             [0.0; 4],
             field_bg,
         );
-        // Border: accent when focused, dim separator otherwise.
+        // Border: accent when focused (was accent_dim — invisible in
+        // Nord/Warp themes), separator otherwise.
         let border_color = if p.search_focused {
-            color_to_normalized(self.theme.accent_dim)
+            color_to_normalized(self.theme.accent)
         } else {
             separator_color
         };
@@ -1914,11 +2234,12 @@ fragment float4 text_fragment(
 
         // Prompt glyph only — cwd lives in the block history, not the input
         // box (Warp style), so the typed command never runs into the path.
-        // v0.8 Quiet: prompt marker ❯ uses accent_dim (warm gray) so the
-        // UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
+        // v1.0 fix: use accent (not accent_dim) for the prompt marker ❯ —
+        // accent_dim is invisible in Nord/Warp themes. The prompt ❯ is a
+        // primary UI element, not dim chrome, so accent is appropriate.
         let prompt_str = "❯ ";
         let prompt_chars = 2;
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        let prompt_c = color_to_normalized(self.theme.accent);
         self.push_text(
             &mut verts,
             left,
@@ -1930,9 +2251,17 @@ fragment float4 text_fragment(
 
         // Editor buffer lines (line 0 starts after the prompt).
         // v0.9: draw a selection highlight for the active mouse-drag range.
-        // The selection spans `((sl,sc),(el,ec))` in document order; we render
-        // per-line quads so partial selections (and multi-line ones) show up.
-        let sel_bg = color_to_normalized(self.theme.selection);
+        // v1.0 fix: accent-based blend for selection visibility across all themes.
+        let sel_bg = {
+            let accent = color_to_normalized(self.theme.accent);
+            let bg = color_to_normalized(self.theme.background);
+            [
+                accent[0] * 0.35 + bg[0] * 0.65,
+                accent[1] * 0.35 + bg[1] * 0.65,
+                accent[2] * 0.35 + bg[2] * 0.65,
+                0.60,
+            ]
+        };
         if let Some(((sl, sc), (el, ec))) = p.selection {
             for i in sl..=el {
                 let Some(line) = p.lines.get(i) else {
@@ -2137,8 +2466,6 @@ fragment float4 text_fragment(
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v0.8 Quiet: accent_dim for the selected-row highlight tint.
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -2219,12 +2546,21 @@ fragment float4 text_fragment(
             let is_sel = i == selected;
             let lcolor = if is_sel { sel_label_color } else { label_color };
             if is_sel {
+                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
+                // bg*0.65) — was [prompt_c, 0.20] which is low-contrast.
+                let accent = color_to_normalized(self.theme.accent);
+                let selection_bg = [
+                    accent[0] * 0.35 + theme_bg[0] * 0.65,
+                    accent[1] * 0.35 + theme_bg[1] * 0.65,
+                    accent[2] * 0.35 + theme_bg[2] * 0.65,
+                    1.0,
+                ];
                 push_quad(
                     &mut verts,
                     [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
                     bg_uv,
                     [0.0; 4],
-                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
+                    selection_bg,
                 );
             }
             let (icon, icon_color, suffix) = match matches[i].kind {
@@ -2285,20 +2621,27 @@ fragment float4 text_fragment(
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v0.8 Quiet direction: chevrons/prompt marks use accent_dim (warm gray)
-        // so the UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
-        // Header / cwd dim text: also accent_dim (Quiet — uniform dim chrome).
-        let dim = color_to_normalized(self.theme.accent_dim);
+        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
+        // accent_dim is too close to bg in Nord/Warp themes, making prompt
+        // marks (❯), chevrons, and dim text invisible. label_c is always
+        // readable across all themes.
+        let prompt_c = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
+        let dim = prompt_c;
         // Block separator: theme.separator (barely-visible warm dark).
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
-        let border_c = [0.5, 0.5, 0.5, 0.35];
+        // v1.0 Warp-style: thin low-opacity border.
+        let border_c = [0.5, 0.5, 0.5, 0.20];
         let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
             1.0,
         ];
 
@@ -2340,6 +2683,21 @@ fragment float4 text_fragment(
         let suffix_x = layout.suffix_x;
         let start = layout.start;
         let end = layout.end;
+
+        // v1.0 Warp-style: subtle drop shadow behind the popup.
+        let shadow_pad = ch * 0.15;
+        push_quad(
+            &mut verts,
+            [
+                popup_x0 - shadow_pad,
+                popup_top - shadow_pad,
+                popup_x1 + shadow_pad,
+                popup_bottom + shadow_pad,
+            ],
+            bg_uv,
+            [0.0; 4],
+            [0.0, 0.0, 0.0, 0.15],
+        );
 
         // Background + border.
         push_quad(
@@ -2417,12 +2775,21 @@ fragment float4 text_fragment(
             }
             let is_sel = i == p.selection;
             if is_sel {
+                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
+                // bg*0.65) — was [prompt_c, 0.20] which is low-contrast.
+                let accent = color_to_normalized(self.theme.accent);
+                let selection_bg = [
+                    accent[0] * 0.35 + theme_bg[0] * 0.65,
+                    accent[1] * 0.35 + theme_bg[1] * 0.65,
+                    accent[2] * 0.35 + theme_bg[2] * 0.65,
+                    1.0,
+                ];
                 push_quad(
                     &mut verts,
                     [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
                     bg_uv,
                     [0.0; 4],
-                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.20],
+                    selection_bg,
                 );
             }
             let entry = &p.entries[i];
@@ -2457,16 +2824,24 @@ fragment float4 text_fragment(
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v0.8 Quiet: accent_dim for highlight tint + dim text.
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
-        let dim = color_to_normalized(self.theme.accent_dim);
+        // v1.0 fix: replace accent_dim with label_c — same fix as Settings
+        // and Palette search mode. accent_dim is invisible in Nord/Warp.
+        let prompt_c = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
+        let dim = prompt_c;
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
-        let border_c = [0.5, 0.5, 0.5, 0.35];
+        // v1.0 P2: unify with Settings baseline — border α 0.35→0.20,
+        // popup_bg 5%→8% lighten.
+        let border_c = [0.5, 0.5, 0.5, 0.20];
         let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
             1.0,
         ];
 
@@ -2474,6 +2849,22 @@ fragment float4 text_fragment(
         let popup_h = (n_fields as f32 + 3.0) * ch + ch * 0.5;
         let popup_top = vp_h * 0.15;
         let popup_bottom = popup_top + popup_h;
+
+        // v1.0 P2: add Warp-style shadow (was missing — form mode had no
+        // shadow while search mode did, causing visual discontinuity).
+        let shadow_pad = ch * 0.15;
+        push_quad(
+            &mut verts,
+            [
+                popup_x0 - shadow_pad,
+                popup_top - shadow_pad,
+                popup_x1 + shadow_pad,
+                popup_bottom + shadow_pad,
+            ],
+            bg_uv,
+            [0.0; 4],
+            [0.0, 0.0, 0.0, 0.15],
+        );
 
         // Background + border.
         push_quad(
@@ -2524,13 +2915,22 @@ fragment float4 text_fragment(
             // Value bracket area.
             let val_x = popup_x0 + cw * 0.5 + 12.0 * cw;
             if *is_current {
-                // Highlight the current field's value area.
+                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
+                // bg*0.65) — was [accent_dim, 0.15] which is invisible in
+                // Nord/Warp themes.
+                let accent = color_to_normalized(self.theme.accent);
+                let selection_bg = [
+                    accent[0] * 0.35 + theme_bg[0] * 0.65,
+                    accent[1] * 0.35 + theme_bg[1] * 0.65,
+                    accent[2] * 0.35 + theme_bg[2] * 0.65,
+                    1.0,
+                ];
                 push_quad(
                     &mut verts,
                     [val_x, y, popup_x1 - cw * 0.5, y + ch],
                     bg_uv,
                     [0.0; 4],
-                    [prompt_c[0], prompt_c[1], prompt_c[2], 0.15],
+                    selection_bg,
                 );
             }
             let val_avail = (((popup_x1 - cw * 0.5 - val_x) / cw).max(1.0)) as usize;
@@ -2547,14 +2947,316 @@ fragment float4 text_fragment(
         verts
     }
 
+    /// v1.0 S1: Build the Settings panel (Cmd+,) as a centered modal
+    /// overlay. Renders a title bar, a 4-tab tab bar (Appearance / Font /
+    /// Keybindings / Window), the active tab's content, and a footer hint.
+    ///
+    /// Layout:
+    ///   ┌────────────────────────────────────┐
+    ///   │ Settings                           │  ← title (2 rows)
+    ///   │ Appearance  Font  Keybindings  Win │  ← tab bar (1 row)
+    ///   ├────────────────────────────────────┤
+    ///   │  › Weft Warm (default)             │  ← content (scrollable)
+    ///   │    Weft Light                      │
+    ///   │    ...                             │
+    ///   ├────────────────────────────────────┤
+    ///   │ ↑↓ navigate  Enter apply  Tab …   │  ← footer (1 row)
+    ///   └────────────────────────────────────┘
+    fn build_settings_vertices(
+        &self,
+        s: crate::overlay::SettingsDrawParams<'_>,
+    ) -> (Vec<f32>, Option<[f32; 4]>) {
+        use crate::overlay::SettingsTab;
+
+        let mut verts = Vec::new();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_w = self.viewport.0;
+        let vp_h = self.viewport.1;
+        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
+            return (verts, None);
+        }
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.accent);
+        let separator = color_to_normalized(self.theme.separator);
+        // v1.0 fix: compute a "label" color that's always readable across all
+        // themes. The old `dim` (= accent_dim) is too close to the background
+        // in some themes (e.g. Nord: accent_dim #4c566a vs bg #2e3440). By
+        // blending fg with bg (70% fg + 30% bg) we get a muted but always-
+        // readable secondary text color that adapts to each theme.
+        let label_c = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+        // Warp-inspired: very thin 1px border at low opacity, subtle shadow.
+        let border_c = [0.5, 0.5, 0.5, 0.20];
+        // Popup background: 8% lighter — enough to distinguish from the
+        // terminal canvas without being jarring.
+        let popup_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
+            1.0,
+        ];
+        let selection_bg = [
+            accent[0] * 0.35 + theme_bg[0] * 0.65,
+            accent[1] * 0.35 + theme_bg[1] * 0.65,
+            accent[2] * 0.35 + theme_bg[2] * 0.65,
+            1.0,
+        ];
+
+        // Centered modal box: 72% viewport width, 78% viewport height.
+        let box_w = vp_w * 0.72;
+        let box_h = vp_h * 0.78;
+        let box_x0 = (vp_w - box_w) / 2.0;
+        let box_x1 = box_x0 + box_w;
+        let box_y0 = (vp_h - box_h) / 2.0;
+        let box_y1 = box_y0 + box_h;
+
+        let pad_x = cw * 1.5;
+        let content_x0 = box_x0 + pad_x;
+        let content_x1 = box_x1 - pad_x;
+        let content_cols = (((content_x1 - content_x0) / cw).max(1.0)) as usize;
+
+        // Warp-style: very subtle shadow (low opacity, tight offset).
+        let shadow_pad = ch * 0.15;
+        push_quad(
+            &mut verts,
+            [
+                box_x0 - shadow_pad,
+                box_y0 - shadow_pad,
+                box_x1 + shadow_pad,
+                box_y1 + shadow_pad,
+            ],
+            bg_uv,
+            [0.0; 4],
+            [0.0, 0.0, 0.0, 0.15],
+        );
+
+        // Background (no top accent border — Warp keeps it minimal).
+        push_quad(
+            &mut verts,
+            [box_x0, box_y0, box_x1, box_y1],
+            bg_uv,
+            [0.0; 4],
+            popup_bg,
+        );
+        // Single 1px border on all four sides.
+        for (bx0, by0, bx1, by1) in [
+            (box_x0, box_y0, box_x1, box_y0 + 1.0),
+            (box_x0, box_y1 - 1.0, box_x1, box_y1),
+            (box_x0, box_y0, box_x0 + 1.0, box_y1),
+            (box_x1 - 1.0, box_y0, box_x1, box_y1),
+        ] {
+            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
+        }
+
+        // Title row — subtle (label_c, not accent) to keep visual hierarchy calm.
+        let mut y = box_y0 + ch * 1.0;
+        self.push_text(&mut verts, content_x0, y, "Settings", label_c, content_cols);
+        y += ch * 1.8;
+
+        // Tab bar: 4 tabs side by side with 1px underline for active.
+        let tab_w = box_w / 4.0;
+        for (i, tab) in SettingsTab::ALL.iter().enumerate() {
+            let tx0 = box_x0 + i as f32 * tab_w;
+            let label = tab.label();
+            let is_active = *tab == s.active_tab;
+            let color = if is_active { fg } else { label_c };
+            // Active tab: 1px underline at text baseline.
+            if is_active {
+                push_quad(
+                    &mut verts,
+                    [
+                        tx0 + cw * 0.5,
+                        y + ch * 0.9,
+                        tx0 + tab_w - cw * 0.5,
+                        y + ch * 0.9 + 1.0,
+                    ],
+                    bg_uv,
+                    [0.0; 4],
+                    accent,
+                );
+            }
+            self.push_text(&mut verts, tx0 + cw * 0.5, y, label, color, content_cols);
+        }
+        y += ch * 1.5;
+
+        // Separator line between tab bar and content.
+        push_quad(
+            &mut verts,
+            [content_x0, y + ch * 0.3, content_x1, y + ch * 0.3 + 1.0],
+            bg_uv,
+            [0.0; 4],
+            separator,
+        );
+
+        // Content area: render the active tab.
+        let content_top = y + ch * 0.5;
+        // v1.0 fix: move footer up from ch*0.8 to ch*1.5 so it sits between
+        // the separator line and the bottom border with balanced spacing.
+        let footer_y = box_y1 - ch * 1.5;
+        let content_bottom = footer_y - ch * 0.5;
+        let content_h = content_bottom - content_top;
+        let max_rows = (content_h / ch).max(1.0) as usize;
+
+        match s.active_tab {
+            SettingsTab::Appearance => {
+                // Theme list — Warp-style: checkmark for current theme,
+                // subtle selection highlight for the cursor row.
+                for (i, theme) in s.themes.iter().take(max_rows).enumerate() {
+                    let row_y = content_top + i as f32 * ch;
+                    let is_current = theme.name == s.theme_name;
+                    let is_selected = i == s.selection;
+                    // Selection highlight.
+                    if is_selected {
+                        push_quad(
+                            &mut verts,
+                            [content_x0, row_y, content_x1, row_y + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
+                    // Current theme: accent checkmark; others: blank space.
+                    let prefix = if is_current { "● " } else { "  " };
+                    let label_color = if is_current { accent } else { fg };
+                    let label = format!("{}{}", prefix, theme.label);
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        row_y,
+                        &label,
+                        label_color,
+                        content_cols,
+                    );
+                }
+            }
+            SettingsTab::Font => {
+                let rows = [
+                    ("Family:", s.font_family),
+                    ("Size:", &format!("{:.1} pt", s.font_size)),
+                    ("Line height:", &format!("{:.2}", s.line_height)),
+                ];
+                for (i, (label, value)) in rows.iter().enumerate() {
+                    let row_y = content_top + i as f32 * ch;
+                    self.push_text(&mut verts, content_x0, row_y, label, label_c, content_cols);
+                    let value_x = content_x0 + cw * 12.0;
+                    self.push_text(&mut verts, value_x, row_y, value, fg, content_cols);
+                }
+            }
+            SettingsTab::Keybindings => {
+                // Read-only list of action → chord pairs.
+                for (i, kb) in s.keybindings.iter().take(max_rows).enumerate() {
+                    let row_y = content_top + i as f32 * ch;
+                    let is_selected = i == s.selection;
+                    if is_selected {
+                        push_quad(
+                            &mut verts,
+                            [content_x0, row_y, content_x1, row_y + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        row_y,
+                        &kb.action,
+                        label_c,
+                        content_cols,
+                    );
+                    let binding_x = content_x1 - cw * 15.0;
+                    self.push_text(
+                        &mut verts,
+                        binding_x,
+                        row_y,
+                        &kb.binding,
+                        accent,
+                        content_cols,
+                    );
+                }
+            }
+            SettingsTab::Window => {
+                let rows = [
+                    ("Opacity:", format!("{:.2}", s.window_opacity)),
+                    ("Padding X:", format!("{} cells", s.window_padding_x)),
+                    ("Padding Y:", format!("{} cells", s.window_padding_y)),
+                    ("Scrollback:", format!("{} lines", s.scrollback_lines)),
+                ];
+                for (i, (label, value)) in rows.iter().enumerate() {
+                    let row_y = content_top + i as f32 * ch;
+                    self.push_text(&mut verts, content_x0, row_y, label, label_c, content_cols);
+                    let value_x = content_x0 + cw * 12.0;
+                    self.push_text(&mut verts, value_x, row_y, value, fg, content_cols);
+                }
+            }
+        }
+
+        // v1.0 fix: Footer hint with two-color design — accent for shortcut
+        // keys, label_c for descriptions. Each pair is rendered separately so
+        // we can use different colors and control spacing precisely.
+        push_quad(
+            &mut verts,
+            [
+                content_x0,
+                footer_y - ch * 0.4,
+                content_x1,
+                footer_y - ch * 0.4 + 1.0,
+            ],
+            bg_uv,
+            [0.0; 4],
+            separator,
+        );
+        // Compact pairs: "key description" with key in accent, desc in label_c.
+        // v1.0: bumped inter-pair gap (cw*1.5) well above intra-pair gap
+        // (cw*0.3) so each "key description" group reads as a unit and
+        // groups are clearly separated. Also rendered at scale 1.1 so the
+        // footer is slightly more prominent than the body text — the
+        // narrow Unicode symbols (⏎ ⇥ ⌘) otherwise make the footer feel
+        // smaller than the body even though both use the same cell size.
+        let pairs: [(&str, &str); 5] = [
+            ("↑↓", "navigate"),
+            ("⏎", "apply"),
+            ("⇥", "switch"),
+            ("esc", "close"),
+            ("⌘⏎", "save"),
+        ];
+        let mut fx = content_x0;
+        let gap = cw * 1.5; // gap between pairs (5x intra-pair gap)
+        let inner = cw * 0.3; // gap between key and description within a pair
+        let scale = 1.1;
+        for (key, desc) in &pairs {
+            self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
+            fx += cw * scale * Self::text_col_width(key) as f32 + inner;
+            self.push_text_scaled(&mut verts, fx, footer_y, desc, label_c, content_cols, scale);
+            fx += cw * scale * Self::text_col_width(desc) as f32 + gap;
+        }
+
+        (verts, Some([box_x0, box_y0, box_x1, box_y1]))
+    }
+
     /// Build the right-click context menu (F7) as a small popup at (x, y).
     fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v0.8 Quiet: accent_dim for the selected-row highlight tint.
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
+        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
+        // accent_dim is invisible in Nord/Warp themes.
+        let prompt_c = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -2581,7 +3283,8 @@ fragment float4 text_fragment(
             theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
             1.0,
         ];
-        let border_c = [0.5, 0.5, 0.5, 0.35];
+        // v1.0 Warp-style: thin low-opacity border.
+        let border_c = [0.5, 0.5, 0.5, 0.20];
 
         // Background.
         push_quad(&mut verts, layout.menu_rect, bg_uv, [0.0; 4], popup_bg);
@@ -2663,11 +3366,17 @@ fragment float4 text_fragment(
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v0.8 Quiet direction: chevrons/prompt marks use accent_dim (warm gray)
-        // so the UI skeleton recedes — was hardcoded cold blue [0.42, 0.85, 1.0].
-        let prompt_c = color_to_normalized(self.theme.accent_dim);
-        // Header / cwd dim text: also accent_dim (Quiet — uniform dim chrome).
-        let dim = color_to_normalized(self.theme.accent_dim);
+        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
+        // accent_dim is too close to bg in Nord/Warp themes, making prompt
+        // marks (❯), chevrons, and dim text invisible. label_c is always
+        // readable across all themes.
+        let prompt_c = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
+        let dim = prompt_c;
         // Block separator: theme.separator (barely-visible warm dark).
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
@@ -2738,6 +3447,10 @@ fragment float4 text_fragment(
         enum LaidRow<'a> {
             Output {
                 text: &'a str,
+                /// v1.0 P0-a: pre-wrapped chunks (from cache for historical
+                /// blocks, freshly computed for live blocks). Avoids calling
+                /// `wrap_line_chunks` per row in the pre-pass + render loop.
+                chunks: Rc<[String]>,
                 block_id: Option<BlockId>,
                 line: usize,
             },
@@ -2778,11 +3491,14 @@ fragment float4 text_fragment(
             let base_idx = skip;
             for (i, line) in live_lines.iter().enumerate().rev() {
                 let line_idx = base_idx + i;
-                let vis_rows = wrapped_row_count(line, cols);
+                let chunks: Rc<[String]> =
+                    Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
+                let vis_rows = chunks.len();
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Output {
                     text: line,
+                    chunks,
                     block_id: None,
                     line: line_idx,
                 });
@@ -2797,76 +3513,68 @@ fragment float4 text_fragment(
             row_data.push(LaidRow::Separator);
         }
 
-        for b in blocks.iter().rev() {
-            // v0.9 fix: limit the foldable check to the last 500 lines —
-            // checking all lines of a huge block (e.g. 20K-line for-loop)
-            // is O(n) per frame and the foldable flag only needs to know if
-            // ANY line has content, which is almost always true for the tail.
-            let foldable = b
-                .output
-                .lines()
-                .rev()
-                .take(500)
-                .any(|l| !l.trim().is_empty());
-            if !b.collapsed {
-                let mut out_lines: Vec<&str> = b.output.lines().collect();
-                // Trim trailing prompt lines AND empty lines. The shell often
-                // emits a trailing newline before the next prompt, which shows
-                // up as an empty line at the end of the block output. Without
-                // trimming, every block gets a visually uneven bottom margin
-                // (the "上窄下宽" complaint) and cross-block copy carries the
-                // empty line into the pasted text.
-                while out_lines.last().is_some_and(|l| {
-                    let t = l.trim();
-                    t.is_empty() || matches!(t, "%" | "$" | "#")
-                }) {
-                    out_lines.pop();
-                }
-                // v0.9 fix: the previous 2000-line tail cap was removed — it
-                // broke find-highlight navigation for matches in earlier lines
-                // (the matched row wasn't in `row_data`, so the highlight
-                // check `bh.1 == *line` never matched). The render loop already
-                // skips rows outside the clip region, so laying out all lines
-                // doesn't add vertex cost; the only cost is the O(n) layout
-                // loop itself, which is cheap (Vec pushes, no per-row GPU work).
-                let base_idx = 0usize;
-                for (i, line) in out_lines.iter().enumerate().rev() {
-                    let line_idx = base_idx + i;
-                    let vis_rows = wrapped_row_count(line, cols);
-                    cursor_dist += vis_rows as f32 * pitch;
-                    rows.push(cursor_dist);
-                    row_data.push(LaidRow::Output {
-                        text: line,
-                        block_id: Some(b.id),
-                        line: line_idx,
-                    });
-                }
+        // v1.0 P0-a: Ensure all historical blocks have a cached layout for
+        // the current `cols`. This is the only place the cache is mutated
+        // per frame — each block is recomputed only if its content/collapse
+        // state changed or `cols` changed (resize). Eliminates the
+        // O(total_output_chars) per-frame wrapping cost.
+        //
+        // Uses `borrow_mut()` (scoped) because `draw()` holds an immutable
+        // borrow of `self.layer` — `RefCell` provides interior mutability.
+        {
+            let mut cache = self.block_layout_cache.borrow_mut();
+            for b in blocks.iter() {
+                cache.ensure_cached(b, cols);
             }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Command {
-                command: &b.command,
-                collapsed: b.collapsed,
-                foldable,
-                block_id: b.id,
-            });
-            let dur = block_duration_str(b);
-            let bcwd = b
-                .cwd
-                .as_deref()
-                .map(abbreviate_path)
-                .unwrap_or_else(|| "~".to_string());
-            let header = if dur.is_empty() {
-                bcwd
-            } else {
-                format!("{bcwd} ({dur})")
-            };
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Header { text: header });
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Separator);
+        }
+
+        // Read cached layouts (immutable borrow, scoped to this loop).
+        // The `Rc<[String]>` chunks are cloned (refcount bump) into
+        // `row_data`, so the `Ref` can be dropped before the render loop.
+        {
+            let cache = self.block_layout_cache.borrow();
+            for b in blocks.iter().rev() {
+                let cached = cache.get(b.id.0);
+                if !b.collapsed {
+                    for line in cached.lines.iter().rev() {
+                        let text = &b.output[line.byte_start..line.byte_end];
+                        let vis_rows = line.chunks.len();
+                        cursor_dist += vis_rows as f32 * pitch;
+                        rows.push(cursor_dist);
+                        row_data.push(LaidRow::Output {
+                            text,
+                            chunks: Rc::clone(&line.chunks),
+                            block_id: Some(b.id),
+                            line: line.idx,
+                        });
+                    }
+                }
+                cursor_dist += pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Command {
+                    command: &b.command,
+                    collapsed: b.collapsed,
+                    foldable: cached.foldable,
+                    block_id: b.id,
+                });
+                let dur = block_duration_str(b);
+                let bcwd = b
+                    .cwd
+                    .as_deref()
+                    .map(abbreviate_path)
+                    .unwrap_or_else(|| "~".to_string());
+                let header = if dur.is_empty() {
+                    bcwd
+                } else {
+                    format!("{bcwd} ({dur})")
+                };
+                cursor_dist += pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Header { text: header });
+                cursor_dist += pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Separator);
+            }
         }
 
         // ── Phase 2: Render scrollable content with offset ───────────────
@@ -2887,10 +3595,15 @@ fragment float4 text_fragment(
         // drag start); we key on y-band rather than a global index so wrapped
         // multi-chunk Output rows highlight correctly per chunk.
         let selection_bg = {
-            let mut c = color_to_normalized(self.theme.selection);
-            // Semi-transparent so the underlying text stays readable (matches
-            // the grid-view selection alpha above).
-            c[3] = 0.55;
+            let accent = color_to_normalized(self.theme.accent);
+            let bg = color_to_normalized(self.theme.background);
+            let mut c = [
+                accent[0] * 0.35 + bg[0] * 0.65,
+                accent[1] * 0.35 + bg[1] * 0.65,
+                accent[2] * 0.35 + bg[2] * 0.65,
+                1.0,
+            ];
+            c[3] = 0.60;
             c
         };
         // Pre-pass: build bv_rows (y-bands + text) WITHOUT rendering, so we
@@ -2912,10 +3625,10 @@ fragment float4 text_fragment(
             match &row_data[i] {
                 LaidRow::Output {
                     text,
+                    chunks,
                     block_id,
                     line: _,
                 } => {
-                    let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
                     if chunks.len() <= 1 {
                         bv_rows.push(weft_core::selection::BlockViewRow {
                             kind: weft_core::selection::BlockViewRowKind::Output,
@@ -3063,10 +3776,10 @@ fragment float4 text_fragment(
             match &row_data[i] {
                 LaidRow::Output {
                     text,
+                    chunks,
                     block_id,
                     line,
                 } => {
-                    let chunks: Vec<String> = wrap_line_chunks(text, cols).collect();
                     if chunks.len() <= 1 {
                         // Selection highlight (under the text).
                         if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
@@ -3510,6 +4223,58 @@ fragment float4 text_fragment(
         }
     }
 
+    /// v1.0: Like `push_text` but renders each glyph quad scaled by `scale`
+    /// (1.0 == identical to push_text). Used for the Settings footer where
+    /// the hint pairs benefit from being slightly more prominent than the
+    /// body text. The glyph atlas is rasterized at the base cell size, so
+    /// scaling up samples with mild magnification (acceptable for ≤1.2x).
+    /// Column advance is scaled too so layout math stays consistent.
+    #[allow(clippy::too_many_arguments)]
+    fn push_text_scaled(
+        &self,
+        vertices: &mut Vec<f32>,
+        x: f32,
+        y: f32,
+        text: &str,
+        fg: [f32; 4],
+        max_cols: usize,
+        scale: f32,
+    ) {
+        let cw = self.cell_width() as f32 * scale;
+        let ch = self.cell_height() as f32 * scale;
+        // Vertically center the scaled glyph within the original cell row
+        // so the footer baseline stays aligned with the separator line.
+        let y_off = (self.cell_height() as f32 - ch) * 0.5;
+        let mut col = 0usize;
+        let mut px = x;
+        for c in text.chars() {
+            let w = Self::char_col_width(c);
+            if w == 0 {
+                continue;
+            }
+            if col + w > max_cols {
+                break;
+            }
+            let Some(g) = self.atlas.get(c) else {
+                col += w;
+                px += w as f32 * cw;
+                continue;
+            };
+            let (u, v) = g.uv_origin;
+            let (uw, vh) = g.uv_size;
+            let cell_w = w as f32 * cw;
+            push_quad(
+                vertices,
+                [px, y + y_off, px + cell_w, y + y_off + ch],
+                [u, v + vh, u + uw, v],
+                fg,
+                [0.0; 4],
+            );
+            col += w;
+            px += cell_w;
+        }
+    }
+
     /// Like `push_text` but wraps long text across multiple visual rows
     /// Lay out a line left-to-right, coloring each shell token by its kind
     /// (syntax highlight). `default_fg` is used for Whitespace/Default tokens.
@@ -3602,48 +4367,45 @@ fragment float4 text_fragment(
 
         let theme_bg = color_to_normalized(self.theme.background);
         let accent = color_to_normalized(self.theme.accent);
-        let accent_dim = color_to_normalized(self.theme.accent_dim);
         let sep = color_to_normalized(self.theme.separator);
         let fg = color_to_normalized(self.theme.foreground);
+        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
+        // accent_dim is too close to bg in Nord (#4c566a vs #2e3440) and
+        // Warp themes, making buttons/status text invisible. label_c is
+        // always readable across all themes.
+        let accent_dim = [
+            fg[0] * 0.70 + theme_bg[0] * 0.30,
+            fg[1] * 0.70 + theme_bg[1] * 0.30,
+            fg[2] * 0.70 + theme_bg[2] * 0.30,
+            1.0,
+        ];
 
-        // ── Drop shadow (offset translucent rect behind the card) ────────
-        let shadow_offset = 4.0;
+        // ── Drop shadow (Warp-style: tight offset, low opacity) ──────────
+        let shadow_offset = 2.0;
         push_quad(
             &mut verts,
             [
-                popup_x0 + shadow_offset,
-                popup_y0 + shadow_offset,
+                popup_x0 - shadow_offset,
+                popup_y0 - shadow_offset,
                 popup_x1 + shadow_offset,
                 popup_y1 + shadow_offset,
             ],
             bg_uv,
             [0.0; 4],
-            [0.0, 0.0, 0.0, 0.45],
+            [0.0, 0.0, 0.0, 0.15],
         );
 
-        // ── Card background — theme-aware: darken for dark themes, lighten
-        // for light themes. Detect luminance from the bg so the popup always
-        // reads as a distinct floating surface against the grid. Near-opaque
-        // (0.97 alpha) to occlude underlying grid content. ─────────────────
-        let bg_lum = theme_bg[0] * 0.299 + theme_bg[1] * 0.587 + theme_bg[2] * 0.114;
-        let card_bg = if bg_lum < 0.35 {
-            // Dark theme — tint darker than the grid bg.
-            [
-                theme_bg[0] * 0.55 + 0.02,
-                theme_bg[1] * 0.55 + 0.02,
-                theme_bg[2] * 0.55 + 0.02,
-                0.97,
-            ]
-        } else {
-            // Light theme — tint lighter than the grid bg (towards pure white)
-            // so the card reads as elevated/sunken like a macOS popover.
-            [
-                (theme_bg[0] + (1.0 - theme_bg[0]) * 0.6).min(1.0),
-                (theme_bg[1] + (1.0 - theme_bg[1]) * 0.6).min(1.0),
-                (theme_bg[2] + (1.0 - theme_bg[2]) * 0.6).min(1.0),
-                0.97,
-            ]
-        };
+        // ── Card background — v1.0: unified with Settings/Palette to 8%
+        // lighten (was a dual-branch 45% darken / 60% lighten, which made
+        // Find read as "darker than window" while other popups read as
+        // "lighter than window" — visually inconsistent). Opaque (α=1.0)
+        // to fully occlude underlying grid content.
+        let card_bg = [
+            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
+            1.0,
+        ];
         push_quad(
             &mut verts,
             [popup_x0, popup_y0, popup_x1, popup_y1],
@@ -3652,9 +4414,9 @@ fragment float4 text_fragment(
             card_bg,
         );
 
-        // ── 1px border around the card (top/right/bottom/left) ──────────
+        // ── 1px border — Warp-style: low opacity, subtle ──────────────────
         let border_w = 1.0;
-        let border_bg = [sep[0], sep[1], sep[2], 0.9];
+        let border_bg = [0.5, 0.5, 0.5, 0.20];
         push_quad(
             &mut verts,
             [popup_x0, popup_y0, popup_x1, popup_y0 + border_w],
@@ -4566,5 +5328,173 @@ mod tests {
         // "weft" is part of the prompt (cwd), not the command — must not match
         // the stripped command "git status".
         assert!(!block_matches_query(&b, "weft"));
+    }
+
+    // ── v1.0 P0-a: BlockLayoutCache tests ──────────────────────────────
+
+    fn mk_block_with_output(id: u64, command: &str, output: &str) -> Block {
+        Block {
+            id: BlockId(id),
+            command: command.to_string(),
+            cwd: None,
+            output: output.to_string(),
+            exit_code: None,
+            started_at: std::time::SystemTime::UNIX_EPOCH,
+            finished_at: None,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn block_layout_cache_computes_on_first_access() {
+        let block = mk_block_with_output(1, "echo hello", "hello\nworld\n");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(layout.lines.len(), 2);
+        assert_eq!(layout.lines[0].idx, 0);
+        assert_eq!(layout.lines[1].idx, 1);
+        assert!(layout.foldable);
+    }
+
+    #[test]
+    fn block_layout_cache_trims_trailing_empty() {
+        let block = mk_block_with_output(1, "echo", "output\n\n\n");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(
+            layout.lines.len(),
+            1,
+            "trailing empty lines should be trimmed"
+        );
+        assert_eq!(
+            &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end],
+            "output"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_trims_trailing_prompt() {
+        let block = mk_block_with_output(1, "echo", "output\n%\n$\n#\n");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(
+            layout.lines.len(),
+            1,
+            "trailing prompt lines should be trimmed"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_byte_offsets_correct() {
+        let block = mk_block_with_output(1, "echo", "first\nsecond\nthird\n");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(layout.lines.len(), 3);
+        assert_eq!(
+            &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end],
+            "first"
+        );
+        assert_eq!(
+            &block.output[layout.lines[1].byte_start..layout.lines[1].byte_end],
+            "second"
+        );
+        assert_eq!(
+            &block.output[layout.lines[2].byte_start..layout.lines[2].byte_end],
+            "third"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_wraps_long_lines() {
+        // 20 chars at cols=10 → 2 chunks
+        let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
+        let layout = compute_block_layout(&block, 10);
+        assert_eq!(layout.lines.len(), 1);
+        assert_eq!(
+            layout.lines[0].chunks.len(),
+            2,
+            "20 chars at cols=10 → 2 chunks"
+        );
+        assert_eq!(layout.lines[0].chunks[0], "0123456789");
+        assert_eq!(layout.lines[0].chunks[1], "abcdefghij");
+    }
+
+    #[test]
+    fn block_layout_cache_foldable_false_for_empty_output() {
+        let block = mk_block_with_output(1, "true", "\n\n\n");
+        let layout = compute_block_layout(&block, 80);
+        assert!(!layout.foldable, "all-empty output should not be foldable");
+        assert_eq!(layout.lines.len(), 0, "all lines trimmed");
+    }
+
+    #[test]
+    fn block_layout_cache_ensure_cached_reuses() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "hello\n");
+        cache.ensure_cached(&block, 80);
+        let layout1 = cache.get(1).clone();
+
+        // Same content + cols → should NOT rebuild (same instance).
+        cache.ensure_cached(&block, 80);
+        let layout2 = cache.get(1).clone();
+        assert_eq!(layout1.lines.len(), layout2.lines.len());
+        assert_eq!(layout1.cols, layout2.cols);
+    }
+
+    #[test]
+    fn block_layout_cache_rebuilds_on_output_change() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "hello\n");
+        cache.ensure_cached(&block, 80);
+        assert_eq!(cache.get(1).lines.len(), 1);
+
+        // Output grew → cache should detect and rebuild.
+        let block2 = mk_block_with_output(1, "echo", "hello\nworld\n");
+        cache.ensure_cached(&block2, 80);
+        assert_eq!(
+            cache.get(1).lines.len(),
+            2,
+            "output change should trigger rebuild"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_rebuilds_on_cols_change() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
+        cache.ensure_cached(&block, 10);
+        assert_eq!(
+            cache.get(1).lines[0].chunks.len(),
+            2,
+            "20 chars / cols=10 → 2 chunks"
+        );
+
+        // Resize to cols=20 → should rebuild with 1 chunk.
+        cache.ensure_cached(&block, 20);
+        assert_eq!(
+            cache.get(1).lines[0].chunks.len(),
+            1,
+            "20 chars / cols=20 → 1 chunk"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_rebuilds_on_collapse_toggle() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "hello\n");
+        cache.ensure_cached(&block, 80);
+        assert!(!cache.get(1).collapsed);
+
+        let mut block2 = block.clone();
+        block2.collapsed = true;
+        cache.ensure_cached(&block2, 80);
+        assert!(
+            cache.get(1).collapsed,
+            "collapse toggle should trigger rebuild"
+        );
+    }
+
+    #[test]
+    fn block_layout_cache_empty_output() {
+        let block = mk_block_with_output(1, "true", "");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(layout.lines.len(), 0);
+        assert!(!layout.foldable);
     }
 }

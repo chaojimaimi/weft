@@ -20,6 +20,7 @@
 //! fully unit-testable in isolation. The `Terminal` (phase 2) drives a
 //! `BlockTracker` from its `osc_dispatch` / `print` paths.
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
 /// Hard cap on captured output to bound memory for commands like
@@ -119,6 +120,10 @@ pub struct BlockTracker {
     /// before this were loaded from SQLite on startup (history search only —
     /// NOT shown in the main block view, which is session-scoped).
     session_start: usize,
+    /// v1.0 P0-b Layer 2: Block ids whose rendering-relevant state changed
+    /// (new block, collapse toggle) since the last [`take_dirty_blocks`].
+    /// The renderer can skip unchanged blocks when rebuilding vertices.
+    dirty_blocks: HashSet<u64>,
 }
 
 impl Default for BlockTracker {
@@ -142,6 +147,7 @@ impl BlockTracker {
             output_buf: String::new(),
             output_truncated: false,
             session_start: 0,
+            dirty_blocks: HashSet::new(),
         }
     }
 
@@ -192,7 +198,24 @@ impl BlockTracker {
     pub fn toggle_collapse(&mut self, id: BlockId) {
         if let Some(b) = self.blocks.iter_mut().find(|b| b.id == id) {
             b.collapsed = !b.collapsed;
+            self.dirty_blocks.insert(id.0);
         }
+    }
+
+    /// v1.0 P0-b Layer 2: Mark a block as needing vertex rebuild.
+    pub fn mark_block_dirty(&mut self, id: BlockId) {
+        self.dirty_blocks.insert(id.0);
+    }
+
+    /// v1.0 P0-b Layer 2: Drain the set of dirty block ids. The renderer calls
+    /// this after rebuilding vertices to reset the set for the next frame.
+    pub fn take_dirty_blocks(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.dirty_blocks)
+    }
+
+    /// v1.0 P0-b Layer 2: Whether any block is dirty.
+    pub fn has_dirty_blocks(&self) -> bool {
+        !self.dirty_blocks.is_empty()
     }
 
     /// The currently-running command (between `133;B` and `133;D`), for the
@@ -218,6 +241,7 @@ impl BlockTracker {
             if b.id.0 >= self.next_id {
                 self.next_id = b.id.0 + 1;
             }
+            self.dirty_blocks.insert(b.id.0);
         }
         self.blocks.extend(blocks);
         // Everything loaded so far is pre-session history; session blocks
@@ -312,8 +336,9 @@ impl BlockTracker {
         // future AI context) never holds a credential. The live grid stays raw.
         output = crate::secrets::mask(&output);
 
+        let block_id = BlockId(self.next_id);
         let block = Block {
-            id: BlockId(self.next_id),
+            id: block_id,
             command,
             cwd,
             output,
@@ -325,6 +350,7 @@ impl BlockTracker {
         self.next_id += 1;
         self.blocks.push(block.clone());
         self.unpersisted.push(block);
+        self.dirty_blocks.insert(block_id.0);
     }
 }
 
@@ -576,5 +602,78 @@ mod tests {
         t.on_print('x');
         t.on_command_end(0);
         assert_eq!(t.blocks().last().unwrap().output, "x");
+    }
+
+    // ── v1.0 P0-b: dirty_blocks tests ──────────────────────────────────
+
+    #[test]
+    fn dirty_blocks_empty_on_new_tracker() {
+        let mut t = BlockTracker::new();
+        assert!(!t.has_dirty_blocks());
+        assert!(t.take_dirty_blocks().is_empty());
+    }
+
+    #[test]
+    fn finalize_marks_block_dirty() {
+        let mut t = BlockTracker::new();
+        t.on_prompt_start();
+        t.on_command_start("ls".to_string());
+        t.on_command_end(0);
+        assert!(t.has_dirty_blocks());
+        let dirty = t.take_dirty_blocks();
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty.contains(&1));
+    }
+
+    #[test]
+    fn toggle_collapse_marks_dirty() {
+        let mut t = BlockTracker::new();
+        t.on_prompt_start();
+        t.on_command_start("ls".to_string());
+        t.on_command_end(0);
+        t.take_dirty_blocks(); // clear
+        assert!(!t.has_dirty_blocks());
+        t.toggle_collapse(BlockId(1));
+        assert!(t.has_dirty_blocks());
+        let dirty = t.take_dirty_blocks();
+        assert!(dirty.contains(&1));
+    }
+
+    #[test]
+    fn mark_block_dirty_adds_id() {
+        let mut t = BlockTracker::new();
+        t.mark_block_dirty(BlockId(42));
+        assert!(t.has_dirty_blocks());
+        let dirty = t.take_dirty_blocks();
+        assert!(dirty.contains(&42));
+    }
+
+    #[test]
+    fn take_dirty_blocks_clears_set() {
+        let mut t = BlockTracker::new();
+        t.mark_block_dirty(BlockId(1));
+        t.mark_block_dirty(BlockId(2));
+        let dirty = t.take_dirty_blocks();
+        assert_eq!(dirty.len(), 2);
+        assert!(!t.has_dirty_blocks());
+    }
+
+    #[test]
+    fn load_blocks_marks_all_loaded_dirty() {
+        let mut t = BlockTracker::new();
+        let b = Block {
+            id: BlockId(5),
+            command: "x".to_string(),
+            cwd: None,
+            output: "y".to_string(),
+            exit_code: Some(0),
+            started_at: SystemTime::now(),
+            finished_at: Some(SystemTime::now()),
+            collapsed: false,
+        };
+        t.load_blocks(vec![b]);
+        assert!(t.has_dirty_blocks());
+        let dirty = t.take_dirty_blocks();
+        assert!(dirty.contains(&5));
     }
 }

@@ -364,6 +364,12 @@ pub struct Grid {
     pub scrollback: Scrollback,
     /// Current scroll offset (0 = no scroll, >0 = viewing history).
     pub scroll_offset: usize,
+    /// v1.0 P0-c: Pending viewport scroll delta for the renderer. Positive =
+    /// rows scrolled up (content moved up, new blank rows at bottom).
+    /// Negative = rows scrolled down (content moved down, new blank rows at
+    /// top). The renderer reads this via [`take_pending_scroll`] to shift
+    /// its per-row vertex cache, avoiding a full rebuild on scroll.
+    pending_scroll: std::cell::Cell<i32>,
 }
 
 impl Grid {
@@ -385,6 +391,7 @@ impl Grid {
             tabstops,
             scrollback: Scrollback::new(scrollback_lines),
             scroll_offset: 0,
+            pending_scroll: std::cell::Cell::new(0),
         }
     }
 
@@ -835,6 +842,9 @@ impl Grid {
                     Row::new(self.num_cols),
                 ));
             }
+            // v1.0 P0-c: record scroll delta for renderer cache shift.
+            self.pending_scroll
+                .set(self.pending_scroll.get() + (bottom - top + 1) as i32);
             return;
         }
 
@@ -856,6 +866,11 @@ impl Grid {
         for i in (bottom - n + 1)..=bottom {
             self.viewport[i] = Row::new(self.num_cols);
         }
+        // v1.0 P0-c: record scroll delta for renderer cache shift instead of
+        // mark_all_dirty. The renderer shifts its per-row vertex cache to
+        // match, only rebuilding the newly exposed rows at the bottom.
+        self.pending_scroll
+            .set(self.pending_scroll.get() + n as i32);
     }
 
     /// Scroll the scroll region down by n lines.
@@ -867,6 +882,8 @@ impl Grid {
             for i in top..=bottom {
                 self.viewport[i] = Row::new(self.num_cols);
             }
+            self.pending_scroll
+                .set(self.pending_scroll.get() - (bottom - top + 1) as i32);
             return;
         }
 
@@ -877,6 +894,9 @@ impl Grid {
         for i in top..(top + n) {
             self.viewport[i] = Row::new(self.num_cols);
         }
+        // v1.0 P0-c: record scroll delta for renderer cache shift.
+        self.pending_scroll
+            .set(self.pending_scroll.get() - n as i32);
     }
 
     /// Set scroll region (CSI r). Parameters are 1-based.
@@ -1069,6 +1089,42 @@ impl Grid {
         for row in &mut self.viewport {
             row.clear_dirty();
         }
+        // v1.0 P0-c: also clear pending_scroll so stale scroll deltas don't
+        // trigger cache shifts on frames where the renderer didn't observe
+        // the scroll (e.g., force_full took precedence).
+        self.pending_scroll.set(0);
+    }
+
+    /// v1.0 P0-b Layer 1: Iterate over dirty viewport rows.
+    ///
+    /// Yields `(row_idx, dirty_col_extent)` — the row index and the number of
+    /// leading cells that may have changed (0..extent). Callers should rebuild
+    /// vertices for these rows only; clean rows can be reused from a cache.
+    ///
+    /// **Scrollback caveat**: only the live viewport is tracked. When
+    /// `scroll_offset > 0`, rendered cells come from scrollback history (which
+    /// has no dirty flags) — callers MUST force a full redraw in that case.
+    pub fn dirty_rows(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.viewport.iter().enumerate().filter_map(|(i, r)| {
+            if r.dirty_occ > 0 {
+                Some((i, r.dirty_occ))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// v1.0 P0-b Layer 1: Whether ANY viewport row is dirty.
+    pub fn has_dirty(&self) -> bool {
+        self.viewport.iter().any(|r| r.dirty_occ > 0)
+    }
+
+    /// v1.0 P0-c: Take and reset the pending viewport scroll delta.
+    /// The renderer calls this to read how many rows the viewport shifted
+    /// since the last frame, then shifts its per-row vertex cache
+    /// accordingly. Returns 0 when no scroll occurred.
+    pub fn take_pending_scroll(&self) -> i32 {
+        self.pending_scroll.take()
     }
 
     // ── Resize / reset ───────────────────────────────────────────
@@ -1287,6 +1343,8 @@ impl Grid {
         self.cursor.row = new_cursor_row.min(new_rows.saturating_sub(1));
         self.cursor.col = new_cursor_col.min(new_cols.saturating_sub(1));
         self.cursor.wrap_pending = false;
+        // v1.0 P0-b: all rows are new/rearranged after a reflow.
+        self.mark_all_dirty();
     }
 
     /// Clear the entire screen and reset cursor.
@@ -2206,5 +2264,110 @@ mod tests {
             !row1_has_digits,
             "continuation should have been merged into row 0"
         );
+    }
+
+    // ── v1.0 P0-b: dirty tracking tests ────────────────────────────────
+
+    #[test]
+    fn dirty_rows_empty_on_fresh_grid() {
+        let grid = Grid::new(5, 10);
+        assert_eq!(grid.dirty_rows().count(), 0);
+        assert!(!grid.has_dirty());
+    }
+
+    #[test]
+    fn dirty_rows_after_cell_write() {
+        let mut grid = Grid::new(5, 10);
+        grid.cell_mut(2, 3).character = 'X';
+        let dirty: Vec<_> = grid.dirty_rows().collect();
+        assert_eq!(dirty, vec![(2, 4)]);
+        assert!(grid.has_dirty());
+    }
+
+    #[test]
+    fn dirty_rows_extent_tracks_max_col() {
+        let mut grid = Grid::new(5, 10);
+        grid.cell_mut(1, 2).character = 'A';
+        grid.cell_mut(1, 7).character = 'B';
+        let dirty: Vec<_> = grid.dirty_rows().collect();
+        assert_eq!(dirty, vec![(1, 8)]);
+    }
+
+    #[test]
+    fn dirty_rows_multiple_rows() {
+        let mut grid = Grid::new(5, 10);
+        grid.cell_mut(0, 1).character = 'A';
+        grid.cell_mut(3, 5).character = 'B';
+        let dirty: Vec<_> = grid.dirty_rows().collect();
+        assert_eq!(dirty, vec![(0, 2), (3, 6)]);
+    }
+
+    #[test]
+    fn clear_all_dirty_resets_rows() {
+        let mut grid = Grid::new(5, 10);
+        grid.cell_mut(1, 2).character = 'A';
+        grid.cell_mut(3, 4).character = 'B';
+        assert!(grid.has_dirty());
+        grid.clear_all_dirty();
+        assert!(!grid.has_dirty());
+        assert_eq!(grid.dirty_rows().count(), 0);
+    }
+
+    #[test]
+    fn mark_all_dirty_sets_every_row() {
+        let mut grid = Grid::new(3, 10);
+        grid.mark_all_dirty();
+        assert_eq!(grid.dirty_rows().count(), 3);
+        for (_, extent) in grid.dirty_rows() {
+            assert_eq!(extent, 10);
+        }
+    }
+
+    #[test]
+    fn scroll_up_sets_pending_scroll() {
+        let mut grid = Grid::new(3, 5);
+        // Move cursor to bottom so newline triggers scroll_up.
+        grid.cursor.row = 2;
+        grid.newline();
+        // v1.0 P0-c: scroll_up now records pending_scroll instead of
+        // mark_all_dirty — the renderer shifts its cache to match.
+        assert_eq!(grid.take_pending_scroll(), 1);
+        // After take, pending_scroll is reset.
+        assert_eq!(grid.take_pending_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_down_sets_negative_pending_scroll() {
+        let mut grid = Grid::new(5, 5);
+        grid.scroll_down(2);
+        assert_eq!(grid.take_pending_scroll(), -2);
+    }
+
+    #[test]
+    fn pending_scroll_accumulates() {
+        let mut grid = Grid::new(5, 5);
+        grid.scroll_up(1);
+        grid.scroll_up(1);
+        assert_eq!(grid.take_pending_scroll(), 2);
+    }
+
+    #[test]
+    fn clear_all_dirty_clears_pending_scroll() {
+        let mut grid = Grid::new(5, 5);
+        grid.scroll_up(1);
+        assert_eq!(grid.take_pending_scroll(), 1);
+        grid.scroll_up(1);
+        grid.clear_all_dirty();
+        assert_eq!(grid.take_pending_scroll(), 0);
+    }
+
+    #[test]
+    fn resize_marks_all_rows_dirty() {
+        let mut grid = Grid::new(3, 5);
+        grid.clear_all_dirty();
+        assert!(!grid.has_dirty());
+        grid.resize(5, 8);
+        assert!(grid.has_dirty());
+        assert_eq!(grid.dirty_rows().count(), 5);
     }
 }
