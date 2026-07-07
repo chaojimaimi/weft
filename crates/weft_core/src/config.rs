@@ -2552,4 +2552,110 @@ path = "#0000ff"
         let back: Action = serde_json::from_str(s).unwrap();
         assert_eq!(back, Action::ToggleSettings);
     }
+
+    // ── T2: per-field Config::save roundtrip tests ────────────────────
+
+    #[test]
+    fn save_font_size_change() {
+        let path = unique_tmp_path("font-size");
+        let cfg = Config {
+            font: FontConfig {
+                size: 13.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.font.size, 13.0);
+        // Other fields retain defaults.
+        assert_eq!(reloaded.font.family, "Menlo");
+        assert_eq!(reloaded.theme.name, "weft-warm");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_window_opacity_change() {
+        let path = unique_tmp_path("win-opacity");
+        let cfg = Config {
+            window: WindowConfig {
+                opacity: 0.85,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        // f32 round-trip through TOML f64 — compare with small epsilon.
+        assert!((reloaded.window.opacity - 0.85).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_theme_name_change() {
+        let path = unique_tmp_path("theme-name");
+        let cfg = Config {
+            theme: ThemeConfig {
+                name: "dracula".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.theme.name, "dracula");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_scrollback_lines_change() {
+        let path = unique_tmp_path("scrollback");
+        let cfg = Config {
+            scrollback: ScrollbackConfig { lines: 25_000 },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.scrollback.lines, 25_000);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_preserves_other_fields_when_one_changes() {
+        // Changing only window.width should leave font, theme, and scrollback
+        // at their configured (non-default) values after a save + reload cycle.
+        let path = unique_tmp_path("preserve");
+        let cfg = Config {
+            font: FontConfig {
+                family: "Monaco".into(),
+                size: 16.0,
+                ..Default::default()
+            },
+            theme: ThemeConfig {
+                name: "nord".into(),
+                ..Default::default()
+            },
+            window: WindowConfig {
+                width: 1200,
+                ..Default::default()
+            },
+            scrollback: ScrollbackConfig { lines: 50_000 },
+            ..Default::default()
+        };
+        cfg.save_to_path(&path).expect("save should succeed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        // The field we changed.
+        assert_eq!(reloaded.window.width, 1200);
+        // Other configured fields must survive unchanged.
+        assert_eq!(reloaded.font.family, "Monaco");
+        assert_eq!(reloaded.font.size, 16.0);
+        assert_eq!(reloaded.theme.name, "nord");
+        assert_eq!(reloaded.scrollback.lines, 50_000);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

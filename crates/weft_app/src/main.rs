@@ -6359,4 +6359,90 @@ mod tests {
         // `$HOME` should NOT be stripped (no space after $, it's part of cmd).
         assert_eq!(strip_prompt_prefix("echo $HOME"), "echo $HOME");
     }
+
+    // ── T5: first_run marker logic + supplementary prompt tests ─────────
+
+    /// Verify the `.first_run` marker existence logic that
+    /// `first_run_welcome()` relies on: on a fresh config dir the marker is
+    /// absent (→ welcome should show); after the function runs once, the
+    /// marker exists (→ welcome should not show again).
+    ///
+    /// This calls the private `first_run_welcome()` directly (accessible
+    /// from the test submodule) with `XDG_CONFIG_HOME` pointed at a unique
+    /// temp dir so the user's real config is never touched. The env var is
+    /// saved and restored around the test to avoid affecting parallel tests.
+    #[test]
+    fn first_run_marker_created_on_first_call_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir().join(format!("weft-first-run-{pid}-{id}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        // Before first call: marker should not exist.
+        let marker = tmp.join("weft").join(".first_run");
+        assert!(!marker.exists(), "marker should not exist before first run");
+
+        // First call: should return a welcome banner and create the marker.
+        let first = first_run_welcome();
+        assert!(first.is_some(), "first run should return a welcome banner");
+        let banner = first.unwrap();
+        assert!(
+            banner.contains("printf"),
+            "banner should be a printf command, got: {banner:?}"
+        );
+        assert!(
+            banner.contains("Welcome"),
+            "banner should contain welcome text"
+        );
+        assert!(marker.exists(), "marker should be created after first run");
+
+        // Second call: marker now exists → should return None.
+        let second = first_run_welcome();
+        assert!(
+            second.is_none(),
+            "second run should not return welcome (marker exists)"
+        );
+
+        // Restore env and clean up.
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strip_prompt_prefix_marker_with_no_command_keeps_input() {
+        // When the line is just the marker (no command after it), the
+        // function should fall back to the original input rather than
+        // returning an empty string.
+        let result = strip_prompt_prefix("❯ ");
+        // The trimmed-after string is empty → returns the original `s`.
+        assert_eq!(result, "❯ ");
+    }
+
+    #[test]
+    fn strip_prompt_prefix_picks_last_marker_in_line() {
+        // When the line contains multiple markers (e.g. a path with `$`),
+        // the function picks the LAST one so the command after it is kept.
+        // Here `$ ` appears in `a$ b` and again as the real prompt `$ ls`.
+        assert_eq!(strip_prompt_prefix("echo a$ b $ ls"), "ls");
+    }
+
+    #[test]
+    fn word_at_handles_multibyte_boundaries() {
+        // word_at operates on chars, so multibyte positions are safe.
+        // "héllo" — é is one char (two UTF-8 bytes).
+        let line = "héllo";
+        // Cursor at end (char index 5).
+        assert_eq!(word_at(line, 5), Some((0, 5)));
+        // Cursor at char index 2 (the 'l').
+        assert_eq!(word_at(line, 2), Some((0, 2)));
+    }
 }

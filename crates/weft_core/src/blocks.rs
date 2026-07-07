@@ -719,4 +719,107 @@ mod tests {
         let dirty = t.take_dirty_blocks();
         assert!(dirty.contains(&5));
     }
+
+    // ── T1: additional BlockTracker coverage ──────────────────────────
+
+    #[test]
+    fn multiple_tabs_block_isolation() {
+        // Two independent BlockTrackers maintain their own block lists;
+        // assigning an id in one must not collide with the other.
+        let mut a = BlockTracker::new();
+        let mut b = BlockTracker::new();
+        run_one(&mut a, "ls", "a", 0);
+        run_one(&mut b, "pwd", "b", 0);
+
+        // Each tracker has exactly one block — no cross-contamination.
+        assert_eq!(a.blocks().len(), 1);
+        assert_eq!(b.blocks().len(), 1);
+        // Both start their id sequence at 1 (independent state machines).
+        assert_eq!(a.blocks()[0].id, BlockId(1));
+        assert_eq!(b.blocks()[0].id, BlockId(1));
+        // Commands don't leak across trackers.
+        assert_eq!(a.blocks()[0].command, "ls");
+        assert_eq!(b.blocks()[0].command, "pwd");
+
+        // Adding a block to `a` doesn't change `b`.
+        run_one(&mut a, "echo more", "more", 0);
+        assert_eq!(a.blocks().len(), 2);
+        assert_eq!(b.blocks().len(), 1);
+    }
+
+    #[test]
+    fn clear_command_produces_empty_output_block() {
+        // The shell's `clear` command typically produces no captured output
+        // (it emits control sequences that the VT parser handles, not printable
+        // chars). The block should still record the command name and exit code.
+        // We drive the tracker directly (without run_one) so no stray newline
+        // is appended to the output.
+        let mut t = BlockTracker::new();
+        t.on_prompt_start();
+        t.on_command_start("clear".to_string());
+        // No on_print / on_newline calls — clear produces no printable output.
+        t.on_command_end(0);
+        let block = t.blocks().last().unwrap();
+        assert_eq!(block.command, "clear");
+        assert!(block.output.is_empty(), "clear should produce no output");
+        assert_eq!(block.exit_code, Some(0));
+    }
+
+    #[test]
+    fn empty_command_produces_block() {
+        // v1.0 fix: an empty command ("") still produces a block. The shell
+        // may emit 133;B with an empty command line (e.g. user pressed Enter
+        // on an empty prompt). The block should be recorded with an empty
+        // command string rather than being silently dropped.
+        let mut t = BlockTracker::new();
+        let block = run_one(&mut t, "", "some output", 0);
+        assert_eq!(block.command, "");
+        assert_eq!(block.output, "some output\n");
+        assert_eq!(block.exit_code, Some(0));
+        assert_eq!(t.blocks().len(), 1);
+    }
+
+    #[test]
+    fn command_after_clear_does_not_affect_history() {
+        // Running `clear` then another command should leave the history with
+        // exactly two blocks — the clear block doesn't erase prior history
+        // (that's the shell's job, not the BlockTracker's).
+        let mut t = BlockTracker::new();
+        run_one(&mut t, "echo first", "first\n", 0);
+        run_one(&mut t, "clear", "", 0);
+        run_one(&mut t, "echo second", "second\n", 0);
+
+        assert_eq!(t.blocks().len(), 3);
+        assert_eq!(t.blocks()[0].command, "echo first");
+        assert_eq!(t.blocks()[1].command, "clear");
+        assert_eq!(t.blocks()[2].command, "echo second");
+        // IDs continue to rise monotonically across the clear.
+        assert_eq!(t.blocks()[0].id, BlockId(1));
+        assert_eq!(t.blocks()[1].id, BlockId(2));
+        assert_eq!(t.blocks()[2].id, BlockId(3));
+    }
+
+    #[test]
+    fn reset_to_prompt_finalizes_with_no_exit_code() {
+        // v1.0 fix: reset_to_prompt() (called after Ctrl+C flush) finalizes
+        // any in-flight block with no exit code, mirroring the 133;A interrupt
+        // path. This is a distinct code path from on_prompt_start().
+        let mut t = BlockTracker::new();
+        t.on_prompt_start();
+        t.on_command_start("long-running".to_string());
+        t.on_print('x');
+        t.on_print('y');
+        // Simulate Ctrl+C flush → reset_to_prompt (no 133;D, no 133;A).
+        t.reset_to_prompt();
+
+        assert_eq!(t.blocks().len(), 1);
+        let block = &t.blocks()[0];
+        assert_eq!(block.command, "long-running");
+        assert_eq!(block.output, "xy");
+        assert_eq!(
+            block.exit_code, None,
+            "reset_to_prompt finalizes with no exit code"
+        );
+        assert_eq!(t.phase(), ShellPhase::AtPrompt);
+    }
 }

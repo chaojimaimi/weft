@@ -633,4 +633,47 @@ mod tests {
         let err = PtyError::ChildSignaled("SIGHUP".into());
         assert!(err.to_string().contains("SIGHUP"));
     }
+
+    // ── T4: additional PTY coverage ────────────────────────────────────
+
+    /// Spawning a non-existent program: forkpty succeeds (the fork itself
+    /// works), the child's exec fails, and the child exits with code 127
+    /// (the POSIX convention for "command not found"). The parent sees an
+    /// `Exit` event rather than a spawn-time error.
+    ///
+    /// Marked `#[ignore]` because it spawns a real subprocess (needs a PTY
+    /// and a working fork). Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn spawn_unknown_command_child_exits() {
+        let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80), || {})
+            .expect("forkpty itself should succeed even if the program doesn't exist");
+
+        // The child's exec will fail → it exits with code 127. Collect
+        // events until we see the Exit.
+        let mut got_exit = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
+            match event {
+                Ok(Some(PtyEvent::Exit(result))) => {
+                    // exec failure → child exits with 127.
+                    assert!(
+                        result.is_ok(),
+                        "expected exit code 127, got error: {result:?}"
+                    );
+                    assert_eq!(result.unwrap(), 127, "exec failure should exit 127");
+                    got_exit = true;
+                    break;
+                }
+                Ok(Some(PtyEvent::Output(_))) => continue,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            got_exit,
+            "should receive an Exit event for an unknown command"
+        );
+    }
 }

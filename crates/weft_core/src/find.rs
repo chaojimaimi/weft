@@ -891,4 +891,81 @@ mod tests {
             assert_eq!(d.len, s.len, "len must agree");
         }
     }
+
+    // ── T3: additional find coverage ───────────────────────────────────
+
+    /// Helper: build a Row with the given text written into its cells.
+    fn make_row(num_cols: usize, text: &str) -> crate::grid::Row {
+        let mut row = crate::grid::Row::new(num_cols);
+        for (i, ch) in text.chars().enumerate() {
+            if i >= num_cols {
+                break;
+            }
+            row.cells[i].character = ch;
+            row.cells[i].flags = CellFlags::DIRTY;
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            row.cells[i].width = if w > 1 {
+                crate::grid::CellWidth::Full
+            } else {
+                crate::grid::CellWidth::Half
+            };
+        }
+        row
+    }
+
+    #[test]
+    fn find_in_grid_covers_scrollback_and_viewport() {
+        // find_in_grid uses a unified row index over (scrollback, viewport).
+        // A match in scrollback and a match in viewport should both be found,
+        // with row indices reflecting their unified position.
+        let mut g = Grid::new(3, 25);
+        // Push two rows into scrollback (the older region).
+        g.scrollback.push(make_row(25, "old foo here"));
+        g.scrollback.push(make_row(25, "second scrollback foo"));
+        // Viewport has a match too.
+        write(&mut g, 0, 0, "viewport foo");
+        write(&mut g, 1, 0, "no match here");
+        write(&mut g, 2, 0, "another foo");
+
+        let m = find_in_grid(&g, "foo", false, false);
+        // 4 matches: 2 in scrollback + 2 in viewport.
+        assert_eq!(m.len(), 4);
+        // Scrollback matches come first (unified row 0, 1).
+        assert_eq!(m[0].row, 0, "scrollback row 0");
+        assert_eq!(m[1].row, 1, "scrollback row 1");
+        // Viewport matches follow at rows sb_len + vp_row.
+        let sb_len = g.scrollback_len();
+        assert_eq!(m[2].row, sb_len, "viewport row 0");
+        assert_eq!(m[3].row, sb_len + 2, "viewport row 2");
+    }
+
+    #[test]
+    fn find_in_blocks_matches_command_only() {
+        // When only the command line contains the needle (not the output),
+        // find_in_blocks must still return a match marked is_command=true.
+        let blocks = [make_block(7, "grep hello files", "no output matching")];
+        let m = find_in_blocks(blocks.iter(), "hello", false, false).unwrap();
+        assert_eq!(m.len(), 1);
+        assert!(m[0].is_command, "match should be in command, not output");
+        assert_eq!(m[0].block_id, BlockId(7));
+        assert_eq!(m[0].col, 5);
+        assert_eq!(m[0].len, 5);
+    }
+
+    #[test]
+    fn find_case_sensitive_empty_query_returns_empty() {
+        // An empty query with case_sensitive=true must still return empty
+        // (the early-return guard is independent of case sensitivity).
+        let mut g = Grid::new(2, 20);
+        write(&mut g, 0, 0, "hello world");
+        assert!(find_in_grid(&g, "", true, false).is_empty());
+        // find_in_snapshot path too.
+        let snap = g.find_snapshot();
+        assert!(find_in_snapshot(&snap, "", true, false).unwrap().is_empty());
+        // And the blocks path.
+        let blocks = [make_block(1, "echo hi", "hi")];
+        assert!(find_in_blocks(blocks.iter(), "", true, false)
+            .unwrap()
+            .is_empty());
+    }
 }

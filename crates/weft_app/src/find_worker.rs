@@ -310,4 +310,40 @@ mod tests {
         }
         assert!(got_err, "worker should send RegexInvalid");
     }
+
+    // ── T3: additional scan_chunk coverage ─────────────────────────────
+
+    #[test]
+    fn scan_chunk_regex_invalid_pattern_returns_empty() {
+        // scan_chunk swallows the RegexError from find_in_snapshot and returns
+        // an empty Vec (the worker surfaces RegexInvalid separately via the
+        // pre-scan in run()).
+        let s = snap(&["hello world", "abc"]);
+        let m = scan_chunk(&s, 0, 2, "(unclosed", false, true);
+        assert!(
+            m.is_empty(),
+            "invalid regex should produce empty matches, got {m:?}"
+        );
+    }
+
+    #[test]
+    fn scan_chunk_finds_multiple_matches() {
+        // A single chunk containing multiple matches on different rows must
+        // return all of them, with row indices rebased to the original.
+        let s = snap(&["foo bar foo", "baz", "foo qux foo"]);
+        // Scan rows 0..3 (the whole snapshot).
+        let m = scan_chunk(&s, 0, 3, "foo", false, false);
+        assert_eq!(m.len(), 4, "expected 4 foo matches");
+        // Row 0 has two matches.
+        assert_eq!(m[0].row, 0);
+        assert_eq!(m[0].col, 0);
+        assert_eq!(m[0].len, 3);
+        assert_eq!(m[1].row, 0);
+        assert_eq!(m[1].col, 8);
+        // Row 2 has two matches (row 1 has none).
+        assert_eq!(m[2].row, 2);
+        assert_eq!(m[2].col, 0);
+        assert_eq!(m[3].row, 2);
+        assert_eq!(m[3].col, 8);
+    }
 }
