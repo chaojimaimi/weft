@@ -353,4 +353,88 @@ mod tests {
         let t = Tab::empty();
         assert!(t.ime_preedit.is_empty());
     }
+
+    // ── v1.0 H4: TabsAutoSave snapshot roundtrip ─────────────────────
+
+    /// Build a Tab with a live Terminal but no PTY — enough for
+    /// `to_snapshot` / `restore_from_snapshot` without spawning a shell.
+    fn tab_with_terminal(scrollback_lines: usize) -> Tab {
+        let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
+        Tab {
+            terminal: Some(Terminal::with_scrollback(24, 80, scrollback_lines)),
+            pty: None,
+            msg_rx,
+            msg_tx,
+            input_handler: InputHandler::new(),
+            selection_handler: SelectionHandler::new(),
+            ime_preedit: String::new(),
+            pending_pty_resize: None,
+            block_scroll_offset: 0,
+        }
+    }
+
+    #[test]
+    fn snapshot_is_none_when_no_terminal() {
+        // Tab::empty has no terminal → to_snapshot returns None.
+        let t = Tab::empty();
+        assert!(t.to_snapshot(0).is_none());
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_scroll_offset_and_editor() {
+        let mut t = tab_with_terminal(1000);
+        t.block_scroll_offset = 7;
+        t.terminal
+            .as_mut()
+            .unwrap()
+            .editor_mut()
+            .buffer
+            .set_text("echo hi");
+
+        let snap = t.to_snapshot(2).expect("snapshot with terminal");
+        assert_eq!(snap.position, 2);
+        assert_eq!(snap.block_scroll_offset, 7);
+        assert!(!snap.editor_buffer.is_empty(), "editor buffer encoded");
+
+        // Restore into a fresh tab.
+        let mut restored = tab_with_terminal(1000);
+        assert!(restored.restore_from_snapshot(&snap));
+        assert_eq!(restored.block_scroll_offset, 7);
+        let editor_text = restored.terminal.as_ref().unwrap().editor().buffer.text();
+        assert_eq!(editor_text, "echo hi");
+    }
+
+    #[test]
+    fn snapshot_default_shell_phase_is_not_integrated() {
+        // A fresh Terminal has NotIntegrated phase → snapshot encodes that.
+        let t = tab_with_terminal(1000);
+        let snap = t.to_snapshot(0).unwrap();
+        assert_eq!(snap.shell_phase, "NotIntegrated");
+    }
+
+    #[test]
+    fn snapshot_cwd_none_when_unset() {
+        // No OSC 7 received → cwd is None in the snapshot.
+        let t = tab_with_terminal(1000);
+        let snap = t.to_snapshot(0).unwrap();
+        assert!(snap.cwd.is_none());
+    }
+
+    #[test]
+    fn restore_from_invalid_editor_buffer_keeps_empty() {
+        // Garbage JSON → restore returns false, editor stays empty.
+        let mut t = tab_with_terminal(1000);
+        let snap = weft_core::persistence::TabSnapshot {
+            position: 0,
+            cwd: None,
+            block_scroll_offset: 3,
+            editor_buffer: "{not valid json".to_string(),
+            shell_phase: "AtPrompt".to_string(),
+        };
+        assert!(!t.restore_from_snapshot(&snap));
+        // scroll offset still applied even if editor restore failed.
+        assert_eq!(t.block_scroll_offset, 3);
+        let editor_text = t.terminal.as_ref().unwrap().editor().buffer.text();
+        assert!(editor_text.is_empty());
+    }
 }

@@ -291,6 +291,30 @@ const CONTEXT_MENU_ITEMS: &[(&str, &str)] = &[
     ("Send to Input", "send_to_input"),
 ];
 
+/// Index of the context menu item at `(click_x, click_y)`, or `None` when
+/// the click misses every item. Extracted from `execute_context_menu` so
+/// the hit-test geometry is unit-testable without an `App`/renderer.
+///
+/// Geometry mirrors `build_context_menu_vertices`: each row is
+/// `cell_height * 1.2` tall, with a `cell_height * 0.2` top inset.
+fn context_menu_hit_index(
+    menu_x: f32,
+    menu_y: f32,
+    cell_height: f32,
+    click_x: f32,
+    click_y: f32,
+) -> Option<usize> {
+    let item_h = cell_height * 1.2;
+    let top_inset = cell_height * 0.2;
+    for (i, _) in CONTEXT_MENU_ITEMS.iter().enumerate() {
+        let item_y = menu_y + top_inset + i as f32 * item_h;
+        if click_y >= item_y && click_y < item_y + item_h && click_x >= menu_x {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Active popup border drag state.
 #[derive(Clone)]
 struct DragState {
@@ -4526,19 +4550,12 @@ impl App {
             .as_ref()
             .map(|r| r.cell_height() as f32)
             .unwrap_or(16.0);
-        let item_h = ch * 1.2;
-        let top_inset = ch * 0.2; // matches renderer's `menu_y0 + ch * 0.2`
 
-        // Check if click is on a menu item.
-        for (i, _label) in CONTEXT_MENU_ITEMS.iter().enumerate() {
-            let item_y = menu.y + top_inset + i as f32 * item_h;
-            if click_y >= item_y && click_y < item_y + item_h && click_x >= menu.x {
-                // Execute the action.
-                let action = CONTEXT_MENU_ITEMS[i].1;
-                self.run_context_action(menu.block_id, action);
-                self.request_redraw();
-                return;
-            }
+        if let Some(i) = context_menu_hit_index(menu.x, menu.y, ch, click_x, click_y) {
+            let action = CONTEXT_MENU_ITEMS[i].1;
+            self.run_context_action(menu.block_id, action);
+            self.request_redraw();
+            return;
         }
         // Click outside menu items — just close (already taken).
         self.request_redraw();
@@ -6317,6 +6334,11 @@ fn main() {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate `XDG_CONFIG_HOME` — env vars are
+    /// process-global, so parallel tests that touch the same var would
+    /// clobber each other's values.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn word_at_picks_token_left_of_cursor() {
         assert_eq!(word_at("ls -l", 5), Some((3, 5))); // "-l"
@@ -6373,6 +6395,7 @@ mod tests {
     /// saved and restored around the test to avoid affecting parallel tests.
     #[test]
     fn first_run_marker_created_on_first_call_only() {
+        let _env = ENV_LOCK.lock().unwrap();
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -6444,5 +6467,228 @@ mod tests {
         assert_eq!(word_at(line, 5), Some((0, 5)));
         // Cursor at char index 2 (the 'l').
         assert_eq!(word_at(line, 2), Some((0, 2)));
+    }
+
+    // ── Keybindings tab: chord_label formatting ──────────────────────
+
+    #[test]
+    fn chord_label_cmd_plus_char() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(chord_label(KeyCode::Char('c'), Modifiers::SUPER), "cmd+c");
+    }
+
+    #[test]
+    fn chord_label_cmd_shift_t() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(
+            chord_label(KeyCode::Char('t'), Modifiers::SUPER | Modifiers::SHIFT),
+            "cmd+shift+t"
+        );
+    }
+
+    #[test]
+    fn chord_label_shift_page_up() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(
+            chord_label(KeyCode::PageUp, Modifiers::SHIFT),
+            "shift+page_up"
+        );
+    }
+
+    #[test]
+    fn chord_label_bare_enter() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(chord_label(KeyCode::Enter, Modifiers::empty()), "enter");
+    }
+
+    #[test]
+    fn chord_label_ctrl_a() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(
+            chord_label(KeyCode::Char('a'), Modifiers::CONTROL),
+            "ctrl+a"
+        );
+    }
+
+    #[test]
+    fn chord_label_alt_plus_char() {
+        use weft_core::input::{KeyCode, Modifiers};
+        assert_eq!(chord_label(KeyCode::Char('x'), Modifiers::ALT), "alt+x");
+    }
+
+    // ── F7 context menu: hit-test geometry ───────────────────────────
+
+    #[test]
+    fn context_menu_items_count_is_four() {
+        assert_eq!(CONTEXT_MENU_ITEMS.len(), 4);
+    }
+
+    #[test]
+    fn context_menu_actions_are_unique() {
+        let actions: Vec<&str> = CONTEXT_MENU_ITEMS.iter().map(|(_, a)| *a).collect();
+        let mut sorted = actions.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), actions.len(), "duplicate action strings");
+    }
+
+    #[test]
+    fn context_menu_hit_first_item() {
+        // menu at (100, 200), cell_height 16 → top_inset 3.2, item_h 19.2.
+        // Item 0 spans y ∈ [203.2, 222.4).
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 210.0),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn context_menu_hit_second_item() {
+        // Item 1 spans y ∈ [222.4, 241.6).
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 230.0),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn context_menu_hit_last_item() {
+        // Item 3 spans y ∈ [260.8, 280.0).
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 270.0),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn context_menu_miss_below_last_item() {
+        // Below all items → None.
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 300.0),
+            None
+        );
+    }
+
+    #[test]
+    fn context_menu_miss_left_of_menu() {
+        // click_x < menu_x → None even when y is on item 0.
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 50.0, 210.0),
+            None
+        );
+    }
+
+    #[test]
+    fn context_menu_hit_boundary_top_inset() {
+        // Above top_inset (y < 203.2) → None.
+        assert_eq!(
+            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 202.0),
+            None
+        );
+    }
+
+    // ── config mtime hot-reload: external file change is picked up ──
+    //
+    // The 1Hz mtime poller in `spawn_threads` calls `reload_config()` →
+    // `Config::load()` when it detects a change. This test verifies the
+    // data source: after an external edit (simulating the user editing
+    // config.toml in another editor), `Config::load()` returns the new
+    // values. The thread-scheduling layer is not exercised here.
+
+    #[test]
+    fn config_load_picks_up_external_theme_change() {
+        let _env = ENV_LOCK.lock().unwrap();
+        use weft_core::config::Config;
+        let tmp = unique_temp_dir("weft-mtime-theme");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let cfg_dir = tmp.join("weft");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_path = cfg_dir.join("config.toml");
+
+        // Initial: theme = weft-warm.
+        std::fs::write(&cfg_path, "[theme]\nname = \"weft-warm\"\n").unwrap();
+        let first = Config::load();
+        assert_eq!(first.theme.name, "weft-warm");
+
+        // External edit: theme → weft-light (simulating user editing the file).
+        std::fs::write(&cfg_path, "[theme]\nname = \"weft-light\"\n").unwrap();
+        let second = Config::load();
+        assert_eq!(second.theme.name, "weft-light");
+
+        restore_xdg(old_xdg, &tmp);
+    }
+
+    #[test]
+    fn config_load_picks_up_external_font_change() {
+        let _env = ENV_LOCK.lock().unwrap();
+        use weft_core::config::Config;
+        let tmp = unique_temp_dir("weft-mtime-font");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let cfg_dir = tmp.join("weft");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_path = cfg_dir.join("config.toml");
+
+        std::fs::write(&cfg_path, "[font]\nsize = 12.0\n").unwrap();
+        let first = Config::load();
+        assert!((first.font.size - 12.0).abs() < 1e-6);
+
+        std::fs::write(&cfg_path, "[font]\nsize = 16.0\n").unwrap();
+        let second = Config::load();
+        assert!((second.font.size - 16.0).abs() < 1e-6);
+
+        restore_xdg(old_xdg, &tmp);
+    }
+
+    #[test]
+    fn config_load_returns_default_when_file_deleted() {
+        let _env = ENV_LOCK.lock().unwrap();
+        use weft_core::config::Config;
+        let tmp = unique_temp_dir("weft-mtime-del");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        let cfg_dir = tmp.join("weft");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_path = cfg_dir.join("config.toml");
+
+        // File exists → load reads it.
+        std::fs::write(&cfg_path, "[font]\nsize = 18.0\n").unwrap();
+        let with_file = Config::load();
+        assert!((with_file.font.size - 18.0).abs() < 1e-6);
+
+        // File deleted → load falls back to defaults.
+        std::fs::remove_file(&cfg_path).unwrap();
+        let without_file = Config::load();
+        assert!(
+            (without_file.font.size - 14.0).abs() < 1e-6,
+            "default font size"
+        );
+
+        restore_xdg(old_xdg, &tmp);
+    }
+
+    /// Helper: create a unique temp dir for an env-var-scoped test.
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir().join(format!("{prefix}-{pid}-{id}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    /// Helper: restore XDG_CONFIG_HOME and clean up the temp dir.
+    fn restore_xdg(old: Option<std::ffi::OsString>, tmp: &std::path::Path) {
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(tmp);
     }
 }
