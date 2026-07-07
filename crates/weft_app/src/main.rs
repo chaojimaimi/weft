@@ -494,6 +494,15 @@ impl App {
 
     fn spawn_pty(&mut self, rows: usize, cols: usize) {
         let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
+        // v1.0 V13: On first launch, inject a welcome banner via PTY.
+        // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it
+        // out of zsh history). The marker file is created in
+        // first_run_welcome() so this only fires once ever.
+        if let Some(cmd) = first_run_welcome() {
+            if let Some(p) = tab.pty.as_ref() {
+                let _ = p.write_sync(cmd.as_bytes());
+            }
+        }
         self.tabs.push(tab);
     }
 
@@ -6012,6 +6021,50 @@ fn weft_cache_dir() -> Option<std::path::PathBuf> {
         }
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache").join("weft"))
+}
+
+/// v1.0 V13: Onboarding — first-run welcome message.
+///
+/// Detects first launch by checking `~/.config/weft/.first_run`. On first
+/// launch, returns a `printf` command string that prints a short welcome
+/// banner with core shortcuts. The caller writes this to the PTY right
+/// after spawn, so it shows up in the user's first shell session. The
+/// `.first_run` marker is created here (not by the caller).
+///
+/// Returns `None` on subsequent launches or if the config dir can't be
+/// resolved (we'd rather skip onboarding than spam the user every launch).
+fn first_run_welcome() -> Option<String> {
+    use std::path::PathBuf;
+    // Resolve config dir: $XDG_CONFIG_HOME/weft or ~/.config/weft
+    let dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            PathBuf::from(xdg).join("weft")
+        } else {
+            return None;
+        }
+    } else {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("weft"))?
+    };
+    let marker = dir.join(".first_run");
+    if marker.exists() {
+        return None;
+    }
+    // Create marker immediately (best-effort). Even if the printf write
+    // fails later, we don't want to re-show the welcome on every launch.
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&marker, b"1");
+    // Leading space + HIST_IGNORE_SPACE (default in zsh) keeps this out of
+    // shell history. The printf is one-shot; it doesn't persist anywhere.
+    let banner = "\x1b[2m# Welcome to Weft v1.0\x1b[0m\n\
+\x1b[2m# Core shortcuts:\x1b[0m\n\
+\x1b[2m#   Cmd+T        New tab      Cmd+W  Close tab\x1b[0m\n\
+\x1b[2m#   Cmd+D        Split pane   Cmd+[/]  Cycle tabs\x1b[0m\n\
+\x1b[2m#   Cmd+P        Command palette (fuzzy)\x1b[0m\n\
+\x1b[2m#   Cmd+F        Find         Cmd+Shift+S  Toggle sidebar\x1b[0m\n\
+\x1b[2m#   Cmd+,        Settings     Cmd+Shift+T  Cycle theme\x1b[0m\n\
+\x1b[2m# Block view groups commands and output. Type a command and press Enter.\x1b[0m\n";
+    // Leading space keeps this out of zsh history (HIST_IGNORE_SPACE default).
+    Some(format!(" printf {:?}\n", banner))
 }
 
 /// Configure shell integration for the child shell and return env overrides.
