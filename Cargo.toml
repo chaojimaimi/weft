@@ -45,5 +45,7 @@ core-text = "20.1"
 core-foundation = "0.9"
 # Secret masking (v0.5 F8)
 regex = "1"
+# Window icon (PNG decode for winit runtime icon)
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }

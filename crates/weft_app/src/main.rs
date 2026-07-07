@@ -13,6 +13,8 @@ mod tab;
 use renderer::{
     block_matches_query, visible_panel_rows, FindDrawState, MetalRenderer, TabBarDrawState,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tab::Tab;
 use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx, CompletePosition};
@@ -81,6 +83,13 @@ struct App {
     /// Last cursor blink toggle time (shared anchor for both the grid-view
     /// hard blink and the prompt signature breath).
     cursor_blink_time: std::time::Instant,
+    /// Flicker fix (Step 2): shared flag the blink-timer thread checks before
+    /// waking the event loop. When false (no visible cursor/caret, window
+    /// unfocused, or running a command in block view without a prompt), the
+    /// timer skips `send_event(Wake)`, avoiding pointless full redraws that
+    /// caused the idle-terminal flicker. The main thread updates this after
+    /// each redraw based on whether a cursor/caret was actually drawn.
+    cursor_anim_active: Arc<AtomicBool>,
     /// Last known mouse position for click/scroll handling.
     last_mouse_x: f64,
     last_mouse_y: f64,
@@ -425,6 +434,7 @@ impl App {
             cursor_blink_on: true,
             cursor_blink_phase: 0.0,
             cursor_blink_time: std::time::Instant::now(),
+            cursor_anim_active: Arc::new(AtomicBool::new(true)),
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             last_resize_instant: std::time::Instant::now(),
@@ -4938,7 +4948,11 @@ impl ApplicationHandler<AppEvent> for App {
             // Window-level transparency is fixed at creation; the layer opaque
             // flag + bg alpha still update live, but crossing the 1.0 boundary
             // (opaque ↔ see-through) needs a relaunch.
-            .with_transparent(win.opacity < 1.0);
+            .with_transparent(win.opacity < 1.0)
+            // Runtime window icon (shows in the Dock during `cargo run` and
+            // in the app switcher). The .icns in the .app bundle takes over
+            // once packaged — see v1.0 Phase 3 V9-b.
+            .with_window_icon(load_window_icon());
 
         let window = event_loop.create_window(attrs).unwrap();
         let renderer = MetalRenderer::new(
@@ -5119,9 +5133,18 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Cursor-blink timer: wake the loop ~2x/sec so the caret toggles
         // without a vsync busy-loop. Exits when the event loop drops the proxy.
+        // Flicker fix (Step 2): only wake when a cursor/caret is actually
+        // animating. The main thread sets `cursor_anim_active` after each
+        // redraw — when false (no prompt in block view, cursor hidden in
+        // grid view, or window unfocused), the timer skips the wake, which
+        // avoids pointless full redraws that caused idle flicker.
         let blink_proxy = self.proxy.clone();
+        let blink_flag = self.cursor_anim_active.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(530));
+            if !blink_flag.load(Ordering::Relaxed) {
+                continue; // no cursor to animate — skip this wake
+            }
             if blink_proxy.send_event(AppEvent::Wake).is_err() {
                 break; // event loop exited
             }
@@ -5500,6 +5523,19 @@ impl ApplicationHandler<AppEvent> for App {
                         scroll_metrics,
                         &tab_bar,
                     );
+                    // Flicker fix (Step 2): update the shared flag so the blink
+                    // timer thread knows whether to keep waking the loop. In
+                    // block view the caret only animates at the prompt; in grid
+                    // view it animates when the cursor isn't hidden. When no
+                    // caret is visible, skipping the wake avoids pointless
+                    // full redraws (the main cause of idle-terminal flicker).
+                    let anim_active = if terminal.show_block_view() {
+                        terminal.block_tracker().phase() == ShellPhase::AtPrompt
+                    } else {
+                        terminal.cursor_visible
+                    };
+                    self.cursor_anim_active
+                        .store(anim_active, Ordering::Relaxed);
                 }
 
                 // v1.0 P0-b: clear the grid's per-row dirty flags now that
@@ -5887,6 +5923,18 @@ fn scan_path_bins() -> Vec<String> {
         }
     }
     bins.into_iter().collect()
+}
+
+/// Load the weft window icon from the embedded 256×256 PNG. Returns `None`
+/// (winit default icon) if decode fails — best-effort, not a hard error.
+/// The PNG is embedded at compile time via `include_bytes!`, so there's no
+/// runtime file dependency.
+fn load_window_icon() -> Option<winit::window::Icon> {
+    let png_bytes = include_bytes!("../../../assets/logo/png/weft-icon-256.png");
+    let img = image::load_from_memory(png_bytes).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
 fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
