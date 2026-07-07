@@ -1,0 +1,126 @@
+# v1.0 V11: Release pipeline for Weft.app
+#
+# Triggers on:
+#   - Push of version tags (v1.0.0, v1.0.1, ...)
+#   - Manual dispatch from Actions tab
+#
+# Produces:
+#   - Signed + notarized Weft.app
+#   - Notarized .zip artifact attached to GitHub Release
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   - APPLE_ID              — Apple ID email
+#   - APPLE_APP_SPECIFIC_PASSWORD — app-specific password for notarytool
+#   - APPLE_TEAM_ID         — Developer Program team ID
+#   - APPLE_DEVID_P12_BASE64 — base64 of Developer ID Application .p12
+#   - APPLE_DEVID_P12_PASSWORD — password for the .p12
+#
+# The .p12 is imported into a temporary keychain on each run.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: Weft
+  BUNDLE_ID: dev.weft.terminal
+  MACOS_MIN: "12.0"
+
+jobs:
+  build-macos:
+    name: Build macOS .app
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Assemble .app bundle
+        run: ./scripts/build-app.sh
+
+      - name: Import Developer ID certificate
+        env:
+          DEVID_P12_BASE64: ${{ secrets.APPLE_DEVID_P12_BASE64 }}
+          DEVID_P12_PASSWORD: ${{ secrets.APPLE_DEVID_P12_PASSWORD }}
+        run: |
+          # Create a temporary keychain for CI signing.
+          KEYCHAIN="weft-ci.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 32)"
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+
+          # Import the Developer ID Application certificate.
+          P12_PATH="$RUNNER_TEMP/dev_id.p12"
+          echo "${DEVID_P12_BASE64}" | base64 --decode > "${P12_PATH}"
+          security import "${P12_PATH}" \
+              -P "${DEVID_P12_PASSWORD}" \
+              -k "${KEYCHAIN}" \
+              -T /usr/bin/codesign
+          security list-keychains -d "${HOME}" -s "${KEYCHAIN}" login.keychain-db
+
+          # Allow codesign to access the key.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN}"
+
+      - name: Store notarytool credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool store-credentials "AC_PASSWORD" \
+              --apple-id "${APPLE_ID}" \
+              --password "${APPLE_APP_SPECIFIC_PASSWORD}" \
+              --team-id "${APPLE_TEAM_ID}"
+
+      - name: Sign, notarize, staple
+        run: ./scripts/notarize.sh
+
+      - name: Create distributable ZIP
+        run: |
+          cd target/release/osx
+          ditto -c -k --keepParent Weft.app Weft-${{ github.ref_name }}.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/osx/Weft-*.zip
+          draft: true
+          generate_release_notes: true
+          name: Weft ${{ github.ref_name }}
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          security delete-keychain weft-ci.keychain-db || true
