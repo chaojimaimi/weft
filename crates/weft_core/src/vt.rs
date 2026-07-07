@@ -318,9 +318,13 @@ impl Terminal {
     ///
     /// Important: the fast path only triggers when vte's parser is in the
     /// ground state (no escape sequence in progress). We track this via
-    /// `parser_in_ground_state` — set true initially, cleared on any escape
-    /// byte (0x1B) or C0 control (< 0x20), restored to true when vte's `print`
-    /// callback fires (which only happens in ground state).
+    /// `parser_in_ground_state` — set true initially, cleared ONLY on ESC
+    /// (0x1B) which is the sole byte that transitions vte out of ground.
+    /// C0 controls (\n, \r, \t, BEL, …) are "execute" actions that stay in
+    /// ground, so the fast path remains engaged after them. v1.0 P1.5-C3:
+    /// the previous code also cleared the flag on every C0 control, which
+    /// forced the first char of each line through vte's per-byte path —
+    /// ~100k wasted advance() calls for `seq 1 100000`.
     pub fn process(&mut self, bytes: &[u8]) {
         let mut parser = std::mem::take(&mut self.parser);
         let mut i = 0;
@@ -344,10 +348,17 @@ impl Terminal {
             // sequences internally via its state machine.
             if i < bytes.len() {
                 let b = bytes[i];
-                // Any escape (0x1B) or C0 control (< 0x20) takes vte out of
-                // ground state. The `print` callback will set it back to true
-                // when vte returns to ground.
-                if b == 0x1B || b < 0x20 {
+                // v1.0 P1.5-C3: Only ESC (0x1B) transitions vte OUT of ground
+                // state. C0 controls (0x00-0x1F except 0x1B) are "execute"
+                // actions that stay in ground per the VT500 state machine, so
+                // the ASCII fast path can remain engaged after \n, \r, \t, etc.
+                // Previously the fast path was disabled after EVERY \n, forcing
+                // the first char of each line through vte's per-byte advance()+
+                // print() — ~100k extra advance calls for `seq 1 100000`.
+                // If we were already in an escape sequence (ground == false),
+                // leaving the flag untouched is safe: vte's print callback
+                // restores it to true when the sequence completes.
+                if b == 0x1B {
                     self.parser_in_ground_state = false;
                 }
                 parser.advance(self, b);

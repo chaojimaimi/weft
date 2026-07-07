@@ -162,27 +162,36 @@ impl Tab {
     /// command blocks ready for persistence (the caller inserts them into
     /// the shared BlockStore). `need_redraw` is true when any output was
     /// processed (so the caller can call `request_redraw`).
+    ///
+    /// v1.0 P1.5-C3: Time-bounded processing. The loop drains messages until
+    /// either the channel is empty OR a ~8ms wall-clock budget is exhausted.
+    /// This keeps the render thread responsive during huge PTY bursts (e.g.
+    /// `cat huge.log`): instead of blocking for 100ms+ processing a full read
+    /// buffer, we process ~8ms worth, yield to the renderer, then resume next
+    /// frame. The byte budget (`MAX_BYTES_PER_MESSAGE`) only governs splitting
+    /// a single oversized message so one message can't monopolize a frame.
     pub fn process_messages(&mut self) -> (bool, Vec<weft_core::blocks::Block>, bool) {
         let mut need_redraw = false;
-        // v1.0 perf: Raised from 64KB to 256KB to match the PTY read buffer.
-        // With the scroll_up allocation fix, processing is ~25x cheaper per
-        // byte, so we can afford a larger per-frame budget. This reduces the
-        // number of frames needed for large outputs (e.g. `seq 1 100000`
-        // went from ~100 frames to ~25 frames).
-        const MAX_BYTES_PER_FRAME: usize = 256 * 1024;
-        let mut bytes_this_frame = 0usize;
+        // Split threshold for a single oversized message (matches the PTY
+        // read buffer size). Messages larger than this are split: head is
+        // processed now, tail is re-queued for the next frame.
+        const MAX_BYTES_PER_MESSAGE: usize = 256 * 1024;
+        // 8ms leaves ~8ms for rendering at 60fps. We check the clock at most
+        // every MIN_BYTES_FOR_TIME_CHECK bytes to avoid Instant::now() overhead
+        // dominating for tiny messages.
+        const FRAME_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+        const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
+        let frame_start = std::time::Instant::now();
+        let mut bytes_since_check = 0usize;
 
-        while bytes_this_frame < MAX_BYTES_PER_FRAME {
-            let msg = match self.msg_rx.try_recv() {
-                Ok(m) => m,
-                Err(_) => break,
-            };
+        while let Ok(msg) = self.msg_rx.try_recv() {
             match msg {
                 AppMsg::PtyOutput(data) => {
-                    let remaining_budget = MAX_BYTES_PER_FRAME - bytes_this_frame;
-                    if data.len() > remaining_budget {
-                        let head = data[..remaining_budget].to_vec();
-                        let tail = data[remaining_budget..].to_vec();
+                    if data.len() > MAX_BYTES_PER_MESSAGE {
+                        // Oversized message: process the head, re-queue the
+                        // tail, then yield to the renderer this frame.
+                        let head = data[..MAX_BYTES_PER_MESSAGE].to_vec();
+                        let tail = data[MAX_BYTES_PER_MESSAGE..].to_vec();
                         let _ = self.msg_tx.send(AppMsg::PtyOutput(tail));
                         let mut response = Vec::new();
                         if let Some(terminal) = &mut self.terminal {
@@ -199,7 +208,7 @@ impl Tab {
                         }
                         break;
                     }
-                    bytes_this_frame += data.len();
+                    bytes_since_check += data.len();
                     let mut response = Vec::new();
                     if let Some(terminal) = &mut self.terminal {
                         terminal.process(&data);
@@ -212,6 +221,14 @@ impl Tab {
                                 tracing::warn!(error = %e, "failed to write terminal response");
                             }
                         }
+                    }
+                    // Cooperative yield: if we've spent the frame's time
+                    // budget, stop draining and let the renderer draw. The
+                    // remaining messages stay queued for next frame.
+                    if bytes_since_check >= MIN_BYTES_FOR_TIME_CHECK
+                        && frame_start.elapsed() >= FRAME_TIME_BUDGET
+                    {
+                        break;
                     }
                 }
                 AppMsg::PtyExit(code) => {
