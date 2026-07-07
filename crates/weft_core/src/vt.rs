@@ -2101,3 +2101,153 @@ mod reflow_cjk_tests {
         }
     }
 }
+
+/// v1.0 P1.5: Performance benchmarks for the VT parse + grid write pipeline.
+///
+/// Run with: `cargo test -p weft_core --lib -- --ignored --nocapture`
+///
+/// These feed realistic PTY byte streams through `Terminal::process()` and
+/// measure wall-clock time. They cover the scenarios from the v1.0 plan's
+/// Phase 1.5 validation table so we can decide whether the optional C2
+/// (custom VT parser) / C3 (multithreading) tasks are still needed after
+/// the high-ROI B0-B3 + C1 optimizations.
+///
+/// All benchmarks use a 24×80 terminal (the v1.0 default) with 10K-line
+/// scrollback, matching the plan's test conditions.
+#[cfg(test)]
+mod perf_benchmarks {
+    use super::*;
+    use std::time::Instant;
+
+    /// Build a realistic `seq 1 N` byte stream, wrapped in OSC 133 shell-
+    /// integration markers the way zsh would emit them. The marker prefix
+    /// forces the parser through the escape path once per command, then the
+    /// bulk numeric output hits the ASCII fast path.
+    fn seq_output(n: u32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(n as usize * 8);
+        // 133;A (prompt start) + 133;B (command start) + 133;C (output start)
+        buf.extend_from_slice(b"\x1b]133;A\x07andylee@host ~ % \x1b]133;B\x07seq 1 ");
+        buf.extend_from_slice(n.to_string().as_bytes());
+        buf.extend_from_slice(b"\n\x1b]133;C\x07");
+        for i in 1..=n {
+            buf.extend_from_slice(i.to_string().as_bytes());
+            buf.push(b'\n');
+        }
+        // 133;D;0 (command end, exit 0) + 133;A (next prompt start)
+        buf.extend_from_slice(b"\x1b]133;D;0\x07\x1b]133;A\x07andylee@host ~ % ");
+        buf
+    }
+
+    /// Build a realistic `ls -la /usr/bin` byte stream: ~1000 entries with
+    /// file-mode / owner / size / date / name columns. Mixes ASCII fast path
+    /// (the columns) with occasional ANSI color escapes (like `ls --color`).
+    fn ls_output(entry_count: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(entry_count * 80);
+        buf.extend_from_slice(
+            b"\x1b]133;A\x07andylee@host ~ % \x1b]133;B\x07ls -la /usr/bin\n\x1b]133;C\x07",
+        );
+        buf.extend_from_slice(b"total 12345\n");
+        for i in 0..entry_count {
+            // Mode owner group size date name — printable ASCII bulk.
+            // Insert a color SGR every 10 lines to exercise escape handling.
+            if i % 10 == 0 {
+                buf.extend_from_slice(b"\x1b[1;32m"); // bold green
+            }
+            let line = format!(
+                "-rwxr-xr-x  1 root  wheel  {:>6} Jan  1 12:00 bin_tool_{:04}\n",
+                10000 + i,
+                i
+            );
+            buf.extend_from_slice(line.as_bytes());
+            if i % 10 == 0 {
+                buf.extend_from_slice(b"\x1b[0m"); // reset
+            }
+        }
+        buf.extend_from_slice(b"\x1b]133;D;0\x07\x1b]133;A\x07andylee@host ~ % ");
+        buf
+    }
+
+    /// Measure `Terminal::process` throughput for a given byte stream.
+    /// Returns (elapsed_ms, bytes, rows_written).
+    fn bench(label: &str, bytes: &[u8]) -> (f64, usize) {
+        let mut t = Terminal::with_scrollback(24, 80, 10_000);
+        let start = Instant::now();
+        t.process(bytes);
+        let elapsed = start.elapsed();
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let bytes_len = bytes.len();
+        // Throughput in MB/s.
+        let mbps = (bytes_len as f64 / 1_048_576.0) / (elapsed.as_secs_f64().max(1e-9));
+        println!("  {label:<28} {ms:>8.2} ms  | {bytes_len:>8} bytes | {mbps:>7.1} MB/s");
+        (ms, bytes_len)
+    }
+
+    /// `seq 1 10000` — plan target: < 50ms (Warp ~10ms).
+    #[test]
+    #[ignore]
+    fn bench_seq_10000() {
+        println!("\n=== Phase 1.5 benchmark: seq 1 10000 (target < 50ms) ===");
+        let bytes = seq_output(10_000);
+        let (ms, _) = bench("seq 1 10000", &bytes);
+        assert!(ms < 50.0, "seq 1 10000 took {ms:.2}ms, target < 50ms");
+    }
+
+    /// `seq 1 100000` — plan target: < 300ms (Warp ~50ms).
+    #[test]
+    #[ignore]
+    fn bench_seq_100000() {
+        println!("\n=== Phase 1.5 benchmark: seq 1 100000 (target < 300ms) ===");
+        let bytes = seq_output(100_000);
+        let (ms, _) = bench("seq 1 100000", &bytes);
+        assert!(ms < 300.0, "seq 1 100000 took {ms:.2}ms, target < 300ms");
+    }
+
+    /// `ls -la /usr/bin` style (~1000 entries) — plan target: < 20ms (Warp ~5ms).
+    #[test]
+    #[ignore]
+    fn bench_ls_usr_bin() {
+        println!("\n=== Phase 1.5 benchmark: ls -la /usr/bin (target < 20ms) ===");
+        let bytes = ls_output(1000);
+        let (ms, _) = bench("ls -la /usr/bin (1000 entries)", &bytes);
+        assert!(ms < 20.0, "ls output took {ms:.2}ms, target < 20ms");
+    }
+
+    /// Pure ASCII bulk (no escapes) — measures the C1 fast-path ceiling.
+    #[test]
+    #[ignore]
+    fn bench_pure_ascii_100k() {
+        println!("\n=== Phase 1.5 benchmark: pure ASCII bulk (no escapes) ===");
+        let bytes: Vec<u8> = (0..100_000)
+            .flat_map(|i| format!("{i}\n").into_bytes())
+            .collect();
+        let (ms, _) = bench("pure ASCII 100k lines", &bytes);
+        // No escape overhead at all — should be faster than seq_output which
+        // has OSC 133 markers. Use as a ceiling reference.
+        let _ = ms;
+    }
+
+    /// Color-heavy output (SGR every line) — measures escape-sequence overhead.
+    #[test]
+    #[ignore]
+    fn bench_color_output() {
+        println!("\n=== Phase 1.5 benchmark: colored output (SGR per line) ===");
+        let mut bytes = Vec::with_capacity(80_000);
+        bytes.extend_from_slice(b"\x1b]133;A\x07% \x1b]133;B\x07color-test\n\x1b]133;C\x07");
+        for i in 0..5000 {
+            // Alternate colors to exercise SGR parsing.
+            let color = match i % 6 {
+                0 => b"\x1b[31m", // red
+                1 => b"\x1b[32m", // green
+                2 => b"\x1b[33m", // yellow
+                3 => b"\x1b[34m", // blue
+                4 => b"\x1b[35m", // magenta
+                _ => b"\x1b[36m", // cyan
+            };
+            bytes.extend_from_slice(color);
+            bytes.extend_from_slice(format!("line {i:04} with color\n").as_bytes());
+            bytes.extend_from_slice(b"\x1b[0m");
+        }
+        let (ms, _) = bench("colored 5k lines", &bytes);
+        let _ = ms;
+    }
+}
