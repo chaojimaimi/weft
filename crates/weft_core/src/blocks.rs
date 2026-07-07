@@ -310,6 +310,34 @@ impl BlockTracker {
         }
     }
 
+    /// v1.0 P1.5-C2: Batch-append a run of printable ASCII bytes to the
+    /// in-flight block's output. Avoids per-char `push_capped` method call
+    /// overhead — one truncation check + one `extend_from_slice` instead of
+    /// N individual `push` calls. No-op unless a command is executing.
+    pub fn on_print_ascii_run(&mut self, bytes: &[u8]) {
+        if !self.is_capturing() || bytes.is_empty() {
+            return;
+        }
+        if self.output_truncated {
+            return;
+        }
+        // ASCII bytes are 1 byte each = 1 char each, so len check is direct.
+        if self.output_buf.len() + bytes.len() > MAX_OUTPUT_BYTES {
+            // Partial push up to the cap.
+            let remaining = MAX_OUTPUT_BYTES.saturating_sub(self.output_buf.len());
+            if remaining > 0 {
+                // Safety: bytes are printable ASCII (0x20..=0x7E), valid UTF-8.
+                self.output_buf
+                    .push_str(std::str::from_utf8(&bytes[..remaining]).unwrap_or(""));
+            }
+            self.output_truncated = true;
+            return;
+        }
+        // Safety: bytes are printable ASCII (0x20..=0x7E), valid UTF-8.
+        self.output_buf
+            .push_str(std::str::from_utf8(bytes).unwrap_or(""));
+    }
+
     /// Append a newline to the in-flight block's output. No-op unless a command
     /// is executing.
     pub fn on_newline(&mut self) {

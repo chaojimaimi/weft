@@ -78,6 +78,14 @@ impl HyperlinkRegistry {
         self.cell_map.clear();
     }
 
+    /// v1.0 P1.5-C2: Returns true if no cells are currently tagged with
+    /// hyperlinks. Used by the ASCII fast path to skip per-cell unlink
+    /// checks entirely (the common case — terminal output rarely has
+    /// OSC 8 hyperlinks).
+    pub fn cell_map_is_empty(&self) -> bool {
+        self.cell_map.is_empty()
+    }
+
     /// Number of currently tagged cells (for diagnostics / tests).
     pub fn tagged_cell_count(&self) -> usize {
         self.cell_map.len()

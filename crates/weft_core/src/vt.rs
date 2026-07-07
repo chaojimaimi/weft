@@ -191,13 +191,19 @@ impl Terminal {
     /// resolve to the wrong URL.
     fn scroll_grid_up(&mut self, n: usize) {
         self.grid.scroll_up(n);
-        self.hyperlinks.clear_cell_map();
+        // v1.0 P1.5-C2: skip the HashMap clear when no hyperlinks are active
+        // (the common case — terminal output rarely has OSC 8 links).
+        if !self.hyperlinks.cell_map_is_empty() {
+            self.hyperlinks.clear_cell_map();
+        }
     }
 
     /// Same as [`scroll_grid_up`](Self::scroll_grid_up) for scroll-down.
     fn scroll_grid_down(&mut self, n: usize) {
         self.grid.scroll_down(n);
-        self.hyperlinks.clear_cell_map();
+        if !self.hyperlinks.cell_map_is_empty() {
+            self.hyperlinks.clear_cell_map();
+        }
     }
 
     pub fn cwd(&self) -> Option<&str> {
@@ -354,14 +360,17 @@ impl Terminal {
     /// v1.0 perf: Bulk-write a run of printable ASCII bytes (0x20..=0x7E)
     /// directly to the grid, bypassing vte's per-byte state machine.
     ///
-    /// This mirrors `print()` but processes a contiguous run in one call:
-    /// - No per-char `unicode_width` lookup (all ASCII = width 1)
-    /// - No per-char `vte::Parser::advance` state-machine transition
-    /// - Single `block_tracker.phase()` lookup for the whole run
-    /// - Single scroll_offset reset check
-    ///
-    /// Wrap handling (deferred-wrap, line boundary) is applied per-char
-    /// inside the loop, matching `print()`'s semantics exactly.
+    /// v1.0 P1.5-C2: Rewritten to process one row at a time instead of
+    /// per-char, eliminating several sources of per-char overhead:
+    /// - **Hyperlink check**: skipped entirely when no active hyperlink AND
+    ///   the cell_map is empty (99.9% of output). Old code called
+    ///   `unlink_cell` (HashMap::remove) for every char.
+    /// - **Dirty marking**: once per row segment, not per cell.
+    /// - **Bounds check**: computed once per row (`remaining_in_row`), not
+    ///   checked per char.
+    /// - **Block capture**: batched via `on_print_ascii_run` (one
+    ///   `push_str` instead of N `push` calls).
+    /// - **Cursor access**: `cursor.col` updated once per row, not per char.
     fn print_ascii_run(&mut self, bytes: &[u8]) {
         debug_assert!(!bytes.is_empty());
         let phase = self.block_tracker.phase();
@@ -374,17 +383,19 @@ impl Terminal {
         let num_rows = self.grid.num_rows;
         let fg = self.attrs.fg;
         let bg = self.attrs.bg;
-        let flags = self.attrs.flags | CellFlags::DIRTY;
-        let hyperlink_id = self.active_hyperlink_id;
+        let base_flags = self.attrs.flags | CellFlags::DIRTY;
 
-        for &b in bytes {
-            let c = b as char; // 0x20..=0x7E → safe ASCII cast
+        // v1.0 P1.5-C2: Determine hyperlink handling mode once.
+        // - `has_hyperlink`: active OSC 8 → every cell gets linked.
+        // - `need_unlink_check`: no active link, but old cells might have
+        //   HYPERLINK flag → need to check + unlink (rare).
+        // - Neither: skip ALL hyperlink logic (fast path, 99.9% of output).
+        let has_hyperlink = self.active_hyperlink_id.is_some();
+        let need_unlink_check = !has_hyperlink && !self.hyperlinks.cell_map_is_empty();
 
-            if capturing {
-                self.block_tracker.on_print(c);
-            }
-
-            // Handle deferred wrap (same as print()).
+        let mut offset = 0;
+        while offset < bytes.len() {
+            // Handle deferred wrap (same as print()) — once per row boundary.
             if self.grid.cursor.wrap_pending {
                 self.grid.cursor.wrap_pending = false;
                 self.grid.cursor.col = 0;
@@ -399,15 +410,12 @@ impl Terminal {
                 }
             }
 
-            // ASCII is always width 1 (Half) — skip unicode_width lookup.
-            let width = CellWidth::Half;
-            let row = self.grid.cursor.row;
             let col = self.grid.cursor.col;
 
-            // Wrap if col is out of bounds (resize race — same as print()).
-            let mut row = row;
-            let mut col = col;
-            if col >= num_cols {
+            // v1.0 P1.5-C2: resize race — cursor.col may be >= num_cols after
+            // a narrowing resize. Reset to col 0 and advance row (same as the
+            // old per-char bounds check, but done once per row boundary).
+            let col = if col >= num_cols {
                 self.grid.cursor.wrap_pending = false;
                 self.grid.cursor.col = 0;
                 let (_, bottom) = self.grid.scroll_region();
@@ -416,34 +424,86 @@ impl Terminal {
                 } else if self.grid.cursor.row < num_rows - 1 {
                     self.grid.cursor.row += 1;
                 }
-                row = self.grid.cursor.row;
-                col = 0;
-                if row > 0 {
-                    self.grid.viewport[row - 1].wrapped = true;
+                let new_row = self.grid.cursor.row;
+                if new_row > 0 {
+                    self.grid.viewport[new_row - 1].wrapped = true;
                 }
+                0
+            } else {
+                col
+            };
+            // Read row AFTER the col adjustment (cursor.row may have changed).
+            let row = self.grid.cursor.row;
+
+            // How many bytes fit in the current row? No per-char bounds check.
+            let remaining_in_row = num_cols - col;
+            let remaining_bytes = bytes.len() - offset;
+            let count = remaining_in_row.min(remaining_bytes);
+            let chunk = &bytes[offset..offset + count];
+
+            // Batch capture to block tracker — one push_str instead of N pushes.
+            if capturing {
+                self.block_tracker.on_print_ascii_run(chunk);
             }
 
-            // Write the cell.
+            // Write cells — tight inner loop, no per-cell wrap/bounds check.
             {
-                let cell = &mut self.grid.viewport[row].cells[col];
-                cell.character = c;
-                cell.fg = fg;
-                cell.bg = bg;
-                cell.flags = flags;
-                cell.width = width;
-                if let Some(id) = hyperlink_id {
-                    cell.flags |= CellFlags::HYPERLINK;
-                    self.hyperlinks.link_cell(row, col, id);
-                } else {
-                    if cell.flags.contains(CellFlags::HYPERLINK) {
-                        cell.flags.remove(CellFlags::HYPERLINK);
+                let cells = &mut self.grid.viewport[row].cells;
+                if has_hyperlink {
+                    let id = self.active_hyperlink_id.unwrap();
+                    let link_flags = base_flags | CellFlags::HYPERLINK;
+                    for (i, &b) in chunk.iter().enumerate() {
+                        let c = col + i;
+                        cells[c].character = b as char;
+                        cells[c].fg = fg;
+                        cells[c].bg = bg;
+                        cells[c].flags = link_flags;
+                        cells[c].width = CellWidth::Half;
                     }
-                    self.hyperlinks.unlink_cell(row, col);
+                    // Batch-link all cells at once (borrow released).
+                    for i in 0..count {
+                        self.hyperlinks.link_cell(row, col + i, id);
+                    }
+                } else if need_unlink_check {
+                    // Slow path: some cells might have old hyperlinks to clean.
+                    // Collect positions first, then unlink after writing.
+                    let mut to_unlink: [usize; 128] = [0; 128];
+                    let mut unlink_n = 0;
+                    for (i, &b) in chunk.iter().enumerate() {
+                        let c = col + i;
+                        if cells[c].flags.contains(CellFlags::HYPERLINK) {
+                            to_unlink[unlink_n] = c;
+                            unlink_n += 1;
+                        }
+                        cells[c].character = b as char;
+                        cells[c].fg = fg;
+                        cells[c].bg = bg;
+                        cells[c].flags = base_flags;
+                        cells[c].width = CellWidth::Half;
+                    }
+                    for &c in to_unlink.iter().take(unlink_n) {
+                        self.hyperlinks.unlink_cell(row, c);
+                    }
+                } else {
+                    // Fast path: no hyperlink logic at all.
+                    for (i, &b) in chunk.iter().enumerate() {
+                        let c = col + i;
+                        cells[c].character = b as char;
+                        cells[c].fg = fg;
+                        cells[c].bg = bg;
+                        cells[c].flags = base_flags;
+                        cells[c].width = CellWidth::Half;
+                    }
                 }
-                self.grid.viewport[row].mark_dirty(col);
-                self.grid.cursor.col += 1;
             }
 
+            // Mark dirty once for the whole row segment — was per-cell.
+            self.grid.viewport[row].mark_dirty(col + count - 1);
+
+            self.grid.cursor.col += count;
+            offset += count;
+
+            // Handle end-of-row wrap.
             if self.grid.cursor.col >= num_cols {
                 self.grid.cursor.wrap_pending = true;
                 self.grid.cursor.col = num_cols - 1;
