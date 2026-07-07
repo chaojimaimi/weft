@@ -635,6 +635,10 @@ fragment float4 text_fragment(
             let tex = self.device.new_texture(&descriptor);
             *self.offscreen_texture.borrow_mut() = Some(tex);
             self.offscreen_dims.set((vw, vh));
+            // New textures have undefined content. Force a full redraw so the
+            // offscreen is fully rendered with Clear + all rows before any
+            // incremental Load path is used.
+            self.force_full_grid.set(true);
         }
         self.offscreen_texture.borrow().is_some()
     }
@@ -1314,12 +1318,16 @@ fragment float4 text_fragment(
             let cache = self.offscreen_texture.borrow();
             target_tex = cache.as_ref().unwrap().clone();
             color_att.set_texture(Some(&target_tex));
-            // Load if we blitted (preserve scrolled content), Clear otherwise.
-            if can_blit_scroll {
-                color_att.set_load_action(MTLLoadAction::Load);
-            } else {
+            // P0-c fix: Only Clear when force_full (full rebuild). Incremental
+            // frames must use Load to preserve the previous frame's offscreen
+            // content — P0-b only re-renders dirty rows, so Clear would wipe
+            // non-dirty rows to background, causing blank/flickering content.
+            // When blitting, Load preserves the blitted scroll content.
+            if self.force_full_cached.get() {
                 color_att.set_load_action(MTLLoadAction::Clear);
                 color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+            } else {
+                color_att.set_load_action(MTLLoadAction::Load);
             }
         } else {
             color_att.set_texture(Some(drawable.texture()));

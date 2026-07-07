@@ -781,6 +781,8 @@ impl App {
             }
             Action::ScrollPageUp
             | Action::ScrollPageDown
+            | Action::ScrollLineUp
+            | Action::ScrollLineDown
             | Action::ScrollToTop
             | Action::ScrollToBottom => {
                 self.scroll_action(action);
@@ -1317,6 +1319,8 @@ impl App {
                 weft_core::config::Action::ReloadConfig => "Reload Config",
                 weft_core::config::Action::ScrollPageUp => "Scroll Page Up",
                 weft_core::config::Action::ScrollPageDown => "Scroll Page Down",
+                weft_core::config::Action::ScrollLineUp => "Scroll Line Up",
+                weft_core::config::Action::ScrollLineDown => "Scroll Line Down",
                 weft_core::config::Action::ScrollToTop => "Scroll To Top",
                 weft_core::config::Action::ScrollToBottom => "Scroll To Bottom",
                 weft_core::config::Action::ToggleBlockPanel => "Toggle Block Panel",
@@ -2704,6 +2708,13 @@ impl App {
                 Action::ScrollPageDown => {
                     tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(rows);
                 }
+                Action::ScrollLineUp => {
+                    tab.block_scroll_offset =
+                        tab.block_scroll_offset.saturating_add(1).min(max_scroll);
+                }
+                Action::ScrollLineDown => {
+                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(1);
+                }
                 Action::ScrollToTop => {
                     tab.block_scroll_offset = max_scroll;
                 }
@@ -2715,6 +2726,8 @@ impl App {
             match action {
                 Action::ScrollPageUp => grid.scroll_up_history(rows),
                 Action::ScrollPageDown => grid.scroll_down_history(rows),
+                Action::ScrollLineUp => grid.scroll_up_history(1),
+                Action::ScrollLineDown => grid.scroll_down_history(1),
                 Action::ScrollToTop => grid.scroll_to_top(),
                 Action::ScrollToBottom => grid.scroll_to_bottom(),
                 _ => {}

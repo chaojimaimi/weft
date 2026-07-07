@@ -231,8 +231,38 @@ impl Pty {
     }
 
     /// Write bytes synchronously (for use before tokio runtime or in tests).
+    ///
+    /// Retries on EAGAIN/EWOULDBLOCK with a short sleep (up to ~1s). This is
+    /// critical for control characters like Ctrl+C (0x03) — if the PTY's
+    /// write buffer is momentarily full (e.g. shell hasn't drained its stdin
+    /// while a command is producing heavy output), a non-retrying write would
+    /// silently drop the SIGINT byte and the user couldn't interrupt the
+    /// command.
     pub fn write_sync(&self, data: &[u8]) -> Result<()> {
-        nix::unistd::write(&self.master, data).map_err(|e| PtyError::Write(io::Error::from(e)))?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let mut written = 0;
+        for _ in 0..100 {
+            match nix::unistd::write(&self.master, &data[written..]) {
+                Ok(n) => {
+                    written += n;
+                    if written >= data.len() {
+                        return Ok(());
+                    }
+                }
+                Err(nix::errno::Errno::EAGAIN) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(PtyError::Write(io::Error::from(e))),
+            }
+        }
+        // Timed out after ~1s of retries — log but don't crash.
+        tracing::warn!(
+            written,
+            total = data.len(),
+            "pty write_sync timed out retrying EAGAIN"
+        );
         Ok(())
     }
 

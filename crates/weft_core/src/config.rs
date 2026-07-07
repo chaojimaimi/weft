@@ -900,6 +900,12 @@ pub enum Action {
     ScrollPageUp,
     #[serde(rename = "scroll_page_down")]
     ScrollPageDown,
+    /// Scroll the scrollback buffer up by one line (Cmd+↑).
+    #[serde(rename = "scroll_line_up")]
+    ScrollLineUp,
+    /// Scroll the scrollback buffer down by one line (Cmd+↓).
+    #[serde(rename = "scroll_line_down")]
+    ScrollLineDown,
     #[serde(rename = "scroll_to_top")]
     ScrollToTop,
     #[serde(rename = "scroll_to_bottom")]
@@ -968,6 +974,8 @@ impl Default for KeyBindings {
             ("cmd+shift+comma", Action::ReloadConfig),
             ("shift+page_up", Action::ScrollPageUp),
             ("shift+page_down", Action::ScrollPageDown),
+            ("cmd+up", Action::ScrollLineUp),
+            ("cmd+down", Action::ScrollLineDown),
             ("cmd+home", Action::ScrollToTop),
             ("cmd+end", Action::ScrollToBottom),
             ("cmd+shift+b", Action::ToggleBlockPanel),
@@ -1235,6 +1243,8 @@ impl Config {
                     Action::ReloadConfig => "reload_config",
                     Action::ScrollPageUp => "scroll_page_up",
                     Action::ScrollPageDown => "scroll_page_down",
+                    Action::ScrollLineUp => "scroll_line_up",
+                    Action::ScrollLineDown => "scroll_line_down",
                     Action::ScrollToTop => "scroll_to_top",
                     Action::ScrollToBottom => "scroll_to_bottom",
                     Action::ToggleBlockPanel => "toggle_block_panel",
