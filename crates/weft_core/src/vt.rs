@@ -569,6 +569,14 @@ impl Terminal {
     /// editor's command rather than the grid snapshot.
     pub fn submit_command(&mut self) -> Vec<u8> {
         let command = self.editor.text();
+        // v1.0: Empty Enter — zsh's preexec hook does NOT fire on an empty
+        // command, so no 133;B/D markers arrive. We synthesize an empty
+        // block here (Warp-style spacer) so the block view preserves a
+        // visual gap for blank Enter, matching the UX of history blocks.
+        if command.is_empty() {
+            self.block_tracker.on_command_start(String::new());
+            self.block_tracker.on_command_end(0);
+        }
         self.command_from_editor = Some(command.clone());
         let bytes = build_submit_bytes(&command, self.bracketed_paste);
         // Record into in-memory history so ↑/↓ navigation works. This is the

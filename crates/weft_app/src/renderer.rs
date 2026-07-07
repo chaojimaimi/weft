@@ -3746,6 +3746,10 @@ fragment float4 text_fragment(
             LiveCommand {
                 command: &'a str,
             },
+            /// v1.0: Warp-style clear spacer — viewport-height blank gap
+            /// inserted before a `clear` block so the cleared prompt appears
+            /// at the top of a fresh "page" while history remains scrollable.
+            Blank,
         }
 
         let mut rows: Vec<f32> = Vec::new();
@@ -3853,6 +3857,16 @@ fragment float4 text_fragment(
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
+                // v1.0: Warp-style clear — insert a viewport-height blank
+                // gap above this block so it starts a fresh "page". History
+                // above remains reachable by scrolling up. We detect `clear`
+                // by the first whitespace token (matches `clear`, `clear;`,
+                // `clear && foo`, but not `clearance` / `echo clear`).
+                if b.command.split_whitespace().next() == Some("clear") {
+                    cursor_dist += vp_h;
+                    rows.push(cursor_dist);
+                    row_data.push(LaidRow::Blank);
+                }
             }
         }
 
@@ -3966,6 +3980,9 @@ fragment float4 text_fragment(
                         y_top: y,
                         y_bottom: y + pitch,
                     });
+                }
+                LaidRow::Blank => {
+                    // No selectable content; skip (selection can't land here).
                 }
             }
         }
@@ -4252,6 +4269,10 @@ fragment float4 text_fragment(
                     }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
                     // LiveCommand's bv_rows entry is in the pre-pass.
+                }
+                LaidRow::Blank => {
+                    // Warp-style clear spacer: nothing to draw — the
+                    // background fill already covers this region. Skip.
                 }
             }
 
