@@ -286,6 +286,26 @@ pub struct MetalRenderer {
     /// scrollback, the rendered cells come from history (not dirty-tracked),
     /// so a full redraw is needed.
     prev_scroll_offset: Cell<usize>,
+    /// v1.0 P0-c: Persistent offscreen texture used as the render target
+    /// instead of drawing directly to the drawable. This enables GPU-side
+    /// scroll blit: on scroll, copy the unchanged region within the
+    /// offscreen texture (src_y=Δ → dst_y=0) via MTLBlitCommandEncoder,
+    /// then render only the newly exposed rows with load_action=Load.
+    /// The offscreen is blitted to the drawable at the end of the frame.
+    /// Recreated on viewport resize.
+    offscreen_texture: RefCell<Option<metal::Texture>>,
+    /// v1.0 P0-c: Dimensions of the current offscreen texture (w, h) in
+    /// physical pixels. Used to detect resize → recreate offscreen.
+    offscreen_dims: Cell<(f32, f32)>,
+    /// v1.0 P0-c: Pending scroll delta captured during build_grid_vertices
+    /// (via grid.take_pending_scroll()). Used by the draw() epilogue to
+    /// decide whether to issue a GPU blit before the render pass.
+    pending_scroll_delta: Cell<i32>,
+    /// v1.0 P0-c: Cached result of the `force_full` computation from
+    /// build_grid_vertices. Stashed on self so the draw() epilogue (which
+    /// runs after build_grid_vertices returns) can decide whether to skip
+    /// the GPU scroll blit on forced-full frames (resize/theme/tab-switch).
+    force_full_cached: Cell<bool>,
 }
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
@@ -578,6 +598,10 @@ fragment float4 text_fragment(
             prev_cursor_row: Cell::new(None),
             grid_cache_dims: Cell::new((0, 0)),
             prev_scroll_offset: Cell::new(0),
+            offscreen_texture: RefCell::new(None),
+            offscreen_dims: Cell::new((0.0, 0.0)),
+            pending_scroll_delta: Cell::new(0),
+            force_full_cached: Cell::new(true),
         }
     }
 
@@ -588,6 +612,31 @@ fragment float4 text_fragment(
         self.theme = theme;
         // Colors are baked into cached vertices — force a full rebuild.
         self.force_full_grid.set(true);
+    }
+
+    /// v1.0 P0-c: Ensure the offscreen texture exists and matches the current
+    /// viewport size. Recreates the texture on resize. Returns true if the
+    /// texture is usable (false on first frame or after a failed allocation).
+    fn ensure_offscreen_texture(&self) -> bool {
+        let (vw, vh) = (self.viewport.0, self.viewport.1);
+        if vw <= 0.0 || vh <= 0.0 {
+            return false;
+        }
+        // Recreate if missing or dimensions changed.
+        if self.offscreen_dims.get() != (vw, vh) {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_texture_type(metal::MTLTextureType::D2);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_width(vw as u64);
+            descriptor.set_height(vh as u64);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            let tex = self.device.new_texture(&descriptor);
+            *self.offscreen_texture.borrow_mut() = Some(tex);
+            self.offscreen_dims.set((vw, vh));
+        }
+        self.offscreen_texture.borrow().is_some()
     }
 
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
@@ -750,6 +799,14 @@ fragment float4 text_fragment(
         };
         // v0.9: cache the blink state so overlay builders can draw a caret.
         self.cursor_blink_on = cursor_blink_on;
+
+        // v1.0 P0-c: reset the cached scroll/force_full state to safe
+        // defaults. build_grid_vertices (grid view only) overwrites these
+        // with real values. In block view they stay at the defaults, which
+        // disables the GPU scroll blit (block-view scrolling isn't a simple
+        // viewport shift, so blit doesn't apply there).
+        self.pending_scroll_delta.set(0);
+        self.force_full_cached.set(true);
 
         // v0.9 H1: compute chrome_top (tab bar height) and set it on the
         // LayoutCtx so all content is shifted below the tab bar. The bar is
@@ -1203,15 +1260,74 @@ fragment float4 text_fragment(
             MTLResourceOptions::CPUCacheModeWriteCombined,
         );
 
-        // Render pass
-        let pass_desc = RenderPassDescriptor::new();
-        let color_att = pass_desc.color_attachments().object_at(0).unwrap();
-        color_att.set_texture(Some(drawable.texture()));
-        color_att.set_load_action(MTLLoadAction::Clear);
-        color_att.set_store_action(MTLStoreAction::Store);
-        color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+        // v1.0 P0-c: GPU scroll blit. Render to a persistent offscreen
+        // texture instead of drawing directly to the drawable. This enables
+        // blitting the unchanged region within the offscreen on scroll,
+        // avoiding a full vertex rebuild + rasterization for the majority
+        // of the screen that didn't change.
+        let has_offscreen = self.ensure_offscreen_texture();
 
         let command_buffer = self.queue.new_command_buffer();
+
+        // v1.0 P0-c: If scrolling and not force_full, blit the unchanged
+        // region within the offscreen texture (src_y=Δ → dst_y=0) before
+        // rendering. The render pass then uses load_action=Load to preserve
+        // the blitted content, only drawing the newly exposed rows.
+        let pending_scroll = self.pending_scroll_delta.get();
+        let can_blit_scroll = has_offscreen
+            && !self.force_full_cached.get()
+            && pending_scroll != 0
+            && self.offscreen_texture.borrow().is_some();
+
+        if can_blit_scroll {
+            let cache = self.offscreen_texture.borrow();
+            let tex = cache.as_ref().unwrap();
+            let ch = self.cell_height() as f32;
+            let vp_h = self.viewport.1;
+            // pending_scroll > 0 means content moved up (new lines at bottom).
+            // Blit the bottom (vp_h - Δ*ch) region from y=Δ*ch to y=0.
+            let delta_px = (pending_scroll.unsigned_abs() as f32 * ch).min(vp_h);
+            if delta_px < vp_h {
+                let blit = command_buffer.new_blit_command_encoder();
+                let src_origin = metal::MTLOrigin {
+                    x: 0,
+                    y: delta_px as u64,
+                    z: 0,
+                };
+                let dst_origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
+                let size = metal::MTLSize {
+                    width: self.viewport.0 as u64,
+                    height: (vp_h - delta_px) as u64,
+                    depth: 1,
+                };
+                blit.copy_from_texture(tex, 0, 0, src_origin, size, tex, 0, 0, dst_origin);
+                blit.end_encoding();
+            }
+        }
+
+        // Render pass — target the offscreen texture (or fall back to the
+        // drawable if offscreen is unavailable).
+        let pass_desc = RenderPassDescriptor::new();
+        let color_att = pass_desc.color_attachments().object_at(0).unwrap();
+        let target_tex: metal::Texture;
+        if has_offscreen {
+            let cache = self.offscreen_texture.borrow();
+            target_tex = cache.as_ref().unwrap().clone();
+            color_att.set_texture(Some(&target_tex));
+            // Load if we blitted (preserve scrolled content), Clear otherwise.
+            if can_blit_scroll {
+                color_att.set_load_action(MTLLoadAction::Load);
+            } else {
+                color_att.set_load_action(MTLLoadAction::Clear);
+                color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+            }
+        } else {
+            color_att.set_texture(Some(drawable.texture()));
+            color_att.set_load_action(MTLLoadAction::Clear);
+            color_att.set_clear_color(MTLClearColor::new(bg_r, bg_g, bg_b, clear_a));
+        }
+        color_att.set_store_action(MTLStoreAction::Store);
+
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
 
         encoder.set_render_pipeline_state(&self.pipeline);
@@ -1227,6 +1343,31 @@ fragment float4 text_fragment(
             encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
         }
         encoder.end_encoding();
+
+        // v1.0 P0-c: If we rendered to the offscreen, blit it to the
+        // drawable for presentation.
+        if has_offscreen {
+            let blit = command_buffer.new_blit_command_encoder();
+            let cache = self.offscreen_texture.borrow();
+            let src_tex = cache.as_ref().unwrap();
+            let drawable_tex = drawable.texture();
+            blit.copy_from_texture(
+                src_tex,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                metal::MTLSize {
+                    width: self.viewport.0 as u64,
+                    height: self.viewport.1 as u64,
+                    depth: 1,
+                },
+                drawable_tex,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            blit.end_encoding();
+        }
 
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
@@ -1299,6 +1440,11 @@ fragment float4 text_fragment(
             || selection.selection.is_some()
             || selection.selecting;
 
+        // v1.0 P0-c: stash force_full on self so draw()'s epilogue (which
+        // runs after this method returns) can decide whether to skip the
+        // GPU scroll blit on forced-full frames.
+        self.force_full_cached.set(force_full);
+
         // v1.0 P0-c: CPU-side cache shift for viewport scrolls. When the
         // terminal scrolls (newline at bottom), the viewport rows shift up
         // by N — the previously-rendered content at rows 0..rows-N is now
@@ -1310,6 +1456,8 @@ fragment float4 text_fragment(
         // rows, which moves WITH the rows during scroll_up. So dirty rows
         // are still detected and rebuilt even after the cache shift.
         let pending_scroll = grid.take_pending_scroll();
+        // v1.0 P0-c: stash on self so draw()'s epilogue can issue a GPU blit.
+        self.pending_scroll_delta.set(pending_scroll);
         if !force_full && pending_scroll != 0 {
             let mut cache = self.grid_row_cache.borrow_mut();
             if cache.len() == num_rows {
