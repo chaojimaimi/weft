@@ -176,6 +176,12 @@ pub struct GlyphInfo {
 pub struct GlyphAtlas {
     texture: metal::Texture,
     cache: HashMap<char, GlyphInfo>,
+    /// v1.0 P1.5-B3: Direct-indexed lookup for ASCII chars (0..=127).
+    /// Terminal output is overwhelmingly ASCII (digits, letters, punctuation,
+    /// space) — a direct array index eliminates HashMap hashing for the
+    /// common case. `ascii[0..32]` are control chars (unused, always None);
+    /// 32..=127 covers printable ASCII. Falls back to `cache` for non-ASCII.
+    ascii: [Option<GlyphInfo>; 128],
     /// Monospace cell width in pixels.
     pub cell_width: u32,
     /// Monospace cell height in pixels (line height).
@@ -275,6 +281,12 @@ impl GlyphAtlas {
         let mut next_y: u32 = 0;
         let mut row_height: u32 = 0;
 
+        // v1.0 P1.5-B3: Direct-indexed array mirroring ASCII cache entries.
+        // Filled alongside `cache` so the fast path in `get()` /
+        // `get_or_rasterize()` can skip the HashMap hash for the common case
+        // (terminal output is overwhelmingly printable ASCII).
+        let mut ascii: [Option<GlyphInfo>; 128] = [None; 128];
+
         // Pre-rasterize printable ASCII (32–126)
         for ch in (32u8..=126).map(|b| b as char) {
             let placed = Self::rasterize_and_place(
@@ -294,6 +306,9 @@ impl GlyphAtlas {
             );
             if let Some(info) = placed {
                 cache.insert(ch, info);
+                // v1.0 P1.5-B3: mirror into the direct-index array for O(1)
+                // ASCII lookups. GlyphInfo is Copy, so this is cheap.
+                ascii[ch as usize] = Some(info);
             }
         }
 
@@ -369,6 +384,7 @@ impl GlyphAtlas {
         Self {
             texture,
             cache,
+            ascii,
             cell_width: cell_w,
             cell_height: cell_h,
             atlas_w,
@@ -387,6 +403,14 @@ impl GlyphAtlas {
 
     /// Look up a cached glyph by character.
     pub fn get(&self, ch: char) -> Option<&GlyphInfo> {
+        // v1.0 P1.5-B3: ASCII fast path — direct array index beats HashMap
+        // hash + lookup. Terminal output is overwhelmingly ASCII, so this
+        // branch is the hot path. ASCII entries are mirrored in both
+        // `ascii[]` and `cache` (kept in sync in `new()` and
+        // `get_or_rasterize()`), so returning from either is equivalent.
+        if (ch as u32) < 128 {
+            return self.ascii[ch as usize].as_ref();
+        }
         self.cache.get(&ch)
     }
 
@@ -398,7 +422,14 @@ impl GlyphAtlas {
     ///
     /// Returns None only if the atlas is full or the character can't be rasterized.
     pub fn get_or_rasterize(&mut self, ch: char) -> Option<&GlyphInfo> {
-        if self.cache.contains_key(&ch) {
+        // v1.0 P1.5-B3: ASCII fast path — direct array index check instead
+        // of HashMap contains_key. ASCII entries are mirrored in both
+        // `ascii[]` and `cache`, so a hit here means a hit in `cache` too.
+        if (ch as u32) < 128 {
+            if self.ascii[ch as usize].is_some() {
+                return self.ascii[ch as usize].as_ref();
+            }
+        } else if self.cache.contains_key(&ch) {
             return self.cache.get(&ch);
         }
 
@@ -479,8 +510,24 @@ impl GlyphAtlas {
             self.atlas_h,
         );
 
+        // v1.0 P1.5-B3: ASCII chars are mirrored into the direct-index array
+        // (alongside `cache`) so future `get()` calls hit the O(1) fast path
+        // instead of hashing into `cache`. Non-ASCII chars go into `cache`
+        // only — the array covers just 0..=127.
+        let is_ascii = (ch as u32) < 128;
+        if is_ascii {
+            self.ascii[ch as usize] = Some(info);
+        }
         self.cache.insert(ch, info);
-        self.cache.get(&ch)
+
+        // Return from the same source the corresponding `get()` will use, so
+        // the caller's reference stays valid regardless of which path served
+        // it: ASCII from `ascii[]`, otherwise from `cache`.
+        if is_ascii {
+            self.ascii[ch as usize].as_ref()
+        } else {
+            self.cache.get(&ch)
+        }
     }
 
     /// Get the Metal atlas texture.
