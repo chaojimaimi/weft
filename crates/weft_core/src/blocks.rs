@@ -262,6 +262,21 @@ impl BlockTracker {
         self.phase = ShellPhase::AtPrompt;
     }
 
+    /// v1.0 fix: Force-reset to AtPrompt after Ctrl+C flush.
+    ///
+    /// When `flush_pty_output()` discards stale PTY output, it may also
+    /// discard the OSC 133;A marker the shell emits after an interrupted
+    /// command. Without that marker, `phase` stays `CommandExecuting` and
+    /// the editor/input box never reappears. This method synthesizes the
+    /// `133;A` transition: finalize any in-flight block (no exit code) and
+    /// return to `AtPrompt`.
+    pub fn reset_to_prompt(&mut self) {
+        if self.phase == ShellPhase::CommandExecuting {
+            self.finalize(None);
+        }
+        self.phase = ShellPhase::AtPrompt;
+    }
+
     /// `133;B` — command start (preexec). `command` is the prompt-row text the
     /// caller extracted from the grid. Begins output capture.
     pub fn on_command_start(&mut self, command: String) {

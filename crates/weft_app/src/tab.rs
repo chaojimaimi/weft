@@ -147,6 +147,13 @@ impl Tab {
             }
             // PtyOutput → discard (stale output from interrupted command)
         }
+        // v1.0 fix: Reset shell phase to AtPrompt — the flush may have
+        // discarded the OSC 133;A marker the shell emits after interruption.
+        // Without this, phase stays CommandExecuting and the prompt/editor
+        // never reappears (user must press Enter to recover).
+        if let Some(terminal) = &mut self.terminal {
+            terminal.block_tracker_mut().reset_to_prompt();
+        }
     }
 
     /// Process queued messages into the terminal. Returns
@@ -157,7 +164,12 @@ impl Tab {
     /// processed (so the caller can call `request_redraw`).
     pub fn process_messages(&mut self) -> (bool, Vec<weft_core::blocks::Block>, bool) {
         let mut need_redraw = false;
-        const MAX_BYTES_PER_FRAME: usize = 64 * 1024;
+        // v1.0 perf: Raised from 64KB to 256KB to match the PTY read buffer.
+        // With the scroll_up allocation fix, processing is ~25x cheaper per
+        // byte, so we can afford a larger per-frame budget. This reduces the
+        // number of frames needed for large outputs (e.g. `seq 1 100000`
+        // went from ~100 frames to ~25 frames).
+        const MAX_BYTES_PER_FRAME: usize = 256 * 1024;
         let mut bytes_this_frame = 0usize;
 
         while bytes_this_frame < MAX_BYTES_PER_FRAME {

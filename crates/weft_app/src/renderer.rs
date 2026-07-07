@@ -2625,9 +2625,21 @@ fragment float4 text_fragment(
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        let label_color = [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0];
+        let label_color = [
+            fg[0] * 0.85 + theme_bg[0] * 0.15,
+            fg[1] * 0.85 + theme_bg[1] * 0.15,
+            fg[2] * 0.85 + theme_bg[2] * 0.15,
+            1.0,
+        ];
         let sel_label_color = fg;
-        let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
+        // v1.0 fix: blend with bg (same fix as palette popup). The old
+        // fg*0.40 was invisible in Solarized Dark / One Dark / Nord.
+        let suffix_color = [
+            fg[0] * 0.50 + theme_bg[0] * 0.50,
+            fg[1] * 0.50 + theme_bg[1] * 0.50,
+            fg[2] * 0.50 + theme_bg[2] * 0.50,
+            1.0,
+        ];
 
         // v0.8 stage 4: layout (window + popup rect + column anchors) is
         // computed by the pure functions in `layout.rs`, so it can be unit-
@@ -2950,7 +2962,19 @@ fragment float4 text_fragment(
             }
             let entry = &p.entries[i];
             let lcolor = if is_sel { fg } else { dim };
-            let suffix_color = [fg[0] * 0.40, fg[1] * 0.40, fg[2] * 0.40, 1.0];
+            // v1.0 fix: blend fg with theme_bg instead of pure fg*0.40.
+            // The old fg*0.40 drops foreground towards black — on dark
+            // themes with low fg values (Solarized Dark fg=0x93, One Dark
+            // fg=0xab), the result is nearly identical to the popup
+            // background, making "Workflow"/"Builtin"/"Theme" labels
+            // invisible. Blending guarantees the color sits halfway between
+            // fg and bg, ensuring readable contrast in ALL themes.
+            let suffix_color = [
+                fg[0] * 0.50 + theme_bg[0] * 0.50,
+                fg[1] * 0.50 + theme_bg[1] * 0.50,
+                fg[2] * 0.50 + theme_bg[2] * 0.50,
+                1.0,
+            ];
 
             // Label + description.
             let label_avail = (((popup_x1 - label_x) / cw) as usize)
