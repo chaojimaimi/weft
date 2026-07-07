@@ -16,3 +16,6 @@ Thumbs.db
 
 # Claude Code (local config, not project-level)
 .claude/
+
+# Icon generation intermediate files (kept .icns only)
+assets/icon.iconset/
