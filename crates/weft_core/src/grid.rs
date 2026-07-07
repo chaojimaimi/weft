@@ -187,6 +187,16 @@ impl Row {
     pub fn mark_dirty(&mut self, col: usize) {
         self.dirty_occ = self.dirty_occ.max(col + 1);
     }
+
+    /// v1.0 perf: Clear all cells in place (reuses Vec capacity, no allocation).
+    /// Equivalent to `*self = Row::new(cols)` but avoids the Vec allocation.
+    pub fn clear(&mut self) {
+        for cell in &mut self.cells {
+            *cell = Cell::default();
+        }
+        self.dirty_occ = 0;
+        self.wrapped = false;
+    }
 }
 
 /// Cursor position and state.
@@ -262,6 +272,14 @@ impl Scrollback {
         } else {
             self.buffer[self.head] = row;
             self.head = (self.head + 1) % self.max_lines;
+        }
+    }
+
+    /// v1.0 perf: Push multiple rows (avoids repeated method call overhead
+    /// in the drain+extend scroll path).
+    pub fn extend<I: IntoIterator<Item = Row>>(&mut self, iter: I) {
+        for row in iter {
+            self.push(row);
         }
     }
 
@@ -836,11 +854,17 @@ impl Grid {
 
         if n > bottom - top {
             // Push all rows in the scroll region into scrollback
-            for i in top..=bottom {
-                self.scrollback.push(std::mem::replace(
-                    &mut self.viewport[i],
-                    Row::new(self.num_cols),
-                ));
+            if top == 0 {
+                for i in top..=bottom {
+                    self.scrollback.push(std::mem::replace(
+                        &mut self.viewport[i],
+                        Row::new(self.num_cols),
+                    ));
+                }
+            } else {
+                for i in top..=bottom {
+                    self.viewport[i].clear();
+                }
             }
             // v1.0 P0-c: record scroll delta for renderer cache shift.
             self.pending_scroll
@@ -848,23 +872,34 @@ impl Grid {
             return;
         }
 
-        // Push top rows into scrollback (only if scrolling the main viewport)
-        if top == 0 {
-            for i in 0..n {
-                self.scrollback.push(std::mem::replace(
-                    &mut self.viewport[i],
-                    Row::new(self.num_cols),
-                ));
+        if top == 0 && bottom == self.num_rows - 1 {
+            // v1.0 perf: Full-viewport scroll using rotate_left.
+            // For n=1 (the common streaming case): 1 Row alloc (was 2 with
+            // drain+extend, was ~24 with the old shift loop).
+            // rotate_left moves [0] to [n-1], shifts [1..] to [0..n-1].
+            // We take the old [0] into scrollback first, insert a fresh
+            // empty Row at [0], then rotate — the empty Row ends up at [n-1].
+            for _ in 0..n {
+                let old_top = std::mem::replace(&mut self.viewport[0], Row::new(self.num_cols));
+                self.scrollback.push(old_top);
+                self.viewport.rotate_left(1);
             }
-        }
-
-        // Shift rows up
-        for i in top..=(bottom - n) {
-            self.viewport[i] =
-                std::mem::replace(&mut self.viewport[i + n], Row::new(self.num_cols));
-        }
-        for i in (bottom - n + 1)..=bottom {
-            self.viewport[i] = Row::new(self.num_cols);
+        } else {
+            // Scroll region (or partial viewport): rotate in place, then
+            // clear the exposed bottom rows. For top==0, push the old top
+            // rows to scrollback before rotating.
+            if top == 0 {
+                for i in 0..n {
+                    self.scrollback.push(std::mem::replace(
+                        &mut self.viewport[i],
+                        Row::new(self.num_cols),
+                    ));
+                }
+            }
+            self.viewport[top..=bottom].rotate_left(n);
+            for i in (bottom + 1 - n)..=bottom {
+                self.viewport[i].clear();
+            }
         }
         // v1.0 P0-c: record scroll delta for renderer cache shift instead of
         // mark_all_dirty. The renderer shifts its per-row vertex cache to
@@ -880,19 +915,17 @@ impl Grid {
 
         if n > bottom - top {
             for i in top..=bottom {
-                self.viewport[i] = Row::new(self.num_cols);
+                self.viewport[i].clear();
             }
             self.pending_scroll
                 .set(self.pending_scroll.get() - (bottom - top + 1) as i32);
             return;
         }
 
-        for i in (top + n..=bottom).rev() {
-            self.viewport[i] =
-                std::mem::replace(&mut self.viewport[i - n], Row::new(self.num_cols));
-        }
+        // v1.0 perf: rotate_right + clear — zero allocations (was O(num_rows)).
+        self.viewport[top..=bottom].rotate_right(n);
         for i in top..(top + n) {
-            self.viewport[i] = Row::new(self.num_cols);
+            self.viewport[i].clear();
         }
         // v1.0 P0-c: record scroll delta for renderer cache shift.
         self.pending_scroll

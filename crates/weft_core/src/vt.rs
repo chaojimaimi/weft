@@ -295,9 +295,10 @@ impl Terminal {
     /// Each byte is advanced through the parser, which calls back
     /// into our Perform implementation.
     pub fn process(&mut self, bytes: &[u8]) {
-        // We need to temporarily move the parser out to avoid double &mut self.
-        // Take ownership, advance, then put it back.
-        let mut parser = std::mem::replace(&mut self.parser, vte::Parser::new());
+        // v1.0 perf: mem::take is equivalent to mem::replace(_, Default::default())
+        // but clearer. The parser state is preserved across calls (take out,
+        // advance, put back) — only a default-constructed parser is discarded.
+        let mut parser = std::mem::take(&mut self.parser);
         for &byte in bytes {
             parser.advance(self, byte);
         }
@@ -383,12 +384,21 @@ impl Terminal {
             return;
         }
 
-        // Flatten each param group's first value into a single list.
-        // Semicolons → separate groups, colons → sub-params within one group.
-        let vals: Vec<u16> = params
-            .iter()
-            .map(|sub| sub.first().copied().unwrap_or(0))
-            .collect();
+        // v1.0 perf: Use a stack-allocated array instead of Vec<u16>.
+        // SGR sequences rarely exceed 16 params (truecolor: 38;2;R;G;B = 5).
+        // The old `Vec<u16>::collect()` allocated on every SGR dispatch —
+        // a hot path for colored output (e.g. `ls --color`, `rg`).
+        const MAX_SGR_PARAMS: usize = 32;
+        let mut buf = [0u16; MAX_SGR_PARAMS];
+        let mut len = 0usize;
+        for sub in params.iter() {
+            if len >= MAX_SGR_PARAMS {
+                break;
+            }
+            buf[len] = sub.first().copied().unwrap_or(0);
+            len += 1;
+        }
+        let vals: &[u16] = &buf[..len];
 
         let mut i = 0;
         while i < vals.len() {
@@ -419,7 +429,7 @@ impl Terminal {
                 }
                 // 256-color / truecolor foreground
                 38 => {
-                    if let Some((color, skip)) = self.parse_sgr_color(&vals, i + 1) {
+                    if let Some((color, skip)) = self.parse_sgr_color(vals, i + 1) {
                         self.attrs.fg = color;
                         i += skip;
                     }
@@ -432,7 +442,7 @@ impl Terminal {
                 }
                 // 256-color / truecolor background
                 48 => {
-                    if let Some((color, skip)) = self.parse_sgr_color(&vals, i + 1) {
+                    if let Some((color, skip)) = self.parse_sgr_color(vals, i + 1) {
                         self.attrs.bg = color;
                         i += skip;
                     }
@@ -543,21 +553,25 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
+        // v1.0 perf: cache phase once per print() call. The phase doesn't
+        // change within a single print() — it only transitions on OSC 133
+        // markers, which arrive via osc_dispatch, not print.
+        let phase = self.block_tracker.phase();
+
         // Snap back to the live viewport for new content — EXCEPT when idle at
         // an integrated prompt (AtPrompt). In that state the shell may emit
         // prompt re-renders or async segments that would otherwise destroy
         // the user's scroll position while they're reading history. During
         // CommandExecuting (output streaming) and in non-integrated mode
         // (plain grid terminal), new output always resets scroll.
-        if self.block_tracker.phase() != ShellPhase::AtPrompt {
+        if phase != ShellPhase::AtPrompt {
             self.grid.scroll_offset = 0;
         }
 
         // Feed the printed char to the active command block's output capture.
-        // The tracker self-gates on phase (only captures while
-        // CommandExecuting); we additionally pause during the alternate screen
-        // so vim/less full-screen content never leaks into a block.
-        if !self.alt_active {
+        // v1.0 perf: check is_capturing() here to skip the function call
+        // overhead when not capturing (e.g. AtPrompt, NotIntegrated).
+        if !self.alt_active && phase == ShellPhase::CommandExecuting {
             self.block_tracker.on_print(c);
         }
 
@@ -578,7 +592,13 @@ impl vte::Perform for Terminal {
             }
         }
 
-        let width = if unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 1 {
+        // v1.0 perf: ASCII fast path — all ASCII chars are width 1.
+        // This skips the unicode_width lookup for the common case (terminal
+        // output is predominantly ASCII: digits, letters, punctuation).
+        // For 58KB of `seq` output, this saves ~58000 lookup calls.
+        let width = if c.is_ascii() {
+            CellWidth::Half
+        } else if unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -712,7 +732,8 @@ impl vte::Perform for Terminal {
                 // spaces, otherwise the block view concatenates the fields.
                 let prev_col = self.grid.cursor.col;
                 self.grid.advance_tab(1);
-                if !self.alt_active {
+                // v1.0 perf: skip on_print calls when not capturing.
+                if !self.alt_active && self.block_tracker.is_capturing() {
                     let advanced = self.grid.cursor.col.saturating_sub(prev_col);
                     for _ in 0..advanced {
                         self.block_tracker.on_print(' ');
@@ -723,7 +744,8 @@ impl vte::Perform for Terminal {
                 // LF, VT, FF → move to next line (CR+LF on Unix terminals).
                 // The raw VT `index()` only moves down; Unix terminals
                 // treat LF as newline (carriage return + index).
-                if !self.alt_active {
+                // v1.0 perf: skip on_newline call when not capturing.
+                if !self.alt_active && self.block_tracker.is_capturing() {
                     self.block_tracker.on_newline();
                 }
                 self.grid.carriage_return();

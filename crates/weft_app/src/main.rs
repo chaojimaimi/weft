@@ -4870,12 +4870,23 @@ fn clipboard_paste() -> Option<String> {
 }
 
 impl ApplicationHandler<AppEvent> for App {
-    /// Cross-thread wake-up (PTY output or blink timer): schedule one redraw.
-    /// The pump/process/draw happens in `WindowEvent::RedrawRequested`, so we
-    /// avoid the vsync busy-loop while still reacting promptly to output.
+    /// Cross-thread wake-up (PTY output or blink timer): pump + process
+    /// immediately, then schedule a redraw for rendering.
+    ///
+    /// v1.0 perf: Previously this only called `request_redraw()`, deferring
+    /// all PTY processing to `RedrawRequested` (next vsync). That added up
+    /// to 16ms latency per batch — for `seq 1 100000` (~500KB), ~30 vsync
+    /// cycles were needed just for the data to flow through, on top of the
+    /// VT parse + render time. Processing here means data is drained from
+    /// the PTY channel on arrival, and the subsequent `RedrawRequested`
+    /// only needs to render (the heavy work is already done).
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
-            AppEvent::Wake => self.request_redraw(),
+            AppEvent::Wake => {
+                self.pump_pty();
+                self.process_messages();
+                self.request_redraw();
+            }
             AppEvent::ConfigReload => {
                 self.reload_config();
                 self.request_redraw();
