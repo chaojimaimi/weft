@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="ic-warm">
+      <rect width="1024" height="1024" rx="224" ry="224"/>
+    </clipPath>
+    <!-- W neon tube color: warm amber-white (mirrors cool #e0fffe/#b0fff5/#60f0e0) -->
+    <linearGradient id="neon-warm" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fff0dc"/>
+      <stop offset="50%" stop-color="#f0d8b0"/>
+      <stop offset="100%" stop-color="#c89868"/>
+    </linearGradient>
+    <!-- Grid line color: dim warm brown (mirrors teal #30dcc0/#20b0a0) -->
+    <linearGradient id="gridg-warm" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8a6a48"/>
+      <stop offset="100%" stop-color="#6a5238"/>
+    </linearGradient>
+    <!-- Filters (identical to cool version) -->
+    <filter id="glow-xs-warm">
+      <feGaussianBlur stdDeviation="1.5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-s-warm">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-m-warm">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-l-warm">
+      <feGaussianBlur stdDeviation="12" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glow-xl-warm">
+      <feGaussianBlur stdDeviation="24" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="grid-glow-warm">
+      <feGaussianBlur stdDeviation="2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Warm brown-black background (v0.8 "Quiet × Warm" base #221c18) -->
+  <rect width="1024" height="1024" rx="224" ry="224" fill="#221c18"/>
+
+  <g clip-path="url(#ic-warm)">
+
+    <!-- ===== GRID: Solid horizontal and vertical lines ===== -->
+    <!-- Vertical grid lines (was #28c4b4, now #6a5238) -->
+    <g stroke="#6a5238" stroke-width="1.5" opacity="0.4" filter="url(#grid-glow-warm)">
+      <line x1="120" y1="80" x2="120" y2="944"/>
+      <line x1="180" y1="80" x2="180" y2="944"/>
+      <line x1="240" y1="80" x2="240" y2="944"/>
+      <line x1="300" y1="80" x2="300" y2="944"/>
+      <line x1="360" y1="80" x2="360" y2="944"/>
+      <line x1="420" y1="80" x2="420" y2="944"/>
+      <line x1="480" y1="80" x2="480" y2="944"/>
+      <line x1="540" y1="80" x2="540" y2="944"/>
+      <line x1="600" y1="80" x2="600" y2="944"/>
+      <line x1="660" y1="80" x2="660" y2="944"/>
+      <line x1="720" y1="80" x2="720" y2="944"/>
+      <line x1="780" y1="80" x2="780" y2="944"/>
+      <line x1="840" y1="80" x2="840" y2="944"/>
+      <line x1="900" y1="80" x2="900" y2="944"/>
+    </g>
+    <!-- Horizontal grid lines -->
+    <g stroke="#6a5238" stroke-width="1.5" opacity="0.4" filter="url(#grid-glow-warm)">
+      <line x1="80" y1="120" x2="944" y2="120"/>
+      <line x1="80" y1="180" x2="944" y2="180"/>
+      <line x1="80" y1="240" x2="944" y2="240"/>
+      <line x1="80" y1="300" x2="944" y2="300"/>
+      <line x1="80" y1="360" x2="944" y2="360"/>
+      <line x1="80" y1="420" x2="944" y2="420"/>
+      <line x1="80" y1="480" x2="944" y2="480"/>
+      <line x1="80" y1="540" x2="944" y2="540"/>
+      <line x1="80" y1="600" x2="944" y2="600"/>
+      <line x1="80" y1="660" x2="944" y2="660"/>
+      <line x1="80" y1="720" x2="944" y2="720"/>
+      <line x1="80" y1="780" x2="944" y2="780"/>
+      <line x1="80" y1="840" x2="944" y2="840"/>
+      <line x1="80" y1="900" x2="944" y2="900"/>
+    </g>
+
+    <!-- Grid intersection dots (was #40e0d0, now #8a6a48) -->
+    <g fill="#8a6a48" opacity="0.35" filter="url(#glow-xs-warm)">
+      <circle cx="120" cy="120" r="3"/><circle cx="180" cy="120" r="3"/><circle cx="240" cy="120" r="3"/><circle cx="300" cy="120" r="3"/><circle cx="360" cy="120" r="3"/><circle cx="420" cy="120" r="3"/><circle cx="480" cy="120" r="3"/><circle cx="540" cy="120" r="3"/><circle cx="600" cy="120" r="3"/><circle cx="660" cy="120" r="3"/><circle cx="720" cy="120" r="3"/><circle cx="780" cy="120" r="3"/><circle cx="840" cy="120" r="3"/><circle cx="900" cy="120" r="3"/>
+      <circle cx="120" cy="180" r="3"/><circle cx="180" cy="180" r="3"/><circle cx="240" cy="180" r="3"/><circle cx="300" cy="180" r="3"/><circle cx="360" cy="180" r="3"/><circle cx="420" cy="180" r="3"/><circle cx="480" cy="180" r="3"/><circle cx="540" cy="180" r="3"/><circle cx="600" cy="180" r="3"/><circle cx="660" cy="180" r="3"/><circle cx="720" cy="180" r="3"/><circle cx="780" cy="180" r="3"/><circle cx="840" cy="180" r="3"/><circle cx="900" cy="180" r="3"/>
+      <circle cx="120" cy="240" r="3"/><circle cx="180" cy="240" r="3"/><circle cx="240" cy="240" r="3"/><circle cx="300" cy="240" r="3"/><circle cx="360" cy="240" r="3"/><circle cx="420" cy="240" r="3"/><circle cx="480" cy="240" r="3"/><circle cx="540" cy="240" r="3"/><circle cx="600" cy="240" r="3"/><circle cx="660" cy="240" r="3"/><circle cx="720" cy="240" r="3"/><circle cx="780" cy="240" r="3"/><circle cx="840" cy="240" r="3"/><circle cx="900" cy="240" r="3"/>
+      <circle cx="120" cy="300" r="3"/><circle cx="180" cy="300" r="3"/><circle cx="240" cy="300" r="3"/><circle cx="300" cy="300" r="3"/><circle cx="360" cy="300" r="3"/><circle cx="420" cy="300" r="3"/><circle cx="480" cy="300" r="3"/><circle cx="540" cy="300" r="3"/><circle cx="600" cy="300" r="3"/><circle cx="660" cy="300" r="3"/><circle cx="720" cy="300" r="3"/><circle cx="780" cy="300" r="3"/><circle cx="840" cy="300" r="3"/><circle cx="900" cy="300" r="3"/>
+      <circle cx="120" cy="360" r="3"/><circle cx="180" cy="360" r="3"/><circle cx="240" cy="360" r="3"/><circle cx="300" cy="360" r="3"/><circle cx="360" cy="360" r="3"/><circle cx="420" cy="360" r="3"/><circle cx="480" cy="360" r="3"/><circle cx="540" cy="360" r="3"/><circle cx="600" cy="360" r="3"/><circle cx="660" cy="360" r="3"/><circle cx="720" cy="360" r="3"/><circle cx="780" cy="360" r="3"/><circle cx="840" cy="360" r="3"/><circle cx="900" cy="360" r="3"/>
+      <circle cx="120" cy="420" r="3"/><circle cx="180" cy="420" r="3"/><circle cx="240" cy="420" r="3"/><circle cx="300" cy="420" r="3"/><circle cx="360" cy="420" r="3"/><circle cx="420" cy="420" r="3"/><circle cx="480" cy="420" r="3"/><circle cx="540" cy="420" r="3"/><circle cx="600" cy="420" r="3"/><circle cx="660" cy="420" r="3"/><circle cx="720" cy="420" r="3"/><circle cx="780" cy="420" r="3"/><circle cx="840" cy="420" r="3"/><circle cx="900" cy="420" r="3"/>
+      <circle cx="120" cy="480" r="3"/><circle cx="180" cy="480" r="3"/><circle cx="240" cy="480" r="3"/><circle cx="300" cy="480" r="3"/><circle cx="360" cy="480" r="3"/><circle cx="420" cy="480" r="3"/><circle cx="480" cy="480" r="3"/><circle cx="540" cy="480" r="3"/><circle cx="600" cy="480" r="3"/><circle cx="660" cy="480" r="3"/><circle cx="720" cy="480" r="3"/><circle cx="780" cy="480" r="3"/><circle cx="840" cy="480" r="3"/><circle cx="900" cy="480" r="3"/>
+      <circle cx="120" cy="540" r="3"/><circle cx="180" cy="540" r="3"/><circle cx="240" cy="540" r="3"/><circle cx="300" cy="540" r="3"/><circle cx="360" cy="540" r="3"/><circle cx="420" cy="540" r="3"/><circle cx="480" cy="540" r="3"/><circle cx="540" cy="540" r="3"/><circle cx="600" cy="540" r="3"/><circle cx="660" cy="540" r="3"/><circle cx="720" cy="540" r="3"/><circle cx="780" cy="540" r="3"/><circle cx="840" cy="540" r="3"/><circle cx="900" cy="540" r="3"/>
+      <circle cx="120" cy="600" r="3"/><circle cx="180" cy="600" r="3"/><circle cx="240" cy="600" r="3"/><circle cx="300" cy="600" r="3"/><circle cx="360" cy="600" r="3"/><circle cx="420" cy="600" r="3"/><circle cx="480" cy="600" r="3"/><circle cx="540" cy="600" r="3"/><circle cx="600" cy="600" r="3"/><circle cx="660" cy="600" r="3"/><circle cx="720" cy="600" r="3"/><circle cx="780" cy="600" r="3"/><circle cx="840" cy="600" r="3"/><circle cx="900" cy="600" r="3"/>
+      <circle cx="120" cy="660" r="3"/><circle cx="180" cy="660" r="3"/><circle cx="240" cy="660" r="3"/><circle cx="300" cy="660" r="3"/><circle cx="360" cy="660" r="3"/><circle cx="420" cy="660" r="3"/><circle cx="480" cy="660" r="3"/><circle cx="540" cy="660" r="3"/><circle cx="600" cy="660" r="3"/><circle cx="660" cy="660" r="3"/><circle cx="720" cy="660" r="3"/><circle cx="780" cy="660" r="3"/><circle cx="840" cy="660" r="3"/><circle cx="900" cy="660" r="3"/>
+      <circle cx="120" cy="720" r="3"/><circle cx="180" cy="720" r="3"/><circle cx="240" cy="720" r="3"/><circle cx="300" cy="720" r="3"/><circle cx="360" cy="720" r="3"/><circle cx="420" cy="720" r="3"/><circle cx="480" cy="720" r="3"/><circle cx="540" cy="720" r="3"/><circle cx="600" cy="720" r="3"/><circle cx="660" cy="720" r="3"/><circle cx="720" cy="720" r="3"/><circle cx="780" cy="720" r="3"/><circle cx="840" cy="720" r="3"/><circle cx="900" cy="720" r="3"/>
+      <circle cx="120" cy="780" r="3"/><circle cx="180" cy="780" r="3"/><circle cx="240" cy="780" r="3"/><circle cx="300" cy="780" r="3"/><circle cx="360" cy="780" r="3"/><circle cx="420" cy="780" r="3"/><circle cx="480" cy="780" r="3"/><circle cx="540" cy="780" r="3"/><circle cx="600" cy="780" r="3"/><circle cx="660" cy="780" r="3"/><circle cx="720" cy="780" r="3"/><circle cx="780" cy="780" r="3"/><circle cx="840" cy="780" r="3"/><circle cx="900" cy="780" r="3"/>
+      <circle cx="120" cy="840" r="3"/><circle cx="180" cy="840" r="3"/><circle cx="240" cy="840" r="3"/><circle cx="300" cy="840" r="3"/><circle cx="360" cy="840" r="3"/><circle cx="420" cy="840" r="3"/><circle cx="480" cy="840" r="3"/><circle cx="540" cy="840" r="3"/><circle cx="600" cy="840" r="3"/><circle cx="660" cy="840" r="3"/><circle cx="720" cy="840" r="3"/><circle cx="780" cy="840" r="3"/><circle cx="840" cy="840" r="3"/><circle cx="900" cy="840" r="3"/>
+      <circle cx="120" cy="900" r="3"/><circle cx="180" cy="900" r="3"/><circle cx="240" cy="900" r="3"/><circle cx="300" cy="900" r="3"/><circle cx="360" cy="900" r="3"/><circle cx="420" cy="900" r="3"/><circle cx="480" cy="900" r="3"/><circle cx="540" cy="900" r="3"/><circle cx="600" cy="900" r="3"/><circle cx="660" cy="900" r="3"/><circle cx="720" cy="900" r="3"/><circle cx="780" cy="900" r="3"/><circle cx="840" cy="900" r="3"/><circle cx="900" cy="900" r="3"/>
+    </g>
+
+    <!-- ===== W LETTER: Neon tube effect (hollow center, bright edges) ===== -->
+    <!-- W path data (identical geometry to cool version): 4 strokes forming W -->
+    <!-- Left leg: (280,310) -> (392,720) -->
+    <!-- Left-center: (392,720) -> (512,430) -->
+    <!-- Right-center: (512,430) -> (632,720) -->
+    <!-- Right leg: (632,720) -> (744,310) -->
+
+    <!-- Layer 1: Outermost wide glow (was #00e0cc, now #a07840 deep amber) -->
+    <g fill="none" stroke="#a07840" stroke-width="44" stroke-linecap="round" stroke-linejoin="round" opacity="0.08" filter="url(#glow-xl-warm)">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+    <!-- Layer 2: Medium outer glow (was #00e8d8, now #b88850 amber) -->
+    <g fill="none" stroke="#b88850" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" opacity="0.2" filter="url(#glow-l-warm)">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+    <!-- Layer 3: Inner glow / tube body (was #20f0e0, now #d4a574 amber accent) -->
+    <g fill="none" stroke="#d4a574" stroke-width="16" stroke-linecap="round" stroke-linejoin="round" opacity="0.5" filter="url(#glow-m-warm)">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+    <!-- Layer 4: Bright tube edges (uses neon-warm gradient) -->
+    <g fill="none" stroke="url(#neon-warm)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" opacity="0.9" filter="url(#glow-s-warm)">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+    <!-- Layer 5: Inner dark line for hollow tube effect (was #0a1a1e cool, now #1a1410 warm) -->
+    <g fill="none" stroke="#1a1410" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.5" filter="none">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+    <!-- Layer 6: Bright highlight on top edge (white, kept identical) -->
+    <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.4" filter="url(#glow-xs-warm)">
+      <path d="M 280 310 L 392 720 L 512 430 L 632 720 L 744 310"/>
+    </g>
+
+  </g>
+</svg>

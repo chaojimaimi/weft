@@ -3,6 +3,18 @@ name = "weft_app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "A modern macOS terminal emulator with block-based command history"
+
+[[bin]]
+name = "weft"
+path = "src/main.rs"
 
 [dependencies]
 weft_core = { path = "../weft_core" }

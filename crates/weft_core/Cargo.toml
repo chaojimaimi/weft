@@ -3,6 +3,13 @@ name = "weft_core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Core library for Weft terminal emulator (VT parser, grid, blocks)"
 
 [dependencies]
 vte.workspace = true

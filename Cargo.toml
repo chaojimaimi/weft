@@ -3,9 +3,16 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT"
+authors = ["Weft Contributors"]
+repository = "https://github.com/chaojimaimi/weft"
+homepage = "https://github.com/chaojimaimi/weft"
+readme = "README.md"
+keywords = ["terminal", "macos", "metal", "gpu"]
+categories = ["command-line-utilities", "gui"]
+rust-version = "1.75"
 
 [workspace.dependencies]
 # Core

@@ -1,4 +1,4 @@
-//! Weft v0.2 "Weave" — Metal GPU-rendered terminal emulator
+//! Weft v1.0 "Weave" — Metal GPU-rendered terminal emulator
 //!
 //! Full pipeline: PTY → VT parser → Grid → Metal renderer
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
@@ -6079,7 +6079,7 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
 
 fn main() {
     tracing_subscriber::fmt::init();
-    info!("Starting Weft v0.2 \"Weave\"");
+    info!("Starting Weft v1.0 \"Weave\"");
 
     // Create a tokio runtime for PTY async operations.
     let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");

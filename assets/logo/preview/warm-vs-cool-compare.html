@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weft Logo — 冷青 vs 暖琥珀 对比</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a1a;
+    color: #d4d4d4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    padding: 40px 20px 80px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 28px; color: #f0f0f0; margin-bottom: 6px; }
+  h2 { font-size: 20px; color: #f0f0f0; margin: 40px 0 16px; padding-bottom: 8px; border-bottom: 1px solid #404040; }
+  .subtitle { color: #999; margin-bottom: 8px; font-size: 14px; }
+  .intro { color: #aaa; margin-bottom: 32px; font-size: 14px; background: #222; padding: 16px 20px; border-radius: 8px; border-left: 3px solid #d4a574; }
+
+  /* === Section 1: Side-by-side at 512px on dark === */
+  .compare-row {
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    gap: 48px;
+    flex-wrap: wrap;
+    margin-bottom: 24px;
+  }
+  .logo-card {
+    background: #0d0d0d;
+    border: 1px solid #333;
+    border-radius: 16px;
+    padding: 32px;
+    text-align: center;
+    flex: 0 0 auto;
+  }
+  .logo-card.cool { border-color: #20f0e0; }
+  .logo-card.warm { border-color: #d4a574; }
+  .logo-card img {
+    width: 320px;
+    height: 320px;
+    display: block;
+    image-rendering: -webkit-optimize-contrast;
+  }
+  .logo-card .label {
+    margin-top: 16px;
+    font-size: 15px;
+    font-weight: 600;
+  }
+  .logo-card.cool .label { color: #20f0e0; }
+  .logo-card.warm .label { color: #d4a574; }
+  .logo-card .desc {
+    margin-top: 4px;
+    font-size: 12px;
+    color: #888;
+  }
+
+  /* === Section 2: Size readability on dark === */
+  .sizes-row {
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+  }
+  .sizes-row .group {
+    display: flex;
+    align-items: flex-end;
+    gap: 16px;
+    background: #1f1f1f;
+    padding: 20px 24px;
+    border-radius: 12px;
+    border: 1px solid #333;
+  }
+  .sizes-row .group.cool { border-color: #20f0e044; }
+  .sizes-row .group.warm { border-color: #d4a57444; }
+  .sizes-row .group-label {
+    font-size: 11px;
+    color: #888;
+    margin-bottom: 12px;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .sizes-row .group.cool .group-label { color: #20f0e0; }
+  .sizes-row .group.warm .group-label { color: #d4a574; }
+  .size-cell {
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .size-cell img { display: block; }
+  .size-cell .px { font-size: 10px; color: #777; }
+
+  /* === Section 3: Simulated macOS Dock (light bg) === */
+  .dock-sim {
+    background: linear-gradient(180deg, #e8e8e8 0%, #d0d0d0 100%);
+    border-radius: 12px;
+    padding: 24px;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 32px;
+    margin-bottom: 16px;
+  }
+  .dock-sim .dock-item {
+    text-align: center;
+  }
+  .dock-sim .dock-item img {
+    display: block;
+    margin: 0 auto;
+  }
+  .dock-sim .dock-item .name {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #333;
+  }
+  .dock-label {
+    text-align: center;
+    font-size: 12px;
+    color: #888;
+    margin-bottom: 16px;
+  }
+
+  /* === Section 4: Color palette === */
+  .palette-row {
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .palette {
+    flex: 1;
+    min-width: 280px;
+    background: #222;
+    border-radius: 12px;
+    padding: 20px;
+    border: 1px solid #333;
+  }
+  .palette h3 {
+    font-size: 14px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #333;
+  }
+  .palette.cool h3 { color: #20f0e0; border-color: #20f0e044; }
+  .palette.warm h3 { color: #d4a574; border-color: #d4a57444; }
+  .swatch {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    color: #ccc;
+  }
+  .swatch .chip {
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    border: 1px solid #555;
+    flex-shrink: 0;
+  }
+  .swatch .role { color: #999; min-width: 90px; }
+  .swatch .hex { font-family: 'SF Mono', Menlo, monospace; color: #aaa; }
+
+  /* === Section 5: Pros/cons === */
+  .analysis {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .analysis .col {
+    flex: 1;
+    min-width: 280px;
+    background: #222;
+    border-radius: 12px;
+    padding: 20px;
+    border: 1px solid #333;
+  }
+  .analysis .col h3 { font-size: 14px; margin-bottom: 12px; }
+  .analysis .col.cool h3 { color: #20f0e0; }
+  .analysis .col.warm h3 { color: #d4a574; }
+  .analysis ul { list-style: none; padding: 0; }
+  .analysis li {
+    font-size: 13px;
+    color: #bbb;
+    margin-bottom: 8px;
+    padding-left: 18px;
+    position: relative;
+  }
+  .analysis li.pro::before { content: '+'; position: absolute; left: 0; color: #6ec46e; font-weight: bold; }
+  .analysis li.con::before { content: '−'; position: absolute; left: 0; color: #c46e6e; font-weight: bold; }
+
+  .decision-note {
+    margin-top: 32px;
+    background: #2a2218;
+    border: 1px solid #d4a57444;
+    border-radius: 12px;
+    padding: 20px;
+    color: #d4c8b0;
+    font-size: 14px;
+  }
+  .decision-note strong { color: #d4a574; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Weft Logo — 配色方向对比</h1>
+  <p class="subtitle">冷青色 (原设计) vs 暖琥珀色 (v0.8 "Quiet × Warm" 匹配)</p>
+  <div class="intro">
+    两版 Logo <strong>几何结构完全相同</strong> (W 路径 + 14×14 编织网格 + 196 交叉点 + 6 层霓虹灯管效果)，
+    仅替换配色：
+    <br>• 冷青版 — <code>#20f0e0</code> W 主色 on <code>#0b0e14</code> 冷蓝黑底 (原设计，2026-07-04)
+    <br>• 暖琥珀版 — <code>#d4a574</code> W 主色 on <code>#221c18</code> 暖棕黑底 (匹配 v0.8 UI 主题)
+    <br><br>
+    请在下方各场景下对比，确认最终采用方向后，我会生成对应 PNG 尺寸并接入 v1.0 发布流程。
+  </div>
+
+  <!-- Section 1: 512px on dark (terminal context) -->
+  <h2>① 终端深色背景 (512px)</h2>
+  <p class="subtitle">这是 Logo 在 weft 应用内 (About 对话框 / 窗口标题) 的主要呈现场景</p>
+  <div class="compare-row">
+    <div class="logo-card cool">
+      <img src="../weft-icon.svg" alt="Cool cyan logo">
+      <div class="label">冷青色 (原设计)</div>
+      <div class="desc">#20f0e0 on #0b0e14 · 科技感 · 冷调</div>
+    </div>
+    <div class="logo-card warm">
+      <img src="../weft-icon-warm.svg" alt="Warm amber logo">
+      <div class="label">暖琥珀色 (v0.8 匹配)</div>
+      <div class="desc">#d4a574 on #221c18 · 温暖感 · 与 UI 统一</div>
+    </div>
+  </div>
+
+  <!-- Section 2: Size readability on dark -->
+  <h2>② 多尺寸可读性 (深色背景)</h2>
+  <p class="subtitle">Dock / 任务栏 / 标题栏 使用场景。32px 是最小可读尺寸，网格细节在此尺寸坍缩</p>
+  <div class="sizes-row">
+    <div class="group cool">
+      <div class="group-label">冷青色</div>
+      <div class="size-cell"><img src="../weft-icon.svg" width="256" height="256"><div class="px">256px</div></div>
+      <div class="size-cell"><img src="../weft-icon.svg" width="128" height="128"><div class="px">128px</div></div>
+      <div class="size-cell"><img src="../weft-icon.svg" width="64" height="64"><div class="px">64px</div></div>
+      <div class="size-cell"><img src="../weft-icon.svg" width="32" height="32"><div class="px">32px</div></div>
+    </div>
+  </div>
+  <div class="sizes-row">
+    <div class="group warm">
+      <div class="group-label">暖琥珀色</div>
+      <div class="size-cell"><img src="../weft-icon-warm.svg" width="256" height="256"><div class="px">256px</div></div>
+      <div class="size-cell"><img src="../weft-icon-warm.svg" width="128" height="128"><div class="px">128px</div></div>
+      <div class="size-cell"><img src="../weft-icon-warm.svg" width="64" height="64"><div class="px">64px</div></div>
+      <div class="size-cell"><img src="../weft-icon-warm.svg" width="32" height="32"><div class="px">32px</div></div>
+    </div>
+  </div>
+
+  <!-- Section 3: Simulated macOS Dock (light bg) -->
+  <h2>③ 模拟 macOS Dock (浅色背景)</h2>
+  <p class="subtitle">macOS Dock 默认是浅色半透明背景。Logo 在浅色背景上的对比度是关键考量</p>
+  <div class="dock-sim">
+    <div class="dock-item">
+      <img src="../weft-icon.svg" width="72" height="72">
+      <div class="name">冷青色</div>
+    </div>
+    <div class="dock-item">
+      <img src="../weft-icon-warm.svg" width="72" height="72">
+      <div class="name">暖琥珀色</div>
+    </div>
+  </div>
+  <div class="dock-label">↑ 模拟 Dock 中的实际观感 (72px @2x)</div>
+
+  <!-- Section 4: Color palette -->
+  <h2>④ 配色对照表</h2>
+  <div class="palette-row">
+    <div class="palette cool">
+      <h3>冷青色方案</h3>
+      <div class="swatch"><div class="chip" style="background:#0b0e14"></div><div class="role">背景</div><div class="hex">#0b0e14</div></div>
+      <div class="swatch"><div class="chip" style="background:#20f0e0"></div><div class="role">W 主色</div><div class="hex">#20f0e0</div></div>
+      <div class="swatch"><div class="chip" style="background:#28c4b4"></div><div class="role">网格线</div><div class="hex">#28c4b4</div></div>
+      <div class="swatch"><div class="chip" style="background:#40e0d0"></div><div class="role">网格点</div><div class="hex">#40e0d0</div></div>
+      <div class="swatch"><div class="chip" style="background:#e0fffe"></div><div class="role">W 高光</div><div class="hex">#e0fffe</div></div>
+    </div>
+    <div class="palette warm">
+      <h3>暖琥珀色方案</h3>
+      <div class="swatch"><div class="chip" style="background:#221c18"></div><div class="role">背景</div><div class="hex">#221c18</div></div>
+      <div class="swatch"><div class="chip" style="background:#d4a574"></div><div class="role">W 主色</div><div class="hex">#d4a574</div></div>
+      <div class="swatch"><div class="chip" style="background:#6a5238"></div><div class="role">网格线</div><div class="hex">#6a5238</div></div>
+      <div class="swatch"><div class="chip" style="background:#8a6a48"></div><div class="role">网格点</div><div class="hex">#8a6a48</div></div>
+      <div class="swatch"><div class="chip" style="background:#fff0dc"></div><div class="role">W 高光</div><div class="hex">#fff0dc</div></div>
+    </div>
+  </div>
+
+  <!-- Section 5: Pros/cons analysis -->
+  <h2>⑤ 方案分析</h2>
+  <div class="analysis">
+    <div class="col cool">
+      <h3>冷青色方案 (原设计)</h3>
+      <ul>
+        <li class="pro">Dock 中辨识度高，冷色调在浅色 Dock 背景上对比强烈</li>
+        <li class="pro">霓虹青色更具"终端/科技"气质，与 Warp 紫色形成差异</li>
+        <li class="pro">assets/logo/png/ 已有全部 7 尺寸 PNG，零额外工作</li>
+        <li class="con">与 v0.8 "Quiet × Warm" UI 主题色调不一致 (冷 vs 暖)</li>
+        <li class="con">青色偏冷，可能与温暖琥珀色 UI 出现视觉割裂感</li>
+      </ul>
+    </div>
+    <div class="col warm">
+      <h3>暖琥珀色方案 (v0.8 匹配)</h3>
+      <ul>
+        <li class="pro">与 v0.8 "Quiet × Warm" 终端 UI 主题色调完全统一</li>
+        <li class="pro">品牌一致性 — 从 Dock 图标到应用内 UI 色调连贯</li>
+        <li class="pro">琥珀色温暖、低饱和，符合 weft "编织/织物" 名字的柔和气质</li>
+        <li class="con">需基于 weft-icon-warm.svg 重新栅格化生成 7 尺寸 PNG (~2 分钟 sips 命令)</li>
+        <li class="con">暖色调在浅色 Dock 背景上对比度略低于冷色 (但 #221c18 深底仍可辨)</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="decision-note">
+    <strong>决策提示：</strong>请告诉我采用哪个方向 —
+    回复 <code>冷青色</code> 或 <code>暖琥珀色</code>。
+    确认后，我会：
+    <br>① 生成选定版本的 .icns 文件 (从 SVG 栅格化 → iconutil 打包)
+    <br>② 接入 winit 运行时窗口图标 (crates/weft_app/src/main.rs)
+    <br>③ 更新 v1.0_IMPLEMENTATION_PLAN.md Phase 3 — 把 Logo 接入列为发布前必做项
+    <br>④ 若选暖色，会在 assets/logo/png/ 旁生成 png-warm/ 目录存放新尺寸 PNG
+  </div>
+</div>
+</body>
+</html>
