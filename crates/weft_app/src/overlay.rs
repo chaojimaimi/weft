@@ -142,6 +142,9 @@ pub struct SettingsDrawParams<'a> {
     pub active_tab: SettingsTab,
     /// Row cursor position within the active tab's content area.
     pub selection: usize,
+    /// v1.0 fix: vertical scroll offset for list-based tabs (Keybindings).
+    /// The renderer renders rows `[offset .. offset+max_rows]`.
+    pub scroll_offset: usize,
     /// Current theme name (config value, e.g. "weft-warm").
     pub theme_name: &'a str,
     /// All available built-in themes (name + display label).
@@ -401,6 +404,7 @@ pub fn build_overlay_stack<'a>(
     settings_open: bool,
     settings_tab: SettingsTab,
     settings_selection: usize,
+    settings_scroll_offset: usize,
     settings_theme_name: &'a str,
     settings_themes: &'a [SettingsThemeView],
     settings_font_family: &'a str,
@@ -534,6 +538,7 @@ pub fn build_overlay_stack<'a>(
             content: OverlayContent::Settings(SettingsDrawParams {
                 active_tab: settings_tab,
                 selection: settings_selection,
+                scroll_offset: settings_scroll_offset,
                 theme_name: settings_theme_name,
                 themes: settings_themes,
                 font_family: settings_font_family,
@@ -739,6 +744,7 @@ mod tests {
         let s = SettingsDrawParams {
             active_tab: SettingsTab::Appearance,
             selection: 0,
+            scroll_offset: 0,
             theme_name: "weft-warm",
             themes: &themes,
             font_family: "Menlo",
@@ -779,6 +785,7 @@ mod tests {
                     content: OverlayContent::Settings(SettingsDrawParams {
                         active_tab: SettingsTab::Appearance,
                         selection: 0,
+                        scroll_offset: 0,
                         theme_name: "",
                         themes: &[],
                         font_family: "",

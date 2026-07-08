@@ -244,6 +244,10 @@ struct App {
     settings_tab: crate::overlay::SettingsTab,
     /// Row cursor in the active tab's content area.
     settings_selection: usize,
+    /// v1.0 fix: vertical scroll offset within the active tab's list (for
+    /// tabs with more rows than fit on screen, e.g. Keybindings). The
+    /// renderer renders `[offset .. offset+max_rows]`.
+    settings_scroll_offset: usize,
     /// The working config copy the user edits in the panel. Applied on Enter
     /// (save) or discarded on Esc. Initialized from the live config when the
     /// panel opens.
@@ -517,6 +521,7 @@ impl App {
             settings_open: false,
             settings_tab: crate::overlay::SettingsTab::Appearance,
             settings_selection: 0,
+            settings_scroll_offset: 0,
             settings_draft: weft_core::config::Config::default(),
             settings_dirty: false,
             settings_error: None,
@@ -950,6 +955,7 @@ impl App {
                     self.settings_draft = self.config.clone();
                     self.settings_tab = crate::overlay::SettingsTab::Appearance;
                     self.settings_selection = 0;
+                    self.settings_scroll_offset = 0;
                     self.settings_dirty = false;
                     self.settings_error = None;
                 }
@@ -1242,20 +1248,25 @@ impl App {
                     .unwrap_or(0);
                 self.settings_tab = tabs[(idx + 1) % tabs.len()];
                 self.settings_selection = 0;
+                self.settings_scroll_offset = 0;
                 self.request_redraw();
                 true
             }
             KeyCode::Up => {
-                if self.settings_selection > 0 {
-                    self.settings_selection -= 1;
+                // v1.0 fix: wrap-around selection so users can cycle through
+                // all rows with arrow keys alone (no End/Home needed).
+                let max = self.settings_tab_row_count();
+                if max > 0 {
+                    self.settings_selection = (self.settings_selection + max - 1) % max;
                 }
                 self.request_redraw();
                 true
             }
             KeyCode::Down => {
-                let max = self.settings_tab_row_count().saturating_sub(1);
-                if self.settings_selection < max {
-                    self.settings_selection += 1;
+                // v1.0 fix: wrap-around selection (Down at bottom → top).
+                let max = self.settings_tab_row_count();
+                if max > 0 {
+                    self.settings_selection = (self.settings_selection + 1) % max;
                 }
                 self.request_redraw();
                 true
@@ -3954,6 +3965,7 @@ impl App {
                                 if self.settings_tab != tab {
                                     self.settings_tab = tab;
                                     self.settings_selection = 0;
+                                    self.settings_scroll_offset = 0;
                                 }
                             }
                             SettingsHitKind::Theme(i) => {
@@ -5648,6 +5660,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.settings_open,
                         self.settings_tab,
                         self.settings_selection,
+                        self.settings_scroll_offset,
                         &self.settings_draft.theme.name,
                         &settings_themes,
                         &self.settings_draft.font.family,

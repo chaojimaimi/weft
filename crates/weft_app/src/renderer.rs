@@ -3389,7 +3389,7 @@ fragment float4 text_fragment(
             let label = tab.label();
             let is_active = *tab == s.active_tab;
             let color = if is_active { fg } else { label_c };
-            // Active tab: 1px underline at text baseline.
+            // Active tab: 1px underline spanning the full slot width.
             if is_active {
                 push_quad(
                     &mut verts,
@@ -3404,7 +3404,11 @@ fragment float4 text_fragment(
                     accent,
                 );
             }
-            self.push_text(&mut verts, tx0 + cw * 0.5, y, label, color, content_cols);
+            // Center the label within its slot so short labels (Font/Logo)
+            // don't clump against the left edge of unequal-width tabs.
+            let label_chars = label.chars().count() as f32;
+            let text_x = tx0 + ((tab_w - label_chars * cw) / 2.0).max(cw * 0.5);
+            self.push_text(&mut verts, text_x, y, label, color, content_cols);
             // v1.0 S1-b: register a hit region for the whole tab cell so
             // clicks anywhere in the tab switch tabs (matching the
             // underline's visual span).
@@ -3515,10 +3519,21 @@ fragment float4 text_fragment(
                 }
             }
             SettingsTab::Keybindings => {
-                // Read-only list of action → chord pairs.
-                for (i, kb) in s.keybindings.iter().take(max_rows).enumerate() {
+                // v1.0 fix: scrollable list — render `[offset .. offset+max_rows]`
+                // and auto-clamp offset so the selected row is always visible.
+                let total = s.keybindings.len();
+                let visible = max_rows.min(total);
+                // Derive offset from selection: keep selection in view.
+                let mut offset = s.scroll_offset.min(total);
+                if s.selection < offset {
+                    offset = s.selection;
+                } else if s.selection >= offset + visible {
+                    offset = s.selection + 1 - visible;
+                }
+                let end = (offset + visible).min(total);
+                for (i, kb) in s.keybindings[offset..end].iter().enumerate() {
                     let row_y = content_top + i as f32 * ch;
-                    let is_selected = i == s.selection;
+                    let is_selected = offset + i == s.selection;
                     if is_selected {
                         push_quad(
                             &mut verts,
@@ -3543,6 +3558,28 @@ fragment float4 text_fragment(
                         row_y,
                         &kb.binding,
                         accent,
+                        content_cols,
+                    );
+                }
+                // Scroll indicator when more rows exist below/above.
+                if end < total {
+                    let arrow_y = content_top + visible as f32 * ch - ch * 0.9;
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        arrow_y,
+                        "↓ more",
+                        label_c,
+                        content_cols,
+                    );
+                }
+                if offset > 0 {
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        content_top,
+                        "↑ more",
+                        label_c,
                         content_cols,
                     );
                 }

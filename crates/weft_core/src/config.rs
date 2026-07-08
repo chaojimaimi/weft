@@ -1233,7 +1233,9 @@ impl Config {
             editor["submit_on_ctrl_enter"] = toml_edit::value(true);
         }
 
-        // [logo] section — only write variant when non-default.
+        // [logo] section — write variant when non-default; clear it when
+        // default so a later switch back to Cool doesn't get overridden by
+        // a stale `variant = "warm"` left in the file.
         let default_logo = LogoConfig::default();
         if self.logo.variant != default_logo.variant {
             let logo_entry = doc.entry("logo").or_insert_with(toml_edit::table);
@@ -1242,6 +1244,17 @@ impl Config {
             }
             let logo = logo_entry.as_table_mut().expect("logo is a table");
             logo["variant"] = toml_edit::value(self.logo.variant.as_str());
+        } else if let Some(logo_entry) = doc.get_mut("logo") {
+            // Default variant: remove any stale `variant` key so a saved
+            // non-default value doesn't override the default on next load.
+            if let Some(logo) = logo_entry.as_table_mut() {
+                logo.remove("variant");
+                // If the [logo] table is now empty, remove it entirely to
+                // keep the config file clean.
+                if logo.iter().count() == 0 {
+                    doc.remove("logo");
+                }
+            }
         }
 
         // [keybindings] section.
@@ -2839,6 +2852,32 @@ path = "#0000ff"
         assert_eq!(reloaded.font.family, "Monaco");
         assert_eq!(reloaded.font.size, 14.0);
         assert_eq!(reloaded.logo.variant, LogoVariant::Warm);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn logo_variant_save_cool_clears_stale_non_default() {
+        // v1.0 fix: switching back to Cool (default) after saving a non-default
+        // variant must clear the stale `variant = "warm"` from the file.
+        // Otherwise the saved non-default value would override the default
+        // on next load.
+        let tmp = std::env::temp_dir().join("weft_logo_clear_stale_test.toml");
+        let _ = std::fs::remove_file(&tmp);
+        // Step 1: save with Warm — writes [logo] variant = "warm".
+        let mut cfg = Config::default();
+        cfg.logo.variant = LogoVariant::Warm;
+        cfg.save_to_path(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(text.contains("variant = \"warm\""));
+        // Step 2: switch back to Cool and save — must remove the stale key.
+        cfg.logo.variant = LogoVariant::Cool;
+        cfg.save_to_path(&tmp).unwrap();
+        let reloaded: Config = toml::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.logo.variant,
+            LogoVariant::Cool,
+            "stale non-default variant should be cleared on save"
+        );
         let _ = std::fs::remove_file(&tmp);
     }
 }
