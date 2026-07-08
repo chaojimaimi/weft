@@ -2262,8 +2262,12 @@ name = "weft-light"
 
     #[test]
     fn load_missing_file_is_default() {
-        // HOME/XDG unset → no path → default. (Tests run with whatever env;
-        // this asserts graceful handling when the path can't be resolved.)
+        // Point XDG_CONFIG_HOME to a non-existent directory so Config::load()
+        // cannot find a user config file, guaranteeing we hit the default path.
+        // Without this isolation the test picks up the developer's real
+        // config.toml and fails on the font-family assertion.
+        let tmp = std::env::temp_dir().join("weft-test-nonexistent");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
         let c = Config::load();
         assert_eq!(c.font.family, "Menlo");
     }

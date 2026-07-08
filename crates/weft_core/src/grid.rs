@@ -132,7 +132,7 @@ impl Default for Cell {
 
 impl Cell {
     pub fn with_char(ch: char) -> Self {
-        let width = if unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1 {
+        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -513,7 +513,7 @@ impl Grid {
             }
         }
 
-        let width = if unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1 {
+        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -569,7 +569,7 @@ impl Grid {
     /// Write a character at the cursor position and advance.
     /// Preserves existing fg/bg (for direct/test use).
     pub fn write_char(&mut self, ch: char) {
-        let width = if unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1 {
+        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -848,9 +848,18 @@ impl Grid {
 
     /// Scroll the scroll region up by n lines.
     /// Lines scrolled off the top go into the scrollback buffer.
+    ///
+    /// For full-viewport scrolls (the common streaming case), records a
+    /// `pending_scroll` delta so the renderer can shift its per-row vertex
+    /// cache — an O(n) optimization over a full rebuild. For scroll-region
+    /// scrolls (DECSTBM, used by TUI apps like `less`), the renderer's cache
+    /// shift can't be used because it operates on the entire cache while the
+    /// scroll only affected `[top..=bottom]`. In that case, all rows in the
+    /// scroll region are marked dirty so the renderer rebuilds them.
     pub fn scroll_up(&mut self, n: usize) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
+        let full_viewport = top == 0 && bottom == self.num_rows - 1;
 
         if n > bottom - top {
             // Push all rows in the scroll region into scrollback
@@ -866,13 +875,19 @@ impl Grid {
                     self.viewport[i].clear();
                 }
             }
-            // v1.0 P0-c: record scroll delta for renderer cache shift.
-            self.pending_scroll
-                .set(self.pending_scroll.get() + (bottom - top + 1) as i32);
+            if full_viewport {
+                self.pending_scroll
+                    .set(self.pending_scroll.get() + (bottom - top + 1) as i32);
+            } else {
+                // Scroll region: mark affected rows dirty for rebuild.
+                for i in top..=bottom {
+                    self.viewport[i].mark_dirty(self.num_cols - 1);
+                }
+            }
             return;
         }
 
-        if top == 0 && bottom == self.num_rows - 1 {
+        if full_viewport {
             // v1.0 perf: Full-viewport scroll using rotate_left.
             // For n=1 (the common streaming case): 1 Row alloc (was 2 with
             // drain+extend, was ~24 with the old shift loop).
@@ -884,6 +899,8 @@ impl Grid {
                 self.scrollback.push(old_top);
                 self.viewport.rotate_left(1);
             }
+            self.pending_scroll
+                .set(self.pending_scroll.get() + n as i32);
         } else {
             // Scroll region (or partial viewport): rotate in place, then
             // clear the exposed bottom rows. For top==0, push the old top
@@ -900,25 +917,37 @@ impl Grid {
             for i in (bottom + 1 - n)..=bottom {
                 self.viewport[i].clear();
             }
+            // Mark all rows in the scroll region dirty — the renderer's
+            // per-row cache is position-relative and can't be shifted for a
+            // partial-region scroll, so rebuild all affected rows.
+            for i in top..=bottom {
+                self.viewport[i].mark_dirty(self.num_cols - 1);
+            }
         }
-        // v1.0 P0-c: record scroll delta for renderer cache shift instead of
-        // mark_all_dirty. The renderer shifts its per-row vertex cache to
-        // match, only rebuilding the newly exposed rows at the bottom.
-        self.pending_scroll
-            .set(self.pending_scroll.get() + n as i32);
     }
 
     /// Scroll the scroll region down by n lines.
+    ///
+    /// Like [`scroll_up`](Self::scroll_up), only full-viewport scrolls use
+    /// `pending_scroll` for the renderer cache shift. Scroll-region scrolls
+    /// mark affected rows dirty instead.
     pub fn scroll_down(&mut self, n: usize) {
         let top = self.scroll_top;
         let bottom = self.scroll_bottom;
+        let full_viewport = top == 0 && bottom == self.num_rows - 1;
 
         if n > bottom - top {
             for i in top..=bottom {
                 self.viewport[i].clear();
             }
-            self.pending_scroll
-                .set(self.pending_scroll.get() - (bottom - top + 1) as i32);
+            if full_viewport {
+                self.pending_scroll
+                    .set(self.pending_scroll.get() - (bottom - top + 1) as i32);
+            } else {
+                for i in top..=bottom {
+                    self.viewport[i].mark_dirty(self.num_cols - 1);
+                }
+            }
             return;
         }
 
@@ -927,9 +956,14 @@ impl Grid {
         for i in top..(top + n) {
             self.viewport[i].clear();
         }
-        // v1.0 P0-c: record scroll delta for renderer cache shift.
-        self.pending_scroll
-            .set(self.pending_scroll.get() - n as i32);
+        if full_viewport {
+            self.pending_scroll
+                .set(self.pending_scroll.get() - n as i32);
+        } else {
+            for i in top..=bottom {
+                self.viewport[i].mark_dirty(self.num_cols - 1);
+            }
+        }
     }
 
     /// Set scroll region (CSI r). Parameters are 1-based.
@@ -2392,6 +2426,61 @@ mod tests {
         grid.scroll_up(1);
         grid.clear_all_dirty();
         assert_eq!(grid.take_pending_scroll(), 0);
+    }
+
+    #[test]
+    fn scroll_region_up_marks_dirty_not_pending() {
+        // less/vim set a scroll region (DECSTBM) then scroll within it.
+        // The renderer's cache shift can only handle full-viewport scrolls,
+        // so scroll-region scrolls must mark rows dirty instead.
+        let mut grid = Grid::new(5, 5);
+        // Scroll region: rows 1..3 (0-indexed), leaving row 0 and row 4
+        // outside the region.
+        grid.set_scroll_region(2, 4);
+        assert_eq!(grid.scroll_top, 1);
+        assert_eq!(grid.scroll_bottom, 3);
+
+        grid.scroll_up(1);
+        // No pending_scroll for scroll-region scrolls.
+        assert_eq!(grid.take_pending_scroll(), 0);
+        // Rows in the scroll region (1..=3) should be dirty.
+        let dirty: Vec<_> = grid.dirty_rows().map(|(r, _)| r).collect();
+        assert!(dirty.contains(&1));
+        assert!(dirty.contains(&2));
+        assert!(dirty.contains(&3));
+        // Row 0 is outside the scroll region — must NOT be dirty.
+        assert!(!dirty.contains(&0));
+        // Row 4 is outside the scroll region — must NOT be dirty.
+        assert!(!dirty.contains(&4));
+    }
+
+    #[test]
+    fn scroll_region_down_marks_dirty_not_pending() {
+        let mut grid = Grid::new(5, 5);
+        grid.set_scroll_region(2, 4);
+        grid.scroll_down(1);
+        assert_eq!(grid.take_pending_scroll(), 0);
+        let dirty: Vec<_> = grid.dirty_rows().map(|(r, _)| r).collect();
+        assert!(dirty.contains(&1));
+        assert!(dirty.contains(&2));
+        assert!(dirty.contains(&3));
+        assert!(!dirty.contains(&0));
+        assert!(!dirty.contains(&4));
+    }
+
+    #[test]
+    fn full_viewport_scroll_still_uses_pending_scroll() {
+        // Regression: full-viewport scrolls must still use the cache-shift
+        // optimization (pending_scroll), not mark-all-dirty.
+        let mut grid = Grid::new(5, 5);
+        grid.scroll_up(2);
+        assert_eq!(grid.take_pending_scroll(), 2);
+        assert_eq!(grid.dirty_rows().count(), 0);
+
+        let mut grid = Grid::new(5, 5);
+        grid.scroll_down(2);
+        assert_eq!(grid.take_pending_scroll(), -2);
+        assert_eq!(grid.dirty_rows().count(), 0);
     }
 
     #[test]

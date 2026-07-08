@@ -434,7 +434,7 @@ impl GlyphAtlas {
         }
 
         // Determine which font to use
-        let is_wide = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1;
+        let is_wide = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1;
         let is_emoji = is_emoji_char(ch);
 
         let font = if is_emoji {

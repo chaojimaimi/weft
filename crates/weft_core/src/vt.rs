@@ -825,7 +825,7 @@ impl vte::Perform for Terminal {
         // For 58KB of `seq` output, this saves ~58000 lookup calls.
         let width = if c.is_ascii() {
             CellWidth::Half
-        } else if unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) > 1 {
+        } else if unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half

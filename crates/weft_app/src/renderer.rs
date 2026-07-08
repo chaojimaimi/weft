@@ -35,7 +35,7 @@ fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
     let mut current = String::new();
     let mut col = 0usize;
     for c in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
         if w == 0 {
             continue;
         }
@@ -895,6 +895,11 @@ fragment float4 text_fragment(
         // IMPORTANT: drawable_size must be in PHYSICAL PIXELS
         self.layer
             .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
+        // v1.0 fix: invalidate per-row vertex cache on viewport change.
+        // Without this, macOS live-resize can render a frame with old-cache
+        // vertices at the new viewport size before ensure_offscreen_texture()
+        // detects the change → text misalignment / flicker.
+        self.force_full_grid_redraw();
         window.request_redraw();
     }
 
@@ -4587,9 +4592,10 @@ fragment float4 text_fragment(
     }
 
     /// Column width of a character (0 for zero-width combining marks,
-    /// 1 for ASCII/narrow, 2 for CJK full-width).
+    /// 1 for ASCII/narrow, 2 for CJK full-width including ambiguous-width
+    /// characters like ①②③ which are rendered full-width in CJK context).
     fn char_col_width(c: char) -> usize {
-        unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+        unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0)
     }
 
     /// Total column width of a string — sum of each char's display width.
@@ -4598,7 +4604,7 @@ fragment float4 text_fragment(
     /// occupy 2 columns each, not 1).
     fn text_col_width(s: &str) -> usize {
         s.chars()
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+            .map(|c| unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0))
             .sum()
     }
 
@@ -4626,7 +4632,7 @@ fragment float4 text_fragment(
         let mut px = x_left;
         let mut col = 0f32; // column units consumed
         for (ci, c) in text.chars().enumerate() {
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            let w = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
             if w == 0 {
                 continue;
             }
@@ -5138,7 +5144,7 @@ fragment float4 text_fragment(
             let mut kept: Vec<char> = Vec::new();
             let mut w = 1usize; // reserve 1 for "…"
             for c in find.query.chars().rev() {
-                let cw_char = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                let cw_char = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
                 if w + cw_char > query_budget {
                     break;
                 }
