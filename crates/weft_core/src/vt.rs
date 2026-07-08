@@ -2136,6 +2136,49 @@ mod tests {
 mod reflow_cjk_tests {
     use super::*;
 
+    /// v1.0 fix: verify CJK characters render correctly after ASCII fast path.
+    /// Regression test: `ls -l` with Chinese filenames showed `????` because
+    /// the ASCII fast path scanned 0x20..=0x7E and left CJK bytes (≥0x80) for
+    /// vte's per-byte path. This test ensures the handoff preserves UTF-8.
+    #[test]
+    fn ascii_fast_path_preserves_cjk() {
+        let mut t = Terminal::new(24, 80);
+        // Mix ASCII + CJK in one line: `-rw-r--r-- 1 user wheel 0 Jan 1 12:00 中文文件.txt\n`
+        let line = "-rw-r--r-- 1 user wheel 0 Jan 1 12:00 中文文件.txt\n";
+        t.process(line.as_bytes());
+        let g = t.grid();
+        // The CJK chars should land at their correct column positions.
+        // Find them by scanning the first row.
+        let row: String = (0..g.num_cols).map(|c| g.cell(0, c).character).collect();
+        assert!(row.contains('中'), "expected '中' in row 0, got: {:?}", row);
+        assert!(row.contains('文'), "expected '文' in row 0, got: {:?}", row);
+    }
+
+    /// v1.0 fix: verify CJK survives a byte-boundary split that mimics
+    /// `tab.rs` message chunking. A UTF-8 multi-byte sequence split across
+    /// two `process()` calls must not corrupt into `?` / replacement chars.
+    #[test]
+    fn cjk_survives_byte_boundary_split() {
+        let mut t = Terminal::new(24, 80);
+        // "中文" = [0xE4, 0xB8, 0xAD, 0xE6, 0x96, 0x87] (6 bytes)
+        let bytes = "中文".as_bytes();
+        // Split in the middle of the first char (after byte 1).
+        t.process(&bytes[..1]); // 0xE4 alone — incomplete UTF-8 start
+        t.process(&bytes[1..]); // 0xB8 0xAD 0xE6 0x96 0x87 — rest
+        let g = t.grid();
+        let row: String = (0..g.num_cols).map(|c| g.cell(0, c).character).collect();
+        assert!(
+            row.contains('中'),
+            "expected '中' after split, got: {:?}",
+            row
+        );
+        assert!(
+            row.contains('文'),
+            "expected '文' after split, got: {:?}",
+            row
+        );
+    }
+
     /// A full-width char that would straddle the right margin makes the print
     /// path wrap before placing it, leaving the last cell as a never-written
     /// default. Reflow must NOT bake that trailing blank into the logical line

@@ -6409,6 +6409,19 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
         .map(|(k, v)| (k.to_string(), v))
         .collect();
 
+    // v1.0 fix: ensure UTF-8 locale for the child shell. When weft is launched
+    // from Finder (.app bundle), the GUI environment typically lacks LANG /
+    // LC_CTYPE, so the shell falls back to the `C` locale and tools like `ls`
+    // render non-ASCII filenames (中文, etc.) as `?`. Force a UTF-8 locale
+    // unless the user already has one set.
+    let lang_ok = std::env::var("LANG").is_ok_and(|l| l.contains("UTF-8") || l.contains("utf8"));
+    let lc_ctype_ok =
+        std::env::var("LC_CTYPE").is_ok_and(|l| l.contains("UTF-8") || l.contains("utf8"));
+    if !lang_ok && !lc_ctype_ok {
+        // Prefer en_US.UTF-8 (always available on macOS); fall back to C.UTF-8.
+        env.push(("LANG".to_string(), "en_US.UTF-8".to_string()));
+    }
+
     // zsh: write the generated .zshenv and redirect ZDOTDIR at its directory.
     if let Some((redirect_var, file)) = plan.rc_redirect() {
         let dir = cache_root.join("zsh");
