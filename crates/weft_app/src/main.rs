@@ -5928,6 +5928,21 @@ impl ApplicationHandler<AppEvent> for App {
             event_loop.exit();
         }
     }
+
+    /// v1.0 fix: during macOS live-resize, winit may defer `RedrawRequested`
+    /// until the mouse is released. The grid IS reflowed in the `Resized`
+    /// handler, but without a redraw the old drawable is stretched to fit the
+    /// new window bounds → "content squished together" artifact.
+    ///
+    /// `AboutToWait` fires when the event loop is about to block waiting for
+    /// events. By requesting a redraw here while the resize cascade is active
+    /// (within 100ms of the last `Resized`), we ensure the content is
+    /// re-rendered on every intermediate size during live resize.
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.last_resize_instant.elapsed() < std::time::Duration::from_millis(100) {
+            self.request_redraw();
+        }
+    }
 }
 
 /// Resolve the character to insert for a printable editor key. Prefers the

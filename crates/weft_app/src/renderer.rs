@@ -5348,10 +5348,9 @@ fragment float4 text_fragment(
                 max_cols,
             );
 
-            // Close "×" button at the right. v0.9 W1+: only show on hover
-            // (Warp-style) — active tab always shows × so the user can close
-            // the current tab without hovering first. Inactive tabs show ×
-            // only when hovered_tab == Some(i).
+            // Close button: draw a standard × icon using vector lines
+            // (not a font character). Warp-style: two diagonal strokes.
+            // v0.9 W1+: active tab always shows ×; inactive tabs show × on hover.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
             let is_hovered = tab_bar.hovered_tab == Some(i);
@@ -5361,23 +5360,15 @@ fragment float4 text_fragment(
                 } else {
                     [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
                 };
-                // Render × directly as a 1-cell quad. Can't use push_text
-                // because width_cjk('×')=2 and max_cols=1 would skip it.
-                // The glyph atlas slot is 2 cells (from width_cjk in
-                // glyph.rs), so we use the full UV but render at 1-cell width.
-                if let Some(g) = self.atlas.get('×') {
-                    let (u, v) = g.uv_origin;
-                    let (uw, vh) = g.uv_size;
-                    let cx = close_x0 + (close_w - cw) * 0.5;
-                    let cy = y0 + (bar_h - ch) * 0.5;
-                    push_quad(
-                        &mut vertices,
-                        [cx, cy, cx + cw, cy + ch],
-                        [u, v + vh, u + uw, v],
-                        close_color,
-                        [0.0; 4],
-                    );
-                }
+                // Center of the close button area
+                let cx = close_x0 + close_w * 0.5;
+                let cy = y0 + bar_h * 0.5;
+                // × size: ~35% of cell height, line width ~1.5px × scale
+                let r = ch * 0.32;
+                let line_w = (1.5 * self.scale as f32).max(1.0);
+                // Two diagonal lines forming ×
+                push_line(&mut vertices, cx - r, cy - r, cx + r, cy + r, line_w, close_color);
+                push_line(&mut vertices, cx - r, cy + r, cx + r, cy - r, line_w, close_color);
             }
 
             hits.push(TabHit {
@@ -5502,6 +5493,37 @@ fn push_quad(vertices: &mut Vec<f32>, dst: [f32; 4], uv: [f32; 4], fg: [f32; 4],
     ] {
         vertices.extend_from_slice(&[
             x, y, u, v, fg[0], fg[1], fg[2], fg[3], bg[0], bg[1], bg[2], bg[3],
+        ]);
+    }
+}
+
+/// Draw a line segment as a thin rotated rectangle (two triangles).
+/// Used for vector-drawn UI elements like the tab close button × icon.
+fn push_line(vertices: &mut Vec<f32>, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: [f32; 4]) {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.5 {
+        return;
+    }
+    // Perpendicular unit vector × half-width
+    let hw = width * 0.5;
+    let px = -dy / len * hw;
+    let py = dx / len * hw;
+    // Four corners of the rotated rectangle
+    let (ax, ay) = (x1 + px, y1 + py);
+    let (bx, by) = (x1 - px, y1 - py);
+    let (cx, cy) = (x2 + px, y2 + py);
+    let (dx, dy) = (x2 - px, y2 - py);
+    // UV=[0;4] and fg=[0;4] → mask=0 → only bg (color) shows
+    let uv = [0.0f32; 4];
+    let fg = [0.0f32; 4];
+    for (x, y) in [
+        (ax, ay), (bx, by), (cx, cy),
+        (bx, by), (dx, dy), (cx, cy),
+    ] {
+        vertices.extend_from_slice(&[
+            x, y, uv[0], uv[1], fg[0], fg[1], fg[2], fg[3], color[0], color[1], color[2], color[3],
         ]);
     }
 }
