@@ -1656,7 +1656,13 @@ fragment float4 text_fragment(
         // blitting the unchanged region within the offscreen on scroll,
         // avoiding a full vertex rebuild + rasterization for the majority
         // of the screen that didn't change.
-        let has_offscreen = self.ensure_offscreen_texture();
+        //
+        // v1.0 fix: when the drawable texture size doesn't match the viewport
+        // (macOS live-resize async lag), skip the offscreen and render directly
+        // to the drawable. Otherwise the offscreen→drawable blit would only
+        // cover the top-left portion of the drawable, leaving stale content
+        // elsewhere → "content squished to top-left" visual artifact.
+        let has_offscreen = !vp_mismatch && self.ensure_offscreen_texture();
 
         let command_buffer = self.queue.new_command_buffer();
 
@@ -5355,14 +5361,23 @@ fragment float4 text_fragment(
                 } else {
                     [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
                 };
-                self.push_text(
-                    &mut vertices,
-                    close_x0 + cw * 0.5,
-                    y0 + (bar_h - ch) * 0.5,
-                    "×",
-                    close_color,
-                    1,
-                );
+                // Render × directly as a 1-cell quad. Can't use push_text
+                // because width_cjk('×')=2 and max_cols=1 would skip it.
+                // The glyph atlas slot is 2 cells (from width_cjk in
+                // glyph.rs), so we use the full UV but render at 1-cell width.
+                if let Some(g) = self.atlas.get('×') {
+                    let (u, v) = g.uv_origin;
+                    let (uw, vh) = g.uv_size;
+                    let cx = close_x0 + (close_w - cw) * 0.5;
+                    let cy = y0 + (bar_h - ch) * 0.5;
+                    push_quad(
+                        &mut vertices,
+                        [cx, cy, cx + cw, cy + ch],
+                        [u, v + vh, u + uw, v],
+                        close_color,
+                        [0.0; 4],
+                    );
+                }
             }
 
             hits.push(TabHit {
