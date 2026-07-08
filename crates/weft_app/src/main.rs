@@ -6422,6 +6422,23 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
         env.push(("LANG".to_string(), "en_US.UTF-8".to_string()));
     }
 
+    // v1.0 fix: set TERM / COLORTERM / TERM_PROGRAM for the child shell.
+    // When launched from Finder, GUI apps have no TERM set, so `less`,
+    // `vim`, `top`, etc. can't query terminfo and degrade ("terminal is
+    // not fully functional"). Weft implements xterm-256color semantics
+    // (256-color SGR, cursor movement, alternate screen), so advertise
+    // that capability. Don't override an existing TERM — the user may have
+    // set a specialized one (e.g. tmux).
+    if std::env::var("TERM").is_err() {
+        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    }
+    env.push(("COLORTERM".to_string(), "truecolor".to_string()));
+    env.push(("TERM_PROGRAM".to_string(), "Weft".to_string()));
+    env.push((
+        "TERM_PROGRAM_VERSION".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+
     // zsh: write the generated .zshenv and redirect ZDOTDIR at its directory.
     if let Some((redirect_var, file)) = plan.rc_redirect() {
         let dir = cache_root.join("zsh");
