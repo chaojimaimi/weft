@@ -1310,7 +1310,8 @@ impl App {
     /// v1.0 S1-c: Adjust the value of the currently-selected row in the
     /// active tab by `delta` (±1). Font/Window rows map to numeric fields;
     /// the Font family row cycles through a fixed list of common macOS
-    /// monospace families. No-op for Appearance/Keybindings (pick-list tabs).
+    /// monospace families. The Logo tab cycles the Dock icon variant.
+    /// No-op for Appearance/Keybindings (pick-list tabs).
     fn adjust_settings_value(&mut self, delta: i32) {
         use crate::overlay::SettingsTab;
         match self.settings_tab {
@@ -1372,6 +1373,19 @@ impl App {
                 }
                 _ => {}
             },
+            SettingsTab::Logo => {
+                if self.settings_selection == 0 {
+                    // Variant: cycle Cool → Warm → Light → Transparent → Cool.
+                    let variants = weft_core::config::LogoVariant::ALL;
+                    let cur = variants
+                        .iter()
+                        .position(|v| *v == self.settings_draft.logo.variant)
+                        .unwrap_or(0);
+                    let next = (cur as i32 + delta).rem_euclid(variants.len() as i32) as usize;
+                    self.settings_draft.logo.variant = variants[next];
+                    self.settings_dirty = true;
+                }
+            }
             SettingsTab::Appearance | SettingsTab::Keybindings => {
                 // Pick-list tabs — ←/→ has no meaning here.
             }
@@ -1391,6 +1405,8 @@ impl App {
             // v1.0 S1-d: Opacity / Padding X / Padding Y / Scrollback — match
             // the four rows rendered by build_settings_vertices.
             SettingsTab::Window => 4,
+            // v1.0 Logo: single row (Variant) — ←/→ cycles the value.
+            SettingsTab::Logo => 1,
         }
     }
 
@@ -1424,8 +1440,11 @@ impl App {
                     }
                 }
             }
-            SettingsTab::Font | SettingsTab::Keybindings | SettingsTab::Window => {
-                // Read-only in v1.0 — no edits from keyboard.
+            SettingsTab::Font
+            | SettingsTab::Keybindings
+            | SettingsTab::Window
+            | SettingsTab::Logo => {
+                // Read-only from Enter — ←/→ handles adjustments instead.
             }
         }
     }
@@ -5639,6 +5658,7 @@ impl ApplicationHandler<AppEvent> for App {
                         self.settings_draft.window.padding_y,
                         self.settings_draft.scrollback.lines,
                         &settings_keybindings,
+                        self.settings_draft.logo.variant,
                         self.settings_error.as_deref(),
                     );
                     // v0.8 U6: compute block-content metrics for the dynamic
@@ -6146,23 +6166,28 @@ fn scan_path_bins() -> Vec<String> {
 /// The PNG is embedded at compile time via `include_bytes!`, so there's no
 /// runtime file dependency.
 fn load_window_icon() -> Option<winit::window::Icon> {
-    let png_bytes = include_bytes!("../../../assets/logo/png/weft-icon-256.png");
+    // Use the Cool variant (default) for the window title-bar icon. Set once
+    // at window creation; runtime Dock icon switching via set_dock_icon() does
+    // not update this (would need window recreation — acceptable trade-off).
+    let png_bytes = include_bytes!("../../../assets/logo/variants/png/cool-256.png");
     let img = image::load_from_memory(png_bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
-/// v1.0 Logo: PNG bytes for each logo variant. Until per-variant assets are
-/// generated (phase 1), all variants use the same cool PNG — the runtime
-/// switching mechanism is in place and ready for real assets.
+/// v1.0 Logo: PNG bytes for each logo variant. Each variant ships its own
+/// 256×256 PNG (rendered from `assets/logo/variants/{variant}.svg`); the
+/// runtime switches Dock icon by loading the matching bytes via NSImage.
 fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     use weft_core::config::LogoVariant;
     match variant {
-        LogoVariant::Cool => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
-        LogoVariant::Warm => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
-        LogoVariant::Light => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
-        LogoVariant::Transparent => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
+        LogoVariant::Cool => include_bytes!("../../../assets/logo/variants/png/cool-256.png"),
+        LogoVariant::Warm => include_bytes!("../../../assets/logo/variants/png/warm-256.png"),
+        LogoVariant::Light => include_bytes!("../../../assets/logo/variants/png/light-256.png"),
+        LogoVariant::Transparent => {
+            include_bytes!("../../../assets/logo/variants/png/transparent-256.png")
+        }
     }
 }
 

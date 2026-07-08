@@ -89,15 +89,18 @@ pub enum SettingsTab {
     Font,
     Keybindings,
     Window,
+    /// v1.0 Logo: Dock icon variant selection (←/→ cycles Cool/Warm/Light/Transparent).
+    Logo,
 }
 
 impl SettingsTab {
     /// All tabs in display order.
-    pub const ALL: [SettingsTab; 4] = [
+    pub const ALL: [SettingsTab; 5] = [
         SettingsTab::Appearance,
         SettingsTab::Font,
         SettingsTab::Keybindings,
         SettingsTab::Window,
+        SettingsTab::Logo,
     ];
 
     /// Human-readable label for the tab bar.
@@ -107,6 +110,7 @@ impl SettingsTab {
             SettingsTab::Font => "Font",
             SettingsTab::Keybindings => "Keybindings",
             SettingsTab::Window => "Window",
+            SettingsTab::Logo => "Logo",
         }
     }
 }
@@ -158,6 +162,8 @@ pub struct SettingsDrawParams<'a> {
     pub scrollback_lines: usize,
     /// Keybindings to display (read-only in v1.0).
     pub keybindings: &'a [SettingsKeybindingView],
+    /// v1.0 Logo: currently-applied Dock icon variant (Logo tab displays its label).
+    pub logo_variant: weft_core::config::LogoVariant,
     /// v1.0 S2: Last save error message. `None` when the most recent save
     /// succeeded (or no save has been attempted). Surfaced as a red banner
     /// at the top of the panel.
@@ -294,9 +300,10 @@ impl OverlayWarmup for OverlayContent<'_> {
             }
             OverlayContent::Settings(s) => {
                 // Tab labels + status text + theme names + keybinding strings.
-                missing.extend("Settings Appearance Font Keybindings Window".chars());
+                missing.extend("Settings Appearance Font Keybindings Window Logo".chars());
                 missing.extend(
-                    "Theme: Font: Size: Line: Window Opacity Padding Scrollback Lines".chars(),
+                    "Theme: Font: Size: Line: Window Opacity Padding Scrollback Lines Variant:"
+                        .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
                 // now uses Unicode symbols ⏎ (U+23CE), ⇥ (U+21E5), ⌘ (U+2318)
@@ -317,6 +324,11 @@ impl OverlayWarmup for OverlayContent<'_> {
                 for kb in s.keybindings {
                     missing.extend(kb.action.chars());
                     missing.extend(kb.binding.chars());
+                }
+                // v1.0 Logo: warm all variant labels (Cool/Warm/Light/Transparent
+                // + parenthetical descriptions) so the Logo tab renders correctly.
+                for v in weft_core::config::LogoVariant::ALL {
+                    missing.extend(v.label().chars());
                 }
             }
         }
@@ -399,6 +411,7 @@ pub fn build_overlay_stack<'a>(
     settings_window_padding_y: u32,
     settings_scrollback_lines: usize,
     settings_keybindings: &'a [SettingsKeybindingView],
+    settings_logo_variant: weft_core::config::LogoVariant,
     settings_error: Option<&'a str>,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
@@ -531,6 +544,7 @@ pub fn build_overlay_stack<'a>(
                 window_padding_y: settings_window_padding_y,
                 scrollback_lines: settings_scrollback_lines,
                 keybindings: settings_keybindings,
+                logo_variant: settings_logo_variant,
                 error: settings_error,
             }),
         });
@@ -685,13 +699,15 @@ mod tests {
         assert!(labels.contains(&"Font"));
         assert!(labels.contains(&"Keybindings"));
         assert!(labels.contains(&"Window"));
+        assert!(labels.contains(&"Logo"));
     }
 
     #[test]
-    fn settings_tab_all_has_four_tabs() {
-        assert_eq!(SettingsTab::ALL.len(), 4);
+    fn settings_tab_all_has_five_tabs() {
+        assert_eq!(SettingsTab::ALL.len(), 5);
         assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
         assert_eq!(SettingsTab::ALL[3], SettingsTab::Window);
+        assert_eq!(SettingsTab::ALL[4], SettingsTab::Logo);
     }
 
     #[test]
@@ -733,6 +749,7 @@ mod tests {
             window_padding_y: 0,
             scrollback_lines: 10_000,
             keybindings: &kbs,
+            logo_variant: weft_core::config::LogoVariant::Cool,
             error: None,
         };
         let mut missing = HashSet::new();
@@ -772,6 +789,7 @@ mod tests {
                         window_padding_y: 0,
                         scrollback_lines: 10_000,
                         keybindings: &[],
+                        logo_variant: weft_core::config::LogoVariant::Cool,
                         error: None,
                     }),
                 },

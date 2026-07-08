@@ -405,7 +405,7 @@ pub struct SettingsHit {
 /// without recomputing layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingsHitKind {
-    /// A tab-bar entry (Appearance / Font / Keybindings / Window).
+    /// A tab-bar entry (Appearance / Font / Keybindings / Window / Logo).
     Tab(crate::overlay::SettingsTab),
     /// A theme row in the Appearance tab (0-based index).
     Theme(usize),
@@ -3382,8 +3382,8 @@ fragment float4 text_fragment(
         self.push_text(&mut verts, content_x0, y, "Settings", label_c, content_cols);
         y += ch * 1.8;
 
-        // Tab bar: 4 tabs side by side with 1px underline for active.
-        let tab_w = box_w / 4.0;
+        // Tab bar: tabs side by side with 1px underline for active.
+        let tab_w = box_w / SettingsTab::ALL.len() as f32;
         for (i, tab) in SettingsTab::ALL.iter().enumerate() {
             let tx0 = box_x0 + i as f32 * tab_w;
             let label = tab.label();
@@ -3560,6 +3560,28 @@ fragment float4 text_fragment(
                     let value_x = content_x0 + cw * 12.0;
                     self.push_text(&mut verts, value_x, row_y, value, fg, content_cols);
                 }
+            }
+            // v1.0 Logo: single row — Variant label + current value.
+            // ←/→ cycles through LogoVariant::ALL (Cool/Warm/Light/Transparent).
+            SettingsTab::Logo => {
+                let row_y = content_top;
+                self.push_text(
+                    &mut verts,
+                    content_x0,
+                    row_y,
+                    "Variant:",
+                    label_c,
+                    content_cols,
+                );
+                let value_x = content_x0 + cw * 12.0;
+                self.push_text(
+                    &mut verts,
+                    value_x,
+                    row_y,
+                    s.logo_variant.label(),
+                    fg,
+                    content_cols,
+                );
             }
         }
 
