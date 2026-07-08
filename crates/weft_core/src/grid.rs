@@ -1066,6 +1066,12 @@ impl Grid {
                     self.viewport[i] = Row::new(self.num_cols);
                 }
             }
+            // Mark all affected rows dirty — the renderer's per-row cache is
+            // position-relative and can't be shifted for a partial-region
+            // operation, so all moved + blanked rows must be rebuilt.
+            for i in row..=bottom {
+                self.viewport[i].mark_dirty(self.num_cols - 1);
+            }
         }
     }
 
@@ -1081,6 +1087,10 @@ impl Grid {
             }
             for i in (bottom - shift + 1)..=bottom {
                 self.viewport[i] = Row::new(self.num_cols);
+            }
+            // Mark all affected rows dirty — same rationale as insert_blank_lines.
+            for i in row..=bottom {
+                self.viewport[i].mark_dirty(self.num_cols - 1);
             }
         }
     }
@@ -2491,5 +2501,48 @@ mod tests {
         grid.resize(5, 8);
         assert!(grid.has_dirty());
         assert_eq!(grid.dirty_rows().count(), 5);
+    }
+
+    // ── IL/DL dirty marking tests ──────────────────────────────────
+
+    #[test]
+    fn insert_blank_lines_marks_dirty() {
+        // less/vim use IL (CSI L) to scroll within a scroll region.
+        // The affected rows must be marked dirty so the renderer rebuilds them.
+        let mut grid = Grid::new(5, 5);
+        grid.clear_all_dirty();
+        // Set a scroll region (rows 1..3, 0-indexed) so IL operates within it.
+        grid.set_scroll_region(2, 4);
+        // Place cursor inside the scroll region.
+        grid.cursor.row = 1;
+        grid.cursor.col = 0;
+        grid.insert_blank_lines(1);
+        // Rows 1..=3 must be dirty (moved + blanked).
+        let dirty: Vec<_> = grid.dirty_rows().map(|(r, _)| r).collect();
+        assert!(dirty.contains(&1), "cursor row must be dirty");
+        assert!(dirty.contains(&2), "shifted row must be dirty");
+        assert!(dirty.contains(&3), "bottom row must be dirty");
+        // Row 0 is outside the scroll region — must NOT be dirty.
+        assert!(!dirty.contains(&0));
+        // Row 4 is outside the scroll region — must NOT be dirty.
+        assert!(!dirty.contains(&4));
+    }
+
+    #[test]
+    fn delete_lines_marks_dirty() {
+        // less/vim use DL (CSI M) to scroll within a scroll region.
+        // The affected rows must be marked dirty so the renderer rebuilds them.
+        let mut grid = Grid::new(5, 5);
+        grid.clear_all_dirty();
+        grid.set_scroll_region(2, 4);
+        grid.cursor.row = 1;
+        grid.cursor.col = 0;
+        grid.delete_lines(1);
+        let dirty: Vec<_> = grid.dirty_rows().map(|(r, _)| r).collect();
+        assert!(dirty.contains(&1), "cursor row must be dirty");
+        assert!(dirty.contains(&2), "shifted row must be dirty");
+        assert!(dirty.contains(&3), "bottom row must be dirty");
+        assert!(!dirty.contains(&0), "row outside scroll region must NOT be dirty");
+        assert!(!dirty.contains(&4), "row outside scroll region must NOT be dirty");
     }
 }

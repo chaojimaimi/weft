@@ -989,6 +989,27 @@ fragment float4 text_fragment(
             Some(d) => d,
             None => return,
         };
+
+        // v1.0 fix: detect drawable/viewport size mismatch during macOS live
+        // resize. CAMetalLayer.set_drawable_size() is asynchronous — the
+        // drawable returned here may still have the PREVIOUS size. If we blit
+        // viewport-sized data to a smaller drawable, Metal writes past the
+        // texture bounds → corruption/tearing. If the drawable is smaller
+        // than the layer bounds, Core Animation stretches it → character
+        // spacing distortion.
+        //
+        // Mitigation: clamp the blit to the drawable's actual texture size,
+        // and force a full redraw so the offscreen is rebuilt at the correct
+        // size on the next frame (when the drawable has caught up).
+        let drawable_tex_size = {
+            let tex = drawable.texture();
+            (tex.width() as f32, tex.height() as f32)
+        };
+        let vp_mismatch = (drawable_tex_size.0 - self.viewport.0).abs() > 0.5
+            || (drawable_tex_size.1 - self.viewport.1).abs() > 0.5;
+        if vp_mismatch {
+            self.force_full_grid_redraw();
+        }
         // v0.9: cache the blink state so overlay builders can draw a caret.
         self.cursor_blink_on = cursor_blink_on;
 
@@ -1455,14 +1476,18 @@ fragment float4 text_fragment(
                 let blit = command_buffer.new_blit_command_encoder();
                 let cache = self.offscreen_texture.borrow();
                 let src_tex = cache.as_ref().unwrap();
+                // v1.0 fix: clamp blit to the drawable's actual texture size
+                // to prevent out-of-bounds writes during live resize.
+                let blit_w = self.viewport.0.min(drawable_tex_size.0) as u64;
+                let blit_h = self.viewport.1.min(drawable_tex_size.1) as u64;
                 blit.copy_from_texture(
                     src_tex,
                     0,
                     0,
                     metal::MTLOrigin { x: 0, y: 0, z: 0 },
                     metal::MTLSize {
-                        width: self.viewport.0 as u64,
-                        height: self.viewport.1 as u64,
+                        width: blit_w,
+                        height: blit_h,
                         depth: 1,
                     },
                     drawable.texture(),
@@ -1790,14 +1815,19 @@ fragment float4 text_fragment(
             let cache = self.offscreen_texture.borrow();
             let src_tex = cache.as_ref().unwrap();
             let drawable_tex = drawable.texture();
+            // v1.0 fix: clamp blit to the drawable's actual texture size to
+            // prevent out-of-bounds writes during macOS live resize (when
+            // next_drawable returns a texture with the previous dimensions).
+            let blit_w = self.viewport.0.min(drawable_tex_size.0) as u64;
+            let blit_h = self.viewport.1.min(drawable_tex_size.1) as u64;
             blit.copy_from_texture(
                 src_tex,
                 0,
                 0,
                 metal::MTLOrigin { x: 0, y: 0, z: 0 },
                 metal::MTLSize {
-                    width: self.viewport.0 as u64,
-                    height: self.viewport.1 as u64,
+                    width: blit_w,
+                    height: blit_h,
                     depth: 1,
                 },
                 drawable_tex,
