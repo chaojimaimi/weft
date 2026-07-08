@@ -3522,7 +3522,16 @@ fragment float4 text_fragment(
                 // v1.0 fix: scrollable list — render `[offset .. offset+max_rows]`
                 // and auto-clamp offset so the selected row is always visible.
                 let total = s.keybindings.len();
-                let visible = max_rows.min(total);
+                // Reserve one row for the scroll indicator when the list is
+                // scrollable (more rows than fit), so the indicator doesn't
+                // overlap the last visible keybinding row.
+                let scrollable = total > max_rows;
+                let usable_rows = if scrollable {
+                    max_rows.saturating_sub(1)
+                } else {
+                    max_rows
+                };
+                let visible = usable_rows.min(total);
                 // Derive offset from selection: keep selection in view.
                 let mut offset = s.scroll_offset.min(total);
                 if s.selection < offset {
@@ -3561,27 +3570,32 @@ fragment float4 text_fragment(
                         content_cols,
                     );
                 }
-                // Scroll indicator when more rows exist below/above.
-                if end < total {
-                    let arrow_y = content_top + visible as f32 * ch - ch * 0.9;
-                    self.push_text(
-                        &mut verts,
-                        content_x0,
-                        arrow_y,
-                        "↓ more",
-                        label_c,
-                        content_cols,
-                    );
-                }
-                if offset > 0 {
-                    self.push_text(
-                        &mut verts,
-                        content_x0,
-                        content_top,
-                        "↑ more",
-                        label_c,
-                        content_cols,
-                    );
+                // v1.0 fix: scroll indicator on its own row below the list
+                // (not overlapping the last keybinding row). Shows "↑ more"
+                // / "↓ more" / both when scrollable in either direction.
+                if scrollable {
+                    let indicator_y = content_top + visible as f32 * ch;
+                    let mut indicator = String::new();
+                    if offset > 0 {
+                        indicator.push('↑');
+                    }
+                    if end < total {
+                        if !indicator.is_empty() {
+                            indicator.push(' ');
+                        }
+                        indicator.push('↓');
+                    }
+                    if !indicator.is_empty() {
+                        indicator.push_str(" more");
+                        self.push_text(
+                            &mut verts,
+                            content_x0,
+                            indicator_y,
+                            &indicator,
+                            label_c,
+                            content_cols,
+                        );
+                    }
                 }
             }
             SettingsTab::Window => {
