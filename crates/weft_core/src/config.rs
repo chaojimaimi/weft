@@ -1038,6 +1038,7 @@ pub struct Config {
     pub window: WindowConfig,
     pub scrollback: ScrollbackConfig,
     pub editor: EditorConfig,
+    pub logo: LogoConfig,
     /// Raw user keybinding overrides: `"cmd+x" = "copy"`. Resolved later via
     /// [`Config::keybindings`] (merged onto defaults).
     pub keybindings: HashMap<String, Action>,
@@ -1230,6 +1231,17 @@ impl Config {
             }
             let editor = editor_entry.as_table_mut().expect("editor is a table");
             editor["submit_on_ctrl_enter"] = toml_edit::value(true);
+        }
+
+        // [logo] section — only write variant when non-default.
+        let default_logo = LogoConfig::default();
+        if self.logo.variant != default_logo.variant {
+            let logo_entry = doc.entry("logo").or_insert_with(toml_edit::table);
+            if logo_entry.is_none() {
+                *logo_entry = toml_edit::table();
+            }
+            let logo = logo_entry.as_table_mut().expect("logo is a table");
+            logo["variant"] = toml_edit::value(self.logo.variant.as_str());
         }
 
         // [keybindings] section.
@@ -1526,6 +1538,90 @@ pub struct EditorConfig {
     /// (Warp default). If false (default), `Enter` submits and `Shift+Enter`
     /// inserts a newline.
     pub submit_on_ctrl_enter: bool,
+}
+
+/// v1.0 Logo variant — the app icon shown in the Dock / app switcher.
+/// Not theme-bound: the user picks a preferred variant in Settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogoVariant {
+    /// Cool dark — `#0b0e14` bg + neon cyan W.
+    /// Also the fallback for unknown config values.
+    #[default]
+    Cool,
+    /// Warm dark — `#221c18` bg + amber W.
+    Warm,
+    /// Light — `#f5f5f7` bg + deep cyan W.
+    Light,
+    /// Transparent — no bg fill, only grid + W.
+    Transparent,
+}
+
+impl<'de> Deserialize<'de> for LogoVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(LogoVariant::from_str(&s))
+    }
+}
+
+impl LogoVariant {
+    /// All variants in display order.
+    pub const ALL: [LogoVariant; 4] = [
+        LogoVariant::Cool,
+        LogoVariant::Warm,
+        LogoVariant::Light,
+        LogoVariant::Transparent,
+    ];
+
+    /// Human-readable label for the Settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogoVariant::Cool => "Cool (dark cyan)",
+            LogoVariant::Warm => "Warm (dark amber)",
+            LogoVariant::Light => "Light (pale cyan)",
+            LogoVariant::Transparent => "Transparent",
+        }
+    }
+
+    /// Identifier used in config.toml `[logo] variant = "..."`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogoVariant::Cool => "cool",
+            LogoVariant::Warm => "warm",
+            LogoVariant::Light => "light",
+            LogoVariant::Transparent => "transparent",
+        }
+    }
+
+    /// Parse from a config string. Unknown values fall back to `Cool`.
+    /// Infallible by design (never returns Err / always yields a valid variant).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.trim() {
+            "warm" => LogoVariant::Warm,
+            "light" => LogoVariant::Light,
+            "transparent" => LogoVariant::Transparent,
+            _ => LogoVariant::Cool,
+        }
+    }
+}
+
+/// v1.0 Logo config — Dock icon variant selection.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LogoConfig {
+    /// Selected logo variant.
+    pub variant: LogoVariant,
+}
+
+impl Default for LogoConfig {
+    fn default() -> Self {
+        Self {
+            variant: LogoVariant::Cool,
+        }
+    }
 }
 
 // ── Parsing helpers ────────────────────────────────────────────────────
@@ -2657,5 +2753,92 @@ path = "#0000ff"
         assert_eq!(reloaded.theme.name, "nord");
         assert_eq!(reloaded.scrollback.lines, 50_000);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ── Logo config ───────────────────────────────────────────────────
+
+    #[test]
+    fn logo_variant_default_is_cool() {
+        let c = Config::default();
+        assert_eq!(c.logo.variant, LogoVariant::Cool);
+    }
+
+    #[test]
+    fn logo_variant_round_trip_all_variants() {
+        for v in LogoVariant::ALL {
+            let toml_str = format!("[logo]\nvariant = \"{}\"\n", v.as_str());
+            let cfg: Config = toml::from_str(&toml_str).unwrap();
+            assert_eq!(cfg.logo.variant, v, "round-trip failed for {:?}", v);
+        }
+    }
+
+    #[test]
+    fn logo_variant_unknown_falls_back_to_cool() {
+        let toml_str = "[logo]\nvariant = \"nonexistent\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.logo.variant, LogoVariant::Cool);
+    }
+
+    #[test]
+    fn logo_variant_save_writes_non_default() {
+        let tmp = std::env::temp_dir().join("weft_logo_save_test.toml");
+        let _ = std::fs::remove_file(&tmp);
+        let mut cfg = Config::default();
+        cfg.logo.variant = LogoVariant::Warm;
+        cfg.save_to_path(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(text.contains("[logo]"), "missing [logo] section");
+        assert!(
+            text.contains("variant = \"warm\""),
+            "missing variant = warm"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn logo_variant_default_not_written() {
+        let tmp = std::env::temp_dir().join("weft_logo_default_test.toml");
+        let _ = std::fs::remove_file(&tmp);
+        let cfg = Config::default();
+        cfg.save_to_path(&tmp).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        assert!(
+            !text.contains("[logo]"),
+            "default logo should not be written"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn logo_variant_from_str_round_trip() {
+        for v in LogoVariant::ALL {
+            assert_eq!(LogoVariant::from_str(v.as_str()), v);
+        }
+    }
+
+    #[test]
+    fn logo_variant_label_not_empty() {
+        for v in LogoVariant::ALL {
+            assert!(!v.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn logo_variant_preserves_other_sections() {
+        let tmp = std::env::temp_dir().join("weft_logo_preserve_test.toml");
+        let _ = std::fs::remove_file(&tmp);
+        let initial = "[font]\nfamily = \"Monaco\"\nsize = 14.0\n\n[logo]\nvariant = \"light\"\n";
+        std::fs::write(&tmp, initial).unwrap();
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let mut cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.logo.variant, LogoVariant::Light);
+        cfg.logo.variant = LogoVariant::Warm;
+        cfg.save_to_path(&tmp).unwrap();
+        let reloaded_text = std::fs::read_to_string(&tmp).unwrap();
+        let reloaded: Config = toml::from_str(&reloaded_text).unwrap();
+        assert_eq!(reloaded.font.family, "Monaco");
+        assert_eq!(reloaded.font.size, 14.0);
+        assert_eq!(reloaded.logo.variant, LogoVariant::Warm);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

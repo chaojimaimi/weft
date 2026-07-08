@@ -254,6 +254,9 @@ struct App {
     /// succeeded (or no save has been attempted). Surfaced as a red banner
     /// at the top of the panel so the user sees why Apply/Save didn't work.
     settings_error: Option<String>,
+    /// v1.0 Logo: currently-applied Dock icon variant. Tracked so we only
+    /// call `setApplicationIconImage:` when the variant actually changes.
+    current_logo_variant: weft_core::config::LogoVariant,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
@@ -517,6 +520,7 @@ impl App {
             settings_draft: weft_core::config::Config::default(),
             settings_dirty: false,
             settings_error: None,
+            current_logo_variant: weft_core::config::LogoVariant::Cool,
             should_exit: false,
         }
     }
@@ -3495,6 +3499,14 @@ impl App {
                 .set_max_lines(config.scrollback.lines, cols);
         }
 
+        // v1.0 Logo: sync Dock icon if variant changed.
+        if config.logo.variant != self.current_logo_variant {
+            self.current_logo_variant = config.logo.variant;
+            unsafe {
+                set_dock_icon(self.current_logo_variant);
+            }
+        }
+
         self.config = config;
         self.request_redraw();
     }
@@ -5175,6 +5187,15 @@ impl ApplicationHandler<AppEvent> for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
 
+        // v1.0 Logo: apply the configured Dock icon variant on startup.
+        // `with_window_icon` sets the window title-bar icon; this sets the
+        // Dock / app-switcher icon. For `cargo run` both show; in a .app
+        // bundle the .icns takes over unless overridden here.
+        self.current_logo_variant = self.config.logo.variant;
+        unsafe {
+            set_dock_icon(self.current_logo_variant);
+        }
+
         // v0.9 U-D1: seed the appearance tracker so the first
         // `poll_system_appearance` (1s after launch) doesn't re-apply the
         // same theme and cause a flicker. The startup theme above already
@@ -6130,6 +6151,72 @@ fn load_window_icon() -> Option<winit::window::Icon> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
+/// v1.0 Logo: PNG bytes for each logo variant. Until per-variant assets are
+/// generated (phase 1), all variants use the same cool PNG — the runtime
+/// switching mechanism is in place and ready for real assets.
+fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
+    use weft_core::config::LogoVariant;
+    match variant {
+        LogoVariant::Cool => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
+        LogoVariant::Warm => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
+        LogoVariant::Light => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
+        LogoVariant::Transparent => include_bytes!("../../../assets/logo/png/weft-icon-256.png"),
+    }
+}
+
+/// v1.0 Logo: set the macOS Dock app icon at runtime via
+/// `NSApp.setApplicationIconImage:`. Constructs an NSImage from PNG bytes
+/// using `NSImage initWithData:` (raw `objc2::msg_send!` pattern — no need
+/// to enable `NSImage` in objc2-app-kit features).
+///
+/// On failure (class lookup, image decode, or ObjC call), this is a no-op:
+/// the Dock keeps whatever icon it currently has. Safe to call repeatedly.
+unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let png_bytes = logo_png_bytes(variant);
+
+    // NSData dataWithBytes:length:
+    let data_cls = objc2::ffi::objc_getClass(c"NSData".as_ptr());
+    if data_cls.is_null() {
+        return;
+    }
+    let data: *mut AnyObject = msg_send![
+        data_cls as *const AnyObject,
+        dataWithBytes: png_bytes.as_ptr(),
+        length: png_bytes.len(),
+    ];
+    if data.is_null() {
+        return;
+    }
+
+    // NSImage alloc initWithData:
+    let image_cls = objc2::ffi::objc_getClass(c"NSImage".as_ptr());
+    if image_cls.is_null() {
+        return;
+    }
+    let alloc: *mut AnyObject = msg_send![image_cls as *const AnyObject, alloc];
+    if alloc.is_null() {
+        return;
+    }
+    let image: *mut AnyObject = msg_send![alloc, initWithData: data];
+    if image.is_null() {
+        return;
+    }
+
+    // NSApp setApplicationIconImage:
+    let app_cls = objc2::ffi::objc_getClass(c"NSApplication".as_ptr());
+    if app_cls.is_null() {
+        return;
+    }
+    let app: *mut AnyObject = msg_send![app_cls as *const AnyObject, sharedApplication];
+    if app.is_null() {
+        return;
+    }
+    let _: () = msg_send![app, setApplicationIconImage: image];
 }
 
 fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
