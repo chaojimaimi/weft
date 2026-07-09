@@ -5918,14 +5918,36 @@ impl ApplicationHandler<AppEvent> for App {
                                     self.request_redraw();
                                 } else {
                                     // Passthrough: send committed text to the PTY.
-                                    let bracketed = self.tabs[self.active_tab]
-                                        .terminal
-                                        .as_ref()
-                                        .map(|t| t.bracketed_paste)
-                                        .unwrap_or(false);
-                                    let bytes = encode_paste(&text, bracketed);
-                                    if let Some(pty) = &self.tabs[self.active_tab].pty {
-                                        let _ = pty.write_sync(&bytes);
+                                    //
+                                    // v1.0 fix: send the text as RAW BYTES, not
+                                    // via `encode_paste`. A typed/IME-committed
+                                    // character is keyboard INPUT, not a paste —
+                                    // wrapping it in bracketed-paste escapes
+                                    // (`\x1b[200~ … \x1b[201~`) corrupts
+                                    // alt-screen apps like `less`/`vim` which
+                                    // don't understand bracketed paste: the
+                                    // leading `\x1b[` is an unknown CSI to them,
+                                    // so a typed `/` (intended to start a
+                                    // search) put `less` into a confused state
+                                    // and the window appeared frozen until a
+                                    // resize forced a repaint. Real pastes
+                                    // (Cmd+V → `paste_from_clipboard`) still use
+                                    // `encode_paste` with bracketed wrapping.
+                                    // (bracketed_paste is a shell-prompt mode;
+                                    // it stays on inside alt-screen apps
+                                    // because `swap_alt` doesn't save/restore
+                                    // it, so we must not consult it here.)
+                                    let bytes = text.as_bytes();
+                                    if !bytes.is_empty() {
+                                        if let Some(pty) = &self.tabs[self.active_tab].pty {
+                                            let _ = pty.write_sync(bytes);
+                                        }
+                                        // Match the other branches (and the
+                                        // keyboard path) so the window is
+                                        // invalidated even if the app's echoed
+                                        // output Wake is delayed by the IME
+                                        // commit transaction.
+                                        self.request_redraw();
                                     }
                                 }
                             }
