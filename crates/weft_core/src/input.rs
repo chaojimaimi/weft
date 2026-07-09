@@ -270,12 +270,7 @@ impl InputHandler {
 
     /// Build the SGR/legacy mouse button code from the logical button +
     /// modifiers + motion flag.
-    fn encode_mouse_button(
-        &self,
-        btn_code: u32,
-        action: MouseAction,
-        mods: Modifiers,
-    ) -> u32 {
+    fn encode_mouse_button(&self, btn_code: u32, action: MouseAction, mods: Modifiers) -> u32 {
         let mut pb = btn_code;
         if mods.contains(Modifiers::SHIFT) {
             pb |= 4;

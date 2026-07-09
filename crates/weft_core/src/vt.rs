@@ -916,7 +916,8 @@ impl vte::Perform for Terminal {
                 cells[new_col - 1].reset();
                 splat_dirty.push(new_col - 1);
             }
-            if ew == CellWidth::Full && new_col + 1 < num_cols
+            if ew == CellWidth::Full
+                && new_col + 1 < num_cols
                 && cells[new_col + 1].flags.contains(CellFlags::WIDE_SPACER)
             {
                 cells[new_col + 1].reset();
@@ -1006,7 +1007,8 @@ impl vte::Perform for Terminal {
             // Case 2: target is the LEADING Full cell → reset its spacer at
             // col+1 so it doesn't linger as a phantom space. (If the new char
             // is also Full it reclaims col+1 below, so the reset is harmless.)
-            if existing_width == CellWidth::Full && col + 1 < num_cols
+            if existing_width == CellWidth::Full
+                && col + 1 < num_cols
                 && cells[col + 1].flags.contains(CellFlags::WIDE_SPACER)
             {
                 cells[col + 1].reset();
@@ -1642,7 +1644,7 @@ mod tests {
         // orphaned leading Full cell at col-1.
         let mut t = term();
         t.process("中".as_bytes()); // [0]=中, [1]=WIDE_SPACER
-        // CUP to col 2 (1-based) = col index 1, print over the spacer.
+                                    // CUP to col 2 (1-based) = col index 1, print over the spacer.
         t.process(b"\x1b[1;2HB");
         assert_eq!(t.grid().cell(0, 1).character, 'B');
         assert!(!t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));

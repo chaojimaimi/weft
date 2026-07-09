@@ -2069,7 +2069,7 @@ mod tests {
         assert_eq!(grid.num_rows, 5);
         assert_eq!(grid.cell(0, 0).character, 'A');
         assert_eq!(grid.cell(4, 0).character, ' '); // blank new row
-        // Shrink rows 5 → 2: trailing rows dropped, content kept.
+                                                    // Shrink rows 5 → 2: trailing rows dropped, content kept.
         grid.resize_dims(2, 4);
         assert_eq!(grid.num_rows, 2);
         assert_eq!(grid.cell(0, 0).character, 'A');
@@ -2685,7 +2685,13 @@ mod tests {
         assert!(dirty.contains(&1), "cursor row must be dirty");
         assert!(dirty.contains(&2), "shifted row must be dirty");
         assert!(dirty.contains(&3), "bottom row must be dirty");
-        assert!(!dirty.contains(&0), "row outside scroll region must NOT be dirty");
-        assert!(!dirty.contains(&4), "row outside scroll region must NOT be dirty");
+        assert!(
+            !dirty.contains(&0),
+            "row outside scroll region must NOT be dirty"
+        );
+        assert!(
+            !dirty.contains(&4),
+            "row outside scroll region must NOT be dirty"
+        );
     }
 }
