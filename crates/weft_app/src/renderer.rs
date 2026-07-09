@@ -2066,13 +2066,24 @@ fragment float4 text_fragment(
 
                 // Determine cell colors (resolve the cell's color-origin against
                 // the palette / theme defaults).
-                let fg = resolve_cell_color(cell.fg, default_fg, palette);
-                let bg = resolve_cell_color(cell.bg, default_bg, palette);
+                let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
+                let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
+
+                // v1.0 fix: honor SGR reverse video (DEC SGR 7 / `CSI 7m`).
+                // The VT parser sets CellFlags::REVERSE on cells printed while
+                // inverse video is active (e.g. `less` search-match highlight).
+                // Without this swap, matched text in `less` jumps to the right
+                // place but is never highlighted — it renders with normal
+                // fg/bg. Swap BEFORE the alpha scaling below so the opacity is
+                // applied to the (now background) color consistently.
+                if cell.flags.contains(CellFlags::REVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+
                 // Scale the plain background alpha by window opacity so empty
                 // cells show the desktop through them. Text/selection/cursor
                 // pick their own colors with alpha 1.0 in `final_bg` below, so
                 // they stay fully opaque regardless of this scaling.
-                let mut bg = bg;
                 bg[3] *= self.opacity;
 
                 // Check if this is the cursor position
