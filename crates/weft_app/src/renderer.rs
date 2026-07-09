@@ -385,6 +385,9 @@ pub struct TabBarDrawState {
     /// in `build_tab_bar_vertices`. The app clamps this to the valid range
     /// (0 .. total_tab_width - visible_width) on each frame.
     pub scroll_offset: f32,
+    /// v1.2: true when the mouse is over the "+" (new tab) button. Drives a
+    /// hover highlight effect on the button.
+    pub plus_hovered: bool,
 }
 
 /// v0.9 H1: Hit-test rect for a tab label + close button.
@@ -5455,23 +5458,49 @@ fragment float4 text_fragment(
 
             // CPU-side cull: skip tabs entirely outside the visible region.
             if x1 < vis_left || x0 > vis_right {
-                // Still register hit rect for scroll-into-view logic, but
-                // don't render. Actually skip entirely — the app handles
-                // scroll-into-view separately.
                 continue;
             }
 
             let is_active = i == tab_bar.active_tab;
+            let is_hovered = tab_bar.hovered_tab == Some(i);
 
-            // Tab background.
+            // Clamp rendering to [vis_left, vis_right] so tab backgrounds
+            // don't bleed under the arrows or the "+" button.
+            let draw_x0 = x0.max(vis_left);
+            let draw_x1 = x1.min(vis_right);
+
+            // Tab background: active tab gets the main bg; hovered tab gets
+            // a subtle highlight (Warp-style hover feedback).
             if is_active {
-                push_quad(&mut vertices, [x0, y0, x1, y1], [0.0; 4], [0.0; 4], bg);
                 push_quad(
                     &mut vertices,
-                    [x0, y1 - 2.0, x1, y1],
+                    [draw_x0, y0, draw_x1, y1],
+                    [0.0; 4],
+                    [0.0; 4],
+                    bg,
+                );
+                push_quad(
+                    &mut vertices,
+                    [draw_x0, y1 - 2.0, draw_x1, y1],
                     [0.0; 4],
                     [0.0; 4],
                     accent,
+                );
+            } else if is_hovered {
+                // v1.2: hover highlight — a subtle light overlay on inactive
+                // tabs when the mouse is over them (matches demo behavior).
+                let hover_bg = [
+                    fg[0] * 0.08 + bar_bg[0] * 0.92,
+                    fg[1] * 0.08 + bar_bg[1] * 0.92,
+                    fg[2] * 0.08 + bar_bg[2] * 0.92,
+                    1.0,
+                ];
+                push_quad(
+                    &mut vertices,
+                    [draw_x0, y0, draw_x1, y1],
+                    [0.0; 4],
+                    [0.0; 4],
+                    hover_bg,
                 );
             }
 
@@ -5479,7 +5508,7 @@ fragment float4 text_fragment(
             if i > 0 && x0 >= vis_left {
                 push_quad(
                     &mut vertices,
-                    [x0, y0, x0 + 1.0, y1],
+                    [draw_x0, y0, draw_x0 + 1.0, y1],
                     [0.0; 4],
                     [0.0; 4],
                     separator,
@@ -5495,6 +5524,9 @@ fragment float4 text_fragment(
                 let display = truncate_str(label, max_cols.saturating_sub(1));
                 let label_color = if is_active {
                     fg
+                } else if is_hovered {
+                    // v1.2: brighter text on hover for better focus feedback.
+                    [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0]
                 } else {
                     [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0]
                 };
@@ -5511,8 +5543,7 @@ fragment float4 text_fragment(
             // Close button.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
-            let is_hovered = tab_bar.hovered_tab == Some(i);
-            if is_active || is_hovered {
+            if (is_active || is_hovered) && close_x0 < vis_right {
                 let close_color = if is_active {
                     fg
                 } else {
@@ -5606,7 +5637,10 @@ fragment float4 text_fragment(
             let ra_cy = bar_h * 0.5;
             let ra_r = ch * 0.12;
             let ra_w = 1.5 * self.scale as f32;
-            let max_scroll = (total_tab_w - avail_for_tabs).max(0.0);
+            let max_scroll = {
+                let vis_w = vis_right - vis_left;
+                (total_tab_w - vis_w).max(0.0)
+            };
             let ra_color = if scroll_offset < max_scroll {
                 arrow_active_color
             } else {
@@ -5652,9 +5686,30 @@ fragment float4 text_fragment(
         let plus_x0 = vp_w - right_reserve;
         let plus_cx = plus_x0 + plus_w * 0.5;
         let plus_cy = bar_h * 0.5;
-        let plus_r = ch * 0.20; // slightly larger to match the wider button
-        let plus_line_w = 1.2 * self.scale as f32;
-        let plus_color = [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0];
+        let plus_r = ch * 0.22;
+        let plus_line_w = 1.5 * self.scale as f32;
+        // v1.2: hover highlight — when the mouse is over the "+" button,
+        // brighten the icon and add a subtle circular background.
+        if tab_bar.plus_hovered {
+            let hover_bg = [
+                fg[0] * 0.12 + bar_bg[0] * 0.88,
+                fg[1] * 0.12 + bar_bg[1] * 0.88,
+                fg[2] * 0.12 + bar_bg[2] * 0.88,
+                1.0,
+            ];
+            push_quad(
+                &mut vertices,
+                [plus_x0, y0, plus_x0 + plus_w, y1],
+                [0.0; 4],
+                [0.0; 4],
+                hover_bg,
+            );
+        }
+        let plus_color = if tab_bar.plus_hovered {
+            fg // full bright on hover
+        } else {
+            [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
+        };
         push_line(
             &mut vertices,
             plus_cx - plus_r,

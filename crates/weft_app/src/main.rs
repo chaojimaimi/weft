@@ -81,6 +81,9 @@ struct App {
     /// left/right via arrows, wheel, or trackpad. Clamped to
     /// [0, total_tab_width - visible_width] each frame.
     tab_scroll_offset: f32,
+    /// v1.2: true when the mouse is hovering the "+" (new tab) button.
+    /// Drives a hover highlight in the renderer.
+    plus_hovered: bool,
     /// v1.1: timestamp of the last click in the titlebar/tab-bar background
     /// (non-tab, non-traffic-light) region. Used to detect double-click →
     /// toggle maximize, matching macOS native titlebar behavior.
@@ -496,6 +499,7 @@ impl App {
             prev_drawn_tab: 0,
             hovered_tab: None,
             tab_scroll_offset: 0.0,
+            plus_hovered: false,
             last_titlebar_click: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
@@ -3190,6 +3194,7 @@ impl App {
             let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
             let vp_w = renderer.viewport_width();
             let min_tab_w = cw * 15.0;
+            let arrow_w = cw * 2.5;
             let plus_w = cw * 3.0;
             let right_pad = pad_x * 0.5;
             let tabs_start = chrome_left + tl_w + pad_x;
@@ -3197,9 +3202,12 @@ impl App {
             let avail_for_tabs = vp_w - tabs_start - right_reserve;
             let total_at_min = self.tabs.len() as f32 * min_tab_w;
             if total_at_min > avail_for_tabs {
-                // Scroll mode: max_scroll = total - visible_width.
-                // visible_width = avail_for_tabs (arrows overlap tab space).
-                let max_scroll = total_at_min - avail_for_tabs;
+                // Scroll mode. max_scroll = total_tab_width - visible_width.
+                // visible_width excludes the arrow slots on both sides.
+                let vis_left = tabs_start + arrow_w;
+                let vis_right = vp_w - right_reserve - arrow_w;
+                let vis_w = vis_right - vis_left;
+                let max_scroll = (total_at_min - vis_w).max(0.0);
                 self.tab_scroll_offset = self.tab_scroll_offset.clamp(0.0, max_scroll);
             } else {
                 self.tab_scroll_offset = 0.0;
@@ -3232,11 +3240,14 @@ impl App {
             let vis_right = vp_w - right_reserve - arrow_w;
             let vis_w = vis_right - vis_left;
 
+            // Tab position relative to vis_left (in tab-bar content space).
             let tab_x0 = self.active_tab as f32 * min_tab_w - self.tab_scroll_offset;
             let tab_x1 = tab_x0 + min_tab_w;
             if tab_x0 < 0.0 {
+                // Tab is to the left of visible region — scroll left.
                 self.tab_scroll_offset = (self.active_tab as f32 * min_tab_w).max(0.0);
             } else if tab_x1 > vis_w {
+                // Tab is to the right — scroll right.
                 let target = self.active_tab as f32 * min_tab_w + min_tab_w - vis_w;
                 self.tab_scroll_offset = target.max(0.0);
             }
@@ -3301,6 +3312,7 @@ impl App {
             labels,
             hovered_tab: self.hovered_tab,
             scroll_offset: self.tab_scroll_offset,
+            plus_hovered: self.plus_hovered,
         }
     }
 
@@ -4673,24 +4685,33 @@ impl App {
         // bar is hidden for a single tab). Reads `tab_hits` populated during
         // the last draw; layout is stable between mouse moves at rest.
         if self.tabs.len() > 1 {
-            let new_hover: Option<usize> = if let Some(renderer) = &self.renderer {
+            let (new_hover, new_plus_hover) = if let Some(renderer) = &self.renderer {
                 let bar_h = renderer.tab_bar_height();
                 let yf = y as f32;
                 if yf <= bar_h {
                     let xf = x as f32;
-                    renderer
+                    // Check "+" button hover.
+                    let [nx0, _ny0, nx1, _ny1] = renderer.new_tab_rect;
+                    let plus_h = nx1 > 0.0 && xf >= nx0 && xf < nx1 && yf <= bar_h;
+                    // Check tab hover (exclude arrow sentinels).
+                    let tab_h = renderer
                         .tab_hits
                         .iter()
-                        .find(|h| xf >= h.tab_rect[0] && xf < h.tab_rect[2])
-                        .map(|h| h.index)
+                        .find(|h| {
+                            h.index < usize::MAX - 1 && xf >= h.tab_rect[0] && xf < h.tab_rect[2]
+                        })
+                        .map(|h| h.index);
+                    (tab_h, plus_h)
                 } else {
-                    None
+                    (None, false)
                 }
             } else {
-                None
+                (None, false)
             };
-            if new_hover != self.hovered_tab {
-                self.hovered_tab = new_hover;
+            let changed = new_hover != self.hovered_tab || new_plus_hover != self.plus_hovered;
+            self.hovered_tab = new_hover;
+            self.plus_hovered = new_plus_hover;
+            if changed {
                 self.request_redraw();
             }
         }
@@ -6167,8 +6188,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // v0.9 W1+: clear tab hover state when the mouse leaves the
                 // window, so the close "×" doesn't stay visible on a tab that
                 // is no longer hovered.
-                if self.hovered_tab.is_some() {
+                if self.hovered_tab.is_some() || self.plus_hovered {
                     self.hovered_tab = None;
+                    self.plus_hovered = false;
                     self.request_redraw();
                 }
             }
