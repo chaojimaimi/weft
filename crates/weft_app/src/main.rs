@@ -273,6 +273,22 @@ struct App {
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
+    /// v1.2 fix: timestamp + text of the most recent `Ime::Commit` event.
+    /// Used by `KeyboardInput` to suppress duplicate key delivery on macOS.
+    ///
+    /// On macOS with IME enabled, winit's `interpretKeyEvents` can deliver
+    /// BOTH `Ime::Commit(text)` AND `KeyboardInput` for the same keystroke
+    /// (when `doCommandBySelector` fires even after `insertText` commits).
+    /// This is especially common with CJK input methods that are active but
+    /// not composing — the key goes through `insertText` (→ `Ime::Commit`)
+    /// AND `doCommandBySelector` (→ `forward_key_to_app` → `KeyboardInput`).
+    ///
+    /// Without dedup, a typed `/` in `less` is sent to the PTY twice:
+    /// once via `Ime::Commit` and once via `encode_key`. The second `/`
+    /// enters `less`'s search as a search term, corrupting its state and
+    /// causing the "frozen" appearance (stuck in search mode with garbage
+    /// in the PTY buffer). See winit view.rs:410-414, 490-497.
+    last_ime_commit: Option<(std::time::Instant, String)>,
 }
 
 /// Which border is being dragged to resize a popup.
@@ -537,6 +553,7 @@ impl App {
             settings_error: None,
             current_logo_variant: weft_core::config::LogoVariant::Cool,
             should_exit: false,
+            last_ime_commit: None,
         }
     }
 
@@ -810,6 +827,44 @@ impl App {
             .map(|t| t.app_cursor_keys)
             .unwrap_or(false);
         self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
+
+        // v1.2 fix: suppress duplicate key delivery on macOS.
+        //
+        // When IME is enabled, winit's `interpretKeyEvents` can deliver BOTH
+        // `Ime::Commit(text)` AND `KeyboardInput` for the same keystroke.
+        // This happens when `insertText:` commits the text (→ Ime::Commit)
+        // but `doCommandBySelector:` also fires (→ forward_key_to_app=true →
+        // KeyboardInput). The result is a doubled character sent to the PTY.
+        //
+        // In alt-screen apps like `less`, a doubled `/` causes the second `/`
+        // to enter the search term, corrupting `less`'s state — the window
+        // appears "frozen" until a resize forces a repaint.
+        //
+        // Dedup strategy: if an `Ime::Commit` happened within the last 50ms
+        // for the exact same text that `encode_key` would produce, skip the
+        // PTY write. Only applies to bare printable keys (no Ctrl/Alt/Super)
+        // since IME commits never carry modifier combinations.
+        if m.is_empty() {
+            if let Some((instant, committed_text)) = self.last_ime_commit.clone() {
+                if instant.elapsed() < std::time::Duration::from_millis(50) {
+                    // Check if encode_key would produce the same bytes as the
+                    // IME commit. This avoids hardcoding char mappings.
+                    let encoded = self.tab().input_handler.encode_key(key, m);
+                    if encoded == committed_text.as_bytes() {
+                        // Duplicate — IME already sent these bytes. Consume
+                        // the stale commit so it doesn't suppress the next
+                        // legitimate key.
+                        self.last_ime_commit = None;
+                        tracing::debug!(
+                            ?key,
+                            committed = %committed_text,
+                            "suppressed duplicate KeyboardInput (IME already committed)"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
 
         let bytes = self.tab().input_handler.encode_key(key, m);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
@@ -4754,8 +4809,28 @@ impl App {
         // a keyboard event triggers a redraw → process_messages → alt_active
         // becomes true, the wheel starts working — which matches the user
         // report "scrolling works only after pressing a key".
-        self.pump_pty();
-        self.process_messages();
+        //
+        // v1.2 fix: a single pump may only read part of the alt-screen
+        // sequence (e.g. `\x1b[?1049h` split across two channel events).
+        // Loop until alt_active stabilizes or we hit the iteration cap,
+        // ensuring the first wheel event sees the correct alt-screen state.
+        for _ in 0..4 {
+            let before = self.tabs[self.active_tab]
+                .terminal
+                .as_ref()
+                .map(|t| t.is_alt_screen_active())
+                .unwrap_or(false);
+            self.pump_pty();
+            self.process_messages();
+            let after = self.tabs[self.active_tab]
+                .terminal
+                .as_ref()
+                .map(|t| t.is_alt_screen_active())
+                .unwrap_or(false);
+            if before == after {
+                break;
+            }
+        }
 
         let lines = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, v) => {
@@ -5990,6 +6065,11 @@ impl ApplicationHandler<AppEvent> for App {
                     winit::event::Ime::Commit(text) => {
                         self.tabs[self.active_tab].ime_preedit.clear();
                         if !text.is_empty() {
+                            // v1.2 fix: record this commit so the immediately
+                            // following `KeyboardInput` event can detect the
+                            // duplicate and suppress its PTY write. On macOS
+                            // winit can deliver both events for the same key.
+                            self.last_ime_commit = Some((std::time::Instant::now(), text.clone()));
                             // v0.9 fix: when the Find bar is open, IME
                             // committed text goes into the find query, not
                             // the shell editor / PTY. This lets CJK users
