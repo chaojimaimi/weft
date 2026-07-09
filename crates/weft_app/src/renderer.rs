@@ -3779,12 +3779,11 @@ fragment float4 text_fragment(
             separator,
         );
         // Compact pairs: "key description" with key in accent, desc in label_c.
-        // v1.0: bumped inter-pair gap (cw*1.5) well above intra-pair gap
-        // (cw*0.3) so each "key description" group reads as a unit and
-        // groups are clearly separated. Also rendered at scale 1.1 so the
-        // footer is slightly more prominent than the body text — the
-        // narrow Unicode symbols (⏎ ⇥ ⌘) otherwise make the footer feel
-        // smaller than the body even though both use the same cell size.
+        // v1.2 fix: previously rendered at scale=1.1 with left-to-right
+        // accumulation that could overflow past content_x1 (the panel's
+        // right border). Now uses scale=1.0 (same as body text, so font
+        // size tracks window resize consistently) and a right-to-left
+        // layout so pairs can never overflow the right edge.
         // v1.0 S1-b/S2: the apply / close / save pairs register clickable
         // hit regions so mouse users can hit those actions directly. The
         // navigate / switch / adjust pairs are hints only (no click target).
@@ -3796,25 +3795,34 @@ fragment float4 text_fragment(
             ("esc", "close", Some(SettingsHitKind::CloseButton)),
             ("⌘⏎", "save", Some(SettingsHitKind::SaveButton)),
         ];
-        let mut fx = content_x0;
-        let gap = cw * 1.5; // gap between pairs (5x intra-pair gap)
+        let gap = cw * 1.5; // gap between pairs
         let inner = cw * 0.3; // gap between key and description within a pair
-        let scale = 1.1;
+        let scale = 1.0; // v1.2: match body text scale — tracks resize correctly
         let footer_h = ch * scale;
-        for (key, desc, hit_kind) in &pairs {
+        // Right-to-left layout: start from the right edge and work backwards.
+        let mut fx = content_x1;
+        for (key, desc, hit_kind) in pairs.iter().rev() {
+            let desc_w = cw * scale * Self::text_col_width(desc) as f32;
+            let key_w = cw * scale * Self::text_col_width(key) as f32;
+            let pair_w = key_w + inner + desc_w;
+            fx -= pair_w;
             let pair_x0 = fx;
             self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
-            fx += cw * scale * Self::text_col_width(key) as f32 + inner;
-            self.push_text_scaled(&mut verts, fx, footer_y, desc, label_c, content_cols, scale);
-            fx += cw * scale * Self::text_col_width(desc) as f32 + gap;
-            // Register the clickable rect for apply / close / save. The
-            // rect spans from the pair's first glyph to just before the
-            // inter-pair gap, and one footer row in height.
+            self.push_text_scaled(
+                &mut verts,
+                fx + key_w + inner,
+                footer_y,
+                desc,
+                label_c,
+                content_cols,
+                scale,
+            );
+            fx -= gap;
+            // Register the clickable rect for apply / close / save.
             if let Some(kind) = hit_kind {
-                let pair_x1 = fx - gap;
                 hits.push(SettingsHit {
                     kind: *kind,
-                    rect: [pair_x0, footer_y, pair_x1, footer_y + footer_h],
+                    rect: [pair_x0, footer_y, pair_x0 + pair_w, footer_y + footer_h],
                 });
             }
         }
@@ -5347,6 +5355,10 @@ fragment float4 text_fragment(
         let bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.accent);
+        // v1.2 fix: use theme.separator for tab dividers (was hardcoded
+        // fg*0.2 at alpha 0.5 — nearly invisible in dark themes). The
+        // separator color is theme-aware and provides enough contrast.
+        let separator = color_to_normalized(self.theme.separator);
 
         // Tab bar background: slightly darker (dark theme) or lighter (light
         // theme) than the main background, same as the find popup formula.
@@ -5375,18 +5387,29 @@ fragment float4 text_fragment(
             bar_bg,
         );
 
-        // Tab layout: each tab is 20 cells wide, 1px divider between tabs.
-        // v0.9 fix: increased from 16→20 cells so "weft · sleep 5" fits.
-        let tab_w = cw * 20.0;
-        let close_w = cw * 2.0; // "×" button area
-        let label_w = tab_w - close_w;
-        let y0 = 0.0f32;
-        let y1 = bar_h;
-
         // v1.1: the first tab starts after the macOS traffic-light buttons
         // (close/minimize/maximize) so it doesn't overlap them. The traffic
         // lights sit at the top-left of the transparent titlebar.
         let tl_w = self.traffic_lights_width();
+
+        // Tab layout: each tab is up to 20 cells wide, with a 1px divider.
+        // v0.9 fix: increased from 16→20 cells so "weft · sleep 5" fits.
+        // v1.2 fix: when total tab width would overflow the window, shrink
+        // tabs to fit the available space (min 6 cells) so all tabs stay
+        // visible. Previously tabs had a fixed width and overflowed past
+        // the right edge, making later tabs invisible and unclickable.
+        let max_tab_w = cw * 20.0;
+        let min_tab_w = cw * 6.0;
+        let available_w = vp_w - chrome_left - tl_w - pad_x - cw; // -cw for "+"
+        let tab_w = if tab_bar.tab_count > 0 {
+            (available_w / tab_bar.tab_count as f32).clamp(min_tab_w, max_tab_w)
+        } else {
+            max_tab_w
+        };
+        let close_w = cw * 2.0; // "×" button area
+        let label_w = tab_w - close_w;
+        let y0 = 0.0f32;
+        let y1 = bar_h;
 
         for i in 0..tab_bar.tab_count {
             let x0 = chrome_left + tl_w + pad_x + i as f32 * tab_w;
@@ -5414,13 +5437,14 @@ fragment float4 text_fragment(
             }
 
             // Divider between tabs (1px).
+            // v1.2 fix: use theme.separator instead of hardcoded fg*0.2.
             if i > 0 {
                 push_quad(
                     &mut vertices,
                     [x0, y0, x0 + 1.0, y1],
                     [0.0; 4],
                     [0.0; 4],
-                    [fg[0] * 0.2, fg[1] * 0.2, fg[2] * 0.2, 0.5],
+                    separator,
                 );
             }
 

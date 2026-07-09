@@ -6445,10 +6445,6 @@ fn load_window_icon() -> Option<winit::window::Icon> {
 /// v1.0 Logo: PNG bytes for each logo variant. Each variant ships its own
 /// 256×256 PNG (rendered from `assets/logo/variants/{variant}.svg`); the
 /// runtime switches Dock icon by loading the matching bytes via NSImage.
-///
-/// (Currently unused: `set_dock_icon` is disabled to avoid a startup abort.
-/// Kept so re-enabling the Dock icon later is a one-line change.)
-#[allow(dead_code)]
 fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     use weft_core::config::LogoVariant;
     match variant {
@@ -6463,24 +6459,45 @@ fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
 
 /// v1.0 Logo: set the macOS Dock app icon at runtime via
 /// `NSApp.setApplicationIconImage:`. Constructs an NSImage from PNG bytes
-/// using `NSImage initWithData:` (raw `objc2::msg_send!` pattern — no need
-/// to enable `NSImage` in objc2-app-kit features).
+/// using typed `objc2-app-kit` safe methods.
 ///
-/// On failure (class lookup, image decode, or ObjC call), this is a no-op:
-/// the Dock keeps whatever icon it currently has. Safe to call repeatedly.
+/// v1.2 fix: re-enabled using the same typed objc2-app-kit pattern proven
+/// in `configure_titlebar` (renderer.rs). The original raw `msg_send!`
+/// implementation panicked under an `extern "C"` boundary (nounwind →
+/// abort). The typed `NSImage::initWithData:` + `NSApplication` setters
+/// are safe and wrapped in `catch_unwind` as a belt-and-suspenders guard.
 ///
-/// v1.0 fix: this `msg_send!` call chain panics under some runtime
-/// conditions (ObjC method-resolution assertion), and since it runs from
-/// winit's `app_did_finish_launching` (an `extern "C"` boundary) the
-/// panic is `nounwind` → abort, killing the app at startup.
-/// `catch_unwind` can't catch a `nounwind` panic, so the Dock icon (which
-/// is purely cosmetic) is now skipped entirely to keep the terminal
-/// launchable. The window title-bar icon set via `with_window_icon` still
-/// works.
-unsafe fn set_dock_icon(_variant: weft_core::config::LogoVariant) {
-    // No-op: see doc comment. Dock icon setting disabled to avoid a startup
-    // abort. Re-enable once the objc2 msg_send! panic is resolved.
-    tracing::warn!("set_dock_icon skipped (disabled to avoid startup abort)");
+/// On failure (not on main thread, image decode, ObjC call), this is a
+/// no-op: the Dock keeps whatever icon it currently has. Safe to call
+/// repeatedly.
+unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+
+    // NSApplication::sharedApplication requires a MainThreadMarker. If we're
+    // not on the main thread (shouldn't happen — both call sites are in the
+    // event loop), silently skip.
+    let Some(mtm) = MainThreadMarker::new() else {
+        tracing::warn!(?variant, "set_dock_icon skipped — not on main thread");
+        return;
+    };
+
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let png_bytes = logo_png_bytes(variant);
+        let ns_data = NSData::dataWithBytes_length(
+            png_bytes.as_ptr() as *mut std::ffi::c_void,
+            png_bytes.len(),
+        );
+        let ns_image = NSImage::initWithData(NSImage::alloc(), &ns_data);
+        if let Some(image) = ns_image {
+            let app = NSApplication::sharedApplication(mtm);
+            app.setApplicationIconImage(Some(&image));
+            tracing::info!(?variant, "dock icon updated");
+        } else {
+            tracing::warn!(?variant, "NSImage::initWithData returned nil");
+        }
+    }));
 }
 
 fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
