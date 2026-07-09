@@ -3203,7 +3203,8 @@ impl App {
             let arrow_w = cw * 2.5;
             let plus_w = cw * 3.0;
             let right_pad = pad_x * 0.5;
-            let tabs_start = chrome_left + tl_w + pad_x;
+            let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
+            let tabs_start = chrome_left + tl_offset + pad_x;
             let right_reserve = plus_w + right_pad;
             let avail_for_tabs = vp_w - tabs_start - right_reserve;
             let total_at_min = self.tabs.len() as f32 * min_tab_w;
@@ -3235,7 +3236,8 @@ impl App {
             let arrow_w = cw * 2.5;
             let plus_w = cw * 3.0;
             let right_pad = pad_x * 0.5;
-            let tabs_start = chrome_left + tl_w + pad_x;
+            let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
+            let tabs_start = chrome_left + tl_offset + pad_x;
             let right_reserve = plus_w + right_pad;
             let avail_for_tabs = vp_w - tabs_start - right_reserve;
             let total_at_min = self.tabs.len() as f32 * min_tab_w;
@@ -5820,14 +5822,9 @@ impl ApplicationHandler<AppEvent> for App {
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
                     let pad_x = renderer.padding_x() as f64;
                     let pad_y = renderer.padding_y() as f64;
-                    // v0.9 H1: subtract tab bar height from usable height when
-                    // more than one tab is open. With a single tab the bar is
-                    // hidden (matches the previous design).
-                    let tab_bar_h = if self.tabs.len() > 1 {
-                        renderer.tab_bar_height() as f64
-                    } else {
-                        0.0
-                    };
+                    // v1.2: tab bar is always rendered now (even single tab),
+                    // so always subtract its height from usable height.
+                    let tab_bar_h = renderer.tab_bar_height() as f64;
                     // v0.9 W5: subtract sidebar width when the panel is open so
                     // the grid reflows beside the sidebar (mirrors grid_dims).
                     let chrome_left = if self.panel_open {
@@ -5858,6 +5855,12 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                         info!(rows = new_rows, cols = new_cols, "all tabs resized (event)");
                         self.last_resize_instant = std::time::Instant::now();
+                        // v1.2-fix: re-clamp tab scroll offset after resize.
+                        // The window may have grown/shrunk, changing max_scroll.
+                        // Without this, a stale scroll_offset can leave tabs
+                        // culled (invisible) after resize.
+                        self.clamp_tab_scroll();
+                        self.scroll_active_tab_into_view();
                     }
                 }
             }

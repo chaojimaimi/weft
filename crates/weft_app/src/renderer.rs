@@ -5413,7 +5413,10 @@ fragment float4 text_fragment(
         let plus_w = cw * 3.0; // "+" button width (~24px, matches demo)
         let right_pad = pad_x * 0.5; // gap between "+" and window edge
 
-        let tabs_start = chrome_left + tl_w + pad_x;
+        // v1.2-fix: when the sidebar is open (chrome_left > 0), the traffic
+        // lights are over the sidebar, not to its right — so don't add tl_w.
+        let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
+        let tabs_start = chrome_left + tl_offset + pad_x;
         let right_reserve = plus_w + right_pad;
         let avail_for_tabs = vp_w - tabs_start - right_reserve;
 
@@ -5430,8 +5433,18 @@ fragment float4 text_fragment(
         };
 
         let total_tab_w = tab_bar.tab_count as f32 * tab_w;
+        // v1.2-fix: defensively clamp scroll_offset in the renderer. Even if
+        // the app's stored value is stale (e.g. after a resize that hasn't
+        // been clamped yet), this prevents tabs from being over-scrolled
+        // past the last tab (which would leave a blank gap on the right).
         let scroll_offset = if overflowing {
-            tab_bar.scroll_offset
+            // vis_w is computed below, but we need max_scroll here. Compute
+            // it inline (must match the vis_left/vis_right formulas below).
+            let vl = tabs_start + arrow_w;
+            let vr = vp_w - right_reserve - arrow_w;
+            let vw = (vr - vl).max(0.0);
+            let ms = (total_tab_w - vw).max(0.0);
+            tab_bar.scroll_offset.clamp(0.0, ms)
         } else {
             0.0
         };
