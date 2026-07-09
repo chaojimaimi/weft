@@ -5351,6 +5351,13 @@ fragment float4 text_fragment(
             // Close button: draw a standard × icon using vector lines
             // (not a font character). Warp-style: two diagonal strokes.
             // v0.9 W1+: active tab always shows ×; inactive tabs show × on hover.
+            // v1.0 fix: the × was far larger than the Chrome/Safari/Warp
+            // convention (~8px glyph). At ch≈28px, r=ch*0.32 gave a ~18px span
+            // — over 2× the reference — so it read as heavy/intrusive,
+            // especially on inactive tabs. Reduced to a restrained size: active
+            // ~ch*0.16 (~9px span), inactive ~ch*0.13 (~7px span), with a
+            // thinner 1.0px stroke and a dimmer color for inactive. The click
+            // hit area (`close_rect`, full 2-cell width) is unchanged.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
             let is_hovered = tab_bar.hovered_tab == Some(i);
@@ -5358,14 +5365,17 @@ fragment float4 text_fragment(
                 let close_color = if is_active {
                     fg
                 } else {
-                    [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
+                    // Dimmer than before (0.7→0.5) so the hover affordance
+                    // reads as secondary, matching Warp/Safari inactive style.
+                    [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
                 };
                 // Center of the close button area
                 let cx = close_x0 + close_w * 0.5;
                 let cy = y0 + bar_h * 0.5;
-                // × size: ~35% of cell height, line width ~1.5px × scale
-                let r = ch * 0.32;
-                let line_w = (1.5 * self.scale as f32).max(1.0);
+                // × size: active ~16% of cell height (~9px span @ ch=28);
+                // inactive ~13% (~7px span). Thin 1.0px stroke.
+                let r = if is_active { ch * 0.16 } else { ch * 0.13 };
+                let line_w = 1.0 * self.scale as f32;
                 // Two diagonal lines forming ×
                 push_line(&mut vertices, cx - r, cy - r, cx + r, cy + r, line_w, close_color);
                 push_line(&mut vertices, cx - r, cy + r, cx + r, cy - r, line_w, close_color);
