@@ -152,6 +152,10 @@ pub struct InputHandler {
     pub app_cursor_keys: bool,
     /// Current mouse protocol mode.
     pub mouse_protocol: MouseProtocol,
+    /// v1.0 fix: SGR-1006 encoding flag (CSI ?1006h). When true, mouse/scroll
+    /// events use the SGR format; when false, the legacy `\x1b[M...` format.
+    /// Synced from `Terminal.sgr_mouse` alongside `mouse_protocol`.
+    pub sgr_mouse: bool,
     /// Mouse coordinate origin (0 or 1 based, SGR uses 1-based).
     mouse_coord_base: u8,
 }
@@ -161,6 +165,7 @@ impl InputHandler {
         Self {
             app_cursor_keys: false,
             mouse_protocol: MouseProtocol::Off,
+            sgr_mouse: false,
             mouse_coord_base: 1, // SGR uses 1-based
         }
     }
@@ -188,8 +193,16 @@ impl InputHandler {
         }
     }
 
-    /// Encode a mouse event using SGR mouse protocol.
-    /// Returns bytes to send to PTY, or None if mouse protocol is off.
+    /// Encode a mouse event.
+    /// Returns bytes to send to PTY, or None if mouse protocol is off or the
+    /// event isn't reportable in the current mode.
+    ///
+    /// v1.0 fix: emit the format the app actually requested. `sgr_mouse`
+    /// (CSI ?1006h) selects `\x1b[<Pb;Px;Py M/m`; otherwise the legacy
+    /// `\x1b[M` + 3 encoded chars (button, x, y, each +32) is used. Sending
+    /// SGR format to an app that enabled only 1000 left the bytes
+    /// un-parseable → leftover leaked as visible text (vim `~@k`) and put
+    /// the app into a broken state where subsequent keys stopped working.
     pub fn encode_mouse(
         &self,
         button: MouseButton,
@@ -202,14 +215,67 @@ impl InputHandler {
             return None;
         }
 
-        // SGR mouse mode: CSI < Pb ; Px ; Py M (press) / m (release)
         let btn_code = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
         };
+        let pb = self.encode_mouse_button(btn_code, action, mods);
 
-        // Add modifier bits
+        let px = col + self.mouse_coord_base as usize;
+        let py = row + self.mouse_coord_base as usize;
+
+        if self.sgr_mouse {
+            // SGR-1006: press/move → 'M', release → 'm'. Motion is only
+            // sent in ButtonEvent/AnyEvent modes.
+            let suffix = match action {
+                MouseAction::Press => 'M',
+                MouseAction::Release => 'm',
+                MouseAction::Move => match self.mouse_protocol {
+                    MouseProtocol::ButtonEvent | MouseProtocol::AnyEvent => 'M',
+                    _ => return None,
+                },
+            };
+            let mut buf = Vec::with_capacity(16);
+            let _ = write!(buf, "\x1b[<{pb};{px};{py}{suffix}");
+            Some(buf)
+        } else {
+            // Legacy X10/normal: CSI M then 3 chars (button, x, y) each +32.
+            // No release event in legacy mode (release arrives as button 3).
+            if action == MouseAction::Release {
+                return None;
+            }
+            // Motion only in ButtonEvent/AnyEvent.
+            if action == MouseAction::Move
+                && !matches!(
+                    self.mouse_protocol,
+                    MouseProtocol::ButtonEvent | MouseProtocol::AnyEvent
+                )
+            {
+                return None;
+            }
+            // Coordinates > 223 (255-32) can't be encoded in legacy mode —
+            // drop rather than send a corrupt report.
+            if px > 223 || py > 223 {
+                return None;
+            }
+            let mut buf = Vec::with_capacity(6);
+            buf.extend_from_slice(b"\x1b[M");
+            buf.push((pb as u8).wrapping_add(32));
+            buf.push((px as u8).wrapping_add(32));
+            buf.push((py as u8).wrapping_add(32));
+            Some(buf)
+        }
+    }
+
+    /// Build the SGR/legacy mouse button code from the logical button +
+    /// modifiers + motion flag.
+    fn encode_mouse_button(
+        &self,
+        btn_code: u32,
+        action: MouseAction,
+        mods: Modifiers,
+    ) -> u32 {
         let mut pb = btn_code;
         if mods.contains(Modifiers::SHIFT) {
             pb |= 4;
@@ -220,30 +286,10 @@ impl InputHandler {
         if mods.contains(Modifiers::CONTROL) {
             pb |= 16;
         }
-
-        // Motion flag
         if action == MouseAction::Move {
             pb |= 32;
         }
-
-        let suffix = match action {
-            MouseAction::Press => 'M',
-            MouseAction::Release => 'm',
-            MouseAction::Move => {
-                // Only send move events in ButtonEvent or AnyEvent mode
-                match self.mouse_protocol {
-                    MouseProtocol::ButtonEvent | MouseProtocol::AnyEvent => 'M',
-                    _ => return None,
-                }
-            }
-        };
-
-        let px = col + self.mouse_coord_base as usize;
-        let py = row + self.mouse_coord_base as usize;
-
-        let mut buf = Vec::with_capacity(16);
-        let _ = write!(buf, "\x1b[<{pb};{px};{py}{suffix}");
-        Some(buf)
+        pb
     }
 
     /// Set the mouse protocol mode (from DEC private mode sequences).
@@ -279,6 +325,12 @@ impl InputHandler {
     }
 
     /// Encode scroll wheel events.
+    /// Encode a scroll-wheel event. Wheel is button 4 (up) / 5 (down), encoded
+    /// as button codes 64/65 (bit 6 = wheel) in the mouse report.
+    ///
+    /// v1.0 fix: format-aware (SGR when `sgr_mouse`, legacy otherwise) — see
+    /// `encode_mouse`. A wheel event is always a "press" (no release), so the
+    /// legacy path emits one `CSI M` report with button 64/65.
     pub fn encode_scroll(
         &self,
         up: bool,
@@ -290,26 +342,29 @@ impl InputHandler {
             return None;
         }
 
-        // Scroll wheel: button 4 (up) or 5 (down) in SGR mode
-        let btn_code = if up { 64 } else { 65 }; // bit 6 set for scroll
-
-        let mut pb = btn_code;
-        if mods.contains(Modifiers::SHIFT) {
-            pb |= 4;
-        }
-        if mods.contains(Modifiers::ALT) {
-            pb |= 8;
-        }
-        if mods.contains(Modifiers::CONTROL) {
-            pb |= 16;
-        }
+        // Scroll wheel: bit 6 set, +1 for down.
+        let btn_code = if up { 64 } else { 65 };
+        let pb = self.encode_mouse_button(btn_code, MouseAction::Press, mods);
 
         let px = col + self.mouse_coord_base as usize;
         let py = row + self.mouse_coord_base as usize;
 
-        let mut buf = Vec::with_capacity(16);
-        let _ = write!(buf, "\x1b[<{pb};{px};{py}M");
-        Some(buf)
+        if self.sgr_mouse {
+            let mut buf = Vec::with_capacity(16);
+            let _ = write!(buf, "\x1b[<{pb};{px};{py}M");
+            Some(buf)
+        } else {
+            // Legacy: coords > 223 can't be encoded — drop.
+            if px > 223 || py > 223 {
+                return None;
+            }
+            let mut buf = Vec::with_capacity(6);
+            buf.extend_from_slice(b"\x1b[M");
+            buf.push((pb as u8).wrapping_add(32));
+            buf.push((px as u8).wrapping_add(32));
+            buf.push((py as u8).wrapping_add(32));
+            Some(buf)
+        }
     }
 
     fn encode_char(&self, c: char, mods: Modifiers) -> Vec<u8> {
@@ -879,6 +934,7 @@ mod tests {
     fn mouse_sgr_left_press() {
         let mut h = handler();
         h.mouse_protocol = MouseProtocol::Normal;
+        h.sgr_mouse = true; // SGR-1006 encoding (CSI ?1006h)
         let bytes = h.encode_mouse(
             MouseButton::Left,
             MouseAction::Press,
@@ -893,9 +949,28 @@ mod tests {
     }
 
     #[test]
+    fn mouse_legacy_press() {
+        // v1.0: when sgr_mouse is OFF (app did not enable 1006), use the
+        // legacy `\x1b[M` + 3 encoded chars (button, x, y, each +32).
+        let mut h = handler();
+        h.mouse_protocol = MouseProtocol::Normal;
+        h.sgr_mouse = false;
+        let bytes = h.encode_mouse(
+            MouseButton::Left,
+            MouseAction::Press,
+            5,
+            10,
+            Modifiers::empty(),
+        );
+        // button 0→32 (' '), px=col(5)+base(1)=6→38 ('&'), py=row(10)+1=11→43 ('+')
+        assert_eq!(bytes.as_deref(), Some(b"\x1b[M &+".as_slice()));
+    }
+
+    #[test]
     fn mouse_sgr_release() {
         let mut h = handler();
         h.mouse_protocol = MouseProtocol::Normal;
+        h.sgr_mouse = true;
         let bytes = h.encode_mouse(
             MouseButton::Left,
             MouseAction::Release,
@@ -913,6 +988,7 @@ mod tests {
     fn mouse_scroll() {
         let mut h = handler();
         h.mouse_protocol = MouseProtocol::Normal;
+        h.sgr_mouse = true;
         let bytes = h.encode_scroll(true, 5, 10, Modifiers::empty());
         assert!(bytes.is_some());
         let bytes = bytes.unwrap();

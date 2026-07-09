@@ -71,6 +71,14 @@ pub struct Terminal {
     pub cursor_style: CursorStyle,
     /// Mouse protocol mode.
     pub mouse_protocol: MouseProtocol,
+    /// v1.0 fix: SGR-1006 mouse encoding flag (CSI ?1006h / l). When true,
+    /// mouse/scroll events are encoded in the SGR format `\x1b[<Pb;Px;Py M/m`
+    /// (handles coords > 95 cleanly). When false, the legacy format
+    /// `\x1b[MbbbxxxYYYXXX` (32-offset, char-encoded) is used instead. TUIs
+    /// that enable mouse reporting usually also enable 1006; if we send SGR
+    /// format while the app expects legacy, the app can't parse the sequence
+    /// and the leftover bytes leak as visible text (e.g. vim's `~@k`).
+    pub sgr_mouse: bool,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
     /// Alternate screen buffer for full-screen apps (DEC 1049/47).
@@ -128,6 +136,7 @@ impl Terminal {
             cursor_visible: true,
             cursor_style: CursorStyle::Block,
             mouse_protocol: MouseProtocol::Off,
+            sgr_mouse: false,
             palette: Self::init_palette(),
             // Alt screen has no scrollback: full-screen apps manage their own
             // scrolling and history should not leak across invocations.
@@ -798,6 +807,15 @@ impl Terminal {
                     MouseProtocol::Off
                 }
             }
+            // v1.0 fix: SGR-1006 mouse ENCODING (selects the format of mouse
+            // reports, independent of whether reporting is on). vim/tmux/htop
+            // enable this together with 1000/1002/1003. Previously ignored →
+            // we always emitted SGR format, corrupting apps that expected
+            // legacy encoding and leaking bytes as visible text (vim `~@k`).
+            1006 => self.sgr_mouse = set,
+            // SGR pixel-mode (1015) and urxvt-mode (1015): not implemented;
+            // apps that request them fall back to our default (SGR-1006 when
+            // sgr_mouse, legacy otherwise).
             _ => tracing::trace!(mode, set, "unhandled DEC private mode"),
         }
     }

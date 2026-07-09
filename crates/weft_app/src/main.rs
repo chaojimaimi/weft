@@ -3946,6 +3946,18 @@ impl App {
     }
 
     fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        // v1.0 fix: sync InputHandler.mouse_protocol + sgr_mouse from the
+        // Terminal's VT-parsed values before any mouse-event encoding. Without
+        // this the handler's copy stays `Off` (its setters are test-only) and
+        // `encode_mouse` returns None — mouse-aware apps (vim `set mouse=a`,
+        // tmux, htop) never receive clicks/drags. sgr_mouse selects the report
+        // format (SGR-1006 vs legacy) — sending the wrong format corrupts the
+        // app (vim `~@k`). Mirrors the scroll-path sync.
+        if let Some(t) = &self.tabs[self.active_tab].terminal {
+            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
+            self.tabs[self.active_tab].input_handler.mouse_protocol = mp;
+            self.tabs[self.active_tab].input_handler.sgr_mouse = sgr;
+        }
         // v1.0 S1-b: Settings panel click handling — checked first so
         // settings clicks work even inside TUI apps that captured the mouse
         // (the panel is modal and overlays everything). When the panel is
@@ -4449,6 +4461,14 @@ impl App {
 
     /// Handle mouse movement.
     fn handle_mouse_move(&mut self, x: f64, y: f64) {
+        // v1.0 fix: sync mouse_protocol + sgr_mouse (see handle_mouse_press)
+        // so move-event encoding (ButtonEvent/AnyEvent drag reporting) reflects
+        // the app's actual mouse mode and report format.
+        if let Some(t) = &self.tabs[self.active_tab].terminal {
+            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
+            self.tabs[self.active_tab].input_handler.mouse_protocol = mp;
+            self.tabs[self.active_tab].input_handler.sgr_mouse = sgr;
+        }
         // Update popup drag if active (clone to avoid borrow conflict).
         if let Some(drag) = self.drag_state.clone() {
             self.update_popup_drag(x, y, &drag);
@@ -4720,16 +4740,48 @@ impl App {
         // Short-lived immutable borrow to read the mode flags up-front —
         // avoids holding a long-lived mutable borrow of `terminal` across
         // later accesses to `block_scroll_offset`, `renderer`, etc.
-        let (mouse_protocol_active, alt_screen_active, block_view) = {
+        let (mouse_protocol_active, alt_screen_active, block_view, mouse_protocol, sgr_mouse) = {
             let Some(t) = &self.tabs[self.active_tab].terminal else {
                 return;
             };
+            // v1.0 fix: while a command is executing (e.g. `less`/`vim`/`man`
+            // just launched), the block-view scroll branch must NOT capture the
+            // wheel. `show_block_view()` returns true whenever the shell is
+            // bootstrapped and we're not yet on the alt screen — but during the
+            // brief window before the app's `ESC[?1049h` is fully parsed,
+            // `alt_active` is still false and `show_block_view()` is true. That
+            // let the wheel fall into the block-scroll branch (mutating
+            // `block_scroll_offset`, which has no effect on the about-to-be-alt
+            // screen) instead of the alt-screen arrow-key branch — so the first
+            // scroll did nothing useful / showed garbled output until a mouse
+            // click forced a redraw that completed the alt-screen parse.
+            // Suppressing block_view during CommandExecuting routes the wheel
+            // correctly once the app takes over the screen.
+            let block_view = t.show_block_view()
+                && t.block_tracker().phase() != ShellPhase::CommandExecuting;
+            // v1.0 fix: capture mouse_protocol here and sync it into the
+            // InputHandler below (after this immutable borrow ends). Without
+            // this sync, InputHandler.mouse_protocol stays `Off` forever (its
+            // setters are test-only), so `encode_scroll`/`encode_mouse` hit
+            // their `if Off { return None }` guards and silently drop every
+            // mouse event — mouse-aware apps (vim `set mouse=a`, tmux, htop)
+            // never receive wheel/click input. Mirrors the `app_cursor_keys`
+            // sync in handle_key_event.
+            let mp = t.mouse_protocol;
+            let sgr = t.sgr_mouse;
             (
-                t.mouse_protocol != MouseProtocol::Off,
+                mp != MouseProtocol::Off,
                 t.is_alt_screen_active(),
-                t.show_block_view(),
+                block_view,
+                mp,
+                sgr,
             )
         };
+        // Apply the captured mouse_protocol + SGR-encoding flag to the
+        // InputHandler (deferred to avoid borrowing `terminal` and mutating
+        // `input_handler` at once).
+        self.tabs[self.active_tab].input_handler.mouse_protocol = mouse_protocol;
+        self.tabs[self.active_tab].input_handler.sgr_mouse = sgr_mouse;
 
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
