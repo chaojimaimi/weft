@@ -3181,7 +3181,7 @@ impl App {
 
     /// v1.2: Clamp `tab_scroll_offset` to the valid range [0, max_scroll].
     /// Called after every scroll/resize/tab-count change. No-op when tabs
-    /// don't overflow.
+    /// don't overflow. Layout params must match `build_tab_bar_vertices`.
     fn clamp_tab_scroll(&mut self) {
         if let Some(renderer) = &self.renderer {
             let cw = renderer.cell_width() as f32;
@@ -3189,12 +3189,17 @@ impl App {
             let pad_x = renderer.padding_x();
             let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
             let vp_w = renderer.viewport_width();
-            let max_tab_w = cw * 20.0;
-            let total_tab_w = self.tabs.len() as f32 * max_tab_w;
+            let min_tab_w = cw * 15.0;
+            let plus_w = cw * 3.0;
+            let right_pad = pad_x * 0.5;
             let tabs_start = chrome_left + tl_w + pad_x;
-            let avail_for_tabs = vp_w - tabs_start - cw; // -cw for "+"
-            if total_tab_w > avail_for_tabs {
-                let max_scroll = total_tab_w - avail_for_tabs;
+            let right_reserve = plus_w + right_pad;
+            let avail_for_tabs = vp_w - tabs_start - right_reserve;
+            let total_at_min = self.tabs.len() as f32 * min_tab_w;
+            if total_at_min > avail_for_tabs {
+                // Scroll mode: max_scroll = total - visible_width.
+                // visible_width = avail_for_tabs (arrows overlap tab space).
+                let max_scroll = total_at_min - avail_for_tabs;
                 self.tab_scroll_offset = self.tab_scroll_offset.clamp(0.0, max_scroll);
             } else {
                 self.tab_scroll_offset = 0.0;
@@ -3204,7 +3209,7 @@ impl App {
 
     /// v1.2: Scroll the tab bar so the active tab is visible. Called after
     /// tab switch, new tab, close tab. If the active tab is already visible,
-    /// no scroll happens.
+    /// no scroll happens. Layout params must match `build_tab_bar_vertices`.
     fn scroll_active_tab_into_view(&mut self) {
         if let Some(renderer) = &self.renderer {
             let cw = renderer.cell_width() as f32;
@@ -3212,27 +3217,27 @@ impl App {
             let pad_x = renderer.padding_x();
             let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
             let vp_w = renderer.viewport_width();
-            let max_tab_w = cw * 20.0;
-            let total_tab_w = self.tabs.len() as f32 * max_tab_w;
+            let min_tab_w = cw * 15.0;
+            let arrow_w = cw * 2.5;
+            let plus_w = cw * 3.0;
+            let right_pad = pad_x * 0.5;
             let tabs_start = chrome_left + tl_w + pad_x;
-            let avail_for_tabs = vp_w - tabs_start - cw;
-            if total_tab_w <= avail_for_tabs {
+            let right_reserve = plus_w + right_pad;
+            let avail_for_tabs = vp_w - tabs_start - right_reserve;
+            let total_at_min = self.tabs.len() as f32 * min_tab_w;
+            if total_at_min <= avail_for_tabs {
                 return; // No overflow — nothing to scroll.
             }
-            let arrow_w = cw * 1.8;
             let vis_left = tabs_start + arrow_w;
-            let vis_right = vp_w - cw - arrow_w;
+            let vis_right = vp_w - right_reserve - arrow_w;
             let vis_w = vis_right - vis_left;
 
-            let tab_x0 = self.active_tab as f32 * max_tab_w - self.tab_scroll_offset;
-            let tab_x1 = tab_x0 + max_tab_w;
+            let tab_x0 = self.active_tab as f32 * min_tab_w - self.tab_scroll_offset;
+            let tab_x1 = tab_x0 + min_tab_w;
             if tab_x0 < 0.0 {
-                // Tab is to the left of visible region — scroll left.
-                self.tab_scroll_offset = (self.active_tab as f32 * max_tab_w).max(0.0);
+                self.tab_scroll_offset = (self.active_tab as f32 * min_tab_w).max(0.0);
             } else if tab_x1 > vis_w {
-                // Tab is to the right — scroll right so the tab's right edge
-                // aligns with the visible region's right edge.
-                let target = self.active_tab as f32 * max_tab_w + max_tab_w - vis_w;
+                let target = self.active_tab as f32 * min_tab_w + min_tab_w - vis_w;
                 self.tab_scroll_offset = target.max(0.0);
             }
             self.clamp_tab_scroll();

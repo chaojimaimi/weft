@@ -3538,9 +3538,14 @@ fragment float4 text_fragment(
             }
             // Center the label within its slot so short labels (Font/Logo)
             // don't clump against the left edge of unequal-width tabs.
+            // v1.2-fix: truncate to slot width (tab_w / cw cols), not the
+            // full content area width. Previously passed content_cols which
+            // let long labels overflow into adjacent slots when the panel
+            // was small.
+            let slot_cols = ((tab_w / cw) as usize).max(1);
             let label_chars = label.chars().count() as f32;
             let text_x = tx0 + ((tab_w - label_chars * cw) / 2.0).max(cw * 0.5);
-            self.push_text(&mut verts, text_x, y, label, color, content_cols);
+            self.push_text(&mut verts, text_x, y, label, color, slot_cols);
             // v1.0 S1-b: register a hit region for the whole tab cell so
             // clicks anywhere in the tab switch tabs (matching the
             // underline's visual span).
@@ -5389,33 +5394,53 @@ fragment float4 text_fragment(
         // v1.2: Tab sizing — tabs have a minimum width (15 cells ~120px) and
         // maximum (20 cells ~200px). When total width exceeds available space,
         // tabs scroll horizontally instead of being compressed.
+        //
+        // v1.2-fix: Three-tier overflow detection:
+        //   1. Tabs at max width fit → use max, no scroll
+        //   2. Tabs at min width fit → shrink to fit, no scroll
+        //   3. Even min width doesn't fit → scroll mode (fixed min width)
+        // Previously only checked max-width fit vs available, incorrectly
+        // entering scroll mode when min-width tabs would have fit fine.
         let max_tab_w = cw * 20.0;
         let min_tab_w = cw * 15.0;
-        let arrow_w = cw * 1.8; // scroll arrow width (only shown when overflowing)
+        let arrow_w = cw * 2.5; // scroll arrow slot width
+        let plus_w = cw * 3.0; // "+" button width (~24px, matches demo)
+        let right_pad = pad_x * 0.5; // gap between "+" and window edge
 
         let tabs_start = chrome_left + tl_w + pad_x;
-        let total_tab_w = tab_bar.tab_count as f32 * max_tab_w;
-        let plus_w = cw; // "+" button width
-        let avail_for_tabs = vp_w - tabs_start - plus_w;
-        let overflowing = total_tab_w > avail_for_tabs;
-        let tab_w = if overflowing { min_tab_w } else { max_tab_w };
+        let right_reserve = plus_w + right_pad;
+        let avail_for_tabs = vp_w - tabs_start - right_reserve;
+
+        let total_at_max = tab_bar.tab_count as f32 * max_tab_w;
+        let total_at_min = tab_bar.tab_count as f32 * min_tab_w;
+
+        let (tab_w, overflowing) = if total_at_max <= avail_for_tabs {
+            (max_tab_w, false)
+        } else if total_at_min <= avail_for_tabs {
+            let fitted = avail_for_tabs / tab_bar.tab_count as f32;
+            (fitted.clamp(min_tab_w, max_tab_w), false)
+        } else {
+            (min_tab_w, true)
+        };
+
+        let total_tab_w = tab_bar.tab_count as f32 * tab_w;
         let scroll_offset = if overflowing {
             tab_bar.scroll_offset
         } else {
             0.0
         };
 
-        // The visible region (where tabs actually render). When overflowing,
-        // scroll arrows take space on both sides.
+        // Visible region for tab content. Arrows take space on both sides
+        // when overflowing.
         let vis_left = if overflowing {
             tabs_start + arrow_w
         } else {
             tabs_start
         };
         let vis_right = if overflowing {
-            vp_w - plus_w - arrow_w
+            vp_w - right_reserve - arrow_w
         } else {
-            vp_w - plus_w
+            vp_w - right_reserve
         };
 
         let close_w = cw * 2.0;
@@ -5461,23 +5486,27 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Tab label.
-            let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
-            let max_cols = (label_w / cw) as usize;
-            let display = truncate_str(label, max_cols.saturating_sub(1));
-            let label_color = if is_active {
-                fg
-            } else {
-                [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0]
-            };
-            self.push_text(
-                &mut vertices,
-                x0 + cw * 0.5,
-                y0 + (bar_h - ch) * 0.5,
-                &display,
-                label_color,
-                max_cols,
-            );
+            // Tab label — skip if the text would start left of vis_left
+            // (avoids overlapping the scroll arrow).
+            let label_x = x0 + cw * 0.5;
+            if label_x >= vis_left {
+                let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
+                let max_cols = (label_w / cw) as usize;
+                let display = truncate_str(label, max_cols.saturating_sub(1));
+                let label_color = if is_active {
+                    fg
+                } else {
+                    [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0]
+                };
+                self.push_text(
+                    &mut vertices,
+                    label_x,
+                    y0 + (bar_h - ch) * 0.5,
+                    &display,
+                    label_color,
+                    max_cols,
+                );
+            }
 
             // Close button.
             let close_x0 = x0 + label_w;
@@ -5521,8 +5550,18 @@ fragment float4 text_fragment(
         }
 
         // v1.2: Scroll arrows — drawn when tabs overflow.
-        let arrow_active_color = fg; // bright when the arrow can scroll
+        // Opaque background quads under the arrows prevent partially-visible
+        // tabs from showing through behind the arrow icons.
+        let arrow_active_color = fg;
         if overflowing {
+            // Left arrow background (opaque bar_bg to mask tab content below).
+            push_quad(
+                &mut vertices,
+                [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
+                [0.0; 4],
+                [0.0; 4],
+                bar_bg,
+            );
             // Left arrow (‹) — always render the geometry; visibility depends
             // on scroll_offset. When scroll_offset == 0, dim it.
             let la_cx = tabs_start + arrow_w * 0.5;
@@ -5554,6 +5593,14 @@ fragment float4 text_fragment(
                 la_color,
             );
 
+            // Right arrow background (opaque bar_bg to mask tab content below).
+            push_quad(
+                &mut vertices,
+                [vis_right, 0.0, vis_right + arrow_w, bar_h],
+                [0.0; 4],
+                [0.0; 4],
+                bar_bg,
+            );
             // Right arrow (›).
             let ra_cx = vis_right + arrow_w * 0.5;
             let ra_cy = bar_h * 0.5;
@@ -5600,12 +5647,13 @@ fragment float4 text_fragment(
         }
 
         // v1.2: "+" button is fixed at the far right edge, outside the scroll
-        // region. It's always visible and clickable.
-        let plus_x0 = vp_w - plus_w;
-        let plus_cx = plus_x0 + cw * 0.5;
+        // region. It's always visible and clickable. Positioned with right_pad
+        // gap from the window edge.
+        let plus_x0 = vp_w - right_reserve;
+        let plus_cx = plus_x0 + plus_w * 0.5;
         let plus_cy = bar_h * 0.5;
-        let plus_r = ch * 0.16;
-        let plus_line_w = 1.0 * self.scale as f32;
+        let plus_r = ch * 0.20; // slightly larger to match the wider button
+        let plus_line_w = 1.2 * self.scale as f32;
         let plus_color = [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0];
         push_line(
             &mut vertices,
@@ -5625,7 +5673,7 @@ fragment float4 text_fragment(
             plus_line_w,
             plus_color,
         );
-        let new_tab_rect = [plus_x0, y0, plus_x0 + cw, y1];
+        let new_tab_rect = [plus_x0, y0, plus_x0 + plus_w, y1];
 
         (vertices, hits, new_tab_rect)
     }
