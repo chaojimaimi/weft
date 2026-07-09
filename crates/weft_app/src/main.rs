@@ -6207,6 +6207,10 @@ fn load_window_icon() -> Option<winit::window::Icon> {
 /// v1.0 Logo: PNG bytes for each logo variant. Each variant ships its own
 /// 256×256 PNG (rendered from `assets/logo/variants/{variant}.svg`); the
 /// runtime switches Dock icon by loading the matching bytes via NSImage.
+///
+/// (Currently unused: `set_dock_icon` is disabled to avoid a startup abort.
+/// Kept so re-enabling the Dock icon later is a one-line change.)
+#[allow(dead_code)]
 fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     use weft_core::config::LogoVariant;
     match variant {
@@ -6226,50 +6230,19 @@ fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
 ///
 /// On failure (class lookup, image decode, or ObjC call), this is a no-op:
 /// the Dock keeps whatever icon it currently has. Safe to call repeatedly.
-unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let png_bytes = logo_png_bytes(variant);
-
-    // NSData dataWithBytes:length:
-    let data_cls = objc2::ffi::objc_getClass(c"NSData".as_ptr());
-    if data_cls.is_null() {
-        return;
-    }
-    let data: *mut AnyObject = msg_send![
-        data_cls as *const AnyObject,
-        dataWithBytes: png_bytes.as_ptr(),
-        length: png_bytes.len(),
-    ];
-    if data.is_null() {
-        return;
-    }
-
-    // NSImage alloc initWithData:
-    let image_cls = objc2::ffi::objc_getClass(c"NSImage".as_ptr());
-    if image_cls.is_null() {
-        return;
-    }
-    let alloc: *mut AnyObject = msg_send![image_cls as *const AnyObject, alloc];
-    if alloc.is_null() {
-        return;
-    }
-    let image: *mut AnyObject = msg_send![alloc, initWithData: data];
-    if image.is_null() {
-        return;
-    }
-
-    // NSApp setApplicationIconImage:
-    let app_cls = objc2::ffi::objc_getClass(c"NSApplication".as_ptr());
-    if app_cls.is_null() {
-        return;
-    }
-    let app: *mut AnyObject = msg_send![app_cls as *const AnyObject, sharedApplication];
-    if app.is_null() {
-        return;
-    }
-    let _: () = msg_send![app, setApplicationIconImage: image];
+///
+/// v1.0 fix: this `msg_send!` call chain panics under some runtime
+/// conditions (ObjC method-resolution assertion), and since it runs from
+/// winit's `app_did_finish_launching` (an `extern "C"` boundary) the
+/// panic is `nounwind` → abort, killing the app at startup.
+/// `catch_unwind` can't catch a `nounwind` panic, so the Dock icon (which
+/// is purely cosmetic) is now skipped entirely to keep the terminal
+/// launchable. The window title-bar icon set via `with_window_icon` still
+/// works.
+unsafe fn set_dock_icon(_variant: weft_core::config::LogoVariant) {
+    // No-op: see doc comment. Dock icon setting disabled to avoid a startup
+    // abort. Re-enable once the objc2 msg_send! panic is resolved.
+    tracing::warn!("set_dock_icon skipped (disabled to avoid startup abort)");
 }
 
 fn resolve_text_char(text: Option<&str>, fallback: char, shift: bool) -> char {
