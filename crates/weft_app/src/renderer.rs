@@ -388,6 +388,10 @@ pub struct TabBarDrawState {
     /// v1.2: true when the mouse is over the "+" (new tab) button. Drives a
     /// hover highlight effect on the button.
     pub plus_hovered: bool,
+    /// v1.2: true when the mouse is over the left scroll arrow.
+    pub arrow_left_hovered: bool,
+    /// v1.2: true when the mouse is over the right scroll arrow.
+    pub arrow_right_hovered: bool,
 }
 
 /// v0.9 H1: Hit-test rect for a tab label + close button.
@@ -1058,18 +1062,14 @@ fragment float4 text_fragment(
         //
         // v1.1: with the transparent (FullSizeContentView) titlebar, the
         // macOS traffic-light buttons float over the Metal content. Even with
-        // a single tab (no tab bar drawn) we must reserve `titlebar_height`
-        // at the top so content isn't hidden behind the buttons. The draw
-        // path below paints a theme-color strip there for single-tab mode.
+        // a single tab we now always render the tab bar (for the "+" button),
+        // so chrome_top always reserves tab_bar_height.
         let tab_h = self.tab_bar_height();
         let titlebar_h = self.titlebar_height();
-        let chrome_top = if tab_bar.tab_count > 1 {
-            tab_h.max(titlebar_h)
-        } else {
-            titlebar_h
-        };
+        let chrome_top = tab_h.max(titlebar_h);
         // Whether a standalone titlebar strip (no tab bar) needs painting.
-        let single_tab_titlebar = tab_bar.tab_count <= 1;
+        // v1.2: always false now — the tab bar is always drawn.
+        let single_tab_titlebar = false;
 
         // v0.9 W5: compute chrome_left (sidebar width) when the history panel
         // is open — the panel becomes a left sidebar that pushes content right.
@@ -1504,9 +1504,12 @@ fragment float4 text_fragment(
 
         // v0.9 H1: Tab bar — drawn at the top of the window. The content
         // area is already shifted down by `chrome_top` in the LayoutCtx, so
-        // this draws in the space above the content. Only drawn when more
-        // than one tab is open (single tab hides the bar).
-        if tab_bar.tab_count > 1 {
+        // this draws in the space above the content.
+        // v1.2: always render the tab bar (even for a single tab) so the
+        // "+" button is always available. Previously single-tab mode hid
+        // the bar entirely, making "+" inaccessible without first opening a
+        // second tab via menu/keyboard.
+        if tab_bar.tab_count >= 1 {
             let (tab_verts, hits, new_tab_rect) = self.build_tab_bar_vertices(tab_bar);
             vertices.extend_from_slice(&tab_verts);
             self.tab_hits = hits;
@@ -5583,28 +5586,44 @@ fragment float4 text_fragment(
         // v1.2: Scroll arrows — drawn when tabs overflow.
         // Opaque background quads under the arrows prevent partially-visible
         // tabs from showing through behind the arrow icons.
-        let arrow_active_color = fg;
         if overflowing {
-            // Left arrow background (opaque bar_bg to mask tab content below).
+            let max_scroll = {
+                let vis_w = vis_right - vis_left;
+                (total_tab_w - vis_w).max(0.0)
+            };
+
+            // ── Left arrow (‹) ──
+            let la_cx = tabs_start + arrow_w * 0.5;
+            let la_cy = bar_h * 0.5;
+            let la_r = ch * 0.14;
+            let la_w = 1.5 * self.scale as f32;
+            // Background: bar_bg + hover highlight if the mouse is over it.
+            let la_bg = if tab_bar.arrow_left_hovered && scroll_offset > 0.0 {
+                [
+                    fg[0] * 0.12 + bar_bg[0] * 0.88,
+                    fg[1] * 0.12 + bar_bg[1] * 0.88,
+                    fg[2] * 0.12 + bar_bg[2] * 0.88,
+                    1.0,
+                ]
+            } else {
+                bar_bg
+            };
             push_quad(
                 &mut vertices,
                 [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
                 [0.0; 4],
                 [0.0; 4],
-                bar_bg,
+                la_bg,
             );
-            // Left arrow (‹) — always render the geometry; visibility depends
-            // on scroll_offset. When scroll_offset == 0, dim it.
-            let la_cx = tabs_start + arrow_w * 0.5;
-            let la_cy = bar_h * 0.5;
-            let la_r = ch * 0.12;
-            let la_w = 1.5 * self.scale as f32;
             let la_color = if scroll_offset > 0.0 {
-                arrow_active_color
+                if tab_bar.arrow_left_hovered {
+                    fg
+                } else {
+                    [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
+                }
             } else {
                 [fg[0] * 0.25, fg[1] * 0.25, fg[2] * 0.25, 1.0]
             };
-            // Draw ‹ as two lines (chevron pointing left).
             push_line(
                 &mut vertices,
                 la_cx + la_r,
@@ -5624,32 +5643,41 @@ fragment float4 text_fragment(
                 la_color,
             );
 
-            // Right arrow background (opaque bar_bg to mask tab content below).
+            // ── Right arrow (›) ──
+            let ra_cx = vis_right + arrow_w * 0.5;
+            let ra_cy = bar_h * 0.5;
+            let ra_r = ch * 0.14;
+            let ra_w = 1.5 * self.scale as f32;
+            let ra_bg = if tab_bar.arrow_right_hovered && scroll_offset < max_scroll {
+                [
+                    fg[0] * 0.12 + bar_bg[0] * 0.88,
+                    fg[1] * 0.12 + bar_bg[1] * 0.88,
+                    fg[2] * 0.12 + bar_bg[2] * 0.88,
+                    1.0,
+                ]
+            } else {
+                bar_bg
+            };
             push_quad(
                 &mut vertices,
                 [vis_right, 0.0, vis_right + arrow_w, bar_h],
                 [0.0; 4],
                 [0.0; 4],
-                bar_bg,
+                ra_bg,
             );
-            // Right arrow (›).
-            let ra_cx = vis_right + arrow_w * 0.5;
-            let ra_cy = bar_h * 0.5;
-            let ra_r = ch * 0.12;
-            let ra_w = 1.5 * self.scale as f32;
-            let max_scroll = {
-                let vis_w = vis_right - vis_left;
-                (total_tab_w - vis_w).max(0.0)
-            };
             let ra_color = if scroll_offset < max_scroll {
-                arrow_active_color
+                if tab_bar.arrow_right_hovered {
+                    fg
+                } else {
+                    [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
+                }
             } else {
                 [fg[0] * 0.25, fg[1] * 0.25, fg[2] * 0.25, 1.0]
             };
             push_line(
                 &mut vertices,
-                ra_cx - la_r,
-                ra_cy - la_r,
+                ra_cx - ra_r,
+                ra_cy - ra_r,
                 ra_cx + ra_r,
                 ra_cy,
                 ra_w,
@@ -5659,37 +5687,46 @@ fragment float4 text_fragment(
                 &mut vertices,
                 ra_cx + ra_r,
                 ra_cy,
-                ra_cx - la_r,
-                ra_cy + la_r,
+                ra_cx - ra_r,
+                ra_cy + ra_r,
                 ra_w,
                 ra_color,
             );
 
-            // Register arrow hit rects via special TabHit entries (index =
-            // usize::MAX for left arrow, usize::MAX - 1 for right). The app's
-            // click handler checks these sentinel values.
-            hits.push(TabHit {
-                tab_rect: [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
-                close_rect: [0.0; 4],
-                index: usize::MAX,
-            });
-            hits.push(TabHit {
-                tab_rect: [vis_right, 0.0, vis_right + arrow_w, bar_h],
-                close_rect: [0.0; 4],
-                index: usize::MAX - 1,
-            });
+            // Register arrow hit rects — inserted at the FRONT of the hits
+            // array so the click handler finds them before any tab hit whose
+            // tab_rect might overlap the arrow region.
+            hits.insert(
+                0,
+                TabHit {
+                    tab_rect: [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
+                    close_rect: [0.0; 4],
+                    index: usize::MAX, // left arrow sentinel
+                },
+            );
+            hits.insert(
+                1,
+                TabHit {
+                    tab_rect: [vis_right, 0.0, vis_right + arrow_w, bar_h],
+                    close_rect: [0.0; 4],
+                    index: usize::MAX - 1, // right arrow sentinel
+                },
+            );
         }
 
-        // v1.2: "+" button is fixed at the far right edge, outside the scroll
-        // region. It's always visible and clickable. Positioned with right_pad
-        // gap from the window edge.
-        let plus_x0 = vp_w - right_reserve;
+        // v1.2: "+" button position:
+        //   - Non-overflowing: right after the last tab (natural flow).
+        //   - Overflowing: after the right scroll arrow (fixed position).
+        let plus_x0 = if overflowing {
+            vis_right + arrow_w
+        } else {
+            tabs_start + tab_bar.tab_count as f32 * tab_w
+        };
         let plus_cx = plus_x0 + plus_w * 0.5;
         let plus_cy = bar_h * 0.5;
         let plus_r = ch * 0.22;
         let plus_line_w = 1.5 * self.scale as f32;
-        // v1.2: hover highlight — when the mouse is over the "+" button,
-        // brighten the icon and add a subtle circular background.
+        // v1.2: hover highlight.
         if tab_bar.plus_hovered {
             let hover_bg = [
                 fg[0] * 0.12 + bar_bg[0] * 0.88,
@@ -5706,7 +5743,7 @@ fragment float4 text_fragment(
             );
         }
         let plus_color = if tab_bar.plus_hovered {
-            fg // full bright on hover
+            fg
         } else {
             [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0]
         };

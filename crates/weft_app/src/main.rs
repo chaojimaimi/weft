@@ -84,6 +84,10 @@ struct App {
     /// v1.2: true when the mouse is hovering the "+" (new tab) button.
     /// Drives a hover highlight in the renderer.
     plus_hovered: bool,
+    /// v1.2: true when the mouse is hovering the left scroll arrow.
+    arrow_left_hovered: bool,
+    /// v1.2: true when the mouse is hovering the right scroll arrow.
+    arrow_right_hovered: bool,
     /// v1.1: timestamp of the last click in the titlebar/tab-bar background
     /// (non-tab, non-traffic-light) region. Used to detect double-click →
     /// toggle maximize, matching macOS native titlebar behavior.
@@ -500,6 +504,8 @@ impl App {
             hovered_tab: None,
             tab_scroll_offset: 0.0,
             plus_hovered: false,
+            arrow_left_hovered: false,
+            arrow_right_hovered: false,
             last_titlebar_click: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
@@ -3313,6 +3319,8 @@ impl App {
             hovered_tab: self.hovered_tab,
             scroll_offset: self.tab_scroll_offset,
             plus_hovered: self.plus_hovered,
+            arrow_left_hovered: self.arrow_left_hovered,
+            arrow_right_hovered: self.arrow_right_hovered,
         }
     }
 
@@ -4168,10 +4176,9 @@ impl App {
         }
 
         // v0.9 H1: Tab bar click handling — check before everything else so
-        // tab clicks work even inside TUI apps that captured the mouse. Only
-        // left-clicks on the tab bar are handled here, and only when more
-        // than one tab is open (single tab hides the bar).
-        if button == winit::event::MouseButton::Left && self.tabs.len() > 1 {
+        // tab clicks work even inside TUI apps that captured the mouse.
+        // v1.2: always active (even single tab) since the bar is always drawn.
+        if button == winit::event::MouseButton::Left {
             if let Some(renderer) = &self.renderer {
                 let bar_h = renderer.tab_bar_height();
                 if y as f32 <= bar_h {
@@ -4681,18 +4688,40 @@ impl App {
         }
 
         // v0.9 W1+: tab bar hover detection — show close "×" on the hovered
-        // tab (Warp-style). Only active when more than one tab is open (the
-        // bar is hidden for a single tab). Reads `tab_hits` populated during
-        // the last draw; layout is stable between mouse moves at rest.
-        if self.tabs.len() > 1 {
-            let (new_hover, new_plus_hover) = if let Some(renderer) = &self.renderer {
+        // tab (Warp-style) and highlight the "+" / scroll arrows.
+        // v1.2: always active (even single tab) since the tab bar is now
+        // always rendered. Reads `tab_hits` populated during the last draw.
+        {
+            let (new_hover, new_plus_hover, new_la_hover, new_ra_hover) = if let Some(renderer) =
+                &self.renderer
+            {
                 let bar_h = renderer.tab_bar_height();
                 let yf = y as f32;
                 if yf <= bar_h {
                     let xf = x as f32;
                     // Check "+" button hover.
                     let [nx0, _ny0, nx1, _ny1] = renderer.new_tab_rect;
-                    let plus_h = nx1 > 0.0 && xf >= nx0 && xf < nx1 && yf <= bar_h;
+                    let plus_h = nx1 > 0.0 && xf >= nx0 && xf < nx1;
+                    // Check arrow hover (sentinel index values).
+                    let (la_h, ra_h) =
+                        renderer
+                            .tab_hits
+                            .iter()
+                            .fold((false, false), |(la, ra), h| {
+                                if h.index == usize::MAX
+                                    && xf >= h.tab_rect[0]
+                                    && xf < h.tab_rect[2]
+                                {
+                                    (true, ra)
+                                } else if h.index == usize::MAX - 1
+                                    && xf >= h.tab_rect[0]
+                                    && xf < h.tab_rect[2]
+                                {
+                                    (la, true)
+                                } else {
+                                    (la, ra)
+                                }
+                            });
                     // Check tab hover (exclude arrow sentinels).
                     let tab_h = renderer
                         .tab_hits
@@ -4701,16 +4730,21 @@ impl App {
                             h.index < usize::MAX - 1 && xf >= h.tab_rect[0] && xf < h.tab_rect[2]
                         })
                         .map(|h| h.index);
-                    (tab_h, plus_h)
+                    (tab_h, plus_h, la_h, ra_h)
                 } else {
-                    (None, false)
+                    (None, false, false, false)
                 }
             } else {
-                (None, false)
+                (None, false, false, false)
             };
-            let changed = new_hover != self.hovered_tab || new_plus_hover != self.plus_hovered;
+            let changed = new_hover != self.hovered_tab
+                || new_plus_hover != self.plus_hovered
+                || new_la_hover != self.arrow_left_hovered
+                || new_ra_hover != self.arrow_right_hovered;
             self.hovered_tab = new_hover;
             self.plus_hovered = new_plus_hover;
+            self.arrow_left_hovered = new_la_hover;
+            self.arrow_right_hovered = new_ra_hover;
             if changed {
                 self.request_redraw();
             }
@@ -6185,12 +6219,15 @@ impl ApplicationHandler<AppEvent> for App {
                 self.handle_mouse_move(position.x, position.y);
             }
             WindowEvent::CursorLeft { .. } => {
-                // v0.9 W1+: clear tab hover state when the mouse leaves the
-                // window, so the close "×" doesn't stay visible on a tab that
-                // is no longer hovered.
-                if self.hovered_tab.is_some() || self.plus_hovered {
+                if self.hovered_tab.is_some()
+                    || self.plus_hovered
+                    || self.arrow_left_hovered
+                    || self.arrow_right_hovered
+                {
                     self.hovered_tab = None;
                     self.plus_hovered = false;
+                    self.arrow_left_hovered = false;
+                    self.arrow_right_hovered = false;
                     self.request_redraw();
                 }
             }
