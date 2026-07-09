@@ -6,6 +6,7 @@
 mod find_worker;
 mod glyph;
 mod layout;
+mod menu;
 mod overlay;
 mod renderer;
 mod tab;
@@ -52,6 +53,9 @@ pub(crate) enum AppEvent {
     ConfigReload,
     /// v1.0 H4: Periodic 30s timer fired — persist tab snapshots.
     TabsAutoSave,
+    /// v1.1: A native menu item was clicked — dispatch the action on the
+    /// main thread (where `App` is borrowed during `user_event`).
+    MenuAction(weft_core::config::Action),
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -5231,6 +5235,11 @@ impl ApplicationHandler<AppEvent> for App {
             AppEvent::TabsAutoSave => {
                 self.save_all_tabs();
             }
+            AppEvent::MenuAction(action) => {
+                // v1.1: native menu click → reuse the same dispatch as
+                // keybindings. execute_action redraws where needed.
+                self.execute_action(action);
+            }
         }
         if self.should_exit {
             event_loop.exit();
@@ -5289,6 +5298,13 @@ impl ApplicationHandler<AppEvent> for App {
         // the NSWindow via the raw-window-handle AppKit handle and sets the
         // style mask + transparency + movable-by-background.
         configure_titlebar(&window);
+        // v1.1: Install the native macOS menu bar (Weft/File/Edit/View/Find/
+        // Window). Runs on the main thread; replaces winit's default menu.
+        // Must be after `create_window` (NSApplication is up by `resumed`).
+        // MainThreadMarker is sound here — `resumed` always runs on main.
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            menu::install(mtm, self.proxy.clone());
+        }
         let renderer = MetalRenderer::new(
             &window,
             self.config.font.clone(),

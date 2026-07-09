@@ -1506,10 +1506,10 @@ fragment float4 text_fragment(
         } else {
             self.tab_hits.clear();
             self.new_tab_rect = [0.0; 4]; // no "+" button in single-tab mode
-            // v1.1: single-tab mode — still paint a theme-color strip at the
-            // top (titlebar_height tall) so the transparent titlebar's traffic
-            // lights sit on a themed background instead of overlapping text.
-            // No tabs/dividers/close buttons; just the background quad.
+                                          // v1.1: single-tab mode — still paint a theme-color strip at the
+                                          // top (titlebar_height tall) so the transparent titlebar's traffic
+                                          // lights sit on a themed background instead of overlapping text.
+                                          // No tabs/dividers/close buttons; just the background quad.
             if single_tab_titlebar {
                 let bg = color_to_normalized(self.theme.background);
                 let strip_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
@@ -5331,7 +5331,10 @@ fragment float4 text_fragment(
     /// - Each tab is ~16 cells wide, with a 1px divider between tabs.
     /// - Active tab gets a brighter background + accent underline.
     /// - Close "×" button at the right of each tab.
-    fn build_tab_bar_vertices(&self, tab_bar: &TabBarDrawState) -> (Vec<f32>, Vec<TabHit>, [f32; 4]) {
+    fn build_tab_bar_vertices(
+        &self,
+        tab_bar: &TabBarDrawState,
+    ) -> (Vec<f32>, Vec<TabHit>, [f32; 4]) {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let bar_h = self.tab_bar_height();

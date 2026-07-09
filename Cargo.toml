@@ -25,7 +25,7 @@ metal = "0.29"
 objc2 = "0.5"
 objc2-metal = "0.2"
 objc2-foundation = "0.2"
-objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSView", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.2", features = ["NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem"] }
 objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer"] }
 winit = "0.30"
 
