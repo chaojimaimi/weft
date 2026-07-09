@@ -4076,6 +4076,14 @@ impl App {
                             return;
                         }
                     }
+                    // v1.1: "+" (new tab) button — check before the
+                    // background-drag/double-click handler so a click on "+"
+                    // opens a tab instead of maximizing.
+                    let [nx0, ny0, nx1, ny1] = renderer.new_tab_rect;
+                    if nx1 > 0.0 && xf >= nx0 && xf < nx1 && yf >= ny0 && yf < ny1 {
+                        self.new_tab();
+                        return;
+                    }
                     // v1.1: Click in the tab-bar background (not on any tab,
                     // not on the traffic lights). This is a draggable region
                     // (movableByWindowBackground handles the drag). Detect a

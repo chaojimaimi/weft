@@ -245,6 +245,11 @@ pub struct MetalRenderer {
     /// each draw when `tab_bar.tab_counts > 1`; cleared otherwise. The app
     /// reads this from `handle_mouse_press` to route tab clicks.
     pub tab_hits: Vec<TabHit>,
+    /// v1.1: Last-rendered "new tab" (+) button hit-test rect, or all-zero
+    /// when not drawn (single tab / no tab bar). Populated by
+    /// `build_tab_bar_vertices`; the app reads this in `handle_mouse_press`
+    /// to open a new tab on click.
+    pub new_tab_rect: [f32; 4],
     /// v1.0 S1-b: Last-rendered Settings panel hit-test rects (tabs, theme
     /// rows, footer buttons). Populated by `build_settings_vertices` each
     /// draw when the panel is open; cleared otherwise. The app reads this
@@ -752,6 +757,7 @@ fragment float4 text_fragment(
             find_state: None,
             find_buttons: None,
             tab_hits: Vec::new(),
+            new_tab_rect: [0.0; 4],
             settings_hits: Vec::new(),
             panel_highlight: None,
             cursor_blink_on: true,
@@ -1493,11 +1499,13 @@ fragment float4 text_fragment(
         // this draws in the space above the content. Only drawn when more
         // than one tab is open (single tab hides the bar).
         if tab_bar.tab_count > 1 {
-            let (tab_verts, hits) = self.build_tab_bar_vertices(tab_bar);
+            let (tab_verts, hits, new_tab_rect) = self.build_tab_bar_vertices(tab_bar);
             vertices.extend_from_slice(&tab_verts);
             self.tab_hits = hits;
+            self.new_tab_rect = new_tab_rect;
         } else {
             self.tab_hits.clear();
+            self.new_tab_rect = [0.0; 4]; // no "+" button in single-tab mode
             // v1.1: single-tab mode — still paint a theme-color strip at the
             // top (titlebar_height tall) so the transparent titlebar's traffic
             // lights sit on a themed background instead of overlapping text.
@@ -5323,7 +5331,7 @@ fragment float4 text_fragment(
     /// - Each tab is ~16 cells wide, with a 1px divider between tabs.
     /// - Active tab gets a brighter background + accent underline.
     /// - Close "×" button at the right of each tab.
-    fn build_tab_bar_vertices(&self, tab_bar: &TabBarDrawState) -> (Vec<f32>, Vec<TabHit>) {
+    fn build_tab_bar_vertices(&self, tab_bar: &TabBarDrawState) -> (Vec<f32>, Vec<TabHit>, [f32; 4]) {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let bar_h = self.tab_bar_height();
@@ -5487,7 +5495,39 @@ fragment float4 text_fragment(
             });
         }
 
-        (vertices, hits)
+        // v1.1: "+" (new tab) button at the right of the last tab.
+        // A compact circular-ish plus, drawn with two short perpendicular
+        // line segments. Matches the close "×" stroke weight for visual
+        // consistency. The hit rect is one cell wide/tall, centered on the +.
+        let plus_x0 = chrome_left + tl_w + pad_x + tab_bar.tab_count as f32 * tab_w;
+        let plus_cx = plus_x0 + cw * 0.5;
+        let plus_cy = bar_h * 0.5;
+        let plus_r = ch * 0.16;
+        let plus_line_w = 1.0 * self.scale as f32;
+        let plus_color = [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0];
+        // Horizontal bar of +
+        push_line(
+            &mut vertices,
+            plus_cx - plus_r,
+            plus_cy,
+            plus_cx + plus_r,
+            plus_cy,
+            plus_line_w,
+            plus_color,
+        );
+        // Vertical bar of +
+        push_line(
+            &mut vertices,
+            plus_cx,
+            plus_cy - plus_r,
+            plus_cx,
+            plus_cy + plus_r,
+            plus_line_w,
+            plus_color,
+        );
+        let new_tab_rect = [plus_x0, y0, plus_x0 + cw, y1];
+
+        (vertices, hits, new_tab_rect)
     }
 }
 
