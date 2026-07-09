@@ -5531,17 +5531,26 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Tab label — skip if the text would start left of vis_left
-            // (avoids overlapping the scroll arrow).
-            let label_x = x0 + cw * 0.5;
-            if label_x >= vis_left {
+            // Tab label — render the visible portion. When the tab is
+            // partially scrolled under the left arrow, shift the label start
+            // to vis_left so text begins where it becomes visible (rather
+            // than being entirely skipped). When the tab extends past
+            // vis_right, truncate columns so text doesn't overlap the "+"
+            // button or right arrow.
+            let label_x_raw = x0 + cw * 0.5;
+            let label_x = label_x_raw.max(vis_left);
+            // Available width for text: from label_x to the lesser of the
+            // tab's own right edge (x1) and vis_right.
+            let text_right = x1.min(vis_right);
+            let avail_text_w = (text_right - label_x).max(0.0);
+            if avail_text_w >= cw {
+                // Column budget based on actual visible width, not full tab.
+                let max_cols = ((avail_text_w / cw) as usize).max(1);
                 let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
-                let max_cols = (label_w / cw) as usize;
                 let display = truncate_str(label, max_cols.saturating_sub(1));
                 let label_color = if is_active {
                     fg
                 } else if is_hovered {
-                    // v1.2: brighter text on hover for better focus feedback.
                     [fg[0] * 0.85, fg[1] * 0.85, fg[2] * 0.85, 1.0]
                 } else {
                     [fg[0] * 0.6, fg[1] * 0.6, fg[2] * 0.6, 1.0]
@@ -5556,10 +5565,11 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Close button.
+            // Close button — only render if its center is within vis_right.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
-            if (is_active || is_hovered) && close_x0 < vis_right {
+            let close_cx = close_x0 + close_w * 0.5;
+            if (is_active || is_hovered) && close_cx < vis_right && close_x0 >= vis_left {
                 let close_color = if is_active {
                     fg
                 } else {
