@@ -5477,15 +5477,15 @@ impl ApplicationHandler<AppEvent> for App {
                         renderer.resize(window, physical_size);
 
                         // Resize ALL tabs' grids immediately for smooth
-                        // animation. The rewrap is fast (<1ms) so doing it
-                        // on every intermediate event is fine. Background
-                        // tabs also need resizing so their content wraps
-                        // correctly when switched to.
+                        // animation. The rewrap/dimension-only resize is fast
+                        // (<1ms) so doing it on every intermediate event is
+                        // fine. Background tabs also need resizing so their
+                        // content wraps correctly when switched to.
                         for tab in &mut self.tabs {
                             if let Some(terminal) = &mut tab.terminal {
                                 terminal.resize(new_rows, new_cols);
                             }
-                            // Debounce the PTY SIGWINCH for each tab.
+                            // Queue the PTY SIGWINCH for this tab.
                             tab.pending_pty_resize = Some((new_rows, new_cols));
                         }
                         info!(rows = new_rows, cols = new_cols, "all tabs resized (event)");
@@ -5531,18 +5531,41 @@ impl ApplicationHandler<AppEvent> for App {
                     self.recompute_layout();
                 }
 
-                // Flush debounced PTY resize for ALL tabs after the cascade
-                // settles (100ms of no new resize events). The grids were
-                // already resized immediately in the Resized handler —
-                // this only sends the SIGWINCH to each shell.
-                if self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100) {
-                    for tab in &mut self.tabs {
-                        if let Some((rows, cols)) = tab.pending_pty_resize.take() {
+                // Flush the PTY SIGWINCH (TIOCSWINSZ) so the foreground app
+                // repaints at the new size.
+                //
+                // v1.0 fix (live-resize): the active tab's SIGWINCH is now sent
+                // on a SHORT throttle (~30ms) instead of the old 100ms settle
+                // debounce. Alt-screen TUIs (less/vim/man) only re-render on
+                // SIGWINCH — with the old 100ms debounce they never repainted
+                // mid-drag, so the screen stayed stale until mouse release (the
+                // "content doesn't follow the window until released" report).
+                // 30ms ≈ every other vsync at 60Hz: enough coalescing to avoid
+                // hammering the app, tight enough that each Resized within a
+                // drag still drives a repaint. Background tabs keep the old
+                // settle-debounce (their grid is already correct; the SIGWINCH
+                // just syncs the shell, and can wait until activation).
+                let now = std::time::Instant::now();
+                let active_ready = now.duration_since(self.last_resize_instant)
+                    > std::time::Duration::from_millis(30);
+                let cascade_settled =
+                    self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100);
+                for (i, tab) in self.tabs.iter_mut().enumerate() {
+                    if let Some((rows, cols)) = tab.pending_pty_resize {
+                        // Active tab: flush on the 30ms throttle. Background
+                        // tabs: flush only after the cascade settles (100ms).
+                        let flush = if i == self.active_tab {
+                            active_ready
+                        } else {
+                            cascade_settled
+                        };
+                        if flush {
                             if let Some(pty) = &tab.pty {
                                 if let Err(e) = pty.resize(rows as u16, cols as u16) {
                                     warn!("PTY resize failed: {e}");
                                 }
                             }
+                            tab.pending_pty_resize = None;
                         }
                     }
                 }

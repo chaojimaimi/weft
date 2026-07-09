@@ -191,6 +191,13 @@ impl Terminal {
     /// resolve to the wrong URL.
     fn scroll_grid_up(&mut self, n: usize) {
         self.grid.scroll_up(n);
+        // v1.0 fix: alt-screen TUIs (vim/less/man) repaint their whole screen
+        // after scrolling, so the renderer's scroll-blit/cache-shift
+        // optimization (built for shell streaming) corrupts their redraw.
+        // Discard the pending scroll delta and force a full rebuild instead.
+        if self.alt_active {
+            self.grid.discard_scroll_and_dirty_all();
+        }
         // v1.0 P1.5-C2: skip the HashMap clear when no hyperlinks are active
         // (the common case — terminal output rarely has OSC 8 links).
         if !self.hyperlinks.cell_map_is_empty() {
@@ -201,6 +208,9 @@ impl Terminal {
     /// Same as [`scroll_grid_up`](Self::scroll_grid_up) for scroll-down.
     fn scroll_grid_down(&mut self, n: usize) {
         self.grid.scroll_down(n);
+        if self.alt_active {
+            self.grid.discard_scroll_and_dirty_all();
+        }
         if !self.hyperlinks.cell_map_is_empty() {
             self.hyperlinks.clear_cell_map();
         }
@@ -534,9 +544,35 @@ impl Terminal {
     }
 
     /// Resize the terminal grid (and alternate screen to match).
+    ///
+    /// The **active** grid (whichever is currently displayed, i.e. `self.grid`
+    /// after any alt-screen swap) is resized **dimension-only** when an
+    /// alt-screen TUI app is running, and **reflowed** otherwise. The
+    /// **inactive** grid is always reflowed so it is correct when swapped to.
+    ///
+    /// Why dimension-only for the active alt-screen grid: apps like `less`,
+    /// `vim`, `man` paint with absolute cursor positioning at a fixed width and
+    /// repaint themselves on SIGWINCH. Reflowing (rewrapping) their content
+    /// mid-drag — while SIGWINCH is still debounced and undelivered — moves
+    /// their characters to wrong cells, producing the "content squished into
+    /// the top-left corner" artifact that only resolves on mouse release (when
+    /// SIGWINCH finally fires and the app repaints). Alacritty/Warp apply the
+    /// same rule: never reflow the active screen during a TUI app's lifetime.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        self.grid.resize(rows, cols);
-        self.alt_grid.resize(rows, cols);
+        if self.alt_active {
+            // self.grid IS the alt grid (swapped in). Dimension-only so the
+            // running TUI app owns its layout until it repaints on SIGWINCH.
+            // self.alt_grid IS the hidden primary grid — reflow it so it is
+            // correct when the app exits and swaps back.
+            self.grid.resize_dims(rows, cols);
+            self.alt_grid.resize(rows, cols);
+        } else {
+            // self.grid IS the primary grid at a shell prompt — reflow so
+            // scrollback rewraps. self.alt_grid is hidden (usually empty);
+            // reflow is harmless and keeps it consistent.
+            self.grid.resize(rows, cols);
+            self.alt_grid.resize(rows, cols);
+        }
     }
 
     /// Full terminal reset (RIS / ESC c).

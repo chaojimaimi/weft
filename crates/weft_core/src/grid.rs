@@ -1204,7 +1204,85 @@ impl Grid {
         self.pending_scroll.take()
     }
 
+    /// v1.0 fix: discard the pending scroll delta AND mark every viewport row
+    /// dirty. Used for alt-screen apps (vim/less/man) after a scroll: those
+    /// apps repaint their whole screen after scrolling, so the renderer's
+    /// scroll-blit + per-row cache-shift optimization (designed for shell
+    /// streaming where moved rows keep their content) is WRONG here — it
+    /// shifts stale content that the app is about to overwrite, producing the
+    /// "only the top row moves, rows overlap and merge" rendering corruption.
+    /// Forcing a full rebuild (no blit) makes alt-screen scrolls correct.
+    pub fn discard_scroll_and_dirty_all(&mut self) {
+        self.pending_scroll.set(0);
+        self.mark_all_dirty();
+    }
+
     // ── Resize / reset ───────────────────────────────────────────
+
+    /// Dimension-only resize: change `num_rows`/`num_cols` and reshape the
+    /// viewport rows **without reflowing** content. Rows are truncated or
+    /// blank-padded to `new_cols`; the viewport is grown with blank rows or
+    /// truncated to `new_rows`. The cursor is clamped into range.
+    ///
+    /// This is the correct resize for the **active** grid when an alt-screen
+    /// TUI app (less/vim/man) is running. Those apps paint their content with
+    /// absolute cursor positioning at a specific width, and they repaint
+    /// themselves on SIGWINCH. A reflow (the full `resize`) would relocate
+    /// their characters to wrong cells mid-drag, producing the "content
+    /// squished into the top-left corner" artifact — because the grid gets
+    /// rewrapped at the new width while the app still thinks it drew at the
+    /// old width (SIGWINCH is debounced and only delivered after the drag
+    /// settles). Matching Alacritty/Warp, we keep the active grid's layout
+    /// untouched and let the app repaint on SIGWINCH.
+    ///
+    /// The full reflow in [`resize`](Self::resize) is still used for the
+    /// inactive grid and for the primary screen at a shell prompt (where
+    /// scrollback rewrapping is expected and there is no TUI app to repaint).
+    pub fn resize_dims(&mut self, new_rows: usize, new_cols: usize) {
+        if new_rows == self.num_rows && new_cols == self.num_cols {
+            return;
+        }
+        let old_cols = self.num_cols;
+
+        // Reshape each existing viewport row to the new width: truncate if
+        // narrower, pad with blank cells if wider. Do NOT merge/split rows —
+        // the app owns the layout.
+        if new_cols != old_cols {
+            for row in &mut self.viewport {
+                resize_row_cells(&mut row.cells, new_cols);
+                // Truncation may have dropped the rightmost dirty cell; mark
+                // the whole row dirty so the renderer repaints it fully.
+                row.mark_dirty(new_cols.saturating_sub(1));
+            }
+        }
+
+        // Grow or truncate the viewport to the new row count.
+        if new_rows > self.num_rows {
+            let extra = new_rows - self.num_rows;
+            // Add blank rows at the BOTTOM (common convention: TUI apps clear
+            // newly exposed rows themselves on SIGWINCH).
+            for _ in 0..extra {
+                self.viewport.push(Row::new(new_cols));
+            }
+        } else if new_rows < self.num_rows {
+            self.viewport.truncate(new_rows);
+        }
+
+        self.num_rows = new_rows;
+        self.num_cols = new_cols;
+        self.scroll_bottom = new_rows.saturating_sub(1);
+        self.scroll_top = 0;
+        self.tabstops = Self::init_tabstops(new_cols);
+        self.scroll_offset = 0;
+
+        // Clamp the cursor into the new bounds. The app will reposition it on
+        // its next paint; clamping here just keeps internal invariants safe.
+        self.cursor.row = self.cursor.row.min(new_rows.saturating_sub(1));
+        self.cursor.col = self.cursor.col.min(new_cols.saturating_sub(1));
+        self.cursor.wrap_pending = false;
+
+        self.mark_all_dirty();
+    }
 
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
         if new_rows == self.num_rows && new_cols == self.num_cols {
@@ -1445,6 +1523,22 @@ impl Grid {
     /// Get scroll region boundaries (read-only).
     pub fn scroll_region(&self) -> (usize, usize) {
         (self.scroll_top, self.scroll_bottom)
+    }
+}
+
+/// Resize a single row's cell vector to `new_cols` in place: truncate if
+/// narrower, pad with default (blank) cells if wider. No content is moved
+/// between rows — this preserves the app's per-cell layout exactly, which is
+/// the point of the dimension-only alt-screen resize.
+fn resize_row_cells(cells: &mut Vec<Cell>, new_cols: usize) {
+    if cells.len() == new_cols {
+        return;
+    }
+    if cells.len() > new_cols {
+        cells.truncate(new_cols);
+    } else {
+        let extra = new_cols - cells.len();
+        cells.extend(std::iter::repeat_with(Cell::default).take(extra));
     }
 }
 
@@ -1932,6 +2026,55 @@ mod tests {
         assert_eq!(grid.num_cols, 10);
         assert_eq!(grid.cell(0, 0).character, '1');
         assert_eq!(grid.cell(0, 4).character, '5');
+    }
+
+    #[test]
+    fn resize_dims_does_not_reflow() {
+        // The dimension-only resize must NOT rewrap content. A TUI app (less)
+        // owns its layout and repaints on SIGWINCH. This guards against
+        // regressing the "content squished into the top-left corner" bug.
+        let mut grid = Grid::with_scrollback(3, 8, 100);
+        // Row 0: "ABCDEFGH" (8 chars, no wrap). Row 1: a second line.
+        for c in 0..8 {
+            grid.viewport[0].cells[c].character = char::from(b'A' + c as u8);
+        }
+        grid.viewport[1].cells[0].character = 'X';
+
+        // Narrow to 4 cols. A REFLOW would merge/wrap "ABCD" / "EFGH"; a
+        // dimension-only resize just truncates each row in place.
+        grid.resize_dims(3, 4);
+        assert_eq!(grid.num_cols, 4);
+        // Row 0 keeps its first 4 chars in place — no relocation.
+        assert_eq!(grid.cell(0, 0).character, 'A');
+        assert_eq!(grid.cell(0, 1).character, 'B');
+        assert_eq!(grid.cell(0, 2).character, 'C');
+        assert_eq!(grid.cell(0, 3).character, 'D');
+        // The tail "EFGH" is dropped (truncated), NOT moved to row 1.
+        // Row 1 still starts with 'X'.
+        assert_eq!(grid.cell(1, 0).character, 'X');
+
+        // Widen back to 8 — cells are padded with blanks, not unwrapped.
+        grid.resize_dims(3, 8);
+        assert_eq!(grid.cell(0, 0).character, 'A');
+        assert_eq!(grid.cell(0, 3).character, 'D');
+        assert_eq!(grid.cell(0, 4).character, ' '); // padded, NOT 'E'
+    }
+
+    #[test]
+    fn resize_dims_grows_and_shrinks_rows() {
+        let mut grid = Grid::new(3, 4);
+        grid.viewport[0].cells[0].character = 'A';
+        // Grow rows 3 → 5: new rows appended at the bottom.
+        grid.resize_dims(5, 4);
+        assert_eq!(grid.num_rows, 5);
+        assert_eq!(grid.cell(0, 0).character, 'A');
+        assert_eq!(grid.cell(4, 0).character, ' '); // blank new row
+        // Shrink rows 5 → 2: trailing rows dropped, content kept.
+        grid.resize_dims(2, 4);
+        assert_eq!(grid.num_rows, 2);
+        assert_eq!(grid.cell(0, 0).character, 'A');
+        // Cursor is clamped into range.
+        assert!(grid.cursor.row < 2);
     }
 
     #[test]
