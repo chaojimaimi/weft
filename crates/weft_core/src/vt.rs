@@ -906,7 +906,23 @@ impl vte::Perform for Terminal {
             // Write on new line
             let new_row = self.grid.cursor.row;
             let new_col = self.grid.cursor.col;
-            let cell = &mut self.grid.viewport[new_row].cells[new_col];
+            let cells = &mut self.grid.viewport[new_row].cells;
+            // v1.0 fix (CJK splat): clear any existing wide pair this write
+            // bisects (same as the main print path). See comments there.
+            let mut splat_dirty: Vec<usize> = Vec::with_capacity(4);
+            let ef = cells[new_col].flags;
+            let ew = cells[new_col].width;
+            if ef.contains(CellFlags::WIDE_SPACER) && new_col > 0 {
+                cells[new_col - 1].reset();
+                splat_dirty.push(new_col - 1);
+            }
+            if ew == CellWidth::Full && new_col + 1 < num_cols
+                && cells[new_col + 1].flags.contains(CellFlags::WIDE_SPACER)
+            {
+                cells[new_col + 1].reset();
+                splat_dirty.push(new_col + 1);
+            }
+            let cell = &mut cells[new_col];
             cell.character = c;
             cell.fg = self.attrs.fg;
             cell.bg = self.attrs.bg;
@@ -919,14 +935,19 @@ impl vte::Perform for Terminal {
             } else {
                 self.hyperlinks.unlink_cell(new_row, new_col);
             }
-            self.grid.viewport[new_row].mark_dirty(new_col);
 
             if new_col + 1 < num_cols {
-                let spacer = &mut self.grid.viewport[new_row].cells[new_col + 1];
+                let spacer = &mut cells[new_col + 1];
                 spacer.character = ' ';
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
-                self.grid.viewport[new_row].mark_dirty(new_col + 1);
+            }
+            splat_dirty.push(new_col);
+            if new_col + 1 < num_cols {
+                splat_dirty.push(new_col + 1);
+            }
+            for dc in splat_dirty {
+                self.grid.viewport[new_row].mark_dirty(dc);
             }
 
             self.grid.cursor.col = new_col + 2;
@@ -963,7 +984,36 @@ impl vte::Perform for Terminal {
         }
 
         {
-            let cell = &mut self.grid.viewport[row].cells[col];
+            let cells = &mut self.grid.viewport[row].cells;
+            // v1.0 fix (CJK splat): before writing a new char, clear any
+            // existing wide-char pair that this write would bisect. Without
+            // this, overwriting part of a double-width CJK char (or its
+            // WIDE_SPACER second cell) leaves an orphaned half that manifests
+            // as merged fragments and phantom spaces after a TUI app (vim)
+            // scrolls via IL/DL and reprints shorter/different content. This
+            // is the standard "wide splat" handling xterm/Alacritty perform.
+            // Collect columns to mark dirty afterwards (can't call mark_dirty
+            // while `cells` is mutably borrowed).
+            let mut splat_dirty: Vec<usize> = Vec::with_capacity(4);
+            let existing_flags = cells[col].flags;
+            let existing_width = cells[col].width;
+            // Case 1: target is a WIDE_SPACER (2nd cell of a pair) → reset the
+            // orphaned leading Full cell at col-1.
+            if existing_flags.contains(CellFlags::WIDE_SPACER) && col > 0 {
+                cells[col - 1].reset();
+                splat_dirty.push(col - 1);
+            }
+            // Case 2: target is the LEADING Full cell → reset its spacer at
+            // col+1 so it doesn't linger as a phantom space. (If the new char
+            // is also Full it reclaims col+1 below, so the reset is harmless.)
+            if existing_width == CellWidth::Full && col + 1 < num_cols
+                && cells[col + 1].flags.contains(CellFlags::WIDE_SPACER)
+            {
+                cells[col + 1].reset();
+                splat_dirty.push(col + 1);
+            }
+
+            let cell = &mut cells[col];
             cell.character = c;
             cell.fg = self.attrs.fg;
             cell.bg = self.attrs.bg;
@@ -984,17 +1034,24 @@ impl vte::Perform for Terminal {
                 self.hyperlinks.unlink_cell(row, col);
             }
 
-            self.grid.viewport[row].mark_dirty(col);
-            self.grid.cursor.col += width as usize;
-
             if width == CellWidth::Full && col + 1 < num_cols {
-                let spacer = &mut self.grid.viewport[row].cells[col + 1];
+                let spacer = &mut cells[col + 1];
                 spacer.character = ' ';
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
-                self.grid.viewport[row].mark_dirty(col + 1);
+            }
+            // Columns to mark dirty: the written cell, its spacer (if Full),
+            // and any splat-cleared cells.
+            splat_dirty.push(col);
+            if width == CellWidth::Full && col + 1 < num_cols {
+                splat_dirty.push(col + 1);
+            }
+            // Apply dirty marks after the cells borrow ends.
+            for dc in splat_dirty {
+                self.grid.viewport[row].mark_dirty(dc);
             }
         }
+        self.grid.cursor.col += width as usize;
 
         if self.grid.cursor.col >= num_cols {
             self.grid.cursor.wrap_pending = true;
@@ -1559,6 +1616,39 @@ mod tests {
         let flags = t.grid().cell(0, 0).flags;
         assert!(flags.contains(CellFlags::BOLD));
         assert!(flags.contains(CellFlags::ITALIC));
+    }
+
+    #[test]
+    fn wide_char_splat_clears_orphaned_spacer() {
+        // v1.0 regression: overwriting a CJK double-width char's leading cell
+        // with a half-width char must clear the trailing WIDE_SPACER, else it
+        // lingers as a phantom space (the vim-scroll CJK corruption).
+        let mut t = term();
+        // Print a CJK char at col 0 → occupies [0]=char, [1]=WIDE_SPACER.
+        t.process("中".as_bytes());
+        assert_eq!(t.grid().cell(0, 0).character, '中');
+        assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+        // CUP back to col 0, print a single ASCII char (overwrites the lead).
+        t.process(b"\x1b[1;1HA");
+        assert_eq!(t.grid().cell(0, 0).character, 'A');
+        // The orphaned spacer at col 1 must be cleared (reset to default).
+        assert!(!t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.grid().cell(0, 1).character, ' ');
+    }
+
+    #[test]
+    fn wide_char_splat_clears_orphaned_lead() {
+        // v1.0 regression: overwriting a WIDE_SPACER (2nd cell) must clear the
+        // orphaned leading Full cell at col-1.
+        let mut t = term();
+        t.process("中".as_bytes()); // [0]=中, [1]=WIDE_SPACER
+        // CUP to col 2 (1-based) = col index 1, print over the spacer.
+        t.process(b"\x1b[1;2HB");
+        assert_eq!(t.grid().cell(0, 1).character, 'B');
+        assert!(!t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+        // The orphaned lead at col 0 must be reset (not '中').
+        assert_eq!(t.grid().cell(0, 0).character, ' ');
+        assert!(!t.grid().cell(0, 0).flags.contains(CellFlags::WIDE_SPACER));
     }
 
     #[test]

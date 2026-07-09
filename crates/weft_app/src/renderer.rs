@@ -1312,6 +1312,21 @@ fragment float4 text_fragment(
             // instances (P1.5-B1) into `instances`; overlays go into
             // `vertices` (appended below).
             self.block_view_rows.clear();
+            // v1.0 fix (vim scroll): alt-screen TUIs (vim/less/man) scroll via
+            // IL/DL (CSI L/M) which PHYSICALLY move viewport rows, then repaint
+            // the moved rows. The renderer's per-row vertex cache is indexed by
+            // row position — after an IL/DL the cache at a given index holds the
+            // PREVIOUS frame's content for that row, and even though the VT marks
+            // the moved rows dirty (triggering a rebuild), subtle ordering /
+            // partial-frame interactions left the screen showing stale cached
+            // content ("only the top row moves, rows overlap and merge").
+            // Forcing a full grid rebuild every frame on the alt screen bypasses
+            // the cache entirely and renders directly from the live grid,
+            // eliminating the corruption. Cost: full redraw while in a TUI app
+            // (acceptable — TUIs don't stream like shell output).
+            if terminal.is_alt_screen_active() {
+                self.force_full_grid_redraw();
+            }
             instances = self.build_grid_instances(
                 grid,
                 terminal.palette(),
