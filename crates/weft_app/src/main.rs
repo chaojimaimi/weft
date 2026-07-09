@@ -11,7 +11,8 @@ mod renderer;
 mod tab;
 
 use renderer::{
-    block_matches_query, visible_panel_rows, FindDrawState, MetalRenderer, TabBarDrawState,
+    block_matches_query, configure_titlebar, visible_panel_rows, FindDrawState, MetalRenderer,
+    TabBarDrawState,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -71,6 +72,10 @@ struct App {
     /// hover-to-show close "×" button. Reset on tab close/switch and on
     /// `CursorLeft` (mouse leaves the window).
     hovered_tab: Option<usize>,
+    /// v1.1: timestamp of the last click in the titlebar/tab-bar background
+    /// (non-tab, non-traffic-light) region. Used to detect double-click →
+    /// toggle maximize, matching macOS native titlebar behavior.
+    last_titlebar_click: Option<std::time::Instant>,
     /// Current keyboard modifier state, updated by ModifiersChanged events.
     mods: winit::event::Modifiers,
     /// Cursor blink state (grid view: hard on/off, period 1060ms).
@@ -465,6 +470,7 @@ impl App {
             active_tab: 0,
             prev_drawn_tab: 0,
             hovered_tab: None,
+            last_titlebar_click: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
             cursor_blink_phase: 0.0,
@@ -4025,6 +4031,11 @@ impl App {
             if let Some(renderer) = &self.renderer {
                 let bar_h = renderer.tab_bar_height();
                 if y as f32 <= bar_h {
+                    // v1.1: clicks in the macOS traffic-light region (top-left)
+                    // must pass through to the system (close/minimize/maximize).
+                    if (x as f32) < renderer.traffic_lights_width() {
+                        return;
+                    }
                     // Click is in the tab bar region. Check hit-test rects.
                     let xf = x as f32;
                     let yf = y as f32;
@@ -4065,7 +4076,26 @@ impl App {
                             return;
                         }
                     }
-                    return; // Click in tab bar but not on any tab — consume.
+                    // v1.1: Click in the tab-bar background (not on any tab,
+                    // not on the traffic lights). This is a draggable region
+                    // (movableByWindowBackground handles the drag). Detect a
+                    // double-click here to toggle maximize, matching the macOS
+                    // native titlebar double-click behavior.
+                    let now = std::time::Instant::now();
+                    let is_double = self
+                        .last_titlebar_click
+                        .map(|t| now.duration_since(t) < std::time::Duration::from_millis(500))
+                        .unwrap_or(false);
+                    if is_double {
+                        if let Some(window) = &self.window {
+                            let maximized = window.is_maximized();
+                            window.set_maximized(!maximized);
+                        }
+                        self.last_titlebar_click = None;
+                    } else {
+                        self.last_titlebar_click = Some(now);
+                    }
+                    return;
                 }
             }
         }
@@ -4757,8 +4787,8 @@ impl App {
             // click forced a redraw that completed the alt-screen parse.
             // Suppressing block_view during CommandExecuting routes the wheel
             // correctly once the app takes over the screen.
-            let block_view = t.show_block_view()
-                && t.block_tracker().phase() != ShellPhase::CommandExecuting;
+            let block_view =
+                t.show_block_view() && t.block_tracker().phase() != ShellPhase::CommandExecuting;
             // v1.0 fix: capture mouse_protocol here and sync it into the
             // InputHandler below (after this immutable borrow ends). Without
             // this sync, InputHandler.mouse_protocol stays `Off` forever (its
@@ -5244,6 +5274,13 @@ impl ApplicationHandler<AppEvent> for App {
             .with_window_icon(load_window_icon());
 
         let window = event_loop.create_window(attrs).unwrap();
+        // v1.1: Warp-style transparent titlebar. Must run AFTER create_window
+        // (needs the NSView/NSWindow to exist) and BEFORE renderer attaches the
+        // Metal layer (so FullSizeContentView is in effect when the layer is
+        // sized → it extends under the titlebar). configure_titlebar reaches
+        // the NSWindow via the raw-window-handle AppKit handle and sets the
+        // style mask + transparency + movable-by-background.
+        configure_titlebar(&window);
         let renderer = MetalRenderer::new(
             &window,
             self.config.font.clone(),

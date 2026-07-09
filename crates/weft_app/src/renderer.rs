@@ -955,11 +955,28 @@ fragment float4 text_fragment(
     }
 
     /// v0.9 H1: Tab bar height in physical pixels. Only drawn when there
-    /// are 2+ tabs. Roughly 1.5× cell height, clamped to [24, 40] logical
-    /// pixels (× scale for physical).
+    /// are 2+ tabs. Roughly 1.5× cell height, clamped to [28, 40] logical
+    /// pixels (× scale for physical). v1.1: lower bound raised 24→28 to
+    /// comfortably fit the macOS traffic-light buttons (~28pt) when the tab
+    /// bar doubles as the (transparent) titlebar.
     pub fn tab_bar_height(&self) -> f32 {
         let logical = self.cell_height() as f32 / self.scale as f32 * 1.5;
-        logical.clamp(24.0, 40.0) * self.scale as f32
+        logical.clamp(28.0, 40.0) * self.scale as f32
+    }
+
+    /// v1.1: Reserved top space for the macOS titlebar (traffic lights) in
+    /// physical pixels. Used as the minimum chrome_top even with a single tab
+    /// so the transparent titlebar never overlaps terminal content. The native
+    /// traffic lights are ~28pt tall; we reserve the same height here.
+    pub fn titlebar_height(&self) -> f32 {
+        28.0 * self.scale as f32
+    }
+
+    /// v1.1: Width reserved for the macOS traffic-light buttons at the top-left,
+    /// in physical pixels. Tabs and content start to the right of this so they
+    /// don't collide with the close/minimize/maximize buttons.
+    pub fn traffic_lights_width(&self) -> f32 {
+        72.0 * self.scale as f32
     }
 
     /// v0.9 W5: Left sidebar width in physical pixels (240 logical px × scale).
@@ -1023,13 +1040,22 @@ fragment float4 text_fragment(
 
         // v0.9 H1: compute chrome_top (tab bar height) and set it on the
         // LayoutCtx so all content is shifted below the tab bar. The bar is
-        // only drawn when more than one tab is open (single tab hides it,
-        // matching the previous design).
+        // only drawn when more than one tab is open (single tab hides it).
+        //
+        // v1.1: with the transparent (FullSizeContentView) titlebar, the
+        // macOS traffic-light buttons float over the Metal content. Even with
+        // a single tab (no tab bar drawn) we must reserve `titlebar_height`
+        // at the top so content isn't hidden behind the buttons. The draw
+        // path below paints a theme-color strip there for single-tab mode.
+        let tab_h = self.tab_bar_height();
+        let titlebar_h = self.titlebar_height();
         let chrome_top = if tab_bar.tab_count > 1 {
-            self.tab_bar_height()
+            tab_h.max(titlebar_h)
         } else {
-            0.0
+            titlebar_h
         };
+        // Whether a standalone titlebar strip (no tab bar) needs painting.
+        let single_tab_titlebar = tab_bar.tab_count <= 1;
 
         // v0.9 W5: compute chrome_left (sidebar width) when the history panel
         // is open — the panel becomes a left sidebar that pushes content right.
@@ -1472,6 +1498,32 @@ fragment float4 text_fragment(
             self.tab_hits = hits;
         } else {
             self.tab_hits.clear();
+            // v1.1: single-tab mode — still paint a theme-color strip at the
+            // top (titlebar_height tall) so the transparent titlebar's traffic
+            // lights sit on a themed background instead of overlapping text.
+            // No tabs/dividers/close buttons; just the background quad.
+            if single_tab_titlebar {
+                let bg = color_to_normalized(self.theme.background);
+                let strip_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
+                    [bg[0] * 0.85, bg[1] * 0.85, bg[2] * 0.85, 1.0]
+                } else {
+                    [
+                        bg[0] + (1.0 - bg[0]) * 0.5,
+                        bg[1] + (1.0 - bg[1]) * 0.5,
+                        bg[2] + (1.0 - bg[2]) * 0.5,
+                        1.0,
+                    ]
+                };
+                let h = self.titlebar_height();
+                let vp_w = self.viewport.0;
+                push_quad(
+                    &mut vertices,
+                    [0.0, 0.0, vp_w, h],
+                    [0.0; 4],
+                    [0.0; 4],
+                    strip_bg,
+                );
+            }
         }
 
         // v1.0 P1.5-B1: early-exit only when BOTH instances (grid) and
@@ -5320,8 +5372,13 @@ fragment float4 text_fragment(
         let y0 = 0.0f32;
         let y1 = bar_h;
 
+        // v1.1: the first tab starts after the macOS traffic-light buttons
+        // (close/minimize/maximize) so it doesn't overlap them. The traffic
+        // lights sit at the top-left of the transparent titlebar.
+        let tl_w = self.traffic_lights_width();
+
         for i in 0..tab_bar.tab_count {
-            let x0 = chrome_left + pad_x + i as f32 * tab_w;
+            let x0 = chrome_left + tl_w + pad_x + i as f32 * tab_w;
             let x1 = x0 + tab_w;
             let is_active = i == tab_bar.active_tab;
 
@@ -5403,8 +5460,24 @@ fragment float4 text_fragment(
                 let r = if is_active { ch * 0.16 } else { ch * 0.13 };
                 let line_w = 1.0 * self.scale as f32;
                 // Two diagonal lines forming ×
-                push_line(&mut vertices, cx - r, cy - r, cx + r, cy + r, line_w, close_color);
-                push_line(&mut vertices, cx - r, cy + r, cx + r, cy - r, line_w, close_color);
+                push_line(
+                    &mut vertices,
+                    cx - r,
+                    cy - r,
+                    cx + r,
+                    cy + r,
+                    line_w,
+                    close_color,
+                );
+                push_line(
+                    &mut vertices,
+                    cx - r,
+                    cy + r,
+                    cx + r,
+                    cy - r,
+                    line_w,
+                    close_color,
+                );
             }
 
             hits.push(TabHit {
@@ -5535,7 +5608,15 @@ fn push_quad(vertices: &mut Vec<f32>, dst: [f32; 4], uv: [f32; 4], fg: [f32; 4],
 
 /// Draw a line segment as a thin rotated rectangle (two triangles).
 /// Used for vector-drawn UI elements like the tab close button × icon.
-fn push_line(vertices: &mut Vec<f32>, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: [f32; 4]) {
+fn push_line(
+    vertices: &mut Vec<f32>,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    width: f32,
+    color: [f32; 4],
+) {
     let dx = x2 - x1;
     let dy = y2 - y1;
     let len = (dx * dx + dy * dy).sqrt();
@@ -5554,10 +5635,7 @@ fn push_line(vertices: &mut Vec<f32>, x1: f32, y1: f32, x2: f32, y2: f32, width:
     // UV=[0;4] and fg=[0;4] → mask=0 → only bg (color) shows
     let uv = [0.0f32; 4];
     let fg = [0.0f32; 4];
-    for (x, y) in [
-        (ax, ay), (bx, by), (cx, cy),
-        (bx, by), (dx, dy), (cx, cy),
-    ] {
+    for (x, y) in [(ax, ay), (bx, by), (cx, cy), (bx, by), (dx, dy), (cx, cy)] {
         vertices.extend_from_slice(&[
             x, y, uv[0], uv[1], fg[0], fg[1], fg[2], fg[3], color[0], color[1], color[2], color[3],
         ]);
@@ -5748,6 +5826,70 @@ unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window, scale: f64
     // shader already maps logical-top → clip-top, so the drawable is upright; do NOT
     // set geometryFlipped (it would composite the framebuffer upside-down).
     let _: () = msg_send![layer_ptr, setGeometryFlipped: false];
+}
+
+/// v1.1: Configure a Warp-style transparent titlebar on the native NSWindow.
+///
+/// Sets `NSWindowStyleMaskFullSizeContentView` (Metal layer extends under the
+/// titlebar), `titlebarAppearsTransparent` (no system titlebar chrome), and
+/// `titleVisibility:hidden` (no title text). `movableByWindowBackground` lets
+/// the user drag the window by any non-interactive background area (the tab
+/// bar's empty regions), matching Warp. The traffic-light buttons stay native
+/// and float over the Metal content at the top-left.
+///
+/// Uses the typed `objc2-app-kit` `NSWindow` methods (safe functions) rather
+/// than raw `msg_send!` to avoid the nounwind-abort panic that disabled
+/// `set_dock_icon`.
+pub fn configure_titlebar(window: &Window) {
+    use objc2::rc::Retained;
+    use objc2_app_kit::{NSView, NSWindowStyleMask, NSWindowTitleVisibility};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // Wrap in catch_unwind as a belt-and-suspenders guard against any ObjC
+    // runtime assertion (matching the set_dock_icon defensive pattern), even
+    // though these typed setters are nominally safe.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let raw = match window.window_handle() {
+            Ok(h) => h.as_raw(),
+            Err(_) => return,
+        };
+        let RawWindowHandle::AppKit(appkit) = raw else {
+            return; // Not macOS — nothing to configure.
+        };
+        // Retain the NSView from the raw handle, then reach its NSWindow.
+        let ns_view: Retained<NSView> = match Retained::retain(appkit.ns_view.as_ptr().cast()) {
+            Some(v) => v,
+            None => return,
+        };
+        let ns_window = match ns_window_of(&ns_view) {
+            Some(w) => w,
+            None => return,
+        };
+        // Add FullSizeContentView (1 << 15) to the existing style mask without
+        // dropping Titled/Closable/etc. (those keep the traffic lights).
+        let mask = ns_window.styleMask();
+        ns_window.setStyleMask(mask | NSWindowStyleMask::FullSizeContentView);
+        ns_window.setTitlebarAppearsTransparent(true);
+        ns_window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
+        ns_window.setMovableByWindowBackground(true);
+    }));
+}
+
+/// Helper: get the NSWindow owning an NSView (`[view window]`), retained.
+unsafe fn ns_window_of(
+    view: &objc2_app_kit::NSView,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    let ptr: *mut AnyObject = msg_send![view, window];
+    if ptr.is_null() {
+        None
+    } else {
+        // Retain via the NSWindow type so the returned Retained<NSWindow> is
+        // properly managed. `[view window]` returns an unretained reference.
+        Retained::retain(ptr.cast())
+    }
 }
 
 /// Toggle the CAMetalLayer's `opaque` flag. A non-opaque layer lets a
