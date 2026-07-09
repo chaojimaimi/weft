@@ -380,6 +380,11 @@ pub struct TabBarDrawState {
     /// or `None` when the cursor isn't over any tab. Used to show the close
     /// "×" button on hover (Warp-style) — active tab always shows "×".
     pub hovered_tab: Option<usize>,
+    /// v1.2: horizontal scroll offset in physical pixels. 0 = scrolled all
+    /// the way left (showing the first tab). Applied as `x0 -= scroll_offset`
+    /// in `build_tab_bar_vertices`. The app clamps this to the valid range
+    /// (0 .. total_tab_width - visible_width) on each frame.
+    pub scroll_offset: f32,
 }
 
 /// v0.9 H1: Hit-test rect for a tab label + close button.
@@ -3779,14 +3784,14 @@ fragment float4 text_fragment(
             separator,
         );
         // Compact pairs: "key description" with key in accent, desc in label_c.
-        // v1.2 fix: previously rendered at scale=1.1 with left-to-right
-        // accumulation that could overflow past content_x1 (the panel's
-        // right border). Now uses scale=1.0 (same as body text, so font
-        // size tracks window resize consistently) and a right-to-left
-        // layout so pairs can never overflow the right edge.
+        // v1.2 fix: left-to-right layout with right-edge truncation. Pairs
+        // start from content_x0 (left edge, matching body text reading
+        // direction) and stop when they would exceed content_x1 (right
+        // edge). This keeps the leftmost pairs (↑↓ navigate, ⏎ apply) always
+        // visible — they are the most-used operations. Pairs that don't fit
+        // are simply not rendered (CPU-side cull, no half-glyph cropping).
         // v1.0 S1-b/S2: the apply / close / save pairs register clickable
-        // hit regions so mouse users can hit those actions directly. The
-        // navigate / switch / adjust pairs are hints only (no click target).
+        // hit regions so mouse users can hit those actions directly.
         let pairs: [(&str, &str, Option<SettingsHitKind>); 6] = [
             ("↑↓", "navigate", None),
             ("⏎", "apply", Some(SettingsHitKind::ApplyButton)),
@@ -3797,15 +3802,17 @@ fragment float4 text_fragment(
         ];
         let gap = cw * 1.5; // gap between pairs
         let inner = cw * 0.3; // gap between key and description within a pair
-        let scale = 1.0; // v1.2: match body text scale — tracks resize correctly
+        let scale = 1.0; // match body text scale
         let footer_h = ch * scale;
-        // Right-to-left layout: start from the right edge and work backwards.
-        let mut fx = content_x1;
-        for (key, desc, hit_kind) in pairs.iter().rev() {
-            let desc_w = cw * scale * Self::text_col_width(desc) as f32;
+        let mut fx = content_x0;
+        for (key, desc, hit_kind) in &pairs {
             let key_w = cw * scale * Self::text_col_width(key) as f32;
+            let desc_w = cw * scale * Self::text_col_width(desc) as f32;
             let pair_w = key_w + inner + desc_w;
-            fx -= pair_w;
+            // Stop if this pair would exceed the right content boundary.
+            if fx + pair_w > content_x1 {
+                break;
+            }
             let pair_x0 = fx;
             self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
             self.push_text_scaled(
@@ -3817,7 +3824,6 @@ fragment float4 text_fragment(
                 content_cols,
                 scale,
             );
-            fx -= gap;
             // Register the clickable rect for apply / close / save.
             if let Some(kind) = hit_kind {
                 hits.push(SettingsHit {
@@ -3825,6 +3831,7 @@ fragment float4 text_fragment(
                     rect: [pair_x0, footer_y, pair_x0 + pair_w, footer_y + footer_h],
                 });
             }
+            fx += pair_w + gap;
         }
 
         (verts, Some([box_x0, box_y0, box_x1, box_y1]), hits)
@@ -5348,25 +5355,16 @@ fragment float4 text_fragment(
         let bar_h = self.tab_bar_height();
         let vp_w = self.viewport.0;
         let pad_x = self.padding_x;
-        // v0.9 W5: shift tab bar right by chrome_left (sidebar width) so
-        // tabs don't overlap the left sidebar.
         let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
 
         let bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.accent);
-        // v1.2 fix: use theme.separator for tab dividers (was hardcoded
-        // fg*0.2 at alpha 0.5 — nearly invisible in dark themes). The
-        // separator color is theme-aware and provides enough contrast.
         let separator = color_to_normalized(self.theme.separator);
 
-        // Tab bar background: slightly darker (dark theme) or lighter (light
-        // theme) than the main background, same as the find popup formula.
         let bar_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
-            // Dark theme — dim the background.
             [bg[0] * 0.85, bg[1] * 0.85, bg[2] * 0.85, 1.0]
         } else {
-            // Light theme — lighten.
             [
                 bg[0] + (1.0 - bg[0]) * 0.5,
                 bg[1] + (1.0 - bg[1]) * 0.5,
@@ -5378,7 +5376,6 @@ fragment float4 text_fragment(
         let mut vertices = Vec::new();
         let mut hits = Vec::new();
 
-        // Bar background (full width, including sidebar area for visual continuity).
         push_quad(
             &mut vertices,
             [0.0, 0.0, vp_w, bar_h],
@@ -5387,46 +5384,63 @@ fragment float4 text_fragment(
             bar_bg,
         );
 
-        // v1.1: the first tab starts after the macOS traffic-light buttons
-        // (close/minimize/maximize) so it doesn't overlap them. The traffic
-        // lights sit at the top-left of the transparent titlebar.
         let tl_w = self.traffic_lights_width();
 
-        // Tab layout: each tab is up to 20 cells wide, with a 1px divider.
-        // v0.9 fix: increased from 16→20 cells so "weft · sleep 5" fits.
-        // v1.2 fix: when total tab width would overflow the window, shrink
-        // tabs to fit the available space (min 6 cells) so all tabs stay
-        // visible. Previously tabs had a fixed width and overflowed past
-        // the right edge, making later tabs invisible and unclickable.
+        // v1.2: Tab sizing — tabs have a minimum width (15 cells ~120px) and
+        // maximum (20 cells ~200px). When total width exceeds available space,
+        // tabs scroll horizontally instead of being compressed.
         let max_tab_w = cw * 20.0;
-        let min_tab_w = cw * 6.0;
-        let available_w = vp_w - chrome_left - tl_w - pad_x - cw; // -cw for "+"
-        let tab_w = if tab_bar.tab_count > 0 {
-            (available_w / tab_bar.tab_count as f32).clamp(min_tab_w, max_tab_w)
+        let min_tab_w = cw * 15.0;
+        let arrow_w = cw * 1.8; // scroll arrow width (only shown when overflowing)
+
+        let tabs_start = chrome_left + tl_w + pad_x;
+        let total_tab_w = tab_bar.tab_count as f32 * max_tab_w;
+        let plus_w = cw; // "+" button width
+        let avail_for_tabs = vp_w - tabs_start - plus_w;
+        let overflowing = total_tab_w > avail_for_tabs;
+        let tab_w = if overflowing { min_tab_w } else { max_tab_w };
+        let scroll_offset = if overflowing {
+            tab_bar.scroll_offset
         } else {
-            max_tab_w
+            0.0
         };
-        let close_w = cw * 2.0; // "×" button area
+
+        // The visible region (where tabs actually render). When overflowing,
+        // scroll arrows take space on both sides.
+        let vis_left = if overflowing {
+            tabs_start + arrow_w
+        } else {
+            tabs_start
+        };
+        let vis_right = if overflowing {
+            vp_w - plus_w - arrow_w
+        } else {
+            vp_w - plus_w
+        };
+
+        let close_w = cw * 2.0;
         let label_w = tab_w - close_w;
         let y0 = 0.0f32;
         let y1 = bar_h;
 
         for i in 0..tab_bar.tab_count {
-            let x0 = chrome_left + tl_w + pad_x + i as f32 * tab_w;
+            // Apply scroll offset to x position.
+            let x0 = tabs_start + i as f32 * tab_w - scroll_offset;
             let x1 = x0 + tab_w;
+
+            // CPU-side cull: skip tabs entirely outside the visible region.
+            if x1 < vis_left || x0 > vis_right {
+                // Still register hit rect for scroll-into-view logic, but
+                // don't render. Actually skip entirely — the app handles
+                // scroll-into-view separately.
+                continue;
+            }
+
             let is_active = i == tab_bar.active_tab;
 
-            // Tab background: active tab gets the main bg color (stands out
-            // from the dimmed bar bg); inactive tabs are transparent (show
-            // the bar bg).
-            let tab_bg = if is_active {
-                [bg[0], bg[1], bg[2], 1.0]
-            } else {
-                [0.0; 4] // transparent — shows bar_bg underneath
-            };
+            // Tab background.
             if is_active {
-                push_quad(&mut vertices, [x0, y0, x1, y1], [0.0; 4], [0.0; 4], tab_bg);
-                // Active tab accent underline (2px at the bottom).
+                push_quad(&mut vertices, [x0, y0, x1, y1], [0.0; 4], [0.0; 4], bg);
                 push_quad(
                     &mut vertices,
                     [x0, y1 - 2.0, x1, y1],
@@ -5436,9 +5450,8 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Divider between tabs (1px).
-            // v1.2 fix: use theme.separator instead of hardcoded fg*0.2.
-            if i > 0 {
+            // Divider between tabs.
+            if i > 0 && x0 >= vis_left {
                 push_quad(
                     &mut vertices,
                     [x0, y0, x0 + 1.0, y1],
@@ -5448,7 +5461,7 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Tab label (truncated to fit label_w).
+            // Tab label.
             let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
             let max_cols = (label_w / cw) as usize;
             let display = truncate_str(label, max_cols.saturating_sub(1));
@@ -5466,16 +5479,7 @@ fragment float4 text_fragment(
                 max_cols,
             );
 
-            // Close button: draw a standard × icon using vector lines
-            // (not a font character). Warp-style: two diagonal strokes.
-            // v0.9 W1+: active tab always shows ×; inactive tabs show × on hover.
-            // v1.0 fix: the × was far larger than the Chrome/Safari/Warp
-            // convention (~8px glyph). At ch≈28px, r=ch*0.32 gave a ~18px span
-            // — over 2× the reference — so it read as heavy/intrusive,
-            // especially on inactive tabs. Reduced to a restrained size: active
-            // ~ch*0.16 (~9px span), inactive ~ch*0.13 (~7px span), with a
-            // thinner 1.0px stroke and a dimmer color for inactive. The click
-            // hit area (`close_rect`, full 2-cell width) is unchanged.
+            // Close button.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
             let is_hovered = tab_bar.hovered_tab == Some(i);
@@ -5483,18 +5487,12 @@ fragment float4 text_fragment(
                 let close_color = if is_active {
                     fg
                 } else {
-                    // Dimmer than before (0.7→0.5) so the hover affordance
-                    // reads as secondary, matching Warp/Safari inactive style.
                     [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
                 };
-                // Center of the close button area
                 let cx = close_x0 + close_w * 0.5;
                 let cy = y0 + bar_h * 0.5;
-                // × size: active ~16% of cell height (~9px span @ ch=28);
-                // inactive ~13% (~7px span). Thin 1.0px stroke.
                 let r = if is_active { ch * 0.16 } else { ch * 0.13 };
                 let line_w = 1.0 * self.scale as f32;
-                // Two diagonal lines forming ×
                 push_line(
                     &mut vertices,
                     cx - r,
@@ -5522,17 +5520,93 @@ fragment float4 text_fragment(
             });
         }
 
-        // v1.1: "+" (new tab) button at the right of the last tab.
-        // A compact circular-ish plus, drawn with two short perpendicular
-        // line segments. Matches the close "×" stroke weight for visual
-        // consistency. The hit rect is one cell wide/tall, centered on the +.
-        let plus_x0 = chrome_left + tl_w + pad_x + tab_bar.tab_count as f32 * tab_w;
+        // v1.2: Scroll arrows — drawn when tabs overflow.
+        let arrow_active_color = fg; // bright when the arrow can scroll
+        if overflowing {
+            // Left arrow (‹) — always render the geometry; visibility depends
+            // on scroll_offset. When scroll_offset == 0, dim it.
+            let la_cx = tabs_start + arrow_w * 0.5;
+            let la_cy = bar_h * 0.5;
+            let la_r = ch * 0.12;
+            let la_w = 1.5 * self.scale as f32;
+            let la_color = if scroll_offset > 0.0 {
+                arrow_active_color
+            } else {
+                [fg[0] * 0.25, fg[1] * 0.25, fg[2] * 0.25, 1.0]
+            };
+            // Draw ‹ as two lines (chevron pointing left).
+            push_line(
+                &mut vertices,
+                la_cx + la_r,
+                la_cy - la_r,
+                la_cx - la_r,
+                la_cy,
+                la_w,
+                la_color,
+            );
+            push_line(
+                &mut vertices,
+                la_cx - la_r,
+                la_cy,
+                la_cx + la_r,
+                la_cy + la_r,
+                la_w,
+                la_color,
+            );
+
+            // Right arrow (›).
+            let ra_cx = vis_right + arrow_w * 0.5;
+            let ra_cy = bar_h * 0.5;
+            let ra_r = ch * 0.12;
+            let ra_w = 1.5 * self.scale as f32;
+            let max_scroll = (total_tab_w - avail_for_tabs).max(0.0);
+            let ra_color = if scroll_offset < max_scroll {
+                arrow_active_color
+            } else {
+                [fg[0] * 0.25, fg[1] * 0.25, fg[2] * 0.25, 1.0]
+            };
+            push_line(
+                &mut vertices,
+                ra_cx - la_r,
+                ra_cy - la_r,
+                ra_cx + ra_r,
+                ra_cy,
+                ra_w,
+                ra_color,
+            );
+            push_line(
+                &mut vertices,
+                ra_cx + ra_r,
+                ra_cy,
+                ra_cx - la_r,
+                ra_cy + la_r,
+                ra_w,
+                ra_color,
+            );
+
+            // Register arrow hit rects via special TabHit entries (index =
+            // usize::MAX for left arrow, usize::MAX - 1 for right). The app's
+            // click handler checks these sentinel values.
+            hits.push(TabHit {
+                tab_rect: [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
+                close_rect: [0.0; 4],
+                index: usize::MAX,
+            });
+            hits.push(TabHit {
+                tab_rect: [vis_right, 0.0, vis_right + arrow_w, bar_h],
+                close_rect: [0.0; 4],
+                index: usize::MAX - 1,
+            });
+        }
+
+        // v1.2: "+" button is fixed at the far right edge, outside the scroll
+        // region. It's always visible and clickable.
+        let plus_x0 = vp_w - plus_w;
         let plus_cx = plus_x0 + cw * 0.5;
         let plus_cy = bar_h * 0.5;
         let plus_r = ch * 0.16;
         let plus_line_w = 1.0 * self.scale as f32;
         let plus_color = [fg[0] * 0.7, fg[1] * 0.7, fg[2] * 0.7, 1.0];
-        // Horizontal bar of +
         push_line(
             &mut vertices,
             plus_cx - plus_r,
@@ -5542,7 +5616,6 @@ fragment float4 text_fragment(
             plus_line_w,
             plus_color,
         );
-        // Vertical bar of +
         push_line(
             &mut vertices,
             plus_cx,

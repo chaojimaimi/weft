@@ -76,6 +76,11 @@ struct App {
     /// hover-to-show close "×" button. Reset on tab close/switch and on
     /// `CursorLeft` (mouse leaves the window).
     hovered_tab: Option<usize>,
+    /// v1.2: horizontal scroll offset of the tab bar in physical pixels.
+    /// When tabs overflow the window width, this lets the user scroll
+    /// left/right via arrows, wheel, or trackpad. Clamped to
+    /// [0, total_tab_width - visible_width] each frame.
+    tab_scroll_offset: f32,
     /// v1.1: timestamp of the last click in the titlebar/tab-bar background
     /// (non-tab, non-traffic-light) region. Used to detect double-click →
     /// toggle maximize, matching macOS native titlebar behavior.
@@ -490,6 +495,7 @@ impl App {
             active_tab: 0,
             prev_drawn_tab: 0,
             hovered_tab: None,
+            tab_scroll_offset: 0.0,
             last_titlebar_click: None,
             mods: winit::event::Modifiers::default(),
             cursor_blink_on: true,
@@ -3055,8 +3061,7 @@ impl App {
         }
         info!(tab_idx = self.active_tab, "new tab created");
         self.refresh_find_for_active_tab();
-        // v1.0 H4: persist immediately so a crash before the 30s auto-save
-        // doesn't lose the new tab.
+        self.scroll_active_tab_into_view();
         self.save_all_tabs();
         self.request_redraw();
     }
@@ -3087,8 +3092,8 @@ impl App {
             self.active_tab = self.tabs.len() - 1;
         }
         info!(closed = removed_idx, active = self.active_tab, "tab closed");
-        // v1.0 H4: persist the updated tab list so the closed tab stays
-        // closed on restart.
+        self.clamp_tab_scroll();
+        self.scroll_active_tab_into_view();
         self.save_all_tabs();
         self.refresh_find_for_active_tab();
         self.request_redraw();
@@ -3154,6 +3159,7 @@ impl App {
         self.active_tab = (self.active_tab + 1) % self.tabs.len();
         info!(active = self.active_tab, "switched to next tab");
         self.refresh_find_for_active_tab();
+        self.scroll_active_tab_into_view();
         self.request_redraw();
     }
 
@@ -3169,7 +3175,68 @@ impl App {
         };
         info!(active = self.active_tab, "switched to prev tab");
         self.refresh_find_for_active_tab();
+        self.scroll_active_tab_into_view();
         self.request_redraw();
+    }
+
+    /// v1.2: Clamp `tab_scroll_offset` to the valid range [0, max_scroll].
+    /// Called after every scroll/resize/tab-count change. No-op when tabs
+    /// don't overflow.
+    fn clamp_tab_scroll(&mut self) {
+        if let Some(renderer) = &self.renderer {
+            let cw = renderer.cell_width() as f32;
+            let tl_w = renderer.traffic_lights_width();
+            let pad_x = renderer.padding_x();
+            let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+            let vp_w = renderer.viewport_width();
+            let max_tab_w = cw * 20.0;
+            let total_tab_w = self.tabs.len() as f32 * max_tab_w;
+            let tabs_start = chrome_left + tl_w + pad_x;
+            let avail_for_tabs = vp_w - tabs_start - cw; // -cw for "+"
+            if total_tab_w > avail_for_tabs {
+                let max_scroll = total_tab_w - avail_for_tabs;
+                self.tab_scroll_offset = self.tab_scroll_offset.clamp(0.0, max_scroll);
+            } else {
+                self.tab_scroll_offset = 0.0;
+            }
+        }
+    }
+
+    /// v1.2: Scroll the tab bar so the active tab is visible. Called after
+    /// tab switch, new tab, close tab. If the active tab is already visible,
+    /// no scroll happens.
+    fn scroll_active_tab_into_view(&mut self) {
+        if let Some(renderer) = &self.renderer {
+            let cw = renderer.cell_width() as f32;
+            let tl_w = renderer.traffic_lights_width();
+            let pad_x = renderer.padding_x();
+            let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+            let vp_w = renderer.viewport_width();
+            let max_tab_w = cw * 20.0;
+            let total_tab_w = self.tabs.len() as f32 * max_tab_w;
+            let tabs_start = chrome_left + tl_w + pad_x;
+            let avail_for_tabs = vp_w - tabs_start - cw;
+            if total_tab_w <= avail_for_tabs {
+                return; // No overflow — nothing to scroll.
+            }
+            let arrow_w = cw * 1.8;
+            let vis_left = tabs_start + arrow_w;
+            let vis_right = vp_w - cw - arrow_w;
+            let vis_w = vis_right - vis_left;
+
+            let tab_x0 = self.active_tab as f32 * max_tab_w - self.tab_scroll_offset;
+            let tab_x1 = tab_x0 + max_tab_w;
+            if tab_x0 < 0.0 {
+                // Tab is to the left of visible region — scroll left.
+                self.tab_scroll_offset = (self.active_tab as f32 * max_tab_w).max(0.0);
+            } else if tab_x1 > vis_w {
+                // Tab is to the right — scroll right so the tab's right edge
+                // aligns with the visible region's right edge.
+                let target = self.active_tab as f32 * max_tab_w + max_tab_w - vis_w;
+                self.tab_scroll_offset = target.max(0.0);
+            }
+            self.clamp_tab_scroll();
+        }
     }
 
     /// Build the `TabBarDrawState` for the renderer from the current tab list.
@@ -3228,6 +3295,7 @@ impl App {
             active_tab: self.active_tab,
             labels,
             hovered_tab: self.hovered_tab,
+            scroll_offset: self.tab_scroll_offset,
         }
     }
 
@@ -4099,6 +4167,31 @@ impl App {
                     let xf = x as f32;
                     let yf = y as f32;
                     for hit in &renderer.tab_hits {
+                        // v1.2: Check scroll-arrow sentinel values first.
+                        // usize::MAX = left arrow, usize::MAX - 1 = right arrow.
+                        if hit.index == usize::MAX {
+                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
+                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
+                                let cw = renderer.cell_width() as f32;
+                                self.tab_scroll_offset =
+                                    (self.tab_scroll_offset - cw * 15.0).max(0.0);
+                                self.clamp_tab_scroll();
+                                self.request_redraw();
+                                return;
+                            }
+                            continue;
+                        }
+                        if hit.index == usize::MAX - 1 {
+                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
+                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
+                                let cw = renderer.cell_width() as f32;
+                                self.tab_scroll_offset += cw * 15.0;
+                                self.clamp_tab_scroll();
+                                self.request_redraw();
+                                return;
+                            }
+                            continue;
+                        }
                         // Check close button first (it's inside the tab rect).
                         let [cx0, cy0, cx1, cy1] = hit.close_rect;
                         if xf >= cx0 && xf < cx1 && yf >= cy0 && yf < cy1 {
@@ -4125,12 +4218,10 @@ impl App {
                         if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
                             if self.active_tab != hit.index {
                                 self.active_tab = hit.index;
-                                // v0.9 H1 Stage 4 fix: re-bind find state to
-                                // the new active tab so matches come from its
-                                // content, not the previous tab's.
                                 self.refresh_find_for_active_tab();
                             }
                             self.hovered_tab = None;
+                            self.scroll_active_tab_into_view();
                             self.request_redraw();
                             return;
                         }
@@ -4829,6 +4920,35 @@ impl App {
                 .unwrap_or(false);
             if before == after {
                 break;
+            }
+        }
+
+        // v1.2: If the scroll event is over the tab bar, adjust the tab bar
+        // horizontal scroll offset instead of scrolling the terminal. This
+        // lets the user navigate overflowed tabs via trackpad / wheel.
+        if let Some(renderer) = &self.renderer {
+            let bar_h = renderer.tab_bar_height();
+            if y as f32 <= bar_h && self.tabs.len() > 1 {
+                let cw = renderer.cell_width() as f32;
+                let scroll_step = cw * 15.0; // scroll ~1 tab width per notch
+                let delta_px = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, v) => {
+                        // Vertical wheel in tab bar → horizontal scroll.
+                        -v * scroll_step
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                        // Trackpad: use deltaX if significant, else convert deltaY.
+                        if pos.x.abs() > pos.y.abs() {
+                            -(pos.x as f32)
+                        } else {
+                            -(pos.y as f32) * 0.5
+                        }
+                    }
+                };
+                self.tab_scroll_offset = (self.tab_scroll_offset + delta_px).max(0.0);
+                self.clamp_tab_scroll();
+                self.request_redraw();
+                return;
             }
         }
 
