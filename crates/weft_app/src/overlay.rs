@@ -316,6 +316,7 @@ impl OverlayWarmup for OverlayContent<'_> {
                 // and ⚠ (U+26A0) for the save-error banner.
                 missing.extend("↑↓⏎⇥⌘←→esc navigate apply switch adjust close save".chars());
                 missing.insert('\u{26a0}');
+                missing.insert('\u{25cf}'); // ● current-theme marker
                 missing.extend(s.theme_name.chars());
                 missing.extend(s.font_family.chars());
                 if let Some(err) = s.error {

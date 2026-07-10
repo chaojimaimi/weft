@@ -3656,9 +3656,76 @@ fragment float4 text_fragment(
                 ];
                 for (i, (label, value)) in rows.iter().enumerate() {
                     let row_y = content_top + i as f32 * ch;
-                    self.push_text(&mut verts, content_x0, row_y, label, label_c, content_cols);
+                    let is_sel = i == s.selection;
+                    // v1.2: selection highlight for adjustable rows.
+                    if is_sel {
+                        push_quad(
+                            &mut verts,
+                            [content_x0, row_y, content_x1, row_y + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
+                    let label_color = if is_sel { fg } else { label_c };
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        row_y,
+                        label,
+                        label_color,
+                        content_cols,
+                    );
                     let value_x = content_x0 + cw * 12.0;
-                    self.push_text(&mut verts, value_x, row_y, value, fg, content_cols);
+                    let value_color = if is_sel { accent } else { fg };
+                    self.push_text(&mut verts, value_x, row_y, value, value_color, content_cols);
+                    // v1.2: adjustment triangles ◁ ▷ on the selected row.
+                    if is_sel {
+                        let tri_color = accent;
+                        let tri_r = ch * 0.12;
+                        let tri_cy = row_y + ch * 0.5;
+                        let tri_lx = value_x - cw * 0.8;
+                        let tri_rx = value_x + cw * Self::text_col_width(value) as f32 + cw * 0.8;
+                        let tri_w = 1.0 * self.scale as f32;
+                        // ◁ (pointing left, on the left side of value)
+                        push_line(
+                            &mut verts,
+                            tri_lx + tri_r,
+                            tri_cy - tri_r,
+                            tri_lx,
+                            tri_cy,
+                            tri_w,
+                            tri_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            tri_lx,
+                            tri_cy,
+                            tri_lx + tri_r,
+                            tri_cy + tri_r,
+                            tri_w,
+                            tri_color,
+                        );
+                        // ▷ (pointing right, on the right side of value)
+                        push_line(
+                            &mut verts,
+                            tri_rx - tri_r,
+                            tri_cy - tri_r,
+                            tri_rx,
+                            tri_cy,
+                            tri_w,
+                            tri_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            tri_rx,
+                            tri_cy,
+                            tri_rx - tri_r,
+                            tri_cy + tri_r,
+                            tri_w,
+                            tri_color,
+                        );
+                    }
                 }
             }
             SettingsTab::Keybindings => {
@@ -3750,32 +3817,152 @@ fragment float4 text_fragment(
                 ];
                 for (i, (label, value)) in rows.iter().enumerate() {
                     let row_y = content_top + i as f32 * ch;
-                    self.push_text(&mut verts, content_x0, row_y, label, label_c, content_cols);
+                    let is_sel = i == s.selection;
+                    if is_sel {
+                        push_quad(
+                            &mut verts,
+                            [content_x0, row_y, content_x1, row_y + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
+                    let label_color = if is_sel { fg } else { label_c };
+                    self.push_text(
+                        &mut verts,
+                        content_x0,
+                        row_y,
+                        label,
+                        label_color,
+                        content_cols,
+                    );
                     let value_x = content_x0 + cw * 12.0;
-                    self.push_text(&mut verts, value_x, row_y, value, fg, content_cols);
+                    let value_color = if is_sel { accent } else { fg };
+                    self.push_text(&mut verts, value_x, row_y, value, value_color, content_cols);
+                    if is_sel {
+                        let tri_color = accent;
+                        let tri_r = ch * 0.12;
+                        let tri_cy = row_y + ch * 0.5;
+                        let tri_lx = value_x - cw * 0.8;
+                        let tri_rx = value_x + cw * Self::text_col_width(value) as f32 + cw * 0.8;
+                        let tri_w = 1.0 * self.scale as f32;
+                        push_line(
+                            &mut verts,
+                            tri_lx + tri_r,
+                            tri_cy - tri_r,
+                            tri_lx,
+                            tri_cy,
+                            tri_w,
+                            tri_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            tri_lx,
+                            tri_cy,
+                            tri_lx + tri_r,
+                            tri_cy + tri_r,
+                            tri_w,
+                            tri_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            tri_rx - tri_r,
+                            tri_cy - tri_r,
+                            tri_rx,
+                            tri_cy,
+                            tri_w,
+                            tri_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            tri_rx,
+                            tri_cy,
+                            tri_rx - tri_r,
+                            tri_cy + tri_r,
+                            tri_w,
+                            tri_color,
+                        );
+                    }
                 }
             }
             // v1.0 Logo: single row — Variant label + current value.
             // ←/→ cycles through LogoVariant::ALL (Cool/Warm/Light/Transparent).
             SettingsTab::Logo => {
                 let row_y = content_top;
+                let is_sel = s.selection == 0;
+                if is_sel {
+                    push_quad(
+                        &mut verts,
+                        [content_x0, row_y, content_x1, row_y + ch],
+                        bg_uv,
+                        [0.0; 4],
+                        selection_bg,
+                    );
+                }
+                let label_color = if is_sel { fg } else { label_c };
                 self.push_text(
                     &mut verts,
                     content_x0,
                     row_y,
                     "Variant:",
-                    label_c,
+                    label_color,
                     content_cols,
                 );
                 let value_x = content_x0 + cw * 12.0;
+                let value_str = s.logo_variant.label();
+                let value_color = if is_sel { accent } else { fg };
                 self.push_text(
                     &mut verts,
                     value_x,
                     row_y,
-                    s.logo_variant.label(),
-                    fg,
+                    value_str,
+                    value_color,
                     content_cols,
                 );
+                if is_sel {
+                    let tri_color = accent;
+                    let tri_r = ch * 0.12;
+                    let tri_cy = row_y + ch * 0.5;
+                    let tri_lx = value_x - cw * 0.8;
+                    let tri_rx = value_x + cw * Self::text_col_width(value_str) as f32 + cw * 0.8;
+                    let tri_w = 1.0 * self.scale as f32;
+                    push_line(
+                        &mut verts,
+                        tri_lx + tri_r,
+                        tri_cy - tri_r,
+                        tri_lx,
+                        tri_cy,
+                        tri_w,
+                        tri_color,
+                    );
+                    push_line(
+                        &mut verts,
+                        tri_lx,
+                        tri_cy,
+                        tri_lx + tri_r,
+                        tri_cy + tri_r,
+                        tri_w,
+                        tri_color,
+                    );
+                    push_line(
+                        &mut verts,
+                        tri_rx - tri_r,
+                        tri_cy - tri_r,
+                        tri_rx,
+                        tri_cy,
+                        tri_w,
+                        tri_color,
+                    );
+                    push_line(
+                        &mut verts,
+                        tri_rx,
+                        tri_cy,
+                        tri_rx - tri_r,
+                        tri_cy + tri_r,
+                        tri_w,
+                        tri_color,
+                    );
+                }
             }
         }
 
@@ -5565,11 +5752,13 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Close button — only render if its center is within vis_right.
+            // Close button — only render when the ENTIRE tab is visible
+            // (x0 >= vis_left AND x1 <= vis_right). When a tab is partially
+            // scrolled under an arrow, hiding × prevents accidental closes.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
-            let close_cx = close_x0 + close_w * 0.5;
-            if (is_active || is_hovered) && close_cx < vis_right && close_x0 >= vis_left {
+            let tab_fully_visible = x0 >= vis_left && x1 <= vis_right;
+            if (is_active || is_hovered) && tab_fully_visible {
                 let close_color = if is_active {
                     fg
                 } else {
