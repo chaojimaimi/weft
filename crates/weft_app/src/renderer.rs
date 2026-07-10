@@ -3612,13 +3612,13 @@ fragment float4 text_fragment(
 
         match s.active_tab {
             SettingsTab::Appearance => {
-                // Theme list — Warp-style: checkmark for current theme,
-                // subtle selection highlight for the cursor row.
+                // Theme list — Warp-style: vector-drawn circle for current
+                // theme (avoids the ● glyph rendering as an oval because the
+                // cell is wider than tall), subtle selection highlight.
                 for (i, theme) in s.themes.iter().take(max_rows).enumerate() {
                     let row_y = content_top + i as f32 * ch;
                     let is_current = theme.name == s.theme_name;
                     let is_selected = i == s.selection;
-                    // Selection highlight.
                     if is_selected {
                         push_quad(
                             &mut verts,
@@ -3628,20 +3628,69 @@ fragment float4 text_fragment(
                             selection_bg,
                         );
                     }
-                    // Current theme: accent checkmark; others: blank space.
-                    let prefix = if is_current { "● " } else { "  " };
+                    // v1.2: draw a vector circle (current) or ring (others)
+                    // at the row's left edge. Uses push_line segments to
+                    // approximate a circle with radius based on ch (not cw),
+                    // so it stays round regardless of cell aspect ratio.
+                    let dot_cx = content_x0 + ch * 0.35;
+                    let dot_cy = row_y + ch * 0.5;
+                    let dot_r = ch * 0.16;
+                    let dot_color = if is_current {
+                        accent
+                    } else {
+                        [fg[0] * 0.3, fg[1] * 0.3, fg[2] * 0.3, 1.0]
+                    };
+                    let dot_lw = if is_current {
+                        1.5 * self.scale as f32
+                    } else {
+                        1.0 * self.scale as f32
+                    };
+                    // Approximate circle with 8 line segments.
+                    let segments = 8;
+                    for s_idx in 0..segments {
+                        let a0 = s_idx as f32 * std::f32::consts::TAU / segments as f32;
+                        let a1 = (s_idx + 1) as f32 * std::f32::consts::TAU / segments as f32;
+                        if !is_current && s_idx % 2 == 0 {
+                            // Ring: skip alternate segments for a dashed look.
+                            // Actually, draw all segments but with dim color —
+                            // a full ring is cleaner.
+                        }
+                        push_line(
+                            &mut verts,
+                            dot_cx + dot_r * a0.cos(),
+                            dot_cy + dot_r * a0.sin(),
+                            dot_cx + dot_r * a1.cos(),
+                            dot_cy + dot_r * a1.sin(),
+                            dot_lw,
+                            dot_color,
+                        );
+                    }
+                    // For current theme, fill the circle with a center dot.
+                    if is_current {
+                        push_quad(
+                            &mut verts,
+                            [
+                                dot_cx - dot_r * 0.4,
+                                dot_cy - dot_r * 0.4,
+                                dot_cx + dot_r * 0.4,
+                                dot_cy + dot_r * 0.4,
+                            ],
+                            [0.0; 4],
+                            [0.0; 4],
+                            accent,
+                        );
+                    }
+                    // Label starts after the dot area (reserve 2 cells width
+                    // matching the old "● " / "  " prefix).
                     let label_color = if is_current { accent } else { fg };
-                    let label = format!("{}{}", prefix, theme.label);
                     self.push_text(
                         &mut verts,
-                        content_x0,
+                        content_x0 + cw * 2.0,
                         row_y,
-                        &label,
+                        theme.label,
                         label_color,
                         content_cols,
                     );
-                    // v1.0 S1-b: hit-test row so a click selects + applies
-                    // the theme (matching Enter's behavior on that row).
                     hits.push(SettingsHit {
                         kind: SettingsHitKind::Theme(i),
                         rect: [content_x0, row_y, content_x1, row_y + ch],
@@ -3654,10 +3703,12 @@ fragment float4 text_fragment(
                     ("Size:", &format!("{:.1} pt", s.font_size)),
                     ("Line height:", &format!("{:.2}", s.line_height)),
                 ];
+                // v1.2-fix: value_x aligned after the longest label so
+                // triangles don't overlap label text (e.g. "Line height:").
+                let value_x = content_x0 + cw * 14.0;
                 for (i, (label, value)) in rows.iter().enumerate() {
                     let row_y = content_top + i as f32 * ch;
                     let is_sel = i == s.selection;
-                    // v1.2: selection highlight for adjustable rows.
                     if is_sel {
                         push_quad(
                             &mut verts,
@@ -3676,53 +3727,37 @@ fragment float4 text_fragment(
                         label_color,
                         content_cols,
                     );
-                    let value_x = content_x0 + cw * 12.0;
                     let value_color = if is_sel { accent } else { fg };
                     self.push_text(&mut verts, value_x, row_y, value, value_color, content_cols);
-                    // v1.2: adjustment triangles ◁ ▷ on the selected row.
+                    // v1.2: filled triangle indicators ◀ ▶ on the selected row.
                     if is_sel {
                         let tri_color = accent;
-                        let tri_r = ch * 0.12;
+                        let tri_h = ch * 0.14; // half-height of triangle
+                        let tri_w = ch * 0.10; // half-width of triangle
                         let tri_cy = row_y + ch * 0.5;
-                        let tri_lx = value_x - cw * 0.8;
-                        let tri_rx = value_x + cw * Self::text_col_width(value) as f32 + cw * 0.8;
-                        let tri_w = 1.0 * self.scale as f32;
-                        // ◁ (pointing left, on the left side of value)
-                        push_line(
-                            &mut verts,
-                            tri_lx + tri_r,
-                            tri_cy - tri_r,
-                            tri_lx,
-                            tri_cy,
-                            tri_w,
-                            tri_color,
-                        );
-                        push_line(
+                        let val_text_w = cw * Self::text_col_width(value) as f32;
+                        let tri_lx = value_x - cw * 0.6;
+                        let tri_rx = value_x + val_text_w + cw * 0.6;
+                        // ◀ (pointing left): tip at tri_lx, base at tri_lx + tri_w
+                        push_filled_triangle(
                             &mut verts,
                             tri_lx,
                             tri_cy,
-                            tri_lx + tri_r,
-                            tri_cy + tri_r,
-                            tri_w,
+                            tri_lx + tri_w,
+                            tri_cy - tri_h,
+                            tri_lx + tri_w,
+                            tri_cy + tri_h,
                             tri_color,
                         );
-                        // ▷ (pointing right, on the right side of value)
-                        push_line(
-                            &mut verts,
-                            tri_rx - tri_r,
-                            tri_cy - tri_r,
-                            tri_rx,
-                            tri_cy,
-                            tri_w,
-                            tri_color,
-                        );
-                        push_line(
+                        // ▶ (pointing right): tip at tri_rx, base at tri_rx - tri_w
+                        push_filled_triangle(
                             &mut verts,
                             tri_rx,
                             tri_cy,
-                            tri_rx - tri_r,
-                            tri_cy + tri_r,
-                            tri_w,
+                            tri_rx - tri_w,
+                            tri_cy - tri_h,
+                            tri_rx - tri_w,
+                            tri_cy + tri_h,
                             tri_color,
                         );
                     }
@@ -3815,6 +3850,7 @@ fragment float4 text_fragment(
                     ("Padding Y:", format!("{} cells", s.window_padding_y)),
                     ("Scrollback:", format!("{} lines", s.scrollback_lines)),
                 ];
+                let value_x = content_x0 + cw * 14.0;
                 for (i, (label, value)) in rows.iter().enumerate() {
                     let row_y = content_top + i as f32 * ch;
                     let is_sel = i == s.selection;
@@ -3836,50 +3872,34 @@ fragment float4 text_fragment(
                         label_color,
                         content_cols,
                     );
-                    let value_x = content_x0 + cw * 12.0;
                     let value_color = if is_sel { accent } else { fg };
                     self.push_text(&mut verts, value_x, row_y, value, value_color, content_cols);
                     if is_sel {
                         let tri_color = accent;
-                        let tri_r = ch * 0.12;
+                        let tri_h = ch * 0.14;
+                        let tri_w = ch * 0.10;
                         let tri_cy = row_y + ch * 0.5;
-                        let tri_lx = value_x - cw * 0.8;
-                        let tri_rx = value_x + cw * Self::text_col_width(value) as f32 + cw * 0.8;
-                        let tri_w = 1.0 * self.scale as f32;
-                        push_line(
-                            &mut verts,
-                            tri_lx + tri_r,
-                            tri_cy - tri_r,
-                            tri_lx,
-                            tri_cy,
-                            tri_w,
-                            tri_color,
-                        );
-                        push_line(
+                        let val_text_w = cw * Self::text_col_width(value) as f32;
+                        let tri_lx = value_x - cw * 0.6;
+                        let tri_rx = value_x + val_text_w + cw * 0.6;
+                        push_filled_triangle(
                             &mut verts,
                             tri_lx,
                             tri_cy,
-                            tri_lx + tri_r,
-                            tri_cy + tri_r,
-                            tri_w,
+                            tri_lx + tri_w,
+                            tri_cy - tri_h,
+                            tri_lx + tri_w,
+                            tri_cy + tri_h,
                             tri_color,
                         );
-                        push_line(
-                            &mut verts,
-                            tri_rx - tri_r,
-                            tri_cy - tri_r,
-                            tri_rx,
-                            tri_cy,
-                            tri_w,
-                            tri_color,
-                        );
-                        push_line(
+                        push_filled_triangle(
                             &mut verts,
                             tri_rx,
                             tri_cy,
-                            tri_rx - tri_r,
-                            tri_cy + tri_r,
-                            tri_w,
+                            tri_rx - tri_w,
+                            tri_cy - tri_h,
+                            tri_rx - tri_w,
+                            tri_cy + tri_h,
                             tri_color,
                         );
                     }
@@ -3908,7 +3928,7 @@ fragment float4 text_fragment(
                     label_color,
                     content_cols,
                 );
-                let value_x = content_x0 + cw * 12.0;
+                let value_x = content_x0 + cw * 14.0;
                 let value_str = s.logo_variant.label();
                 let value_color = if is_sel { accent } else { fg };
                 self.push_text(
@@ -3921,45 +3941,30 @@ fragment float4 text_fragment(
                 );
                 if is_sel {
                     let tri_color = accent;
-                    let tri_r = ch * 0.12;
+                    let tri_h = ch * 0.14;
+                    let tri_w = ch * 0.10;
                     let tri_cy = row_y + ch * 0.5;
-                    let tri_lx = value_x - cw * 0.8;
-                    let tri_rx = value_x + cw * Self::text_col_width(value_str) as f32 + cw * 0.8;
-                    let tri_w = 1.0 * self.scale as f32;
-                    push_line(
-                        &mut verts,
-                        tri_lx + tri_r,
-                        tri_cy - tri_r,
-                        tri_lx,
-                        tri_cy,
-                        tri_w,
-                        tri_color,
-                    );
-                    push_line(
+                    let val_text_w = cw * Self::text_col_width(value_str) as f32;
+                    let tri_lx = value_x - cw * 0.6;
+                    let tri_rx = value_x + val_text_w + cw * 0.6;
+                    push_filled_triangle(
                         &mut verts,
                         tri_lx,
                         tri_cy,
-                        tri_lx + tri_r,
-                        tri_cy + tri_r,
-                        tri_w,
+                        tri_lx + tri_w,
+                        tri_cy - tri_h,
+                        tri_lx + tri_w,
+                        tri_cy + tri_h,
                         tri_color,
                     );
-                    push_line(
-                        &mut verts,
-                        tri_rx - tri_r,
-                        tri_cy - tri_r,
-                        tri_rx,
-                        tri_cy,
-                        tri_w,
-                        tri_color,
-                    );
-                    push_line(
+                    push_filled_triangle(
                         &mut verts,
                         tri_rx,
                         tri_cy,
-                        tri_rx - tri_r,
-                        tri_cy + tri_r,
-                        tri_w,
+                        tri_rx - tri_w,
+                        tri_cy - tri_h,
+                        tri_rx - tri_w,
+                        tri_cy + tri_h,
                         tri_color,
                     );
                 }
@@ -5650,7 +5655,10 @@ fragment float4 text_fragment(
         };
 
         let close_w = cw * 2.0;
-        let label_w = tab_w - close_w;
+        // v1.2-fix: reserve a small gap between label text and close button
+        // so truncated "…" doesn't overlap the × icon.
+        let label_gap = cw * 0.5;
+        let label_w = tab_w - close_w - label_gap;
         let y0 = 0.0f32;
         let y1 = bar_h;
 
@@ -5752,13 +5760,21 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Close button — only render when the ENTIRE tab is visible
-            // (x0 >= vis_left AND x1 <= vis_right). When a tab is partially
-            // scrolled under an arrow, hiding × prevents accidental closes.
+            // Close button rendering rules:
+            //   - Active tab: × always shown (even if partially visible, so
+            //     the user can always close the current tab). Position is
+            //     clamped to [vis_left, vis_right].
+            //   - Inactive tab: × only when fully visible AND hovered.
+            //   - Partially visible inactive tab: × hidden entirely.
             let close_x0 = x0 + label_w;
             let close_x1 = x1;
             let tab_fully_visible = x0 >= vis_left && x1 <= vis_right;
-            if (is_active || is_hovered) && tab_fully_visible {
+            let show_close = if is_active {
+                true // active tab always shows ×
+            } else {
+                is_hovered && tab_fully_visible
+            };
+            if show_close {
                 let close_color = if is_active {
                     fg
                 } else {
@@ -5788,9 +5804,17 @@ fragment float4 text_fragment(
                 );
             }
 
+            // Hit rect: close_rect only registered when the tab is fully
+            // visible. Partially visible tabs have close_rect = [0;4] so
+            // clicks on the clipped area don't accidentally close the tab.
+            let hit_close_rect = if tab_fully_visible {
+                [close_x0, y0, close_x1, y1]
+            } else {
+                [0.0; 4]
+            };
             hits.push(TabHit {
-                tab_rect: [x0, y0, x1, y1],
-                close_rect: [close_x0, y0, close_x1, y1],
+                tab_rect: [x0.max(vis_left), y0, x1.min(vis_right), y1],
+                close_rect: hit_close_rect,
                 index: i,
             });
         }
@@ -6128,6 +6152,29 @@ fn push_line(
     let uv = [0.0f32; 4];
     let fg = [0.0f32; 4];
     for (x, y) in [(ax, ay), (bx, by), (cx, cy), (bx, by), (dx, dy), (cx, cy)] {
+        vertices.extend_from_slice(&[
+            x, y, uv[0], uv[1], fg[0], fg[1], fg[2], fg[3], color[0], color[1], color[2], color[3],
+        ]);
+    }
+}
+
+/// Draw a filled triangle (3 vertices, 1 triangle = 3 vertices in the
+/// vertex buffer). Used for solid adjustment-triangle indicators ◀ ▶ in
+/// the Settings panel. The triangle is specified by 3 (x,y) corner points.
+#[allow(clippy::too_many_arguments)]
+fn push_filled_triangle(
+    vertices: &mut Vec<f32>,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
+    color: [f32; 4],
+) {
+    let uv = [0.0f32; 4];
+    let fg = [0.0f32; 4];
+    for (x, y) in [(x0, y0), (x1, y1), (x2, y2)] {
         vertices.extend_from_slice(&[
             x, y, uv[0], uv[1], fg[0], fg[1], fg[2], fg[3], color[0], color[1], color[2], color[3],
         ]);
