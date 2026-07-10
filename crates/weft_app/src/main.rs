@@ -3246,18 +3246,23 @@ impl App {
             }
             let vis_left = tabs_start + arrow_w;
             let vis_right = vp_w - right_reserve - arrow_w;
-            let vis_w = vis_right - vis_left;
 
-            // Tab position relative to vis_left (in tab-bar content space).
-            let tab_x0 = self.active_tab as f32 * min_tab_w - self.tab_scroll_offset;
-            let tab_x1 = tab_x0 + min_tab_w;
-            if tab_x0 < 0.0 {
-                // Tab is to the left of visible region — scroll left.
-                self.tab_scroll_offset = (self.active_tab as f32 * min_tab_w).max(0.0);
-            } else if tab_x1 > vis_w {
-                // Tab is to the right — scroll right.
-                let target = self.active_tab as f32 * min_tab_w + min_tab_w - vis_w;
-                self.tab_scroll_offset = target.max(0.0);
+            // Compute the active tab's ABSOLUTE position on screen.
+            // abs_x0 = tabs_start + active*tab_w - scroll_offset.
+            let abs_x0 = tabs_start + self.active_tab as f32 * min_tab_w - self.tab_scroll_offset;
+            let abs_x1 = abs_x0 + min_tab_w;
+
+            if abs_x0 < vis_left {
+                // Tab left edge is under the left arrow — scroll right so the
+                // tab's left edge aligns with vis_left (fully visible).
+                self.tab_scroll_offset =
+                    (tabs_start + self.active_tab as f32 * min_tab_w - vis_left).max(0.0);
+            } else if abs_x1 > vis_right {
+                // Tab right edge is past the right arrow — scroll left so the
+                // tab's right edge aligns with vis_right.
+                self.tab_scroll_offset =
+                    (tabs_start + self.active_tab as f32 * min_tab_w + min_tab_w - vis_right)
+                        .max(0.0);
             }
             self.clamp_tab_scroll();
         }

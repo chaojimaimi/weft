@@ -5726,20 +5726,14 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Tab label — render the visible portion. When the tab is
-            // partially scrolled under the left arrow, shift the label start
-            // to vis_left so text begins where it becomes visible (rather
-            // than being entirely skipped). When the tab extends past
-            // vis_right, truncate columns so text doesn't overlap the "+"
-            // button or right arrow.
-            let label_x_raw = x0 + cw * 0.5;
-            let label_x = label_x_raw.max(vis_left);
-            // Available width for text: from label_x to the lesser of the
-            // tab's own right edge (x1) and vis_right.
-            let text_right = x1.min(vis_right);
+            // ── Tab label ──
+            // Text starts at x0 + cw*0.5 (clamped to vis_left). Text must end
+            // before the close button area: text_right = min(x1, vis_right)
+            // - close_w. This ensures "…" truncation never overlaps ×.
+            let label_x = (x0 + cw * 0.5).max(vis_left);
+            let text_right = x1.min(vis_right) - close_w;
             let avail_text_w = (text_right - label_x).max(0.0);
             if avail_text_w >= cw {
-                // Column budget based on actual visible width, not full tab.
                 let max_cols = ((avail_text_w / cw) as usize).max(1);
                 let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
                 let display = truncate_str(label, max_cols.saturating_sub(1));
@@ -5760,54 +5754,48 @@ fragment float4 text_fragment(
                 );
             }
 
-            // Close button rendering rules:
-            //   - Active tab: × always shown (even if partially visible, so
-            //     the user can always close the current tab). Position is
-            //     clamped to [vis_left, vis_right].
-            //   - Inactive tab: × only when fully visible AND hovered.
-            //   - Partially visible inactive tab: × hidden entirely.
-            let close_x0 = x0 + label_w;
-            let close_x1 = x1;
-            let tab_fully_visible = x0 >= vis_left && x1 <= vis_right;
-            let show_close = if is_active {
-                true // active tab always shows ×
-            } else {
-                is_hovered && tab_fully_visible
-            };
+            // ── Close button ──
+            // The × center cx = x0 + label_w + close_w*0.5. The × is shown
+            // only when cx is inside the visible region [vis_left, vis_right]
+            // — this applies to BOTH active and inactive tabs, so the × never
+            // overlaps the scroll arrows, "+" button, or tab label text.
+            // Inactive tabs additionally require hover.
+            let close_cx = x0 + label_w + close_w * 0.5;
+            let close_cy = y0 + bar_h * 0.5;
+            let close_r = if is_active { ch * 0.16 } else { ch * 0.13 };
+            let cx_in_view = close_cx - close_r >= vis_left && close_cx + close_r <= vis_right;
+            let show_close = cx_in_view && (is_active || is_hovered);
             if show_close {
                 let close_color = if is_active {
                     fg
                 } else {
                     [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
                 };
-                let cx = close_x0 + close_w * 0.5;
-                let cy = y0 + bar_h * 0.5;
-                let r = if is_active { ch * 0.16 } else { ch * 0.13 };
                 let line_w = 1.0 * self.scale as f32;
                 push_line(
                     &mut vertices,
-                    cx - r,
-                    cy - r,
-                    cx + r,
-                    cy + r,
+                    close_cx - close_r,
+                    close_cy - close_r,
+                    close_cx + close_r,
+                    close_cy + close_r,
                     line_w,
                     close_color,
                 );
                 push_line(
                     &mut vertices,
-                    cx - r,
-                    cy + r,
-                    cx + r,
-                    cy - r,
+                    close_cx - close_r,
+                    close_cy + close_r,
+                    close_cx + close_r,
+                    close_cy - close_r,
                     line_w,
                     close_color,
                 );
             }
 
-            // Hit rect: close_rect only registered when the tab is fully
-            // visible. Partially visible tabs have close_rect = [0;4] so
-            // clicks on the clipped area don't accidentally close the tab.
-            let hit_close_rect = if tab_fully_visible {
+            // Hit rect: close_rect registered only when cx is in view.
+            let close_x0 = x0 + label_w;
+            let close_x1 = x0 + label_w + close_w;
+            let hit_close_rect = if cx_in_view {
                 [close_x0, y0, close_x1, y1]
             } else {
                 [0.0; 4]
