@@ -17,5 +17,11 @@ Thumbs.db
 # Claude Code (local config, not project-level)
 .claude/
 
+# ZCode harness working directory
+.zcode/
+
+# Runtime log
+weft.log
+
 # Icon generation intermediate files (kept .icns only)
 assets/icon.iconset/
