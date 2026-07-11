@@ -249,8 +249,11 @@ impl App {
     pub(super) fn execute_context_menu(&mut self, menu: &ContextMenu, click_x: f32, click_y: f32) {
         let hit = self.renderer.as_ref().and_then(|renderer| {
             let ctx = renderer.layout_ctx?;
-            crate::layout::layout_context_menu(&ctx, menu.x, menu.y, renderer.scale() as f32)
-                .item_at(click_x, click_y)
+            let layout =
+                crate::layout::layout_context_menu(&ctx, menu.x, menu.y, renderer.scale() as f32);
+            let scene =
+                crate::context_menu_component::build_context_menu_scene(layout, CONTEXT_MENU_ITEMS);
+            crate::context_menu_component::context_menu_item_at(&scene, click_x, click_y)
         });
         if let Some(i) = hit {
             let action = CONTEXT_MENU_ITEMS[i].1;
@@ -265,78 +268,73 @@ impl App {
     /// Run a context menu action on the target block.
     /// `block_id` is `None` for the in-flight (running) command.
     pub(super) fn run_context_action(&mut self, block_id: Option<BlockId>, action: &str) {
-        let Some(terminal) = &mut self.sessions.tabs[self.sessions.active_tab].terminal else {
-            return;
-        };
+        let mut clipboard_text = None;
+        {
+            let Some(terminal) = &mut self.sessions.tabs[self.sessions.active_tab].terminal else {
+                return;
+            };
 
-        match action {
-            "copy_command" | "copy_output" => {
-                // For in-flight blocks, copy from the live command/output.
-                if block_id.is_none() {
+            match action {
+                "copy_command" | "copy_output" if block_id.is_none() => {
                     if let Some(live) = terminal.block_tracker().in_flight() {
                         let text = if action == "copy_command" {
                             live.command.to_string()
                         } else {
                             live.output.to_string()
                         };
-                        clipboard_copy(&text);
-                        info!(len = text.len(), "copied in-flight to clipboard");
+                        clipboard_text = Some(text);
                     }
-                    return;
                 }
-                let bid = block_id.unwrap();
-                let block = terminal
-                    .block_tracker()
-                    .session_blocks()
-                    .iter()
-                    .find(|b| b.id == bid);
-                if let Some(b) = block {
-                    let text = if action == "copy_command" {
-                        &b.command
-                    } else {
-                        &b.output
-                    };
-                    clipboard_copy(text);
-                    info!(len = text.len(), "copied to clipboard");
+                "copy_command" | "copy_output" => {
+                    let bid = block_id.expect("copy branch has a finalized block id");
+                    let block = terminal
+                        .block_tracker()
+                        .session_blocks()
+                        .iter()
+                        .find(|b| b.id == bid);
+                    if let Some(block) = block {
+                        clipboard_text = Some(if action == "copy_command" {
+                            block.command.clone()
+                        } else {
+                            block.output.clone()
+                        });
+                    }
                 }
-            }
-            "toggle_fold" => {
-                if let Some(bid) = block_id {
-                    terminal.block_tracker_mut().toggle_collapse(bid);
+                "toggle_fold" => {
+                    if let Some(bid) = block_id {
+                        terminal.block_tracker_mut().toggle_collapse(bid);
+                    }
+                    // In-flight blocks can't be folded (no finalized block yet).
                 }
-                // In-flight blocks can't be folded (no finalized block yet).
-            }
-            // W4: copy the block's command into the editor buffer so the user
-            // can tweak parameters and re-submit (Warp-style "rerun"). Only
-            // takes effect at the prompt — when a command is running or an
-            // alt-screen app is active, the editor isn't the effective input
-            // mode, so we silently no-op rather than stashing text the user
-            // would see resurface unexpectedly when the prompt returns.
-            "send_to_input" => {
-                if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
-                    // Clone first to release the immutable borrow before editor_mut().
-                    let cmd = if let Some(bid) = block_id {
-                        terminal
-                            .block_tracker()
-                            .session_blocks()
-                            .iter()
-                            .find(|b| b.id == bid)
-                            .map(|b| b.command.clone())
-                    } else {
-                        terminal
-                            .block_tracker()
-                            .in_flight()
-                            .map(|f| f.command.to_string())
-                    };
-                    if let Some(cmd) = cmd {
-                        if !cmd.is_empty() {
+                // W4: copy the block's command into the editor buffer so the user
+                // can tweak parameters and re-submit (Warp-style "rerun").
+                "send_to_input" => {
+                    if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
+                        let cmd = if let Some(bid) = block_id {
+                            terminal
+                                .block_tracker()
+                                .session_blocks()
+                                .iter()
+                                .find(|b| b.id == bid)
+                                .map(|b| b.command.clone())
+                        } else {
+                            terminal
+                                .block_tracker()
+                                .in_flight()
+                                .map(|f| f.command.to_string())
+                        };
+                        if let Some(cmd) = cmd.filter(|cmd| !cmd.is_empty()) {
                             terminal.editor_mut().buffer.set_text(&cmd);
                         }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
+        if let Some(text) = clipboard_text.as_ref() {
+            info!(len = text.len(), "context action copied to clipboard");
+        }
+        self.drain_effects(effect::context_clipboard_effects(clipboard_text));
     }
 
     /// Handle scroll wheel.

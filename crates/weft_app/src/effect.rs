@@ -80,11 +80,16 @@ pub(crate) fn copy_clipboard_effects(text: Option<String>) -> Vec<Effect> {
         .unwrap_or_default()
 }
 
+pub(crate) fn context_clipboard_effects(text: Option<String>) -> Vec<Effect> {
+    text.map(|text| vec![Effect::CopyClipboard { text }])
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_clipboard_effects, ime_commit_effects, passthrough_key_effects,
-        pending_resize_effects, Effect,
+        context_clipboard_effects, copy_clipboard_effects, ime_commit_effects,
+        passthrough_key_effects, pending_resize_effects, Effect,
     };
 
     #[test]
@@ -174,5 +179,16 @@ mod tests {
                 text: "selected".into(),
             }]
         );
+    }
+
+    #[test]
+    fn context_copy_preserves_empty_text_as_clear_clipboard_action() {
+        assert_eq!(
+            context_clipboard_effects(Some(String::new())),
+            [Effect::CopyClipboard {
+                text: String::new(),
+            }]
+        );
+        assert!(context_clipboard_effects(None).is_empty());
     }
 }

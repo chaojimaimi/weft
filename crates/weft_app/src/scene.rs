@@ -58,6 +58,10 @@ impl<T> HitRegion<T> {
     pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
+
+    pub(crate) fn contains_half_open(&self, x: f32, y: f32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

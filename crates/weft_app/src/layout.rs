@@ -635,6 +635,7 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
     }
 }
 
+#[cfg(test)]
 impl ContextMenuLayout {
     pub fn item_at(self, x: f32, y: f32) -> Option<usize> {
         self.item_rects.iter().position(|rect| {

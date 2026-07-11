@@ -4,6 +4,7 @@
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 
 mod app_state;
+mod context_menu_component;
 mod editor_controller;
 mod effect;
 mod find_controller;
@@ -126,7 +127,7 @@ struct App {
 }
 
 /// Context menu item labels.
-const CONTEXT_MENU_ITEMS: &[(&str, &str)] = &[
+const CONTEXT_MENU_ITEMS: &[(&str, &str); 4] = &[
     ("Copy Command", "copy_command"),
     ("Copy Output", "copy_output"),
     ("Toggle Fold", "toggle_fold"),
