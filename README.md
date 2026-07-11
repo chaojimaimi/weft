@@ -109,7 +109,7 @@ Enables OSC 133 markers that split commands into blocks (visible in block view +
 ## Development
 
 ```bash
-cargo test --workspace          # 603 tests
+cargo test --workspace          # 628 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```

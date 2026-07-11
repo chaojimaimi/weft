@@ -342,14 +342,7 @@ impl OverlayWarmup for OverlayContent<'_> {
 /// A rectangular region that responds to mouse input, tagged with its target.
 /// Produced by the renderer during vertex building, consumed by the app's
 /// mouse handler.
-#[derive(Debug, Clone)]
-pub struct HitRegion {
-    pub x0: f32,
-    pub y0: f32,
-    pub x1: f32,
-    pub y1: f32,
-    pub target: HitTarget,
-}
+pub type HitRegion = crate::scene::HitRegion<HitTarget>;
 
 /// What a hit region refers to — determines the action taken on click.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,13 +361,6 @@ pub enum HitTarget {
     // ContextMenuItem(usize),
 }
 
-impl HitRegion {
-    /// Whether a point (in physical pixels) falls within this region.
-    pub fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
-    }
-}
-
 // ── Stack builder ─────────────────────────────────────────────────────
 
 /// Build the overlay stack for the current frame. This is a **free function**
@@ -388,7 +374,7 @@ impl HitRegion {
 pub fn build_overlay_stack<'a>(
     terminal: &'a Terminal,
     _viewport_width: f32,
-    renderer_scale: f64,
+    panel_width: f32,
     panel_open: bool,
     panel_query: &'a str,
     panel_selection: usize,
@@ -423,16 +409,13 @@ pub fn build_overlay_stack<'a>(
 
     // History panel (Cmd+Shift+B).
     if panel_open {
-        // v0.9 W5: panel width must match renderer's sidebar_width() (240×scale)
-        // so chrome_left == panel width and content isn't covered.
-        let width_px = 240.0 * renderer_scale as f32;
         layers.push(OverlayLayer {
             kind: OverlayKind::HistoryPanel,
             z: OverlayZ::Panel,
             input_policy: OverlayInputPolicy::Focused,
             content: OverlayContent::HistoryPanel(PanelDrawParams {
                 blocks: terminal.block_tracker().blocks(),
-                width_px,
+                width_px: panel_width,
                 query: panel_query,
                 selection: panel_selection,
                 expanded_id: panel_expanded,

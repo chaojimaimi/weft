@@ -432,6 +432,144 @@ pub fn layout_palette_form_rect(ctx: &LayoutCtx, n_fields: usize, popup_width_sc
     [popup_x0, popup_top, popup_x1, popup_top + popup_h]
 }
 
+// ── Tab strip ─────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug)]
+pub struct TabStripInput {
+    pub viewport_width: f32,
+    pub bar_height: f32,
+    pub cell_width: f32,
+    pub padding_x: f32,
+    pub chrome_left: f32,
+    pub traffic_lights_width: f32,
+    pub tab_count: usize,
+    pub requested_scroll_offset: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TabStripLayout {
+    pub bar_rect: Rect,
+    pub tabs_start: f32,
+    pub tab_width: f32,
+    pub overflowing: bool,
+    pub scroll_offset: f32,
+    pub max_scroll: f32,
+    pub visible_left: f32,
+    pub visible_right: f32,
+    pub arrow_width: f32,
+    pub plus_width: f32,
+    pub plus_rect: Rect,
+    pub left_arrow_rect: Option<Rect>,
+    pub right_arrow_rect: Option<Rect>,
+}
+
+impl TabStripLayout {
+    pub fn tab_rect(self, index: usize) -> Rect {
+        let x0 = self.tabs_start + index as f32 * self.tab_width - self.scroll_offset;
+        [
+            x0.max(self.visible_left),
+            self.bar_rect[1],
+            (x0 + self.tab_width).min(self.visible_right),
+            self.bar_rect[3],
+        ]
+    }
+
+    pub fn scroll_offset_for_tab(self, index: usize) -> f32 {
+        if !self.overflowing {
+            return 0.0;
+        }
+        let unscrolled_x0 = self.tabs_start + index as f32 * self.tab_width;
+        let x0 = unscrolled_x0 - self.scroll_offset;
+        let x1 = x0 + self.tab_width;
+        let target = if x0 < self.visible_left {
+            unscrolled_x0 - self.visible_left
+        } else if x1 > self.visible_right {
+            unscrolled_x0 + self.tab_width - self.visible_right
+        } else {
+            self.scroll_offset
+        };
+        target.clamp(0.0, self.max_scroll)
+    }
+}
+
+pub fn layout_tab_strip(input: TabStripInput) -> TabStripLayout {
+    let max_tab_width = input.cell_width * 20.0;
+    let min_tab_width = input.cell_width * 15.0;
+    let arrow_width = input.cell_width * 2.5;
+    let plus_width = input.cell_width * 3.0;
+    let right_padding = input.padding_x * 0.5;
+    let traffic_offset = if input.chrome_left > 0.0 {
+        0.0
+    } else {
+        input.traffic_lights_width
+    };
+    let tabs_start = input.chrome_left + traffic_offset + input.padding_x;
+    let right_reserve = plus_width + right_padding;
+    let available = (input.viewport_width - tabs_start - right_reserve).max(0.0);
+    let count = input.tab_count as f32;
+    let total_at_max = count * max_tab_width;
+    let total_at_min = count * min_tab_width;
+    let (tab_width, overflowing) = if input.tab_count == 0 || total_at_max <= available {
+        (max_tab_width, false)
+    } else if total_at_min <= available {
+        (
+            (available / count).clamp(min_tab_width, max_tab_width),
+            false,
+        )
+    } else {
+        (min_tab_width, true)
+    };
+    let total_tab_width = count * tab_width;
+    let visible_left = if overflowing {
+        tabs_start + arrow_width
+    } else {
+        tabs_start
+    };
+    let visible_right = if overflowing {
+        input.viewport_width - right_reserve - arrow_width
+    } else {
+        input.viewport_width - right_reserve
+    }
+    .max(visible_left);
+    let max_scroll = if overflowing {
+        (total_tab_width - (visible_right - visible_left)).max(0.0)
+    } else {
+        0.0
+    };
+    let scroll_offset = input.requested_scroll_offset.clamp(0.0, max_scroll);
+    let plus_x0 = if overflowing {
+        visible_right + arrow_width
+    } else {
+        tabs_start + total_tab_width
+    };
+    let bar_rect = [0.0, 0.0, input.viewport_width, input.bar_height];
+    TabStripLayout {
+        bar_rect,
+        tabs_start,
+        tab_width,
+        overflowing,
+        scroll_offset,
+        max_scroll,
+        visible_left,
+        visible_right,
+        arrow_width,
+        plus_width,
+        plus_rect: [plus_x0, 0.0, plus_x0 + plus_width, input.bar_height],
+        left_arrow_rect: overflowing.then_some([
+            tabs_start,
+            0.0,
+            tabs_start + arrow_width,
+            input.bar_height,
+        ]),
+        right_arrow_rect: overflowing.then_some([
+            visible_right,
+            0.0,
+            visible_right + arrow_width,
+            input.bar_height,
+        ]),
+    }
+}
+
 // ── Context menu ───────────────────────────────────────────────────────
 //
 // Right-click menu on a block. Fixed 3 items (Copy Command / Copy Output /
@@ -446,6 +584,8 @@ pub struct ContextMenuLayout {
     pub menu_rect: Rect,
     /// Per-item Y (top edge). Length = items.len().
     pub item_y: [f32; 4],
+    /// Exact hit-test rectangles for the four actions.
+    pub item_rects: [Rect; 4],
     /// X of the item label text.
     pub text_x: f32,
     /// Y of the separator after item `i` (None for the last item).
@@ -484,12 +624,23 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
     ];
     let separator_ys = [item_y[0] + item_h, item_y[1] + item_h, item_y[2] + item_h];
     let text_x = menu_x0 + cw * 0.4;
+    let item_rects = item_y.map(|item_top| [menu_x0, item_top, menu_x1, item_top + item_h]);
 
     ContextMenuLayout {
         menu_rect: [menu_x0, menu_y0, menu_x1, menu_y1],
         item_y,
+        item_rects,
         text_x,
         separator_ys,
+    }
+}
+
+impl ContextMenuLayout {
+    pub fn item_at(self, x: f32, y: f32) -> Option<usize> {
+        self.item_rects.iter().position(|rect| {
+            let [x0, y0, x1, y1] = *rect;
+            x >= x0 && x < x1 && y >= y0 && y < y1
+        })
     }
 }
 
@@ -963,6 +1114,96 @@ mod tests {
         assert_eq!(r5[2], r2[2]);
     }
 
+    // ── Tab strip layout ────────────────────────────────────────────────
+
+    fn tab_input(tab_count: usize, requested_scroll_offset: f32) -> TabStripInput {
+        TabStripInput {
+            viewport_width: 1200.0,
+            bar_height: 56.0,
+            cell_width: 8.0,
+            padding_x: 10.0,
+            chrome_left: 0.0,
+            traffic_lights_width: 72.0,
+            tab_count,
+            requested_scroll_offset,
+        }
+    }
+
+    #[test]
+    fn tab_strip_uses_three_tier_width_and_clamps_scroll() {
+        let three = layout_tab_strip(tab_input(3, 100.0));
+        assert!(!three.overflowing);
+        assert_eq!(three.tab_width, 160.0);
+        assert_eq!(three.scroll_offset, 0.0);
+
+        let ten = layout_tab_strip(tab_input(10, 10_000.0));
+        assert!(ten.overflowing);
+        assert_eq!(ten.tab_width, 120.0);
+        assert_eq!(ten.scroll_offset, ten.max_scroll);
+        assert!(ten.left_arrow_rect.is_some());
+        assert!(ten.right_arrow_rect.is_some());
+        assert_eq!(ten.plus_rect[0], ten.visible_right + ten.arrow_width);
+    }
+
+    #[test]
+    fn tab_strip_reveals_active_tab_using_rendered_bounds() {
+        let layout = layout_tab_strip(tab_input(10, 0.0));
+        let offset = layout.scroll_offset_for_tab(9);
+        assert!(offset > 0.0);
+        let revealed = layout_tab_strip(tab_input(10, offset));
+        let rect = revealed.tab_rect(9);
+        assert!(rect[0] >= revealed.visible_left);
+        assert!(rect[2] <= revealed.visible_right);
+    }
+
+    #[test]
+    fn sidebar_replaces_traffic_light_offset_for_tabs() {
+        let mut input = tab_input(2, 0.0);
+        input.chrome_left = 240.0;
+        let layout = layout_tab_strip(input);
+        assert_eq!(layout.tabs_start, 250.0);
+    }
+
+    #[test]
+    fn zero_tabs_and_extremely_narrow_viewport_remain_finite() {
+        let zero = layout_tab_strip(TabStripInput {
+            tab_count: 0,
+            viewport_width: 80.0,
+            ..tab_input(0, f32::INFINITY)
+        });
+        assert!(!zero.overflowing);
+        assert_eq!(zero.scroll_offset, 0.0);
+        assert!(zero.plus_rect.iter().all(|value| value.is_finite()));
+
+        let narrow = layout_tab_strip(TabStripInput {
+            viewport_width: 80.0,
+            ..tab_input(4, 500.0)
+        });
+        assert!(narrow.overflowing);
+        assert!(narrow.visible_right >= narrow.visible_left);
+        assert!(narrow.max_scroll.is_finite());
+        assert!(narrow.scroll_offset.is_finite());
+        assert!(narrow.tab_rect(0).iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
+    fn supported_minimum_window_keeps_tab_controls_inside_viewport() {
+        let layout = layout_tab_strip(TabStripInput {
+            viewport_width: crate::ui_tokens::MIN_WINDOW_WIDTH as f32,
+            ..tab_input(4, 500.0)
+        });
+        assert!(layout.overflowing);
+        assert!(layout.plus_rect[0] >= 0.0);
+        assert!(layout.plus_rect[2] <= layout.bar_rect[2]);
+        for rect in [layout.left_arrow_rect, layout.right_arrow_rect]
+            .into_iter()
+            .flatten()
+        {
+            assert!(rect[0] >= 0.0);
+            assert!(rect[2] <= layout.bar_rect[2]);
+        }
+    }
+
     // ── Context menu layout (stage 4 — U2) ──────────────────────────────
 
     /// Click in the middle of the viewport: menu anchored at click, items
@@ -996,6 +1237,11 @@ mod tests {
         assert!((layout.separator_ys[2] - 663.84).abs() < 1e-3);
         // text_x = menu_x0 + 0.4*cw = 800 + 2.88 = 802.88
         assert!((layout.text_x - 802.88).abs() < 1e-3);
+        assert_eq!(layout.item_at(900.0, 610.0), Some(0));
+        assert_eq!(layout.item_at(900.0, 630.0), Some(1));
+        assert_eq!(layout.item_at(900.0, 670.0), Some(3));
+        assert_eq!(layout.item_at(700.0, 610.0), None);
+        assert_eq!(layout.item_at(900.0, 690.0), None);
     }
 
     /// Click near right edge: menu clamps left so its right edge stays

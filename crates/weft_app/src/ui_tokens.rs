@@ -1,0 +1,188 @@
+//! v1.2 semantic UI tokens.
+//!
+//! Terminal ANSI colors remain independent; these tokens describe application
+//! chrome and controls so every component derives hover/surface/text states in
+//! the same way across themes.
+
+use weft_core::config::Theme;
+use weft_core::grid::Color;
+
+pub const MIN_WINDOW_WIDTH: f64 = 360.0;
+pub const MIN_WINDOW_HEIGHT: f64 = 240.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponsiveClass {
+    Compact,
+    Regular,
+    Wide,
+}
+
+impl ResponsiveClass {
+    pub fn from_logical_width(width: f32) -> Self {
+        if width < 640.0 {
+            Self::Compact
+        } else if width < 1100.0 {
+            Self::Regular
+        } else {
+            Self::Wide
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SidebarMetrics {
+    pub panel_width: f32,
+    pub push_width: f32,
+}
+
+impl SidebarMetrics {
+    pub fn for_logical_width(width: f32) -> Self {
+        let class = ResponsiveClass::from_logical_width(width);
+        let panel_width = match class {
+            ResponsiveClass::Compact => (width * 0.8).min(240.0),
+            ResponsiveClass::Regular => (width * 0.24).clamp(240.0, 320.0),
+            ResponsiveClass::Wide => (width * 0.24).clamp(280.0, 360.0),
+        }
+        .max(0.0);
+        let push_width = match class {
+            ResponsiveClass::Compact => 0.0,
+            ResponsiveClass::Regular | ResponsiveClass::Wide => panel_width,
+        };
+        Self {
+            panel_width,
+            push_width,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiMetrics {
+    pub stroke: f32,
+    pub control_compact: f32,
+}
+
+impl UiMetrics {
+    pub fn for_scale(scale: f64) -> Self {
+        let s = scale.max(0.5) as f32;
+        Self {
+            stroke: 1.0 * s,
+            control_compact: 28.0 * s,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiColors {
+    pub canvas: Color,
+    pub chrome: Color,
+    pub raised: Color,
+    pub text_primary: Color,
+    pub text_secondary: Color,
+    pub border_subtle: Color,
+    pub focus: Color,
+}
+
+impl UiColors {
+    pub fn from_theme(theme: &Theme) -> Self {
+        let bg = theme.background;
+        let fg = theme.foreground;
+        let dark = u16::from(bg.r) + u16::from(bg.g) + u16::from(bg.b) < 384;
+        let chrome = if dark {
+            scale(bg, 0.85)
+        } else {
+            mix(bg, Color::rgb(255, 255, 255), 0.50)
+        };
+        Self {
+            canvas: bg,
+            chrome,
+            raised: mix(bg, Color::rgb(255, 255, 255), 0.08),
+            text_primary: fg,
+            text_secondary: mix(bg, fg, 0.70),
+            border_subtle: mix(bg, fg, 0.20),
+            focus: theme.accent,
+        }
+    }
+}
+
+fn scale(color: Color, factor: f32) -> Color {
+    Color::rgb(
+        (f32::from(color.r) * factor).round().clamp(0.0, 255.0) as u8,
+        (f32::from(color.g) * factor).round().clamp(0.0, 255.0) as u8,
+        (f32::from(color.b) * factor).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn mix(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    let channel = |a: u8, b: u8| {
+        (f32::from(a) + (f32::from(b) - f32::from(a)) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color::rgb(
+        channel(from.r, to.r),
+        channel(from.g, to.g),
+        channel(from.b, to.b),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResponsiveClass, SidebarMetrics, UiColors, UiMetrics};
+    use weft_core::config::Theme;
+
+    #[test]
+    fn responsive_breakpoints_are_stable() {
+        assert_eq!(
+            ResponsiveClass::from_logical_width(639.0),
+            ResponsiveClass::Compact
+        );
+        assert_eq!(
+            ResponsiveClass::from_logical_width(640.0),
+            ResponsiveClass::Regular
+        );
+        assert_eq!(
+            ResponsiveClass::from_logical_width(1099.0),
+            ResponsiveClass::Regular
+        );
+        assert_eq!(
+            ResponsiveClass::from_logical_width(1100.0),
+            ResponsiveClass::Wide
+        );
+    }
+
+    #[test]
+    fn compact_sidebar_is_overlay_and_regular_sidebar_pushes_content() {
+        let compact = SidebarMetrics::for_logical_width(500.0);
+        assert_eq!(compact.panel_width, 240.0);
+        assert_eq!(compact.push_width, 0.0);
+
+        let regular = SidebarMetrics::for_logical_width(900.0);
+        assert_eq!(regular.panel_width, 240.0);
+        assert_eq!(regular.push_width, regular.panel_width);
+
+        let wide = SidebarMetrics::for_logical_width(1600.0);
+        assert_eq!(wide.panel_width, 360.0);
+        assert_eq!(wide.push_width, wide.panel_width);
+    }
+
+    #[test]
+    fn metrics_scale_from_logical_points() {
+        let one = UiMetrics::for_scale(1.0);
+        let two = UiMetrics::for_scale(2.0);
+        assert_eq!(two.stroke, one.stroke * 2.0);
+        assert_eq!(two.control_compact, one.control_compact * 2.0);
+    }
+
+    #[test]
+    fn semantic_surfaces_and_text_are_distinct_in_dark_and_light_themes() {
+        for theme in [Theme::weft_warm(), Theme::weft_light()] {
+            let colors = UiColors::from_theme(&theme);
+            assert_ne!(colors.chrome, colors.canvas);
+            assert_ne!(colors.raised, colors.canvas);
+            assert_ne!(colors.text_primary, colors.canvas);
+            assert_ne!(colors.text_secondary, colors.canvas);
+            assert_eq!(colors.focus, theme.accent);
+        }
+    }
+}

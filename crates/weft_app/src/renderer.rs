@@ -1007,7 +1007,8 @@ fragment float4 text_fragment(
     /// bar doubles as the (transparent) titlebar.
     pub fn tab_bar_height(&self) -> f32 {
         let logical = self.cell_height() as f32 / self.scale as f32 * 1.5;
-        logical.clamp(28.0, 40.0) * self.scale as f32
+        let metrics = crate::ui_tokens::UiMetrics::for_scale(self.scale);
+        (logical.clamp(28.0, 40.0) * self.scale as f32).max(metrics.control_compact)
     }
 
     /// v1.1: Reserved top space for the macOS titlebar (traffic lights) in
@@ -1028,7 +1029,18 @@ fragment float4 text_fragment(
     /// v0.9 W5: Left sidebar width in physical pixels (240 logical px × scale).
     /// Used as `chrome_left` when the history panel is in sidebar mode.
     pub fn sidebar_width(&self) -> f32 {
-        240.0 * self.scale as f32
+        let logical_viewport = self.viewport.0 / self.scale as f32;
+        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).panel_width
+            * self.scale as f32
+    }
+
+    /// Width reserved beside the terminal. In compact windows the history
+    /// panel becomes an overlay drawer, so it keeps its visual width without
+    /// shrinking the PTY or pushing tab controls outside the viewport.
+    pub fn sidebar_push_width(&self) -> f32 {
+        let logical_viewport = self.viewport.0 / self.scale as f32;
+        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).push_width
+            * self.scale as f32
     }
 
     /// Draw the terminal Grid (and optional overlays) to screen.
@@ -1092,9 +1104,6 @@ fragment float4 text_fragment(
         // macOS traffic-light buttons float over the Metal content. Even with
         // a single tab we now always render the tab bar (for the "+" button),
         // so chrome_top always reserves tab_bar_height.
-        let tab_h = self.tab_bar_height();
-        let titlebar_h = self.titlebar_height();
-        let chrome_top = tab_h.max(titlebar_h);
         // Whether a standalone titlebar strip (no tab bar) needs painting.
         // v1.2: always false now — the tab bar is always drawn.
         let single_tab_titlebar = false;
@@ -1106,10 +1115,20 @@ fragment float4 text_fragment(
             .iter()
             .any(|l| l.kind == crate::overlay::OverlayKind::HistoryPanel);
         let chrome_left = if panel_open {
-            self.sidebar_width()
+            self.sidebar_push_width()
         } else {
             0.0
         };
+
+        let terminal_layout = crate::terminal_geometry::terminal_layout_for_renderer(
+            self,
+            winit::dpi::PhysicalSize::new(
+                self.viewport.0.round().max(0.0) as u32,
+                self.viewport.1.round().max(0.0) as u32,
+            ),
+            chrome_left as f64,
+        );
+        let chrome_top = terminal_layout.chrome_top as f32;
 
         // Build this frame's LayoutCtx: the single source of truth for
         // coordinate math in every overlay builder (v0.8 stage 1). Stored on
@@ -1117,14 +1136,17 @@ fragment float4 text_fragment(
         // during this draw; rebuilt every frame so resizes/padding changes
         // take effect immediately.
         let mut ctx = crate::layout::LayoutCtx::new(
-            self.viewport,
-            self.cell_width() as f32,
-            self.cell_height() as f32,
-            self.padding_x,
-            self.padding_y,
+            (
+                terminal_layout.viewport.right as f32,
+                terminal_layout.viewport.bottom as f32,
+            ),
+            terminal_layout.cell_width as f32,
+            terminal_layout.cell_height as f32,
+            terminal_layout.padding_x as f32,
+            terminal_layout.padding_y as f32,
         );
         ctx.chrome_top = chrome_top;
-        ctx.chrome_left = chrome_left;
+        ctx.chrome_left = terminal_layout.chrome_left as f32;
         self.layout_ctx = Some(ctx);
 
         let grid = terminal.grid();
@@ -4071,16 +4093,11 @@ fragment float4 text_fragment(
     fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
-        let theme_bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let fg = color_to_normalized(ui.text_primary);
         // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
         // accent_dim is invisible in Nord/Warp themes.
-        let prompt_c = [
-            fg[0] * 0.70 + theme_bg[0] * 0.30,
-            fg[1] * 0.70 + theme_bg[1] * 0.30,
-            fg[2] * 0.70 + theme_bg[2] * 0.30,
-            1.0,
-        ];
+        let prompt_c = color_to_normalized(ui.text_secondary);
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -4101,14 +4118,8 @@ fragment float4 text_fragment(
         let menu_w = menu_x1 - menu_x0;
         let text_x = layout.text_x;
 
-        let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
-        // v1.0 Warp-style: thin low-opacity border.
-        let border_c = [0.5, 0.5, 0.5, 0.20];
+        let popup_bg = color_to_normalized(ui.raised);
+        let border_c = color_to_normalized(ui.border_subtle);
 
         // Background.
         push_quad(&mut verts, layout.menu_rect, bg_uv, [0.0; 4], popup_bg);
@@ -5587,99 +5598,39 @@ fragment float4 text_fragment(
         let pad_x = self.padding_x;
         let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
 
-        let bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.accent);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let bg = color_to_normalized(ui.canvas);
+        let fg = color_to_normalized(ui.text_primary);
+        let accent = color_to_normalized(ui.focus);
         let separator = color_to_normalized(self.theme.separator);
 
-        let bar_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
-            [bg[0] * 0.85, bg[1] * 0.85, bg[2] * 0.85, 1.0]
-        } else {
-            [
-                bg[0] + (1.0 - bg[0]) * 0.5,
-                bg[1] + (1.0 - bg[1]) * 0.5,
-                bg[2] + (1.0 - bg[2]) * 0.5,
-                1.0,
-            ]
-        };
+        let bar_bg = color_to_normalized(ui.chrome);
 
         let mut vertices = Vec::new();
         let mut hits = Vec::new();
 
-        push_quad(
-            &mut vertices,
-            [0.0, 0.0, vp_w, bar_h],
-            [0.0; 4],
-            [0.0; 4],
-            bar_bg,
-        );
+        // v1.2 architecture: renderer and App scroll/hit behavior consume the
+        // same pure tab-strip layout product.
+        let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
+            viewport_width: vp_w,
+            bar_height: bar_h,
+            cell_width: cw,
+            padding_x: pad_x,
+            chrome_left,
+            traffic_lights_width: self.traffic_lights_width(),
+            tab_count: tab_bar.tab_count,
+            requested_scroll_offset: tab_bar.scroll_offset,
+        });
+        let tab_w = strip.tab_width;
+        let overflowing = strip.overflowing;
+        let arrow_w = strip.arrow_width;
+        let plus_w = strip.plus_width;
+        let tabs_start = strip.tabs_start;
+        let scroll_offset = strip.scroll_offset;
+        let vis_left = strip.visible_left;
+        let vis_right = strip.visible_right;
 
-        let tl_w = self.traffic_lights_width();
-
-        // v1.2: Tab sizing — tabs have a minimum width (15 cells ~120px) and
-        // maximum (20 cells ~200px). When total width exceeds available space,
-        // tabs scroll horizontally instead of being compressed.
-        //
-        // v1.2-fix: Three-tier overflow detection:
-        //   1. Tabs at max width fit → use max, no scroll
-        //   2. Tabs at min width fit → shrink to fit, no scroll
-        //   3. Even min width doesn't fit → scroll mode (fixed min width)
-        // Previously only checked max-width fit vs available, incorrectly
-        // entering scroll mode when min-width tabs would have fit fine.
-        let max_tab_w = cw * 20.0;
-        let min_tab_w = cw * 15.0;
-        let arrow_w = cw * 2.5; // scroll arrow slot width
-        let plus_w = cw * 3.0; // "+" button width (~24px, matches demo)
-        let right_pad = pad_x * 0.5; // gap between "+" and window edge
-
-        // v1.2-fix: when the sidebar is open (chrome_left > 0), the traffic
-        // lights are over the sidebar, not to its right — so don't add tl_w.
-        let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
-        let tabs_start = chrome_left + tl_offset + pad_x;
-        let right_reserve = plus_w + right_pad;
-        let avail_for_tabs = vp_w - tabs_start - right_reserve;
-
-        let total_at_max = tab_bar.tab_count as f32 * max_tab_w;
-        let total_at_min = tab_bar.tab_count as f32 * min_tab_w;
-
-        let (tab_w, overflowing) = if total_at_max <= avail_for_tabs {
-            (max_tab_w, false)
-        } else if total_at_min <= avail_for_tabs {
-            let fitted = avail_for_tabs / tab_bar.tab_count as f32;
-            (fitted.clamp(min_tab_w, max_tab_w), false)
-        } else {
-            (min_tab_w, true)
-        };
-
-        let total_tab_w = tab_bar.tab_count as f32 * tab_w;
-        // v1.2-fix: defensively clamp scroll_offset in the renderer. Even if
-        // the app's stored value is stale (e.g. after a resize that hasn't
-        // been clamped yet), this prevents tabs from being over-scrolled
-        // past the last tab (which would leave a blank gap on the right).
-        let scroll_offset = if overflowing {
-            // vis_w is computed below, but we need max_scroll here. Compute
-            // it inline (must match the vis_left/vis_right formulas below).
-            let vl = tabs_start + arrow_w;
-            let vr = vp_w - right_reserve - arrow_w;
-            let vw = (vr - vl).max(0.0);
-            let ms = (total_tab_w - vw).max(0.0);
-            tab_bar.scroll_offset.clamp(0.0, ms)
-        } else {
-            0.0
-        };
-
-        // Visible region for tab content. Arrows take space on both sides
-        // when overflowing.
-        let vis_left = if overflowing {
-            tabs_start + arrow_w
-        } else {
-            tabs_start
-        };
-        let vis_right = if overflowing {
-            vp_w - right_reserve - arrow_w
-        } else {
-            vp_w - right_reserve
-        };
+        push_quad(&mut vertices, strip.bar_rect, [0.0; 4], [0.0; 4], bar_bg);
 
         let close_w = cw * 2.0;
         // v1.2-fix: reserve a small gap between label text and close button
@@ -5798,7 +5749,7 @@ fragment float4 text_fragment(
                 } else {
                     [fg[0] * 0.5, fg[1] * 0.5, fg[2] * 0.5, 1.0]
                 };
-                let line_w = 1.0 * self.scale as f32;
+                let line_w = crate::ui_tokens::UiMetrics::for_scale(self.scale).stroke;
                 push_line(
                     &mut vertices,
                     close_cx - close_r,
@@ -5828,7 +5779,7 @@ fragment float4 text_fragment(
                 [0.0; 4]
             };
             hits.push(TabHit {
-                tab_rect: [x0.max(vis_left), y0, x1.min(vis_right), y1],
+                tab_rect: strip.tab_rect(i),
                 close_rect: hit_close_rect,
                 index: i,
             });
@@ -5838,10 +5789,9 @@ fragment float4 text_fragment(
         // Opaque background quads under the arrows prevent partially-visible
         // tabs from showing through behind the arrow icons.
         if overflowing {
-            let max_scroll = {
-                let vis_w = vis_right - vis_left;
-                (total_tab_w - vis_w).max(0.0)
-            };
+            let max_scroll = strip.max_scroll;
+            let left_arrow_rect = strip.left_arrow_rect.expect("overflow has left arrow");
+            let right_arrow_rect = strip.right_arrow_rect.expect("overflow has right arrow");
 
             // ── Left arrow (‹) ──
             let la_cx = tabs_start + arrow_w * 0.5;
@@ -5859,13 +5809,7 @@ fragment float4 text_fragment(
             } else {
                 bar_bg
             };
-            push_quad(
-                &mut vertices,
-                [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
-                [0.0; 4],
-                [0.0; 4],
-                la_bg,
-            );
+            push_quad(&mut vertices, left_arrow_rect, [0.0; 4], [0.0; 4], la_bg);
             let la_color = if scroll_offset > 0.0 {
                 if tab_bar.arrow_left_hovered {
                     fg
@@ -5909,13 +5853,7 @@ fragment float4 text_fragment(
             } else {
                 bar_bg
             };
-            push_quad(
-                &mut vertices,
-                [vis_right, 0.0, vis_right + arrow_w, bar_h],
-                [0.0; 4],
-                [0.0; 4],
-                ra_bg,
-            );
+            push_quad(&mut vertices, right_arrow_rect, [0.0; 4], [0.0; 4], ra_bg);
             let ra_color = if scroll_offset < max_scroll {
                 if tab_bar.arrow_right_hovered {
                     fg
@@ -5950,7 +5888,7 @@ fragment float4 text_fragment(
             hits.insert(
                 0,
                 TabHit {
-                    tab_rect: [tabs_start, 0.0, tabs_start + arrow_w, bar_h],
+                    tab_rect: left_arrow_rect,
                     close_rect: [0.0; 4],
                     index: usize::MAX, // left arrow sentinel
                 },
@@ -5958,7 +5896,7 @@ fragment float4 text_fragment(
             hits.insert(
                 1,
                 TabHit {
-                    tab_rect: [vis_right, 0.0, vis_right + arrow_w, bar_h],
+                    tab_rect: right_arrow_rect,
                     close_rect: [0.0; 4],
                     index: usize::MAX - 1, // right arrow sentinel
                 },
@@ -5968,11 +5906,7 @@ fragment float4 text_fragment(
         // v1.2: "+" button position:
         //   - Non-overflowing: right after the last tab (natural flow).
         //   - Overflowing: after the right scroll arrow (fixed position).
-        let plus_x0 = if overflowing {
-            vis_right + arrow_w
-        } else {
-            tabs_start + tab_bar.tab_count as f32 * tab_w
-        };
+        let plus_x0 = strip.plus_rect[0];
         let plus_cx = plus_x0 + plus_w * 0.5;
         let plus_cy = bar_h * 0.5;
         let plus_r = ch * 0.22;

@@ -1,7 +1,7 @@
 #!/bin/bash
 # scripts/build-app.sh
 #
-# v1.0 V9-c: Build Weft.app bundle from release binary.
+# v1.2: Build Weft.app bundle from release binary.
 # Usage: ./scripts/build-app.sh [--sign "Developer ID: ..."]
 #
 # Produces: target/release/osx/Weft.app
@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
 BUNDLE_ID="dev.weft.terminal"
-VERSION="1.0.0"
+VERSION="1.2.0"
 MIN_OS="12.0"
 
 # Paths

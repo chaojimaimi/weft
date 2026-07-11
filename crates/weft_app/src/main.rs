@@ -3,27 +3,50 @@
 //! Full pipeline: PTY → VT parser → Grid → Metal renderer
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 
+mod app_state;
+mod editor_controller;
+mod effect;
+mod find_controller;
 mod find_worker;
+mod geometry_controller;
 mod glyph;
 mod ime;
+mod input_router;
 mod layout;
+mod lifecycle_controller;
 mod menu;
+mod mouse_controller;
+mod mouse_press_controller;
 mod overlay;
+mod palette_controller;
+mod palette_state;
+mod panel_controller;
 mod renderer;
+mod scene;
+mod settings_controller;
 mod tab;
 mod terminal_geometry;
+mod ui_tokens;
 
+use app_state::{
+    ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
+    SessionState, SettingsState, TabBarState, WindowRuntimeState,
+};
+use effect::Effect;
+use input_router::{OverlayInputContext, OverlayInputOwner};
+use palette_state::{
+    BuiltinCmd, CreateStep, PaletteEntry, PaletteState, PaletteSubMode, WorkflowForm,
+};
 use renderer::{
     block_matches_query, configure_titlebar, visible_panel_rows, FindDrawState, MetalRenderer,
     TabBarDrawState,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tab::{Tab, TuiScrollResolution};
-use terminal_geometry::dimensions_for_renderer;
+use terminal_geometry::{dimensions_for_renderer, terminal_layout_for_renderer, TerminalLayout};
 use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx, CompletePosition};
-use weft_core::config::{Action, Config, KeyBindings};
+use weft_core::config::{Action, Config};
 use weft_core::input::{encode_paste, KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol};
 use weft_core::persistence::BlockStore;
 use weft_core::selection::{BlockViewPos, BlockViewRowKind, GridPos, SelectionMode};
@@ -68,248 +91,38 @@ struct App {
     renderer: Option<MetalRenderer>,
     /// v0.9 H1: per-tab session state. The active tab is `tabs[active_tab]`.
     /// Currently always has exactly one tab; Stage 2 adds Cmd+T/W multi-tab.
-    tabs: Vec<Tab>,
-    active_tab: usize,
-    /// v1.0 P0-b: tab index that was drawn last frame. When this differs
-    /// from `active_tab`, the renderer's per-row grid cache is stale (built
-    /// from a different terminal's grid) — force a full redraw.
-    prev_drawn_tab: usize,
+    sessions: SessionState,
     /// v0.9 W1+: index of the tab currently hovered by the mouse, or `None`
     /// when the cursor is outside the tab bar. Drives the Warp-style
     /// hover-to-show close "×" button. Reset on tab close/switch and on
     /// `CursorLeft` (mouse leaves the window).
-    hovered_tab: Option<usize>,
+    tab_bar: TabBarState,
     /// v1.2: horizontal scroll offset of the tab bar in physical pixels.
     /// When tabs overflow the window width, this lets the user scroll
     /// left/right via arrows, wheel, or trackpad. Clamped to
     /// [0, total_tab_width - visible_width] each frame.
-    tab_scroll_offset: f32,
-    /// v1.2: true when the mouse is hovering the "+" (new tab) button.
-    /// Drives a hover highlight in the renderer.
-    plus_hovered: bool,
-    /// v1.2: true when the mouse is hovering the left scroll arrow.
-    arrow_left_hovered: bool,
-    /// v1.2: true when the mouse is hovering the right scroll arrow.
-    arrow_right_hovered: bool,
-    /// v1.1: timestamp of the last click in the titlebar/tab-bar background
-    /// (non-tab, non-traffic-light) region. Used to detect double-click →
-    /// toggle maximize, matching macOS native titlebar behavior.
-    last_titlebar_click: Option<std::time::Instant>,
-    /// Current keyboard modifier state, updated by ModifiersChanged events.
-    mods: winit::event::Modifiers,
-    /// Cursor blink state (grid view: hard on/off, period 1060ms).
-    cursor_blink_on: bool,
-    /// Cursor blink phase in radians [0, 2π) for the prompt signature breath
-    /// (v0.8 §0.3). Drives a smooth sin() alpha curve (0.25↔1.0) over a
-    /// 2400ms period, plus the amber glow halo. Updated per-frame from
-    /// elapsed time since `cursor_blink_time`.
-    cursor_blink_phase: f32,
-    /// Last cursor blink toggle time (shared anchor for both the grid-view
-    /// hard blink and the prompt signature breath).
-    cursor_blink_time: std::time::Instant,
-    /// Flicker fix (Step 2): shared flag the blink-timer thread checks before
-    /// waking the event loop. When false (no visible cursor/caret, window
-    /// unfocused, or running a command in block view without a prompt), the
-    /// timer skips `send_event(Wake)`, avoiding pointless full redraws that
-    /// caused the idle-terminal flicker. The main thread updates this after
-    /// each redraw based on whether a cursor/caret was actually drawn.
-    cursor_anim_active: Arc<AtomicBool>,
-    /// Last known mouse position for click/scroll handling.
-    last_mouse_x: f64,
-    last_mouse_y: f64,
-    /// Debounced PTY resize: (rows, cols) waiting to be sent to the PTY
-    /// after the resize animation cascade settles. The grid is resized
-    /// immediately on each Resized event for smooth animation; only the
-    /// PTY SIGWINCH is debounced to prevent the shell from fighting cursor
-    /// position during rapid cascades.
-    last_resize_instant: std::time::Instant,
-    /// Cached `$PATH` executable names for Tab completion (scanned once at
-    /// startup; empty if completion is disabled).
-    path_bins: Vec<String>,
+    window_runtime: WindowRuntimeState,
+    interaction: InteractionState,
     /// Proxy used by background threads (PTY reader, blink timer) to wake the
     /// event loop without a vsync busy-loop.
     proxy: EventLoopProxy<AppEvent>,
-    /// User configuration (loaded at startup, reloaded live by the watcher).
-    config: Config,
-    /// Resolved keybindings (key + modifiers → action).
-    keybindings: KeyBindings,
-    /// Current theme state for ToggleTheme builtin command (true = dark).
-    theme_is_dark: bool,
-    /// v1.0: the user's preferred dark theme name, remembered across
-    /// Cmd+Shift+T toggles so toggling dark→light→dark returns to the
-    /// user's chosen dark theme (e.g. "solarized-dark") instead of the
-    /// default "weft-warm".
-    preferred_dark_theme: String,
-    /// v0.9 U-D1: last queried macOS system appearance (None = not yet
-    /// queried). When `[theme] follow_system = true`, polled once per
-    /// second in `poll_system_appearance` and the theme is hot-swapped
-    /// when it changes.
-    last_system_appearance_dark: Option<bool>,
-    /// v0.9 U-D1: throttle for `poll_system_appearance` — queried at most
-    /// once per second to avoid per-frame NSUserDefaults overhead.
-    last_appearance_check: std::time::Instant,
-    /// SQLite store for command blocks. `None` when the cache dir is
-    /// unavailable or opening failed (persistence is best-effort).
-    block_store: Option<BlockStore>,
+    config_state: ConfigState,
     /// Whether the command-history sidebar panel is shown.
-    panel_open: bool,
-    /// Live search filter typed into the panel.
-    panel_query: String,
-    /// Selected row index within the newest-first filtered list.
-    panel_selection: usize,
-    /// Id of the block whose output is expanded inline in the panel.
-    panel_expanded: Option<BlockId>,
-    /// v0.9 fix: whether the panel search box has keyboard focus. When true,
-    /// typed text goes to `panel_query` instead of the editor. Toggled by
-    /// clicking the search box area at the top of the sidebar.
-    panel_search_focused: bool,
-    /// v0.9: when true, the next mouse drag in the prompt box should extend
-    /// the editor selection (mouse is dragging inside the prompt box).
-    prompt_dragging: bool,
+    panel: PanelState,
     /// v0.9 W2: block currently highlighted in the terminal because the user
     /// clicked its row in the history panel. The renderer draws an accent
     /// border around this block. Cleared after 1.5s.
-    panel_highlight: Option<BlockId>,
-    /// When the panel highlight expires. Polled from the redraw path.
-    panel_highlight_until: Option<std::time::Instant>,
-    /// v0.9: timestamp + row of the last panel row click, for detecting
-    /// double-clicks (which send the command to the prompt).
-    panel_last_click: Option<(std::time::Instant, usize)>,
-
     // ── Command Palette (v0.7) ────────────────────────────────────────
-    /// Whether the Cmd+P command palette overlay is shown.
-    palette_open: bool,
-    /// Popup width scale (0.5–1.0 of viewport). User-adjustable via border drag.
-    popup_width_scale: f32,
-    /// Popup max visible rows. User-adjustable via border drag.
-    popup_max_rows: usize,
-    /// Active drag operation on a popup border (None = no drag).
-    drag_state: Option<DragState>,
-    /// Right-click context menu (F7). None when closed.
-    context_menu: Option<ContextMenu>,
-    /// Live search query typed into the palette.
-    palette_query: String,
-    /// Selected index in the palette results.
-    palette_selection: usize,
-    /// v0.9: last click in the palette results list (time + row index) for
-    /// double-click detection. Double-click runs the entry immediately.
-    palette_last_click: Option<(std::time::Instant, usize)>,
-    /// Cached search results (workflows + builtin commands).
-    palette_results: Vec<PaletteEntry>,
-    /// Active variable-fill form for a selected workflow (None = search mode).
-    palette_form: Option<WorkflowForm>,
-    /// Palette sub-mode (Search / CreateWorkflow / EditWorkflow / ConfirmDelete).
-    palette_submode: PaletteSubMode,
-    /// SQLite workflow store. `None` when the cache dir is unavailable.
-    workflow_store: Option<weft_core::workflow::WorkflowStore>,
+    palette: PaletteState,
 
-    /// Live font zoom factor (1.0 = configured base). Cmd+= / Cmd+- /
-    /// Cmd+0 adjust this; `apply_font_scale` rebuilds the atlas with the
-    /// scaled size. Clamped to [0.5, 3.0]. Persists across config reloads
-    /// (re-applied in `apply_config`).
-    font_scale: f32,
-
-    // ── FindInGrid (Cmd+F, v0.8 B3) ───────────────────────────────────
-    /// Whether the in-grid search bar is open.
-    find_open: bool,
-    /// Live search query (single-line input). Matches update after a 150ms
-    /// debounce — see `find_last_key`.
-    find_query: String,
-    /// Last keystroke time. The actual search runs when `now - find_last_key
-    /// >= 150ms`, checked from the redraw path. `None` when idle.
-    find_last_key: Option<std::time::Instant>,
-    /// Cached matches for `find_query`. Recomputed on debounce expiry.
-    /// Empty when the query is empty or no results.
-    find_matches: Vec<weft_core::find::FindMatch>,
-    /// Index into `find_matches` of the currently highlighted match.
-    find_index: usize,
-    /// True when `find_matches` was truncated at MAX_MATCHES — surfaced in
-    /// the UI as "too many matches, refine query".
-    find_truncated: bool,
-    /// Block-view matches (v0.8 B3 — block content search). When the user
-    /// is in the Warp-style block view, the visible content comes from
-    /// `Block.output` strings, not the live grid. `find_in_grid` alone
-    /// returns "no matches" even when the text is on screen. We track
-    /// block matches separately so the FindUI count reflects what the
-    /// user actually sees; the renderer doesn't yet highlight block
-    /// matches (that needs a layout lookup — future work).
-    find_block_matches: Vec<weft_core::find::BlockMatch>,
-    /// Current index into `find_block_matches` (for Enter cycling in block
-    /// view). Grid view uses `find_index` into `find_matches`.
-    find_block_index: usize,
-    /// True when `find_block_matches` was truncated at MAX_MATCHES.
-    find_block_truncated: bool,
-    /// Regex mode toggle (Cmd+R while find is open). Visual-only for now —
-    /// the actual regex search engine isn't wired yet, so toggling this
-    /// doesn't change search behavior. The renderer shows a lit ".*"
-    /// indicator when true.
-    find_regex_mode: bool,
-    /// Case-sensitive toggle (Cmd+I while find is open, or click "Aa" in
-    /// the popup). When false (default), search is case-insensitive;
-    /// when true, character case must match exactly.
-    find_case_sensitive: bool,
-    /// Background find worker (v0.9 U-P1). Runs `find_in_snapshot` on a
-    /// dedicated thread so large scrollback searches don't block the render
-    /// loop. Submit via `find_worker.submit(...)` and poll results via
-    /// `find_worker.try_recv_result()` in the redraw path.
-    find_worker: find_worker::FindWorker,
-    /// Latest regex compile error message (None = no error / not regex mode).
-    /// Surfaced in the FindUI as "invalid regex" so the user knows the query
-    /// failed to compile (v0.9 U-P2).
-    find_regex_error: Option<String>,
-    /// True when a find query is in-flight on the worker. Used to suppress
-    /// redundant submits while a scan is running.
-    find_worker_busy: bool,
+    find: FindState,
 
     // ── Settings panel (v1.0 S1, Cmd+,) ───────────────────────────────
     /// Whether the Settings overlay is open.
-    settings_open: bool,
-    /// Which tab is active (Appearance / Font / Keybindings / Window).
-    settings_tab: crate::overlay::SettingsTab,
-    /// Row cursor in the active tab's content area.
-    settings_selection: usize,
-    /// v1.0 fix: vertical scroll offset within the active tab's list (for
-    /// tabs with more rows than fit on screen, e.g. Keybindings). The
-    /// renderer renders `[offset .. offset+max_rows]`.
-    settings_scroll_offset: usize,
-    /// The working config copy the user edits in the panel. Applied on Enter
-    /// (save) or discarded on Esc. Initialized from the live config when the
-    /// panel opens.
-    settings_draft: weft_core::config::Config,
-    /// True when the draft has unsaved changes (drives the "Save?" hint).
-    settings_dirty: bool,
-    /// v1.0 S2: Last save error message. `None` when the most recent save
-    /// succeeded (or no save has been attempted). Surfaced as a red banner
-    /// at the top of the panel so the user sees why Apply/Save didn't work.
-    settings_error: Option<String>,
-    /// v1.0 Logo: currently-applied Dock icon variant. Tracked so we only
-    /// call `setApplicationIconImage:` when the variant actually changes.
-    current_logo_variant: weft_core::config::LogoVariant,
+    settings: SettingsState,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
-}
-
-/// Which border is being dragged to resize a popup.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DragTarget {
-    /// Right border — adjusts width.
-    Right,
-    /// Top border — adjusts height (max rows).
-    Top,
-}
-
-/// Right-click context menu on a block (F7).
-#[allow(dead_code)]
-struct ContextMenu {
-    /// Target block for the menu actions. `None` means the target is the
-    /// in-flight (running) command, which has no finalized BlockId yet.
-    block_id: Option<BlockId>,
-    /// Menu popup position (physical pixels).
-    x: f32,
-    y: f32,
-    /// Selected menu item index.
-    selection: usize,
 }
 
 /// Context menu item labels.
@@ -321,120 +134,6 @@ const CONTEXT_MENU_ITEMS: &[(&str, &str)] = &[
     // (Warp-style "rerun" — user can tweak parameters before pressing Enter).
     ("Send to Input", "send_to_input"),
 ];
-
-/// Index of the context menu item at `(click_x, click_y)`, or `None` when
-/// the click misses every item. Extracted from `execute_context_menu` so
-/// the hit-test geometry is unit-testable without an `App`/renderer.
-///
-/// Geometry mirrors `build_context_menu_vertices`: each row is
-/// `cell_height * 1.2` tall, with a `cell_height * 0.2` top inset.
-fn context_menu_hit_index(
-    menu_x: f32,
-    menu_y: f32,
-    cell_height: f32,
-    click_x: f32,
-    click_y: f32,
-) -> Option<usize> {
-    let item_h = cell_height * 1.2;
-    let top_inset = cell_height * 0.2;
-    for (i, _) in CONTEXT_MENU_ITEMS.iter().enumerate() {
-        let item_y = menu_y + top_inset + i as f32 * item_h;
-        if click_y >= item_y && click_y < item_y + item_h && click_x >= menu_x {
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Active popup border drag state.
-#[derive(Clone)]
-struct DragState {
-    target: DragTarget,
-    /// Starting mouse position for delta calculation.
-    start_x: f64,
-    start_y: f64,
-    /// Starting scale/rows for delta calculation.
-    start_scale: f32,
-    start_rows: usize,
-    /// Cell width at drag start (for delta→cols/rows conversion).
-    #[allow(dead_code)]
-    cell_w: f32,
-    cell_h: f32,
-}
-
-// ── Command Palette types ─────────────────────────────────────────────
-
-/// A single entry in the palette results list.
-#[derive(Clone)]
-enum PaletteEntry {
-    Workflow(weft_core::workflow::Workflow),
-    Builtin(BuiltinCmd),
-}
-
-/// Built-in commands that appear in the palette.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BuiltinCmd {
-    ToggleTheme,
-    SelectTheme,
-    ToggleBlockPanel,
-    ReloadConfig,
-}
-
-impl BuiltinCmd {
-    fn label(&self) -> &'static str {
-        match self {
-            BuiltinCmd::ToggleTheme => "Toggle Theme",
-            BuiltinCmd::SelectTheme => "Select Theme",
-            BuiltinCmd::ToggleBlockPanel => "Toggle History Panel",
-            BuiltinCmd::ReloadConfig => "Reload Config",
-        }
-    }
-}
-
-/// Active variable-fill form for a selected workflow.
-#[allow(dead_code)]
-struct WorkflowForm {
-    workflow_id: i64,
-    workflow_name: String,
-    workflow_description: String,
-    var_names: Vec<String>,
-    var_values: Vec<String>,
-    current_field: usize,
-}
-
-/// Sub-modes of the palette beyond normal search.
-enum PaletteSubMode {
-    /// Normal search/filter mode.
-    Search,
-    /// Creating a new workflow: guided step-by-step entry.
-    CreateWorkflow {
-        step: CreateStep,
-        buffer: String,
-        // Partially built workflow fields:
-        name: String,
-        command: String,
-    },
-    /// Editing an existing workflow's command.
-    EditWorkflow {
-        id: i64,
-        name: String,
-        buffer: String,
-    },
-    /// Confirming deletion of a workflow.
-    ConfirmDelete { id: i64, name: String },
-    /// v0.9 W2+: Theme picker sub-mode. `themes` holds resolvable theme names
-    /// (built-ins + custom files from ~/.config/weft/themes/). `buffer` is
-    /// the filter query. `selection` reuses `palette_selection`.
-    SelectTheme { buffer: String, themes: Vec<String> },
-}
-
-/// Steps in the create-workflow guided entry.
-#[derive(PartialEq, Eq)]
-enum CreateStep {
-    Name,
-    Command,
-    Done,
-}
 
 /// Action triggered by clicking a button in the find popup. Produced by
 /// `App::find_button_at` from the renderer's stored hit-test rects.
@@ -452,12 +151,12 @@ enum FindButtonAction {
 impl App {
     /// Immutable borrow of the active tab.
     fn tab(&self) -> &Tab {
-        &self.tabs[self.active_tab]
+        &self.sessions.tabs[self.sessions.active_tab]
     }
 
     /// Mutable borrow of the active tab.
     fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.tabs[self.active_tab]
+        &mut self.sessions.tabs[self.sessions.active_tab]
     }
 
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
@@ -468,99 +167,32 @@ impl App {
             size = config.font.size,
             "config loaded"
         );
-        let keybindings = config.keybindings();
-        // v1.0: extract preferred_dark_theme before moving config into Self.
-        let preferred_dark_theme = {
-            let name = &config.theme.name;
-            if !name.contains("light") && !name.is_empty() {
-                name.clone()
-            } else {
-                config
-                    .theme
-                    .dark_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-warm".into())
-            }
-        };
+        let config_state = ConfigState::new(config, scan_path_bins());
         Self {
             window: None,
             renderer: None,
-            tabs: Vec::new(),
-            active_tab: 0,
-            prev_drawn_tab: 0,
-            hovered_tab: None,
-            tab_scroll_offset: 0.0,
-            plus_hovered: false,
-            arrow_left_hovered: false,
-            arrow_right_hovered: false,
-            last_titlebar_click: None,
-            mods: winit::event::Modifiers::default(),
-            cursor_blink_on: true,
-            cursor_blink_phase: 0.0,
-            cursor_blink_time: std::time::Instant::now(),
-            cursor_anim_active: Arc::new(AtomicBool::new(true)),
-            last_mouse_x: 0.0,
-            last_mouse_y: 0.0,
-            last_resize_instant: std::time::Instant::now(),
-            path_bins: scan_path_bins(),
+            sessions: SessionState::new(),
+            tab_bar: TabBarState::default(),
+            window_runtime: WindowRuntimeState::new(),
+            interaction: InteractionState::new(),
             proxy,
-            config,
-            keybindings,
-            theme_is_dark: true, // default to dark theme
-            preferred_dark_theme,
-            last_system_appearance_dark: None,
-            last_appearance_check: std::time::Instant::now(),
-            block_store: None,
-            panel_open: false,
-            panel_query: String::new(),
-            panel_selection: 0,
-            panel_expanded: None,
-            panel_search_focused: false,
-            prompt_dragging: false,
-            panel_highlight: None,
-            panel_highlight_until: None,
-            panel_last_click: None,
-            palette_open: false,
-            popup_width_scale: 0.6,
-            popup_max_rows: 8,
-            drag_state: None,
-            context_menu: None,
-            palette_query: String::new(),
-            palette_selection: 0,
-            palette_last_click: None,
-            palette_results: Vec::new(),
-            palette_form: None,
-            palette_submode: PaletteSubMode::Search,
-            workflow_store: None,
-            font_scale: 1.0,
-            find_open: false,
-            find_query: String::new(),
-            find_last_key: None,
-            find_matches: Vec::new(),
-            find_index: 0,
-            find_truncated: false,
-            find_block_matches: Vec::new(),
-            find_block_index: 0,
-            find_block_truncated: false,
-            find_regex_mode: false,
-            find_case_sensitive: false,
-            find_worker: find_worker::FindWorker::spawn(),
-            find_regex_error: None,
-            find_worker_busy: false,
-            settings_open: false,
-            settings_tab: crate::overlay::SettingsTab::Appearance,
-            settings_selection: 0,
-            settings_scroll_offset: 0,
-            settings_draft: weft_core::config::Config::default(),
-            settings_dirty: false,
-            settings_error: None,
-            current_logo_variant: weft_core::config::LogoVariant::Cool,
+            config_state,
+            panel: PanelState::default(),
+            palette: PaletteState::new(),
+            find: FindState::new(),
+            settings: SettingsState::new(),
             should_exit: false,
         }
     }
 
     fn spawn_pty(&mut self, rows: usize, cols: usize) {
-        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
+        let tab = Tab::new(
+            rows,
+            cols,
+            self.config_state.config.scrollback.lines,
+            &self.proxy,
+            None,
+        );
         // v1.0 V13: On first launch, inject a welcome banner via PTY.
         // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it
         // out of zsh history). The marker file is created in
@@ -570,7 +202,7 @@ impl App {
                 let _ = p.write_sync(cmd.as_bytes());
             }
         }
-        self.tabs.push(tab);
+        self.sessions.tabs.push(tab);
     }
 
     /// Non-blocking drain of PTY events into channel. Drains ALL tabs per
@@ -578,7 +210,7 @@ impl App {
     /// flushed so switching to them is instant; only the active tab is
     /// rendered).
     fn pump_pty(&mut self) {
-        for tab in &mut self.tabs {
+        for tab in &mut self.sessions.tabs {
             tab.pump_pty();
         }
     }
@@ -588,35 +220,39 @@ impl App {
         let mut had_pty_output = false;
         let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
-        for i in 0..self.tabs.len() {
-            let (alive, drained, need_redraw) = self.tabs[i].process_messages();
+        for i in 0..self.sessions.tabs.len() {
+            let (alive, drained, need_redraw) = self.sessions.tabs[i].process_messages();
             if !alive {
                 // Shell exited on tab `i`. For now (Stage 2) we only exit
                 // the app when the LAST tab's shell exits. A closed tab
                 // via Cmd+W is handled by `close_tab`, not here.
-                if self.tabs.len() <= 1 {
+                if self.sessions.tabs.len() <= 1 {
                     self.should_exit = true;
                     break;
                 }
                 // Otherwise: remove the exited tab and switch to the prev.
-                self.tabs.remove(i);
-                if self.active_tab >= self.tabs.len() {
-                    self.active_tab = self.tabs.len() - 1;
+                self.sessions.tabs.remove(i);
+                if self.sessions.active_tab >= self.sessions.tabs.len() {
+                    self.sessions.active_tab = self.sessions.tabs.len() - 1;
                 }
-                info!(closed = i, active = self.active_tab, "tab shell exited");
+                info!(
+                    closed = i,
+                    active = self.sessions.active_tab,
+                    "tab shell exited"
+                );
                 break;
             }
             drained_blocks.extend(drained);
-            if let Some(resolution) = self.tabs[i].resolve_pending_tui_scroll() {
+            if let Some(resolution) = self.sessions.tabs[i].resolve_pending_tui_scroll() {
                 match resolution {
                     TuiScrollResolution::PtyBytes(bytes) => {
-                        if let Some(pty) = &self.tabs[i].pty {
+                        if let Some(pty) = &self.sessions.tabs[i].pty {
                             if let Err(e) = pty.write_sync(&bytes) {
                                 warn!(error = %e, tab = i, "failed to replay queued TUI scroll");
                             }
                         }
                     }
-                    TuiScrollResolution::LocalRows(rows) if i == self.active_tab => {
+                    TuiScrollResolution::LocalRows(rows) if i == self.sessions.active_tab => {
                         deferred_local_scroll =
                             deferred_local_scroll.saturating_add(rows).clamp(-100, 100);
                     }
@@ -630,7 +266,7 @@ impl App {
             }
         }
         if !drained_blocks.is_empty() {
-            if let Some(store) = &self.block_store {
+            if let Some(store) = &self.sessions.block_store {
                 for block in &drained_blocks {
                     if let Err(e) = store.insert(block) {
                         warn!(error = %e, "failed to persist block");
@@ -653,16 +289,65 @@ impl App {
         }
     }
 
+    fn drain_effects(&mut self, effects: impl IntoIterator<Item = Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::WritePty { tab, bytes } => {
+                    if let Some(pty) = self.sessions.tabs.get(tab).and_then(|tab| tab.pty.as_ref())
+                    {
+                        if let Err(error) = pty.write_sync(&bytes) {
+                            warn!(%error, tab, "failed to apply PTY write effect");
+                        }
+                    }
+                }
+                Effect::InterruptPty { tab } => {
+                    if let Some(pty) = self.sessions.tabs.get(tab).and_then(|tab| tab.pty.as_ref())
+                    {
+                        pty.send_interrupt();
+                    }
+                }
+                Effect::FlushPtyOutput { tab } => {
+                    if let Some(tab) = self.sessions.tabs.get_mut(tab) {
+                        tab.flush_pty_output();
+                    }
+                }
+                Effect::ResizePty { tab, rows, cols } => {
+                    if let Some(session) = self.sessions.tabs.get_mut(tab) {
+                        if let Some(pty) = &session.pty {
+                            if let Err(error) = pty.resize(rows as u16, cols as u16) {
+                                warn!(%error, tab, rows, cols, "failed to apply PTY resize effect");
+                            }
+                        }
+                        if session.pending_pty_resize == Some((rows, cols)) {
+                            session.pending_pty_resize = None;
+                        }
+                    }
+                }
+                Effect::CopyClipboard { text } => clipboard_copy(&text),
+                Effect::RequestRedraw => self.request_redraw(),
+            }
+        }
+    }
+
     /// Cancel native marked text before keyboard ownership changes. macOS
     /// keeps this state on the window rather than on an individual Weft tab.
     fn reset_ime_context(&mut self, reason: &'static str) {
-        for tab in &mut self.tabs {
+        for tab in &mut self.sessions.tabs {
             tab.ime_preedit.clear();
         }
         if let Some(window) = &self.window {
             ime::discard_marked_text(window);
         }
         tracing::debug!(reason, "native IME context reset");
+    }
+
+    fn overlay_input_owner(&self) -> Option<OverlayInputOwner> {
+        OverlayInputOwner::resolve(OverlayInputContext {
+            palette_open: self.palette.open,
+            settings_open: self.settings.open,
+            find_open: self.find.open,
+            panel_search_focused: self.panel.open && self.panel.search_focused,
+        })
     }
 
     fn handle_key_event(
@@ -775,14 +460,14 @@ impl App {
         // SelectAll (Cmd+A) so they target the find query, not the shell
         // editor. Other Cmd chords (Cmd+R regex toggle, Cmd+I case toggle)
         // are handled inside `handle_find_key` below.
-        if self.find_open
+        if self.find.open
             && m.contains(Modifiers::SUPER)
             && matches!(key, KeyCode::Char('v') | KeyCode::Char('a'))
         {
             if key == KeyCode::Char('v') {
                 if let Some(text) = clipboard_paste() {
-                    self.find_query.push_str(&text);
-                    self.find_last_key = Some(std::time::Instant::now());
+                    self.find.query.push_str(&text);
+                    self.find.last_key = Some(std::time::Instant::now());
                     self.request_redraw();
                 }
                 return;
@@ -794,34 +479,21 @@ impl App {
                 return;
             }
         }
-        if let Some(action) = self.keybindings.lookup(key, m) {
+        if let Some(action) = self.config_state.keybindings.lookup(key, m) {
             if self.execute_action(action) {
                 return;
             }
         }
 
-        // Command Palette (highest overlay priority — captures all keys when open).
-        if self.palette_open && self.handle_palette_key(key, m, text) {
-            return;
-        }
-
-        // v1.0 S1: Settings panel (modal — captures all keys when open).
-        if self.settings_open && self.handle_settings_key(key, m, text) {
-            return;
-        }
-
-        // FindInGrid bar (just below palette in priority — both close on Esc
-        // and capture typed text into their respective inputs).
-        if self.find_open && self.handle_find_key(key, m, text) {
-            return;
-        }
-
-        // v0.9 fix: panel search box has click-to-focus. When focused, typed
-        // text goes to the panel query (filtering the history list) instead
-        // of the editor. Esc unfocuses; clicking elsewhere also unfocuses.
-        // This preserves sidebar-mode editor input while making the search
-        // box functional (bug 6: "no search box / can't search").
-        if self.panel_open && self.panel_search_focused && self.handle_panel_key(key, m) {
+        let overlay_owner = self.overlay_input_owner();
+        let overlay_consumed = match overlay_owner {
+            Some(OverlayInputOwner::Palette) => self.handle_palette_key(key, m, text),
+            Some(OverlayInputOwner::Settings) => self.handle_settings_key(key, m, text),
+            Some(OverlayInputOwner::Find) => self.handle_find_key(key, m, text),
+            Some(OverlayInputOwner::PanelSearch) => self.handle_panel_key(key, m),
+            None => false,
+        };
+        if overlay_consumed {
             return;
         }
 
@@ -876,34 +548,8 @@ impl App {
             ?bytes,
             "key → pty"
         );
-        if !bytes.is_empty() {
-            let is_ctrl_c = bytes.len() == 1 && bytes[0] == 0x03;
-            if is_ctrl_c {
-                // v1.0 fix: Ctrl+C (0x03) special path. When the PTY write
-                // buffer is full (e.g. a command like `seq 1 1000000` is
-                // producing output faster than weft can drain), write_sync
-                // returns EAGAIN and the 0x03 byte is dropped. In that case,
-                // bypass the PTY and send SIGINT directly to the foreground
-                // process group via TIOCGPGRP + killpg(SIGINT). This is a
-                // kernel-level signal that doesn't depend on PTY buffer state.
-                if let Some(pty) = &self.tab().pty {
-                    let _ = pty.write_sync(&bytes);
-                    pty.send_interrupt();
-                }
-                // v1.0 fix: Flush stale PTY output so the UI responds
-                // immediately. Without this, weft would spend many frames
-                // processing the interrupted command's remaining output
-                // (e.g. ~7MB from `seq 1 10000000`), making the UI appear
-                // frozen even though the command was already interrupted.
-                // PtyExit events are preserved (see flush_pty_output).
-                self.tab_mut().flush_pty_output();
-                self.request_redraw();
-            } else if let Some(pty) = &self.tab().pty {
-                if let Err(e) = pty.write_sync(&bytes) {
-                    warn!("Failed to write to PTY: {e}");
-                }
-            }
-        }
+        let effects = effect::passthrough_key_effects(self.sessions.active_tab, bytes);
+        self.drain_effects(effects);
     }
 
     /// Dispatch a weft action resolved from a keybinding. Returns true if the
@@ -932,13 +578,14 @@ impl App {
                 true
             }
             Action::ToggleBlockPanel => {
-                self.panel_open = !self.panel_open;
-                if self.panel_open {
+                if self.panel.open {
+                    self.panel.close();
+                } else {
+                    self.panel.open = true;
                     // Fresh search/selection each time the panel opens.
-                    self.panel_query.clear();
-                    self.panel_selection = 0;
-                    self.panel_expanded = None;
-                    self.panel_search_focused = false;
+                    self.panel.query.clear();
+                    self.panel.clear_transient_selection();
+                    self.panel.search_focused = false;
                 }
                 // v0.9 W5: resize grid for sidebar so the terminal content
                 // reflows beside the panel instead of being covered by it.
@@ -948,8 +595,9 @@ impl App {
             }
             Action::ToggleCommandPalette => {
                 self.reset_ime_context("command palette toggled");
-                self.palette_open = !self.palette_open;
-                if self.palette_open {
+                if self.palette.open {
+                    self.palette.close();
+                } else {
                     // v0.9 fix: opening the palette closes the find bar (and
                     // vice versa) so only one modal owns keyboard input at a
                     // time. Without this, Cmd+F then Cmd+P leaves both
@@ -957,10 +605,7 @@ impl App {
                     // v1.0 S1: also close the Settings panel.
                     self.close_find();
                     self.close_settings();
-                    self.palette_query.clear();
-                    self.palette_selection = 0;
-                    self.palette_form = None;
-                    self.palette_submode = PaletteSubMode::Search;
+                    self.palette.open_search();
                     self.refresh_palette_results();
                 }
                 self.request_redraw();
@@ -972,24 +617,15 @@ impl App {
             }
             Action::FindInGrid => {
                 self.reset_ime_context("find toggled");
-                self.find_open = !self.find_open;
-                if self.find_open {
+                if self.find.open {
+                    self.find.close();
+                } else {
                     // v0.9 fix: opening find closes the palette (see above).
                     // v1.0 S1: also close the Settings panel.
                     self.close_palette();
                     self.close_settings();
-                    self.find_query.clear();
-                    self.find_matches.clear();
-                    self.find_index = 0;
-                    self.find_truncated = false;
-                    self.find_block_matches.clear();
-                    self.find_block_index = 0;
-                    self.find_block_truncated = false;
-                    self.find_regex_mode = false;
-                    self.find_case_sensitive = false;
-                    self.find_last_key = None;
-                    self.find_regex_error = None;
-                    self.find_worker_busy = false;
+                    self.find.reset_query();
+                    self.find.open = true;
                 }
                 self.request_redraw();
                 true
@@ -1013,19 +649,13 @@ impl App {
             }
             Action::ToggleSettings => {
                 self.reset_ime_context("settings toggled");
-                self.settings_open = !self.settings_open;
-                if self.settings_open {
+                if self.settings.open {
+                    self.settings.close();
+                } else {
                     // Mutual exclusion: close other modals.
                     self.close_palette();
                     self.close_find();
-                    // Initialize the working draft from the live config so
-                    // edits in the panel don't immediately apply.
-                    self.settings_draft = self.config.clone();
-                    self.settings_tab = crate::overlay::SettingsTab::Appearance;
-                    self.settings_selection = 0;
-                    self.settings_scroll_offset = 0;
-                    self.settings_dirty = false;
-                    self.settings_error = None;
+                    self.settings.open_from(&self.config_state.config);
                 }
                 self.request_redraw();
                 true
@@ -1046,24 +676,24 @@ impl App {
             // panel. The panel itself closes via the Cmd+Shift+B keybinding
             // or by clicking outside the sidebar.
             KeyCode::Escape => {
-                self.panel_search_focused = false;
+                self.panel.search_focused = false;
                 self.request_redraw();
                 true
             }
             KeyCode::Up => {
-                self.panel_selection = self.panel_selection.saturating_sub(1);
+                self.panel.selection = self.panel.selection.saturating_sub(1);
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
             }
             KeyCode::Down => {
-                self.panel_selection = self.panel_selection.saturating_add(1);
+                self.panel.selection = self.panel.selection.saturating_add(1);
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
             }
             KeyCode::Backspace => {
-                self.panel_query.pop();
+                self.panel.query.pop();
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
@@ -1075,7 +705,7 @@ impl App {
                 true
             }
             KeyCode::Char(c) if !c.is_control() => {
-                self.panel_query.push(c);
+                self.panel.query.push(c);
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
@@ -1089,4160 +719,32 @@ impl App {
     /// v0.9: close the find bar and reset its state. Used when another modal
     /// (palette, panel, …) opens so only one owns keyboard input.
     fn close_find(&mut self) {
-        if !self.find_open {
+        if !self.find.open {
             return;
         }
         self.reset_ime_context("find closed");
-        self.find_open = false;
-        self.find_query.clear();
-        self.find_matches.clear();
-        self.find_index = 0;
-        self.find_truncated = false;
-        self.find_block_matches.clear();
-        self.find_block_index = 0;
-        self.find_block_truncated = false;
-        self.find_regex_mode = false;
-        self.find_case_sensitive = false;
-        self.find_last_key = None;
-        self.find_regex_error = None;
-        self.find_worker_busy = false;
+        self.find.close();
     }
 
     /// v0.9: close the command palette and reset its state. Used when
     /// another modal (find bar, …) opens so only one owns keyboard input.
     fn close_palette(&mut self) {
-        if !self.palette_open {
+        if !self.palette.open {
             return;
         }
         self.reset_ime_context("palette closed");
-        self.palette_open = false;
-        self.palette_query.clear();
-        self.palette_selection = 0;
-        self.palette_form = None;
-        self.palette_submode = PaletteSubMode::Search;
+        self.palette.close();
     }
 
     /// v1.0 S1: close the Settings panel, discarding any unsaved draft
     /// changes. Used when another modal opens so only one owns keyboard
     /// input.
     fn close_settings(&mut self) {
-        if !self.settings_open {
+        if !self.settings.open {
             return;
         }
         self.reset_ime_context("settings closed");
-        self.settings_open = false;
-        self.settings_dirty = false;
-    }
-
-    /// Refresh the palette search results from the workflow store + builtin commands.
-    fn refresh_palette_results(&mut self) {
-        let mut results = Vec::new();
-
-        // Workflows from the store.
-        if let Some(store) = &self.workflow_store {
-            let workflows = if self.palette_query.is_empty() {
-                store.list().unwrap_or_default()
-            } else {
-                store.search(&self.palette_query, 50).unwrap_or_default()
-            };
-            for wf in workflows {
-                results.push(PaletteEntry::Workflow(wf));
-            }
-        }
-
-        // Builtin commands (filtered by query if non-empty).
-        let builtins = [
-            BuiltinCmd::ToggleTheme,
-            BuiltinCmd::SelectTheme,
-            BuiltinCmd::ToggleBlockPanel,
-            BuiltinCmd::ReloadConfig,
-        ];
-        for b in &builtins {
-            let label = b.label();
-            if self.palette_query.is_empty()
-                || label
-                    .to_lowercase()
-                    .contains(&self.palette_query.to_lowercase())
-            {
-                results.push(PaletteEntry::Builtin(*b));
-            }
-        }
-
-        self.palette_results = results;
-        // Clamp selection.
-        if self.palette_selection >= self.palette_results.len() {
-            self.palette_selection = 0;
-        }
-    }
-
-    /// Handle a key while the Command Palette is open. Returns true if consumed.
-    fn handle_palette_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
-        // Let modifier chords fall through (so cmd+p can toggle closed).
-        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
-            return false;
-        }
-
-        // If we're in form mode (filling workflow variables), route differently.
-        if self.palette_form.is_some() {
-            return self.handle_palette_form_key(key, mods, text);
-        }
-
-        // Route to sub-mode handler if not in Search.
-        match &self.palette_submode {
-            PaletteSubMode::CreateWorkflow { .. } => {
-                return self.handle_palette_create_key(key, text);
-            }
-            PaletteSubMode::EditWorkflow { .. } => {
-                return self.handle_palette_edit_key(key, text);
-            }
-            PaletteSubMode::ConfirmDelete { .. } => {
-                return self.handle_palette_delete_key(key);
-            }
-            PaletteSubMode::SelectTheme { .. } => {
-                return self.handle_palette_select_theme_key(key, text);
-            }
-            PaletteSubMode::Search => {}
-        }
-
-        match key {
-            KeyCode::Escape => {
-                self.palette_open = false;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Up => {
-                if self.palette_selection > 0 {
-                    self.palette_selection -= 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Down => {
-                if self.palette_selection + 1 < self.palette_results.len() {
-                    self.palette_selection += 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                if let Some(entry) = self.palette_results.get(self.palette_selection).cloned() {
-                    self.activate_palette_entry(entry);
-                }
-                true
-            }
-            KeyCode::Backspace => {
-                // If query is empty and we were typing '>', clear it.
-                if self.palette_query.is_empty() {
-                    self.palette_submode = PaletteSubMode::Search;
-                } else {
-                    self.palette_query.pop();
-                    self.palette_selection = 0;
-                    self.refresh_palette_results();
-                }
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c == '\0' || c.is_control() {
-                    return false;
-                }
-
-                // Check for action shortcuts when a workflow is selected and
-                // query is empty (single-char commands).
-                if self.palette_query.is_empty() {
-                    let action = match c {
-                        '>' => Some("create"),
-                        'e' | 'E' => Some("edit"),
-                        'd' | 'D' => Some("delete"),
-                        'x' | 'X' => Some("export"),
-                        _ => None,
-                    };
-                    if let Some(act) = action {
-                        return self.handle_palette_action(act);
-                    }
-                }
-
-                self.palette_query.push(c);
-                self.palette_selection = 0;
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
-            }
-        }
-    }
-
-    // ── Settings panel (v1.0 S1, Cmd+,) ────────────────────────────────
-
-    /// v1.0 S1: Handle a key while the Settings panel is open. Returns
-    /// true if consumed. Modal — captures all non-modifier-chord keys so
-    /// the panel owns keyboard input while visible.
-    ///
-    /// Key map:
-    /// - `Esc` → close without saving (discard draft)
-    /// - `Tab` → cycle to next tab
-    /// - `↑` / `↓` → navigate selection within the active tab
-    /// - `Enter` → apply selected row (e.g. pick a theme); marks the draft
-    ///   dirty; does NOT close the panel
-    /// - `Cmd+Enter` → save draft to disk & close
-    /// - other chords with Cmd/Ctrl/Alt fall through to keybindings
-    fn handle_settings_key(&mut self, key: KeyCode, mods: Modifiers, _text: Option<&str>) -> bool {
-        use crate::overlay::SettingsTab;
-
-        // Cmd+Enter: save draft to disk & close.
-        if mods.contains(Modifiers::SUPER) && key == KeyCode::Enter {
-            self.save_settings_draft(true);
-            self.request_redraw();
-            return true;
-        }
-
-        // Let other modifier chords fall through (so Cmd+, can toggle
-        // closed, Cmd+Q still quits, etc.).
-        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
-            return false;
-        }
-
-        match key {
-            KeyCode::Escape => {
-                // Close without saving (discard draft).
-                self.settings_open = false;
-                self.settings_error = None;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Tab => {
-                // Cycle to the next tab (wraps around).
-                let tabs = SettingsTab::ALL;
-                let idx = tabs
-                    .iter()
-                    .position(|t| *t == self.settings_tab)
-                    .unwrap_or(0);
-                self.settings_tab = tabs[(idx + 1) % tabs.len()];
-                self.settings_selection = 0;
-                self.settings_scroll_offset = 0;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Up => {
-                // v1.0 fix: wrap-around selection so users can cycle through
-                // all rows with arrow keys alone (no End/Home needed).
-                let max = self.settings_tab_row_count();
-                if max > 0 {
-                    self.settings_selection = (self.settings_selection + max - 1) % max;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Down => {
-                // v1.0 fix: wrap-around selection (Down at bottom → top).
-                let max = self.settings_tab_row_count();
-                if max > 0 {
-                    self.settings_selection = (self.settings_selection + 1) % max;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                // Apply the selected row in the active tab to the draft.
-                self.apply_settings_selection();
-                self.request_redraw();
-                true
-            }
-            // v1.0 S1-c: ←/→ nudges the value of the selected row in the
-            // Font / Window tabs (no-op in Appearance/Keybindings which are
-            // pick-list tabs). The step sizes and clamps match what the
-            // renderer's footer hint advertises ("←→ adjust").
-            KeyCode::Left | KeyCode::Right => {
-                let delta = if key == KeyCode::Left { -1 } else { 1 };
-                self.adjust_settings_value(delta);
-                self.request_redraw();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// v1.0 S2: Persist the working draft to disk and reload the live config
-    /// so theme/font/padding changes take effect immediately. When `close`
-    /// is true the panel is dismissed; the Apply button passes false so the
-    /// user can keep editing. Failures (e.g. unset `HOME`, read-only config
-    /// dir) are surfaced via [`settings_error`] instead of just being logged.
-    fn save_settings_draft(&mut self, close: bool) {
-        if self.settings_dirty {
-            if let Err(e) = self.settings_draft.save() {
-                tracing::warn!(error = ?e, "failed to save settings draft");
-                self.settings_error = Some(e.to_string());
-                // Don't close on failure — the user needs to see the error.
-                return;
-            }
-            // Apply the new config immediately so theme/font changes
-            // take effect without a restart. reload_config() reads the
-            // freshly-saved file and calls apply_config(), which
-            // rebuilds the renderer theme + atlas.
-            self.reload_config();
-            self.settings_dirty = false;
-            self.settings_error = None;
-        }
-        if close {
-            self.settings_open = false;
-            self.settings_error = None;
-        }
-    }
-
-    /// v1.0 S1-c: Adjust the value of the currently-selected row in the
-    /// active tab by `delta` (±1). Font/Window rows map to numeric fields;
-    /// the Font family row cycles through a fixed list of common macOS
-    /// monospace families. The Logo tab cycles the Dock icon variant.
-    /// No-op for Appearance/Keybindings (pick-list tabs).
-    fn adjust_settings_value(&mut self, delta: i32) {
-        use crate::overlay::SettingsTab;
-        match self.settings_tab {
-            SettingsTab::Font => match self.settings_selection {
-                0 => {
-                    // Family: cycle Menlo → Monaco → SF Mono → System → Menlo.
-                    const FAMILIES: &[&str] = &["Menlo", "Monaco", "SF Mono", "System"];
-                    let cur = FAMILIES
-                        .iter()
-                        .position(|f| *f == self.settings_draft.font.family)
-                        .unwrap_or(0);
-                    let next = (cur as i32 + delta).rem_euclid(FAMILIES.len() as i32) as usize;
-                    self.settings_draft.font.family = FAMILIES[next].to_string();
-                    self.settings_dirty = true;
-                }
-                1 => {
-                    // Size: ±0.5 pt, clamped to [8.0, 24.0].
-                    self.settings_draft.font.size =
-                        (self.settings_draft.font.size + delta as f32 * 0.5).clamp(8.0, 24.0);
-                    self.settings_dirty = true;
-                }
-                2 => {
-                    // Line height: ±0.05, clamped to [1.0, 1.5].
-                    self.settings_draft.font.line_height = (self.settings_draft.font.line_height
-                        + delta as f32 * 0.05)
-                        .clamp(1.0, 1.5);
-                    self.settings_dirty = true;
-                }
-                _ => {}
-            },
-            SettingsTab::Window => match self.settings_selection {
-                0 => {
-                    // Opacity: ±0.05, clamped to [0.5, 1.0].
-                    self.settings_draft.window.opacity =
-                        (self.settings_draft.window.opacity + delta as f32 * 0.05).clamp(0.5, 1.0);
-                    self.settings_dirty = true;
-                }
-                1 => {
-                    // Padding X: ±1 cell, clamped to [0, 20].
-                    self.settings_draft.window.padding_x =
-                        ((self.settings_draft.window.padding_x as i32 + delta).max(0) as u32)
-                            .min(20);
-                    self.settings_dirty = true;
-                }
-                2 => {
-                    // Padding Y: ±1 cell, clamped to [0, 20].
-                    self.settings_draft.window.padding_y =
-                        ((self.settings_draft.window.padding_y as i32 + delta).max(0) as u32)
-                            .min(20);
-                    self.settings_dirty = true;
-                }
-                3 => {
-                    // Scrollback: ±1000 lines, clamped to [1000, 100000].
-                    self.settings_draft.scrollback.lines =
-                        ((self.settings_draft.scrollback.lines as i32 + delta * 1000).max(1000)
-                            as usize)
-                            .min(100000);
-                    self.settings_dirty = true;
-                }
-                _ => {}
-            },
-            SettingsTab::Logo => {
-                if self.settings_selection == 0 {
-                    // Variant: cycle Cool → Warm → Light → Transparent → Cool.
-                    let variants = weft_core::config::LogoVariant::ALL;
-                    let cur = variants
-                        .iter()
-                        .position(|v| *v == self.settings_draft.logo.variant)
-                        .unwrap_or(0);
-                    let next = (cur as i32 + delta).rem_euclid(variants.len() as i32) as usize;
-                    self.settings_draft.logo.variant = variants[next];
-                    self.settings_dirty = true;
-                }
-            }
-            SettingsTab::Appearance | SettingsTab::Keybindings => {
-                // Pick-list tabs — ←/→ has no meaning here.
-            }
-        }
-    }
-
-    /// v1.0 S1: Number of selectable rows in the active Settings tab.
-    fn settings_tab_row_count(&self) -> usize {
-        use crate::overlay::SettingsTab;
-        match self.settings_tab {
-            SettingsTab::Appearance => self.settings_theme_views().len(),
-            // v1.0 S1-d: must match the rows rendered by build_settings_vertices
-            // (Family / Size / Line height). Out-of-sync values let ↑↓ walk
-            // past the rendered rows.
-            SettingsTab::Font => 3,
-            SettingsTab::Keybindings => self.settings_keybinding_views().len(),
-            // v1.0 S1-d: Opacity / Padding X / Padding Y / Scrollback — match
-            // the four rows rendered by build_settings_vertices.
-            SettingsTab::Window => 4,
-            // v1.0 Logo: single row (Variant) — ←/→ cycles the value.
-            SettingsTab::Logo => 1,
-        }
-    }
-
-    /// v1.0 S1: Apply the currently-selected row in the active tab to the
-    /// draft. In v1.0 only the Appearance tab is interactive (theme
-    /// selection); the other tabs are read-only display.
-    fn apply_settings_selection(&mut self) {
-        use crate::overlay::SettingsTab;
-        match self.settings_tab {
-            SettingsTab::Appearance => {
-                if let Some(view) = self
-                    .settings_theme_views()
-                    .get(self.settings_selection)
-                    .copied()
-                {
-                    if self.settings_draft.theme.name != view.name {
-                        self.settings_draft.theme.name = view.name.to_string();
-                        // Disable follow_system so the user's explicit theme
-                        // choice takes precedence over the system appearance.
-                        // Otherwise apply_config would ignore `name` and pick
-                        // the theme from system light/dark mode.
-                        self.settings_draft.theme.follow_system = false;
-                        // v1.0: remember the user's preferred dark theme so
-                        // Cmd+Shift+T can toggle back to it. If the selected
-                        // theme is dark (name doesn't contain "light"), update
-                        // preferred_dark_theme.
-                        if !view.name.contains("light") {
-                            self.preferred_dark_theme = view.name.to_string();
-                        }
-                        self.settings_dirty = true;
-                    }
-                }
-            }
-            SettingsTab::Font
-            | SettingsTab::Keybindings
-            | SettingsTab::Window
-            | SettingsTab::Logo => {
-                // Read-only from Enter — ←/→ handles adjustments instead.
-            }
-        }
-    }
-
-    /// v1.0 S1: The list of built-in themes for the Appearance tab. The
-    /// order matches `Theme::resolve_named`'s match arms so the list
-    /// stays in sync with the resolver.
-    fn settings_theme_views(&self) -> Vec<crate::overlay::SettingsThemeView> {
-        use crate::overlay::SettingsThemeView;
-        vec![
-            SettingsThemeView {
-                name: "weft-warm",
-                label: "Weft Warm (default)",
-            },
-            SettingsThemeView {
-                name: "weft-light",
-                label: "Weft Light",
-            },
-            SettingsThemeView {
-                name: "warp",
-                label: "Warp Dark",
-            },
-            SettingsThemeView {
-                name: "dracula",
-                label: "Dracula",
-            },
-            SettingsThemeView {
-                name: "solarized-dark",
-                label: "Solarized Dark",
-            },
-            SettingsThemeView {
-                name: "gruvbox-dark",
-                label: "Gruvbox Dark",
-            },
-            SettingsThemeView {
-                name: "nord",
-                label: "Nord",
-            },
-            SettingsThemeView {
-                name: "tokyo-night",
-                label: "Tokyo Night",
-            },
-            SettingsThemeView {
-                name: "catppuccin",
-                label: "Catppuccin Mocha",
-            },
-            SettingsThemeView {
-                name: "one-dark",
-                label: "One Dark",
-            },
-            SettingsThemeView {
-                name: "monokai-pro",
-                label: "Monokai Pro",
-            },
-        ]
-    }
-
-    /// v1.0 S1: The list of keybinding rows for the Keybindings tab
-    /// (read-only display). Built from the resolved keybinding table.
-    fn settings_keybinding_views(&self) -> Vec<crate::overlay::SettingsKeybindingView> {
-        use crate::overlay::SettingsKeybindingView;
-        // Reverse-lookup: action → chord. The keybindings map is
-        // (KeyCode, Modifiers) → Action, so we iterate and collect.
-        let mut views = Vec::new();
-        for (chord, action) in &self.keybindings.map {
-            let label = match action {
-                weft_core::config::Action::Copy => "Copy",
-                weft_core::config::Action::Paste => "Paste",
-                weft_core::config::Action::ReloadConfig => "Reload Config",
-                weft_core::config::Action::ScrollPageUp => "Scroll Page Up",
-                weft_core::config::Action::ScrollPageDown => "Scroll Page Down",
-                weft_core::config::Action::ScrollLineUp => "Scroll Line Up",
-                weft_core::config::Action::ScrollLineDown => "Scroll Line Down",
-                weft_core::config::Action::ScrollToTop => "Scroll To Top",
-                weft_core::config::Action::ScrollToBottom => "Scroll To Bottom",
-                weft_core::config::Action::ToggleBlockPanel => "Toggle Block Panel",
-                weft_core::config::Action::ToggleCommandPalette => "Command Palette",
-                weft_core::config::Action::ZoomIn => "Zoom In",
-                weft_core::config::Action::ZoomOut => "Zoom Out",
-                weft_core::config::Action::ZoomReset => "Zoom Reset",
-                weft_core::config::Action::FindInGrid => "Find In Grid",
-                weft_core::config::Action::ToggleTheme => "Toggle Theme",
-                weft_core::config::Action::NewTab => "New Tab",
-                weft_core::config::Action::CloseTab => "Close Tab",
-                weft_core::config::Action::NextTab => "Next Tab",
-                weft_core::config::Action::PrevTab => "Previous Tab",
-                weft_core::config::Action::ToggleSettings => "Settings",
-            };
-            views.push(SettingsKeybindingView {
-                action: label.to_string(),
-                binding: chord_label(chord.0, chord.1),
-            });
-        }
-        // Sort by action label for stable display.
-        views.sort_by(|a, b| a.action.cmp(&b.action));
-        views
-    }
-
-    /// Handle a single-key palette action (create/edit/delete/export).
-    fn handle_palette_action(&mut self, action: &str) -> bool {
-        match action {
-            "create" => {
-                self.palette_submode = PaletteSubMode::CreateWorkflow {
-                    step: CreateStep::Name,
-                    buffer: String::new(),
-                    name: String::new(),
-                    command: String::new(),
-                };
-                self.request_redraw();
-                true
-            }
-            "edit" => {
-                if let Some(PaletteEntry::Workflow(wf)) =
-                    self.palette_results.get(self.palette_selection).cloned()
-                {
-                    self.palette_submode = PaletteSubMode::EditWorkflow {
-                        id: wf.id,
-                        name: wf.name.clone(),
-                        buffer: wf
-                            .steps
-                            .first()
-                            .map(|s| s.command.clone())
-                            .unwrap_or_default(),
-                    };
-                    self.request_redraw();
-                    true
-                } else {
-                    false
-                }
-            }
-            "delete" => {
-                if let Some(PaletteEntry::Workflow(wf)) =
-                    self.palette_results.get(self.palette_selection).cloned()
-                {
-                    self.palette_submode = PaletteSubMode::ConfirmDelete {
-                        id: wf.id,
-                        name: wf.name.clone(),
-                    };
-                    self.request_redraw();
-                    true
-                } else {
-                    false
-                }
-            }
-            "export" => {
-                if let Some(store) = &self.workflow_store {
-                    if let Some(PaletteEntry::Workflow(wf)) =
-                        self.palette_results.get(self.palette_selection)
-                    {
-                        match store.export_yaml(wf.id) {
-                            Ok(yaml) => {
-                                info!(workflow = %wf.name, "workflow YAML exported to log");
-                                tracing::debug!(yaml = %yaml, "exported workflow YAML");
-                            }
-                            Err(e) => warn!(error = %e, "failed to export workflow YAML"),
-                        }
-                    }
-                }
-                // Export doesn't change mode — stay in search.
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Handle keys while the FindInGrid bar is open. The bar consumes all
-    /// non-modifier keystrokes into the query input; Esc closes, Enter /
-    /// Shift+Enter navigate next/prev match, Cmd+F toggles closed (handled
-    /// by the keybinding resolution above, so it never reaches here).
-    fn handle_find_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
-        // Cmd+R: toggle regex mode (visual indicator only — actual regex
-        // search engine not yet wired, so this doesn't change results yet).
-        if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('r') {
-            self.find_regex_mode = !self.find_regex_mode;
-            self.request_redraw();
-            return true;
-        }
-        // Cmd+I: toggle case-sensitive search.
-        if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('i') {
-            self.find_case_sensitive = !self.find_case_sensitive;
-            // Re-run the search immediately so the toggle is reflected.
-            self.find_last_key = Some(std::time::Instant::now());
-            self.request_redraw();
-            return true;
-        }
-        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
-            return false;
-        }
-        match key {
-            KeyCode::Escape => {
-                self.find_open = false;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                // Shift+Enter = previous, Enter = next.
-                self.find_cycle_next_prev(!mods.contains(Modifiers::SHIFT));
-                true
-            }
-            KeyCode::Up | KeyCode::Down => {
-                // Arrow keys cycle prev/next, mirroring Warp's find popup.
-                self.find_cycle_next_prev(key == KeyCode::Down);
-                true
-            }
-            KeyCode::Backspace => {
-                if self.find_query.pop().is_some() {
-                    self.find_last_key = Some(std::time::Instant::now());
-                    self.request_redraw();
-                }
-                true
-            }
-            _ => {
-                // v0.9 fix: use resolve_text_char to fall back to the key
-                // char when `text` is None (winit doesn't populate text for
-                // all printable keys, e.g. `-` on some layouts). This
-                // matches the editor's behavior.
-                if let KeyCode::Char(c) = key {
-                    let resolved = resolve_text_char(text, c, mods.contains(Modifiers::SHIFT));
-                    if !resolved.is_control() {
-                        self.find_query.push(resolved);
-                        self.find_last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
-                        return true;
-                    }
-                }
-                if let Some(t) = text {
-                    if !t.is_empty() {
-                        self.find_query.push_str(t);
-                        self.find_last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
-                        return true;
-                    }
-                }
-                false
-            }
-        }
-    }
-
-    /// Cycle the find popup's current match forward (`next = true`) or
-    /// backward (`next = false`). Used by Enter / Shift+Enter, Up/Down
-    /// arrow keys, and the up/down buttons in the popup. In block view,
-    /// cycles through block matches; in grid view, cycles through grid
-    /// matches. No-op when there are no matches.
-    fn find_cycle_next_prev(&mut self, next: bool) {
-        if !self.find_block_matches.is_empty() && self.block_view_active() {
-            let len = self.find_block_matches.len();
-            if next {
-                self.find_block_index = (self.find_block_index + 1) % len;
-            } else if self.find_block_index == 0 {
-                self.find_block_index = len - 1;
-            } else {
-                self.find_block_index -= 1;
-            }
-            // v0.9 fix: auto-expand the block containing the current match so
-            // the highlighted hit is visible. If a match is inside a folded
-            // block's output, expanding it reveals the matching line. Command
-            // matches are always visible (the command line shows even when
-            // folded), so only expand for output matches.
-            let need_expand = self
-                .find_block_matches
-                .get(self.find_block_index)
-                .map(|bm| !bm.is_command)
-                .unwrap_or(false);
-            if need_expand {
-                if let Some(bm) = self.find_block_matches.get(self.find_block_index) {
-                    if let Some(term) = self.tabs[self.active_tab].terminal.as_mut() {
-                        let block = term
-                            .block_tracker()
-                            .session_blocks()
-                            .iter()
-                            .find(|b| b.id == bm.block_id)
-                            .cloned();
-                        if let Some(b) = block {
-                            if b.collapsed {
-                                term.block_tracker_mut().toggle_collapse(b.id);
-                            }
-                        }
-                    }
-                }
-            }
-            self.scroll_to_current_find_match();
-            self.request_redraw();
-        } else if !self.find_matches.is_empty() {
-            let len = self.find_matches.len();
-            if next {
-                self.find_index = (self.find_index + 1) % len;
-            } else if self.find_index == 0 {
-                self.find_index = len - 1;
-            } else {
-                self.find_index -= 1;
-            }
-            self.scroll_to_current_find_match();
-            self.request_redraw();
-        }
-    }
-
-    /// Run the search if the debounce window has elapsed. Called from the
-    /// redraw path; safe to call every frame — it no-ops when no search is
-    /// pending or the debounce hasn't expired.
-    ///
-    /// v0.9 U-P1: grid search is now async — we submit a `FindSnapshot` to
-    /// the background `FindWorker` and drain results in `poll_find_worker_results`.
-    /// This avoids blocking the render thread on large scrollbacks. Block
-    /// search stays synchronous (block output is plain `String` — scanning
-    /// is O(text size), not O(grid cells × flags), and is rarely the bottleneck).
-    fn maybe_refresh_find_results(&mut self) {
-        let Some(t) = self.find_last_key else {
-            return;
-        };
-        if t.elapsed() < std::time::Duration::from_millis(150) {
-            return;
-        }
-        self.find_last_key = None;
-
-        // Access the active tab's terminal via direct field indexing so the
-        // borrow is split to `self.tabs` — the find_* fields below can then
-        // be mutated without a borrow conflict (going through `self.tab()`
-        // would borrow all of `self`).
-        let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
-            return;
-        };
-
-        // Clear any stale regex error when starting a new search.
-        self.find_regex_error = None;
-
-        // Submit grid search to the background worker (async, non-blocking).
-        // The snapshot creation (~2-3ms for 10K rows) is the only main-thread
-        // cost; the scan itself runs on the worker thread.
-        if !self.find_query.is_empty() {
-            let snapshot = std::sync::Arc::new(term.grid().find_snapshot());
-            self.find_worker.submit(
-                self.find_query.clone(),
-                self.find_case_sensitive,
-                self.find_regex_mode,
-                snapshot,
-            );
-            self.find_worker_busy = true;
-        } else {
-            // Empty query → no matches. Clear immediately (no need to wait
-            // for the worker).
-            self.find_matches.clear();
-            self.find_truncated = false;
-            self.find_index = 0;
-            self.find_worker_busy = false;
-        }
-
-        // Search block history + in-flight block synchronously when in
-        // block view. This is fast (String scanning) and the matches are
-        // needed immediately for the FindUI count.
-        // v0.9 U-P2: pass is_regex so regex mode works in block view too.
-        if term.show_block_view() {
-            let blocks = term.block_tracker().session_blocks();
-            let mut block_matches = match weft_core::find::find_in_blocks(
-                blocks,
-                &self.find_query,
-                self.find_case_sensitive,
-                self.find_regex_mode,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    self.find_regex_error = Some(e.0);
-                    self.find_block_matches.clear();
-                    self.find_block_truncated = false;
-                    self.find_block_index = 0;
-                    self.request_redraw();
-                    return;
-                }
-            };
-            if let Some(live) = term.block_tracker().in_flight() {
-                match weft_core::find::find_in_flight(
-                    &live,
-                    &self.find_query,
-                    self.find_case_sensitive,
-                    self.find_regex_mode,
-                ) {
-                    Ok(mut live_matches) => block_matches.append(&mut live_matches),
-                    Err(e) => {
-                        self.find_regex_error = Some(e.0);
-                    }
-                }
-            }
-            self.find_block_truncated =
-                block_matches.len() >= weft_core::find::MAX_MATCHES && !self.find_query.is_empty();
-            self.find_block_matches = block_matches;
-            if !self.find_block_matches.is_empty() {
-                self.find_block_index =
-                    self.find_block_index.min(self.find_block_matches.len() - 1);
-                self.scroll_to_current_find_match();
-            } else {
-                self.find_block_index = 0;
-            }
-        } else {
-            self.find_block_matches.clear();
-            self.find_block_truncated = false;
-            self.find_block_index = 0;
-        }
-
-        self.request_redraw();
-    }
-
-    /// Drain pending find-worker results (v0.9 U-P1). Called every frame
-    /// from the redraw path. When a `Complete` or `Partial` result arrives,
-    /// updates `find_matches` / `find_truncated` and scrolls to the current
-    /// match. When `RegexInvalid` arrives, surfaces the error in the FindUI.
-    fn poll_find_worker_results(&mut self) {
-        if !self.find_worker_busy {
-            return;
-        }
-        while let Some(result) = self.find_worker.try_recv_result() {
-            match result {
-                find_worker::FindResult::Partial { matches } => {
-                    // Incremental results — paint them so the user sees
-                    // matches appear as the scan progresses.
-                    // v0.9 fix: update find_matches regardless of block view —
-                    // grid matches are needed for the FindUI count and for
-                    // scrolling when the user navigates. Block matches are a
-                    // separate field and don't conflict.
-                    if !matches.is_empty() {
-                        self.find_index = self.find_index.min(matches.len() - 1);
-                    } else {
-                        self.find_index = 0;
-                    }
-                    self.find_matches = matches;
-                    if !self.block_view_active() {
-                        self.scroll_to_current_find_match();
-                    }
-                    self.request_redraw();
-                }
-                find_worker::FindResult::Complete { matches, truncated } => {
-                    if !matches.is_empty() {
-                        self.find_index = self.find_index.min(matches.len() - 1);
-                    } else {
-                        self.find_index = 0;
-                    }
-                    self.find_matches = matches;
-                    self.find_truncated = truncated;
-                    if !self.block_view_active() {
-                        self.scroll_to_current_find_match();
-                    }
-                    self.find_worker_busy = false;
-                    self.request_redraw();
-                    // Done — break out of the drain loop.
-                    break;
-                }
-                find_worker::FindResult::RegexInvalid(msg) => {
-                    self.find_regex_error = Some(msg);
-                    self.find_matches.clear();
-                    self.find_truncated = false;
-                    self.find_index = 0;
-                    self.find_worker_busy = false;
-                    self.request_redraw();
-                    break;
-                }
-                find_worker::FindResult::Cancelled => {
-                    // A newer query is in flight — keep `find_worker_busy`
-                    // true; the newer query's results will arrive soon.
-                }
-            }
-        }
-    }
-
-    /// Scroll the viewport so the current find match is visible. In grid
-    /// view, adjusts `grid.scroll_offset` to bring the match to the middle
-    /// viewport row. In block view, adjusts `block_scroll_offset` to bring
-    /// the matching block into the visible region.
-    fn scroll_to_current_find_match(&mut self) {
-        // Block view: scroll to the block containing the current block match.
-        if self.block_view_active() && !self.find_block_matches.is_empty() {
-            let bm = self.find_block_matches.get(self.find_block_index).cloned();
-            let Some(bm) = bm else { return };
-            let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
-                return;
-            };
-            // Find the block's index in session_blocks to compute its row
-            // offset from the bottom. Blocks are laid out bottom-to-top:
-            // the newest (highest index) is at the bottom. The row offset
-            // from the bottom = sum of rows of all blocks BELOW it + its
-            // own offset within. We approximate by scrolling to bring the
-            // block's command line to the middle of the viewport.
-            let blocks = term.block_tracker().session_blocks();
-            let block_idx = blocks.iter().position(|b| b.id == bm.block_id);
-            let Some(block_idx) = block_idx else { return };
-            // Count rows from the bottom up to this block's matching line.
-            // Actual layout (bottom→top within a block):
-            //   Output[N-1] (last printed)  → row 1 from bottom
-            //   Output[N-2]                 → row 2
-            //   …
-            //   Output[0] (first printed)   → row N
-            //   Command                     → row N+1
-            //   Header                      → row N+2
-            //   Separator                   → row N+3
-            // where N = trimmed output line count. So for an output match at
-            // `bm.line`, the in-block offset from the bottom is `N - bm.line`.
-            // For a command match, it's `N + 1`.
-            // (The previous code used `bm.line + 3` which treated the layout
-            // as top-to-bottom — that was inverted, causing the viewport to
-            // jump to the wrong position and the highlight to land off-screen.)
-            let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
-                if b.collapsed {
-                    return 0;
-                }
-                let mut lines: Vec<&str> = b.output.lines().collect();
-                while lines.last().is_some_and(|l| {
-                    let t = l.trim();
-                    t.is_empty() || matches!(t, "%" | "$" | "#")
-                }) {
-                    lines.pop();
-                }
-                lines.len()
-            };
-            let mut rows_from_bottom = 0usize;
-            for (i, b) in blocks.iter().enumerate().rev() {
-                if i == block_idx {
-                    break;
-                }
-                rows_from_bottom += 3 + trim_output_lines(b);
-            }
-            let matching_output_lines = trim_output_lines(&blocks[block_idx]);
-            let line_in_block = if bm.is_command {
-                matching_output_lines + 1
-            } else {
-                matching_output_lines.saturating_sub(bm.line)
-            };
-            rows_from_bottom += line_in_block;
-            // Bring it to roughly the middle of the viewport.
-            let Some(renderer) = self.renderer.as_ref() else {
-                return;
-            };
-            let visible = renderer.block_visible_rows(1);
-            // Scroll so the matching row lands at ~visible/2 from the bottom
-            // of the viewport. block_scroll_offset is "rows scrolled up from
-            // the bottom", so target = rows_from_bottom - visible/2.
-            // (Previously this was ADDING visible/2, which scrolled PAST the
-            // match — the highlight was drawn but outside the clip region.)
-            let cols = term.grid().num_cols;
-            let (total, _) = block_content_metrics(term, cols);
-            let max_scroll = total.saturating_sub(visible);
-            let target = rows_from_bottom.saturating_sub(visible / 2).min(max_scroll);
-            self.tabs[self.active_tab].block_scroll_offset = target;
-            return;
-        }
-        // Grid view: scroll grid to bring the match to the middle row.
-        let Some(m) = self.find_matches.get(self.find_index).copied() else {
-            return;
-        };
-        let Some(term) = self.tabs[self.active_tab].terminal.as_mut() else {
-            return;
-        };
-        let grid = term.grid_mut();
-        let sb_len = grid.scrollback_len();
-        let mid = grid.num_rows / 2;
-        let target_offset = if m.row >= sb_len {
-            0
-        } else {
-            (sb_len + mid).saturating_sub(m.row).min(sb_len)
-        };
-        if grid.scroll_offset != target_offset {
-            grid.scroll_offset = target_offset;
-            term.clear_hyperlink_cell_map();
-        }
-    }
-
-    /// Handle keys in CreateWorkflow sub-mode (guided step-by-step entry).
-    fn handle_palette_create_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
-        let PaletteSubMode::CreateWorkflow {
-            step,
-            buffer,
-            name,
-            command,
-        } = &mut self.palette_submode
-        else {
-            return false;
-        };
-
-        match key {
-            KeyCode::Escape => {
-                self.palette_submode = PaletteSubMode::Search;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                match step {
-                    CreateStep::Name => {
-                        if buffer.is_empty() {
-                            return true; // ignore empty name
-                        }
-                        *name = std::mem::take(buffer);
-                        *step = CreateStep::Command;
-                        self.request_redraw();
-                        true
-                    }
-                    CreateStep::Command => {
-                        if buffer.is_empty() {
-                            return true;
-                        }
-                        *command = std::mem::take(buffer);
-                        *step = CreateStep::Done;
-
-                        // Create the workflow in the store.
-                        let wf = weft_core::workflow::Workflow {
-                            id: 0,
-                            name: name.clone(),
-                            description: "User-created workflow".into(),
-                            steps: vec![weft_core::workflow::WorkflowStep {
-                                command: command.clone(),
-                            }],
-                            variables: vec![],
-                            source: weft_core::workflow::WorkflowSource::Manual,
-                            use_count: 0,
-                            last_used_ms: 0,
-                        };
-                        if let Some(store) = &self.workflow_store {
-                            if let Err(e) = store.insert(&wf) {
-                                warn!(error = %e, "failed to save new workflow");
-                            } else {
-                                info!(name = %wf.name, "workflow created");
-                            }
-                        }
-
-                        // Return to search mode and refresh.
-                        self.palette_submode = PaletteSubMode::Search;
-                        self.palette_query.clear();
-                        self.refresh_palette_results();
-                        self.request_redraw();
-                        true
-                    }
-                    CreateStep::Done => true,
-                }
-            }
-            KeyCode::Backspace => {
-                buffer.pop();
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c != '\0' && !c.is_control() {
-                    buffer.push(c);
-                    self.request_redraw();
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    /// Handle keys in EditWorkflow sub-mode.
-    fn handle_palette_edit_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
-        let (id, name) = match &self.palette_submode {
-            PaletteSubMode::EditWorkflow { id, name, .. } => (*id, name.clone()),
-            _ => return false,
-        };
-
-        match key {
-            KeyCode::Escape => {
-                self.palette_submode = PaletteSubMode::Search;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                let new_command = match &self.palette_submode {
-                    PaletteSubMode::EditWorkflow { buffer, .. } => buffer.clone(),
-                    _ => return false,
-                };
-
-                // Update the workflow in the store.
-                if let Some(store) = &self.workflow_store {
-                    if let Some(mut wf) = store.find_by_name(&name).unwrap_or(None) {
-                        if let Some(step) = wf.steps.first_mut() {
-                            step.command = new_command.clone();
-                        } else {
-                            // No steps — append the new command as the first step.
-                            wf.steps.push(weft_core::workflow::WorkflowStep {
-                                command: new_command.clone(),
-                            });
-                        }
-                        if let Err(e) = store.update(&wf) {
-                            warn!(error = %e, "failed to update workflow");
-                        } else {
-                            info!(name = %name, "workflow updated");
-                        }
-                    }
-                }
-                let _ = id; // id already used via find_by_name
-                self.palette_submode = PaletteSubMode::Search;
-                self.palette_query.clear();
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
-            }
-            KeyCode::Backspace => {
-                if let PaletteSubMode::EditWorkflow { buffer, .. } = &mut self.palette_submode {
-                    buffer.pop();
-                }
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c != '\0' && !c.is_control() {
-                    if let PaletteSubMode::EditWorkflow { buffer, .. } = &mut self.palette_submode {
-                        buffer.push(c);
-                    }
-                    self.request_redraw();
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-    }
-
-    /// Handle keys in ConfirmDelete sub-mode.
-    fn handle_palette_delete_key(&mut self, key: KeyCode) -> bool {
-        match key {
-            KeyCode::Escape => {
-                self.palette_submode = PaletteSubMode::Search;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                let (id, name) = match &self.palette_submode {
-                    PaletteSubMode::ConfirmDelete { id, name } => (*id, name.clone()),
-                    _ => return false,
-                };
-                if let Some(store) = &self.workflow_store {
-                    if let Err(e) = store.delete(id) {
-                        warn!(error = %e, "failed to delete workflow");
-                    } else {
-                        info!(name = %name, "workflow deleted");
-                    }
-                }
-                self.palette_submode = PaletteSubMode::Search;
-                self.palette_query.clear();
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
-            }
-            _ => true, // consume all other keys in confirm mode
-        }
-    }
-
-    /// Handle keys while in the workflow variable form sub-mode.
-    fn handle_palette_form_key(
-        &mut self,
-        key: KeyCode,
-        _mods: Modifiers,
-        text: Option<&str>,
-    ) -> bool {
-        match key {
-            KeyCode::Escape => {
-                // Return to search mode (keep palette open).
-                self.palette_form = None;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Tab => {
-                if let Some(form) = &mut self.palette_form {
-                    if form.current_field + 1 < form.var_names.len() {
-                        form.current_field += 1;
-                    } else {
-                        form.current_field = 0; // wrap
-                    }
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                // Execute the workflow with the filled variables.
-                let form = self.palette_form.take();
-                if let Some(form) = form {
-                    self.execute_workflow(form);
-                }
-                self.palette_open = false;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Backspace => {
-                if let Some(form) = &mut self.palette_form {
-                    if form.current_field < form.var_values.len() {
-                        form.var_values[form.current_field].pop();
-                    }
-                }
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c != '\0' && !c.is_control() {
-                    if let Some(form) = &mut self.palette_form {
-                        if form.current_field < form.var_values.len() {
-                            form.var_values[form.current_field].push(c);
-                        }
-                    }
-                    self.request_redraw();
-                    return true;
-                }
-                false
-            }
-        }
-    }
-
-    /// Activate a palette entry: workflow → enter form mode, builtin → execute.
-    fn activate_palette_entry(&mut self, entry: PaletteEntry) {
-        match entry {
-            PaletteEntry::Workflow(wf) => {
-                let var_names = wf.all_var_names();
-                if var_names.is_empty() {
-                    // No variables — execute immediately (skip the form).
-                    let form = WorkflowForm {
-                        workflow_id: wf.id,
-                        workflow_name: wf.name.clone(),
-                        workflow_description: wf.description.clone(),
-                        var_names: Vec::new(),
-                        var_values: Vec::new(),
-                        current_field: 0,
-                    };
-                    self.execute_workflow(form);
-                    self.palette_open = false;
-                    self.request_redraw();
-                } else {
-                    // Has variables — enter form-fill mode.
-                    let var_count = var_names.len();
-                    self.palette_form = Some(WorkflowForm {
-                        workflow_id: wf.id,
-                        workflow_name: wf.name.clone(),
-                        workflow_description: wf.description.clone(),
-                        var_names,
-                        var_values: vec![String::new(); var_count],
-                        current_field: 0,
-                    });
-                    self.request_redraw();
-                }
-            }
-            PaletteEntry::Builtin(cmd) => {
-                match cmd {
-                    BuiltinCmd::ToggleTheme => {
-                        self.toggle_theme();
-                        self.palette_open = false;
-                    }
-                    BuiltinCmd::SelectTheme => {
-                        // v0.9 W2+: enter theme picker sub-mode instead of
-                        // closing the palette. List built-in themes + custom
-                        // theme files from ~/.config/weft/themes/.
-                        let themes = self.available_theme_names();
-                        self.palette_submode = PaletteSubMode::SelectTheme {
-                            buffer: String::new(),
-                            themes,
-                        };
-                        self.palette_query.clear();
-                        self.palette_selection = 0;
-                        self.refresh_theme_picker_results();
-                        // NOTE: do NOT close the palette — user must pick.
-                    }
-                    BuiltinCmd::ToggleBlockPanel => {
-                        self.execute_action(Action::ToggleBlockPanel);
-                        self.palette_open = false;
-                    }
-                    BuiltinCmd::ReloadConfig => {
-                        self.execute_action(Action::ReloadConfig);
-                        self.palette_open = false;
-                    }
-                }
-                self.request_redraw();
-            }
-        }
-    }
-
-    /// Execute a workflow: render variables → submit commands to PTY.
-    fn execute_workflow(&mut self, form: WorkflowForm) {
-        self.reset_ime_context("workflow submitted");
-        self.tabs[self.active_tab].arm_tui_scroll_window();
-        let Some(store) = &self.workflow_store else {
-            return;
-        };
-        let wf = store.find_by_name(&form.workflow_name).ok().flatten();
-        let Some(wf) = wf else {
-            return;
-        };
-
-        // Build variable values map.
-        let mut values = std::collections::HashMap::new();
-        for (name, val) in form.var_names.iter().zip(form.var_values.iter()) {
-            values.insert(name.clone(), val.clone());
-        }
-
-        match wf.render(&values) {
-            Ok(commands) => {
-                for cmd in &commands {
-                    let tab = &mut self.tabs[self.active_tab];
-                    if let Some(terminal) = &mut tab.terminal {
-                        // Set the command text and submit via the editor path.
-                        terminal.editor_mut().buffer.set_text(cmd);
-                        let bytes = terminal.submit_command();
-                        if !bytes.is_empty() {
-                            if let Some(pty) = &tab.pty {
-                                let _ = pty.write_sync(&bytes);
-                            }
-                        }
-                    }
-                }
-                // Update use count.
-                let _ = store.bump_use_count(wf.id);
-            }
-            Err(e) => {
-                warn!(error = %e, "workflow render failed");
-            }
-        }
-    }
-    /// Returns true if consumed. Ctrl chords that aren't editor ops fall through
-    /// (returns false) so Ctrl+C etc. still reach the PTY.
-    fn handle_editor_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> bool {
-        use weft_core::input::{KeyCode::*, Modifiers};
-        let shift = mods.contains(Modifiers::SHIFT);
-
-        // v0.9 fix: Cmd (SUPER) chords are app-level shortcuts (copy/paste/
-        // tab/panel…), not editor input. If a Cmd chord reaches here it
-        // means no keybinding matched — drop it instead of inserting the
-        // character into the editor (e.g. Cmd+Shift+V was inserting 'V').
-        if mods.contains(Modifiers::SUPER) {
-            return false;
-        }
-
-        // v0.9: any non-Cmd editor key clears the mouse-drag selection so
-        // typing replaces the selection. Cmd+C is handled above (returns
-        // false) so it won't clear the selection — copy still works.
-        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-            if t.editor().buffer.has_selection() {
-                t.editor_mut().buffer.clear_selection();
-                self.request_redraw();
-            }
-        }
-        self.prompt_dragging = false;
-
-        // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
-        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
-            let consumed = if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                let e = t.editor_mut();
-                match key {
-                    Char('a') => {
-                        e.buffer.move_line_home();
-                        true
-                    }
-                    Char('e') => {
-                        e.buffer.move_line_end();
-                        true
-                    }
-                    Char('w') => {
-                        e.buffer.delete_word_back();
-                        true
-                    }
-                    Char('u') => {
-                        e.buffer.clear_line();
-                        true
-                    }
-                    Char('k') => {
-                        e.buffer.delete_to_end();
-                        true
-                    }
-                    Char('r') => {
-                        if e.is_searching() {
-                            e.search_next();
-                        } else {
-                            e.search_start();
-                        }
-                        true
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            return consumed;
-        }
-
-        // Ctrl+R search mode intercepts printable/backspace/enter/esc/arrows.
-        let searching = self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| t.editor().is_searching())
-            .unwrap_or(false);
-        if searching {
-            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                let e = t.editor_mut();
-                match key {
-                    Char(c) => {
-                        e.search_input(resolve_text_char(text, c, shift));
-                        return true;
-                    }
-                    Backspace => {
-                        e.search_backspace();
-                        return true;
-                    }
-                    Enter => {
-                        e.search_accept();
-                        return true;
-                    }
-                    Escape => {
-                        e.search_cancel();
-                        return true;
-                    }
-                    Up => {
-                        e.search_prev();
-                        return true;
-                    }
-                    Down => {
-                        e.search_next();
-                        return true;
-                    }
-                    _ => {}
-                }
-            }
-            return false;
-        }
-
-        // Tab-completion mode: Tab cycles, Enter accepts (no submit), Up/Down
-        // navigate, Esc cancels. Any other key cancels and falls through to
-        // normal editing (so typing/deleting ends the session).
-        let completing = self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| t.editor().is_completing())
-            .unwrap_or(false);
-        if completing {
-            let consumed = match key {
-                Tab => {
-                    self.editor_completion_next();
-                    true
-                }
-                Enter => {
-                    self.editor_completion_accept();
-                    true
-                }
-                Up => {
-                    self.editor_completion_prev();
-                    true
-                }
-                Down => {
-                    self.editor_completion_next();
-                    true
-                }
-                Escape => {
-                    self.editor_completion_cancel();
-                    true
-                }
-                _ => false,
-            };
-            if consumed {
-                self.request_redraw();
-                return true;
-            }
-            self.editor_completion_cancel();
-        }
-
-        match key {
-            Tab => {
-                self.editor_start_completion();
-                true
-            }
-            Enter => {
-                // submit_on_ctrl_enter: Ctrl+Enter submits, plain Enter newlines
-                // (Warp default). Otherwise plain Enter submits, Shift+Enter
-                // newlines.
-                let ctrl = mods.contains(Modifiers::CONTROL);
-                let do_submit = if self.config.editor.submit_on_ctrl_enter {
-                    ctrl
-                } else {
-                    !shift
-                };
-                if do_submit {
-                    self.editor_submit();
-                } else if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.split_newline();
-                }
-                true
-            }
-            Char(c) => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut()
-                        .buffer
-                        .insert_char(resolve_text_char(text, c, shift));
-                }
-                true
-            }
-            Backspace => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.delete_backspace();
-                }
-                true
-            }
-            Delete => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.delete_forward();
-                }
-                true
-            }
-            Left => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.move_left();
-                }
-                true
-            }
-            Right => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.move_right();
-                }
-                true
-            }
-            Home => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.move_line_home();
-                }
-                true
-            }
-            End => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.move_line_end();
-                }
-                true
-            }
-            Up => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    let e = t.editor_mut();
-                    if e.buffer.cursor.0 == 0 {
-                        e.history_prev();
-                    } else {
-                        e.buffer.cursor.0 -= 1;
-                        let len = e.buffer.lines[e.buffer.cursor.0].chars().count();
-                        e.buffer.cursor.1 = e.buffer.cursor.1.min(len);
-                    }
-                }
-                true
-            }
-            Down => {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    let e = t.editor_mut();
-                    let last = e.buffer.line_count() - 1;
-                    if e.buffer.cursor.0 == last {
-                        e.history_next();
-                    } else {
-                        e.buffer.cursor.0 += 1;
-                        let len = e.buffer.lines[e.buffer.cursor.0].chars().count();
-                        e.buffer.cursor.1 = e.buffer.cursor.1.min(len);
-                    }
-                }
-                true
-            }
-            Escape => true, // swallow stray Esc in editor mode
-            _ => false,
-        }
-    }
-
-    // ── Tab completion (drives Editor's completion state machine) ───────────
-
-    fn editor_start_completion(&mut self) {
-        // Gather context under an immutable borrow, then mutate the editor.
-        let (line_owned, col, cwd, history) = match self.tabs[self.active_tab].terminal.as_ref() {
-            Some(t) => {
-                let line_idx = t.editor().buffer.cursor.0;
-                let col = t.editor().buffer.cursor.1;
-                let line = t.editor().buffer.lines.get(line_idx).cloned();
-                let cwd = t.cwd().unwrap_or("").to_string();
-                let history = t.editor().history().to_vec();
-                (line, col, cwd, history)
-            }
-            None => return,
-        };
-        let Some(line_str) = line_owned.as_deref() else {
-            return;
-        };
-
-        // Determine the word range and prefix. Normally this is the token left
-        // of the cursor. But when the cursor sits on whitespace after a command
-        // (e.g. `cd |`), word_at returns None — in that case, if we're at an
-        // argument position, treat it as an empty-prefix path completion so
-        // Tab lists all files/dirs in the cwd (matching Warp's behavior).
-        let (ws, we, prefix, is_cmd_pos): (usize, usize, String, bool) =
-            match word_at(line_str, col) {
-                Some((ws, we)) => {
-                    let prefix: String = line_str.chars().skip(ws).take(we - ws).collect();
-                    let is_cmd = is_command_position(line_str, ws);
-                    (ws, we, prefix, is_cmd)
-                }
-                None => {
-                    // Cursor on whitespace. Check if there's a command token
-                    // before the cursor (making this an argument position).
-                    // If so, start an empty-prefix path completion.
-                    let is_cmd = is_command_position(line_str, col);
-                    if is_cmd {
-                        return; // blank line or after operator — nothing to complete
-                    }
-                    (col, col, String::new(), false)
-                }
-            };
-
-        let position = if is_cmd_pos {
-            CompletePosition::Command
-        } else {
-            CompletePosition::Argument
-        };
-
-        // Skip empty prefix at command position (nothing to match).
-        if prefix.is_empty() && is_cmd_pos {
-            return;
-        }
-
-        let path_bins: Vec<String> = if is_cmd_pos {
-            self.path_bins.clone()
-        } else {
-            Vec::new()
-        };
-        let ctx = CompleteCtx {
-            cwd: &cwd,
-            history: &history,
-            path_bins: &path_bins,
-        };
-        let matches = complete(&prefix, &ctx, position);
-        if matches.is_empty() {
-            return;
-        }
-        let Some(t) = self.tabs[self.active_tab].terminal.as_mut() else {
-            return;
-        };
-        let e = t.editor_mut();
-        if matches.len() == 1 {
-            // Single candidate: accept immediately (replace the word).
-            e.start_completion(matches, ws, we);
-            e.completion_accept();
-        } else {
-            e.start_completion(matches, ws, we);
-        }
-    }
-
-    fn editor_completion_next(&mut self) {
-        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-            t.editor_mut().completion_next();
-        }
-    }
-
-    fn editor_completion_prev(&mut self) {
-        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-            t.editor_mut().completion_prev();
-        }
-    }
-
-    fn editor_completion_accept(&mut self) {
-        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-            t.editor_mut().completion_accept();
-        }
-    }
-
-    fn editor_completion_cancel(&mut self) {
-        if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-            t.editor_mut().completion_cancel();
-        }
-    }
-
-    /// Submit the editor's command: write PTY bytes (and any terminal query
-    /// response) and locally block the editor through the Enter→preexec window.
-    fn editor_submit(&mut self) {
-        // The editor and the launched command share one native NSView IME
-        // context. Drop any uncommitted editor composition before the PTY/TUI
-        // becomes the input owner, otherwise its first key can commit stale
-        // text into less/vim.
-        self.reset_ime_context("editor command submitted");
-        self.tabs[self.active_tab].arm_tui_scroll_window();
-        let bytes = self.tabs[self.active_tab]
-            .terminal
-            .as_mut()
-            .map(|t| t.submit_command())
-            .unwrap_or_default();
-        if !bytes.is_empty() {
-            if let Some(pty) = &self.tabs[self.active_tab].pty {
-                let _ = pty.write_sync(&bytes);
-            }
-        }
-        let resp = self.tabs[self.active_tab]
-            .terminal
-            .as_mut()
-            .map(|t| t.take_response())
-            .unwrap_or_default();
-        if !resp.is_empty() {
-            if let Some(pty) = &self.tabs[self.active_tab].pty {
-                let _ = pty.write_sync(&resp);
-            }
-        }
-        // Snap the block view to the bottom so the user sees the new
-        // command's output. Without this, a fast command (e.g. `echo hi`)
-        // finishes before the next redraw's `had_output && phase ==
-        // CommandExecuting` check fires — the phase is already back to
-        // AtPrompt by then, so the existing snap logic never triggers and
-        // the view stays scrolled up on history. Snapping here, at submit
-        // time, guarantees the user sees the result regardless of how fast
-        // the command completes.
-        self.tabs[self.active_tab].block_scroll_offset = 0;
-        self.request_redraw();
-    }
-
-    /// Count of blocks visible in the panel (newest-first, query-filtered).
-    fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
-            return 0;
-        };
-        let blocks = terminal.block_tracker().blocks();
-        let visible = terminal.grid().num_rows;
-        blocks
-            .iter()
-            .rev()
-            .filter(|b| block_matches_query(b, &self.panel_query))
-            .take(visible)
-            .count()
-    }
-
-    /// Keep the selection inside the filtered, visible list.
-    fn clamp_panel_selection(&mut self) {
-        let max = self.panel_visible_count();
-        if max == 0 {
-            self.panel_selection = 0;
-        } else {
-            self.panel_selection = self.panel_selection.min(max - 1);
-        }
-    }
-
-    /// The [`BlockId`] of the currently selected panel row, if any.
-    fn panel_selected_block_id(&self) -> Option<BlockId> {
-        let terminal = self.tabs[self.active_tab].terminal.as_ref()?;
-        let visible = terminal.grid().num_rows;
-        terminal
-            .block_tracker()
-            .blocks()
-            .iter()
-            .rev()
-            .filter(|b| block_matches_query(b, &self.panel_query))
-            .take(visible)
-            .nth(self.panel_selection)
-            .map(|b| b.id)
-    }
-
-    /// v0.9 fix: send the panel's currently-selected command to the prompt
-    /// editor (Warp-style "click/Enter to rerun"). Looks up the block by id,
-    /// strips any prompt prefix, and sets the editor buffer. Silently no-ops
-    /// when not at the prompt (command running / alt-screen active) to avoid
-    /// stashing text that would resurface unexpectedly.
-    fn send_panel_selection_to_input(&mut self) {
-        let block_id = match self.panel_selected_block_id() {
-            Some(id) => id,
-            None => return,
-        };
-        // Borrow the terminal immutably to find the command, then release
-        // before mutating the editor.
-        let cmd: Option<String> = {
-            let Some(t) = &self.tabs[self.active_tab].terminal else {
-                return;
-            };
-            if t.effective_input_mode() != weft_core::input::InputMode::Editor {
-                return;
-            }
-            t.block_tracker()
-                .blocks()
-                .iter()
-                .find(|b| b.id == block_id)
-                .map(|b| strip_prompt_prefix(&b.command))
-        };
-        if let Some(cmd) = cmd {
-            if !cmd.is_empty() {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.set_text(&cmd);
-                    // v0.9: select all so Cmd+C copies the command without
-                    // needing a drag-select first. The user can still adjust
-                    // the selection by clicking in the prompt box.
-                    t.editor_mut().buffer.select_all();
-                }
-                // Unfocus the panel so the editor gets subsequent keystrokes.
-                self.panel_search_focused = false;
-                self.request_redraw();
-            }
-        }
-    }
-
-    /// v0.9 W2: scroll the terminal's block view so the panel-selected block
-    /// is visible, and arm a 1.5s accent highlight. Called when the user
-    /// clicks a row in the history panel (or presses Cmd+Enter while the
-    /// panel is open).
-    fn scroll_to_panel_selection(&mut self) {
-        let block_id = match self.panel_selected_block_id() {
-            Some(id) => id,
-            None => return,
-        };
-        // Only meaningful in block view (grid view has no block layout).
-        if !self.block_view_active() {
-            return;
-        }
-        let Some(term) = self.tabs[self.active_tab].terminal.as_ref() else {
-            return;
-        };
-        let blocks = term.block_tracker().session_blocks();
-        let block_idx = blocks.iter().position(|b| b.id == block_id);
-        let Some(block_idx) = block_idx else { return };
-
-        // Count rows from the bottom up to the target block's command line.
-        // Layout (bottom→top): Output[N-1] at row 0, …, Output[0] at row
-        // N-1, Command at row N, Header at row N+1, Separator at row N+2.
-        // For each block BELOW the target (i.e. with higher index), add its
-        // full height (3 + output_lines).
-        let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
-            if b.collapsed {
-                return 0;
-            }
-            let mut lines: Vec<&str> = b.output.lines().collect();
-            while lines.last().is_some_and(|l| {
-                let t = l.trim();
-                t.is_empty() || matches!(t, "%" | "$" | "#")
-            }) {
-                lines.pop();
-            }
-            lines.len()
-        };
-        let mut rows_from_bottom = 0usize;
-        for (i, b) in blocks.iter().enumerate().rev() {
-            if i == block_idx {
-                break;
-            }
-            rows_from_bottom += 3 + trim_output_lines(b);
-        }
-        // Position the block's command line at ~1/3 from the bottom of the
-        // viewport so the user sees the command + most of its output above.
-        let Some(renderer) = self.renderer.as_ref() else {
-            return;
-        };
-        let visible = renderer.block_visible_rows(1);
-        let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
-        self.tabs[self.active_tab].block_scroll_offset = target;
-
-        // Arm the highlight: accent border around the block for 1.5s.
-        self.panel_highlight = Some(block_id);
-        self.panel_highlight_until =
-            Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
-        self.request_redraw();
-    }
-
-    /// Local scrollback navigation (page up/down, top, bottom).
-    fn scroll_action(&mut self, action: Action) {
-        let tab = &mut self.tabs[self.active_tab];
-        let Some(terminal) = &mut tab.terminal else {
-            return;
-        };
-        let rows = terminal.grid().num_rows;
-        let cols = terminal.grid().num_cols;
-        // Block view uses a dedicated scroll offset.
-        if terminal.show_block_view() {
-            let (total, _) = block_content_metrics(terminal, cols);
-            // Compute visible rows from the renderer's actual geometry.
-            let prompt_lines = terminal.editor().buffer.lines.len();
-            let visible = self
-                .renderer
-                .as_ref()
-                .map(|r| r.block_visible_rows(prompt_lines))
-                .unwrap_or(rows);
-            let max_scroll = total.saturating_sub(visible);
-            match action {
-                Action::ScrollPageUp => {
-                    tab.block_scroll_offset =
-                        tab.block_scroll_offset.saturating_add(rows).min(max_scroll);
-                }
-                Action::ScrollPageDown => {
-                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(rows);
-                }
-                Action::ScrollLineUp => {
-                    tab.block_scroll_offset =
-                        tab.block_scroll_offset.saturating_add(1).min(max_scroll);
-                }
-                Action::ScrollLineDown => {
-                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(1);
-                }
-                Action::ScrollToTop => {
-                    tab.block_scroll_offset = max_scroll;
-                }
-                Action::ScrollToBottom => tab.block_scroll_offset = 0,
-                _ => {}
-            }
-        } else {
-            let grid = terminal.grid_mut();
-            match action {
-                Action::ScrollPageUp => grid.scroll_up_history(rows),
-                Action::ScrollPageDown => grid.scroll_down_history(rows),
-                Action::ScrollLineUp => grid.scroll_up_history(1),
-                Action::ScrollLineDown => grid.scroll_down_history(1),
-                Action::ScrollToTop => grid.scroll_to_top(),
-                Action::ScrollToBottom => grid.scroll_to_bottom(),
-                _ => {}
-            }
-        }
-        self.request_redraw();
-    }
-
-    /// Re-read config from disk and apply it live. Triggered by the
-    /// reload-config keybinding (and the file watcher).
-    fn reload_config(&mut self) {
-        let config = Config::load();
-        self.apply_config(config);
-        info!("config reloaded");
-    }
-
-    // ── v0.9 H1: Tab management ────────────────────────────────────────
-
-    /// Get the current (rows, cols) of the active tab's terminal, falling
-    /// back to the renderer's viewport estimate if the terminal is not yet
-    /// initialized.
-    fn current_size(&self) -> (usize, usize) {
-        if let Some(t) = &self.tabs[self.active_tab].terminal {
-            let grid = t.grid();
-            return (grid.num_rows, grid.num_cols);
-        }
-        // Fallback must use the same chrome-aware geometry as startup and
-        // resize; deriving directly from the full renderer viewport would
-        // recreate the hidden-last-row bug for a tab whose PTY failed.
-        let (rows, cols) = self.grid_dims();
-        if rows > 0 && cols > 0 {
-            return (rows, cols);
-        }
-        (24, 80)
-    }
-
-    /// Cmd+T — open a new tab with a fresh shell session and switch to it.
-    fn new_tab(&mut self) {
-        self.reset_ime_context("new tab");
-        let (rows, cols) = self.current_size();
-        // New tabs inherit the weft process's cwd (None = no chdir).
-        let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
-        self.tabs.push(tab);
-        self.active_tab = self.tabs.len() - 1;
-        // Apply the current theme palette to the new terminal so it matches
-        // the window's renderer theme (the atlas is shared per-window, not
-        // per-tab — no atlas rebuild needed).
-        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
-            if let Some(r) = &self.renderer {
-                t.set_palette(r.theme().palette);
-            }
-        }
-        info!(tab_idx = self.active_tab, "new tab created");
-        self.refresh_find_for_active_tab();
-        self.scroll_active_tab_into_view();
-        self.save_all_tabs();
-        self.request_redraw();
-    }
-
-    /// Cmd+W — close the current tab. Returns `false` (exit app) if this
-    /// was the last tab; otherwise switches to the previous tab and
-    /// returns `true`.
-    fn close_tab(&mut self) -> bool {
-        if self.tabs.len() <= 1 {
-            // Last tab closed → exit the app. Set the flag so the event
-            // loop can call `event_loop.exit()` (we can't call it here
-            // because we don't have access to the ActiveEventLoop).
-            info!("closing last tab, exiting app");
-            self.save_all_tabs();
-            self.should_exit = true;
-            return true;
-        }
-        self.reset_ime_context("tab closed");
-        let removed_idx = self.active_tab;
-        let _tab = self.tabs.remove(removed_idx);
-        // v0.9 W1+: clear hover state — tab indices shift after removal, so
-        // a stale hovered_tab would point at the wrong tab. The next
-        // CursorMoved will recompute it.
-        self.hovered_tab = None;
-        // Switch to the previous tab (or wrap to last).
-        if self.active_tab > 0 {
-            self.active_tab -= 1;
-        } else {
-            self.active_tab = self.tabs.len() - 1;
-        }
-        info!(closed = removed_idx, active = self.active_tab, "tab closed");
-        self.clamp_tab_scroll();
-        self.scroll_active_tab_into_view();
-        self.save_all_tabs();
-        self.refresh_find_for_active_tab();
-        self.request_redraw();
-        true
-    }
-
-    /// v1.0 H4: Serialize all live tabs to the SQLite `tabs` table so the
-    /// session layout (cwd + editor drafts) survives restarts. Best-effort:
-    /// failures are logged but don't interrupt the caller. The PTY itself
-    /// is NOT persisted (impossible to revive); only UI state is saved.
-    pub fn save_all_tabs(&self) {
-        let Some(store) = &self.block_store else {
-            return;
-        };
-        let snaps: Vec<_> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tab)| tab.to_snapshot(i))
-            .collect();
-        if let Err(e) = store.save_tabs(&snaps) {
-            tracing::warn!(error = %e, "failed to save tab snapshots");
-        }
-    }
-
-    /// v0.9 H1 Stage 4: re-bind the global find state to the active tab.
-    ///
-    /// Find query / regex / case-sensitive flags stay global (convenient for
-    /// searching the same term across tabs), but the matches must come from
-    /// the active tab's content — otherwise switching tabs shows the previous
-    /// tab's match coordinates, which point at the wrong rows/blocks.
-    ///
-    /// Called from `new_tab` / `close_tab` / `next_tab` / `prev_tab`. When
-    /// the find bar is closed or the query is empty this is a no-op.
-    fn refresh_find_for_active_tab(&mut self) {
-        if !self.find_open || self.find_query.is_empty() {
-            return;
-        }
-        // Drop any results still queued from the old tab's scan. Without this
-        // drain, `poll_find_worker_results` would apply the stale `Partial`/
-        // `Complete` results to the new active tab on the next frame.
-        while self.find_worker.try_recv_result().is_some() {}
-        self.find_worker_busy = false;
-        // Clear stale matches so the FindUI count resets to 0 until the new
-        // search completes.
-        self.find_matches.clear();
-        self.find_truncated = false;
-        self.find_index = 0;
-        self.find_block_matches.clear();
-        self.find_block_truncated = false;
-        self.find_block_index = 0;
-        self.find_regex_error = None;
-        // Arm the debounce so `maybe_refresh_find_results` re-submits the
-        // query against the new active tab's snapshot on the next redraw.
-        self.find_last_key = Some(std::time::Instant::now());
-    }
-
-    /// Cmd+Shift+] — switch to the next tab (wraps around).
-    fn next_tab(&mut self) {
-        if self.tabs.len() <= 1 {
-            return;
-        }
-        self.reset_ime_context("next tab");
-        self.active_tab = (self.active_tab + 1) % self.tabs.len();
-        info!(active = self.active_tab, "switched to next tab");
-        self.refresh_find_for_active_tab();
-        self.scroll_active_tab_into_view();
-        self.request_redraw();
-    }
-
-    /// Cmd+Shift+[ — switch to the previous tab (wraps around).
-    fn prev_tab(&mut self) {
-        if self.tabs.len() <= 1 {
-            return;
-        }
-        self.reset_ime_context("previous tab");
-        self.active_tab = if self.active_tab == 0 {
-            self.tabs.len() - 1
-        } else {
-            self.active_tab - 1
-        };
-        info!(active = self.active_tab, "switched to prev tab");
-        self.refresh_find_for_active_tab();
-        self.scroll_active_tab_into_view();
-        self.request_redraw();
-    }
-
-    /// v1.2: Clamp `tab_scroll_offset` to the valid range [0, max_scroll].
-    /// Called after every scroll/resize/tab-count change. No-op when tabs
-    /// don't overflow. Layout params must match `build_tab_bar_vertices`.
-    fn clamp_tab_scroll(&mut self) {
-        if let Some(renderer) = &self.renderer {
-            let cw = renderer.cell_width() as f32;
-            let tl_w = renderer.traffic_lights_width();
-            let pad_x = renderer.padding_x();
-            let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-            let vp_w = renderer.viewport_width();
-            let min_tab_w = cw * 15.0;
-            let arrow_w = cw * 2.5;
-            let plus_w = cw * 3.0;
-            let right_pad = pad_x * 0.5;
-            let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
-            let tabs_start = chrome_left + tl_offset + pad_x;
-            let right_reserve = plus_w + right_pad;
-            let avail_for_tabs = vp_w - tabs_start - right_reserve;
-            let total_at_min = self.tabs.len() as f32 * min_tab_w;
-            if total_at_min > avail_for_tabs {
-                // Scroll mode. max_scroll = total_tab_width - visible_width.
-                // visible_width excludes the arrow slots on both sides.
-                let vis_left = tabs_start + arrow_w;
-                let vis_right = vp_w - right_reserve - arrow_w;
-                let vis_w = vis_right - vis_left;
-                let max_scroll = (total_at_min - vis_w).max(0.0);
-                self.tab_scroll_offset = self.tab_scroll_offset.clamp(0.0, max_scroll);
-            } else {
-                self.tab_scroll_offset = 0.0;
-            }
-        }
-    }
-
-    /// v1.2: Scroll the tab bar so the active tab is visible. Called after
-    /// tab switch, new tab, close tab. If the active tab is already visible,
-    /// no scroll happens. Layout params must match `build_tab_bar_vertices`.
-    fn scroll_active_tab_into_view(&mut self) {
-        if let Some(renderer) = &self.renderer {
-            let cw = renderer.cell_width() as f32;
-            let tl_w = renderer.traffic_lights_width();
-            let pad_x = renderer.padding_x();
-            let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-            let vp_w = renderer.viewport_width();
-            let min_tab_w = cw * 15.0;
-            let arrow_w = cw * 2.5;
-            let plus_w = cw * 3.0;
-            let right_pad = pad_x * 0.5;
-            let tl_offset = if chrome_left > 0.0 { 0.0 } else { tl_w };
-            let tabs_start = chrome_left + tl_offset + pad_x;
-            let right_reserve = plus_w + right_pad;
-            let avail_for_tabs = vp_w - tabs_start - right_reserve;
-            let total_at_min = self.tabs.len() as f32 * min_tab_w;
-            if total_at_min <= avail_for_tabs {
-                return; // No overflow — nothing to scroll.
-            }
-            let vis_left = tabs_start + arrow_w;
-            let vis_right = vp_w - right_reserve - arrow_w;
-
-            // Compute the active tab's ABSOLUTE position on screen.
-            // abs_x0 = tabs_start + active*tab_w - scroll_offset.
-            let abs_x0 = tabs_start + self.active_tab as f32 * min_tab_w - self.tab_scroll_offset;
-            let abs_x1 = abs_x0 + min_tab_w;
-
-            if abs_x0 < vis_left {
-                // Tab left edge is under the left arrow — scroll right so the
-                // tab's left edge aligns with vis_left (fully visible).
-                self.tab_scroll_offset =
-                    (tabs_start + self.active_tab as f32 * min_tab_w - vis_left).max(0.0);
-            } else if abs_x1 > vis_right {
-                // Tab right edge is past the right arrow — scroll left so the
-                // tab's right edge aligns with vis_right.
-                self.tab_scroll_offset =
-                    (tabs_start + self.active_tab as f32 * min_tab_w + min_tab_w - vis_right)
-                        .max(0.0);
-            }
-            self.clamp_tab_scroll();
-        }
-    }
-
-    /// Build the `TabBarDrawState` for the renderer from the current tab list.
-    /// Tab labels are the cwd basename (or "Tab N" when no cwd is set).
-    fn tab_bar_state(&self) -> TabBarDrawState {
-        let labels: Vec<String> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, tab)| {
-                // v1.0 fix: show full path when short (≤ 20 chars, e.g.
-                // "/tmp", "/usr/local"), otherwise show basename only to
-                // keep the tab label compact. Root "/" is kept as-is.
-                let cwd = tab.terminal.as_ref().and_then(|t| t.cwd()).map(|c| {
-                    if c.len() <= 20 {
-                        c.to_string()
-                    } else {
-                        let base = c.rsplit('/').next().unwrap_or("");
-                        if base.is_empty() {
-                            "/".to_string()
-                        } else {
-                            base.to_string()
-                        }
-                    }
-                });
-                // v0.9 W1: when a command is running, show "cwd · cmd". When
-                // idle, show only the cwd basename. (Previous version showed
-                // the last completed command, but that kept the label stuck
-                // on "cwd · cmd" forever after any command — e.g. "sleep 5"
-                // never reverted, and "cd /" showed "/ · cd /". The running
-                // indicator is enough; completed commands live in the history
-                // panel and block view.)
-                let cmd: Option<String> = tab
-                    .terminal
-                    .as_ref()
-                    .and_then(|t| t.block_tracker().in_flight())
-                    .map(|f| f.command.to_string());
-                match (cwd, cmd) {
-                    (Some(cwd), Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(16).collect();
-                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
-                        format!("{} · {}{}", cwd, cmd_short, suffix)
-                    }
-                    (Some(cwd), None) => cwd,
-                    (None, Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(16).collect();
-                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
-                        format!("Tab {} · {}{}", i + 1, cmd_short, suffix)
-                    }
-                    (None, None) => format!("Tab {}", i + 1),
-                }
-            })
-            .collect();
-        TabBarDrawState {
-            tab_count: self.tabs.len(),
-            active_tab: self.active_tab,
-            labels,
-            hovered_tab: self.hovered_tab,
-            scroll_offset: self.tab_scroll_offset,
-            plus_hovered: self.plus_hovered,
-            arrow_left_hovered: self.arrow_left_hovered,
-            arrow_right_hovered: self.arrow_right_hovered,
-        }
-    }
-
-    fn toggle_theme(&mut self) {
-        // v1.0: Cmd+Shift+T now cycles through ALL built-in themes
-        // (not just dark↔light). Find the current theme in the list and
-        // advance to the next one, wrapping around at the end.
-        if self.config.theme.follow_system {
-            self.config.theme.follow_system = false;
-            info!("follow_system disabled by manual toggle");
-        }
-        let themes = self.settings_theme_views();
-        let current = &self.config.theme.name;
-        // Find current theme index; default to 0 if not found.
-        let idx = themes.iter().position(|t| t.name == current).unwrap_or(0);
-        let next = &themes[(idx + 1) % themes.len()];
-        let name = next.name.to_string();
-        // Determine if the new theme is dark (for theme_is_dark tracking).
-        let is_light = name.contains("light");
-        self.theme_is_dark = !is_light;
-        if !is_light {
-            self.preferred_dark_theme = name.clone();
-        }
-        // Update config.theme.name so the Settings panel reflects the
-        // currently active theme after a toggle.
-        self.config.theme.name = name.clone();
-        // v1.0 fix: sync settings_draft so the Settings panel shows the
-        // current theme when toggling while the panel is open.
-        if self.settings_open {
-            self.settings_draft.theme.name = name.clone();
-        }
-        let theme = weft_core::config::Theme::resolve_named(&name, &self.config.theme);
-        if let Some(r) = &mut self.renderer {
-            r.set_theme(theme.clone());
-        }
-        // Reseed ALL tabs' palettes, not just the active one — otherwise
-        // switching tabs shows the old theme's ANSI colors.
-        for tab in &mut self.tabs {
-            if let Some(t) = &mut tab.terminal {
-                t.set_palette(theme.palette);
-            }
-        }
-        info!(dark = self.theme_is_dark, name, "theme cycled");
-        self.request_redraw();
-    }
-
-    /// v0.9 U-D1: Apply a theme by name (light or dark), respecting the
-    /// `[theme]` overrides from the loaded config. Updates `theme_is_dark`
-    /// and reseeds the terminal palette so existing cells recolor on the
-    /// next draw.
-    fn apply_theme_by_name(&mut self, name: &str, dark: bool) {
-        let theme = weft_core::config::Theme::resolve_named(name, &self.config.theme);
-        if let Some(r) = &mut self.renderer {
-            r.set_theme(theme.clone());
-        }
-        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
-            t.set_palette(theme.palette);
-        }
-        self.theme_is_dark = dark;
-        // v1.0: sync config.theme.name + preferred_dark_theme so Settings
-        // panel and Cmd+Shift+T stay in sync with the palette picker.
-        self.config.theme.name = name.to_string();
-        if dark {
-            self.preferred_dark_theme = name.to_string();
-        }
-        info!(dark, name, "theme applied");
-        self.request_redraw();
-    }
-
-    /// v0.9 W2+: List all resolvable theme names for the picker.
-    ///
-    /// Returns built-in names (sorted by display order, not alphabetically)
-    /// followed by custom theme files discovered in
-    /// `~/.config/weft/themes/` (stem of `.toml`/`.yaml`/`.yml` files).
-    /// Built-ins are returned in a curated order (defaults first, then
-    /// classic themes, then community themes) so the picker shows the most
-    /// useful themes at the top.
-    fn available_theme_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = [
-            "weft-warm",
-            "weft-light",
-            "warp",
-            "dracula",
-            "solarized-dark",
-            "gruvbox-dark",
-            "nord",
-            "tokyo-night",
-            "catppuccin",
-            "one-dark",
-            "monokai-pro",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        // Append custom theme file stems from the themes dir (if any).
-        if let Some(dir) = weft_core::config::Theme::themes_dir() {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                let mut customs: Vec<String> = Vec::new();
-                for entry in entries.flatten() {
-                    if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
-                        // Skip names that collide with built-ins.
-                        if !names.iter().any(|n| n == stem) {
-                            customs.push(stem.to_string());
-                        }
-                    }
-                }
-                customs.sort();
-                names.extend(customs);
-            }
-        }
-        names
-    }
-
-    /// v0.9 W2+: Rebuild `palette_results` for the theme picker sub-mode.
-    ///
-    /// Filters `themes` by the buffer (case-insensitive substring) and
-    /// pushes each as a `PaletteEntry::Builtin(BuiltinCmd::SelectTheme)` —
-    /// but the renderer projection (in `draw()`) maps each to a
-    /// `(theme_name, "", "Theme")` tuple via the sub-mode check, so the
-    /// picker rows show theme names with a "Theme" suffix label.
-    fn refresh_theme_picker_results(&mut self) {
-        let (buffer, themes) = match &self.palette_submode {
-            PaletteSubMode::SelectTheme { buffer, themes } => (buffer.clone(), themes.clone()),
-            _ => return,
-        };
-        let q = buffer.to_lowercase();
-        let mut results: Vec<PaletteEntry> = Vec::new();
-        for name in &themes {
-            if q.is_empty() || name.to_lowercase().contains(&q) {
-                // We reuse PaletteEntry::Builtin(SelectTheme) as a sentinel;
-                // the renderer projection distinguishes themes by sub-mode.
-                results.push(PaletteEntry::Builtin(BuiltinCmd::SelectTheme));
-            }
-        }
-        self.palette_results = results;
-        if self.palette_selection >= self.palette_results.len() {
-            self.palette_selection = 0;
-        }
-    }
-
-    /// v0.9 W2+: Handle keyboard input in the theme picker sub-mode.
-    ///
-    /// - Up/Down: navigate the filtered theme list.
-    /// - Enter: apply the selected theme (dark heuristic: name ends with
-    ///   `-dark`/`-night` or contains "dracula"/"nord"/"tokyo"/"monokai"
-    ///   → dark; otherwise treat as light). The palette closes after apply.
-    /// - Escape: return to Search sub-mode (does not close the palette).
-    /// - Backspace: pop the filter buffer; if empty, return to Search.
-    /// - Printable char: append to the filter buffer and refresh.
-    fn handle_palette_select_theme_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
-        let (buffer, themes) = match &self.palette_submode {
-            PaletteSubMode::SelectTheme { buffer, themes } => (buffer.clone(), themes.clone()),
-            _ => return false,
-        };
-
-        // Helper: given the current filtered selection index, resolve back to
-        // the actual theme name from the full `themes` list.
-        let selected_name = |sel: usize, buf: &str| -> Option<String> {
-            let q = buf.to_lowercase();
-            themes
-                .iter()
-                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
-                .nth(sel)
-                .cloned()
-        };
-
-        match key {
-            KeyCode::Escape => {
-                // Return to search mode (keep palette open).
-                self.palette_submode = PaletteSubMode::Search;
-                self.palette_query.clear();
-                self.palette_selection = 0;
-                self.refresh_palette_results();
-                self.request_redraw();
-                true
-            }
-            KeyCode::Up => {
-                if self.palette_selection > 0 {
-                    self.palette_selection -= 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Down => {
-                if self.palette_selection + 1 < self.palette_results.len() {
-                    self.palette_selection += 1;
-                }
-                self.request_redraw();
-                true
-            }
-            KeyCode::Enter => {
-                if let Some(name) = selected_name(self.palette_selection, &buffer) {
-                    // Heuristic: classify as dark unless the name clearly
-                    // indicates a light theme. Affects follow_system parity.
-                    let dark = !matches!(
-                        name.as_str(),
-                        "weft-light" | "solarized-light" | "gruvbox-light"
-                    );
-                    self.apply_theme_by_name(&name, dark);
-                    self.palette_open = false;
-                    self.palette_submode = PaletteSubMode::Search;
-                    self.palette_query.clear();
-                    self.request_redraw();
-                }
-                true
-            }
-            KeyCode::Backspace => {
-                if buffer.is_empty() {
-                    // Exit sub-mode back to search.
-                    self.palette_submode = PaletteSubMode::Search;
-                    self.palette_query.clear();
-                    self.palette_selection = 0;
-                    self.refresh_palette_results();
-                } else {
-                    // Pop filter char.
-                    if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette_submode {
-                        buffer.pop();
-                        let buf = buffer.clone();
-                        self.palette_selection = 0;
-                        self.refresh_theme_picker_results();
-                        // refresh_theme_picker_results reads buffer from self.
-                        let _ = buf; // silence unused
-                    }
-                }
-                self.request_redraw();
-                true
-            }
-            _ => {
-                let c = resolve_text_char(text, '\0', false);
-                if c == '\0' || c.is_control() {
-                    return false;
-                }
-                if let PaletteSubMode::SelectTheme { buffer, .. } = &mut self.palette_submode {
-                    buffer.push(c);
-                    self.palette_selection = 0;
-                    self.refresh_theme_picker_results();
-                }
-                self.request_redraw();
-                true
-            }
-        }
-    }
-
-    /// v0.9 U-D1: Poll the macOS system appearance and switch theme if it
-    /// has changed since the last poll. Throttled to one query per second
-    /// to avoid per-frame `NSUserDefaults` overhead. No-op when
-    /// `[theme] follow_system = false`.
-    fn poll_system_appearance(&mut self) {
-        if !self.config.theme.follow_system {
-            return;
-        }
-        // Throttle: at most one query per second.
-        if self.last_appearance_check.elapsed() < std::time::Duration::from_secs(1) {
-            return;
-        }
-        self.last_appearance_check = std::time::Instant::now();
-        let dark = unsafe { system_appearance_is_dark() };
-        if Some(dark) != self.last_system_appearance_dark {
-            self.last_system_appearance_dark = Some(dark);
-            let name = if dark {
-                self.config
-                    .theme
-                    .dark_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
-            } else {
-                self.config
-                    .theme
-                    .light_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
-            };
-            self.apply_theme_by_name(&name, dark);
-        }
-    }
-
-    /// Apply a (possibly new) config: theme, font, keybindings, scrollback.
-    /// Theme/font/scrollback changes take effect immediately; window size/title
-    /// apply on the next launch.
-    fn apply_config(&mut self, config: Config) {
-        // Theme — renderer defaults + terminal palette reseed (recolors all
-        // Palette-indexed cells on the next draw).
-        //
-        // v0.9 U-D1: when `[theme] follow_system = true`, the system
-        // appearance picks the theme (via `light_name` / `dark_name`,
-        // defaulting to `weft-light` / `weft-warm`). The `name` field is
-        // ignored in this mode.
-        let theme = if config.theme.follow_system {
-            let dark = unsafe { system_appearance_is_dark() };
-            let name = if dark {
-                config
-                    .theme
-                    .dark_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
-            } else {
-                config
-                    .theme
-                    .light_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
-            };
-            weft_core::config::Theme::resolve_named(&name, &config.theme)
-        } else {
-            config.theme()
-        };
-        if let Some(r) = &mut self.renderer {
-            r.set_theme(theme.clone());
-        }
-        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
-            t.set_palette(theme.palette);
-        }
-        // v1.0: sync preferred_dark_theme from the freshly loaded config.
-        let cfg_name = &config.theme.name;
-        if !cfg_name.contains("light") && !cfg_name.is_empty() {
-            self.preferred_dark_theme = cfg_name.clone();
-        } else if let Some(dn) = &config.theme.dark_name {
-            self.preferred_dark_theme = dn.clone();
-        }
-
-        // Font — rebuild the atlas (cell dimensions may change → recompute).
-        // The active `font_scale` (Cmd+/- zoom) is re-applied on top of the
-        // freshly loaded config, so a reload doesn't lose the user's zoom.
-        if self.config.font.family != config.font.family
-            || self.config.font.size != config.font.size
-            || self.config.font.line_height != config.font.line_height
-            || self.font_scale != 1.0
-        {
-            if let Some(r) = &mut self.renderer {
-                let mut scaled = config.font.clone();
-                scaled.size *= self.font_scale;
-                r.rebuild_atlas(scaled);
-            }
-            self.recompute_layout();
-        }
-
-        // Window background opacity (layer-level transparency; text stays
-        // opaque). Recolors the next frame. Window-level transparency is
-        // startup-only — see `resumed`.
-        if (self.config.window.opacity - config.window.opacity).abs() > f32::EPSILON {
-            if let Some(r) = &mut self.renderer {
-                r.set_opacity(config.window.opacity);
-            }
-        }
-
-        // Content padding (changes usable rows/cols → recompute layout).
-        if self.config.window.padding_x != config.window.padding_x
-            || self.config.window.padding_y != config.window.padding_y
-        {
-            if let Some(r) = &mut self.renderer {
-                r.set_padding((config.window.padding_x, config.window.padding_y));
-            }
-            self.recompute_layout();
-        }
-
-        // Keybindings.
-        self.keybindings = config.keybindings();
-
-        // Scrollback capacity.
-        if let Some(t) = &mut self.tabs[self.active_tab].terminal {
-            let cols = t.grid().num_cols;
-            t.grid_mut()
-                .scrollback
-                .set_max_lines(config.scrollback.lines, cols);
-        }
-
-        // v1.0 Logo: sync Dock icon if variant changed.
-        if config.logo.variant != self.current_logo_variant {
-            self.current_logo_variant = config.logo.variant;
-            unsafe {
-                set_dock_icon(self.current_logo_variant);
-            }
-        }
-
-        self.config = config;
-        self.request_redraw();
-    }
-
-    /// Adjust `font_scale` for a zoom action (Cmd+= / Cmd+- / Cmd+0) and
-    /// rebuild the glyph atlas with the scaled size. Each ZoomIn/Out step
-    /// multiplies/divides by 1.1; `font_scale` is clamped to [0.5, 3.0] so
-    /// the cell dimensions stay sane. ZoomReset restores 1.0.
-    fn zoom_action(&mut self, action: Action) {
-        let new_scale = match action {
-            Action::ZoomIn => (self.font_scale * 1.1).min(3.0),
-            Action::ZoomOut => (self.font_scale / 1.1).max(0.5),
-            Action::ZoomReset => 1.0,
-            _ => return,
-        };
-        if (new_scale - self.font_scale).abs() < f32::EPSILON && action != Action::ZoomReset {
-            return;
-        }
-        self.font_scale = new_scale;
-        if let Some(r) = &mut self.renderer {
-            let mut scaled = self.config.font.clone();
-            scaled.size *= self.font_scale;
-            r.rebuild_atlas(scaled);
-        }
-        self.recompute_layout();
-        self.request_redraw();
-    }
-
-    /// Compute grid (rows, cols) from the window size minus content padding and
-    /// the current cell dimensions. Returns (0, 0) until the window/renderer are
-    /// ready. Centralizes the padding-aware geometry used by both resize paths.
-    fn grid_dims(&self) -> (usize, usize) {
-        let (Some(window), Some(renderer)) = (&self.window, &self.renderer) else {
-            return (0, 0);
-        };
-        let size = window.inner_size();
-        // v0.9 W5: when the history panel is open it becomes a left sidebar
-        // that pushes terminal content right, so the grid/PTY must shrink by
-        // the sidebar width (chrome_left).
-        let chrome_left = if self.panel_open {
-            renderer.sidebar_width() as f64
-        } else {
-            0.0
-        };
-        dimensions_for_renderer(renderer, size, chrome_left)
-    }
-
-    /// Recompute grid rows/cols from the current window + cell dimensions and
-    /// resize the terminal / queue a PTY SIGWINCH. Used after a font or padding
-    /// change (cell size or usable area changes) and on window resize.
-    fn recompute_layout(&mut self) {
-        let (new_rows, new_cols) = self.grid_dims();
-        if new_cols == 0 || new_rows == 0 {
-            return;
-        }
-        let Some(window) = &self.window else {
-            return;
-        };
-        let size = window.inner_size();
-        if let Some(renderer) = &mut self.renderer {
-            renderer.resize(window, size);
-        }
-        // v0.9 W5: resize every tab's terminal so non-active tabs also pick
-        // up the new chrome_left (sidebar open/close shifts the grid). Only
-        // the active tab sends a PTY resize immediately; background tabs get
-        // their PTY resize on activation (refresh_grid_for_active_tab).
-        for (i, tab) in self.tabs.iter_mut().enumerate() {
-            if let Some(terminal) = &mut tab.terminal {
-                terminal.resize(new_rows, new_cols);
-                if i == self.active_tab {
-                    info!(rows = new_rows, cols = new_cols, "terminal resized");
-                }
-            }
-            if i == self.active_tab {
-                tab.pending_pty_resize = Some((new_rows, new_cols));
-            }
-        }
-        self.last_resize_instant = std::time::Instant::now();
-    }
-
-    /// Convert pixel coordinates to grid (row, col).
-    fn pixel_to_grid(&self, x: f64, y: f64) -> GridPos {
-        let Some(renderer) = &self.renderer else {
-            return GridPos::new(0, 0);
-        };
-        // CursorMoved position is in physical pixels; cell_width/height are
-        // also in physical pixels — divide directly without scale conversion.
-        // Subtract content padding first so clicks map to the padded grid.
-        let cell_w = renderer.cell_width() as f64;
-        let cell_h = renderer.cell_height() as f64;
-        // v0.9 H1: subtract tab bar height (chrome_top) so clicks map to the
-        // correct grid row. The grid is rendered at
-        // `padding_y + chrome_top + row * cell_h`, so the inverse is
-        // `(y - padding_y - chrome_top) / cell_h`. Without this, a click on
-        // row N would resolve to N + ~1.5 (off-by-one-down) when the tab bar
-        // is visible. Read from layout_ctx so it matches the renderer's
-        // conditional (chrome_top = 0 when single tab hides the bar).
-        let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0) as f64;
-        // v0.9 W5: subtract sidebar width (chrome_left) so clicks map to the
-        // correct column when the history panel pushes the grid right.
-        let chrome_left = if self.panel_open {
-            renderer.sidebar_width() as f64
-        } else {
-            0.0
-        };
-        // Clamp to valid grid bounds. A click past the right/bottom edge (e.g.
-        // a drag-to-select ending at the window margin) would otherwise yield
-        // col == num_cols / row == num_rows and panic text_from_grid on copy.
-        let (num_rows, num_cols) = self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| (t.grid().num_rows, t.grid().num_cols))
-            .unwrap_or((1, 1));
-        let col = (((x - renderer.padding_x() as f64 - chrome_left) / cell_w).max(0.0) as usize)
-            .min(num_cols.saturating_sub(1));
-        let row = (((y - renderer.padding_y() as f64 - chrome_top) / cell_h).max(0.0) as usize)
-            .min(num_rows.saturating_sub(1));
-        GridPos::new(row, col)
-    }
-
-    /// Resolve the OSC 8 hyperlink URL at pixel coordinates `(x, y)`, if any.
-    /// Returns `None` when the click misses a HYPERLINK-tagged cell or when
-    /// the cell_map has been invalidated by a scroll (MVP trade-off: links
-    /// in scrolled-off content aren't clickable).
-    fn hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let terminal = self.tabs[self.active_tab].terminal.as_ref()?;
-        // Block view uses a separate scrollable layout — skip OSC 8 there.
-        if self.block_view_active() {
-            return None;
-        }
-        let pos = self.pixel_to_grid(x, y);
-        terminal
-            .hyperlinks()
-            .url_at(pos.row, pos.col)
-            .map(str::to_string)
-    }
-
-    /// Convert pixel coordinates to a block-view position.
-    ///
-    /// Used in place of `pixel_to_grid` when `show_block_view()` is true: the
-    /// classic grid division (`y / cell_h`) does not match the block view's
-    /// `pitch = cell_h * 1.1` row spacing, inserted Header/Separator rows, the
-    /// pinned CWD bar, or the scroll offset, so a grid-coordinate copy landed
-    /// on the wrong line (the "复制错位" bug). This walks the renderer's cached
-    /// `block_view_rows` (scroll-adjusted y bands + visible text) and maps the
-    /// click to a char index in the matched row, honoring CJK double-width.
-    ///
-    /// Returns `None` if no row band contains `y` (e.g. on the CWD bar / input
-    /// box / outside the scroll region) or the matched row isn't selectable.
-    fn pixel_to_block_view_pos(&self, x: f64, y: f64) -> Option<BlockViewPos> {
-        let renderer = self.renderer.as_ref()?;
-        let cw = renderer.cell_width() as f64;
-        if cw <= 0.0 {
-            return None;
-        }
-        // v0.9 W5: account for the left sidebar offset (chrome_left) so
-        // block-view clicks map to the correct char when the panel is open.
-        let chrome_left = if self.panel_open {
-            renderer.sidebar_width() as f64
-        } else {
-            0.0
-        };
-        let left = renderer.padding_x() as f64 + chrome_left;
-        let rows = renderer.block_view_rows.as_slice();
-        if rows.is_empty() {
-            return None;
-        }
-        // Find the row whose [y_top, y_bottom) contains y.
-        let row_index = rows.iter().position(|r| r.contains_y(y as f32))?;
-        let row = &rows[row_index];
-        if !matches!(
-            row.kind,
-            BlockViewRowKind::Output | BlockViewRowKind::Command | BlockViewRowKind::LiveCommand
-        ) {
-            return None;
-        }
-        // Map pixel x → char index by accumulating each char's display width.
-        // A click in the right half of a double-width cell rounds to that
-        // cell's index (so dragging across it selects the whole CJK char).
-        let mut col_cursor = 0usize; // column units consumed so far
-        let target_col = ((x - left) / cw).max(0.0) as usize;
-        for (ci, c) in row.text.chars().enumerate() {
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w == 0 {
-                // Zero-width (combining mark): belongs to the previous cell,
-                // don't advance the column cursor.
-                continue;
-            }
-            // Click lands in this char if it's before the far edge of the cell.
-            // For double-width, the char occupies [col_cursor, col_cursor+2);
-            // a click anywhere in that range maps to this char.
-            if target_col < col_cursor + w {
-                return Some(BlockViewPos {
-                    row_index,
-                    char_index: ci,
-                });
-            }
-            col_cursor += w;
-        }
-        // Past the last char: clamp to end.
-        Some(BlockViewPos {
-            row_index,
-            char_index: row.text.chars().count(),
-        })
-    }
-
-    /// v0.9: map a physical-pixel click (inside the prompt input box) to an
-    /// editor buffer position `(line, char_col)`. Returns None when the
-    /// renderer/prompt isn't available or the click is outside the box.
-    ///
-    /// The prompt box layout (from `layout_prompt`):
-    ///   - line 0 starts at `first_line_text_x` (after the "❯ " glyph)
-    ///   - lines 1+ start at `left` (= `box_x0`)
-    ///   - each line is `cell_h` tall, starting at `text_y0`
-    fn pixel_to_editor_pos(&self, x: f64, y: f64) -> Option<(usize, usize)> {
-        use unicode_width::UnicodeWidthChar;
-        let renderer = self.renderer.as_ref()?;
-        let ctx = renderer.layout_ctx?;
-        let cw = ctx.cell_w as f64;
-        let ch = ctx.cell_h as f64;
-        if cw <= 0.0 || ch <= 0.0 {
-            return None;
-        }
-        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
-            return None;
-        };
-        if terminal.effective_input_mode() != weft_core::input::InputMode::Editor {
-            return None;
-        }
-        let lines = &terminal.editor().buffer.lines;
-        if lines.is_empty() {
-            return None;
-        }
-        // Recompute the prompt geometry (matches layout_prompt).
-        let n_lines = lines.len().max(1);
-        let box_h = ch * (n_lines as f64 + 2.0);
-        let box_y1 = (ctx.viewport.1 as f64 - ctx.padding_y as f64).max(0.0);
-        let box_y0 = (box_y1 - box_h).max(0.0);
-        let text_y0 = box_y0 + ch;
-        let left = ctx.left() as f64;
-        let prompt_chars = 2usize;
-        let first_line_text_x = left + prompt_chars as f64 * cw;
-        // Which line was clicked? (clamped to [0, n_lines-1])
-        let mut line = ((y - text_y0) / ch) as isize;
-        if line < 0 {
-            line = 0;
-        }
-        let line = (line as usize).min(n_lines - 1);
-        // X origin for this line.
-        let text_x = if line == 0 { first_line_text_x } else { left };
-        // Column offset in display units.
-        let disp_col = ((x - text_x) / cw).max(0.0) as usize;
-        // Walk the line's chars, accumulating display widths, to find the
-        // char index whose cumulative width first exceeds disp_col.
-        let line_str = &lines[line];
-        let mut col_cursor = 0usize;
-        for (ci, c) in line_str.chars().enumerate() {
-            let w = UnicodeWidthChar::width(c).unwrap_or(0);
-            if w == 0 {
-                continue;
-            }
-            if disp_col < col_cursor + w {
-                // For double-width chars, clicking the right half advances
-                // past the char (so drag-select lands after it).
-                let char_idx = if disp_col > col_cursor { ci + 1 } else { ci };
-                return Some((line, char_idx));
-            }
-            col_cursor += w;
-        }
-        // Past the last char: clamp to end of line.
-        Some((line, line_str.chars().count()))
-    }
-
-    /// True when the block view is the active renderer (Editor mode, not in
-    /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
-    /// consistent.
-    fn block_view_active(&self) -> bool {
-        self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| t.show_block_view())
-            .unwrap_or(false)
-    }
-
-    /// True when the foreground program has grabbed the mouse (mouse reporting
-    /// on) and the user is NOT holding Shift to force a selection. While true,
-    /// clicks/drags are forwarded to the program and we must NOT start a visual
-    /// selection (otherwise a stray blue cell follows the click — e.g. inside
-    /// `claude`/`vim`). Standard xterm/Alacritty behavior.
-    fn mouse_reporting_active(&self) -> bool {
-        if self.mods.state().shift_key() {
-            return false; // Shift = force terminal selection
-        }
-        self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| t.mouse_protocol != MouseProtocol::Off)
-            .unwrap_or(false)
-    }
-
-    /// Which foldable block (if any) owns the physical-pixel y in the last
-    /// rendered block view. `None` outside the block view or off every block.
-    /// Find the block at vertical position `y`. Returns `Some(id)` for
-    /// completed blocks, `Some(None)` for the in-flight (running) command,
-    /// or `None` when not on a block row.
-    fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
-        let rows = &self.renderer.as_ref()?.block_view_rows;
-        // Find the row whose y-range contains `y`. Prefer Command/LiveCommand
-        // rows; Output rows fall back to their owning block.
-        for row in rows {
-            if y >= row.y_top && y < row.y_bottom {
-                use weft_core::selection::BlockViewRowKind;
-                match row.kind {
-                    BlockViewRowKind::Command => return Some(row.block_id),
-                    BlockViewRowKind::LiveCommand => return Some(None),
-                    BlockViewRowKind::Output => return Some(row.block_id),
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
-    /// Hit-test the find popup's clickable buttons. Returns the action the
-    /// click should trigger, or `None` when the click landed outside any
-    /// button (or the find popup isn't open). Reads the rects stored by the
-    /// renderer in the last `build_find_vertices` pass.
-    fn find_button_at(&self, x: f32, y: f32) -> Option<FindButtonAction> {
-        let buttons = self.renderer.as_ref()?.find_buttons.as_ref()?;
-        let hit = |r: &[f32; 4]| x >= r[0] && x < r[2] && y >= r[1] && y < r[3];
-        // Order matters: check arrows first (they're nested between the
-        // toggles on the right side), then the toggles. In practice the
-        // rects don't overlap so any order works, but this is defensive.
-        if let Some(r) = buttons.up {
-            if hit(&r) {
-                return Some(FindButtonAction::Prev);
-            }
-        }
-        if let Some(r) = buttons.down {
-            if hit(&r) {
-                return Some(FindButtonAction::Next);
-            }
-        }
-        if hit(&buttons.case_sensitive) {
-            return Some(FindButtonAction::ToggleCase);
-        }
-        if hit(&buttons.regex) {
-            return Some(FindButtonAction::ToggleRegex);
-        }
-        None
-    }
-
-    /// v0.9: map a physical-pixel click to a palette results-list row
-    /// index. Returns `Some(idx)` when the click lands inside a visible
-    /// results row, `None` otherwise (outside the popup, on the query/banner
-    /// row, in workflow form mode, or below the last visible row). Border-drag
-    /// clicks are handled earlier by `check_popup_border_drag`, so they never
-    /// reach here.
-    ///
-    /// Geometry is recomputed via `layout_palette_search` to match
-    /// `build_palette_vertices` exactly — `palette_popup_rect` alone isn't
-    /// enough because we need `results_y` and the visible `start..end` window.
-    fn palette_row_at(&self, x: f64, y: f64) -> Option<usize> {
-        // Form mode (workflow variable fill) has no results list to click.
-        if self.palette_form.is_some() {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        // Popup must have been rendered last frame.
-        renderer.palette_popup_rect?;
-        let ctx = renderer.layout_ctx?;
-        let cw = ctx.cell_w;
-        let ch = ctx.cell_h;
-        if cw <= 0.0 || ch <= 0.0 {
-            return None;
-        }
-        let layout = crate::layout::layout_palette_search(
-            &ctx,
-            self.palette_results.len(),
-            self.palette_selection,
-            self.popup_max_rows,
-            self.popup_width_scale,
-        );
-        let [px0, _py0, px1, _py1] = layout.popup_rect;
-        let xf = x as f32;
-        let yf = y as f32;
-        // Click must be inside the popup horizontally and below the separator
-        // (i.e. on the results list, not the query/banner row above it).
-        if xf < px0 || xf >= px1 || yf < layout.results_y {
-            return None;
-        }
-        let row = ((yf - layout.results_y) / ch) as usize;
-        let idx = layout.start + row;
-        if idx >= layout.end {
-            return None;
-        }
-        Some(idx)
-    }
-
-    fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
-        // v1.0 fix: sync InputHandler.mouse_protocol + sgr_mouse from the
-        // Terminal's VT-parsed values before any mouse-event encoding. Without
-        // this the handler's copy stays `Off` (its setters are test-only) and
-        // `encode_mouse` returns None — mouse-aware apps (vim `set mouse=a`,
-        // tmux, htop) never receive clicks/drags. sgr_mouse selects the report
-        // format (SGR-1006 vs legacy) — sending the wrong format corrupts the
-        // app (vim `~@k`). Mirrors the scroll-path sync.
-        if let Some(t) = &self.tabs[self.active_tab].terminal {
-            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
-            self.tabs[self.active_tab].input_handler.mouse_protocol = mp;
-            self.tabs[self.active_tab].input_handler.sgr_mouse = sgr;
-        }
-        // v1.0 S1-b: Settings panel click handling — checked first so
-        // settings clicks work even inside TUI apps that captured the mouse
-        // (the panel is modal and overlays everything). When the panel is
-        // open, ALL left-clicks are either dispatched to a hit region or
-        // consumed (clicks outside any region do nothing — they don't fall
-        // through to the terminal / PTY).
-        if button == winit::event::MouseButton::Left && self.settings_open {
-            if let Some(renderer) = &self.renderer {
-                let xf = x as f32;
-                let yf = y as f32;
-                for hit in &renderer.settings_hits {
-                    let [x0, y0, x1, y1] = hit.rect;
-                    if xf >= x0 && xf < x1 && yf >= y0 && yf < y1 {
-                        use crate::renderer::SettingsHitKind;
-                        match hit.kind {
-                            SettingsHitKind::Tab(tab) => {
-                                if self.settings_tab != tab {
-                                    self.settings_tab = tab;
-                                    self.settings_selection = 0;
-                                    self.settings_scroll_offset = 0;
-                                }
-                            }
-                            SettingsHitKind::Theme(i) => {
-                                self.settings_selection = i;
-                                self.apply_settings_selection();
-                            }
-                            SettingsHitKind::CloseButton => {
-                                self.settings_open = false;
-                                self.settings_error = None;
-                            }
-                            SettingsHitKind::SaveButton => {
-                                self.save_settings_draft(true);
-                            }
-                            SettingsHitKind::ApplyButton => {
-                                self.save_settings_draft(false);
-                            }
-                        }
-                        self.request_redraw();
-                        return;
-                    }
-                }
-                // Click inside the panel's bounding box but not on any
-                // hit region — still consume the event so the click doesn't
-                // fall through to the terminal underneath.
-                if let Some([bx0, by0, bx1, by1]) = renderer.settings_popup_rect {
-                    if xf >= bx0 && xf < bx1 && yf >= by0 && yf < by1 {
-                        return;
-                    }
-                }
-                // Click outside the panel — close it (Warp-style: clicking
-                // outside dismisses modal overlays). This matches the
-                // behavior of the Command Palette.
-                self.settings_open = false;
-                self.settings_error = None;
-                self.request_redraw();
-                return;
-            }
-        }
-
-        // v0.9 H1: Tab bar click handling — check before everything else so
-        // tab clicks work even inside TUI apps that captured the mouse.
-        // v1.2: always active (even single tab) since the bar is always drawn.
-        if button == winit::event::MouseButton::Left {
-            if let Some(renderer) = &self.renderer {
-                let bar_h = renderer.tab_bar_height();
-                if y as f32 <= bar_h {
-                    // v1.1: clicks in the macOS traffic-light region (top-left)
-                    // must pass through to the system (close/minimize/maximize).
-                    if (x as f32) < renderer.traffic_lights_width() {
-                        return;
-                    }
-                    // Click is in the tab bar region. Check hit-test rects.
-                    let xf = x as f32;
-                    let yf = y as f32;
-                    for hit in &renderer.tab_hits {
-                        // v1.2: Check scroll-arrow sentinel values first.
-                        // usize::MAX = left arrow, usize::MAX - 1 = right arrow.
-                        if hit.index == usize::MAX {
-                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                                let cw = renderer.cell_width() as f32;
-                                self.tab_scroll_offset =
-                                    (self.tab_scroll_offset - cw * 15.0).max(0.0);
-                                self.clamp_tab_scroll();
-                                self.request_redraw();
-                                return;
-                            }
-                            continue;
-                        }
-                        if hit.index == usize::MAX - 1 {
-                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                                let cw = renderer.cell_width() as f32;
-                                self.tab_scroll_offset += cw * 15.0;
-                                self.clamp_tab_scroll();
-                                self.request_redraw();
-                                return;
-                            }
-                            continue;
-                        }
-                        // Check close button first (it's inside the tab rect).
-                        let [cx0, cy0, cx1, cy1] = hit.close_rect;
-                        if xf >= cx0 && xf < cx1 && yf >= cy0 && yf < cy1 {
-                            // Close this tab.
-                            let idx = hit.index;
-                            // If closing the active tab, switch first.
-                            if idx == self.active_tab {
-                                if self.close_tab() {
-                                    // App continues with remaining tabs.
-                                }
-                            } else {
-                                // Close a background tab — remove and adjust index.
-                                self.tabs.remove(idx);
-                                if idx < self.active_tab {
-                                    self.active_tab -= 1;
-                                }
-                                self.hovered_tab = None;
-                                self.request_redraw();
-                            }
-                            return;
-                        }
-                        // Check tab label rect.
-                        let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                        if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                            let hit_index = hit.index;
-                            if self.active_tab != hit_index {
-                                self.reset_ime_context("tab clicked");
-                                self.active_tab = hit_index;
-                                self.refresh_find_for_active_tab();
-                            }
-                            self.hovered_tab = None;
-                            self.scroll_active_tab_into_view();
-                            self.request_redraw();
-                            return;
-                        }
-                    }
-                    // v1.1: "+" (new tab) button — check before the
-                    // background-drag/double-click handler so a click on "+"
-                    // opens a tab instead of maximizing.
-                    let [nx0, ny0, nx1, ny1] = renderer.new_tab_rect;
-                    if nx1 > 0.0 && xf >= nx0 && xf < nx1 && yf >= ny0 && yf < ny1 {
-                        self.new_tab();
-                        return;
-                    }
-                    // v1.1: Click in the tab-bar background (not on any tab,
-                    // not on the traffic lights). This is a draggable region
-                    // (movableByWindowBackground handles the drag). Detect a
-                    // double-click here to toggle maximize, matching the macOS
-                    // native titlebar double-click behavior.
-                    let now = std::time::Instant::now();
-                    let is_double = self
-                        .last_titlebar_click
-                        .map(|t| now.duration_since(t) < std::time::Duration::from_millis(500))
-                        .unwrap_or(false);
-                    if is_double {
-                        if let Some(window) = &self.window {
-                            let maximized = window.is_maximized();
-                            window.set_maximized(!maximized);
-                        }
-                        self.last_titlebar_click = None;
-                    } else {
-                        self.last_titlebar_click = Some(now);
-                    }
-                    return;
-                }
-            }
-        }
-
-        // v0.9 W2: history panel click → select row + scroll terminal to block.
-        // Handled before PTY mouse reporting so panel clicks work even inside
-        // TUI apps that captured the mouse.
-        if button == winit::event::MouseButton::Left && self.panel_open {
-            if let Some(renderer) = &self.renderer {
-                // v0.9 W5: panel is now a LEFT sidebar anchored at x = 0 with
-                // width = sidebar_width().
-                let width_px = renderer.sidebar_width();
-                let panel_x = 0.0;
-                let ch = renderer.cell_height() as f64;
-                // v0.9 fix: list_top must include chrome_top (tab bar height)
-                // to match the renderer's panel content offset. Without this,
-                // row clicks were misaligned by one tab-bar height.
-                let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0) as f64;
-                let xf = x as f32;
-                let yf = y;
-                if xf >= panel_x && xf < panel_x + width_px && yf > 0.0 {
-                    // v0.9 fix: match the renderer's Warp-style panel layout:
-                    //   header  at chrome_top + ch*0.4
-                    //   search  at chrome_top + ch*1.6, height ch*1.4
-                    //   list    at chrome_top + ch*1.6 + ch*1.4 + ch*0.4
-                    let field_pad_y = ch * 1.6;
-                    let field_h = ch * 1.4;
-                    let search_top = chrome_top + field_pad_y;
-                    let search_bottom = chrome_top + field_pad_y + field_h;
-                    let list_top = chrome_top + field_pad_y + field_h + ch * 0.4;
-                    let row_h = ch * 1.1;
-                    if yf >= list_top {
-                        // Click on a history row: select it AND focus the
-                        // panel so Up/Down keys navigate the list (Warp-style).
-                        // Single click only selects + scrolls + highlights
-                        // the block; double-click (or Enter) sends the command
-                        // to the prompt editor.
-                        self.panel_search_focused = true;
-                        let clicked = ((yf - list_top) / row_h) as usize;
-                        let max_rows =
-                            visible_panel_rows(renderer.viewport().1, renderer.cell_height());
-                        if clicked < max_rows {
-                            // v0.9: detect double-click on the same row.
-                            let now = std::time::Instant::now();
-                            let is_double = self
-                                .panel_last_click
-                                .map(|(t, row)| {
-                                    t.elapsed() < std::time::Duration::from_millis(400)
-                                        && row == clicked
-                                })
-                                .unwrap_or(false);
-                            self.panel_last_click = Some((now, clicked));
-                            self.panel_selection = clicked;
-                            self.clamp_panel_selection();
-                            // Scroll terminal to the selected block + highlight.
-                            self.scroll_to_panel_selection();
-                            if is_double {
-                                // Double-click: send the command to the prompt.
-                                self.send_panel_selection_to_input();
-                            }
-                            return;
-                        }
-                    } else if yf >= search_top && yf < search_bottom {
-                        // Click in the search input field: focus it so keyboard
-                        // input goes to panel_query (bug 6 fix).
-                        self.panel_search_focused = true;
-                        self.request_redraw();
-                        return;
-                    }
-                } else {
-                    // Click outside the panel: unfocus search (but keep panel open).
-                    if self.panel_search_focused {
-                        self.panel_search_focused = false;
-                        self.request_redraw();
-                    }
-                }
-            }
-        }
-
-        // v0.9 W3 (revised): block collapse/expand — only clicking the chevron
-        // (▸/▾ in the first cell of a Command row) toggles fold. Clicking the
-        // rest of the command line starts a normal text selection instead, so
-        // the user can select/copy command text. This reverts the earlier
-        // "click anywhere on the command line folds" behavior.
-        if button == winit::event::MouseButton::Left && self.block_view_active() {
-            if let Some(renderer) = &self.renderer {
-                let chrome_left = if self.panel_open {
-                    renderer.sidebar_width()
-                } else {
-                    0.0
-                };
-                let content_left = renderer.padding_x() + chrome_left;
-                let cw = renderer.cell_width() as f32;
-                let xf = x as f32;
-                let yf = y as f32;
-                // Chevron occupies the first cell [content_left, content_left + cw).
-                if xf >= content_left && xf < content_left + cw {
-                    for row in &renderer.block_view_rows {
-                        if row.kind == weft_core::selection::BlockViewRowKind::Command
-                            && yf >= row.y_top
-                            && yf < row.y_bottom
-                        {
-                            if let Some(bid) = row.block_id {
-                                if let Some(term) = self.tabs[self.active_tab].terminal.as_mut() {
-                                    term.block_tracker_mut().toggle_collapse(bid);
-                                    self.request_redraw();
-                                }
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        // OSC 8 hyperlink Cmd+Click: open the URL tagged on the clicked cell
-        // via the registry's side-map. Bypasses normal selection / PTY mouse
-        // reporting so Cmd+Click works even inside TUI apps that captured the
-        // mouse (opencode, claude, vim) — same escape hatch as Shift+drag.
-        if button == winit::event::MouseButton::Left && self.mods.state().super_key() {
-            if let Some(url) = self.hyperlink_at_pixel(x, y) {
-                open_url(&url);
-                return;
-            }
-        }
-
-        // Find popup button clicks (regex / case / up / down). Bypasses the
-        // normal selection / PTY mouse path so the buttons work even inside
-        // TUI apps that captured the mouse — same rationale as Cmd+Click.
-        if button == winit::event::MouseButton::Left && self.find_open {
-            if let Some(action) = self.find_button_at(x as f32, y as f32) {
-                match action {
-                    FindButtonAction::ToggleRegex => {
-                        self.find_regex_mode = !self.find_regex_mode;
-                        // Force immediate re-search so toggle is reflected
-                        // (matches ToggleCase behavior — without this, typing
-                        // the regex first and then toggling .* won't apply
-                        // the regex mode to the existing query).
-                        self.find_last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
-                    }
-                    FindButtonAction::ToggleCase => {
-                        self.find_case_sensitive = !self.find_case_sensitive;
-                        // Force immediate re-search so toggle is reflected.
-                        self.find_last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
-                    }
-                    FindButtonAction::Next => self.find_cycle_next_prev(true),
-                    FindButtonAction::Prev => self.find_cycle_next_prev(false),
-                }
-                return;
-            }
-        }
-
-        // Check for popup border drag (completion or palette).
-        if button == winit::event::MouseButton::Left {
-            if let Some(drag) = self.check_popup_border_drag(x, y) {
-                self.drag_state = Some(drag);
-                return;
-            }
-        }
-
-        // v0.9: Command Palette mouse interaction — click inside the popup
-        // (but not on the border drag zone) selects the entry; double-click
-        // runs it immediately. Mirrors the history panel's click/double-click
-        // pattern so the user doesn't have to press Enter.
-        if button == winit::event::MouseButton::Left && self.palette_open {
-            if let Some(clicked_idx) = self.palette_row_at(x, y) {
-                let now = std::time::Instant::now();
-                let is_double = self
-                    .palette_last_click
-                    .map(|(t, row)| {
-                        t.elapsed() < std::time::Duration::from_millis(400) && row == clicked_idx
-                    })
-                    .unwrap_or(false);
-                self.palette_last_click = Some((now, clicked_idx));
-                if is_double {
-                    if let Some(entry) = self.palette_results.get(clicked_idx).cloned() {
-                        self.activate_palette_entry(entry);
-                    }
-                } else {
-                    self.palette_selection = clicked_idx;
-                    self.request_redraw();
-                }
-                return;
-            }
-        }
-
-        // If context menu is open, handle click as menu selection.
-        // (v0.9 fix: removed the "click any block to fold" handler that
-        // prevented text selection on block output. Folding is now solely
-        // via the chevron click handler above — W3.)
-        if button == winit::event::MouseButton::Left {
-            if let Some(menu) = self.context_menu.take() {
-                self.execute_context_menu(&menu, x as f32, y as f32);
-                return;
-            }
-        }
-
-        // v0.9: click inside the prompt input box → position the editor
-        // cursor at the clicked char and start a mouse-drag selection (so
-        // the user can select/copy part of the command). Clicks outside the
-        // prompt box clear any active editor selection.
-        if button == winit::event::MouseButton::Left {
-            let in_prompt = self
-                .renderer
-                .as_ref()
-                .and_then(|r| r.prompt_box_rect.get())
-                .map(|[x0, y0, x1, y1]| {
-                    let xf = x as f32;
-                    let yf = y as f32;
-                    xf >= x0 && xf <= x1 && yf >= y0 && yf <= y1
-                })
-                .unwrap_or(false);
-            if in_prompt {
-                if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                        t.editor_mut().buffer.start_selection(pos);
-                    }
-                    self.prompt_dragging = true;
-                    // Clear any block/grid selection so Cmd+C targets the editor.
-                    self.tabs[self.active_tab].selection_handler.clear();
-                    self.request_redraw();
-                }
-                return;
-            } else if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                if t.editor().buffer.has_selection() {
-                    t.editor_mut().buffer.clear_selection();
-                    self.request_redraw();
-                }
-            }
-            self.prompt_dragging = false;
-        }
-
-        let selecting = !self.mouse_reporting_active();
-        let block_view = self.block_view_active();
-
-        match button {
-            winit::event::MouseButton::Left => {
-                if selecting {
-                    if block_view {
-                        // Block view: hit-test against the cached visible-row
-                        // snapshot and start a block-view selection. The row
-                        // snapshot is cloned so the selection stays consistent
-                        // with what the user saw at drag start, even if a PTY
-                        // update re-lays-out the view mid-drag.
-                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            let rows_snapshot = self
-                                .renderer
-                                .as_ref()
-                                .map(|r| r.block_view_rows.clone())
-                                .unwrap_or_default();
-                            self.tabs[self.active_tab]
-                                .selection_handler
-                                .start_block_view(bv_pos, rows_snapshot);
-                        } else {
-                            // Click missed every selectable row (e.g. on the
-                            // prompt box, CWD bar, or empty padding). Clear the
-                            // existing selection so the user gets visual
-                            // feedback that the previous selection is gone.
-                            self.tabs[self.active_tab].selection_handler.clear();
-                        }
-                    } else {
-                        // Grid view (alt-screen): classic grid selection.
-                        let pos = self.pixel_to_grid(x, y);
-                        let mode = if self.mods.state().shift_key() {
-                            SelectionMode::Block
-                        } else {
-                            SelectionMode::Simple
-                        };
-                        self.tabs[self.active_tab]
-                            .selection_handler
-                            .start(pos, mode);
-                    }
-                }
-
-                // If mouse protocol is active, send mouse event to PTY.
-                // Always compute a grid pos for PTY mouse reporting (the
-                // foreground program speaks grid coordinates, not block rows).
-                let grid_pos = self.pixel_to_grid(x, y);
-                self.send_mouse_event(MouseButton::Left, MouseAction::Press, grid_pos);
-            }
-            winit::event::MouseButton::Middle => {
-                // Middle click: paste
-                self.paste_from_clipboard();
-                let pos = self.pixel_to_grid(x, y);
-                self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
-            }
-            winit::event::MouseButton::Right => {
-                // If context menu is open, right-click closes it.
-                if self.context_menu.is_some() {
-                    self.context_menu = None;
-                    self.request_redraw();
-                    return;
-                }
-
-                // Block view: open context menu on a block. block_at now
-                // supports both completed blocks (including those with no
-                // output) and the in-flight (running) command.
-                if let Some(id) = self.block_at(y as f32) {
-                    self.context_menu = Some(ContextMenu {
-                        block_id: id,
-                        x: x as f32,
-                        y: y as f32,
-                        selection: 0,
-                    });
-                    self.request_redraw();
-                    return;
-                }
-
-                if selecting {
-                    // Right click: extend selection.
-                    if block_view {
-                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            if self.tabs[self.active_tab]
-                                .selection_handler
-                                .block_view_selection
-                                .is_none()
-                            {
-                                let rows_snapshot = self
-                                    .renderer
-                                    .as_ref()
-                                    .map(|r| r.block_view_rows.clone())
-                                    .unwrap_or_default();
-                                self.tabs[self.active_tab]
-                                    .selection_handler
-                                    .start_block_view(bv_pos, rows_snapshot);
-                            } else {
-                                self.tabs[self.active_tab]
-                                    .selection_handler
-                                    .extend_block_view(bv_pos);
-                            }
-                        }
-                    } else {
-                        let pos = self.pixel_to_grid(x, y);
-                        if self.tabs[self.active_tab]
-                            .selection_handler
-                            .selection
-                            .is_none()
-                        {
-                            self.tabs[self.active_tab]
-                                .selection_handler
-                                .start(pos, SelectionMode::Simple);
-                        } else {
-                            self.tabs[self.active_tab].selection_handler.extend(pos);
-                        }
-                    }
-                }
-                let pos = self.pixel_to_grid(x, y);
-                self.send_mouse_event(MouseButton::Right, MouseAction::Press, pos);
-            }
-            _ => {}
-        }
-
-        self.request_redraw();
-    }
-
-    /// Handle mouse release.
-    fn handle_mouse_release(&mut self, _x: f64, _y: f64, button: winit::event::MouseButton) {
-        // End popup border drag if active.
-        if button == winit::event::MouseButton::Left && self.drag_state.is_some() {
-            self.drag_state = None;
-            return;
-        }
-
-        // v0.9: end editor drag-selection (the selection itself stays so
-        // Cmd+C can copy it).
-        if button == winit::event::MouseButton::Left && self.prompt_dragging {
-            self.prompt_dragging = false;
-            // A click without drag (anchor == cursor) leaves an empty
-            // selection — clear it so the caret shows normally.
-            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                if !t.editor().buffer.has_selection() {
-                    // has_selection returns false when anchor==cursor, so
-                    // explicitly clear the anchor to drop the empty selection.
-                    t.editor_mut().buffer.clear_selection();
-                }
-            }
-            self.request_redraw();
-        }
-
-        let pos = self.pixel_to_grid(_x, _y);
-        self.tabs[self.active_tab].selection_handler.end();
-
-        let btn = match button {
-            winit::event::MouseButton::Left => MouseButton::Left,
-            winit::event::MouseButton::Middle => MouseButton::Middle,
-            winit::event::MouseButton::Right => MouseButton::Right,
-            _ => return,
-        };
-        self.send_mouse_event(btn, MouseAction::Release, pos);
-    }
-
-    /// Handle mouse movement.
-    fn handle_mouse_move(&mut self, x: f64, y: f64) {
-        // v1.0 fix: sync mouse_protocol + sgr_mouse (see handle_mouse_press)
-        // so move-event encoding (ButtonEvent/AnyEvent drag reporting) reflects
-        // the app's actual mouse mode and report format.
-        if let Some(t) = &self.tabs[self.active_tab].terminal {
-            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
-            self.tabs[self.active_tab].input_handler.mouse_protocol = mp;
-            self.tabs[self.active_tab].input_handler.sgr_mouse = sgr;
-        }
-        // Update popup drag if active (clone to avoid borrow conflict).
-        if let Some(drag) = self.drag_state.clone() {
-            self.update_popup_drag(x, y, &drag);
-            return;
-        }
-
-        // v0.9 W1+: tab bar hover detection — show close "×" on the hovered
-        // tab (Warp-style) and highlight the "+" / scroll arrows.
-        // v1.2: always active (even single tab) since the tab bar is now
-        // always rendered. Reads `tab_hits` populated during the last draw.
-        {
-            let (new_hover, new_plus_hover, new_la_hover, new_ra_hover) = if let Some(renderer) =
-                &self.renderer
-            {
-                let bar_h = renderer.tab_bar_height();
-                let yf = y as f32;
-                if yf <= bar_h {
-                    let xf = x as f32;
-                    // Check "+" button hover.
-                    let [nx0, _ny0, nx1, _ny1] = renderer.new_tab_rect;
-                    let plus_h = nx1 > 0.0 && xf >= nx0 && xf < nx1;
-                    // Check arrow hover (sentinel index values).
-                    let (la_h, ra_h) =
-                        renderer
-                            .tab_hits
-                            .iter()
-                            .fold((false, false), |(la, ra), h| {
-                                if h.index == usize::MAX
-                                    && xf >= h.tab_rect[0]
-                                    && xf < h.tab_rect[2]
-                                {
-                                    (true, ra)
-                                } else if h.index == usize::MAX - 1
-                                    && xf >= h.tab_rect[0]
-                                    && xf < h.tab_rect[2]
-                                {
-                                    (la, true)
-                                } else {
-                                    (la, ra)
-                                }
-                            });
-                    // Check tab hover (exclude arrow sentinels).
-                    let tab_h = renderer
-                        .tab_hits
-                        .iter()
-                        .find(|h| {
-                            h.index < usize::MAX - 1 && xf >= h.tab_rect[0] && xf < h.tab_rect[2]
-                        })
-                        .map(|h| h.index);
-                    (tab_h, plus_h, la_h, ra_h)
-                } else {
-                    (None, false, false, false)
-                }
-            } else {
-                (None, false, false, false)
-            };
-            let changed = new_hover != self.hovered_tab
-                || new_plus_hover != self.plus_hovered
-                || new_la_hover != self.arrow_left_hovered
-                || new_ra_hover != self.arrow_right_hovered;
-            self.hovered_tab = new_hover;
-            self.plus_hovered = new_plus_hover;
-            self.arrow_left_hovered = new_la_hover;
-            self.arrow_right_hovered = new_ra_hover;
-            if changed {
-                self.request_redraw();
-            }
-        }
-
-        // v0.9: extend editor drag-selection inside the prompt box.
-        if self.prompt_dragging {
-            if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                    t.editor_mut().buffer.extend_selection(pos);
-                    self.request_redraw();
-                }
-            }
-        }
-
-        if self.tabs[self.active_tab].selection_handler.selecting {
-            if self.block_view_active() {
-                if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                    self.tabs[self.active_tab]
-                        .selection_handler
-                        .extend_block_view(bv_pos);
-                    self.request_redraw();
-                }
-            } else {
-                let pos = self.pixel_to_grid(x, y);
-                self.tabs[self.active_tab].selection_handler.extend(pos);
-                self.request_redraw();
-            }
-        }
-
-        // PTY mouse reporting always speaks grid coordinates.
-        let pos = self.pixel_to_grid(x, y);
-        self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
-    }
-
-    /// Check if a click (x, y) lands on a popup border drag handle.
-    /// Returns a DragState if so, enabling resize-drag.
-    /// Uses the actual popup rectangles stored by the renderer (not
-    /// approximations), so hot-zone detection is accurate.
-    fn check_popup_border_drag(&self, x: f64, y: f64) -> Option<DragState> {
-        let renderer = self.renderer.as_ref()?;
-        let (cw, ch) = (renderer.cell_width() as f32, renderer.cell_height() as f32);
-        let hot_zone = 8.0; // px from the border (wider for usability)
-
-        // Gather all active popup rects (completion + palette).
-        let mut rects: Vec<[f32; 4]> = Vec::new();
-        if let Some(r) = renderer.completion_popup_rect {
-            rects.push(r);
-        }
-        if let Some(r) = renderer.palette_popup_rect {
-            rects.push(r);
-        }
-
-        let xf = x as f32;
-        let yf = y as f32;
-
-        for &[rx0, ry0, rx1, ry1] in &rects {
-            // Right border: x near rx1, y within [ry0, ry1].
-            let on_right = (xf - rx1).abs() < hot_zone && yf >= ry0 && yf <= ry1;
-            // Top border: y near ry0, x within [rx0, rx1].
-            let on_top = (yf - ry0).abs() < hot_zone && xf >= rx0 && xf <= rx1;
-
-            let target = if on_right {
-                DragTarget::Right
-            } else if on_top {
-                DragTarget::Top
-            } else {
-                continue;
-            };
-
-            return Some(DragState {
-                target,
-                start_x: x,
-                start_y: y,
-                start_scale: self.popup_width_scale,
-                start_rows: self.popup_max_rows,
-                cell_w: cw,
-                cell_h: ch,
-            });
-        }
-
-        None
-    }
-
-    /// Update popup dimensions during a border drag.
-    fn update_popup_drag(&mut self, x: f64, y: f64, drag: &DragState) {
-        match drag.target {
-            DragTarget::Right => {
-                // Width: delta-x adjusts the popup width scale.
-                let dx = (x - drag.start_x) as f32;
-                let vp_w = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.viewport_width())
-                    .unwrap_or(800.0);
-                let scale_delta = dx / vp_w;
-                self.popup_width_scale = (drag.start_scale + scale_delta).clamp(0.3, 0.95);
-            }
-            DragTarget::Top => {
-                // Height: delta-y (upward = more rows).
-                let dy = (drag.start_y - y) as f32;
-                let row_delta = (dy / drag.cell_h) as i32;
-                let new_rows = (drag.start_rows as i32 + row_delta).clamp(3, 20) as usize;
-                self.popup_max_rows = new_rows;
-            }
-        }
-        self.request_redraw();
-    }
-
-    /// Execute a context menu action based on click position.
-    fn execute_context_menu(&mut self, menu: &ContextMenu, click_x: f32, click_y: f32) {
-        let ch = self
-            .renderer
-            .as_ref()
-            .map(|r| r.cell_height() as f32)
-            .unwrap_or(16.0);
-
-        if let Some(i) = context_menu_hit_index(menu.x, menu.y, ch, click_x, click_y) {
-            let action = CONTEXT_MENU_ITEMS[i].1;
-            self.run_context_action(menu.block_id, action);
-            self.request_redraw();
-            return;
-        }
-        // Click outside menu items — just close (already taken).
-        self.request_redraw();
-    }
-
-    /// Run a context menu action on the target block.
-    /// `block_id` is `None` for the in-flight (running) command.
-    fn run_context_action(&mut self, block_id: Option<BlockId>, action: &str) {
-        let Some(terminal) = &mut self.tabs[self.active_tab].terminal else {
-            return;
-        };
-
-        match action {
-            "copy_command" | "copy_output" => {
-                // For in-flight blocks, copy from the live command/output.
-                if block_id.is_none() {
-                    if let Some(live) = terminal.block_tracker().in_flight() {
-                        let text = if action == "copy_command" {
-                            live.command.to_string()
-                        } else {
-                            live.output.to_string()
-                        };
-                        clipboard_copy(&text);
-                        info!(len = text.len(), "copied in-flight to clipboard");
-                    }
-                    return;
-                }
-                let bid = block_id.unwrap();
-                let block = terminal
-                    .block_tracker()
-                    .session_blocks()
-                    .iter()
-                    .find(|b| b.id == bid);
-                if let Some(b) = block {
-                    let text = if action == "copy_command" {
-                        &b.command
-                    } else {
-                        &b.output
-                    };
-                    clipboard_copy(text);
-                    info!(len = text.len(), "copied to clipboard");
-                }
-            }
-            "toggle_fold" => {
-                if let Some(bid) = block_id {
-                    terminal.block_tracker_mut().toggle_collapse(bid);
-                }
-                // In-flight blocks can't be folded (no finalized block yet).
-            }
-            // W4: copy the block's command into the editor buffer so the user
-            // can tweak parameters and re-submit (Warp-style "rerun"). Only
-            // takes effect at the prompt — when a command is running or an
-            // alt-screen app is active, the editor isn't the effective input
-            // mode, so we silently no-op rather than stashing text the user
-            // would see resurface unexpectedly when the prompt returns.
-            "send_to_input" => {
-                if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
-                    // Clone first to release the immutable borrow before editor_mut().
-                    let cmd = if let Some(bid) = block_id {
-                        terminal
-                            .block_tracker()
-                            .session_blocks()
-                            .iter()
-                            .find(|b| b.id == bid)
-                            .map(|b| b.command.clone())
-                    } else {
-                        terminal
-                            .block_tracker()
-                            .in_flight()
-                            .map(|f| f.command.to_string())
-                    };
-                    if let Some(cmd) = cmd {
-                        if !cmd.is_empty() {
-                            terminal.editor_mut().buffer.set_text(&cmd);
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Handle scroll wheel.
-    fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta, x: f64, y: f64) {
-        // v0.9 fix: drain pending PTY messages BEFORE checking alt-screen
-        // state. When `less` (or any alt-screen app) starts, the enter
-        // sequence (`\x1b[?1049h`) is still in the channel until the next
-        // `process_messages` call. Without this drain, the first wheel
-        // events see `alt_active = false` and fall through to the
-        // viewport-scroll branch (which does nothing on alt screen). After
-        // a keyboard event triggers a redraw → process_messages → alt_active
-        // becomes true, the wheel starts working — which matches the user
-        // report "scrolling works only after pressing a key".
-        //
-        // Drain anything already available. If the alt-screen sequence has
-        // not arrived yet, the transition route below queues this gesture and
-        // replays it from `process_messages` once parsing reaches alt screen.
-        self.pump_pty();
-        self.process_messages();
-
-        // v1.2: If the scroll event is over the tab bar, adjust the tab bar
-        // horizontal scroll offset instead of scrolling the terminal. This
-        // lets the user navigate overflowed tabs via trackpad / wheel.
-        if let Some(renderer) = &self.renderer {
-            let bar_h = renderer.tab_bar_height();
-            if y as f32 <= bar_h && self.tabs.len() > 1 {
-                let cw = renderer.cell_width() as f32;
-                let scroll_step = cw * 15.0; // scroll ~1 tab width per notch
-                let delta_px = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, v) => {
-                        // Vertical wheel in tab bar → horizontal scroll.
-                        -v * scroll_step
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                        // Trackpad: use deltaX if significant, else convert deltaY.
-                        if pos.x.abs() > pos.y.abs() {
-                            -(pos.x as f32)
-                        } else {
-                            -(pos.y as f32) * 0.5
-                        }
-                    }
-                };
-                self.tab_scroll_offset = (self.tab_scroll_offset + delta_px).max(0.0);
-                self.clamp_tab_scroll();
-                self.request_redraw();
-                return;
-            }
-        }
-
-        let lines = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, v) => {
-                if v > 0.0 {
-                    v.ceil() as usize
-                } else {
-                    v.floor().abs() as usize
-                }
-            }
-            winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                let v = pos.y / 40.0; // approx 40px per line
-                if v > 0.0 {
-                    v.ceil() as usize
-                } else {
-                    v.floor().abs() as usize
-                }
-            }
-        };
-
-        if lines == 0 {
-            return;
-        }
-
-        // Short-lived immutable borrow to read the mode flags up-front —
-        // avoids holding a long-lived mutable borrow of `terminal` across
-        // later accesses to `block_scroll_offset`, `renderer`, etc.
-        let tui_starting = self.tabs[self.active_tab].tui_scroll_window_active();
-        let (mouse_protocol_active, alt_screen_active, app_cursor_keys, mouse_protocol, sgr_mouse) = {
-            let Some(t) = &self.tabs[self.active_tab].terminal else {
-                return;
-            };
-            // v1.0 fix: capture mouse_protocol here and sync it into the
-            // InputHandler below (after this immutable borrow ends). Without
-            // this sync, InputHandler.mouse_protocol stays `Off` forever (its
-            // setters are test-only), so `encode_scroll`/`encode_mouse` hit
-            // their `if Off { return None }` guards and silently drop every
-            // mouse event — mouse-aware apps (vim `set mouse=a`, tmux, htop)
-            // never receive wheel/click input. Mirrors the `app_cursor_keys`
-            // sync in handle_key_event.
-            let mp = t.mouse_protocol;
-            let sgr = t.sgr_mouse;
-            (
-                mp != MouseProtocol::Off,
-                t.is_alt_screen_active(),
-                t.app_cursor_keys,
-                mp,
-                sgr,
-            )
-        };
-        // Apply all terminal-controlled input modes before encoding this
-        // gesture. Vim/less commonly enable DECCKM before the first wheel;
-        // using a stale default would emit CSI arrows instead of SS3 arrows.
-        self.tabs[self.active_tab].input_handler.app_cursor_keys = app_cursor_keys;
-        self.tabs[self.active_tab].input_handler.mouse_protocol = mouse_protocol;
-        self.tabs[self.active_tab].input_handler.sgr_mouse = sgr_mouse;
-
-        // Check if mouse protocol is active — forward scroll to PTY
-        if mouse_protocol_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
-            let pos = self.pixel_to_grid(x, y);
-            let mut m = Modifiers::empty();
-            if self.mods.state().shift_key() {
-                m |= Modifiers::SHIFT;
-            }
-            if self.mods.state().alt_key() {
-                m |= Modifiers::ALT;
-            }
-            if self.mods.state().control_key() {
-                m |= Modifiers::CONTROL;
-            }
-            if let Some(bytes) = self.tabs[self.active_tab]
-                .input_handler
-                .encode_scroll(up, pos.col, pos.row, m)
-            {
-                if let Some(pty) = &self.tabs[self.active_tab].pty {
-                    let _ = pty.write_sync(&bytes);
-                }
-            }
-            return;
-        }
-
-        // A TUI launched from the editor can receive its first wheel gesture
-        // before the PTY reader has delivered/parsing has reached CSI ?1049h.
-        // Keep the gesture per-tab for one 50ms protocol grace period. It is
-        // encoded for the TUI if alternate screen arrives, otherwise it falls
-        // back to ordinary local viewport scrolling (so normal commands do not
-        // lose their first gesture during the two-second launch window).
-        if tui_starting && !alt_screen_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
-            let rows = if up { lines as i32 } else { -(lines as i32) };
-            let pos = self.pixel_to_grid(x, y);
-            let mut m = Modifiers::empty();
-            if self.mods.state().shift_key() {
-                m |= Modifiers::SHIFT;
-            }
-            if self.mods.state().alt_key() {
-                m |= Modifiers::ALT;
-            }
-            if self.mods.state().control_key() {
-                m |= Modifiers::CONTROL;
-            }
-            if self.tabs[self.active_tab].queue_tui_scroll(rows, pos.col, pos.row, m) {
-                if let Some(delay) = self.tabs[self.active_tab].take_tui_scroll_wake_delay() {
-                    let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(delay);
-                        let _ = proxy.send_event(AppEvent::Wake);
-                    });
-                }
-                return;
-            }
-        }
-
-        // Alt-screen apps (less, vim, man, etc.) don't use mouse protocol but
-        // still benefit from wheel scroll: translate to Up/Down arrow key
-        // sequences so the pager scrolls its content natively.
-        if alt_screen_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
-            let key = if up { KeyCode::Up } else { KeyCode::Down };
-            let mut m = Modifiers::empty();
-            if self.mods.state().shift_key() {
-                m |= Modifiers::SHIFT;
-            }
-            let single = self.tabs[self.active_tab].input_handler.encode_key(key, m);
-            if !single.is_empty() {
-                let mut batch = Vec::with_capacity(single.len() * lines);
-                for _ in 0..lines {
-                    batch.extend_from_slice(&single);
-                }
-                if let Some(pty) = &self.tabs[self.active_tab].pty {
-                    let _ = pty.write_sync(&batch);
-                }
-            }
-            return;
-        }
-
-        // Otherwise, scroll the terminal viewport.
-        let up = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-            winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-        };
-        let rows = if up { lines as i32 } else { -(lines as i32) };
-        self.scroll_local_view(rows);
-    }
-
-    /// Apply signed rows to the normal terminal/block viewport. Positive rows
-    /// move toward older content; negative rows move back toward the prompt.
-    fn scroll_local_view(&mut self, rows: i32) {
-        if rows == 0 {
-            return;
-        }
-        let up = rows > 0;
-        let lines = rows.unsigned_abs() as usize;
-        let block_view = self.tabs[self.active_tab]
-            .terminal
-            .as_ref()
-            .is_some_and(Terminal::show_block_view);
-
-        // Block view uses a dedicated scroll offset (not grid.scroll_offset,
-        // which is clamped to grid scrollback — the wrong proxy for block
-        // content like headers/commands/separators).
-        if block_view {
-            // Cap scroll speed at 1 row per wheel notch in the block view.
-            // macOS trackpad inertia can send 3-4 lines per tick, which skips
-            // past content too fast for comfortable reading.
-            let scroll_lines = lines.min(1);
-            // Compute metrics via a short-lived immutable borrow of `terminal`
-            // so we can later mutate `block_scroll_offset` (same Tab, but a
-            // disjoint field — allowed once the immutable borrow ends).
-            let (total, prompt_lines) = {
-                let Some(t) = &self.tabs[self.active_tab].terminal else {
-                    return;
-                };
-                let cols = t.grid().num_cols;
-                let (total, _) = block_content_metrics(t, cols);
-                (total, t.editor().buffer.lines.len())
-            };
-            // Compute visible rows from the renderer's actual geometry
-            // (pitch = ch * 1.1, region = viewport minus prompt box).
-            // The old code used grid().num_rows which overcounts because
-            // the block view uses a 10% taller line pitch and doesn't
-            // occupy the full viewport (prompt box eats space).
-            let visible = self
-                .renderer
-                .as_ref()
-                .map(|r| r.block_visible_rows(prompt_lines))
-                .unwrap_or(1);
-            let max_scroll = total.saturating_sub(visible);
-            if up {
-                self.tabs[self.active_tab].block_scroll_offset = self.tabs[self.active_tab]
-                    .block_scroll_offset
-                    .saturating_add(scroll_lines)
-                    .min(max_scroll);
-            } else {
-                self.tabs[self.active_tab].block_scroll_offset = self.tabs[self.active_tab]
-                    .block_scroll_offset
-                    .saturating_sub(scroll_lines);
-            }
-        } else {
-            // Grid view scroll — needs mutable terminal.
-            if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
-                let grid = &mut terminal.grid_mut();
-                if up {
-                    grid.scroll_up_history(lines);
-                } else {
-                    grid.scroll_down_history(lines);
-                }
-            }
-        }
-        self.request_redraw();
-    }
-
-    /// Send a mouse event to the PTY if mouse protocol is active.
-    fn send_mouse_event(&self, button: MouseButton, action: MouseAction, pos: GridPos) {
-        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
-            return;
-        };
-        if terminal.mouse_protocol == MouseProtocol::Off {
-            return;
-        }
-        let mut m = Modifiers::empty();
-        if self.mods.state().shift_key() {
-            m |= Modifiers::SHIFT;
-        }
-        if self.mods.state().alt_key() {
-            m |= Modifiers::ALT;
-        }
-        if self.mods.state().control_key() {
-            m |= Modifiers::CONTROL;
-        }
-        if let Some(bytes) = self.tabs[self.active_tab]
-            .input_handler
-            .encode_mouse(button, action, pos.col, pos.row, m)
-        {
-            if let Some(pty) = &self.tabs[self.active_tab].pty {
-                let _ = pty.write_sync(&bytes);
-            }
-        }
+        self.settings.close();
     }
 
     /// Copy selection to system clipboard.
@@ -5252,32 +754,30 @@ impl App {
     /// view copies from the terminal Grid. This split fixes the "复制错位"
     /// bug where a grid-coordinate copy landed on the wrong line because the
     /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
-    fn copy_selection(&self) {
-        let Some(terminal) = &self.tabs[self.active_tab].terminal else {
-            return;
-        };
-        // v0.9: editor drag-selection (or select-all after double-click→send-
-        // to-prompt) takes priority — Cmd+C copies the selected editor text.
-        if let Some(text) = terminal.editor().buffer.selected_text() {
-            if !text.is_empty() {
-                clipboard_copy(&text);
+    fn copy_selection(&mut self) {
+        let text = {
+            let Some(terminal) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
                 return;
-            }
-        }
-        let text = if terminal.show_block_view() {
-            self.tabs[self.active_tab]
-                .selection_handler
-                .block_view_text()
-        } else {
-            self.tabs[self.active_tab]
-                .selection_handler
-                .selected_text(terminal.grid())
+            };
+            // Editor drag-selection takes priority over block/grid selection.
+            terminal
+                .editor()
+                .buffer
+                .selected_text()
+                .filter(|text| !text.is_empty())
+                .or_else(|| {
+                    if terminal.show_block_view() {
+                        self.sessions.tabs[self.sessions.active_tab]
+                            .selection_handler
+                            .block_view_text()
+                    } else {
+                        self.sessions.tabs[self.sessions.active_tab]
+                            .selection_handler
+                            .selected_text(terminal.grid())
+                    }
+                })
         };
-        if let Some(text) = text {
-            if !text.is_empty() {
-                clipboard_copy(&text);
-            }
-        }
+        self.drain_effects(effect::copy_clipboard_effects(text));
     }
 
     /// Paste from system clipboard.
@@ -5295,7 +795,7 @@ impl App {
             return;
         }
 
-        let mode = self.tabs[self.active_tab]
+        let mode = self.sessions.tabs[self.sessions.active_tab]
             .terminal
             .as_ref()
             .map(|t| t.effective_input_mode())
@@ -5306,7 +806,10 @@ impl App {
             // split on \n (insert_char rejects control chars including \n,
             // so we must drive split_newline explicitly to preserve line
             // breaks). \r is dropped to handle CRLF paste from external apps.
-            if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
+            if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
+                .terminal
+                .as_mut()
+            {
                 let buf = &mut t.editor_mut().buffer;
                 for c in text.chars() {
                     if c == '\n' {
@@ -5319,13 +822,13 @@ impl App {
             self.request_redraw();
         } else {
             // Passthrough: forward to the PTY.
-            let bracketed = self.tabs[self.active_tab]
+            let bracketed = self.sessions.tabs[self.sessions.active_tab]
                 .terminal
                 .as_ref()
                 .map(|t| t.bracketed_paste)
                 .unwrap_or(false);
             let bytes = encode_paste(&text, bracketed);
-            if let Some(pty) = &self.tabs[self.active_tab].pty {
+            if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
                 if let Err(e) = pty.write_sync(&bytes) {
                     warn!("Failed to paste to PTY: {e}");
                 }
@@ -5342,12 +845,12 @@ impl App {
     ///   2π; the renderer maps it to an alpha curve 0.25↔1.0 + amber glow.
     fn update_cursor_blink(&mut self) {
         let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.cursor_blink_time);
+        let elapsed = now.duration_since(self.window_runtime.cursor_blink_time);
 
         // Grid-view hard blink: toggle every 530ms (anchor reset on toggle).
         if elapsed >= std::time::Duration::from_millis(530) {
-            self.cursor_blink_on = !self.cursor_blink_on;
-            self.cursor_blink_time = now;
+            self.window_runtime.cursor_blink_on = !self.window_runtime.cursor_blink_on;
+            self.window_runtime.cursor_blink_time = now;
         }
 
         // Prompt signature breath: advance phase continuously.
@@ -5356,10 +859,10 @@ impl App {
         let elapsed_ms = elapsed.as_millis() as f64;
         // Each update advances phase by (elapsed_ms / PERIOD_MS) * 2π.
         let delta = (elapsed_ms / PERIOD_MS) * std::f64::consts::TAU;
-        self.cursor_blink_phase += delta as f32;
+        self.window_runtime.cursor_blink_phase += delta as f32;
         // Wrap into [0, 2π) to avoid float drift over long sessions.
-        if self.cursor_blink_phase >= std::f32::consts::TAU {
-            self.cursor_blink_phase -= std::f32::consts::TAU;
+        if self.window_runtime.cursor_blink_phase >= std::f32::consts::TAU {
+            self.window_runtime.cursor_blink_phase -= std::f32::consts::TAU;
         }
     }
 }
@@ -5530,35 +1033,41 @@ impl ApplicationHandler<AppEvent> for App {
             return;
         }
 
-        let win = &self.config.window;
+        let win = &self.config_state.config.window;
         // v0.9 U-D1: resolve the startup theme honoring `follow_system` so
         // the window opens with the correct color from frame 0 (no dark→light
         // flash). `Config::theme()` ignores follow_system; this mirrors the
         // logic in `apply_config` / `poll_system_appearance`.
-        let startup_theme = if self.config.theme.follow_system {
+        let startup_theme = if self.config_state.config.theme.follow_system {
             let dark = unsafe { system_appearance_is_dark() };
             let name = if dark {
-                self.config
+                self.config_state
+                    .config
                     .theme
                     .dark_name
                     .clone()
                     .unwrap_or_else(|| "weft-warm".to_string())
             } else {
-                self.config
+                self.config_state
+                    .config
                     .theme
                     .light_name
                     .clone()
                     .unwrap_or_else(|| "weft-light".to_string())
             };
-            weft_core::config::Theme::resolve_named(&name, &self.config.theme)
+            weft_core::config::Theme::resolve_named(&name, &self.config_state.config.theme)
         } else {
-            self.config.theme()
+            self.config_state.config.theme()
         };
         let attrs = WindowAttributes::default()
             .with_title(&win.title)
             .with_inner_size(winit::dpi::LogicalSize::new(
                 win.width as f64,
                 win.height as f64,
+            ))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(
+                crate::ui_tokens::MIN_WINDOW_WIDTH,
+                crate::ui_tokens::MIN_WINDOW_HEIGHT,
             ))
             // Window-level transparency is fixed at creation; the layer opaque
             // flag + bg alpha still update live, but crossing the 1.0 boundary
@@ -5586,7 +1095,7 @@ impl ApplicationHandler<AppEvent> for App {
         }
         let renderer = MetalRenderer::new(
             &window,
-            self.config.font.clone(),
+            self.config_state.config.font.clone(),
             startup_theme,
             (win.padding_x, win.padding_y),
             win.opacity,
@@ -5614,28 +1123,30 @@ impl ApplicationHandler<AppEvent> for App {
         // `with_window_icon` sets the window title-bar icon; this sets the
         // Dock / app-switcher icon. For `cargo run` both show; in a .app
         // bundle the .icns takes over unless overridden here.
-        self.current_logo_variant = self.config.logo.variant;
+        self.window_runtime.current_logo_variant = self.config_state.config.logo.variant;
         unsafe {
-            set_dock_icon(self.current_logo_variant);
+            set_dock_icon(self.window_runtime.current_logo_variant);
         }
 
         // v0.9 U-D1: seed the appearance tracker so the first
         // `poll_system_appearance` (1s after launch) doesn't re-apply the
         // same theme and cause a flicker. The startup theme above already
         // queried the system appearance, so we record it as "known".
-        if self.config.theme.follow_system {
+        if self.config_state.config.theme.follow_system {
             let dark = unsafe { system_appearance_is_dark() };
-            self.last_system_appearance_dark = Some(dark);
-            self.theme_is_dark = dark;
+            self.window_runtime.last_system_appearance_dark = Some(dark);
+            self.config_state.theme_is_dark = dark;
         }
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
-        self.block_store = weft_cache_dir().and_then(|cache| {
+        self.sessions.block_store = weft_cache_dir().and_then(|cache| {
             let path = cache.join("blocks.db");
             match BlockStore::open(&path) {
                 Ok(store) => {
-                    if let Some(terminal) = &mut self.tabs[self.active_tab].terminal {
+                    if let Some(terminal) =
+                        &mut self.sessions.tabs[self.sessions.active_tab].terminal
+                    {
                         match store.recent(1000) {
                             Ok(history) => {
                                 // Hydrate editor history from persisted commands so
@@ -5679,7 +1190,7 @@ impl ApplicationHandler<AppEvent> for App {
         // stays clean. If the saved cwd equals the weft process's cwd (the
         // common case when launching from the same directory), no rebuild
         // is needed — the initial tab already has the right cwd.
-        if let Some(store) = &self.block_store {
+        if let Some(store) = &self.sessions.block_store {
             match store.load_tabs() {
                 Ok(snaps) if !snaps.is_empty() => {
                     info!(count = snaps.len(), "restoring saved tab snapshots");
@@ -5703,25 +1214,25 @@ impl ApplicationHandler<AppEvent> for App {
                             // cwd is needed; otherwise reuse the existing tab
                             // (already spawned with weft's cwd).
                             if cwd_to_apply.is_some() {
-                                self.tabs[0] = Tab::new(
+                                self.sessions.tabs[0] = Tab::new(
                                     rows,
                                     cols,
-                                    self.config.scrollback.lines,
+                                    self.config_state.config.scrollback.lines,
                                     &self.proxy,
                                     cwd_to_apply,
                                 );
-                                if let Some(t) = &mut self.tabs[0].terminal {
+                                if let Some(t) = &mut self.sessions.tabs[0].terminal {
                                     if let Some(r) = &self.renderer {
                                         t.set_palette(r.theme().palette);
                                     }
                                 }
                             }
-                            self.tabs[0].restore_from_snapshot(snap);
+                            self.sessions.tabs[0].restore_from_snapshot(snap);
                         } else {
                             let mut tab = Tab::new(
                                 rows,
                                 cols,
-                                self.config.scrollback.lines,
+                                self.config_state.config.scrollback.lines,
                                 &self.proxy,
                                 cwd_to_apply,
                             );
@@ -5731,14 +1242,14 @@ impl ApplicationHandler<AppEvent> for App {
                                     t.set_palette(r.theme().palette);
                                 }
                             }
-                            self.tabs.push(tab);
+                            self.sessions.tabs.push(tab);
                         }
                     }
                     // Clear saved tabs so a crash during the session doesn't
                     // re-restore stale state on the next launch — the periodic
                     // auto-save will re-persist the live state.
                     let _ = store.clear_tabs();
-                    self.active_tab = 0;
+                    self.sessions.active_tab = 0;
                     info!(restored = total, "tab snapshots restored");
                 }
                 Ok(_) => {
@@ -5752,7 +1263,7 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Open the workflow DB (best-effort) and seed built-in templates on
         // first launch.
-        self.workflow_store = weft_cache_dir().and_then(|cache| {
+        self.palette.store = weft_cache_dir().and_then(|cache| {
             let path = cache.join("workflows.db");
             match weft_core::workflow::WorkflowStore::open(&path) {
                 Ok(store) => {
@@ -5777,7 +1288,7 @@ impl ApplicationHandler<AppEvent> for App {
         // grid view, or window unfocused), the timer skips the wake, which
         // avoids pointless full redraws that caused idle flicker.
         let blink_proxy = self.proxy.clone();
-        let blink_flag = self.cursor_anim_active.clone();
+        let blink_flag = self.window_runtime.cursor_anim_active.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(530));
             if !blink_flag.load(Ordering::Relaxed) {
@@ -5843,10 +1354,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // rectangle. The editor box is an overlay, but title/tab
                 // chrome is outside that rectangle and must be subtracted.
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
+                    // Responsive geometry depends on the new viewport, so
+                    // update the renderer before asking for sidebar/chrome
+                    // metrics or terminal rows/cols.
+                    renderer.resize(window, physical_size);
                     // v0.9 W5: subtract sidebar width when the panel is open so
                     // the grid reflows beside the sidebar (mirrors grid_dims).
-                    let chrome_left = if self.panel_open {
-                        renderer.sidebar_width() as f64
+                    let chrome_left = if self.panel.open {
+                        renderer.sidebar_push_width() as f64
                     } else {
                         0.0
                     };
@@ -5854,15 +1369,12 @@ impl ApplicationHandler<AppEvent> for App {
                         dimensions_for_renderer(renderer, physical_size, chrome_left);
 
                     if new_cols > 0 && new_rows > 0 {
-                        // Update renderer viewport immediately
-                        renderer.resize(window, physical_size);
-
                         // Resize ALL tabs' grids immediately for smooth
                         // animation. The rewrap/dimension-only resize is fast
                         // (<1ms) so doing it on every intermediate event is
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
-                        for tab in &mut self.tabs {
+                        for tab in &mut self.sessions.tabs {
                             if let Some(terminal) = &mut tab.terminal {
                                 terminal.resize(new_rows, new_cols);
                             }
@@ -5870,7 +1382,7 @@ impl ApplicationHandler<AppEvent> for App {
                             tab.pending_pty_resize = Some((new_rows, new_cols));
                         }
                         info!(rows = new_rows, cols = new_cols, "all tabs resized (event)");
-                        self.last_resize_instant = std::time::Instant::now();
+                        self.window_runtime.last_resize_instant = std::time::Instant::now();
                         // v1.2-fix: re-clamp tab scroll offset after resize.
                         // The window may have grown/shrunk, changing max_scroll.
                         // Without this, a stale scroll_offset can leave tabs
@@ -5887,7 +1399,10 @@ impl ApplicationHandler<AppEvent> for App {
                 // then recompute Grid/PTY dimensions from the same geometry.
                 // Winit follows this event with Resized on macOS; doing the
                 // recompute here also covers a retained physical inner size.
-                let padding = (self.config.window.padding_x, self.config.window.padding_y);
+                let padding = (
+                    self.config_state.config.window.padding_x,
+                    self.config_state.config.window.padding_y,
+                );
                 let changed = self
                     .renderer
                     .as_mut()
@@ -5913,9 +1428,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // block view to the bottom so the user sees fresh content.
                 // (At prompt / idle, preserve the user's scroll position.)
                 if had_output {
-                    if let Some(t) = &self.tabs[self.active_tab].terminal {
+                    if let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal {
                         if t.block_tracker().phase() == ShellPhase::CommandExecuting {
-                            self.tabs[self.active_tab].block_scroll_offset = 0;
+                            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = 0;
                         }
                     }
                 }
@@ -5925,13 +1440,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // from the spawn size to the padded size) — recompute. Mode
                 // transitions no longer cause drift: the grid is always
                 // full-window and the input box is a non-resizing overlay.
-                let desired_rows = self.grid_dims().0;
-                let current_rows = self.tabs[self.active_tab]
+                let desired = self.grid_dims();
+                let current = self.sessions.tabs[self.sessions.active_tab]
                     .terminal
                     .as_ref()
-                    .map(|t| t.grid().num_rows)
-                    .unwrap_or(0);
-                if desired_rows != 0 && desired_rows != current_rows {
+                    .map(|t| (t.grid().num_rows, t.grid().num_cols))
+                    .unwrap_or((0, 0));
+                if desired.0 != 0 && desired.1 != 0 && desired != current {
                     self.recompute_layout();
                 }
 
@@ -5950,73 +1465,73 @@ impl ApplicationHandler<AppEvent> for App {
                 // settle-debounce (their grid is already correct; the SIGWINCH
                 // just syncs the shell, and can wait until activation).
                 let now = std::time::Instant::now();
-                let active_ready = now.duration_since(self.last_resize_instant)
+                let active_ready = now.duration_since(self.window_runtime.last_resize_instant)
                     > std::time::Duration::from_millis(30);
-                let cascade_settled =
-                    self.last_resize_instant.elapsed() > std::time::Duration::from_millis(100);
-                for (i, tab) in self.tabs.iter_mut().enumerate() {
-                    if let Some((rows, cols)) = tab.pending_pty_resize {
-                        // Active tab: flush on the 30ms throttle. Background
-                        // tabs: flush only after the cascade settles (100ms).
-                        let flush = if i == self.active_tab {
-                            active_ready
-                        } else {
-                            cascade_settled
-                        };
-                        if flush {
-                            if let Some(pty) = &tab.pty {
-                                if let Err(e) = pty.resize(rows as u16, cols as u16) {
-                                    warn!("PTY resize failed: {e}");
-                                }
-                            }
-                            tab.pending_pty_resize = None;
-                        }
-                    }
-                }
+                let cascade_settled = self.window_runtime.last_resize_instant.elapsed()
+                    > std::time::Duration::from_millis(100);
+                let pending: Vec<_> = self
+                    .sessions
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.pending_pty_resize)
+                    .collect();
+                let resize_effects = effect::pending_resize_effects(
+                    &pending,
+                    self.sessions.active_tab,
+                    active_ready,
+                    cascade_settled,
+                );
+                self.drain_effects(resize_effects);
 
                 // v0.9 H1: borrow the active Tab once and access its fields
                 // (terminal / ime_preedit / selection_handler / block_scroll_offset)
-                // as disjoint field borrows. Indexing `self.tabs[i]` repeatedly
+                // as disjoint field borrows. Indexing `self.sessions.tabs[i]` repeatedly
                 // would prevent Rust from splitting borrows across the
                 // `&tab.terminal` (immutable) and `&mut tab.selection_handler`
-                // (mutable) needed by `renderer.draw`. `self.tabs` and
+                // (mutable) needed by `renderer.draw`. `self.sessions.tabs` and
                 // `self.renderer` are disjoint fields of `App`, so both can be
                 // mutably borrowed at once.
-                let active = self.active_tab;
-                // Compute the tab bar state BEFORE borrowing `self.tabs`
-                // mutably below: `tab_bar_state()` reads `self.tabs[*]`
-                // labels and would conflict with `&mut self.tabs[active]`.
+                let active = self.sessions.active_tab;
+                // Compute the tab bar state BEFORE borrowing `self.sessions.tabs`
+                // mutably below: `tab_bar_state()` reads `self.sessions.tabs[*]`
+                // labels and would conflict with `&mut self.sessions.tabs[active]`.
                 // The returned `TabBarDrawState` is owned and lives for the
                 // whole draw call.
                 let tab_bar = self.tab_bar_state();
                 // v1.0 S1: compute Settings panel view data before the
                 // mutable `tab` borrow below — settings_theme_views() and
                 // settings_keybinding_views() borrow self immutably, which
-                // would conflict with &mut self.tabs[active].
+                // would conflict with &mut self.sessions.tabs[active].
                 let settings_themes = self.settings_theme_views();
                 let settings_keybindings = self.settings_keybinding_views();
-                let tab = &mut self.tabs[active];
+                let tab = &mut self.sessions.tabs[active];
                 // v1.0 P0-b: when the active tab changed since the last frame,
                 // the renderer's per-row grid cache is stale — force a full
                 // redraw before drawing.
-                let tab_changed = active != self.prev_drawn_tab;
+                let tab_changed = active != self.sessions.prev_drawn_tab;
                 if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
                     if tab_changed {
                         renderer.force_full_grid_redraw();
                     }
                     // Sync popup dimensions to renderer (user-adjustable via border drag).
-                    renderer.set_popup_size(self.popup_width_scale, self.popup_max_rows);
+                    renderer.set_popup_size(
+                        self.interaction.popup_width_scale,
+                        self.interaction.popup_max_rows,
+                    );
                     // Sync context menu target to renderer.
-                    renderer.context_menu_target =
-                        self.context_menu.as_ref().map(|m| (m.x, m.y, m.block_id));
+                    renderer.context_menu_target = self
+                        .interaction
+                        .context_menu
+                        .as_ref()
+                        .map(|m| (m.x, m.y, m.block_id));
 
                     // Build palette entries as (label, description, kind_label) tuples.
                     // v0.9 W2+: in SelectTheme sub-mode, project theme names
                     // (filtered from the full list) instead of the generic
                     // "Select Theme" builtin label.
                     let palette_entries: Vec<(String, String, &str)> =
-                        if matches!(self.palette_submode, PaletteSubMode::SelectTheme { .. }) {
-                            let (buffer, themes) = match &self.palette_submode {
+                        if matches!(self.palette.submode, PaletteSubMode::SelectTheme { .. }) {
+                            let (buffer, themes) = match &self.palette.submode {
                                 PaletteSubMode::SelectTheme { buffer, themes } => {
                                     (buffer.clone(), themes.clone())
                                 }
@@ -6029,7 +1544,8 @@ impl ApplicationHandler<AppEvent> for App {
                                 .map(|n| (n.clone(), String::new(), "Theme"))
                                 .collect()
                         } else {
-                            self.palette_results
+                            self.palette
+                                .results
                                 .iter()
                                 .map(|e| match e {
                                     PaletteEntry::Workflow(wf) => {
@@ -6043,7 +1559,7 @@ impl ApplicationHandler<AppEvent> for App {
                         };
 
                     // Compute palette banner + submode input from the sub-mode state.
-                    let (palette_banner, palette_submode_input) = match &self.palette_submode {
+                    let (palette_banner, palette_submode_input) = match &self.palette.submode {
                         PaletteSubMode::Search => (String::new(), String::new()),
                         PaletteSubMode::CreateWorkflow { step, buffer, .. } => {
                             let label = match step {
@@ -6070,36 +1586,36 @@ impl ApplicationHandler<AppEvent> for App {
                     let overlays = crate::overlay::build_overlay_stack(
                         terminal,
                         renderer.viewport_width(),
-                        renderer.scale(),
-                        self.panel_open,
-                        &self.panel_query,
-                        self.panel_selection,
-                        self.panel_expanded,
-                        self.panel_search_focused,
+                        renderer.sidebar_width(),
+                        self.panel.open,
+                        &self.panel.query,
+                        self.panel.selection,
+                        self.panel.expanded,
+                        self.panel.search_focused,
                         &tab.ime_preedit,
-                        self.palette_open,
-                        &self.palette_query,
-                        self.palette_selection,
+                        self.palette.open,
+                        &self.palette.query,
+                        self.palette.selection,
                         &palette_entries,
                         &palette_banner,
                         &palette_submode_input,
                         terminal.editor().buffer.selection_range(),
-                        self.settings_open,
-                        self.settings_tab,
-                        self.settings_selection,
-                        self.settings_scroll_offset,
-                        &self.settings_draft.theme.name,
+                        self.settings.open,
+                        self.settings.tab,
+                        self.settings.selection,
+                        self.settings.scroll_offset,
+                        &self.settings.draft.theme.name,
                         &settings_themes,
-                        &self.settings_draft.font.family,
-                        self.settings_draft.font.size,
-                        self.settings_draft.font.line_height,
-                        self.settings_draft.window.opacity,
-                        self.settings_draft.window.padding_x,
-                        self.settings_draft.window.padding_y,
-                        self.settings_draft.scrollback.lines,
+                        &self.settings.draft.font.family,
+                        self.settings.draft.font.size,
+                        self.settings.draft.font.line_height,
+                        self.settings.draft.window.opacity,
+                        self.settings.draft.window.padding_x,
+                        self.settings.draft.window.padding_y,
+                        self.settings.draft.scrollback.lines,
                         &settings_keybindings,
-                        self.settings_draft.logo.variant,
-                        self.settings_error.as_deref(),
+                        self.settings.draft.logo.variant,
+                        self.settings.error.as_deref(),
                     );
                     // v0.8 U6: compute block-content metrics for the dynamic
                     // scrollbar thumb (total/visible/max_scroll). None in grid
@@ -6121,65 +1637,67 @@ impl ApplicationHandler<AppEvent> for App {
                     // isn't in the grid).
                     // Compute find state values BEFORE the mutable borrow
                     // on `renderer` (renderer.find_state = ...).
-                    let find_state = if self.find_open {
-                        let grid_total = self.find_matches.len();
-                        let block_total = self.find_block_matches.len();
+                    let find_state = if self.find.open {
+                        let grid_total = self.find.matches.len();
+                        let block_total = self.find.block_matches.len();
                         let block_view = terminal.show_block_view();
                         let (total, current) = if block_view {
-                            (block_total, self.find_block_index + 1)
+                            (block_total, self.find.block_index + 1)
                         } else {
                             (
                                 grid_total,
                                 if grid_total == 0 {
                                     0
                                 } else {
-                                    self.find_index + 1
+                                    self.find.index + 1
                                 },
                             )
                         };
-                        let truncated = self.find_truncated || self.find_block_truncated;
+                        let truncated = self.find.truncated || self.find.block_truncated;
                         let highlight = if !block_view {
                             let grid = terminal.grid();
                             let sb_len = grid.scrollback_len();
                             let offset = grid.scroll_offset.min(sb_len);
                             let unified_base = sb_len - offset;
-                            self.find_matches
-                                .get(self.find_index)
+                            self.find
+                                .matches
+                                .get(self.find.index)
                                 .map(|m| (m.row.saturating_sub(unified_base), m.col, m.len))
                         } else {
                             None
                         };
                         let block_highlight = if block_view {
-                            self.find_block_matches
-                                .get(self.find_block_index)
+                            self.find
+                                .block_matches
+                                .get(self.find.block_index)
                                 .map(|m| (m.block_id.0, m.line, m.is_command, m.col, m.len))
                         } else {
                             None
                         };
                         Some(FindDrawState {
-                            query: self.find_query.clone(),
+                            query: self.find.query.clone(),
                             current,
                             total,
                             truncated,
                             highlight,
                             block_highlight,
                             block_matches: if block_view { 0 } else { block_total },
-                            regex_mode: self.find_regex_mode,
-                            case_sensitive: self.find_case_sensitive,
-                            regex_error: self.find_regex_error.clone(),
+                            regex_mode: self.find.regex_mode,
+                            case_sensitive: self.find.case_sensitive,
+                            regex_error: self.find.regex_error.clone(),
                         })
                     } else {
                         None
                     };
                     renderer.find_state = find_state;
                     // v0.9 W2: expire panel highlight after 1.5s.
-                    if let Some(until) = self.panel_highlight_until {
+                    if let Some(until) = self.panel.highlight_until {
                         if std::time::Instant::now() >= until {
-                            self.panel_highlight = None;
-                            self.panel_highlight_until = None;
+                            self.panel.highlight = None;
+                            self.panel.highlight_until = None;
                         }
                     }
-                    renderer.panel_highlight = self.panel_highlight;
+                    renderer.panel_highlight = self.panel.highlight;
                     // Pause cursor blink while the user is actively selecting
                     // OR while a selection is visible (not yet cleared). A
                     // moving or persistent selection is the focus of attention;
@@ -6188,12 +1706,12 @@ impl ApplicationHandler<AppEvent> for App {
                     let has_selection = tab.selection_handler.selecting
                         || tab.selection_handler.block_view_selection.is_some()
                         || tab.selection_handler.selection.is_some();
-                    let blink_on = self.cursor_blink_on && !has_selection;
+                    let blink_on = self.window_runtime.cursor_blink_on && !has_selection;
                     renderer.draw(
                         terminal,
                         &mut tab.selection_handler,
                         blink_on,
-                        self.cursor_blink_phase,
+                        self.window_runtime.cursor_blink_phase,
                         &overlays,
                         tab.block_scroll_offset,
                         scroll_metrics,
@@ -6210,7 +1728,8 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         terminal.cursor_visible
                     };
-                    self.cursor_anim_active
+                    self.window_runtime
+                        .cursor_anim_active
                         .store(anim_active, Ordering::Relaxed);
                 }
 
@@ -6218,7 +1737,7 @@ impl ApplicationHandler<AppEvent> for App {
                 // the renderer has consumed them. The next frame will mark
                 // rows dirty only if new PTY output / cursor movement changes
                 // them, enabling incremental rendering.
-                self.prev_drawn_tab = active;
+                self.sessions.prev_drawn_tab = active;
                 if let Some(t) = &mut tab.terminal {
                     t.grid_mut().clear_all_dirty();
                 }
@@ -6234,141 +1753,162 @@ impl ApplicationHandler<AppEvent> for App {
                         // `event.text` already reflects Shift (and the keymap),
                         // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
                         // so typed commands keep their case / shifted symbols.
-                        self.handle_key_event(key_code, self.mods, event.text.as_deref());
+                        self.handle_key_event(
+                            key_code,
+                            self.interaction.mods,
+                            event.text.as_deref(),
+                        );
                     }
                 }
             }
             WindowEvent::ModifiersChanged(new_mods) => {
-                self.mods = new_mods;
+                self.interaction.mods = new_mods;
             }
             WindowEvent::MouseInput { state, button, .. } => match state {
                 winit::event::ElementState::Pressed => {
-                    self.handle_mouse_press(self.last_mouse_x, self.last_mouse_y, button);
+                    self.handle_mouse_press(
+                        self.interaction.last_mouse_x,
+                        self.interaction.last_mouse_y,
+                        button,
+                    );
                 }
                 winit::event::ElementState::Released => {
-                    self.handle_mouse_release(self.last_mouse_x, self.last_mouse_y, button);
+                    self.handle_mouse_release(
+                        self.interaction.last_mouse_x,
+                        self.interaction.last_mouse_y,
+                        button,
+                    );
                 }
             },
             WindowEvent::CursorMoved { position, .. } => {
-                self.last_mouse_x = position.x;
-                self.last_mouse_y = position.y;
+                self.interaction.last_mouse_x = position.x;
+                self.interaction.last_mouse_y = position.y;
                 self.handle_mouse_move(position.x, position.y);
             }
             WindowEvent::CursorLeft { .. } => {
-                if self.hovered_tab.is_some()
-                    || self.plus_hovered
-                    || self.arrow_left_hovered
-                    || self.arrow_right_hovered
+                if self.tab_bar.hovered_tab.is_some()
+                    || self.tab_bar.plus_hovered
+                    || self.tab_bar.arrow_left_hovered
+                    || self.tab_bar.arrow_right_hovered
                 {
-                    self.hovered_tab = None;
-                    self.plus_hovered = false;
-                    self.arrow_left_hovered = false;
-                    self.arrow_right_hovered = false;
+                    self.tab_bar.clear_hover();
                     self.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                self.handle_scroll(delta, self.last_mouse_x, self.last_mouse_y);
+                self.handle_scroll(
+                    delta,
+                    self.interaction.last_mouse_x,
+                    self.interaction.last_mouse_y,
+                );
             }
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
                     winit::event::Ime::Enabled => {}
                     winit::event::Ime::Preedit(text, _cursor) => {
-                        // v0.9 fix: when a modal input (find/palette/panel) is
-                        // active, suppress the terminal preedit so the IME
-                        // composition doesn't render in the prompt editor.
-                        if self.find_open || self.palette_open || self.panel_search_focused {
-                            self.tabs[self.active_tab].ime_preedit.clear();
+                        // Keyboard, preedit and commit must agree on the same
+                        // focus owner. Any overlay suppresses terminal preedit;
+                        // Settings intentionally has no text target yet.
+                        if self.overlay_input_owner().is_some() {
+                            self.sessions.tabs[self.sessions.active_tab]
+                                .ime_preedit
+                                .clear();
                         } else {
-                            self.tabs[self.active_tab].ime_preedit = text;
+                            self.sessions.tabs[self.sessions.active_tab].ime_preedit = text;
                         }
                     }
                     winit::event::Ime::Commit(text) => {
-                        self.tabs[self.active_tab].ime_preedit.clear();
+                        self.sessions.tabs[self.sessions.active_tab]
+                            .ime_preedit
+                            .clear();
                         if !text.is_empty() {
                             tracing::debug!(
-                                tab = self.active_tab,
+                                tab = self.sessions.active_tab,
                                 len = text.len(),
                                 "routing fresh IME commit"
                             );
-                            // v0.9 fix: when the Find bar is open, IME
-                            // committed text goes into the find query, not
-                            // the shell editor / PTY. This lets CJK users
-                            // search with Chinese input.
-                            if self.find_open {
-                                self.find_query.push_str(&text);
-                                self.find_last_key = Some(std::time::Instant::now());
-                                self.request_redraw();
-                            } else if self.palette_open {
-                                // v0.9 fix: route IME commit to the command
-                                // palette query so CJK input works there too.
-                                self.palette_query.push_str(&text);
-                                self.palette_selection = 0;
-                                self.refresh_palette_results();
-                                self.request_redraw();
-                            } else if self.panel_open && self.panel_search_focused {
-                                // v0.9 fix: route IME commit to the panel
-                                // (sidebar) search box when it's focused.
-                                self.panel_query.push_str(&text);
-                                self.clamp_panel_selection();
-                                self.request_redraw();
-                            } else {
-                                let mode = self.tabs[self.active_tab]
-                                    .terminal
-                                    .as_ref()
-                                    .map(|t| t.effective_input_mode())
-                                    .unwrap_or(weft_core::input::InputMode::Passthrough);
-                                if mode == weft_core::input::InputMode::Editor {
-                                    // Editor takeover: composed text goes into the box.
-                                    if let Some(t) = self.tabs[self.active_tab].terminal.as_mut() {
-                                        for c in text.chars() {
-                                            t.editor_mut().buffer.insert_char(c);
-                                        }
-                                        // v0.9: IME input clears the editor
-                                        // selection (typing replaces it).
-                                        t.editor_mut().buffer.clear_selection();
-                                    }
-                                    self.prompt_dragging = false;
+                            match self.overlay_input_owner() {
+                                Some(OverlayInputOwner::Palette) => {
+                                    self.palette.query.push_str(&text);
+                                    self.palette.selection = 0;
+                                    self.refresh_palette_results();
                                     self.request_redraw();
-                                } else {
-                                    // Passthrough: send committed text to the PTY.
-                                    //
-                                    // v1.0 fix: send the text as RAW BYTES, not
-                                    // via `encode_paste`. A typed/IME-committed
-                                    // character is keyboard INPUT, not a paste —
-                                    // wrapping it in bracketed-paste escapes
-                                    // (`\x1b[200~ … \x1b[201~`) corrupts
-                                    // alt-screen apps like `less`/`vim` which
-                                    // don't understand bracketed paste: the
-                                    // leading `\x1b[` is an unknown CSI to them,
-                                    // so a typed `/` (intended to start a
-                                    // search) put `less` into a confused state
-                                    // and the window appeared frozen until a
-                                    // resize forced a repaint. Real pastes
-                                    // (Cmd+V → `paste_from_clipboard`) still use
-                                    // `encode_paste` with bracketed wrapping.
-                                    // (bracketed_paste is a shell-prompt mode;
-                                    // it stays on inside alt-screen apps
-                                    // because `swap_alt` doesn't save/restore
-                                    // it, so we must not consult it here.)
-                                    let bytes = text.as_bytes();
-                                    if !bytes.is_empty() {
-                                        if let Some(pty) = &self.tabs[self.active_tab].pty {
-                                            let _ = pty.write_sync(bytes);
+                                }
+                                Some(OverlayInputOwner::Settings) => {
+                                    // Settings currently has no free-text field.
+                                    // Consume the commit so it cannot leak into
+                                    // a covered prompt or passthrough PTY.
+                                    tracing::debug!(
+                                        len = text.len(),
+                                        "IME commit consumed by settings"
+                                    );
+                                    self.request_redraw();
+                                }
+                                Some(OverlayInputOwner::Find) => {
+                                    self.find.query.push_str(&text);
+                                    self.find.last_key = Some(std::time::Instant::now());
+                                    self.request_redraw();
+                                }
+                                Some(OverlayInputOwner::PanelSearch) => {
+                                    self.panel.query.push_str(&text);
+                                    self.clamp_panel_selection();
+                                    self.request_redraw();
+                                }
+                                None => {
+                                    let mode = self.sessions.tabs[self.sessions.active_tab]
+                                        .terminal
+                                        .as_ref()
+                                        .map(|t| t.effective_input_mode())
+                                        .unwrap_or(weft_core::input::InputMode::Passthrough);
+                                    if mode == weft_core::input::InputMode::Editor {
+                                        // Editor takeover: composed text goes into the box.
+                                        if let Some(t) = self.sessions.tabs
+                                            [self.sessions.active_tab]
+                                            .terminal
+                                            .as_mut()
+                                        {
+                                            for c in text.chars() {
+                                                t.editor_mut().buffer.insert_char(c);
+                                            }
+                                            // v0.9: IME input clears the editor
+                                            // selection (typing replaces it).
+                                            t.editor_mut().buffer.clear_selection();
                                         }
-                                        // Match the other branches (and the
-                                        // keyboard path) so the window is
-                                        // invalidated even if the app's echoed
-                                        // output Wake is delayed by the IME
-                                        // commit transaction.
+                                        self.interaction.prompt_dragging = false;
                                         self.request_redraw();
+                                    } else {
+                                        // Passthrough: send committed text to the PTY.
+                                        //
+                                        // v1.0 fix: send the text as RAW BYTES, not
+                                        // via `encode_paste`. A typed/IME-committed
+                                        // character is keyboard INPUT, not a paste —
+                                        // wrapping it in bracketed-paste escapes
+                                        // (`\x1b[200~ … \x1b[201~`) corrupts
+                                        // alt-screen apps like `less`/`vim` which
+                                        // don't understand bracketed paste: the
+                                        // leading `\x1b[` is an unknown CSI to them,
+                                        // so a typed `/` (intended to start a
+                                        // search) put `less` into a confused state
+                                        // and the window appeared frozen until a
+                                        // resize forced a repaint. Real pastes
+                                        // (Cmd+V → `paste_from_clipboard`) still use
+                                        // `encode_paste` with bracketed wrapping.
+                                        // (bracketed_paste is a shell-prompt mode;
+                                        // it stays on inside alt-screen apps
+                                        // because `swap_alt` doesn't save/restore
+                                        // it, so we must not consult it here.)
+                                        let effects = effect::ime_commit_effects(
+                                            self.sessions.active_tab,
+                                            &text,
+                                        );
+                                        self.drain_effects(effects);
                                     }
                                 }
                             }
                         }
                     }
                     winit::event::Ime::Disabled => {
-                        for tab in &mut self.tabs {
+                        for tab in &mut self.sessions.tabs {
                             tab.ime_preedit.clear();
                         }
                     }
@@ -6377,8 +1917,8 @@ impl ApplicationHandler<AppEvent> for App {
             WindowEvent::Focused(focused) => {
                 // Reset blink timer on focus change
                 if focused {
-                    self.cursor_blink_on = true;
-                    self.cursor_blink_time = std::time::Instant::now();
+                    self.window_runtime.cursor_blink_on = true;
+                    self.window_runtime.cursor_blink_time = std::time::Instant::now();
                 } else {
                     self.reset_ime_context("window focus lost");
                 }
@@ -6401,7 +1941,8 @@ impl ApplicationHandler<AppEvent> for App {
     /// (within 100ms of the last `Resized`), we ensure the content is
     /// re-rendered on every intermediate size during live resize.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.last_resize_instant.elapsed() < std::time::Duration::from_millis(100) {
+        if self.window_runtime.last_resize_instant.elapsed() < std::time::Duration::from_millis(100)
+        {
             self.request_redraw();
         }
     }
@@ -7152,61 +2693,6 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), actions.len(), "duplicate action strings");
-    }
-
-    #[test]
-    fn context_menu_hit_first_item() {
-        // menu at (100, 200), cell_height 16 → top_inset 3.2, item_h 19.2.
-        // Item 0 spans y ∈ [203.2, 222.4).
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 210.0),
-            Some(0)
-        );
-    }
-
-    #[test]
-    fn context_menu_hit_second_item() {
-        // Item 1 spans y ∈ [222.4, 241.6).
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 230.0),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn context_menu_hit_last_item() {
-        // Item 3 spans y ∈ [260.8, 280.0).
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 270.0),
-            Some(3)
-        );
-    }
-
-    #[test]
-    fn context_menu_miss_below_last_item() {
-        // Below all items → None.
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 300.0),
-            None
-        );
-    }
-
-    #[test]
-    fn context_menu_miss_left_of_menu() {
-        // click_x < menu_x → None even when y is on item 0.
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 50.0, 210.0),
-            None
-        );
-    }
-
-    #[test]
-    fn context_menu_hit_boundary_top_inset() {
-        // Above top_inset (y < 203.2) → None.
-        assert_eq!(
-            context_menu_hit_index(100.0, 200.0, 16.0, 150.0, 202.0),
-            None
-        );
     }
 
     // ── config mtime hot-reload: external file change is picked up ──

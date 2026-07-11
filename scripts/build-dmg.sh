@@ -1,7 +1,7 @@
 #!/bin/bash
 # scripts/build-dmg.sh
 #
-# v1.0: Build a distributable Weft.dmg disk image with drag-to-Applications
+# v1.2: Build a distributable Weft.dmg disk image with drag-to-Applications
 # layout. Runs scripts/build-app.sh first to ensure Weft.app is up to date.
 #
 # Usage: ./scripts/build-dmg.sh
@@ -14,7 +14,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
-VERSION="1.0.0"
+VERSION="1.2.0"
 RELEASE_DIR="target/release"
 OSX_DIR="${RELEASE_DIR}/osx"
 APP_DIR="${OSX_DIR}/${APP_NAME}.app"
