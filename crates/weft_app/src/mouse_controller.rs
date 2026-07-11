@@ -177,34 +177,43 @@ impl App {
     pub(super) fn check_popup_border_drag(&self, x: f64, y: f64) -> Option<DragState> {
         let renderer = self.renderer.as_ref()?;
         let (cw, ch) = (renderer.cell_width() as f32, renderer.cell_height() as f32);
-        let hot_zone = 8.0; // px from the border (wider for usability)
-
-        // Gather all active popup rects (completion + palette).
-        let mut rects: Vec<[f32; 4]> = Vec::new();
-        if let Some(r) = renderer.completion_popup_rect {
-            rects.push(r);
+        // Completion geometry is derived from the current editor state and
+        // shared Scene, rather than a rectangle retained by the last frame.
+        if let Some(scene) = self.completion_scene() {
+            match crate::completion_component::completion_target_at(&scene, x as f32, y as f32) {
+                Some(crate::completion_component::CompletionTarget::ResizeWidth) => {
+                    return Some(DragState {
+                        target: DragTarget::Right,
+                        start_x: x,
+                        start_y: y,
+                        start_scale: self.interaction.popup_width_scale,
+                        start_rows: self.interaction.popup_max_rows,
+                        cell_w: cw,
+                        cell_h: ch,
+                    });
+                }
+                Some(crate::completion_component::CompletionTarget::ResizeHeight) => {
+                    return Some(DragState {
+                        target: DragTarget::Top,
+                        start_x: x,
+                        start_y: y,
+                        start_scale: self.interaction.popup_width_scale,
+                        start_rows: self.interaction.popup_max_rows,
+                        cell_w: cw,
+                        cell_h: ch,
+                    });
+                }
+                _ => {}
+            }
         }
-        if let Some(r) = renderer.palette_popup_rect {
-            rects.push(r);
-        }
 
-        let xf = x as f32;
-        let yf = y as f32;
-
-        for &[rx0, ry0, rx1, ry1] in &rects {
-            // Right border: x near rx1, y within [ry0, ry1].
-            let on_right = (xf - rx1).abs() < hot_zone && yf >= ry0 && yf <= ry1;
-            // Top border: y near ry0, x within [rx0, rx1].
-            let on_top = (yf - ry0).abs() < hot_zone && xf >= rx0 && xf <= rx1;
-
-            let target = if on_right {
-                DragTarget::Right
-            } else if on_top {
-                DragTarget::Top
-            } else {
-                continue;
-            };
-
+        if let Some(scene) = self.palette_scene() {
+            let target =
+                match crate::palette_component::palette_target_at(&scene, x as f32, y as f32) {
+                    Some(crate::palette_component::PaletteTarget::ResizeWidth) => DragTarget::Right,
+                    Some(crate::palette_component::PaletteTarget::ResizeHeight) => DragTarget::Top,
+                    _ => return None,
+                };
             return Some(DragState {
                 target,
                 start_x: x,
@@ -215,7 +224,6 @@ impl App {
                 cell_h: ch,
             });
         }
-
         None
     }
 

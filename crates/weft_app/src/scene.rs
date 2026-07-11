@@ -18,6 +18,7 @@ pub(crate) struct ClipId(pub(crate) usize);
 pub(crate) enum FocusId {
     Tab(usize),
     FindQuery,
+    Completion,
     PaletteQuery,
     Settings,
     SidebarSearch,

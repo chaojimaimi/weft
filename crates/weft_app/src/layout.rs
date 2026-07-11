@@ -9,8 +9,7 @@
 //! See `docs/v0.8_PLAN.md` §4.1 (stage 1 — layout infrastructure).
 
 /// Axis-aligned rectangle in physical pixels: `[x0, y0, x1, y1]`.
-/// Matches the existing `[f32; 4]` convention used by `completion_popup_rect`
-/// and `palette_popup_rect` in `MetalRenderer`.
+/// Shared by renderer, Scene components and pointer hit testing.
 pub type Rect = [f32; 4];
 
 /// Layout context: the single source of truth for coordinate math in every
@@ -645,6 +644,79 @@ impl ContextMenuLayout {
     }
 }
 
+// ── Find utility bar ──────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FindLayout {
+    pub popup_rect: Rect,
+    pub line_y: f32,
+    pub text_x0: f32,
+    pub text_x1: f32,
+    pub regex_x: f32,
+    pub case_x: f32,
+    pub down_x: f32,
+    pub up_x: f32,
+    pub regex_rect: Rect,
+    pub case_rect: Rect,
+    pub down_rect: Option<Rect>,
+    pub up_rect: Option<Rect>,
+}
+
+pub fn layout_find(ctx: &LayoutCtx, total_matches: usize) -> FindLayout {
+    let cw = ctx.cell_w;
+    let ch = ctx.cell_h;
+    let target_w = 500.0_f32;
+    let right_margin = 20.0;
+    let min_w = cw * 48.0;
+    let popup_w = target_w.min(ctx.width() - right_margin - 20.0).max(min_w);
+    let popup_h = (ch * 1.75).max(ch + 16.0);
+    let popup_x1 = ctx.right() - right_margin;
+    let popup_x0 = popup_x1 - popup_w;
+    let popup_y0 = ctx.top() + 10.0;
+    let popup_y1 = popup_y0 + popup_h;
+
+    let border_w = 1.0;
+    let stripe_w = 3.0;
+    let inner_pad_x = 8.0;
+    let text_x0 = popup_x0 + border_w + stripe_w + inner_pad_x;
+    let text_x1 = popup_x1 - border_w - inner_pad_x;
+    let line_y = popup_y0 + border_w + ((popup_h - border_w * 2.0 - ch) * 0.5).max(0.0);
+    let click_pad = 2.0;
+    let gap_w = cw;
+
+    let text_width = |text: &str| unicode_width::UnicodeWidthStr::width_cjk(text) as f32 * cw;
+    let regex_w = text_width(".*");
+    let case_w = text_width("Aa");
+    let down_w = text_width("↓");
+    let up_w = text_width("↑");
+    let regex_x = text_x1 - regex_w;
+    let case_x = regex_x - gap_w - case_w;
+    let down_x = case_x - gap_w - down_w;
+    let up_x = down_x - gap_w - up_w;
+    let button_rect = |x: f32, width: f32| {
+        [
+            x - click_pad,
+            line_y - click_pad,
+            x + width + click_pad,
+            line_y + ch + click_pad,
+        ]
+    };
+    FindLayout {
+        popup_rect: [popup_x0, popup_y0, popup_x1, popup_y1],
+        line_y,
+        text_x0,
+        text_x1,
+        regex_x,
+        case_x,
+        down_x,
+        up_x,
+        regex_rect: button_rect(regex_x, regex_w),
+        case_rect: button_rect(case_x, case_w),
+        down_rect: (total_matches > 0).then(|| button_rect(down_x, down_w)),
+        up_rect: (total_matches > 0).then(|| button_rect(up_x, up_w)),
+    }
+}
+
 // ── Prompt (editor input box) ─────────────────────────────────────────
 //
 // The input box sits at the bottom of the viewport. Its height grows with
@@ -1243,6 +1315,18 @@ mod tests {
         assert_eq!(layout.item_at(900.0, 670.0), Some(3));
         assert_eq!(layout.item_at(700.0, 610.0), None);
         assert_eq!(layout.item_at(900.0, 690.0), None);
+    }
+
+    #[test]
+    fn find_layout_preserves_popup_and_button_geometry() {
+        let ctx = LayoutCtx::new((1000.0, 700.0), 9.0, 20.0, 8.0, 8.0);
+        let layout = layout_find(&ctx, 3);
+        assert_eq!(layout.popup_rect, [472.0, 18.0, 972.0, 54.0]);
+        assert_eq!(layout.line_y, 26.0);
+        assert_eq!(layout.regex_rect, [943.0, 24.0, 965.0, 48.0]);
+        assert_eq!(layout.case_rect, [916.0, 24.0, 938.0, 48.0]);
+        assert_eq!(layout.down_rect, Some([889.0, 24.0, 911.0, 48.0]));
+        assert_eq!(layout.up_rect, Some([862.0, 24.0, 884.0, 48.0]));
     }
 
     /// Click near right edge: menu clamps left so its right edge stays

@@ -214,10 +214,6 @@ pub struct MetalRenderer {
     popup_max_rows: usize,
     /// Context menu position + target block (F7). Set per-frame by the app.
     pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>)>,
-    /// Last-rendered popup rectangles (completion + palette), for border
-    /// drag-resize hot-zone detection. None when the popup wasn't drawn.
-    pub completion_popup_rect: Option<[f32; 4]>, // [x0, y0, x1, y1]
-    pub palette_popup_rect: Option<[f32; 4]>,
     /// v1.0 S1: Last-rendered Settings panel rect (physical pixels).
     /// `None` when the panel wasn't drawn this frame.
     pub settings_popup_rect: Option<[f32; 4]>,
@@ -235,11 +231,6 @@ pub struct MetalRenderer {
     /// `None` when the find bar is closed. The renderer reads this to draw the
     /// top banner + highlight the current match.
     pub find_state: Option<FindDrawState>,
-    /// Last-rendered find popup button hit-test rects (physical pixels).
-    /// `None` when the find popup wasn't drawn this frame. Populated by
-    /// `build_find_vertices` each draw; the app reads it from
-    /// `handle_mouse_press` to route clicks on the up/down/case/regex buttons.
-    pub find_buttons: Option<FindButtons>,
     /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
     /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
     /// each draw when `tab_bar.tab_counts > 1`; cleared otherwise. The app
@@ -433,22 +424,6 @@ pub enum SettingsHitKind {
     /// Footer "⏎ apply" pair — click persists the draft but keeps the panel
     /// open so the user can keep editing.
     ApplyButton,
-}
-
-/// Hit-test rectangles for the find popup's clickable buttons (physical
-/// pixels). Each `[x0, y0, x1, y1]` rect is the full clickable area of that
-/// button, including padding around the glyph. Set per-frame by the renderer
-/// in `build_find_vertices`; consumed by the app's mouse handler.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FindButtons {
-    /// Up arrow (previous match). `None` when there are no matches to cycle.
-    pub up: Option<[f32; 4]>,
-    /// Down arrow (next match). `None` when there are no matches to cycle.
-    pub down: Option<[f32; 4]>,
-    /// "Aa" case-sensitive toggle.
-    pub case_sensitive: [f32; 4],
-    /// ".*" regex mode toggle.
-    pub regex: [f32; 4],
 }
 
 /// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
@@ -761,13 +736,10 @@ fragment float4 text_fragment(
             popup_width_scale: 0.6,
             popup_max_rows: 8,
             context_menu_target: None,
-            completion_popup_rect: None,
-            palette_popup_rect: None,
             settings_popup_rect: None,
             block_view_rows: Vec::new(),
             layout_ctx: None,
             find_state: None,
-            find_buttons: None,
             tab_hits: Vec::new(),
             new_tab_rect: [0.0; 4],
             settings_hits: Vec::new(),
@@ -1350,12 +1322,8 @@ fragment float4 text_fragment(
         }
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
-        // Reset popup rects — will be set by build_completion/palette/settings_vertices.
-        self.completion_popup_rect = None;
-        self.palette_popup_rect = None;
+        // Reset popup rects — settings still uses renderer-owned hit data.
         self.settings_popup_rect = None;
-        // Reset find button hit-test rects — set by build_find_vertices.
-        self.find_buttons = None;
         // v1.0 S1-b: clear stale settings hit-test rects — repopulated by
         // build_settings_vertices only when the panel is open this frame.
         self.settings_hits.clear();
@@ -1501,38 +1469,28 @@ fragment float4 text_fragment(
         // Positioned above the prompt input box using the same geometry.
         if let Some((matches, selected)) = completions {
             if !matches.is_empty() {
-                // Recompute box_top_y (same formula as build_prompt_vertices).
-                let ch_f = self.cell_height() as f32;
-                let vp_h = self.viewport.1;
                 let n_lines = prompt.map(|p| p.lines.len().max(1)).unwrap_or(1);
-                let box_h = ch_f * (n_lines as f32 + 2.0);
-                let box_top_y = (vp_h - self.padding_y - box_h).max(0.0);
-                // Anchor popup left edge to the cursor's x position (Warp-style),
-                // not the window left padding. The prompt glyph "❯ " takes 2
-                // columns on line 0; subsequent lines start at the left edge.
-                let cw_f = self.cell_width() as f32;
-                // v0.9 W5: align the completion popup with the shifted prompt
-                // (padding_x + chrome_left) so it tracks the sidebar offset.
-                let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-                let prompt_cols = prompt
-                    .map(|p| {
-                        let prompt_indent = if p.cursor.0 == 0 { 2 } else { 0 };
-                        (prompt_indent + p.cursor.1) as f32 * cw_f + self.padding_x + chrome_left
-                    })
-                    .unwrap_or(self.padding_x + chrome_left);
-                let box_x0 = prompt_cols;
-                let (cv, rect) =
-                    self.build_completion_vertices(matches, selected, box_top_y, box_x0);
-                self.completion_popup_rect = rect;
-                vertices.extend_from_slice(&cv);
+                let cursor = prompt.map(|p| p.cursor).unwrap_or((0, 0));
+                let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+                if let Some(layout) = crate::completion_component::derive_completion_layout(
+                    &ctx,
+                    matches,
+                    selected,
+                    n_lines,
+                    cursor,
+                    self.popup_max_rows,
+                    self.popup_width_scale,
+                ) {
+                    vertices.extend_from_slice(
+                        &self.build_completion_vertices(matches, selected, layout),
+                    );
+                }
             }
         }
 
         // Command Palette overlay (v0.7) — centered floating window.
         if let Some(p) = palette {
-            let (pv, rect) = self.build_palette_vertices(p);
-            self.palette_popup_rect = rect;
-            vertices.extend_from_slice(&pv);
+            vertices.extend_from_slice(&self.build_palette_vertices(p));
         }
 
         // v1.0 S1: Settings panel (Cmd+,) — centered modal overlay.
@@ -1551,11 +1509,8 @@ fragment float4 text_fragment(
         // FindInGrid bar (v0.8 B3) — top banner with query + match count,
         // plus a yellow translucent highlight on the current match. Drawn
         // last so it composites above all other overlays.
-        let mut find_btns: Option<FindButtons> = None;
         if let Some(find) = &self.find_state.clone() {
-            let (find_verts, btns) = self.build_find_vertices(find);
-            vertices.extend_from_slice(&find_verts);
-            find_btns = Some(btns);
+            vertices.extend_from_slice(&self.build_find_vertices(find));
         }
 
         // v0.9 H1: Tab bar — drawn at the top of the window. The content
@@ -1652,7 +1607,6 @@ fragment float4 text_fragment(
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
             self.hit_regions = pending_hit_regions;
-            self.find_buttons = find_btns;
             return;
         }
 
@@ -1989,9 +1943,6 @@ fragment float4 text_fragment(
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
         self.hit_regions = pending_hit_regions;
-        // Store the find popup's button hit-test rects (computed during
-        // build_find_vertices) now that the drawable borrow has ended.
-        self.find_buttons = find_btns;
     }
 
     /// v1.0 P1.5-B1: Build per-cell instance data for the grid. Each cell
@@ -2929,21 +2880,15 @@ fragment float4 text_fragment(
     /// Build the Tab-completion dropdown as a floating popup above the prompt
     /// z-order (Completion) and hit-test regions.
     ///
-    /// `anchor_y` is the prompt box's top edge (`box_y0`) — the popup sits
-    /// directly above it. This was previously computed inside
-    /// `build_prompt_vertices` as `popup_bottom = box_y0`.
-    /// Returns (vertices, popup_rect) where popup_rect is the bounding box
-    /// for border drag-resize hot-zone detection.
     fn build_completion_vertices(
         &self,
         matches: &[weft_core::complete::Match],
         selected: usize,
-        anchor_y: f32,
-        box_x0: f32,
-    ) -> (Vec<f32>, Option<[f32; 4]>) {
+        layout: crate::layout::CompletionLayout,
+    ) -> Vec<f32> {
         let mut verts = Vec::new();
         if matches.is_empty() {
-            return (verts, None);
+            return verts;
         }
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
@@ -2966,33 +2911,6 @@ fragment float4 text_fragment(
             fg[2] * 0.50 + theme_bg[2] * 0.50,
             1.0,
         ];
-
-        // v0.8 stage 4: layout (window + popup rect + column anchors) is
-        // computed by the pure functions in `layout.rs`, so it can be unit-
-        // tested without the GPU. The renderer keeps responsibility for
-        // vertex building, theming, and text rasterization.
-        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let (start, end, _shown) = crate::layout::completion_window(
-            anchor_y,
-            ch,
-            self.popup_max_rows,
-            selected,
-            matches.len(),
-        );
-        let max_label_cols = matches[start..end]
-            .iter()
-            .map(|m| Self::text_col_width(&m.label))
-            .max()
-            .unwrap_or(10);
-        let layout = crate::layout::layout_completion(
-            &ctx,
-            start,
-            end,
-            max_label_cols,
-            anchor_y,
-            box_x0,
-            self.popup_width_scale,
-        );
 
         let [popup_x0, popup_top, popup_x1, popup_bottom] = layout.popup_rect;
         let icon_x = layout.icon_x;
@@ -3091,26 +3009,20 @@ fragment float4 text_fragment(
             y -= ch;
         }
 
-        // Return the popup rect for border drag-resize hot-zone detection.
-        let popup_rect = Some(layout.popup_rect);
-
-        (verts, popup_rect)
+        verts
     }
 
     /// Build the Command Palette as a centered floating window. Renders a
     /// search box at the top, a scrollable results list, and an optional
     /// variable-fill form when a workflow is selected.
-    fn build_palette_vertices(
-        &self,
-        p: &crate::overlay::PaletteDrawParams<'_>,
-    ) -> (Vec<f32>, Option<[f32; 4]>) {
+    fn build_palette_vertices(&self, p: &crate::overlay::PaletteDrawParams<'_>) -> Vec<f32> {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (verts, None);
+            return verts;
         }
 
         let theme_bg = color_to_normalized(self.theme.background);
@@ -3151,24 +3063,26 @@ fragment float4 text_fragment(
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
 
         // If we're in form mode, render the form instead of the search list.
-        if let Some(form) = p.form {
-            let rect = crate::layout::layout_palette_form_rect(
-                &ctx,
-                form.fields.len(),
-                self.popup_width_scale,
-            );
-            let v = self.build_palette_form_vertices(form, rect[0], rect[2], vp_h);
-            return (v, Some(rect));
-        }
-
-        // Search mode: query box + results list.
-        let layout = crate::layout::layout_palette_search(
+        let palette_layout = crate::palette_component::derive_palette_layout(
             &ctx,
             p.entries.len(),
             p.selection,
+            p.form.map(|form| form.fields.len()),
             self.popup_max_rows,
             self.popup_width_scale,
         );
+        if let Some(form) = p.form {
+            let crate::palette_component::PaletteLayout::Form(rect) = palette_layout else {
+                unreachable!("form input always derives form layout")
+            };
+            let v = self.build_palette_form_vertices(form, rect[0], rect[2], vp_h);
+            return v;
+        }
+
+        // Search mode: query box + results list.
+        let crate::palette_component::PaletteLayout::Search(layout) = palette_layout else {
+            unreachable!("search input always derives search layout")
+        };
         let [popup_x0, popup_top, popup_x1, popup_bottom] = layout.popup_rect;
         let query_y = layout.query_y;
         let query_x = layout.query_x;
@@ -3313,8 +3227,7 @@ fragment float4 text_fragment(
             y += ch;
         }
 
-        // Return the popup rect for border drag-resize hot-zone detection.
-        (verts, Some(layout.popup_rect))
+        verts
     }
 
     /// Render the palette's variable-fill form (sub-mode when a workflow is selected).
@@ -5195,13 +5108,14 @@ fragment float4 text_fragment(
     /// Drawing uses the same fg/bg vertex pipeline as the rest of the
     /// renderer: text is sampled from the glyph atlas, card surfaces are
     /// bg-only quads sampling the space glyph (mask 0 → solid bg color).
-    fn build_find_vertices(&self, find: &FindDrawState) -> (Vec<f32>, FindButtons) {
+    fn build_find_vertices(&self, find: &FindDrawState) -> Vec<f32> {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let ctx = match &self.layout_ctx {
             Some(c) => *c,
-            None => return (Vec::new(), FindButtons::default()),
+            None => return Vec::new(),
         };
+        let layout = crate::layout::layout_find(&ctx, find.total);
 
         let mut verts = Vec::new();
         let (su, sv, suw, svh) = self.space_uv();
@@ -5211,16 +5125,7 @@ fragment float4 text_fragment(
         // Target ~500px wide (Warp's default), capped by available content
         // width so it never overflows the left edge. Height: at least one
         // cell + 16px padding, at most 1.75× cell height for legibility.
-        let target_w = 500.0_f32;
-        let right_margin = 20.0;
-        let top_margin = 10.0;
-        let min_w = cw * 48.0; // v0.9 fix: wider min so query + buttons + status fit
-        let popup_w = target_w.min(ctx.width() - right_margin - 20.0).max(min_w);
-        let popup_h = (ch * 1.75).max(ch + 16.0);
-        let popup_x1 = ctx.right() - right_margin;
-        let popup_x0 = popup_x1 - popup_w;
-        let popup_y0 = ctx.top() + top_margin;
-        let popup_y1 = popup_y0 + popup_h;
+        let [popup_x0, popup_y0, popup_x1, popup_y1] = layout.popup_rect;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let accent = color_to_normalized(self.theme.accent);
@@ -5347,26 +5252,19 @@ fragment float4 text_fragment(
         //   .* = regex toggle indicator (lit when regex_mode is on)
         //
         // Button hit-test rects (with generous click padding) are stored in
-        // self.find_buttons for the app's mouse handler to read.
-        let inner_pad_x = 8.0;
-        let text_x0 = popup_x0 + border_w + stripe_w + inner_pad_x;
-        let text_x1 = popup_x1 - border_w - inner_pad_x;
-        let line_y = popup_y0 + border_w + ((popup_h - border_w * 2.0 - ch) * 0.5).max(0.0);
-        let right_x = text_x1;
+        // Geometry comes from `FindLayout`, shared with Scene hit testing.
+        let text_x0 = layout.text_x0;
+        let line_y = layout.line_y;
+        let gap_w = cw;
 
         // ── Right-aligned button cluster (rightmost first) ───────────────
         // Each button: 2 chars wide glyph + 1 char gap on its left side.
         // Click padding: extend the hit-test rect 2px above/below the line
         // and 1px left/right so the clickable area is forgiving.
-        let btn_click_pad = 2.0;
-        let gap_cols = 1;
-        let gap_w = gap_cols as f32 * cw;
-
         // ".*" regex toggle (rightmost).
         let regex_label = ".*";
         let regex_w = Self::text_col_width(regex_label);
-        let regex_text_w = regex_w as f32 * cw;
-        let regex_x = right_x - regex_text_w;
+        let regex_x = layout.regex_x;
         let regex_color = if find.regex_mode { accent } else { accent_dim };
         self.push_text(
             &mut verts,
@@ -5376,78 +5274,28 @@ fragment float4 text_fragment(
             regex_color,
             regex_w,
         );
-        let regex_rect = [
-            regex_x - btn_click_pad,
-            line_y - btn_click_pad,
-            right_x + btn_click_pad,
-            line_y + ch + btn_click_pad,
-        ];
-
         // "Aa" case-sensitive toggle.
         let case_label = "Aa";
         let case_w = Self::text_col_width(case_label);
-        let case_text_w = case_w as f32 * cw;
-        let case_x = regex_x - gap_w - case_text_w;
+        let case_x = layout.case_x;
         let case_color = if find.case_sensitive {
             accent
         } else {
             accent_dim
         };
         self.push_text(&mut verts, case_x, line_y, case_label, case_color, case_w);
-        let case_rect = [
-            case_x - btn_click_pad,
-            line_y - btn_click_pad,
-            case_x + case_text_w + btn_click_pad,
-            line_y + ch + btn_click_pad,
-        ];
-
         // "↓" down arrow (next match) — 1 char wide.
         let down_label = "↓";
         let down_w = Self::text_col_width(down_label);
-        let down_text_w = down_w as f32 * cw;
-        let down_x = case_x - gap_w - down_text_w;
+        let down_x = layout.down_x;
         let down_color = if find.total > 0 { accent_dim } else { sep };
         self.push_text(&mut verts, down_x, line_y, down_label, down_color, down_w);
-        let down_rect = if find.total > 0 {
-            Some([
-                down_x - btn_click_pad,
-                line_y - btn_click_pad,
-                down_x + down_text_w + btn_click_pad,
-                line_y + ch + btn_click_pad,
-            ])
-        } else {
-            None
-        };
-
         // "↑" up arrow (previous match) — 1 char wide.
         let up_label = "↑";
         let up_w = Self::text_col_width(up_label);
-        let up_text_w = up_w as f32 * cw;
-        let up_x = down_x - gap_w - up_text_w;
+        let up_x = layout.up_x;
         let up_color = if find.total > 0 { accent_dim } else { sep };
         self.push_text(&mut verts, up_x, line_y, up_label, up_color, up_w);
-        let up_rect = if find.total > 0 {
-            Some([
-                up_x - btn_click_pad,
-                line_y - btn_click_pad,
-                up_x + up_text_w + btn_click_pad,
-                line_y + ch + btn_click_pad,
-            ])
-        } else {
-            None
-        };
-
-        // Store hit-test rects for the app's mouse handler. Returned to the
-        // caller (draw()) rather than written to `self` directly to avoid a
-        // borrow conflict with the Metal drawable (which borrows `self.layer`
-        // for the whole frame).
-        let buttons = FindButtons {
-            up: up_rect,
-            down: down_rect,
-            case_sensitive: case_rect,
-            regex: regex_rect,
-        };
-
         // ── Status text (left of the up arrow, compact) ──────────────────
         // Compact format to avoid overflow:
         //   empty query → "" (nothing, keep it clean)
@@ -5563,7 +5411,7 @@ fragment float4 text_fragment(
         }
 
         let _ = ch;
-        (verts, buttons)
+        verts
     }
 
     /// UV rect of the space glyph (background-only quads need mask 0).

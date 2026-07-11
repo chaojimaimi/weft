@@ -42,6 +42,22 @@ pub(crate) struct WorkflowForm {
     pub(crate) current_field: usize,
 }
 
+impl WorkflowForm {
+    pub(crate) fn draw_fields(&self) -> Vec<(String, String, bool)> {
+        self.var_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                (
+                    name.clone(),
+                    self.var_values.get(index).cloned().unwrap_or_default(),
+                    index == self.current_field,
+                )
+            })
+            .collect()
+    }
+}
+
 /// Sub-modes of the palette beyond normal search.
 pub(crate) enum PaletteSubMode {
     Search,
@@ -120,7 +136,7 @@ impl PaletteState {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaletteEntry, PaletteState};
+    use super::{PaletteEntry, PaletteState, WorkflowForm};
 
     #[test]
     fn open_search_starts_from_clean_transient_state() {
@@ -146,5 +162,24 @@ mod tests {
         assert!(!state.open);
         assert!(state.query.is_empty());
         assert!(state.form.is_none());
+    }
+
+    #[test]
+    fn workflow_form_draw_fields_align_names_values_and_focus() {
+        let form = WorkflowForm {
+            workflow_id: 1,
+            workflow_name: "deploy".into(),
+            workflow_description: String::new(),
+            var_names: vec!["host".into(), "port".into()],
+            var_values: vec!["example.com".into()],
+            current_field: 1,
+        };
+        assert_eq!(
+            form.draw_fields(),
+            vec![
+                ("host".into(), "example.com".into(), false),
+                ("port".into(), String::new(), true),
+            ]
+        );
     }
 }
