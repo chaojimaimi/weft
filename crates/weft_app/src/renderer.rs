@@ -900,11 +900,6 @@ fragment float4 text_fragment(
         self.viewport
     }
 
-    /// Cell size (width, height) in physical pixels.
-    pub fn cell_size(&self) -> (f32, f32) {
-        (self.atlas.cell_width as f32, self.atlas.cell_height as f32)
-    }
-
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
         // Use physical pixels for viewport to match drawable_size and grid dimensions
         let vp_w = size.width as f32;
@@ -939,6 +934,39 @@ fragment float4 text_fragment(
     /// Backing-store scale (Retina factor).
     pub fn scale(&self) -> f64 {
         self.scale
+    }
+
+    /// Refresh every DPI-derived renderer value after a window moves between
+    /// displays. Winit reports physical window sizes, while font size and
+    /// configured padding are logical, so keeping an old scale would make the
+    /// PTY geometry and Metal placement diverge again on the new display.
+    pub fn update_scale(&mut self, scale: f64, padding_logical: (u32, u32)) -> bool {
+        if !scale.is_finite() || scale <= 0.0 || (self.scale - scale).abs() < f64::EPSILON {
+            return false;
+        }
+
+        self.scale = scale;
+        self.padding_x = padding_logical.0 as f32 * scale as f32;
+        self.padding_y = padding_logical.1 as f32 * scale as f32;
+        self.atlas = GlyphAtlas::new(&self.device, &self.font_config, scale);
+
+        // CAMetalLayer contentsScale is not exposed by metal-rs. Keep the raw
+        // Objective-C message contained and unwind-protected per project rule.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            use objc2::msg_send;
+            let layer_ptr: *mut objc2::runtime::AnyObject =
+                (&*self.layer) as *const _ as *mut objc2::runtime::AnyObject;
+            let _: () = msg_send![layer_ptr, setContentsScale: scale];
+        }));
+
+        self.force_full_grid_redraw();
+        info!(
+            scale,
+            cell_width = self.atlas.cell_width,
+            cell_height = self.atlas.cell_height,
+            "renderer scale factor updated"
+        );
+        true
     }
 
     /// How many block-view content rows (at `pitch = ch * 1.1`) fit in the
@@ -1367,12 +1395,18 @@ fragment float4 text_fragment(
             if terminal.is_alt_screen_active() {
                 self.force_full_grid_redraw();
             }
+            let cursor_visible_this_frame = crate::terminal_geometry::grid_cursor_visible(
+                terminal.cursor_style,
+                terminal.cursor_visible,
+                cursor_blink_on,
+                prompt.is_some(),
+            );
             instances = self.build_grid_instances(
                 grid,
                 terminal.palette(),
                 cursor,
                 selection,
-                terminal.cursor_visible && cursor_blink_on && prompt.is_none(),
+                cursor_visible_this_frame,
                 terminal.cursor_style,
             );
             Vec::new()
@@ -2209,7 +2243,7 @@ fragment float4 text_fragment(
 
                 // Override colors for cursor
                 let final_fg = if is_cursor {
-                    if cursor_style == CursorStyle::Block {
+                    if cursor_style.is_block() {
                         [0.0, 0.0, 0.0, 1.0] // Black text on cursor block
                     } else {
                         cursor_color
@@ -2218,14 +2252,11 @@ fragment float4 text_fragment(
                     fg
                 };
 
-                let final_bg = if is_cursor && cursor_style == CursorStyle::Block {
+                let final_bg = if is_cursor && cursor_style.is_block() {
                     cursor_color
                 } else if is_selected {
                     selection_bg
-                } else if is_cursor
-                    && (cursor_style == CursorStyle::Bar
-                        || cursor_style == CursorStyle::BlinkingBar)
-                {
+                } else if is_cursor && cursor_style.is_bar() {
                     // Bar cursor: only highlight the left 2 pixels
                     // We'll draw the full cell with normal bg, then overlay bar later
                     bg
@@ -2261,32 +2292,28 @@ fragment float4 text_fragment(
 
                 // Draw bar/underline cursor overlay
                 if is_cursor && show_cursor {
-                    match cursor_style {
-                        CursorStyle::Bar | CursorStyle::BlinkingBar => {
-                            let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
-                            let bar_w = bar_w.max(1.0).min(cw * 0.15);
-                            // v1.0 P1.5-B1: decoration instance. UV rect
-                            // (0,0,0,1) samples the atlas at u=0 (empty)
-                            // so mask=0 → only bg (cursor color) shows.
-                            push_cell_instance(
-                                &mut instances,
-                                [x0, y0, x0 + bar_w, y1],
-                                [0.0, 0.0, 0.0, 1.0],
-                                [0.0; 4],
-                                cursor_color,
-                            );
-                        }
-                        CursorStyle::Underline | CursorStyle::BlinkingUnderline => {
-                            let line_h = 2.0;
-                            push_cell_instance(
-                                &mut instances,
-                                [x0, y1 - line_h, x1, y1],
-                                [0.0, 0.0, 0.0, 1.0],
-                                [0.0; 4],
-                                cursor_color,
-                            );
-                        }
-                        _ => {} // Block cursor handled above
+                    if cursor_style.is_bar() {
+                        let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
+                        let bar_w = bar_w.max(1.0).min(cw * 0.15);
+                        // v1.0 P1.5-B1: decoration instance. UV rect
+                        // (0,0,0,1) samples the atlas at u=0 (empty)
+                        // so mask=0 → only bg (cursor color) shows.
+                        push_cell_instance(
+                            &mut instances,
+                            [x0, y0, x0 + bar_w, y1],
+                            [0.0, 0.0, 0.0, 1.0],
+                            [0.0; 4],
+                            cursor_color,
+                        );
+                    } else if cursor_style.is_underline() {
+                        let line_h = 2.0;
+                        push_cell_instance(
+                            &mut instances,
+                            [x0, y1 - line_h, x1, y1],
+                            [0.0, 0.0, 0.0, 1.0],
+                            [0.0; 4],
+                            cursor_color,
+                        );
                     }
                 }
 

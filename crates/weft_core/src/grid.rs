@@ -188,6 +188,47 @@ impl Row {
         self.dirty_occ = self.dirty_occ.max(col + 1);
     }
 
+    /// Clear the other half of a wide glyph occupying `col`, if any.
+    ///
+    /// Call this before overwriting or clearing a cell. A write can target
+    /// either the full-width leading cell or its `WIDE_SPACER`; leaving the
+    /// other half behind breaks the row invariant and later TUI repaints can
+    /// combine unrelated glyph halves into visible corruption.
+    pub(crate) fn clear_wide_pair_at(&mut self, col: usize) {
+        if col >= self.cells.len() {
+            return;
+        }
+        if self.cells[col].flags.contains(CellFlags::WIDE_SPACER)
+            && col > 0
+            && self.cells[col - 1].width == CellWidth::Full
+        {
+            self.cells[col - 1].reset();
+            self.mark_dirty(col - 1);
+        }
+        if self.cells[col].width == CellWidth::Full
+            && col + 1 < self.cells.len()
+            && self.cells[col + 1].flags.contains(CellFlags::WIDE_SPACER)
+        {
+            self.cells[col + 1].reset();
+            self.mark_dirty(col + 1);
+        }
+    }
+
+    /// Remove orphaned wide-cell halves after an operation that shifts cells.
+    pub(crate) fn repair_wide_pairs(&mut self) {
+        for col in 0..self.cells.len() {
+            let orphan_spacer = self.cells[col].flags.contains(CellFlags::WIDE_SPACER)
+                && (col == 0 || self.cells[col - 1].width != CellWidth::Full);
+            let orphan_lead = self.cells[col].width == CellWidth::Full
+                && (col + 1 >= self.cells.len()
+                    || !self.cells[col + 1].flags.contains(CellFlags::WIDE_SPACER));
+            if orphan_spacer || orphan_lead {
+                self.cells[col].reset();
+                self.mark_dirty(col);
+            }
+        }
+    }
+
     /// v1.0 perf: Clear all cells in place (reuses Vec capacity, no allocation).
     /// Equivalent to `*self = Row::new(cols)` but avoids the Vec allocation.
     pub fn clear(&mut self) {
@@ -235,6 +276,27 @@ pub enum CursorStyle {
     BlinkingBar,
     /// Steady bar |
     Bar,
+}
+
+impl CursorStyle {
+    pub fn is_blinking(self) -> bool {
+        matches!(
+            self,
+            Self::BlinkingBlock | Self::BlinkingUnderline | Self::BlinkingBar
+        )
+    }
+
+    pub fn is_block(self) -> bool {
+        matches!(self, Self::Block | Self::BlinkingBlock)
+    }
+
+    pub fn is_bar(self) -> bool {
+        matches!(self, Self::Bar | Self::BlinkingBar)
+    }
+
+    pub fn is_underline(self) -> bool {
+        matches!(self, Self::Underline | Self::BlinkingUnderline)
+    }
 }
 
 /// Scrollback buffer (ring buffer).
@@ -540,6 +602,10 @@ impl Grid {
         }
 
         if col < self.num_cols {
+            self.viewport[row].clear_wide_pair_at(col);
+            if width == CellWidth::Full {
+                self.viewport[row].clear_wide_pair_at(col + 1);
+            }
             let cell = &mut self.viewport[row].cells[col];
             cell.character = ch;
             cell.fg = fg;
@@ -579,6 +645,10 @@ impl Grid {
         let col = self.cursor.col;
 
         if col < self.num_cols {
+            self.viewport[row].clear_wide_pair_at(col);
+            if width == CellWidth::Full {
+                self.viewport[row].clear_wide_pair_at(col + 1);
+            }
             // Read current attributes before mutable borrow
             let fg = self.viewport[row].cells[col].fg;
             let bg = self.viewport[row].cells[col].bg;
@@ -593,6 +663,14 @@ impl Grid {
             self.viewport[row].mark_dirty(col);
 
             self.cursor.col += width as usize;
+
+            if width == CellWidth::Full && col + 1 < self.num_cols {
+                let spacer = &mut self.viewport[row].cells[col + 1];
+                spacer.character = ' ';
+                spacer.flags = CellFlags::WIDE_SPACER;
+                spacer.width = CellWidth::Half;
+                self.viewport[row].mark_dirty(col + 1);
+            }
         }
 
         // Handle wrap
@@ -751,6 +829,7 @@ impl Grid {
         let row = self.cursor.row;
         let col = self.cursor.col;
         // Clear from cursor to end of current line
+        self.viewport[row].clear_wide_pair_at(col);
         for c in col..self.num_cols {
             self.viewport[row].cells[c].reset();
         }
@@ -776,6 +855,7 @@ impl Grid {
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
         // Clear from start of current line to cursor
+        self.viewport[row].clear_wide_pair_at(col);
         for c in 0..=col {
             self.viewport[row].cells[c].reset();
         }
@@ -805,6 +885,7 @@ impl Grid {
     pub fn clear_line_right(&mut self) {
         let row = self.cursor.row;
         let col = self.cursor.col;
+        self.viewport[row].clear_wide_pair_at(col);
         for c in col..self.num_cols {
             self.viewport[row].cells[c].reset();
         }
@@ -815,6 +896,7 @@ impl Grid {
     pub fn clear_line_left(&mut self) {
         let row = self.cursor.row;
         let col = self.cursor.col;
+        self.viewport[row].clear_wide_pair_at(col);
         for c in 0..=col {
             self.viewport[row].cells[c].reset();
         }
@@ -836,6 +918,10 @@ impl Grid {
         let row = self.cursor.row;
         let col = self.cursor.col;
         let end = (col + count).min(self.num_cols);
+        if col < end {
+            self.viewport[row].clear_wide_pair_at(col);
+            self.viewport[row].clear_wide_pair_at(end - 1);
+        }
         for c in col..end {
             self.viewport[row].cells[c].reset();
         }
@@ -1034,6 +1120,7 @@ impl Grid {
         for i in (col + shift..self.num_cols).rev() {
             cells[i] = std::mem::take(&mut cells[i - shift]);
         }
+        self.viewport[row].repair_wide_pairs();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 
@@ -1048,6 +1135,7 @@ impl Grid {
         for i in col..self.num_cols - shift {
             cells[i] = std::mem::take(&mut cells[i + shift]);
         }
+        self.viewport[row].repair_wide_pairs();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 
@@ -1057,6 +1145,9 @@ impl Grid {
             let row = self.cursor.row;
             let bottom = self.scroll_bottom;
             let shift = count.min(bottom - row + 1);
+            if shift == 0 {
+                return;
+            }
             for i in (row + shift..=bottom).rev() {
                 self.viewport[i] =
                     std::mem::replace(&mut self.viewport[i - shift], Row::new(self.num_cols));
@@ -1081,11 +1172,17 @@ impl Grid {
             let row = self.cursor.row;
             let bottom = self.scroll_bottom;
             let shift = count.min(bottom - row + 1);
-            for i in row..=bottom - shift {
-                self.viewport[i] =
-                    std::mem::replace(&mut self.viewport[i + shift], Row::new(self.num_cols));
+            if shift == 0 {
+                return;
             }
-            for i in (bottom - shift + 1)..=bottom {
+            let region_len = bottom - row + 1;
+            if shift < region_len {
+                for i in row..=bottom - shift {
+                    self.viewport[i] =
+                        std::mem::replace(&mut self.viewport[i + shift], Row::new(self.num_cols));
+                }
+            }
+            for i in (bottom + 1 - shift)..=bottom {
                 self.viewport[i] = Row::new(self.num_cols);
             }
             // Mark all affected rows dirty — same rationale as insert_blank_lines.
@@ -1576,6 +1673,24 @@ mod tests {
     }
 
     #[test]
+    fn cursor_style_shape_and_blink_classification_is_exhaustive() {
+        assert!(CursorStyle::Block.is_block());
+        assert!(CursorStyle::BlinkingBlock.is_block());
+        assert!(!CursorStyle::Block.is_blinking());
+        assert!(CursorStyle::BlinkingBlock.is_blinking());
+
+        assert!(CursorStyle::Bar.is_bar());
+        assert!(CursorStyle::BlinkingBar.is_bar());
+        assert!(!CursorStyle::Bar.is_blinking());
+        assert!(CursorStyle::BlinkingBar.is_blinking());
+
+        assert!(CursorStyle::Underline.is_underline());
+        assert!(CursorStyle::BlinkingUnderline.is_underline());
+        assert!(!CursorStyle::Underline.is_blinking());
+        assert!(CursorStyle::BlinkingUnderline.is_blinking());
+    }
+
+    #[test]
     fn row_text_trims_trailing_and_keeps_internal_spaces() {
         let mut grid = Grid::new(2, 12);
         // Write "ls  -la" at row 0 (two internal spaces), leaving trailing
@@ -1602,6 +1717,16 @@ mod tests {
         assert_eq!(grid.cursor.row, 0);
         assert_eq!(grid.cursor.col, 1);
         assert_eq!(grid.cell(0, 0).character, 'A');
+    }
+
+    #[test]
+    fn direct_wide_write_creates_valid_pair() {
+        let mut grid = Grid::new(2, 8);
+        grid.write_char('中');
+
+        assert_eq!(grid.cell(0, 0).width, CellWidth::Full);
+        assert!(grid.cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+        assert_row_has_valid_wide_pairs(&grid, 0);
     }
 
     #[test]
@@ -2004,6 +2129,104 @@ mod tests {
         assert_eq!(grid.cell(0, 1).character, ' ');
         assert_eq!(grid.cell(0, 2).character, ' ');
         assert_eq!(grid.cell(0, 3).character, '4');
+    }
+
+    fn assert_row_has_valid_wide_pairs(grid: &Grid, row: usize) {
+        for col in 0..grid.num_cols {
+            let cell = grid.cell(row, col);
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                assert!(col > 0, "wide spacer cannot be in column zero");
+                assert_eq!(
+                    grid.cell(row, col - 1).width,
+                    CellWidth::Full,
+                    "orphaned wide spacer at column {col}"
+                );
+            }
+            if cell.width == CellWidth::Full {
+                assert!(col + 1 < grid.num_cols, "wide lead cannot end a row");
+                assert!(
+                    grid.cell(row, col + 1)
+                        .flags
+                        .contains(CellFlags::WIDE_SPACER),
+                    "orphaned wide lead at column {col}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_clear_repairs_split_wide_pair() {
+        let mut grid = Grid::new(2, 8);
+        grid.write_char_with_attrs(
+            '中',
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::empty(),
+        );
+        grid.cursor.col = 1; // second half of 中
+        grid.clear_line_right();
+
+        assert_row_has_valid_wide_pairs(&grid, 0);
+        assert_eq!(grid.cell(0, 0).character, ' ');
+    }
+
+    #[test]
+    fn insert_blank_repairs_split_wide_pair() {
+        let mut grid = Grid::new(2, 8);
+        grid.write_char_with_attrs(
+            '中',
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::empty(),
+        );
+        grid.cursor.col = 1; // insert between the lead and spacer
+        grid.insert_blank(1);
+
+        assert_row_has_valid_wide_pairs(&grid, 0);
+    }
+
+    #[test]
+    fn erase_chars_repairs_split_wide_pair() {
+        let mut grid = Grid::new(2, 8);
+        grid.write_char_with_attrs(
+            '中',
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::empty(),
+        );
+        grid.cursor.col = 0; // erase only the lead cell
+        grid.erase_chars(1);
+
+        assert_row_has_valid_wide_pairs(&grid, 0);
+        assert_eq!(grid.cell(0, 1).character, ' ');
+    }
+
+    #[test]
+    fn delete_chars_repairs_shifted_wide_pair() {
+        let mut grid = Grid::new(2, 8);
+        grid.write_char('A');
+        grid.write_char_with_attrs(
+            '中',
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::empty(),
+        );
+        grid.cursor.col = 1; // delete only the leading cell of 中
+        grid.delete_chars(1);
+
+        assert_row_has_valid_wide_pairs(&grid, 0);
+    }
+
+    #[test]
+    fn clearing_orphan_spacer_does_not_delete_valid_half_cell() {
+        let mut row = Row::new(4);
+        row.cells[0].character = 'A';
+        row.cells[1].flags = CellFlags::WIDE_SPACER;
+
+        row.clear_wide_pair_at(1);
+
+        assert_eq!(row.cells[0].character, 'A');
+        assert_eq!(row.cells[0].width, CellWidth::Half);
     }
 
     #[test]
@@ -2669,6 +2892,37 @@ mod tests {
         assert!(!dirty.contains(&0));
         // Row 4 is outside the scroll region — must NOT be dirty.
         assert!(!dirty.contains(&4));
+    }
+
+    #[test]
+    fn full_region_insert_and_delete_lines_clear_without_underflow() {
+        fn populated_grid() -> Grid {
+            let mut grid = Grid::new(5, 6);
+            for row in 0..5 {
+                grid.cursor.row = row;
+                grid.cursor.col = 0;
+                grid.write_char(char::from(b'A' + row as u8));
+            }
+            grid.set_scroll_region(1, 4); // rows 0..=3, with status row 4 outside
+            grid.cursor.row = 0;
+            grid
+        }
+
+        let mut inserted = populated_grid();
+        inserted.insert_blank_lines(usize::MAX);
+        assert_eq!(inserted.row_text(0), "");
+        assert_eq!(inserted.row_text(1), "");
+        assert_eq!(inserted.row_text(2), "");
+        assert_eq!(inserted.row_text(3), "");
+        assert_eq!(inserted.row_text(4), "E");
+
+        let mut deleted = populated_grid();
+        deleted.delete_lines(usize::MAX);
+        assert_eq!(deleted.row_text(0), "");
+        assert_eq!(deleted.row_text(1), "");
+        assert_eq!(deleted.row_text(2), "");
+        assert_eq!(deleted.row_text(3), "");
+        assert_eq!(deleted.row_text(4), "E");
     }
 
     #[test]

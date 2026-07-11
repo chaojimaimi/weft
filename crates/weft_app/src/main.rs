@@ -5,11 +5,13 @@
 
 mod find_worker;
 mod glyph;
+mod ime;
 mod layout;
 mod menu;
 mod overlay;
 mod renderer;
 mod tab;
+mod terminal_geometry;
 
 use renderer::{
     block_matches_query, configure_titlebar, visible_panel_rows, FindDrawState, MetalRenderer,
@@ -17,7 +19,8 @@ use renderer::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tab::Tab;
+use tab::{Tab, TuiScrollResolution};
+use terminal_geometry::dimensions_for_renderer;
 use weft_core::blocks::{BlockId, ShellPhase};
 use weft_core::complete::{complete, CompleteCtx, CompletePosition};
 use weft_core::config::{Action, Config, KeyBindings};
@@ -285,22 +288,6 @@ struct App {
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
-    /// v1.2 fix: timestamp + text of the most recent `Ime::Commit` event.
-    /// Used by `KeyboardInput` to suppress duplicate key delivery on macOS.
-    ///
-    /// On macOS with IME enabled, winit's `interpretKeyEvents` can deliver
-    /// BOTH `Ime::Commit(text)` AND `KeyboardInput` for the same keystroke
-    /// (when `doCommandBySelector` fires even after `insertText` commits).
-    /// This is especially common with CJK input methods that are active but
-    /// not composing — the key goes through `insertText` (→ `Ime::Commit`)
-    /// AND `doCommandBySelector` (→ `forward_key_to_app` → `KeyboardInput`).
-    ///
-    /// Without dedup, a typed `/` in `less` is sent to the PTY twice:
-    /// once via `Ime::Commit` and once via `encode_key`. The second `/`
-    /// enters `less`'s search as a search term, corrupting its state and
-    /// causing the "frozen" appearance (stuck in search mode with garbage
-    /// in the PTY buffer). See winit view.rs:410-414, 490-497.
-    last_ime_commit: Option<(std::time::Instant, String)>,
 }
 
 /// Which border is being dragged to resize a popup.
@@ -569,7 +556,6 @@ impl App {
             settings_error: None,
             current_logo_variant: weft_core::config::LogoVariant::Cool,
             should_exit: false,
-            last_ime_commit: None,
         }
     }
 
@@ -599,6 +585,8 @@ impl App {
 
     fn process_messages(&mut self) -> bool {
         let mut any_redraw = false;
+        let mut had_pty_output = false;
+        let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
         for i in 0..self.tabs.len() {
             let (alive, drained, need_redraw) = self.tabs[i].process_messages();
@@ -607,7 +595,8 @@ impl App {
                 // the app when the LAST tab's shell exits. A closed tab
                 // via Cmd+W is handled by `close_tab`, not here.
                 if self.tabs.len() <= 1 {
-                    return false;
+                    self.should_exit = true;
+                    break;
                 }
                 // Otherwise: remove the exited tab and switch to the prev.
                 self.tabs.remove(i);
@@ -618,8 +607,26 @@ impl App {
                 break;
             }
             drained_blocks.extend(drained);
+            if let Some(resolution) = self.tabs[i].resolve_pending_tui_scroll() {
+                match resolution {
+                    TuiScrollResolution::PtyBytes(bytes) => {
+                        if let Some(pty) = &self.tabs[i].pty {
+                            if let Err(e) = pty.write_sync(&bytes) {
+                                warn!(error = %e, tab = i, "failed to replay queued TUI scroll");
+                            }
+                        }
+                    }
+                    TuiScrollResolution::LocalRows(rows) if i == self.active_tab => {
+                        deferred_local_scroll =
+                            deferred_local_scroll.saturating_add(rows).clamp(-100, 100);
+                    }
+                    TuiScrollResolution::LocalRows(_) => {}
+                }
+                any_redraw = true;
+            }
             if need_redraw {
                 any_redraw = true;
+                had_pty_output = true;
             }
         }
         if !drained_blocks.is_empty() {
@@ -631,16 +638,31 @@ impl App {
                 }
             }
         }
+        if deferred_local_scroll != 0 {
+            self.scroll_local_view(deferred_local_scroll);
+        }
         if any_redraw {
             self.request_redraw();
         }
-        true
+        had_pty_output
     }
 
     fn request_redraw(&self) {
         if let (Some(window), Some(_renderer)) = (&self.window, &self.renderer) {
             window.request_redraw();
         }
+    }
+
+    /// Cancel native marked text before keyboard ownership changes. macOS
+    /// keeps this state on the window rather than on an individual Weft tab.
+    fn reset_ime_context(&mut self, reason: &'static str) {
+        for tab in &mut self.tabs {
+            tab.ime_preedit.clear();
+        }
+        if let Some(window) = &self.window {
+            ime::discard_marked_text(window);
+        }
+        tracing::debug!(reason, "native IME context reset");
     }
 
     fn handle_key_event(
@@ -844,45 +866,7 @@ impl App {
             .unwrap_or(false);
         self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
 
-        // v1.2 fix: suppress duplicate key delivery on macOS.
-        //
-        // When IME is enabled, winit's `interpretKeyEvents` can deliver BOTH
-        // `Ime::Commit(text)` AND `KeyboardInput` for the same keystroke.
-        // This happens when `insertText:` commits the text (→ Ime::Commit)
-        // but `doCommandBySelector:` also fires (→ forward_key_to_app=true →
-        // KeyboardInput). The result is a doubled character sent to the PTY.
-        //
-        // In alt-screen apps like `less`, a doubled `/` causes the second `/`
-        // to enter the search term, corrupting `less`'s state — the window
-        // appears "frozen" until a resize forces a repaint.
-        //
-        // Dedup strategy: if an `Ime::Commit` happened within the last 50ms
-        // for the exact same text that `encode_key` would produce, skip the
-        // PTY write. Only applies to bare printable keys (no Ctrl/Alt/Super)
-        // since IME commits never carry modifier combinations.
-        if m.is_empty() {
-            if let Some((instant, committed_text)) = self.last_ime_commit.clone() {
-                if instant.elapsed() < std::time::Duration::from_millis(50) {
-                    // Check if encode_key would produce the same bytes as the
-                    // IME commit. This avoids hardcoding char mappings.
-                    let encoded = self.tab().input_handler.encode_key(key, m);
-                    if encoded == committed_text.as_bytes() {
-                        // Duplicate — IME already sent these bytes. Consume
-                        // the stale commit so it doesn't suppress the next
-                        // legitimate key.
-                        self.last_ime_commit = None;
-                        tracing::debug!(
-                            ?key,
-                            committed = %committed_text,
-                            "suppressed duplicate KeyboardInput (IME already committed)"
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-
-        let bytes = self.tab().input_handler.encode_key(key, m);
+        let bytes = ime::encode_passthrough_key(&self.tab().input_handler, key, m, text);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
         // send for each key, including whether DECCKM/app-cursor mode is on.
         tracing::debug!(
@@ -963,6 +947,7 @@ impl App {
                 true
             }
             Action::ToggleCommandPalette => {
+                self.reset_ime_context("command palette toggled");
                 self.palette_open = !self.palette_open;
                 if self.palette_open {
                     // v0.9 fix: opening the palette closes the find bar (and
@@ -986,6 +971,7 @@ impl App {
                 true
             }
             Action::FindInGrid => {
+                self.reset_ime_context("find toggled");
                 self.find_open = !self.find_open;
                 if self.find_open {
                     // v0.9 fix: opening find closes the palette (see above).
@@ -1026,6 +1012,7 @@ impl App {
                 true
             }
             Action::ToggleSettings => {
+                self.reset_ime_context("settings toggled");
                 self.settings_open = !self.settings_open;
                 if self.settings_open {
                     // Mutual exclusion: close other modals.
@@ -1105,6 +1092,7 @@ impl App {
         if !self.find_open {
             return;
         }
+        self.reset_ime_context("find closed");
         self.find_open = false;
         self.find_query.clear();
         self.find_matches.clear();
@@ -1126,6 +1114,7 @@ impl App {
         if !self.palette_open {
             return;
         }
+        self.reset_ime_context("palette closed");
         self.palette_open = false;
         self.palette_query.clear();
         self.palette_selection = 0;
@@ -1140,6 +1129,7 @@ impl App {
         if !self.settings_open {
             return;
         }
+        self.reset_ime_context("settings closed");
         self.settings_open = false;
         self.settings_dirty = false;
     }
@@ -2408,6 +2398,8 @@ impl App {
 
     /// Execute a workflow: render variables → submit commands to PTY.
     fn execute_workflow(&mut self, form: WorkflowForm) {
+        self.reset_ime_context("workflow submitted");
+        self.tabs[self.active_tab].arm_tui_scroll_window();
         let Some(store) = &self.workflow_store else {
             return;
         };
@@ -2796,6 +2788,12 @@ impl App {
     /// Submit the editor's command: write PTY bytes (and any terminal query
     /// response) and locally block the editor through the Enter→preexec window.
     fn editor_submit(&mut self) {
+        // The editor and the launched command share one native NSView IME
+        // context. Drop any uncommitted editor composition before the PTY/TUI
+        // becomes the input owner, otherwise its first key can commit stale
+        // text into less/vim.
+        self.reset_ime_context("editor command submitted");
+        self.tabs[self.active_tab].arm_tui_scroll_window();
         let bytes = self.tabs[self.active_tab]
             .terminal
             .as_mut()
@@ -3043,12 +3041,11 @@ impl App {
             let grid = t.grid();
             return (grid.num_rows, grid.num_cols);
         }
-        // Fallback: derive from renderer viewport.
-        if let Some(r) = &self.renderer {
-            let (w, h) = r.viewport();
-            let cw = r.cell_size();
-            let cols = (w / cw.0).max(1.0) as usize;
-            let rows = (h / cw.1).max(1.0) as usize;
+        // Fallback must use the same chrome-aware geometry as startup and
+        // resize; deriving directly from the full renderer viewport would
+        // recreate the hidden-last-row bug for a tab whose PTY failed.
+        let (rows, cols) = self.grid_dims();
+        if rows > 0 && cols > 0 {
             return (rows, cols);
         }
         (24, 80)
@@ -3056,6 +3053,7 @@ impl App {
 
     /// Cmd+T — open a new tab with a fresh shell session and switch to it.
     fn new_tab(&mut self) {
+        self.reset_ime_context("new tab");
         let (rows, cols) = self.current_size();
         // New tabs inherit the weft process's cwd (None = no chdir).
         let tab = Tab::new(rows, cols, self.config.scrollback.lines, &self.proxy, None);
@@ -3089,6 +3087,7 @@ impl App {
             self.should_exit = true;
             return true;
         }
+        self.reset_ime_context("tab closed");
         let removed_idx = self.active_tab;
         let _tab = self.tabs.remove(removed_idx);
         // v0.9 W1+: clear hover state — tab indices shift after removal, so
@@ -3166,6 +3165,7 @@ impl App {
         if self.tabs.len() <= 1 {
             return;
         }
+        self.reset_ime_context("next tab");
         self.active_tab = (self.active_tab + 1) % self.tabs.len();
         info!(active = self.active_tab, "switched to next tab");
         self.refresh_find_for_active_tab();
@@ -3178,6 +3178,7 @@ impl App {
         if self.tabs.len() <= 1 {
             return;
         }
+        self.reset_ime_context("previous tab");
         self.active_tab = if self.active_tab == 0 {
             self.tabs.len() - 1
         } else {
@@ -3746,16 +3747,7 @@ impl App {
         } else {
             0.0
         };
-        let usable_w = size.width as f64 - 2.0 * renderer.padding_x() as f64 - chrome_left;
-        // The grid/PTY is always the FULL window. The editor input box is an
-        // overlay that covers the bottom rows in Editor mode — it never
-        // changes the grid size, so editor↔passthrough transitions don't fire
-        // a SIGWINCH/reflow storm (which was clearing prior output + the
-        // command echo). The shell's blank prompt sits under the box.
-        let usable_h = (size.height as f64 - 2.0 * renderer.padding_y() as f64).max(0.0);
-        let cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
-        let rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
-        (rows, cols)
+        dimensions_for_renderer(renderer, size, chrome_left)
     }
 
     /// Recompute grid rows/cols from the current window + cell dimensions and
@@ -4247,8 +4239,10 @@ impl App {
                         // Check tab label rect.
                         let [tx0, ty0, tx1, ty1] = hit.tab_rect;
                         if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                            if self.active_tab != hit.index {
-                                self.active_tab = hit.index;
+                            let hit_index = hit.index;
+                            if self.active_tab != hit_index {
+                                self.reset_ime_context("tab clicked");
+                                self.active_tab = hit_index;
                                 self.refresh_find_for_active_tab();
                             }
                             self.hovered_tab = None;
@@ -4968,27 +4962,11 @@ impl App {
         // becomes true, the wheel starts working — which matches the user
         // report "scrolling works only after pressing a key".
         //
-        // v1.2 fix: a single pump may only read part of the alt-screen
-        // sequence (e.g. `\x1b[?1049h` split across two channel events).
-        // Loop until alt_active stabilizes or we hit the iteration cap,
-        // ensuring the first wheel event sees the correct alt-screen state.
-        for _ in 0..4 {
-            let before = self.tabs[self.active_tab]
-                .terminal
-                .as_ref()
-                .map(|t| t.is_alt_screen_active())
-                .unwrap_or(false);
-            self.pump_pty();
-            self.process_messages();
-            let after = self.tabs[self.active_tab]
-                .terminal
-                .as_ref()
-                .map(|t| t.is_alt_screen_active())
-                .unwrap_or(false);
-            if before == after {
-                break;
-            }
-        }
+        // Drain anything already available. If the alt-screen sequence has
+        // not arrived yet, the transition route below queues this gesture and
+        // replays it from `process_messages` once parsing reaches alt screen.
+        self.pump_pty();
+        self.process_messages();
 
         // v1.2: If the scroll event is over the tab bar, adjust the tab bar
         // horizontal scroll offset instead of scrolling the terminal. This
@@ -5044,25 +5022,11 @@ impl App {
         // Short-lived immutable borrow to read the mode flags up-front —
         // avoids holding a long-lived mutable borrow of `terminal` across
         // later accesses to `block_scroll_offset`, `renderer`, etc.
-        let (mouse_protocol_active, alt_screen_active, block_view, mouse_protocol, sgr_mouse) = {
+        let tui_starting = self.tabs[self.active_tab].tui_scroll_window_active();
+        let (mouse_protocol_active, alt_screen_active, app_cursor_keys, mouse_protocol, sgr_mouse) = {
             let Some(t) = &self.tabs[self.active_tab].terminal else {
                 return;
             };
-            // v1.0 fix: while a command is executing (e.g. `less`/`vim`/`man`
-            // just launched), the block-view scroll branch must NOT capture the
-            // wheel. `show_block_view()` returns true whenever the shell is
-            // bootstrapped and we're not yet on the alt screen — but during the
-            // brief window before the app's `ESC[?1049h` is fully parsed,
-            // `alt_active` is still false and `show_block_view()` is true. That
-            // let the wheel fall into the block-scroll branch (mutating
-            // `block_scroll_offset`, which has no effect on the about-to-be-alt
-            // screen) instead of the alt-screen arrow-key branch — so the first
-            // scroll did nothing useful / showed garbled output until a mouse
-            // click forced a redraw that completed the alt-screen parse.
-            // Suppressing block_view during CommandExecuting routes the wheel
-            // correctly once the app takes over the screen.
-            let block_view =
-                t.show_block_view() && t.block_tracker().phase() != ShellPhase::CommandExecuting;
             // v1.0 fix: capture mouse_protocol here and sync it into the
             // InputHandler below (after this immutable borrow ends). Without
             // this sync, InputHandler.mouse_protocol stays `Off` forever (its
@@ -5076,14 +5040,15 @@ impl App {
             (
                 mp != MouseProtocol::Off,
                 t.is_alt_screen_active(),
-                block_view,
+                t.app_cursor_keys,
                 mp,
                 sgr,
             )
         };
-        // Apply the captured mouse_protocol + SGR-encoding flag to the
-        // InputHandler (deferred to avoid borrowing `terminal` and mutating
-        // `input_handler` at once).
+        // Apply all terminal-controlled input modes before encoding this
+        // gesture. Vim/less commonly enable DECCKM before the first wheel;
+        // using a stale default would emit CSI arrows instead of SS3 arrows.
+        self.tabs[self.active_tab].input_handler.app_cursor_keys = app_cursor_keys;
         self.tabs[self.active_tab].input_handler.mouse_protocol = mouse_protocol;
         self.tabs[self.active_tab].input_handler.sgr_mouse = sgr_mouse;
 
@@ -5115,6 +5080,41 @@ impl App {
             return;
         }
 
+        // A TUI launched from the editor can receive its first wheel gesture
+        // before the PTY reader has delivered/parsing has reached CSI ?1049h.
+        // Keep the gesture per-tab for one 50ms protocol grace period. It is
+        // encoded for the TUI if alternate screen arrives, otherwise it falls
+        // back to ordinary local viewport scrolling (so normal commands do not
+        // lose their first gesture during the two-second launch window).
+        if tui_starting && !alt_screen_active {
+            let up = match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
+                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
+            };
+            let rows = if up { lines as i32 } else { -(lines as i32) };
+            let pos = self.pixel_to_grid(x, y);
+            let mut m = Modifiers::empty();
+            if self.mods.state().shift_key() {
+                m |= Modifiers::SHIFT;
+            }
+            if self.mods.state().alt_key() {
+                m |= Modifiers::ALT;
+            }
+            if self.mods.state().control_key() {
+                m |= Modifiers::CONTROL;
+            }
+            if self.tabs[self.active_tab].queue_tui_scroll(rows, pos.col, pos.row, m) {
+                if let Some(delay) = self.tabs[self.active_tab].take_tui_scroll_wake_delay() {
+                    let proxy = self.proxy.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(delay);
+                        let _ = proxy.send_event(AppEvent::Wake);
+                    });
+                }
+                return;
+            }
+        }
+
         // Alt-screen apps (less, vim, man, etc.) don't use mouse protocol but
         // still benefit from wheel scroll: translate to Up/Down arrow key
         // sequences so the pager scrolls its content natively.
@@ -5141,11 +5141,28 @@ impl App {
             return;
         }
 
-        // Otherwise, scroll the terminal viewport
+        // Otherwise, scroll the terminal viewport.
         let up = match delta {
             winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
             winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
         };
+        let rows = if up { lines as i32 } else { -(lines as i32) };
+        self.scroll_local_view(rows);
+    }
+
+    /// Apply signed rows to the normal terminal/block viewport. Positive rows
+    /// move toward older content; negative rows move back toward the prompt.
+    fn scroll_local_view(&mut self, rows: i32) {
+        if rows == 0 {
+            return;
+        }
+        let up = rows > 0;
+        let lines = rows.unsigned_abs() as usize;
+        let block_view = self.tabs[self.active_tab]
+            .terminal
+            .as_ref()
+            .is_some_and(Terminal::show_block_view);
+
         // Block view uses a dedicated scroll offset (not grid.scroll_offset,
         // which is clamped to grid scrollback — the wrong proxy for block
         // content like headers/commands/separators).
@@ -5586,9 +5603,9 @@ impl ApplicationHandler<AppEvent> for App {
         // desyncs its cursor model from the grid (seen in claude: cursor/text
         // land offset from the drawn UI).
         let win_size = window.inner_size();
-        let init_rows =
-            ((win_size.height as f64) / renderer.cell_height() as f64).max(1.0) as usize;
-        let init_cols = ((win_size.width as f64) / renderer.cell_width() as f64).max(1.0) as usize;
+        let (init_rows, init_cols) = dimensions_for_renderer(&renderer, win_size, 0.0);
+        let init_rows = init_rows.max(1);
+        let init_cols = init_cols.max(1);
         self.spawn_pty(init_rows, init_cols);
         self.window = Some(window);
         self.renderer = Some(renderer);
@@ -5822,14 +5839,10 @@ impl ApplicationHandler<AppEvent> for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {
-                // Grid/PTY tracks the FULL window (the editor input box is an
-                // overlay, never a grid resize) — see grid_dims.
+                // Grid/PTY tracks the renderer's visible terminal content
+                // rectangle. The editor box is an overlay, but title/tab
+                // chrome is outside that rectangle and must be subtracted.
                 if let (Some(renderer), Some(window)) = (&mut self.renderer, &self.window) {
-                    let pad_x = renderer.padding_x() as f64;
-                    let pad_y = renderer.padding_y() as f64;
-                    // v1.2: tab bar is always rendered now (even single tab),
-                    // so always subtract its height from usable height.
-                    let tab_bar_h = renderer.tab_bar_height() as f64;
                     // v0.9 W5: subtract sidebar width when the panel is open so
                     // the grid reflows beside the sidebar (mirrors grid_dims).
                     let chrome_left = if self.panel_open {
@@ -5837,10 +5850,8 @@ impl ApplicationHandler<AppEvent> for App {
                     } else {
                         0.0
                     };
-                    let usable_w = physical_size.width as f64 - 2.0 * pad_x - chrome_left;
-                    let usable_h = (physical_size.height as f64 - 2.0 * pad_y - tab_bar_h).max(0.0);
-                    let new_cols = (usable_w / renderer.cell_width() as f64).max(0.0) as usize;
-                    let new_rows = (usable_h / renderer.cell_height() as f64).max(0.0) as usize;
+                    let (new_rows, new_cols) =
+                        dimensions_for_renderer(renderer, physical_size, chrome_left);
 
                     if new_cols > 0 && new_rows > 0 {
                         // Update renderer viewport immediately
@@ -5867,6 +5878,23 @@ impl ApplicationHandler<AppEvent> for App {
                         self.clamp_tab_scroll();
                         self.scroll_active_tab_into_view();
                     }
+                }
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Moving between Retina and non-Retina displays changes every
+                // physical metric used by the renderer: glyph cells, padding,
+                // title/tab chrome and sidebar width. Refresh those first,
+                // then recompute Grid/PTY dimensions from the same geometry.
+                // Winit follows this event with Resized on macOS; doing the
+                // recompute here also covers a retained physical inner size.
+                let padding = (self.config.window.padding_x, self.config.window.padding_y);
+                let changed = self
+                    .renderer
+                    .as_mut()
+                    .is_some_and(|renderer| renderer.update_scale(scale_factor, padding));
+                if changed {
+                    self.recompute_layout();
+                    self.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -6244,6 +6272,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Ime(ime_event) => {
                 match ime_event {
+                    winit::event::Ime::Enabled => {}
                     winit::event::Ime::Preedit(text, _cursor) => {
                         // v0.9 fix: when a modal input (find/palette/panel) is
                         // active, suppress the terminal preedit so the IME
@@ -6257,11 +6286,11 @@ impl ApplicationHandler<AppEvent> for App {
                     winit::event::Ime::Commit(text) => {
                         self.tabs[self.active_tab].ime_preedit.clear();
                         if !text.is_empty() {
-                            // v1.2 fix: record this commit so the immediately
-                            // following `KeyboardInput` event can detect the
-                            // duplicate and suppress its PTY write. On macOS
-                            // winit can deliver both events for the same key.
-                            self.last_ime_commit = Some((std::time::Instant::now(), text.clone()));
+                            tracing::debug!(
+                                tab = self.active_tab,
+                                len = text.len(),
+                                "routing fresh IME commit"
+                            );
                             // v0.9 fix: when the Find bar is open, IME
                             // committed text goes into the find query, not
                             // the shell editor / PTY. This lets CJK users
@@ -6339,9 +6368,10 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                     winit::event::Ime::Disabled => {
-                        self.tabs[self.active_tab].ime_preedit.clear();
+                        for tab in &mut self.tabs {
+                            tab.ime_preedit.clear();
+                        }
                     }
-                    _ => {}
                 }
             }
             WindowEvent::Focused(focused) => {
@@ -6349,6 +6379,8 @@ impl ApplicationHandler<AppEvent> for App {
                 if focused {
                     self.cursor_blink_on = true;
                     self.cursor_blink_time = std::time::Instant::now();
+                } else {
+                    self.reset_ime_context("window focus lost");
                 }
             }
             _ => {}

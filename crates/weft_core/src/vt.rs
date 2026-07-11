@@ -244,6 +244,13 @@ impl Terminal {
         )
     }
 
+    /// True between editor submission and the shell's OSC 133 `B` marker.
+    /// Input arriving in this short window belongs to the launched command,
+    /// not to the prompt/block view.
+    pub fn command_from_editor_pending(&self) -> bool {
+        self.command_from_editor.is_some()
+    }
+
     /// Whether the alternate screen buffer is currently active.
     pub fn is_alt_screen_active(&self) -> bool {
         self.alt_active
@@ -475,6 +482,13 @@ impl Terminal {
             if capturing {
                 self.block_tracker.on_print_ascii_run(chunk);
             }
+
+            // The contiguous ASCII overwrite can only split a pre-existing
+            // wide glyph at its two boundaries. Pairs fully inside the range
+            // are overwritten together, so repairing the first and last cell
+            // preserves the row invariant without adding per-cell overhead.
+            self.grid.viewport[row].clear_wide_pair_at(col);
+            self.grid.viewport[row].clear_wide_pair_at(col + count - 1);
 
             // Write cells — tight inner loop, no per-cell wrap/bounds check.
             {
@@ -827,6 +841,11 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
         .iter()
         .nth(idx)
         .and_then(|sub| sub.first().copied())
+        // vte represents an omitted CSI parameter as zero. ECMA-48 count
+        // parameters (CUU/CUD/IL/DL/ICH/DCH/ECH/SU/SD/CHT/CBT) define both
+        // omitted Ps and Ps=0 as their command default, normally 1. Commands
+        // where zero is meaningful pass `default == 0` and keep it unchanged.
+        .filter(|&value| value != 0 || default == 0)
         .unwrap_or(default)
 }
 
@@ -906,23 +925,9 @@ impl vte::Perform for Terminal {
             // Write on new line
             let new_row = self.grid.cursor.row;
             let new_col = self.grid.cursor.col;
+            self.grid.viewport[new_row].clear_wide_pair_at(new_col);
+            self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
             let cells = &mut self.grid.viewport[new_row].cells;
-            // v1.0 fix (CJK splat): clear any existing wide pair this write
-            // bisects (same as the main print path). See comments there.
-            let mut splat_dirty: Vec<usize> = Vec::with_capacity(4);
-            let ef = cells[new_col].flags;
-            let ew = cells[new_col].width;
-            if ef.contains(CellFlags::WIDE_SPACER) && new_col > 0 {
-                cells[new_col - 1].reset();
-                splat_dirty.push(new_col - 1);
-            }
-            if ew == CellWidth::Full
-                && new_col + 1 < num_cols
-                && cells[new_col + 1].flags.contains(CellFlags::WIDE_SPACER)
-            {
-                cells[new_col + 1].reset();
-                splat_dirty.push(new_col + 1);
-            }
             let cell = &mut cells[new_col];
             cell.character = c;
             cell.fg = self.attrs.fg;
@@ -943,12 +948,9 @@ impl vte::Perform for Terminal {
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
             }
-            splat_dirty.push(new_col);
+            self.grid.viewport[new_row].mark_dirty(new_col);
             if new_col + 1 < num_cols {
-                splat_dirty.push(new_col + 1);
-            }
-            for dc in splat_dirty {
-                self.grid.viewport[new_row].mark_dirty(dc);
+                self.grid.viewport[new_row].mark_dirty(new_col + 1);
             }
 
             self.grid.cursor.col = new_col + 2;
@@ -985,6 +987,10 @@ impl vte::Perform for Terminal {
         }
 
         {
+            self.grid.viewport[row].clear_wide_pair_at(col);
+            if width == CellWidth::Full {
+                self.grid.viewport[row].clear_wide_pair_at(col + 1);
+            }
             let cells = &mut self.grid.viewport[row].cells;
             // v1.0 fix (CJK splat): before writing a new char, clear any
             // existing wide-char pair that this write would bisect. Without
@@ -993,28 +999,6 @@ impl vte::Perform for Terminal {
             // as merged fragments and phantom spaces after a TUI app (vim)
             // scrolls via IL/DL and reprints shorter/different content. This
             // is the standard "wide splat" handling xterm/Alacritty perform.
-            // Collect columns to mark dirty afterwards (can't call mark_dirty
-            // while `cells` is mutably borrowed).
-            let mut splat_dirty: Vec<usize> = Vec::with_capacity(4);
-            let existing_flags = cells[col].flags;
-            let existing_width = cells[col].width;
-            // Case 1: target is a WIDE_SPACER (2nd cell of a pair) → reset the
-            // orphaned leading Full cell at col-1.
-            if existing_flags.contains(CellFlags::WIDE_SPACER) && col > 0 {
-                cells[col - 1].reset();
-                splat_dirty.push(col - 1);
-            }
-            // Case 2: target is the LEADING Full cell → reset its spacer at
-            // col+1 so it doesn't linger as a phantom space. (If the new char
-            // is also Full it reclaims col+1 below, so the reset is harmless.)
-            if existing_width == CellWidth::Full
-                && col + 1 < num_cols
-                && cells[col + 1].flags.contains(CellFlags::WIDE_SPACER)
-            {
-                cells[col + 1].reset();
-                splat_dirty.push(col + 1);
-            }
-
             let cell = &mut cells[col];
             cell.character = c;
             cell.fg = self.attrs.fg;
@@ -1042,15 +1026,9 @@ impl vte::Perform for Terminal {
                 spacer.flags = CellFlags::WIDE_SPACER;
                 spacer.width = CellWidth::Half;
             }
-            // Columns to mark dirty: the written cell, its spacer (if Full),
-            // and any splat-cleared cells.
-            splat_dirty.push(col);
+            self.grid.viewport[row].mark_dirty(col);
             if width == CellWidth::Full && col + 1 < num_cols {
-                splat_dirty.push(col + 1);
-            }
-            // Apply dirty marks after the cells borrow ends.
-            for dc in splat_dirty {
-                self.grid.viewport[row].mark_dirty(dc);
+                self.grid.viewport[row].mark_dirty(col + 1);
             }
         }
         self.grid.cursor.col += width as usize;
@@ -1299,9 +1277,9 @@ impl vte::Perform for Terminal {
 
             // Cursor style (DECSCUSR — CSI <n> q)
             'q' => {
-                if intermediates.is_empty() {
-                    // Only handle as DECSCUSR if it looks like "CSI N q"
-                    // (not a regular CSI q which is rare)
+                if intermediates.is_empty() || intermediates == [b' '] {
+                    // ECMA/DEC standard form is `CSI Ps SP q`; retain the
+                    // no-intermediate form for compatibility with older TUIs.
                     let style = param(params, 0, 0);
                     self.cursor_style = match style {
                         0 | 1 => CursorStyle::BlinkingBlock,
@@ -1536,6 +1514,26 @@ mod tests {
         Terminal::new(24, 80)
     }
 
+    fn assert_no_orphaned_wide_cells(t: &Terminal, row: usize) {
+        for col in 0..t.grid().num_cols {
+            let cell = t.grid().cell(row, col);
+            if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                assert!(col > 0);
+                assert_eq!(t.grid().cell(row, col - 1).width, CellWidth::Full);
+            }
+            if cell.width == CellWidth::Full {
+                assert!(col + 1 < t.grid().num_cols);
+                assert!(
+                    t.grid()
+                        .cell(row, col + 1)
+                        .flags
+                        .contains(CellFlags::WIDE_SPACER),
+                    "orphaned wide lead at {row}:{col}"
+                );
+            }
+        }
+    }
+
     // ── Print / basic ────────────────────────────────────────────
 
     #[test]
@@ -1546,6 +1544,132 @@ mod tests {
         assert_eq!(t.grid().cell(0, 1).character, 'e');
         assert_eq!(t.grid().cell(0, 4).character, 'o');
         assert_eq!(t.grid().cursor.col, 5);
+    }
+
+    #[test]
+    fn omitted_and_zero_csi_counts_use_one_for_movement_and_editing() {
+        // ECMA-48: for these commands an omitted Ps and Ps=0 both mean 1.
+        // vte exposes an omitted parameter as `[0]`, so the terminal must
+        // normalize it before dispatching to Grid.
+        for sequence in [b"\x1b[A".as_slice(), b"\x1b[0A".as_slice()] {
+            let mut t = Terminal::new(5, 8);
+            t.process(b"\x1b[3;3H");
+            t.process(sequence);
+            assert_eq!(t.grid().cursor.row, 1, "CUU must move one row");
+        }
+
+        for sequence in [b"\x1b[L".as_slice(), b"\x1b[0L".as_slice()] {
+            let mut t = Terminal::new(4, 8);
+            t.process(b"row0\r\nrow1\r\nrow2\r\nrow3");
+            t.process(b"\x1b[1;3r\x1b[1;1H");
+            t.process(sequence);
+            assert_eq!(t.grid().row_text(0), "", "IL must insert a blank row");
+            assert_eq!(t.grid().row_text(1), "row0", "IL must shift row 0 down");
+            assert_eq!(t.grid().row_text(2), "row1", "IL must clip at margin");
+            assert_eq!(t.grid().row_text(3), "row3", "IL must preserve status row");
+        }
+    }
+
+    #[test]
+    fn omitted_zero_and_explicit_one_match_for_all_csi_count_commands() {
+        fn snapshot(prefix: &[u8], action: char, parameter: &str) -> (Vec<String>, usize, usize) {
+            let mut t = Terminal::new(5, 12);
+            t.process(prefix);
+            t.process(format!("\x1b[{parameter}{action}").as_bytes());
+            let rows = (0..t.grid().num_rows)
+                .map(|row| t.grid().row_text(row))
+                .collect();
+            (rows, t.grid().cursor.row, t.grid().cursor.col)
+        }
+
+        let movement_prefix = b"\x1b[3;5H";
+        let edit_prefix = b"abcdefghij\x1b[1;4H";
+        let line_prefix = b"row0\r\nrow1\r\nrow2\r\nrow3\r\nrow4\x1b[2;1H";
+        let cases: &[(&[u8], char)] = &[
+            (movement_prefix, 'A'),
+            (movement_prefix, 'B'),
+            (movement_prefix, 'C'),
+            (movement_prefix, 'D'),
+            (movement_prefix, 'E'),
+            (movement_prefix, 'F'),
+            (movement_prefix, 'I'),
+            (movement_prefix, 'Z'),
+            (edit_prefix, '@'),
+            (edit_prefix, 'P'),
+            (edit_prefix, 'X'),
+            (line_prefix, 'L'),
+            (line_prefix, 'M'),
+            (line_prefix, 'S'),
+            (line_prefix, 'T'),
+        ];
+
+        for &(prefix, action) in cases {
+            let expected = snapshot(prefix, action, "1");
+            assert_eq!(
+                snapshot(prefix, action, ""),
+                expected,
+                "CSI {action} must default an omitted count to one"
+            );
+            assert_eq!(
+                snapshot(prefix, action, "0"),
+                expected,
+                "CSI 0{action} must default a zero count to one"
+            );
+        }
+    }
+
+    #[test]
+    fn vim_implicit_insert_line_does_not_leave_old_suffixes() {
+        let mut t = Terminal::new(6, 40);
+        t.process(b"\x1b[?1049h");
+        t.process(b"old line with a very long stale suffix\r\nsecond old row");
+
+        // Real Vim upward scrolling repeatedly uses DECSTBM + CUP + IL with
+        // no numeric parameter, then paints only the newly exposed line.
+        t.process(b"\x1b[1;5r\x1b[1;1H\x1b[L\x1b[1;6r\x1b[1;1Hnew");
+
+        assert_eq!(t.grid().row_text(0), "new");
+        assert_eq!(
+            t.grid().row_text(1),
+            "old line with a very long stale suffix"
+        );
+        assert_eq!(t.grid().row_text(5), "");
+    }
+
+    #[test]
+    fn less_search_prompt_and_repaint_sequence_updates_grid() {
+        let mut t = Terminal::new(6, 40);
+        t.process(b"\x1b[?1049h\x1b[6;1Hstatus line");
+
+        // Captured from less 668: it clears the prompt row, writes '/', then
+        // redraws every query character using BS + CSI K.
+        t.process(b"\r\x1b[K/\x1b[KG\x08G\x1b[Kr\x08r\x1b[Ki\x08i\x1b[Kd\x08d\x1b[K");
+        assert_eq!(t.grid().row_text(5), "/Grid");
+
+        // Enter clears the prompt and less repaints the result rows with CUP
+        // and EL. This verifies the VT/Grid side independently of macOS input.
+        t.process(b"\r\x1b[K\x1b[1;1H\x1b[Kmatched Grid row\x1b[6;1H:\x1b[K");
+        assert_eq!(t.grid().row_text(0), "matched Grid row");
+        assert_eq!(t.grid().row_text(5), ":");
+    }
+
+    #[test]
+    fn decscusr_accepts_standard_space_intermediate_and_legacy_form() {
+        let cases = [
+            (b"\x1b[1 q".as_slice(), CursorStyle::BlinkingBlock),
+            (b"\x1b[2 q".as_slice(), CursorStyle::Block),
+            (b"\x1b[3 q".as_slice(), CursorStyle::BlinkingUnderline),
+            (b"\x1b[4 q".as_slice(), CursorStyle::Underline),
+            (b"\x1b[5 q".as_slice(), CursorStyle::BlinkingBar),
+            (b"\x1b[6 q".as_slice(), CursorStyle::Bar),
+            // Keep accepting the no-intermediate form used by some TUIs.
+            (b"\x1b[1q".as_slice(), CursorStyle::BlinkingBlock),
+        ];
+        for (sequence, expected) in cases {
+            let mut t = term();
+            t.process(sequence);
+            assert_eq!(t.cursor_style, expected, "sequence={sequence:?}");
+        }
     }
 
     #[test]
@@ -1651,6 +1775,67 @@ mod tests {
         // The orphaned lead at col 0 must be reset (not '中').
         assert_eq!(t.grid().cell(0, 0).character, ' ');
         assert!(!t.grid().cell(0, 0).flags.contains(CellFlags::WIDE_SPACER));
+    }
+
+    #[test]
+    fn ascii_fast_path_clears_wide_pair_boundaries() {
+        // Keep CUP and the ASCII payload in separate process() calls so the
+        // payload takes print_ascii_run rather than vte::Perform::print.
+        let mut overwrite_lead = term();
+        overwrite_lead.process("中".as_bytes());
+        overwrite_lead.process(b"\x1b[1;1H");
+        overwrite_lead.process(b"A");
+        assert_no_orphaned_wide_cells(&overwrite_lead, 0);
+
+        let mut overwrite_spacer = term();
+        overwrite_spacer.process("中".as_bytes());
+        overwrite_spacer.process(b"\x1b[1;2H");
+        overwrite_spacer.process(b"B");
+        assert_no_orphaned_wide_cells(&overwrite_spacer, 0);
+        assert_eq!(overwrite_spacer.grid().cell(0, 0).character, ' ');
+    }
+
+    #[test]
+    fn wide_char_splat_clears_pair_overlapped_by_new_spacer() {
+        // A new full-width glyph occupies both its leading cell and the next
+        // spacer cell. If that second destination cell is itself the leading
+        // half of an older wide glyph, the older glyph's spacer must also be
+        // cleared. Vim can produce this one-column overlap while repainting
+        // shifted CJK rows after IL/DL.
+        let mut t = term();
+        t.process("A中".as_bytes()); // [0]=A, [1]=中, [2]=WIDE_SPACER
+        assert!(t.grid().cell(0, 2).flags.contains(CellFlags::WIDE_SPACER));
+
+        // CUP to col 1 and print 文 across [0,1], overwriting the old lead at
+        // [1]. The old spacer at [2] must not survive.
+        t.process(b"\x1b[1;1H");
+        t.process("文".as_bytes());
+
+        assert_eq!(t.grid().cell(0, 0).character, '文');
+        assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+        assert_eq!(t.grid().cell(0, 2).character, ' ');
+        assert!(
+            !t.grid().cell(0, 2).flags.contains(CellFlags::WIDE_SPACER),
+            "overlapped old wide glyph left an orphaned spacer"
+        );
+    }
+
+    #[test]
+    fn csi_character_edits_preserve_wide_cell_pairs() {
+        // Vim uses ECH/ICH/DCH and line erasure while repainting shifted rows.
+        // Each operation must preserve the full-width lead/spacer invariant.
+        let cases: &[&[u8]] = &[
+            b"\x1b[1;2H\x1b[K", // EL from the spacer
+            b"\x1b[1;1H\x1b[X", // ECH over the lead
+            b"\x1b[1;2H\x1b[@", // ICH between lead/spacer
+            b"\x1b[1;1H\x1b[P", // DCH deleting only the lead
+        ];
+        for edit in cases {
+            let mut t = term();
+            t.process("中A".as_bytes());
+            t.process(edit);
+            assert_no_orphaned_wide_cells(&t, 0);
+        }
     }
 
     #[test]
