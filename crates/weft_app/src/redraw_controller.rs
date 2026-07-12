@@ -322,6 +322,7 @@ impl App {
                 &overlays,
                 tab.block_scroll_offset,
                 scroll_metrics,
+                self.interaction.scrollbar_hovered || self.interaction.scrollbar_drag.is_some(),
                 &tab_bar,
             );
             // Flicker fix (Step 2): update the shared flag so the blink

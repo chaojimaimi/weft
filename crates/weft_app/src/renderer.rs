@@ -970,6 +970,7 @@ fragment float4 text_fragment(
         // v0.8 U6: block-content metrics (total_rows, visible_rows,
         // max_scroll) for the dynamic scrollbar thumb. None in grid view.
         scroll_metrics: Option<(usize, usize, usize)>,
+        scrollbar_emphasized: bool,
         // v0.9 H1: tab bar state. When tab_count > 1 the tab bar is drawn
         // at the top of the window and the content area is shifted down.
         tab_bar: &TabBarDrawState,
@@ -1376,7 +1377,13 @@ fragment float4 text_fragment(
                     ];
                     let (su, sv, suw, svh) = self.space_uv();
                     let bg_uv = [su, sv + svh, su + suw, sv];
-                    push_quad(&mut vertices, scrollbar.thumb, bg_uv, [0.0; 4], thumb_color);
+                    push_quad(
+                        &mut vertices,
+                        crate::scrollbar_component::visual_thumb(&scrollbar, scrollbar_emphasized),
+                        bg_uv,
+                        [0.0; 4],
+                        thumb_color,
+                    );
                 }
             }
         }
@@ -2707,10 +2714,10 @@ unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window, scale: f64
 ///
 /// Sets `NSWindowStyleMaskFullSizeContentView` (Metal layer extends under the
 /// titlebar), `titlebarAppearsTransparent` (no system titlebar chrome), and
-/// `titleVisibility:hidden` (no title text). `movableByWindowBackground` lets
-/// the user drag the window by any non-interactive background area (the tab
-/// bar's empty regions), matching Warp. The traffic-light buttons stay native
-/// and float over the Metal content at the top-left.
+/// `titleVisibility:hidden` (no title text). Window dragging is intentionally
+/// *not* enabled for the full Metal background: doing so lets AppKit steal
+/// scrollbar and terminal drags. The tab-bar controller explicitly calls
+/// winit's native `drag_window()` only for empty titlebar regions.
 ///
 /// Uses the typed `objc2-app-kit` `NSWindow` methods (safe functions) rather
 /// than raw `msg_send!` to avoid the nounwind-abort panic that disabled
@@ -2746,7 +2753,7 @@ pub fn configure_titlebar(window: &Window) {
         ns_window.setStyleMask(mask | NSWindowStyleMask::FullSizeContentView);
         ns_window.setTitlebarAppearsTransparent(true);
         ns_window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
-        ns_window.setMovableByWindowBackground(true);
+        ns_window.setMovableByWindowBackground(false);
     }));
 }
 

@@ -1124,7 +1124,7 @@ impl ApplicationHandler<AppEvent> for App {
         // Metal layer (so FullSizeContentView is in effect when the layer is
         // sized → it extends under the titlebar). configure_titlebar reaches
         // the NSWindow via the raw-window-handle AppKit handle and sets the
-        // style mask + transparency + movable-by-background.
+        // style mask + transparency; tab-bar empty space starts native drag.
         configure_titlebar(&window);
         // v1.1: Install the native macOS menu bar (Weft/File/Edit/View/Find/
         // Window). Runs on the main thread; replaces winit's default menu.

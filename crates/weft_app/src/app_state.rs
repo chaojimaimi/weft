@@ -128,6 +128,7 @@ pub struct InteractionState {
     pub popup_max_rows: usize,
     pub drag_state: Option<DragState>,
     pub scrollbar_drag: Option<crate::scrollbar_component::ScrollbarDragState>,
+    pub scrollbar_hovered: bool,
     pub context_menu: Option<ContextMenu>,
 }
 
@@ -142,6 +143,7 @@ impl InteractionState {
             popup_max_rows: 8,
             drag_state: None,
             scrollbar_drag: None,
+            scrollbar_hovered: false,
             context_menu: None,
         }
     }

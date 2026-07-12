@@ -149,7 +149,7 @@ impl App {
                     }
                     // v1.1: Click in the tab-bar background (not on any tab,
                     // not on the traffic lights). This is a draggable region
-                    // (movableByWindowBackground handles the drag). Detect a
+                    // (winit's native drag_window handles the drag). Detect a
                     // double-click here to toggle maximize, matching the macOS
                     // native titlebar double-click behavior.
                     let now = std::time::Instant::now();
@@ -166,6 +166,11 @@ impl App {
                         self.tab_bar.last_titlebar_click = None;
                     } else {
                         self.tab_bar.last_titlebar_click = Some(now);
+                        if let Some(window) = &self.window {
+                            if let Err(err) = window.drag_window() {
+                                tracing::warn!(?err, "native titlebar drag failed");
+                            }
+                        }
                     }
                     return;
                 }
@@ -230,12 +235,9 @@ impl App {
                 let yf = y as f32;
                 if crate::scrollbar_component::contains(layout.hit, xf, yf) {
                     let thumb_h = layout.thumb[3] - layout.thumb[1];
-                    let grab_offset = if crate::scrollbar_component::contains(layout.thumb, xf, yf)
-                    {
-                        yf - layout.thumb[1]
-                    } else {
-                        thumb_h / 2.0
-                    };
+                    let grab_offset =
+                        crate::scrollbar_component::thumb_grab_offset(&layout, xf, yf, true)
+                            .unwrap_or(thumb_h / 2.0);
                     let offset = crate::scrollbar_component::scroll_offset_for_pointer(
                         &layout,
                         yf,
@@ -247,6 +249,10 @@ impl App {
                             layout,
                             grab_offset,
                         });
+                    self.interaction.scrollbar_hovered = true;
+                    if let Some(window) = &self.window {
+                        window.set_cursor(winit::window::CursorIcon::NsResize);
+                    }
                     self.sessions.tabs[self.sessions.active_tab]
                         .selection_handler
                         .clear();

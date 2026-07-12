@@ -14,6 +14,19 @@ impl App {
         if button == winit::event::MouseButton::Left
             && self.interaction.scrollbar_drag.take().is_some()
         {
+            let hovered = self.active_scrollbar_layout().is_some_and(|layout| {
+                crate::scrollbar_component::contains(layout.hit, _x as f32, _y as f32)
+            });
+            self.interaction.scrollbar_hovered = hovered;
+            if let Some(window) = &self.window {
+                let icon = if hovered {
+                    winit::window::CursorIcon::NsResize
+                } else {
+                    winit::window::CursorIcon::Default
+                };
+                window.set_cursor(icon);
+            }
+            self.request_redraw();
             return;
         }
         if button == winit::event::MouseButton::Left && self.interaction.drag_state.is_some() {
@@ -57,6 +70,12 @@ impl App {
     /// Handle mouse movement.
     pub(super) fn handle_mouse_move(&mut self, x: f64, y: f64) {
         if let Some(drag) = self.interaction.scrollbar_drag {
+            if !self.interaction.scrollbar_hovered {
+                self.interaction.scrollbar_hovered = true;
+                if let Some(window) = &self.window {
+                    window.set_cursor(winit::window::CursorIcon::NsResize);
+                }
+            }
             let offset = crate::scrollbar_component::scroll_offset_for_pointer(
                 &drag.layout,
                 y as f32,
@@ -82,6 +101,22 @@ impl App {
         if let Some(drag) = self.interaction.drag_state.clone() {
             self.update_popup_drag(x, y, &drag);
             return;
+        }
+
+        let scrollbar_hovered = self.active_scrollbar_layout().is_some_and(|layout| {
+            crate::scrollbar_component::contains(layout.hit, x as f32, y as f32)
+        });
+        if scrollbar_hovered != self.interaction.scrollbar_hovered {
+            self.interaction.scrollbar_hovered = scrollbar_hovered;
+            if let Some(window) = &self.window {
+                let icon = if scrollbar_hovered {
+                    winit::window::CursorIcon::NsResize
+                } else {
+                    winit::window::CursorIcon::Default
+                };
+                window.set_cursor(icon);
+            }
+            self.request_redraw();
         }
 
         // v0.9 W1+: tab bar hover detection — show close "×" on the hovered

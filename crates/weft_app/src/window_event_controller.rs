@@ -120,6 +120,13 @@ impl App {
                 self.handle_mouse_move(position.x, position.y);
             }
             WindowEvent::CursorLeft { .. } => {
+                if self.interaction.scrollbar_hovered && self.interaction.scrollbar_drag.is_none() {
+                    self.interaction.scrollbar_hovered = false;
+                    if let Some(window) = &self.window {
+                        window.set_cursor(winit::window::CursorIcon::Default);
+                    }
+                    self.request_redraw();
+                }
                 if self.tab_bar.hovered_tab.is_some()
                     || self.tab_bar.plus_hovered
                     || self.tab_bar.arrow_left_hovered

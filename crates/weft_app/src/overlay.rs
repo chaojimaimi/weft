@@ -47,7 +47,7 @@ pub enum OverlayZ {
 /// How an overlay layer participates in keyboard/mouse input routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayInputPolicy {
-    /// No input interaction (e.g. scrollbar indicator).
+    /// No input interaction (for purely decorative overlays).
     None,
     /// Visible but doesn't intercept input (passive overlay).
     Passive,
