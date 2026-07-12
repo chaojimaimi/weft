@@ -273,13 +273,7 @@ impl App {
             }
         }
         if !drained_blocks.is_empty() {
-            if let Some(store) = &self.sessions.block_store {
-                for block in &drained_blocks {
-                    if let Err(e) = store.insert(block) {
-                        warn!(error = %e, "failed to persist block");
-                    }
-                }
-            }
+            self.persist_blocks(&drained_blocks);
         }
         if deferred_local_scroll != 0 {
             self.scroll_local_view(deferred_local_scroll);
@@ -331,7 +325,91 @@ impl App {
                     }
                 }
                 Effect::CopyClipboard { text } => clipboard_copy(&text),
+                Effect::PersistTabs => self.save_all_tabs(),
+                Effect::PersistBlocks { blocks } => self.persist_blocks(&blocks),
+                Effect::Paste { tab } => self.apply_paste(tab),
+                Effect::Exit => self.should_exit = true,
                 Effect::RequestRedraw => self.request_redraw(),
+            }
+        }
+    }
+
+    /// Persist a batch of drained command blocks to the BlockStore. Best-effort:
+    /// each failure is logged but does not abort the remaining inserts. Extracted
+    /// from `process_messages` so the same logic serves the `PersistBlocks` effect.
+    fn persist_blocks(&self, blocks: &[weft_core::blocks::Block]) {
+        let Some(store) = &self.sessions.block_store else {
+            return;
+        };
+        for block in blocks {
+            if let Err(e) = store.insert(block) {
+                warn!(error = %e, "failed to persist block");
+            }
+        }
+    }
+
+    /// Read the system clipboard (synchronous — NSPasteboard has AppKit main
+    /// thread affinity) and apply the text to `tab`. Editor mode inserts into
+    /// the prompt buffer; Passthrough forwards to the PTY with optional
+    /// bracketed-paste wrapping. Shared by `Effect::Paste` and the legacy
+    /// `Action::Paste` / find-bar Cmd+V paths.
+    fn apply_paste(&mut self, tab: usize) {
+        let Some(text) = clipboard_paste() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.apply_paste_text(tab, &text);
+    }
+
+    /// Apply already-read `text` to `tab` according to its input mode. Split
+    /// out so callers that already hold the clipboard text (e.g. the find bar
+    /// Cmd+V path) can skip the NSPasteboard round-trip.
+    fn apply_paste_text(&mut self, tab: usize, text: &str) {
+        let mode = self
+            .sessions
+            .tabs
+            .get(tab)
+            .and_then(|t| t.terminal.as_ref())
+            .map(|t| t.effective_input_mode())
+            .unwrap_or(weft_core::input::InputMode::Passthrough);
+
+        if mode == weft_core::input::InputMode::Editor {
+            // Editor takeover: paste into the input box. Multi-line text is
+            // split on \n (insert_char rejects control chars including \n,
+            // so we must drive split_newline explicitly to preserve line
+            // breaks). \r is dropped to handle CRLF paste from external apps.
+            if let Some(t) = self
+                .sessions
+                .tabs
+                .get_mut(tab)
+                .and_then(|tab| tab.terminal.as_mut())
+            {
+                let buf = &mut t.editor_mut().buffer;
+                for c in text.chars() {
+                    if c == '\n' {
+                        buf.split_newline();
+                    } else if c != '\r' {
+                        buf.insert_char(c);
+                    }
+                }
+            }
+            self.request_redraw();
+        } else {
+            // Passthrough: forward to the PTY.
+            let bracketed = self
+                .sessions
+                .tabs
+                .get(tab)
+                .and_then(|t| t.terminal.as_ref())
+                .map(|t| t.bracketed_paste)
+                .unwrap_or(false);
+            let bytes = encode_paste(text, bracketed);
+            if let Some(pty) = self.sessions.tabs.get(tab).and_then(|t| t.pty.as_ref()) {
+                if let Err(e) = pty.write_sync(&bytes) {
+                    warn!(error = %e, tab, "failed to paste to PTY");
+                }
             }
         }
     }
@@ -568,7 +646,9 @@ impl App {
                 true
             }
             Action::Paste => {
-                self.paste_from_clipboard();
+                self.drain_effects(vec![Effect::Paste {
+                    tab: self.sessions.active_tab,
+                }]);
                 true
             }
             Action::ReloadConfig => {
@@ -795,52 +875,7 @@ impl App {
     /// editor buffer. Passthrough mode forwards to the PTY as before (with
     /// bracketed-paste wrapping when the shell supports it).
     fn paste_from_clipboard(&mut self) {
-        let Some(text) = clipboard_paste() else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-
-        let mode = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()
-            .map(|t| t.effective_input_mode())
-            .unwrap_or(weft_core::input::InputMode::Passthrough);
-
-        if mode == weft_core::input::InputMode::Editor {
-            // Editor takeover: paste into the input box. Multi-line text is
-            // split on \n (insert_char rejects control chars including \n,
-            // so we must drive split_newline explicitly to preserve line
-            // breaks). \r is dropped to handle CRLF paste from external apps.
-            if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_mut()
-            {
-                let buf = &mut t.editor_mut().buffer;
-                for c in text.chars() {
-                    if c == '\n' {
-                        buf.split_newline();
-                    } else if c != '\r' {
-                        buf.insert_char(c);
-                    }
-                }
-            }
-            self.request_redraw();
-        } else {
-            // Passthrough: forward to the PTY.
-            let bracketed = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_ref()
-                .map(|t| t.bracketed_paste)
-                .unwrap_or(false);
-            let bytes = encode_paste(&text, bracketed);
-            if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
-                if let Err(e) = pty.write_sync(&bytes) {
-                    warn!("Failed to paste to PTY: {e}");
-                }
-            }
-        }
+        self.apply_paste(self.sessions.active_tab);
     }
 
     /// Update cursor blink state.

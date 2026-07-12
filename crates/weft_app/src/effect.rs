@@ -1,6 +1,11 @@
 //! Typed side effects emitted by input controllers.
+//!
+//! `PersistTabs` / `PersistBlocks` / `Exit` are consumed by `drain_effects`
+//! and will be emitted by SessionManager / lifecycle controllers once the
+//! A3 call-chain migration switches those paths to returning `Vec<Effect>`.
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)] // PersistTabs/PersistBlocks/Exit await SessionManager emit-site migration.
 pub(crate) enum Effect {
     WritePty {
         tab: usize,
@@ -20,6 +25,22 @@ pub(crate) enum Effect {
     CopyClipboard {
         text: String,
     },
+    /// Persist all live tab snapshots to the SQLite store (best-effort).
+    PersistTabs,
+    /// Persist a batch of command blocks to the BlockStore.
+    PersistBlocks {
+        blocks: Vec<weft_core::blocks::Block>,
+    },
+    /// Read the system clipboard and apply the text to `tab` (Editor inserts
+    /// into the prompt buffer; Passthrough writes to the PTY with optional
+    /// bracketed-paste wrapping). Synchronous on the main thread because
+    /// NSPasteboard has AppKit thread affinity.
+    Paste {
+        tab: usize,
+    },
+    /// Request application exit. Sets `should_exit`; the actual
+    /// `event_loop.exit()` still happens in the winit callback tail.
+    Exit,
     RequestRedraw,
 }
 
