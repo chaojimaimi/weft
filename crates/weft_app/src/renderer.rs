@@ -29,7 +29,7 @@ use weft_core::vt::Terminal;
 /// yielded `String` fits within `cols` columns (respecting wide-char widths).
 /// The first yielded chunk is the top row, subsequent chunks are continuation
 /// rows below it.
-fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
+pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
     let mut chunks: Vec<String> = Vec::new();
     if cols == 0 {
         chunks.push(text.to_string());
@@ -66,42 +66,42 @@ fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
 
 /// Pre-computed wrapping data for a single output line of a block.
 #[derive(Clone)]
-struct CachedLine {
+pub(crate) struct CachedLine {
     /// 0-based line index within the block's output (before trimming).
-    idx: usize,
+    pub(crate) idx: usize,
     /// Byte offset of this line's start within `block.output`.
-    byte_start: usize,
+    pub(crate) byte_start: usize,
     /// Byte offset of this line's end (exclusive) within `block.output`.
-    byte_end: usize,
+    pub(crate) byte_end: usize,
     /// Pre-wrapped chunks (owned via `Rc` for cheap sharing between the
     /// cache and the per-frame `LaidRow` entries). Usually 1 element;
     /// more for lines that exceed `cols` columns.
-    chunks: Rc<[String]>,
+    pub(crate) chunks: Rc<[String]>,
 }
 
 /// Cached layout for a single finished block.
 #[derive(Clone)]
-struct CachedBlockLayout {
+pub(crate) struct CachedBlockLayout {
     /// Snapshot of `block.output.len()` — if the current block's output
     /// length differs, the cache is stale.
-    output_len: usize,
+    pub(crate) output_len: usize,
     /// Snapshot of `block.command.len()`.
-    command_len: usize,
+    pub(crate) command_len: usize,
     /// Snapshot of `block.collapsed` — toggling invalidates.
-    collapsed: bool,
+    pub(crate) collapsed: bool,
     /// `cols` used to compute wrapping — resize invalidates.
-    cols: usize,
+    pub(crate) cols: usize,
     /// Whether the block has any non-empty output lines (cached foldable
     /// check, avoids re-scanning the last 500 lines every frame).
-    foldable: bool,
+    pub(crate) foldable: bool,
     /// Pre-trimmed, pre-wrapped line metadata. Trailing empty/prompt lines
     /// are already removed, matching the original trimming logic.
-    lines: Vec<CachedLine>,
+    pub(crate) lines: Vec<CachedLine>,
 }
 
 /// Per-renderer block layout cache. Keyed by `BlockId.0`.
 #[derive(Default)]
-struct BlockLayoutCache {
+pub(crate) struct BlockLayoutCache {
     entries: HashMap<u64, CachedBlockLayout>,
 }
 
@@ -109,7 +109,7 @@ impl BlockLayoutCache {
     /// Ensure `block` has a cached layout for `cols`. Recomputes only if
     /// the block is new, its output/command changed, `collapsed` was
     /// toggled, or `cols` changed (resize).
-    fn ensure_cached(&mut self, block: &Block, cols: usize) {
+    pub(crate) fn ensure_cached(&mut self, block: &Block, cols: usize) {
         let id = block.id.0;
         let needs_rebuild = match self.entries.get(&id) {
             None => true,
@@ -125,7 +125,7 @@ impl BlockLayoutCache {
         }
     }
 
-    fn get(&self, id: u64) -> &CachedBlockLayout {
+    pub(crate) fn get(&self, id: u64) -> &CachedBlockLayout {
         self.entries
             .get(&id)
             .expect("ensure_cached must be called before get")
@@ -252,7 +252,7 @@ pub struct MetalRenderer {
     /// Uses `RefCell` because `draw()` holds an immutable borrow of
     /// `self.layer` (from `next_drawable`) across the entire frame, so
     /// `&mut self` is unavailable for cache mutation.
-    block_layout_cache: RefCell<BlockLayoutCache>,
+    pub(crate) block_layout_cache: RefCell<BlockLayoutCache>,
     /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
     /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
     /// the previous frame. Eliminates per-frame iteration of all
@@ -1275,12 +1275,14 @@ fragment float4 text_fragment(
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
                 let box_top_y = (vp_h - pad_y - box_h).max(0.0);
                 self.build_block_view_vertices(
-                    terminal.block_tracker().session_blocks(),
-                    box_top_y,
-                    p.cwd,
-                    terminal.git_branch(),
-                    None,
-                    block_scroll,
+                    crate::paint::block_view_model::BlockViewPaintModel {
+                        blocks: terminal.block_tracker().session_blocks(),
+                        region_bottom_y: box_top_y,
+                        cwd: p.cwd,
+                        git_branch: terminal.git_branch(),
+                        live: None,
+                        block_scroll,
+                    },
                     selection,
                 )
             } else {
@@ -1290,12 +1292,14 @@ fragment float4 text_fragment(
                 // in-flight block's captured output, so the history never
                 // reverts to raw and isn't squeezed by the grid cursor.
                 self.build_block_view_vertices(
-                    terminal.block_tracker().session_blocks(),
-                    vp_h - pad_y,
-                    None,
-                    terminal.git_branch(),
-                    terminal.block_tracker().in_flight(),
-                    block_scroll,
+                    crate::paint::block_view_model::BlockViewPaintModel {
+                        blocks: terminal.block_tracker().session_blocks(),
+                        region_bottom_y: vp_h - pad_y,
+                        cwd: None,
+                        git_branch: terminal.git_branch(),
+                        live: terminal.block_tracker().in_flight(),
+                        block_scroll,
+                    },
                     selection,
                 )
             };
@@ -2463,816 +2467,12 @@ fragment float4 text_fragment(
         verts
     }
 
-    /// Warp-style block history. `region_bottom_y` is the bottom edge of the
-    /// block region (top of the input box in editor mode, or the screen bottom
-    /// in CommandExecuting). The opaque bg covers `[0, region_bottom_y]`.
-    /// `cwd`, when `Some` and no `live` block, draws the persistent cwd line
-    /// (editor mode) with a divider ABOVE it (cwd grouped with the input box).
-    /// `live`, when `Some` (CommandExecuting), draws the in-flight command's
-    /// streaming output at the bottom — so a long-running command (interactive
-    /// `sudo su`) keeps the full history above it instead of reverting to raw.
-    #[allow(clippy::too_many_arguments)]
-    fn build_block_view_vertices(
-        &self,
-        blocks: &[Block],
-        region_bottom_y: f32,
-        cwd: Option<&str>,
-        git_branch: Option<&str>,
-        live: Option<weft_core::blocks::InFlightBlock<'_>>,
-        block_scroll: usize,
-        selection: &mut weft_core::selection::SelectionHandler,
-    ) -> (
-        Vec<f32>,
-        Vec<crate::overlay::HitRegion>,
-        Vec<weft_core::selection::BlockViewRow>,
-    ) {
-        let mut verts = Vec::new();
-        let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
-        let mut bv_rows: Vec<weft_core::selection::BlockViewRow> = Vec::new();
-        let cw = self.cell_width() as f32;
-        let ch = self.cell_height() as f32;
-        let vp_w = self.viewport.0;
-        let vp_h = self.viewport.1;
-        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (verts, hit_regions, bv_rows);
-        }
-
-        let theme_bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
-        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
-        // accent_dim is too close to bg in Nord/Warp themes, making prompt
-        // marks (❯), chevrons, and dim text invisible. label_c is always
-        // readable across all themes.
-        let prompt_c = [
-            fg[0] * 0.70 + theme_bg[0] * 0.30,
-            fg[1] * 0.70 + theme_bg[1] * 0.30,
-            fg[2] * 0.70 + theme_bg[2] * 0.30,
-            1.0,
-        ];
-        let dim = prompt_c;
-        // Block separator: theme.separator (barely-visible warm dark).
-        let separator = color_to_normalized(self.theme.separator);
-        let (su, sv, suw, svh) = self.space_uv();
-        let bg_uv = [su, sv + svh, su + suw, sv];
-
-        // v0.8 stage 4: layout (pitch, left/right/cols, clip region, fixed
-        // CWD line position) is computed by the pure function in `layout.rs`.
-        // The renderer keeps responsibility for vertex building, theming,
-        // and text rasterization. Per-row Y is data-driven (each row's
-        // distance accumulates from the cumulative output line count of all
-        // blocks below it), so it stays in the renderer's render loop.
-        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let cwd_header_active = cwd.is_some() && live.is_none();
-        let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
-        let pitch = layout.pitch;
-        let left = layout.left;
-        let right = layout.right;
-        let cols = layout.cols;
-        let content_bottom_y = layout.clip_bottom;
-
-        // Background fill for the block region.
-        push_quad(
-            &mut verts,
-            [0.0, 0.0, vp_w, region_bottom_y.max(0.0)],
-            bg_uv,
-            [0.0; 4],
-            theme_bg,
-        );
-
-        // ── Fixed bottom area: CWD header (Editor mode) ──────────────────
-        //
-        // In Editor mode the CWD line + divider is pinned to the bottom of
-        // the block region (directly above the input box). It NEVER scrolls —
-        // it's grouped with the input box, not with the scrollable history.
-        //
-        // The scrollable content area starts ABOVE this fixed CWD line.
-        if let Some(cwd) = cwd {
-            if live.is_none() {
-                let fixed_y = layout.fixed_cwd_y;
-                // Divider line.
-                push_quad(
-                    &mut verts,
-                    [left, fixed_y, right, fixed_y + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-                // CWD text (+ optional git branch).
-                let display = abbreviate_path(cwd);
-                let display = if let Some(b) = git_branch {
-                    format!("{display} git:({b})")
-                } else {
-                    display
-                };
-                if !display.is_empty() {
-                    self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
-                }
-            }
-        }
-
-        // ── Phase 1: Pre-layout scrollable content rows ──────────────────
-        //
-        // Flatten every history row into a list with its y-distance from
-        // `content_bottom_y`. Scrolling applies a pixel offset so the entire
-        // content slides as a unit (matching Warp). Only rows within the clip
-        // region are rendered — no blank space.
-
-        enum LaidRow<'a> {
-            Output {
-                text: &'a str,
-                /// v1.0 P0-a: pre-wrapped chunks (from cache for historical
-                /// blocks, freshly computed for live blocks). Avoids calling
-                /// `wrap_line_chunks` per row in the pre-pass + render loop.
-                chunks: Rc<[String]>,
-                block_id: Option<BlockId>,
-                line: usize,
-            },
-            Command {
-                command: &'a str,
-                collapsed: bool,
-                foldable: bool,
-                block_id: BlockId,
-            },
-            Header {
-                text: String,
-            },
-            Separator,
-            LiveCommand {
-                command: &'a str,
-            },
-            /// v1.0: Warp-style clear spacer — viewport-height blank gap
-            /// inserted before a `clear` block so the cleared prompt appears
-            /// at the top of a fresh "page" while history remains scrollable.
-            Blank,
-        }
-
-        let mut rows: Vec<f32> = Vec::new();
-        let mut row_data: Vec<LaidRow> = Vec::new();
-        let mut cursor_dist = 0.0;
-
-        // Bottom of scrollable content: live block (CommandExecuting) or
-        // nothing (Editor mode — CWD is already handled above).
-        if let Some(live) = live {
-            // Live block: line numbers start from 0 in the live output.
-            // Collect to Vec first because std::str::Lines doesn't impl
-            // DoubleEndedIterator (can't .rev() directly).
-            //
-            // v0.9 fix: cap the number of lines we layout per frame to avoid
-            // O(n) slowdown when a command produces huge output (e.g. 20K
-            // lines from a for-loop). Only the tail is visible anyway — older
-            // lines have scrolled off the top of the clip region.
-            const MAX_LAYOUT_LINES_LIVE: usize = 2000;
-            let all_lines: Vec<&str> = live.output.lines().collect();
-            let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
-            let live_lines: Vec<&str> = all_lines[skip..].to_vec();
-            let base_idx = skip;
-            for (i, line) in live_lines.iter().enumerate().rev() {
-                let line_idx = base_idx + i;
-                let chunks: Rc<[String]> =
-                    Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
-                let vis_rows = chunks.len();
-                cursor_dist += vis_rows as f32 * pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Output {
-                    text: line,
-                    chunks,
-                    block_id: None,
-                    line: line_idx,
-                });
-            }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::LiveCommand {
-                command: live.command,
-            });
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Separator);
-        }
-
-        // v1.0 P0-a: Ensure all historical blocks have a cached layout for
-        // the current `cols`. This is the only place the cache is mutated
-        // per frame — each block is recomputed only if its content/collapse
-        // state changed or `cols` changed (resize). Eliminates the
-        // O(total_output_chars) per-frame wrapping cost.
-        //
-        // Uses `borrow_mut()` (scoped) because `draw()` holds an immutable
-        // borrow of `self.layer` — `RefCell` provides interior mutability.
-        {
-            let mut cache = self.block_layout_cache.borrow_mut();
-            for b in blocks.iter() {
-                cache.ensure_cached(b, cols);
-            }
-        }
-
-        // Read cached layouts (immutable borrow, scoped to this loop).
-        // The `Rc<[String]>` chunks are cloned (refcount bump) into
-        // `row_data`, so the `Ref` can be dropped before the render loop.
-        {
-            let cache = self.block_layout_cache.borrow();
-            for b in blocks.iter().rev() {
-                let cached = cache.get(b.id.0);
-                if !b.collapsed {
-                    for line in cached.lines.iter().rev() {
-                        let text = &b.output[line.byte_start..line.byte_end];
-                        let vis_rows = line.chunks.len();
-                        cursor_dist += vis_rows as f32 * pitch;
-                        rows.push(cursor_dist);
-                        row_data.push(LaidRow::Output {
-                            text,
-                            chunks: Rc::clone(&line.chunks),
-                            block_id: Some(b.id),
-                            line: line.idx,
-                        });
-                    }
-                }
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Command {
-                    command: &b.command,
-                    collapsed: b.collapsed,
-                    foldable: cached.foldable,
-                    block_id: b.id,
-                });
-                let dur = block_duration_str(b);
-                let bcwd = b
-                    .cwd
-                    .as_deref()
-                    .map(abbreviate_path)
-                    .unwrap_or_else(|| "~".to_string());
-                let header = if dur.is_empty() {
-                    bcwd
-                } else {
-                    format!("{bcwd} ({dur})")
-                };
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Header { text: header });
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Separator);
-                // v1.0: Warp-style clear — insert a viewport-height blank
-                // gap above this block so it starts a fresh "page". History
-                // above remains reachable by scrolling up. We detect `clear`
-                // by the first whitespace token (matches `clear`, `clear;`,
-                // `clear && foo`, but not `clearance` / `echo clear`).
-                if b.command.split_whitespace().next() == Some("clear") {
-                    cursor_dist += vp_h;
-                    rows.push(cursor_dist);
-                    row_data.push(LaidRow::Blank);
-                }
-            }
-        }
-
-        // ── Phase 2: Render scrollable content with offset ───────────────
-
-        let scroll_px = (block_scroll as f32) * pitch;
-        let clip_top = layout.clip_top;
-        let clip_bottom = content_bottom_y;
-
-        // Track the block whose content is at the top of the viewport (for
-        // the sticky header). We record the topmost visible block's command
-        // and cwd as we render.
-        let mut topmost_block_info: Option<(String, String)> = None;
-
-        // Selection highlight: for a given row mid-y, look up the char range
-        // (in that row's text) that falls inside the active block-view
-        // selection. Returns None if the y is outside the selection. The
-        // snapshot rows share y-bands with this frame's layout (cloned at
-        // drag start); we key on y-band rather than a global index so wrapped
-        // multi-chunk Output rows highlight correctly per chunk.
-        let selection_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let bg = color_to_normalized(self.theme.background);
-            let mut c = [
-                accent[0] * 0.35 + bg[0] * 0.65,
-                accent[1] * 0.35 + bg[1] * 0.65,
-                accent[2] * 0.35 + bg[2] * 0.65,
-                1.0,
-            ];
-            c[3] = 0.60;
-            c
-        };
-        // Pre-pass: build bv_rows (y-bands + text) WITHOUT rendering, so we
-        // can sync the selection's row snapshot to the current frame before
-        // drawing highlights. This fixes the "selection stays at fixed screen
-        // position on scroll" bug — the snapshot's y-bands are refreshed to
-        // the current frame's layout, so the highlight tracks the content.
-        // NOTE: we do NOT clip here (unlike the render loop below). Including
-        // off-screen rows means sync_rows can always find a match by
-        // (block_id, text, kind) even when the selection spans content that
-        // has scrolled out of the viewport — without this, the proportional
-        // fallback would mis-map row_index and the highlight would jump to
-        // the wrong row.
-        for (i, &dist) in rows.iter().enumerate() {
-            let row_top_y = content_bottom_y - dist + scroll_px;
-            let row_bottom_y = row_top_y + pitch;
-            let _ = row_bottom_y; // unused (no clip in pre-pass)
-            let y = row_top_y;
-            match &row_data[i] {
-                LaidRow::Output {
-                    text,
-                    chunks,
-                    block_id,
-                    line: _,
-                } => {
-                    if chunks.len() <= 1 {
-                        bv_rows.push(weft_core::selection::BlockViewRow {
-                            kind: weft_core::selection::BlockViewRowKind::Output,
-                            text: text.to_string(),
-                            block_id: *block_id,
-                            y_top: y,
-                            y_bottom: y + pitch,
-                        });
-                    } else {
-                        for (ci, chunk) in chunks.iter().enumerate() {
-                            let cy = y + ci as f32 * pitch;
-                            bv_rows.push(weft_core::selection::BlockViewRow {
-                                kind: weft_core::selection::BlockViewRowKind::Output,
-                                text: chunk.clone(),
-                                block_id: *block_id,
-                                y_top: cy,
-                                y_bottom: cy + pitch,
-                            });
-                        }
-                    }
-                }
-                LaidRow::Command {
-                    command, block_id, ..
-                } => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Command,
-                        text: command.to_string(),
-                        block_id: Some(*block_id),
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
-                }
-                LaidRow::Header { text: _ } => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Header,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
-                }
-                LaidRow::Separator => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Separator,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
-                }
-                LaidRow::LiveCommand { command } => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::LiveCommand,
-                        text: command.to_string(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                    });
-                }
-                LaidRow::Blank => {
-                    // No selectable content; skip (selection can't land here).
-                }
-            }
-        }
-        // Sync the selection's row snapshot to the current frame's bv_rows.
-        // This remaps start/end row_index by matching (block_id, text, kind),
-        // so the highlight scrolls WITH the content instead of staying pinned
-        // to a stale screen y-position.
-        if let Some(sel) = selection.block_view_selection.as_mut() {
-            sel.sync_rows(bv_rows.clone());
-        }
-        // NOTE: we intentionally do NOT clear bv_rows here. The pre-pass above
-        // built the UNCLIPPED row list (visible + off-screen rows). The render
-        // loop below used to rebuild a CLIPPED version for hit-testing, but
-        // that created an index mismatch: sync_rows remaps the selection's
-        // row_index into the UNCLIPPED array, while the hit-test
-        // (pixel_to_block_view_pos) returned indices into the CLIPPED array.
-        // During a drag, extend_block_view received CLIPPED indices but the
-        // snapshot was UNCLIPPED — producing a wrong range. Using UNCLIPPED
-        // for both sync_rows AND hit-test keeps the indices consistent.
-        // The render loop no longer pushes to bv_rows (the pre-pass already
-        // has every row with the correct y-band + text).
-        // Re-borrow after the mutable sync above.
-        let sel_bv = selection.block_view_selection.as_ref();
-        // Find highlight for block view: (block_id, line, is_command, col, len).
-        let find_block_highlight = self.find_state.as_ref().and_then(|f| f.block_highlight);
-        let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
-            let s = sel_bv?;
-            let snap_idx = s.rows.iter().position(|r| r.contains_y(row_mid_y))?;
-            let top = s.start.row_index.max(s.end.row_index);
-            let bottom = s.start.row_index.min(s.end.row_index);
-            if snap_idx < bottom || snap_idx > top {
-                return None;
-            }
-            let max_char = s.rows[snap_idx].text.chars().count();
-            let (c_start, c_end) = if top == bottom {
-                let lo = s.start.char_index.min(s.end.char_index).min(max_char);
-                let hi = s.start.char_index.max(s.end.char_index).min(max_char);
-                (lo, hi)
-            } else if snap_idx == top {
-                // Top boundary: tail of row [anchor, max). Matches the text
-                // extraction in BlockViewSelection::text() — drag starts at
-                // the anchor and extends downward, so the top row contributes
-                // its tail, not its head.
-                let anchor = if s.start.row_index >= s.end.row_index {
-                    s.start.char_index
-                } else {
-                    s.end.char_index
-                };
-                (anchor.min(max_char), max_char)
-            } else if snap_idx == bottom {
-                // Bottom boundary: head of row [0, anchor).
-                let anchor = if s.start.row_index >= s.end.row_index {
-                    s.end.char_index
-                } else {
-                    s.start.char_index
-                };
-                (0, anchor.min(max_char))
-            } else {
-                (0, max_char)
-            };
-            (c_end > c_start).then_some((c_start, c_end))
-        };
-        // True if a row band (mid-y) falls inside the selection's row range,
-        // regardless of whether the row carries selectable text. Used to
-        // fill Header/Separator rows with the selection color so the
-        // highlight reads as a continuous band instead of broken segments.
-        let row_in_selection = |row_mid_y: f32| -> bool {
-            let Some(s) = sel_bv else { return false };
-            let Some(snap_idx) = s.rows.iter().position(|r| r.contains_y(row_mid_y)) else {
-                return false;
-            };
-            let top = s.start.row_index.max(s.end.row_index);
-            let bottom = s.start.row_index.min(s.end.row_index);
-            snap_idx >= bottom && snap_idx <= top
-        };
-
-        for (i, &dist) in rows.iter().enumerate() {
-            let row_top_y = content_bottom_y - dist + scroll_px;
-            let row_bottom_y = row_top_y + pitch;
-
-            if row_bottom_y < clip_top || row_top_y > clip_bottom {
-                continue;
-            }
-
-            let y = row_top_y;
-
-            match &row_data[i] {
-                LaidRow::Output {
-                    text,
-                    chunks,
-                    block_id,
-                    line,
-                } => {
-                    if chunks.len() <= 1 {
-                        // Selection highlight (under the text).
-                        if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
-                            self.push_block_view_highlight(
-                                &mut verts,
-                                left,
-                                y,
-                                ch,
-                                text,
-                                cs,
-                                ce,
-                                selection_bg,
-                                bg_uv,
-                            );
-                        }
-                        // Find highlight: if this row matches the current
-                        // block match, draw a yellow highlight at (col, len).
-                        if let Some(bh) = find_block_highlight {
-                            if bh.0 == block_id.map(|b| b.0).unwrap_or(0) && bh.1 == *line && !bh.2
-                            {
-                                let hx0 = left + bh.3 as f32 * cw;
-                                let hx1 = hx0 + bh.4 as f32 * cw;
-                                let hl_bg = [0.95, 0.78, 0.20, 0.50];
-                                push_quad(
-                                    &mut verts,
-                                    [hx0, y, hx1, y + ch],
-                                    bg_uv,
-                                    [0.0; 4],
-                                    hl_bg,
-                                );
-                            }
-                        }
-                        self.push_text(&mut verts, left, y, text, fg, cols);
-                        // bv_rows entry is built by the pre-pass (UNCLIPPED).
-                    } else {
-                        for (ci, chunk) in chunks.iter().enumerate() {
-                            let cy = y + ci as f32 * pitch;
-                            if cy + ch > clip_top && cy < clip_bottom {
-                                if let Some((cs, ce)) = sel_range_for_y(cy + pitch * 0.5) {
-                                    self.push_block_view_highlight(
-                                        &mut verts,
-                                        left,
-                                        cy,
-                                        ch,
-                                        chunk,
-                                        cs,
-                                        ce,
-                                        selection_bg,
-                                        bg_uv,
-                                    );
-                                }
-                                // Find highlight for wrapped chunks: only
-                                // highlight on the first chunk (col is relative
-                                // to the original line).
-                                if ci == 0 {
-                                    if let Some(bh) = find_block_highlight {
-                                        if bh.0 == block_id.map(|b| b.0).unwrap_or(0)
-                                            && bh.1 == *line
-                                            && !bh.2
-                                        {
-                                            let hx0 = left + bh.3 as f32 * cw;
-                                            let hx1 = hx0 + bh.4 as f32 * cw;
-                                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
-                                            push_quad(
-                                                &mut verts,
-                                                [hx0, cy, hx1, cy + ch],
-                                                bg_uv,
-                                                [0.0; 4],
-                                                hl_bg,
-                                            );
-                                        }
-                                    }
-                                }
-                                self.push_text(&mut verts, left, cy, chunk, fg, cols);
-                            }
-                            // Wrapped chunk's bv_rows entry is in the pre-pass.
-                        }
-                    }
-                }
-                LaidRow::Command {
-                    command,
-                    collapsed,
-                    foldable,
-                    block_id,
-                } => {
-                    let (chev_w, avail_sub) = if *foldable {
-                        let chev = if *collapsed { "▸" } else { "▾" };
-                        self.push_text(&mut verts, left, y, chev, prompt_c, cols);
-                        (cw, 3)
-                    } else {
-                        (0.0, 2)
-                    };
-                    self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
-                    let cmd_x = left + chev_w + 2.0 * cw;
-                    let avail = cols.saturating_sub(avail_sub).max(1);
-                    // Selection highlight under the command text (excludes the
-                    // chevron/❯ prefix — those aren't part of the copyable text).
-                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
-                        self.push_block_view_highlight(
-                            &mut verts,
-                            cmd_x,
-                            y,
-                            ch,
-                            command,
-                            cs,
-                            ce,
-                            selection_bg,
-                            bg_uv,
-                        );
-                    }
-                    // Find highlight on command text.
-                    if let Some(bh) = find_block_highlight {
-                        if bh.0 == block_id.0 && bh.2 {
-                            let hx0 = cmd_x + bh.3 as f32 * cw;
-                            let hx1 = hx0 + bh.4 as f32 * cw;
-                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
-                            push_quad(&mut verts, [hx0, y, hx1, y + ch], bg_uv, [0.0; 4], hl_bg);
-                        }
-                    }
-                    // v0.9 fix: strip prompt prefix for display consistency.
-                    let cleaned_cmd = strip_prompt_prefix(command);
-                    self.push_line_tokenized(&mut verts, cmd_x, y, &cleaned_cmd, avail);
-                    if *foldable {
-                        // v0.9 (revised): the fold hit region covers only the
-                        // chevron cell, not the whole command line — so the
-                        // rest of the line can be click-drag-selected for copy.
-                        hit_regions.push(crate::overlay::HitRegion {
-                            x0: left,
-                            y0: y,
-                            x1: left + cw,
-                            y1: y + pitch,
-                            target: crate::overlay::HitTarget::BlockFold(*block_id),
-                        });
-                    }
-                    // Command row's bv_rows entry is in the pre-pass.
-                }
-                LaidRow::Header { text } => {
-                    // Fill the row band with selection color when this Header
-                    // row sits inside the active selection — otherwise the
-                    // highlight reads as broken segments between Command
-                    // and Output rows (Header isn't selectable, so
-                    // sel_range_for_y returns None here).
-                    if row_in_selection(y + pitch * 0.5) {
-                        push_quad(
-                            &mut verts,
-                            [left, y, right, y + pitch],
-                            bg_uv,
-                            [0.0; 4],
-                            selection_bg,
-                        );
-                    }
-                    self.push_text(&mut verts, left, y, text, dim, cols);
-                    // Header's bv_rows entry is in the pre-pass.
-                }
-                LaidRow::Separator => {
-                    if row_in_selection(y + pitch * 0.5) {
-                        push_quad(
-                            &mut verts,
-                            [left, y, right, y + pitch],
-                            bg_uv,
-                            [0.0; 4],
-                            selection_bg,
-                        );
-                    }
-                    let ly = y + pitch * 0.5;
-                    push_quad(
-                        &mut verts,
-                        [left, ly, right, ly + 1.5],
-                        bg_uv,
-                        [0.0; 4],
-                        separator,
-                    );
-                    // Separator's bv_rows entry is in the pre-pass.
-                }
-                LaidRow::LiveCommand { command } => {
-                    self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
-                    let cmd_x = left + 2.0 * cw;
-                    let avail = cols.saturating_sub(2).max(1);
-                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
-                        self.push_block_view_highlight(
-                            &mut verts,
-                            cmd_x,
-                            y,
-                            ch,
-                            command,
-                            cs,
-                            ce,
-                            selection_bg,
-                            bg_uv,
-                        );
-                    }
-                    self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
-                    // LiveCommand's bv_rows entry is in the pre-pass.
-                }
-                LaidRow::Blank => {
-                    // Warp-style clear spacer: nothing to draw — the
-                    // background fill already covers this region. Skip.
-                }
-            }
-
-            // Track the topmost visible block for the sticky header. We want
-            // the block whose content is closest to (but not below) the clip
-            // top. Since rows are ordered bottom-to-top, the LAST header/command
-            // row we see that's above clip_top wins.
-            if block_scroll > 0 && row_top_y <= clip_top + pitch {
-                if let LaidRow::Command { command, .. } = &row_data[i] {
-                    let cmd_str: &str = command;
-                    for b in blocks.iter().rev() {
-                        if b.command == cmd_str {
-                            topmost_block_info = Some((
-                                cmd_str.to_string(),
-                                b.cwd.as_deref().map(abbreviate_path).unwrap_or_default(),
-                            ));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Sticky top header (when scrolled) ────────────────────────────
-        //
-        // Warp-style: when the block view is scrolled, the top of the viewport
-        // shows a sticky line with the command (and cwd) of the block whose
-        // output is currently at the top. This gives context about what output
-        // you're looking at without seeing the block's own header.
-        if block_scroll > 0 {
-            if let Some((cmd, block_cwd)) = &topmost_block_info {
-                let sticky_y = layout.clip_top;
-                // Background bar (slightly different shade to distinguish).
-                let sticky_bg = [
-                    theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-                    theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-                    theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-                    1.0,
-                ];
-                push_quad(
-                    &mut verts,
-                    [0.0, sticky_y, vp_w, sticky_y + pitch],
-                    bg_uv,
-                    [0.0; 4],
-                    sticky_bg,
-                );
-                // Bottom border for the sticky bar.
-                push_quad(
-                    &mut verts,
-                    [0.0, sticky_y + pitch, vp_w, sticky_y + pitch + 1.0],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-                // Content: `❯ command  cwd` (command in prompt color, cwd in dim).
-                self.push_text(&mut verts, left, sticky_y, "❯ ", prompt_c, cols);
-                let cmd_x = left + 2.0 * cw;
-                let avail = cols.saturating_sub(2).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, sticky_y, cmd, avail);
-                if !block_cwd.is_empty() {
-                    let cmd_cols = Self::text_col_width(cmd);
-                    let cwd_x = cmd_x + (cmd_cols + 2) as f32 * cw;
-                    let cwd_avail = cols.saturating_sub(2 + cmd_cols + 2).max(1);
-                    self.push_text(&mut verts, cwd_x, sticky_y, block_cwd, dim, cwd_avail);
-                }
-            }
-        }
-
-        // v0.9 W2: draw an accent border around the panel-highlighted block.
-        // The highlight is armed by `scroll_to_panel_selection()` for 1.5s
-        // after a panel click. We scan the laid-out rows to find the y-range
-        // of rows belonging to the highlighted block (Output + Command rows),
-        // then draw a rounded accent border around that range.
-        if let Some(hl_id) = self.panel_highlight {
-            let mut hl_top: Option<f32> = None;
-            let mut hl_bottom: Option<f32> = None;
-            for (i, &dist) in rows.iter().enumerate() {
-                let row_top_y = content_bottom_y - dist + scroll_px;
-                let row_bottom_y = row_top_y + pitch;
-                // Check if this row belongs to the highlighted block.
-                let belongs = match &row_data[i] {
-                    LaidRow::Output { block_id, .. } => *block_id == Some(hl_id),
-                    LaidRow::Command { block_id, .. } => *block_id == hl_id,
-                    _ => false,
-                };
-                if belongs {
-                    hl_top = Some(match hl_top {
-                        Some(t) => t.min(row_top_y),
-                        None => row_top_y,
-                    });
-                    hl_bottom = Some(match hl_bottom {
-                        Some(b) => b.max(row_bottom_y),
-                        None => row_bottom_y,
-                    });
-                }
-            }
-            // Clamp to clip region.
-            if let (Some(top), Some(bottom)) = (hl_top, hl_bottom) {
-                let y0 = top.max(clip_top);
-                let y1 = bottom.min(clip_bottom);
-                if y1 > y0 {
-                    let accent = color_to_normalized(self.theme.accent);
-                    let accent_alpha = [accent[0], accent[1], accent[2], 0.85];
-                    let border_w = 2.0 * self.scale as f32;
-                    // Four-sided border.
-                    push_quad(
-                        &mut verts,
-                        [left - border_w, y0, right + border_w, y0 + border_w],
-                        bg_uv,
-                        [0.0; 4],
-                        accent_alpha,
-                    );
-                    push_quad(
-                        &mut verts,
-                        [left - border_w, y1 - border_w, right + border_w, y1],
-                        bg_uv,
-                        [0.0; 4],
-                        accent_alpha,
-                    );
-                    push_quad(
-                        &mut verts,
-                        [left - border_w, y0, left, y1],
-                        bg_uv,
-                        [0.0; 4],
-                        accent_alpha,
-                    );
-                    push_quad(
-                        &mut verts,
-                        [right, y0, right + border_w, y1],
-                        bg_uv,
-                        [0.0; 4],
-                        accent_alpha,
-                    );
-                }
-            }
-        }
-
-        (verts, hit_regions, bv_rows)
-    }
-
     /// Push a selection-highlight background quad for a character range of
     /// `text`, honoring CJK double-width so the highlight exactly covers the
     /// selected glyphs. Called before `push_text` so the text renders on top
     /// of the highlight (matching grid-view selection rendering).
     #[allow(clippy::too_many_arguments)]
-    fn push_block_view_highlight(
+    pub(crate) fn push_block_view_highlight(
         &self,
         vertices: &mut Vec<f32>,
         x_left: f32,
@@ -3424,7 +2624,7 @@ pub(crate) fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
 /// Abbreviate an absolute path for display: replace a `$HOME` prefix with `~`
 /// (e.g. `/Users/andylee/proj` → `~/proj`). Falls back to the raw path when
 /// `$HOME` is unset or isn't a prefix.
-fn abbreviate_path(path: &str) -> String {
+pub(crate) fn abbreviate_path(path: &str) -> String {
     if let Some(home) = std::env::var_os("HOME") {
         if let Some(h) = home.to_str() {
             if !h.is_empty() && path.starts_with(h) {

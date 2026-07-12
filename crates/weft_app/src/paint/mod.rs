@@ -7,6 +7,8 @@
 //! Layout mirrors the old `renderer.rs` function order so the call sites in
 //! the renderer switch from `push_quad(...)` to `primitives::push_quad(...)`.
 
+pub(crate) mod block_view;
+pub(crate) mod block_view_model;
 pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod panel;
