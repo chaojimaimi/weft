@@ -127,6 +127,7 @@ impl App {
                                 self.tab_bar.hovered_tab = None;
                                 self.request_redraw();
                             }
+                            self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Tab(hit_index)) => {
@@ -142,6 +143,7 @@ impl App {
                         }
                         Some(crate::tab_bar_component::TabBarTarget::NewTab) => {
                             self.new_tab();
+                            self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                             return;
                         }
                         None => {}

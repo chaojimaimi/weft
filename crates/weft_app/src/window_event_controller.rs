@@ -12,8 +12,9 @@ impl App {
             WindowEvent::CloseRequested => {
                 info!("Window closed");
                 // v1.0 H4: persist tab state so the session restores on
-                // next launch.
-                self.save_all_tabs();
+                // next launch. Goes through drain_effects so all persist
+                // paths share the Effect::PersistTabs entry point.
+                self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {

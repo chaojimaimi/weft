@@ -726,9 +726,14 @@ impl App {
             }
             Action::NewTab => {
                 self.new_tab();
+                self.drain_effects(vec![Effect::PersistTabs]);
                 true
             }
-            Action::CloseTab => self.close_tab(),
+            Action::CloseTab => {
+                let consumed = self.close_tab();
+                self.drain_effects(vec![Effect::PersistTabs]);
+                consumed
+            }
             Action::NextTab => {
                 self.next_tab();
                 true
@@ -1060,7 +1065,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
             AppEvent::TabsAutoSave => {
-                self.save_all_tabs();
+                self.drain_effects(vec![Effect::PersistTabs]);
             }
             AppEvent::MenuAction(action) => {
                 // v1.1: native menu click → reuse the same dispatch as

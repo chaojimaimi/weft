@@ -56,7 +56,6 @@ impl App {
         info!(tab_idx = self.sessions.active_tab, "new tab created");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
-        self.save_all_tabs();
         self.request_redraw();
     }
 
@@ -69,7 +68,6 @@ impl App {
             // loop can call `event_loop.exit()` (we can't call it here
             // because we don't have access to the ActiveEventLoop).
             info!("closing last tab, exiting app");
-            self.save_all_tabs();
             self.should_exit = true;
             return true;
         }
@@ -93,7 +91,6 @@ impl App {
         );
         self.clamp_tab_scroll();
         self.scroll_active_tab_into_view();
-        self.save_all_tabs();
         self.refresh_find_for_active_tab();
         self.request_redraw();
         true
