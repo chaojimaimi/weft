@@ -22,6 +22,7 @@ mod menu;
 mod mouse_controller;
 mod mouse_press_controller;
 mod overlay;
+mod paint;
 mod palette_component;
 mod palette_controller;
 mod palette_state;
