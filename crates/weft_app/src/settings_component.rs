@@ -1,7 +1,7 @@
 //! Scene model and hit testing for the Settings panel.
 //!
-//! Replaces `renderer.settings_hits: Vec<SettingsHit>` with a typed
-//! `Scene<SettingsTarget>`. Layout comes from `layout::layout_settings`;
+//! Uses a typed `Scene<SettingsTarget>` instead of renderer-retained hit
+//! state. Layout comes from `layout::layout_settings`;
 //! the renderer's `build_settings_vertices` and the mouse handler share the
 //! same geometry product.
 
@@ -127,7 +127,6 @@ mod tests {
             content_x0: 212.0,
             content_x1: 988.0,
             content_top: 200.0,
-            content_bottom: 660.0,
             max_rows: 20,
             footer_y: 670.0,
             footer_buttons: FooterButtonRects {

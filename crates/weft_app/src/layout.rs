@@ -948,7 +948,6 @@ pub struct FooterButtonRects {
 /// `build_settings_vertices` (renderer) and `mouse_press_controller` so the
 /// tab/theme/footer geometry never drifts apart.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // content_bottom/footer_y consumed by renderer draw (future paint migration)
 pub struct SettingsLayout {
     /// Full panel bounding box `[x0, y0, x1, y1]`.
     pub box_rect: Rect,
@@ -961,8 +960,6 @@ pub struct SettingsLayout {
     pub content_x1: f32,
     /// Top of the content area (after error banner if present).
     pub content_top: f32,
-    /// Bottom of the content area (above footer).
-    pub content_bottom: f32,
     /// Max visible rows in the content area.
     pub max_rows: usize,
     /// Footer Y baseline.
@@ -1048,7 +1045,6 @@ pub fn layout_settings(
         content_x0,
         content_x1,
         content_top,
-        content_bottom,
         max_rows,
         footer_y,
         footer_buttons: FooterButtonRects { apply, close, save },

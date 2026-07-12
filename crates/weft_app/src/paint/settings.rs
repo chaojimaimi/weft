@@ -1,7 +1,7 @@
 //! Settings panel vertex builder extracted from renderer.rs (A5).
 
 use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
-use crate::renderer::{MetalRenderer, SettingsHit, SettingsHitKind};
+use crate::renderer::MetalRenderer;
 
 impl MetalRenderer {
     /// Build the Settings panel (Cmd+,) as a centered modal overlay. Renders
@@ -22,18 +22,42 @@ impl MetalRenderer {
     pub(crate) fn build_settings_vertices(
         &self,
         s: crate::overlay::SettingsDrawParams<'_>,
-    ) -> (Vec<f32>, Option<[f32; 4]>, Vec<SettingsHit>) {
+    ) -> Vec<f32> {
         use crate::overlay::SettingsTab;
 
         let mut verts = Vec::new();
-        let mut hits: Vec<SettingsHit> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return (verts, None, hits);
+            return verts;
         }
+
+        let pairs: [(&str, &str); 6] = [
+            ("↑↓", "navigate"),
+            ("⏎", "apply"),
+            ("⇥", "switch"),
+            ("←→", "adjust"),
+            ("esc", "close"),
+            ("⌘⏎", "save"),
+        ];
+        let inner = cw * 0.3;
+        let mut footer_pair_widths = [0.0; 6];
+        for (index, (key, desc)) in pairs.iter().enumerate() {
+            footer_pair_widths[index] =
+                cw * (Self::text_col_width(key) + Self::text_col_width(desc)) as f32 + inner;
+        }
+        let layout = crate::layout::layout_settings(
+            vp_w,
+            vp_h,
+            cw,
+            ch,
+            SettingsTab::ALL.len(),
+            s.error.is_some(),
+            &footer_pair_widths,
+        )
+        .expect("positive renderer geometry produces SettingsLayout");
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
@@ -69,17 +93,9 @@ impl MetalRenderer {
             1.0,
         ];
 
-        // Centered modal box: 72% viewport width, 78% viewport height.
-        let box_w = vp_w * 0.72;
-        let box_h = vp_h * 0.78;
-        let box_x0 = (vp_w - box_w) / 2.0;
-        let box_x1 = box_x0 + box_w;
-        let box_y0 = (vp_h - box_h) / 2.0;
-        let box_y1 = box_y0 + box_h;
-
-        let pad_x = cw * 1.5;
-        let content_x0 = box_x0 + pad_x;
-        let content_x1 = box_x1 - pad_x;
+        let [box_x0, box_y0, box_x1, box_y1] = layout.box_rect;
+        let content_x0 = layout.content_x0;
+        let content_x1 = layout.content_x1;
         let content_cols = (((content_x1 - content_x0) / cw).max(1.0)) as usize;
 
         // Warp-style: very subtle shadow (low opacity, tight offset).
@@ -116,12 +132,19 @@ impl MetalRenderer {
         }
 
         // Title row — subtle (label_c, not accent) to keep visual hierarchy calm.
-        let mut y = box_y0 + ch * 1.0;
-        self.push_text(&mut verts, content_x0, y, "Settings", label_c, content_cols);
-        y += ch * 1.8;
+        let title_y = box_y0 + ch;
+        self.push_text(
+            &mut verts,
+            content_x0,
+            title_y,
+            "Settings",
+            label_c,
+            content_cols,
+        );
 
         // Tab bar: tabs side by side with 1px underline for active.
-        let tab_w = box_w / SettingsTab::ALL.len() as f32;
+        let tab_w = layout.tab_width;
+        let mut y = layout.tab_bar_y;
         for (i, tab) in SettingsTab::ALL.iter().enumerate() {
             let tx0 = box_x0 + i as f32 * tab_w;
             let label = tab.label();
@@ -152,13 +175,6 @@ impl MetalRenderer {
             let label_chars = label.chars().count() as f32;
             let text_x = tx0 + ((tab_w - label_chars * cw) / 2.0).max(cw * 0.5);
             self.push_text(&mut verts, text_x, y, label, color, slot_cols);
-            // v1.0 S1-b: register a hit region for the whole tab cell so
-            // clicks anywhere in the tab switch tabs (matching the
-            // underline's visual span).
-            hits.push(SettingsHit {
-                kind: SettingsHitKind::Tab(*tab),
-                rect: [tx0, y, tx0 + tab_w, y + ch],
-            });
         }
         y += ch * 1.5;
 
@@ -174,9 +190,12 @@ impl MetalRenderer {
         // Content area: render the active tab.
         // v1.0 fix: move footer up from ch*0.8 to ch*1.5 so it sits between
         // the separator line and the bottom border with balanced spacing.
-        let footer_y = box_y1 - ch * 1.5;
-        let content_bottom = footer_y - ch * 0.5;
-        let content_base = y + ch * 0.5;
+        let footer_y = layout.footer_y;
+        let content_base = if s.error.is_some() {
+            layout.content_top - ch
+        } else {
+            layout.content_top
+        };
 
         // v1.0 S2: error bar at the top of the content area when a save
         // failed. Renders a red background strip with the error message,
@@ -206,9 +225,7 @@ impl MetalRenderer {
         } else {
             content_base
         };
-        // Recompute max_rows after the error bar so content doesn't overflow.
-        let content_h = (content_bottom - content_top).max(0.0);
-        let max_rows = (content_h / ch).max(1.0) as usize;
+        let max_rows = layout.max_rows;
 
         match s.active_tab {
             SettingsTab::Appearance => {
@@ -291,10 +308,6 @@ impl MetalRenderer {
                         label_color,
                         content_cols,
                     );
-                    hits.push(SettingsHit {
-                        kind: SettingsHitKind::Theme(i),
-                        rect: [content_x0, row_y, content_x1, row_y + ch],
-                    });
                 }
             }
             SettingsTab::Font => {
@@ -593,22 +606,10 @@ impl MetalRenderer {
         // edge). This keeps the leftmost pairs (↑↓ navigate, ⏎ apply) always
         // visible — they are the most-used operations. Pairs that don't fit
         // are simply not rendered (CPU-side cull, no half-glyph cropping).
-        // v1.0 S1-b/S2: the apply / close / save pairs register clickable
-        // hit regions so mouse users can hit those actions directly.
-        let pairs: [(&str, &str, Option<SettingsHitKind>); 6] = [
-            ("↑↓", "navigate", None),
-            ("⏎", "apply", Some(SettingsHitKind::ApplyButton)),
-            ("⇥", "switch", None),
-            ("←→", "adjust", None),
-            ("esc", "close", Some(SettingsHitKind::CloseButton)),
-            ("⌘⏎", "save", Some(SettingsHitKind::SaveButton)),
-        ];
         let gap = cw * 1.5; // gap between pairs
-        let inner = cw * 0.3; // gap between key and description within a pair
         let scale = 1.0; // match body text scale
-        let footer_h = ch * scale;
         let mut fx = content_x0;
-        for (key, desc, hit_kind) in &pairs {
+        for (key, desc) in &pairs {
             let key_w = cw * scale * Self::text_col_width(key) as f32;
             let desc_w = cw * scale * Self::text_col_width(desc) as f32;
             let pair_w = key_w + inner + desc_w;
@@ -616,7 +617,6 @@ impl MetalRenderer {
             if fx + pair_w > content_x1 {
                 break;
             }
-            let pair_x0 = fx;
             self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
             self.push_text_scaled(
                 &mut verts,
@@ -627,16 +627,9 @@ impl MetalRenderer {
                 content_cols,
                 scale,
             );
-            // Register the clickable rect for apply / close / save.
-            if let Some(kind) = hit_kind {
-                hits.push(SettingsHit {
-                    kind: *kind,
-                    rect: [pair_x0, footer_y, pair_x0 + pair_w, footer_y + footer_h],
-                });
-            }
             fx += pair_w + gap;
         }
 
-        (verts, Some([box_x0, box_y0, box_x1, box_y1]), hits)
+        verts
     }
 }

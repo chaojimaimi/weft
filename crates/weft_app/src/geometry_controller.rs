@@ -529,12 +529,6 @@ impl App {
         let Some(renderer) = &self.renderer else {
             return false;
         };
-        // Reuse the stored popup rect when available (cheaper than rebuilding
-        // layout). Fall back to a fresh layout_settings call if the renderer
-        // hasn't drawn yet this frame.
-        if let Some([bx0, by0, bx1, by1]) = renderer.settings_popup_rect {
-            return x >= bx0 && x < bx1 && y >= by0 && y < by1;
-        }
         let cw = renderer.cell_width() as f32;
         let ch = renderer.cell_height() as f32;
         let (vp_w, vp_h) = renderer.viewport();

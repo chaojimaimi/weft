@@ -217,9 +217,6 @@ pub struct MetalRenderer {
     pub(crate) popup_max_rows: usize,
     /// Context menu position + target block (F7). Set per-frame by the app.
     pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>)>,
-    /// v1.0 S1: Last-rendered Settings panel rect (physical pixels).
-    /// `None` when the panel wasn't drawn this frame.
-    pub settings_popup_rect: Option<[f32; 4]>,
     /// Last-rendered block-view rows (scroll-adjusted y bands + visible text),
     /// for mouse hit-testing and selection in the block view. Repopulated each
     /// draw when `show_block_view()` is true; cleared otherwise. Empty when the
@@ -236,11 +233,6 @@ pub struct MetalRenderer {
     pub find_state: Option<FindDrawState>,
     /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
     /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
-    /// v1.0 S1-b: Last-rendered Settings panel hit-test rects (tabs, theme
-    /// rows, footer buttons). Populated by `build_settings_vertices` each
-    /// draw when the panel is open; cleared otherwise. The app reads this
-    /// from `handle_mouse_press` to route settings clicks.
-    pub settings_hits: Vec<SettingsHit>,
     /// v0.9 W2: block currently highlighted in the terminal view (set from
     /// the history panel click). The renderer draws an accent border around
     /// this block in block view. Cleared by the app after 1.5s.
@@ -378,39 +370,6 @@ pub struct TabBarDrawState {
     pub arrow_left_hovered: bool,
     /// v1.2: true when the mouse is over the right scroll arrow.
     pub arrow_right_hovered: bool,
-}
-
-/// v1.0 S1-b: Hit-test rect for a clickable region inside the Settings panel.
-/// Repopulated each frame by `build_settings_vertices` (matching the layout
-/// it just rendered). v1.2 A4: the mouse handler now uses the Scene-based
-/// `settings_target_at` instead; these structs remain only because
-/// `build_settings_vertices` still returns them and will be removed when
-/// that function migrates to the paint module.
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
-pub struct SettingsHit {
-    /// What this region refers to — drives the click action.
-    pub kind: SettingsHitKind,
-    /// Clickable rect in physical pixels: `[x0, y0, x1, y1]`.
-    pub rect: [f32; 4],
-}
-
-/// v1.0 S1-b: Identifies what a [`SettingsHit`] region targets. `Tab`/`Theme`
-/// carry the index so the click handler can update the cursor / pick a value
-/// without recomputing layout.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SettingsHitKind {
-    /// A tab-bar entry (Appearance / Font / Keybindings / Window / Logo).
-    Tab(crate::overlay::SettingsTab),
-    /// A theme row in the Appearance tab (0-based index).
-    Theme(usize),
-    /// Footer "esc close" pair — click closes the panel without saving.
-    CloseButton,
-    /// Footer "⌘⏎ save" pair — click persists the draft and closes the panel.
-    SaveButton,
-    /// Footer "⏎ apply" pair — click persists the draft but keeps the panel
-    /// open so the user can keep editing.
-    ApplyButton,
 }
 
 /// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
@@ -723,11 +682,9 @@ fragment float4 text_fragment(
             popup_width_scale: 0.6,
             popup_max_rows: 8,
             context_menu_target: None,
-            settings_popup_rect: None,
             block_view_rows: Vec::new(),
             layout_ctx: None,
             find_state: None,
-            settings_hits: Vec::new(),
             panel_highlight: None,
             cursor_blink_on: true,
             prompt_box_rect: Cell::new(None),
@@ -1308,10 +1265,6 @@ fragment float4 text_fragment(
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
         // Reset popup rects — settings still uses renderer-owned hit data.
-        self.settings_popup_rect = None;
-        // v1.0 S1-b: clear stale settings hit-test rects — repopulated by
-        // build_settings_vertices only when the panel is open this frame.
-        self.settings_hits.clear();
         // v1.0 P1.5-B1: Grid cells render as instances (instanced pipeline);
         // overlays + block view render as legacy vertices. In grid view,
         // `instances` carries the cells and `vertices` carries only overlays;
@@ -1480,10 +1433,7 @@ fragment float4 text_fragment(
 
         // v1.0 S1: Settings panel (Cmd+,) — centered modal overlay.
         if let Some(s) = settings {
-            let (sv, rect, hits) = self.build_settings_vertices(*s);
-            self.settings_popup_rect = rect;
-            self.settings_hits = hits;
-            vertices.extend_from_slice(&sv);
+            vertices.extend_from_slice(&self.build_settings_vertices(*s));
         }
 
         // Context menu overlay (F7) — drawn at mouse position.
