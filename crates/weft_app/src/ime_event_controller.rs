@@ -88,7 +88,7 @@ impl App {
                                 // search) put `less` into a confused state
                                 // and the window appeared frozen until a
                                 // resize forced a repaint. Real pastes
-                                // (Cmd+V → `paste_from_clipboard`) still use
+                                // (Cmd+V → `Effect::Paste`) still use
                                 // `encode_paste` with bracketed wrapping.
                                 // (bracketed_paste is a shell-prompt mode;
                                 // it stays on inside alt-screen apps

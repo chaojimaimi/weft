@@ -115,9 +115,8 @@ impl App {
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Close(idx)) => {
                             if idx == self.sessions.active_tab {
-                                if self.close_tab() {
-                                    // App continues with remaining tabs.
-                                }
+                                let effects = self.close_tab();
+                                self.drain_effects(effects);
                             } else {
                                 // Close a background tab — remove and adjust index.
                                 self.sessions.tabs.remove(idx);
@@ -126,8 +125,8 @@ impl App {
                                 }
                                 self.tab_bar.hovered_tab = None;
                                 self.request_redraw();
+                                self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                             }
-                            self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Tab(hit_index)) => {
@@ -439,7 +438,9 @@ impl App {
             }
             winit::event::MouseButton::Middle => {
                 // Middle click: paste
-                self.paste_from_clipboard();
+                self.drain_effects(vec![crate::effect::Effect::Paste {
+                    tab: self.sessions.active_tab,
+                }]);
                 let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }

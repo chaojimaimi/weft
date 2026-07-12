@@ -1,11 +1,9 @@
 //! Typed side effects emitted by input controllers.
 //!
-//! `PersistTabs` / `PersistBlocks` / `Exit` are consumed by `drain_effects`
-//! and will be emitted by SessionManager / lifecycle controllers once the
-//! A3 call-chain migration switches those paths to returning `Vec<Effect>`.
+//! Controllers return these values instead of directly performing PTY,
+//! clipboard, persistence, exit or redraw side effects.
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // PersistTabs/PersistBlocks/Exit await SessionManager emit-site migration.
 pub(crate) enum Effect {
     WritePty {
         tab: usize,
@@ -42,6 +40,32 @@ pub(crate) enum Effect {
     /// `event_loop.exit()` still happens in the winit callback tail.
     Exit,
     RequestRedraw,
+}
+
+pub(crate) fn close_tab_effects(last_tab: bool) -> Vec<Effect> {
+    if last_tab {
+        vec![Effect::Exit, Effect::PersistTabs]
+    } else {
+        vec![Effect::RequestRedraw, Effect::PersistTabs]
+    }
+}
+
+pub(crate) fn process_message_effects(
+    exit_requested: bool,
+    blocks: Vec<weft_core::blocks::Block>,
+    redraw: bool,
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    if exit_requested {
+        effects.push(Effect::Exit);
+    }
+    if !blocks.is_empty() {
+        effects.push(Effect::PersistBlocks { blocks });
+    }
+    if redraw {
+        effects.push(Effect::RequestRedraw);
+    }
+    effects
 }
 
 pub(crate) fn passthrough_key_effects(tab: usize, bytes: Vec<u8>) -> Vec<Effect> {
@@ -109,8 +133,8 @@ pub(crate) fn context_clipboard_effects(text: Option<String>) -> Vec<Effect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        context_clipboard_effects, copy_clipboard_effects, ime_commit_effects,
-        passthrough_key_effects, pending_resize_effects, Effect,
+        close_tab_effects, context_clipboard_effects, copy_clipboard_effects, ime_commit_effects,
+        passthrough_key_effects, pending_resize_effects, process_message_effects, Effect,
     };
 
     #[test]
@@ -211,5 +235,41 @@ mod tests {
             }]
         );
         assert!(context_clipboard_effects(None).is_empty());
+    }
+
+    #[test]
+    fn close_tab_effects_preserve_exit_persist_and_redraw_order() {
+        assert_eq!(close_tab_effects(true), [Effect::Exit, Effect::PersistTabs]);
+        assert_eq!(
+            close_tab_effects(false),
+            [Effect::RequestRedraw, Effect::PersistTabs]
+        );
+    }
+
+    #[test]
+    fn shell_exit_keeps_completed_blocks_before_redraw() {
+        use std::time::SystemTime;
+        use weft_core::blocks::{Block, BlockId};
+
+        let completed = Block {
+            id: BlockId(9),
+            command: "exit".into(),
+            cwd: None,
+            output: "done".into(),
+            exit_code: Some(0),
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: Some(SystemTime::UNIX_EPOCH),
+            collapsed: false,
+        };
+        assert_eq!(
+            process_message_effects(true, vec![completed.clone()], true),
+            [
+                Effect::Exit,
+                Effect::PersistBlocks {
+                    blocks: vec![completed]
+                },
+                Effect::RequestRedraw,
+            ]
+        );
     }
 }

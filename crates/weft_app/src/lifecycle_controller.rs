@@ -59,17 +59,13 @@ impl App {
         self.request_redraw();
     }
 
-    /// Cmd+W — close the current tab. Returns `false` (exit app) if this
-    /// was the last tab; otherwise switches to the previous tab and
-    /// returns `true`.
-    pub(super) fn close_tab(&mut self) -> bool {
+    /// Cmd+W — close the current tab and return the ordered side effects the
+    /// application shell must drain. Closing the last tab requests exit;
+    /// otherwise the previous tab becomes active and a redraw is requested.
+    pub(super) fn close_tab(&mut self) -> Vec<Effect> {
         if self.sessions.tabs.len() <= 1 {
-            // Last tab closed → exit the app. Set the flag so the event
-            // loop can call `event_loop.exit()` (we can't call it here
-            // because we don't have access to the ActiveEventLoop).
             info!("closing last tab, exiting app");
-            self.should_exit = true;
-            return true;
+            return effect::close_tab_effects(true);
         }
         self.reset_ime_context("tab closed");
         let removed_idx = self.sessions.active_tab;
@@ -92,8 +88,7 @@ impl App {
         self.clamp_tab_scroll();
         self.scroll_active_tab_into_view();
         self.refresh_find_for_active_tab();
-        self.request_redraw();
-        true
+        effect::close_tab_effects(false)
     }
 
     /// v1.0 H4: Serialize all live tabs to the SQLite `tabs` table so the

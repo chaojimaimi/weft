@@ -230,14 +230,19 @@ impl App {
         let mut had_pty_output = false;
         let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
+        let mut exit_requested = false;
         for i in 0..self.sessions.tabs.len() {
             let (alive, drained, need_redraw) = self.sessions.tabs[i].process_messages();
+            // A dying shell can complete its final block in the same batch as
+            // the exit event. Collect before branching so persistence never
+            // loses that last command.
+            drained_blocks.extend(drained);
             if !alive {
                 // Shell exited on tab `i`. For now (Stage 2) we only exit
                 // the app when the LAST tab's shell exits. A closed tab
                 // via Cmd+W is handled by `close_tab`, not here.
                 if self.sessions.tabs.len() <= 1 {
-                    self.should_exit = true;
+                    exit_requested = true;
                     break;
                 }
                 // Otherwise: remove the exited tab and switch to the prev.
@@ -252,7 +257,6 @@ impl App {
                 );
                 break;
             }
-            drained_blocks.extend(drained);
             if let Some(resolution) = self.sessions.tabs[i].resolve_pending_tui_scroll() {
                 match resolution {
                     TuiScrollResolution::PtyBytes(bytes) => {
@@ -275,15 +279,11 @@ impl App {
                 had_pty_output = true;
             }
         }
-        if !drained_blocks.is_empty() {
-            self.persist_blocks(&drained_blocks);
-        }
         if deferred_local_scroll != 0 {
             self.scroll_local_view(deferred_local_scroll);
         }
-        if any_redraw {
-            self.request_redraw();
-        }
+        let effects = effect::process_message_effects(exit_requested, drained_blocks, any_redraw);
+        self.drain_effects(effects);
         had_pty_output
     }
 
@@ -354,8 +354,8 @@ impl App {
     /// Read the system clipboard (synchronous — NSPasteboard has AppKit main
     /// thread affinity) and apply the text to `tab`. Editor mode inserts into
     /// the prompt buffer; Passthrough forwards to the PTY with optional
-    /// bracketed-paste wrapping. Shared by `Effect::Paste` and the legacy
-    /// `Action::Paste` / find-bar Cmd+V paths.
+    /// bracketed-paste wrapping. `Effect::Paste` is the system-clipboard
+    /// entry point; find-bar Cmd+V can pass already-read text directly.
     fn apply_paste(&mut self, tab: usize) {
         let Some(text) = clipboard_paste() else {
             return;
@@ -730,9 +730,9 @@ impl App {
                 true
             }
             Action::CloseTab => {
-                let consumed = self.close_tab();
-                self.drain_effects(vec![Effect::PersistTabs]);
-                consumed
+                let effects = self.close_tab();
+                self.drain_effects(effects);
+                true
             }
             Action::NextTab => {
                 self.next_tab();
@@ -873,17 +873,6 @@ impl App {
                 })
         };
         self.drain_effects(effect::copy_clipboard_effects(text));
-    }
-
-    /// Paste from system clipboard.
-    ///
-    /// Two-path dispatch mirrors `Ime::Commit` (main.rs ~L2721): in Editor mode
-    /// the shell is taken over by weft and does not echo, so pasted bytes sent
-    /// to the PTY would vanish. Instead we insert the text directly into the
-    /// editor buffer. Passthrough mode forwards to the PTY as before (with
-    /// bracketed-paste wrapping when the shell supports it).
-    fn paste_from_clipboard(&mut self) {
-        self.apply_paste(self.sessions.active_tab);
     }
 
     /// Update cursor blink state.
