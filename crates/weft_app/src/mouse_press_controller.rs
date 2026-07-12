@@ -27,55 +27,55 @@ impl App {
         // consumed (clicks outside any region do nothing — they don't fall
         // through to the terminal / PTY).
         if button == winit::event::MouseButton::Left && self.settings.open {
-            if let Some(renderer) = &self.renderer {
-                let xf = x as f32;
-                let yf = y as f32;
-                for hit in &renderer.settings_hits {
-                    let [x0, y0, x1, y1] = hit.rect;
-                    if xf >= x0 && xf < x1 && yf >= y0 && yf < y1 {
-                        use crate::renderer::SettingsHitKind;
-                        match hit.kind {
-                            SettingsHitKind::Tab(tab) => {
-                                if self.settings.tab != tab {
-                                    self.settings.tab = tab;
-                                    self.settings.selection = 0;
-                                    self.settings.scroll_offset = 0;
-                                }
-                            }
-                            SettingsHitKind::Theme(i) => {
-                                self.settings.selection = i;
-                                self.apply_settings_selection();
-                            }
-                            SettingsHitKind::CloseButton => {
-                                self.settings.open = false;
-                                self.settings.error = None;
-                            }
-                            SettingsHitKind::SaveButton => {
-                                self.save_settings_draft(true);
-                            }
-                            SettingsHitKind::ApplyButton => {
-                                self.save_settings_draft(false);
-                            }
-                        }
-                        self.request_redraw();
+            let xf = x as f32;
+            let yf = y as f32;
+            use crate::settings_component::SettingsTarget;
+            match self.settings_target_at(xf, yf) {
+                Some(SettingsTarget::Tab(tab)) => {
+                    if self.settings.tab != tab {
+                        self.settings.tab = tab;
+                        self.settings.selection = 0;
+                        self.settings.scroll_offset = 0;
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                Some(SettingsTarget::Theme(i)) => {
+                    self.settings.selection = i;
+                    self.apply_settings_selection();
+                    self.request_redraw();
+                    return;
+                }
+                Some(SettingsTarget::CloseButton) => {
+                    self.settings.open = false;
+                    self.settings.error = None;
+                    self.request_redraw();
+                    return;
+                }
+                Some(SettingsTarget::SaveButton) => {
+                    self.save_settings_draft(true);
+                    self.request_redraw();
+                    return;
+                }
+                Some(SettingsTarget::ApplyButton) => {
+                    self.save_settings_draft(false);
+                    self.request_redraw();
+                    return;
+                }
+                None => {
+                    // Distinguish "inside panel box but missed all hits"
+                    // (consume) from "outside panel" (close). We rebuild the
+                    // layout just for the box rect — the hit test already
+                    // failed so this is cheap.
+                    if self.point_inside_settings_box(xf, yf) {
                         return;
                     }
+                    // Click outside the panel — close it (Warp-style).
+                    self.settings.open = false;
+                    self.settings.error = None;
+                    self.request_redraw();
+                    return;
                 }
-                // Click inside the panel's bounding box but not on any
-                // hit region — still consume the event so the click doesn't
-                // fall through to the terminal underneath.
-                if let Some([bx0, by0, bx1, by1]) = renderer.settings_popup_rect {
-                    if xf >= bx0 && xf < bx1 && yf >= by0 && yf < by1 {
-                        return;
-                    }
-                }
-                // Click outside the panel — close it (Warp-style: clicking
-                // outside dismisses modal overlays). This matches the
-                // behavior of the Command Palette.
-                self.settings.open = false;
-                self.settings.error = None;
-                self.request_redraw();
-                return;
             }
         }
 

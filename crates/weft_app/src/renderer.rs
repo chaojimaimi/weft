@@ -383,9 +383,12 @@ pub struct TabBarDrawState {
 
 /// v1.0 S1-b: Hit-test rect for a clickable region inside the Settings panel.
 /// Repopulated each frame by `build_settings_vertices` (matching the layout
-/// it just rendered) and consumed by the app's `handle_mouse_press` to
-/// dispatch clicks on tabs, theme rows, and footer buttons.
+/// it just rendered). v1.2 A4: the mouse handler now uses the Scene-based
+/// `settings_target_at` instead; these structs remain only because
+/// `build_settings_vertices` still returns them and will be removed when
+/// that function migrates to the paint module.
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub struct SettingsHit {
     /// What this region refers to — drives the click action.
     pub kind: SettingsHitKind,

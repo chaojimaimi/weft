@@ -459,4 +459,98 @@ impl App {
         );
         crate::panel_component::panel_target_at(&scene, x, y)
     }
+
+    /// Resolve a physical-pixel point in the settings panel to a target.
+    /// Rebuilds the settings layout from renderer geometry + current settings
+    /// state. Returns `None` when the panel is closed, the renderer is absent,
+    /// or the point misses every target.
+    pub(super) fn settings_target_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<crate::settings_component::SettingsTarget> {
+        if !self.settings.open {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let cw = renderer.cell_width() as f32;
+        let ch = renderer.cell_height() as f32;
+        let (vp_w, vp_h) = renderer.viewport();
+
+        // Footer pair widths: key_w + inner + desc_w for each of the 6 pairs.
+        let pairs: [(&str, &str); 6] = [
+            ("↑↓", "navigate"),
+            ("⏎", "apply"),
+            ("⇥", "switch"),
+            ("←→", "adjust"),
+            ("esc", "close"),
+            ("⌘⏎", "save"),
+        ];
+        let inner = cw * 0.3;
+        let mut footer_pair_widths = [0.0f32; 6];
+        for (i, (key, desc)) in pairs.iter().enumerate() {
+            let key_w = cw * crate::renderer::MetalRenderer::text_col_width(key) as f32;
+            let desc_w = cw * crate::renderer::MetalRenderer::text_col_width(desc) as f32;
+            footer_pair_widths[i] = key_w + inner + desc_w;
+        }
+
+        let layout = crate::layout::layout_settings(
+            vp_w,
+            vp_h,
+            cw,
+            ch,
+            crate::overlay::SettingsTab::ALL.len(),
+            self.settings.error.is_some(),
+            &footer_pair_widths,
+        )?;
+
+        let theme_count = if self.settings.tab == crate::overlay::SettingsTab::Appearance {
+            self.settings_theme_views().len().min(layout.max_rows)
+        } else {
+            0
+        };
+
+        let scene = crate::settings_component::build_settings_scene(
+            &layout,
+            crate::overlay::SettingsTab::ALL.as_slice(),
+            theme_count,
+            ch,
+        );
+        crate::settings_component::settings_target_at(&scene, x, y)
+    }
+
+    /// Check whether a point falls inside the settings panel bounding box
+    /// (without requiring a hit target). Used to consume clicks that land on
+    /// the panel background but miss every interactive element.
+    pub(super) fn point_inside_settings_box(&self, x: f32, y: f32) -> bool {
+        if !self.settings.open {
+            return false;
+        }
+        let Some(renderer) = &self.renderer else {
+            return false;
+        };
+        // Reuse the stored popup rect when available (cheaper than rebuilding
+        // layout). Fall back to a fresh layout_settings call if the renderer
+        // hasn't drawn yet this frame.
+        if let Some([bx0, by0, bx1, by1]) = renderer.settings_popup_rect {
+            return x >= bx0 && x < bx1 && y >= by0 && y < by1;
+        }
+        let cw = renderer.cell_width() as f32;
+        let ch = renderer.cell_height() as f32;
+        let (vp_w, vp_h) = renderer.viewport();
+        crate::layout::layout_settings(
+            vp_w,
+            vp_h,
+            cw,
+            ch,
+            crate::overlay::SettingsTab::ALL.len(),
+            self.settings.error.is_some(),
+            &[0.0; 6],
+        )
+        .map(|layout| {
+            let [bx0, by0, bx1, by1] = layout.box_rect;
+            x >= bx0 && x < bx1 && y >= by0 && y < by1
+        })
+        .unwrap_or(false)
+    }
 }
