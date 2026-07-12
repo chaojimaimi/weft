@@ -878,6 +878,62 @@ pub fn layout_block_view(
     }
 }
 
+// ── Panel (history sidebar) layout ──────────────────────────────────
+
+/// Layout product for the history sidebar. Shared between
+/// `build_panel_vertices` (renderer) and `mouse_press_controller` so the
+/// search-field and row geometry never drift apart.
+///
+/// All values are in physical pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct PanelLayout {
+    /// Full sidebar rect `[x0, y0, x1, y1]` (starts at chrome_top).
+    pub panel_rect: Rect,
+    /// Search input field rect (clickable → focus search).
+    pub search_field_rect: Rect,
+    /// Y of the first history row's top edge.
+    pub list_top: f32,
+    /// Per-row height (pitch).
+    pub row_height: f32,
+}
+
+/// Compute panel geometry from a layout context + sidebar width.
+///
+/// Mirrors the constants in `build_panel_vertices`:
+/// - header at `chrome_top + ch*0.4`
+/// - search field at `chrome_top + ch*1.6`, height `ch*1.4`
+/// - list starts at `field_y1 + ch*0.4`
+/// - row height (pitch) = `ch*1.1`
+pub fn layout_panel(
+    chrome_top: f32,
+    cell_w: f32,
+    cell_h: f32,
+    sidebar_width: f32,
+    viewport_h: f32,
+) -> PanelLayout {
+    let panel_x = 0.0;
+    let panel_rect = [panel_x, chrome_top, panel_x + sidebar_width, viewport_h];
+    let field_pad_x = cell_w * 0.5;
+    let field_pad_y = cell_h * 1.6;
+    let field_h = cell_h * 1.4;
+    let field_y0 = chrome_top + field_pad_y;
+    let field_y1 = field_y0 + field_h;
+    let search_field_rect = [
+        panel_x + field_pad_x,
+        field_y0,
+        panel_x + sidebar_width - field_pad_x,
+        field_y1,
+    ];
+    let list_top = field_y1 + cell_h * 0.4;
+    let row_height = cell_h * 1.1;
+    PanelLayout {
+        panel_rect,
+        search_field_rect,
+        list_top,
+        row_height,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

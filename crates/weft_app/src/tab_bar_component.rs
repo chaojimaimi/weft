@@ -160,18 +160,6 @@ pub(crate) fn tab_bar_target_at(
         .map(|hit| hit.target)
 }
 
-impl<T> HitRegion<T> {
-    fn from_rect([x0, y0, x1, y1]: Rect, target: T) -> Self {
-        Self {
-            x0,
-            y0,
-            x1,
-            y1,
-            target,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{build_tab_bar_scene, tab_bar_target_at, TabBarTarget};

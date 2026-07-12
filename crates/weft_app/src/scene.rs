@@ -63,6 +63,17 @@ impl<T> HitRegion<T> {
     pub(crate) fn contains_half_open(&self, x: f32, y: f32) -> bool {
         x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
     }
+
+    /// Construct a hit region from a `[x0, y0, x1, y1]` rect + target.
+    pub(crate) fn from_rect([x0, y0, x1, y1]: Rect, target: T) -> Self {
+        Self {
+            x0,
+            y0,
+            x1,
+            y1,
+            target,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

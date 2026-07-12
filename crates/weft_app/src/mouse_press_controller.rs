@@ -175,70 +175,43 @@ impl App {
         // Handled before PTY mouse reporting so panel clicks work even inside
         // TUI apps that captured the mouse.
         if button == winit::event::MouseButton::Left && self.panel.open {
-            if let Some(renderer) = &self.renderer {
-                // v0.9 W5: panel is now a LEFT sidebar anchored at x = 0 with
-                // width = sidebar_width().
-                let width_px = renderer.sidebar_width();
-                let panel_x = 0.0;
-                let ch = renderer.cell_height() as f64;
-                // v0.9 fix: list_top must include chrome_top (tab bar height)
-                // to match the renderer's panel content offset. Without this,
-                // row clicks were misaligned by one tab-bar height.
-                let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0) as f64;
-                let xf = x as f32;
-                let yf = y;
-                if xf >= panel_x && xf < panel_x + width_px && yf > 0.0 {
-                    // v0.9 fix: match the renderer's Warp-style panel layout:
-                    //   header  at chrome_top + ch*0.4
-                    //   search  at chrome_top + ch*1.6, height ch*1.4
-                    //   list    at chrome_top + ch*1.6 + ch*1.4 + ch*0.4
-                    let field_pad_y = ch * 1.6;
-                    let field_h = ch * 1.4;
-                    let search_top = chrome_top + field_pad_y;
-                    let search_bottom = chrome_top + field_pad_y + field_h;
-                    let list_top = chrome_top + field_pad_y + field_h + ch * 0.4;
-                    let row_h = ch * 1.1;
-                    if yf >= list_top {
-                        // Click on a history row: select it AND focus the
-                        // panel so Up/Down keys navigate the list (Warp-style).
-                        // Single click only selects + scrolls + highlights
-                        // the block; double-click (or Enter) sends the command
-                        // to the prompt editor.
-                        self.panel.search_focused = true;
-                        let clicked = ((yf - list_top) / row_h) as usize;
-                        let max_rows =
-                            visible_panel_rows(renderer.viewport().1, renderer.cell_height());
-                        if clicked < max_rows {
-                            // v0.9: detect double-click on the same row.
-                            let now = std::time::Instant::now();
-                            let is_double = self
-                                .panel
-                                .last_click
-                                .map(|(t, row)| {
-                                    t.elapsed() < std::time::Duration::from_millis(400)
-                                        && row == clicked
-                                })
-                                .unwrap_or(false);
-                            self.panel.last_click = Some((now, clicked));
-                            self.panel.selection = clicked;
-                            self.clamp_panel_selection();
-                            // Scroll terminal to the selected block + highlight.
-                            self.scroll_to_panel_selection();
-                            if is_double {
-                                // Double-click: send the command to the prompt.
-                                self.send_panel_selection_to_input();
-                            }
-                            return;
-                        }
-                    } else if yf >= search_top && yf < search_bottom {
-                        // Click in the search input field: focus it so keyboard
-                        // input goes to panel_query (bug 6 fix).
-                        self.panel.search_focused = true;
-                        self.request_redraw();
-                        return;
+            let xf = x as f32;
+            let yf = y as f32;
+            match self.panel_target_at(xf, yf) {
+                Some(crate::panel_component::PanelTarget::Row(clicked)) => {
+                    // Click on a history row: select it AND focus the
+                    // panel so Up/Down keys navigate the list (Warp-style).
+                    // Single click only selects + scrolls + highlights
+                    // the block; double-click (or Enter) sends the command
+                    // to the prompt editor.
+                    self.panel.search_focused = true;
+                    let now = std::time::Instant::now();
+                    let is_double = self
+                        .panel
+                        .last_click
+                        .map(|(t, row)| {
+                            t.elapsed() < std::time::Duration::from_millis(400) && row == clicked
+                        })
+                        .unwrap_or(false);
+                    self.panel.last_click = Some((now, clicked));
+                    self.panel.selection = clicked;
+                    self.clamp_panel_selection();
+                    self.scroll_to_panel_selection();
+                    if is_double {
+                        self.send_panel_selection_to_input();
                     }
-                } else {
-                    // Click outside the panel: unfocus search (but keep panel open).
+                    return;
+                }
+                Some(crate::panel_component::PanelTarget::SearchField) => {
+                    // Click in the search input field: focus it so keyboard
+                    // input goes to panel_query (bug 6 fix).
+                    self.panel.search_focused = true;
+                    self.request_redraw();
+                    return;
+                }
+                None => {
+                    // Click outside the panel (or below the last row):
+                    // unfocus search (but keep panel open).
                     if self.panel.search_focused {
                         self.panel.search_focused = false;
                         self.request_redraw();

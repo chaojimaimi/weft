@@ -2382,7 +2382,12 @@ fragment float4 text_fragment(
         // box with its own background and border, so it reads as an input
         // field rather than blending into the panel. When focused, the border
         // turns accent color and a blinking cursor is drawn.
-        let field_pad_x = cw * 0.5;
+        //
+        // v1.2 A4: geometry now comes from the shared `layout_panel` product
+        // so the renderer and mouse handler stay in sync (no duplicated magic
+        // numbers).
+        let panel_layout = crate::layout::layout_panel(chrome_top, cw, ch, width_px, vp_h);
+        let [field_x0, field_y0, field_x1, field_y1] = panel_layout.search_field_rect;
         // v0.9 fix: add a "History" header above the search field for a
         // clearer panel identity (Warp-style section title).
         let header_y = chrome_top + ch * 0.4;
@@ -2394,12 +2399,6 @@ fragment float4 text_fragment(
             fg,
             panel_cols,
         );
-        let field_pad_y = ch * 1.6;
-        let field_x0 = panel_x + field_pad_x;
-        let field_y0 = chrome_top + field_pad_y;
-        let field_x1 = panel_x + width_px - field_pad_x;
-        let field_h = ch * 1.4;
-        let field_y1 = field_y0 + field_h;
         // Input field background: slightly lighter than panel bg.
         let field_bg = [
             panel_bg[0] + (1.0 - panel_bg[0]) * 0.08,
@@ -2456,7 +2455,7 @@ fragment float4 text_fragment(
         );
 
         // Text inside the field: show query, or placeholder "Search…" when empty.
-        let text_y = field_y0 + (field_h - ch) * 0.5;
+        let text_y = field_y0 + (field_y1 - field_y0 - ch) * 0.5;
         let text_x = field_x0 + cw * 0.4;
         let text_cols = ((field_x1 - text_x - cw * 0.4) / cw) as usize;
         if p.query.is_empty() {
@@ -2488,9 +2487,8 @@ fragment float4 text_fragment(
         // Display list: newest-first, filtered by query (capped to fit).
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
         let display = panel_display(p.blocks, p.query, max_rows);
-        let row_h = ch * 1.1;
-        // v0.9 fix: list starts below the search field + gap.
-        let mut y = field_y1 + ch * 0.4;
+        let row_h = panel_layout.row_height;
+        let mut y = panel_layout.list_top;
         let mut drawn = 0usize;
 
         for (i, block) in display.iter().enumerate() {

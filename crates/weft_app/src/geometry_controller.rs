@@ -426,4 +426,37 @@ impl App {
         );
         crate::tab_bar_component::tab_bar_target_at(&scene, x, y)
     }
+
+    /// Resolve a physical-pixel point in the history panel to a target.
+    /// Rebuilds the panel layout from renderer geometry (single source of
+    /// truth — no duplicated magic numbers). Returns `None` when the panel
+    /// is closed, the renderer is absent, or the point misses every target.
+    pub(super) fn panel_target_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<crate::panel_component::PanelTarget> {
+        if !self.panel.open {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let chrome_top = renderer.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+        let layout = crate::layout::layout_panel(
+            chrome_top,
+            renderer.cell_width() as f32,
+            renderer.cell_height() as f32,
+            renderer.sidebar_width(),
+            renderer.viewport().1,
+        );
+        let max_rows =
+            crate::renderer::visible_panel_rows(renderer.viewport().1, renderer.cell_height());
+        let scene = crate::panel_component::build_panel_scene(
+            layout.panel_rect,
+            layout.search_field_rect,
+            layout.list_top,
+            layout.row_height,
+            max_rows,
+        );
+        crate::panel_component::panel_target_at(&scene, x, y)
+    }
 }

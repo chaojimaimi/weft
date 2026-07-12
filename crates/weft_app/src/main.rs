@@ -26,6 +26,7 @@ mod paint;
 mod palette_component;
 mod palette_controller;
 mod palette_state;
+mod panel_component;
 mod panel_controller;
 mod redraw_controller;
 mod renderer;
@@ -47,8 +48,7 @@ use palette_state::{
     BuiltinCmd, CreateStep, PaletteEntry, PaletteState, PaletteSubMode, WorkflowForm,
 };
 use renderer::{
-    block_matches_query, configure_titlebar, visible_panel_rows, FindDrawState, MetalRenderer,
-    TabBarDrawState,
+    block_matches_query, configure_titlebar, FindDrawState, MetalRenderer, TabBarDrawState,
 };
 use std::sync::atomic::Ordering;
 use tab::{Tab, TuiScrollResolution};
