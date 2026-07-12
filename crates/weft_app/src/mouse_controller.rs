@@ -11,6 +11,11 @@ impl App {
         button: winit::event::MouseButton,
     ) {
         // End popup border drag if active.
+        if button == winit::event::MouseButton::Left
+            && self.interaction.scrollbar_drag.take().is_some()
+        {
+            return;
+        }
         if button == winit::event::MouseButton::Left && self.interaction.drag_state.is_some() {
             self.interaction.drag_state = None;
             return;
@@ -51,6 +56,16 @@ impl App {
 
     /// Handle mouse movement.
     pub(super) fn handle_mouse_move(&mut self, x: f64, y: f64) {
+        if let Some(drag) = self.interaction.scrollbar_drag {
+            let offset = crate::scrollbar_component::scroll_offset_for_pointer(
+                &drag.layout,
+                y as f32,
+                drag.grab_offset,
+            );
+            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = offset;
+            self.request_redraw();
+            return;
+        }
         // v1.0 fix: sync mouse_protocol + sgr_mouse (see handle_mouse_press)
         // so move-event encoding (ButtonEvent/AnyEvent drag reporting) reflects
         // the app's actual mouse mode and report format.

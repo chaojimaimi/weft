@@ -221,6 +221,41 @@ impl App {
             }
         }
 
+        // The block-view scrollbar owns its expanded hit strip before text
+        // selection and PTY mouse reporting. Clicking the track jumps the
+        // thumb under the pointer and immediately begins a drag.
+        if button == winit::event::MouseButton::Left {
+            if let Some(layout) = self.active_scrollbar_layout() {
+                let xf = x as f32;
+                let yf = y as f32;
+                if crate::scrollbar_component::contains(layout.hit, xf, yf) {
+                    let thumb_h = layout.thumb[3] - layout.thumb[1];
+                    let grab_offset = if crate::scrollbar_component::contains(layout.thumb, xf, yf)
+                    {
+                        yf - layout.thumb[1]
+                    } else {
+                        thumb_h / 2.0
+                    };
+                    let offset = crate::scrollbar_component::scroll_offset_for_pointer(
+                        &layout,
+                        yf,
+                        grab_offset,
+                    );
+                    self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = offset;
+                    self.interaction.scrollbar_drag =
+                        Some(crate::scrollbar_component::ScrollbarDragState {
+                            layout,
+                            grab_offset,
+                        });
+                    self.sessions.tabs[self.sessions.active_tab]
+                        .selection_handler
+                        .clear();
+                    self.request_redraw();
+                    return;
+                }
+            }
+        }
+
         // v0.9 W3 (revised): block collapse/expand — only clicking the chevron
         // (▸/▾ in the first cell of a Command row) toggles fold. Clicking the
         // rest of the command line starts a normal text selection instead, so

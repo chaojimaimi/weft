@@ -3,6 +3,29 @@
 use super::*;
 
 impl App {
+    pub(super) fn active_scrollbar_layout(
+        &self,
+    ) -> Option<crate::scrollbar_component::ScrollbarLayout> {
+        let renderer = self.renderer.as_ref()?;
+        let ctx = renderer.layout_ctx?;
+        let terminal = self.sessions.tabs[self.sessions.active_tab]
+            .terminal
+            .as_ref()?;
+        if !terminal.show_block_view() {
+            return None;
+        }
+        let cols = terminal.grid().num_cols;
+        let (total, _) = block_content_metrics(terminal, cols);
+        let visible = renderer.block_visible_rows(terminal.editor().buffer.lines.len());
+        let max_scroll = total.saturating_sub(visible);
+        crate::scrollbar_component::scrollbar_layout(
+            &ctx,
+            total,
+            visible,
+            max_scroll,
+            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset,
+        )
+    }
     pub(super) fn palette_scene(
         &self,
     ) -> Option<crate::scene::Scene<crate::palette_component::PaletteTarget>> {

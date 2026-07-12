@@ -31,6 +31,7 @@ mod panel_controller;
 mod redraw_controller;
 mod renderer;
 mod scene;
+mod scrollbar_component;
 mod settings_component;
 mod settings_controller;
 mod tab;

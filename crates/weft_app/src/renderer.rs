@@ -1358,22 +1358,13 @@ fragment float4 text_fragment(
         // Only drawn when content overflows the viewport.
         if show_blocks {
             if let Some((total, visible, max_scroll)) = scroll_metrics {
-                if visible < total && max_scroll > 0 {
-                    use crate::layout::Spacing;
-                    let track_top = ctx.top();
-                    let track_h = ctx.height();
-                    let bar_x = ctx.right() - Spacing::sm(&ctx);
-                    let bar_w = Spacing::xs(&ctx) + 1.0; // ~3px at 14pt
-                                                         // Thumb height: proportional to visible/total, clamped to
-                                                         // [3 rows, track_h] so it's always grabbable.
-                    let min_thumb = Spacing::row_md(&ctx) * 3.0;
-                    let ratio = visible as f32 / total as f32;
-                    let thumb_h = (track_h * ratio).max(min_thumb).min(track_h);
-                    // Thumb Y: block_scroll counts UP from the bottom (0 =
-                    // viewing newest). Map so block_scroll=0 → thumb at bottom,
-                    // block_scroll=max_scroll → thumb at top.
-                    let scroll_ratio = block_scroll as f32 / max_scroll as f32;
-                    let thumb_y = track_top + (track_h - thumb_h) * (1.0 - scroll_ratio);
+                if let Some(scrollbar) = crate::scrollbar_component::scrollbar_layout(
+                    &ctx,
+                    total,
+                    visible,
+                    max_scroll,
+                    block_scroll,
+                ) {
                     // v1.0: label_c (70% fg + 30% bg) — was accent_dim.
                     let fg_v = color_to_normalized(self.theme.foreground);
                     let bg_v = color_to_normalized(self.theme.background);
@@ -1385,13 +1376,7 @@ fragment float4 text_fragment(
                     ];
                     let (su, sv, suw, svh) = self.space_uv();
                     let bg_uv = [su, sv + svh, su + suw, sv];
-                    push_quad(
-                        &mut vertices,
-                        [bar_x, thumb_y, bar_x + bar_w, thumb_y + thumb_h],
-                        bg_uv,
-                        [0.0; 4],
-                        thumb_color,
-                    );
+                    push_quad(&mut vertices, scrollbar.thumb, bg_uv, [0.0; 4], thumb_color);
                 }
             }
         }
