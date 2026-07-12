@@ -233,14 +233,6 @@ pub struct MetalRenderer {
     pub find_state: Option<FindDrawState>,
     /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
     /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
-    /// each draw when `tab_bar.tab_counts > 1`; cleared otherwise. The app
-    /// reads this from `handle_mouse_press` to route tab clicks.
-    pub tab_hits: Vec<TabHit>,
-    /// v1.1: Last-rendered "new tab" (+) button hit-test rect, or all-zero
-    /// when not drawn (single tab / no tab bar). Populated by
-    /// `build_tab_bar_vertices`; the app reads this in `handle_mouse_press`
-    /// to open a new tab on click.
-    pub new_tab_rect: [f32; 4],
     /// v1.0 S1-b: Last-rendered Settings panel hit-test rects (tabs, theme
     /// rows, footer buttons). Populated by `build_settings_vertices` each
     /// draw when the panel is open; cleared otherwise. The app reads this
@@ -383,17 +375,6 @@ pub struct TabBarDrawState {
     pub arrow_left_hovered: bool,
     /// v1.2: true when the mouse is over the right scroll arrow.
     pub arrow_right_hovered: bool,
-}
-
-/// v0.9 H1: Hit-test rect for a tab label + close button.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TabHit {
-    /// Full clickable rect of the tab label area: `[x0, y0, x1, y1]`.
-    pub tab_rect: [f32; 4],
-    /// Clickable rect of the close "×" button: `[x0, y0, x1, y1]`.
-    pub close_rect: [f32; 4],
-    /// Tab index (0-based) this hit corresponds to.
-    pub index: usize,
 }
 
 /// v1.0 S1-b: Hit-test rect for a clickable region inside the Settings panel.
@@ -740,8 +721,6 @@ fragment float4 text_fragment(
             block_view_rows: Vec::new(),
             layout_ctx: None,
             find_state: None,
-            tab_hits: Vec::new(),
-            new_tab_rect: [0.0; 4],
             settings_hits: Vec::new(),
             panel_highlight: None,
             cursor_blink_on: true,
@@ -1521,17 +1500,13 @@ fragment float4 text_fragment(
         // the bar entirely, making "+" inaccessible without first opening a
         // second tab via menu/keyboard.
         if tab_bar.tab_count >= 1 {
-            let (tab_verts, hits, new_tab_rect) = self.build_tab_bar_vertices(tab_bar);
+            let tab_verts = self.build_tab_bar_vertices(tab_bar);
             vertices.extend_from_slice(&tab_verts);
-            self.tab_hits = hits;
-            self.new_tab_rect = new_tab_rect;
         } else {
-            self.tab_hits.clear();
-            self.new_tab_rect = [0.0; 4]; // no "+" button in single-tab mode
-                                          // v1.1: single-tab mode — still paint a theme-color strip at the
-                                          // top (titlebar_height tall) so the transparent titlebar's traffic
-                                          // lights sit on a themed background instead of overlapping text.
-                                          // No tabs/dividers/close buttons; just the background quad.
+            // v1.1: single-tab mode — still paint a theme-color strip at the
+            // top (titlebar_height tall) so the transparent titlebar's traffic
+            // lights sit on a themed background instead of overlapping text.
+            // No tabs/dividers/close buttons; just the background quad.
             if single_tab_titlebar {
                 let bg = color_to_normalized(self.theme.background);
                 let strip_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
@@ -5435,10 +5410,7 @@ fragment float4 text_fragment(
     /// - Each tab is ~16 cells wide, with a 1px divider between tabs.
     /// - Active tab gets a brighter background + accent underline.
     /// - Close "×" button at the right of each tab.
-    fn build_tab_bar_vertices(
-        &self,
-        tab_bar: &TabBarDrawState,
-    ) -> (Vec<f32>, Vec<TabHit>, [f32; 4]) {
+    fn build_tab_bar_vertices(&self, tab_bar: &TabBarDrawState) -> Vec<f32> {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let bar_h = self.tab_bar_height();
@@ -5455,7 +5427,6 @@ fragment float4 text_fragment(
         let bar_bg = color_to_normalized(ui.chrome);
 
         let mut vertices = Vec::new();
-        let mut hits = Vec::new();
 
         // v1.2 architecture: renderer and App scroll/hit behavior consume the
         // same pure tab-strip layout product.
@@ -5619,18 +5590,7 @@ fragment float4 text_fragment(
             }
 
             // Hit rect: close_rect registered only when cx is in view.
-            let close_x0 = x0 + label_w;
-            let close_x1 = x0 + label_w + close_w;
-            let hit_close_rect = if cx_in_view {
-                [close_x0, y0, close_x1, y1]
-            } else {
-                [0.0; 4]
-            };
-            hits.push(TabHit {
-                tab_rect: strip.tab_rect(i),
-                close_rect: hit_close_rect,
-                index: i,
-            });
+            // Hit regions now live in the TabBar Scene (tab_bar_component.rs).
         }
 
         // v1.2: Scroll arrows — drawn when tabs overflow.
@@ -5729,26 +5689,6 @@ fragment float4 text_fragment(
                 ra_w,
                 ra_color,
             );
-
-            // Register arrow hit rects — inserted at the FRONT of the hits
-            // array so the click handler finds them before any tab hit whose
-            // tab_rect might overlap the arrow region.
-            hits.insert(
-                0,
-                TabHit {
-                    tab_rect: left_arrow_rect,
-                    close_rect: [0.0; 4],
-                    index: usize::MAX, // left arrow sentinel
-                },
-            );
-            hits.insert(
-                1,
-                TabHit {
-                    tab_rect: right_arrow_rect,
-                    close_rect: [0.0; 4],
-                    index: usize::MAX - 1, // right arrow sentinel
-                },
-            );
         }
 
         // v1.2: "+" button position:
@@ -5798,9 +5738,7 @@ fragment float4 text_fragment(
             plus_line_w,
             plus_color,
         );
-        let new_tab_rect = [plus_x0, y0, plus_x0 + plus_w, y1];
-
-        (vertices, hits, new_tab_rect)
+        vertices
     }
 }
 

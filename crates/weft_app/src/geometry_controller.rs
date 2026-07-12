@@ -392,4 +392,38 @@ impl App {
             _ => None,
         }
     }
+
+    /// Resolve a physical-pixel point in the tab bar to the topmost target.
+    /// Rebuilds the tab-strip layout from the current renderer geometry +
+    /// `TabBarState.scroll_offset`, then queries the shared TabBar Scene.
+    /// Returns `None` when the renderer is absent or the point is outside the
+    /// bar.
+    pub(super) fn tab_bar_target_at(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<crate::tab_bar_component::TabBarTarget> {
+        let renderer = self.renderer.as_ref()?;
+        if y > renderer.tab_bar_height() {
+            return None;
+        }
+        let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+        let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
+            viewport_width: renderer.viewport().0,
+            bar_height: renderer.tab_bar_height(),
+            cell_width: renderer.cell_width() as f32,
+            padding_x: renderer.padding_x(),
+            chrome_left,
+            traffic_lights_width: renderer.traffic_lights_width(),
+            tab_count: self.sessions.tabs.len(),
+            requested_scroll_offset: self.tab_bar.scroll_offset,
+        });
+        let scene = crate::tab_bar_component::build_tab_bar_scene(
+            strip,
+            self.sessions.tabs.len(),
+            renderer.cell_width() as f32,
+            renderer.cell_height() as f32,
+        );
+        crate::tab_bar_component::tab_bar_target_at(&scene, x, y)
+    }
 }

@@ -91,41 +91,29 @@ impl App {
                     if (x as f32) < renderer.traffic_lights_width() {
                         return;
                     }
-                    // Click is in the tab bar region. Check hit-test rects.
+                    // Click is in the tab bar region. Resolve via the shared
+                    // TabBar Scene (arrows → close → tab label → "+", in
+                    // z-order). Falls through to the double-click handler when
+                    // the click misses every target.
                     let xf = x as f32;
                     let yf = y as f32;
-                    for hit in &renderer.tab_hits {
-                        // v1.2: Check scroll-arrow sentinel values first.
-                        // usize::MAX = left arrow, usize::MAX - 1 = right arrow.
-                        if hit.index == usize::MAX {
-                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                                let cw = renderer.cell_width() as f32;
-                                self.tab_bar.scroll_offset =
-                                    (self.tab_bar.scroll_offset - cw * 15.0).max(0.0);
-                                self.clamp_tab_scroll();
-                                self.request_redraw();
-                                return;
-                            }
-                            continue;
+                    match self.tab_bar_target_at(xf, yf) {
+                        Some(crate::tab_bar_component::TabBarTarget::ArrowLeft) => {
+                            let cw = renderer.cell_width() as f32;
+                            self.tab_bar.scroll_offset =
+                                (self.tab_bar.scroll_offset - cw * 15.0).max(0.0);
+                            self.clamp_tab_scroll();
+                            self.request_redraw();
+                            return;
                         }
-                        if hit.index == usize::MAX - 1 {
-                            let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                            if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                                let cw = renderer.cell_width() as f32;
-                                self.tab_bar.scroll_offset += cw * 15.0;
-                                self.clamp_tab_scroll();
-                                self.request_redraw();
-                                return;
-                            }
-                            continue;
+                        Some(crate::tab_bar_component::TabBarTarget::ArrowRight) => {
+                            let cw = renderer.cell_width() as f32;
+                            self.tab_bar.scroll_offset += cw * 15.0;
+                            self.clamp_tab_scroll();
+                            self.request_redraw();
+                            return;
                         }
-                        // Check close button first (it's inside the tab rect).
-                        let [cx0, cy0, cx1, cy1] = hit.close_rect;
-                        if xf >= cx0 && xf < cx1 && yf >= cy0 && yf < cy1 {
-                            // Close this tab.
-                            let idx = hit.index;
-                            // If closing the active tab, switch first.
+                        Some(crate::tab_bar_component::TabBarTarget::Close(idx)) => {
                             if idx == self.sessions.active_tab {
                                 if self.close_tab() {
                                     // App continues with remaining tabs.
@@ -141,10 +129,7 @@ impl App {
                             }
                             return;
                         }
-                        // Check tab label rect.
-                        let [tx0, ty0, tx1, ty1] = hit.tab_rect;
-                        if xf >= tx0 && xf < tx1 && yf >= ty0 && yf < ty1 {
-                            let hit_index = hit.index;
+                        Some(crate::tab_bar_component::TabBarTarget::Tab(hit_index)) => {
                             if self.sessions.active_tab != hit_index {
                                 self.reset_ime_context("tab clicked");
                                 self.sessions.active_tab = hit_index;
@@ -155,14 +140,11 @@ impl App {
                             self.request_redraw();
                             return;
                         }
-                    }
-                    // v1.1: "+" (new tab) button — check before the
-                    // background-drag/double-click handler so a click on "+"
-                    // opens a tab instead of maximizing.
-                    let [nx0, ny0, nx1, ny1] = renderer.new_tab_rect;
-                    if nx1 > 0.0 && xf >= nx0 && xf < nx1 && yf >= ny0 && yf < ny1 {
-                        self.new_tab();
-                        return;
+                        Some(crate::tab_bar_component::TabBarTarget::NewTab) => {
+                            self.new_tab();
+                            return;
+                        }
+                        None => {}
                     }
                     // v1.1: Click in the tab-bar background (not on any tab,
                     // not on the traffic lights). This is a draggable region

@@ -71,54 +71,19 @@ impl App {
 
         // v0.9 W1+: tab bar hover detection — show close "×" on the hovered
         // tab (Warp-style) and highlight the "+" / scroll arrows.
-        // v1.2: always active (even single tab) since the tab bar is now
-        // always rendered. Reads `tab_hits` populated during the last draw.
+        // v1.2: always active (even single tab) since the bar is always drawn.
+        // Hit testing goes through the shared TabBar Scene (no renderer state).
         {
-            let (new_hover, new_plus_hover, new_la_hover, new_ra_hover) = if let Some(renderer) =
-                &self.renderer
-            {
-                let bar_h = renderer.tab_bar_height();
-                let yf = y as f32;
-                if yf <= bar_h {
-                    let xf = x as f32;
-                    // Check "+" button hover.
-                    let [nx0, _ny0, nx1, _ny1] = renderer.new_tab_rect;
-                    let plus_h = nx1 > 0.0 && xf >= nx0 && xf < nx1;
-                    // Check arrow hover (sentinel index values).
-                    let (la_h, ra_h) =
-                        renderer
-                            .tab_hits
-                            .iter()
-                            .fold((false, false), |(la, ra), h| {
-                                if h.index == usize::MAX
-                                    && xf >= h.tab_rect[0]
-                                    && xf < h.tab_rect[2]
-                                {
-                                    (true, ra)
-                                } else if h.index == usize::MAX - 1
-                                    && xf >= h.tab_rect[0]
-                                    && xf < h.tab_rect[2]
-                                {
-                                    (la, true)
-                                } else {
-                                    (la, ra)
-                                }
-                            });
-                    // Check tab hover (exclude arrow sentinels).
-                    let tab_h = renderer
-                        .tab_hits
-                        .iter()
-                        .find(|h| {
-                            h.index < usize::MAX - 1 && xf >= h.tab_rect[0] && xf < h.tab_rect[2]
-                        })
-                        .map(|h| h.index);
-                    (tab_h, plus_h, la_h, ra_h)
-                } else {
-                    (None, false, false, false)
-                }
-            } else {
-                (None, false, false, false)
-            };
+            use crate::tab_bar_component::TabBarTarget;
+            let (new_hover, new_plus_hover, new_la_hover, new_ra_hover) =
+                match self.tab_bar_target_at(x as f32, y as f32) {
+                    Some(TabBarTarget::Tab(idx)) => (Some(idx), false, false, false),
+                    Some(TabBarTarget::Close(idx)) => (Some(idx), false, false, false),
+                    Some(TabBarTarget::NewTab) => (None, true, false, false),
+                    Some(TabBarTarget::ArrowLeft) => (None, false, true, false),
+                    Some(TabBarTarget::ArrowRight) => (None, false, false, true),
+                    None => (None, false, false, false),
+                };
             let changed = new_hover != self.tab_bar.hovered_tab
                 || new_plus_hover != self.tab_bar.plus_hovered
                 || new_la_hover != self.tab_bar.arrow_left_hovered

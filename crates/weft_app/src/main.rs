@@ -31,6 +31,7 @@ mod renderer;
 mod scene;
 mod settings_controller;
 mod tab;
+mod tab_bar_component;
 mod terminal_geometry;
 mod ui_tokens;
 mod window_event_controller;
