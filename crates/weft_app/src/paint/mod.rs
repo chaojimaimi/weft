@@ -9,5 +9,8 @@
 
 pub(crate) mod overlays;
 pub(crate) mod palette;
+pub(crate) mod panel;
 pub(crate) mod primitives;
+pub(crate) mod settings;
+pub(crate) mod tab_bar;
 pub(crate) mod text;
