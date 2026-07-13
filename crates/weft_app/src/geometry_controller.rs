@@ -613,6 +613,8 @@ impl App {
             crate::overlay::SettingsTab::ALL.len(),
             self.settings.error.is_some(),
             &footer_pair_widths,
+            self.settings_is_narrow(),
+            self.settings.drill_down,
         )?;
 
         let theme_count = if self.settings.tab == crate::overlay::SettingsTab::Appearance {
@@ -624,6 +626,7 @@ impl App {
         let scene = crate::settings_component::build_settings_scene(
             &layout,
             crate::overlay::SettingsTab::ALL.as_slice(),
+            self.settings.tab,
             theme_count,
             ch,
         );
@@ -651,6 +654,8 @@ impl App {
             crate::overlay::SettingsTab::ALL.len(),
             self.settings.error.is_some(),
             &[0.0; 6],
+            self.settings_is_narrow(),
+            self.settings.drill_down,
         )
         .map(|layout| {
             let [bx0, by0, bx1, by1] = layout.box_rect;

@@ -100,6 +100,13 @@ impl App {
         // would conflict with `active_mut()`.
         let settings_themes = self.settings_theme_views();
         let settings_keybindings = self.settings_keybinding_views();
+        // F5: compute settings split-layout state before the mutable `tab`
+        // borrow below. These feed build_overlay_stack's new params.
+        let settings_is_narrow = self.settings_is_narrow();
+        let settings_drill_down = self.settings.drill_down;
+        let settings_keybinding_conflict_count =
+            settings_keybindings.iter().filter(|v| v.conflict).count();
+        let settings_field_errors: &[(String, String)] = &self.settings.field_errors;
         let palette_form_fields = self
             .palette
             .form
@@ -253,9 +260,17 @@ impl App {
                 self.settings.draft.window.padding_x,
                 self.settings.draft.window.padding_y,
                 self.settings.draft.scrollback.lines,
+                self.settings.draft.window.width,
+                self.settings.draft.window.height,
+                self.settings.draft.window.sidebar_width,
+                self.settings.draft.editor.submit_on_ctrl_enter,
                 &settings_keybindings,
                 self.settings.draft.logo.variant,
                 self.settings.error.as_deref(),
+                settings_is_narrow,
+                settings_drill_down,
+                settings_keybinding_conflict_count,
+                settings_field_errors,
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid

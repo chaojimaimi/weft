@@ -32,11 +32,15 @@ impl App {
             let yf = y as f32;
             use crate::settings_component::SettingsTarget;
             match self.settings_target_at(xf, yf) {
-                Some(SettingsTarget::Tab(tab)) => {
+                Some(SettingsTarget::SidebarCategory(tab)) => {
                     if self.settings.tab != tab {
                         self.settings.tab = tab;
                         self.settings.selection = 0;
                         self.settings.scroll_offset = 0;
+                        // F5: narrow mode — clicking a category drills into it.
+                        if self.settings_is_narrow() {
+                            self.settings.drill_down = true;
+                        }
                     }
                     self.request_redraw();
                     return;

@@ -12,9 +12,9 @@ use crate::scene::{FocusId, HitRegion, Scene, SemanticNode, SemanticRole};
 /// A clickable region of the settings panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsTarget {
-    /// A tab-bar entry (Appearance / Font / Keybindings / Window / Logo).
-    Tab(SettingsTab),
-    /// A theme row in the Appearance tab (0-based screen-relative index).
+    /// F5: A sidebar category entry (Appearance / Terminal / Input / ...).
+    SidebarCategory(SettingsTab),
+    /// A theme row in the Appearance category (0-based screen-relative index).
     Theme(usize),
     /// Footer "⏎ apply" button.
     ApplyButton,
@@ -26,11 +26,13 @@ pub(crate) enum SettingsTarget {
 
 /// Build the settings Scene from a shared layout product + dynamic state.
 /// `theme_count` is the number of visible theme rows (already capped by
-/// `layout.max_rows`). `tabs` is the ordered list of settings tabs.
-/// `cell_h` is the physical cell height (drives tab/theme row heights).
+/// `layout.max_rows`). `tabs` is the ordered list of settings categories.
+/// `cell_h` is the physical cell height (drives sidebar row heights).
+/// `active_tab` is the currently-selected sidebar category (for highlight).
 pub(crate) fn build_settings_scene(
     layout: &SettingsLayout,
     tabs: &[SettingsTab],
+    _active_tab: SettingsTab,
     theme_count: usize,
     cell_h: f32,
 ) -> Scene<SettingsTarget> {
@@ -44,39 +46,44 @@ pub(crate) fn build_settings_scene(
         focus: Some(FocusId::Settings),
     });
 
-    // Tab bar hits.
-    for (i, tab) in tabs.iter().enumerate() {
-        let tx0 = box_x0 + i as f32 * layout.tab_width;
-        let tab_rect: Rect = [
-            tx0,
-            layout.tab_bar_y,
-            tx0 + layout.tab_width,
-            layout.tab_bar_y + cell_h,
-        ];
-        scene
-            .hits
-            .push(HitRegion::from_rect(tab_rect, SettingsTarget::Tab(*tab)));
-        scene.semantics.push(SemanticNode {
-            role: SemanticRole::Tab,
-            label: tab.label().into(),
-            bounds: tab_rect,
-            focus: Some(FocusId::Settings),
-        });
+    // F5: Sidebar category hit regions (vertical list).
+    if layout.show_sidebar {
+        for (i, tab) in tabs.iter().enumerate() {
+            let row_y = layout.sidebar_top + i as f32 * cell_h;
+            let row_rect: Rect = [
+                layout.sidebar_rect[0],
+                row_y,
+                layout.sidebar_rect[2],
+                row_y + cell_h,
+            ];
+            scene.hits.push(HitRegion::from_rect(
+                row_rect,
+                SettingsTarget::SidebarCategory(*tab),
+            ));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::Tab,
+                label: tab.label().into(),
+                bounds: row_rect,
+                focus: Some(FocusId::Settings),
+            });
+        }
     }
 
-    // Theme row hits (Appearance only — theme_count is 0 for other tabs).
-    for i in 0..theme_count {
-        let row_y = layout.content_top + i as f32 * cell_h;
-        let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
-        scene
-            .hits
-            .push(HitRegion::from_rect(row_rect, SettingsTarget::Theme(i)));
-        scene.semantics.push(SemanticNode {
-            role: SemanticRole::ListItem,
-            label: format!("Theme {}", i + 1),
-            bounds: row_rect,
-            focus: None,
-        });
+    // Theme row hits (Appearance only — theme_count is 0 for other categories).
+    if layout.show_content && theme_count > 0 {
+        for i in 0..theme_count {
+            let row_y = layout.content_top + i as f32 * cell_h;
+            let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+            scene
+                .hits
+                .push(HitRegion::from_rect(row_rect, SettingsTarget::Theme(i)));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::ListItem,
+                label: format!("Theme {}", i + 1),
+                bounds: row_rect,
+                focus: None,
+            });
+        }
     }
 
     // Footer buttons.
@@ -95,6 +102,9 @@ pub(crate) fn build_settings_scene(
             .hits
             .push(HitRegion::from_rect(save, SettingsTarget::SaveButton));
     }
+
+    // Suppress unused-variable warning for box_x0 (kept for clarity).
+    let _ = box_x0;
 
     scene
 }
@@ -122,9 +132,14 @@ mod tests {
     fn sample_layout() -> SettingsLayout {
         SettingsLayout {
             box_rect: [200.0, 100.0, 1000.0, 700.0],
-            tab_bar_y: 156.0,
-            tab_width: 160.0,
-            content_x0: 212.0,
+            sidebar_rect: [200.0, 140.0, 400.0, 660.0],
+            sidebar_width: 200.0,
+            sidebar_top: 140.0,
+            show_sidebar: true,
+            show_content: true,
+            tab_bar_y: 140.0,
+            tab_width: CELL_H,
+            content_x0: 412.0,
             content_x1: 988.0,
             content_top: 200.0,
             max_rows: 20,
@@ -138,14 +153,26 @@ mod tests {
     }
 
     #[test]
-    fn tab_hit_returns_correct_variant() {
+    fn sidebar_category_hit_returns_correct_variant() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, 0, CELL_H);
-        // Tab 1 starts at box_x0 + 1*tab_width = 200 + 160 = 360
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
+        // Row 1 (Terminal) starts at sidebar_top + 1*20 = 140 + 20 = 160
         assert_eq!(
-            settings_target_at(&scene, 400.0, 160.0),
-            Some(SettingsTarget::Tab(SettingsTab::Font)),
+            settings_target_at(&scene, 300.0, 165.0),
+            Some(SettingsTarget::SidebarCategory(SettingsTab::Terminal)),
+        );
+    }
+
+    #[test]
+    fn active_sidebar_category_highlighted() {
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Keybindings, 0, CELL_H);
+        // Row 3 (Keybindings) starts at sidebar_top + 3*20 = 140 + 60 = 200
+        assert_eq!(
+            settings_target_at(&scene, 300.0, 205.0),
+            Some(SettingsTarget::SidebarCategory(SettingsTab::Keybindings)),
         );
     }
 
@@ -153,22 +180,46 @@ mod tests {
     fn theme_row_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, 5, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H);
         // Row 2 starts at content_top + 2*20 = 200 + 40 = 240
         assert_eq!(
-            settings_target_at(&scene, 300.0, 245.0),
+            settings_target_at(&scene, 500.0, 245.0),
             Some(SettingsTarget::Theme(2)),
         );
+    }
+
+    #[test]
+    fn theme_row_misses_when_sidebar_hidden() {
+        // F5: in narrow drill-down sidebar mode, content is hidden so theme
+        // rows should not be hit-testable.
+        let tabs = SettingsTab::ALL.to_vec();
+        let mut layout = sample_layout();
+        layout.show_content = false;
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H);
+        // Clicking where a theme row would be returns None (content hidden).
+        assert_eq!(settings_target_at(&scene, 500.0, 245.0), None);
     }
 
     #[test]
     fn footer_button_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, 0, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
         assert_eq!(
             settings_target_at(&scene, 250.0, 680.0),
             Some(SettingsTarget::ApplyButton),
         );
+    }
+
+    #[test]
+    fn narrow_drill_down_hides_sidebar_categories() {
+        // F5: in narrow content mode, sidebar is hidden so category clicks
+        // should not register.
+        let tabs = SettingsTab::ALL.to_vec();
+        let mut layout = sample_layout();
+        layout.show_sidebar = false;
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
+        // Clicking where a sidebar row would be returns None (sidebar hidden).
+        assert_eq!(settings_target_at(&scene, 300.0, 165.0), None);
     }
 }

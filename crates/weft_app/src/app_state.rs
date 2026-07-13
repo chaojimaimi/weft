@@ -491,6 +491,12 @@ pub struct SettingsState {
     pub draft: Config,
     pub dirty: bool,
     pub error: Option<String>,
+    /// F5: In narrow mode, true = show content (user drilled into a category),
+    /// false = show sidebar. Wide mode ignores this (both are visible).
+    pub drill_down: bool,
+    /// F5: Field-level validation errors (field_label, message). Set by
+    /// validation before save; cleared on successful save or panel close.
+    pub field_errors: Vec<(String, String)>,
 }
 
 impl SettingsState {
@@ -503,6 +509,8 @@ impl SettingsState {
             draft: Config::default(),
             dirty: false,
             error: None,
+            drill_down: false,
+            field_errors: Vec::new(),
         }
     }
 
@@ -514,12 +522,16 @@ impl SettingsState {
         self.draft = config.clone();
         self.dirty = false;
         self.error = None;
+        self.drill_down = false;
+        self.field_errors.clear();
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.dirty = false;
         self.error = None;
+        self.drill_down = false;
+        self.field_errors.clear();
     }
 }
 

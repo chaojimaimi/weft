@@ -80,35 +80,45 @@ pub enum OverlayContent<'a> {
     // future: ContextMenu(ContextMenuDrawParams<'a>),
 }
 
-/// v1.0 S1: Which tab of the Settings panel is active.
+/// F5: Which category of the Settings panel is active. The old v1.0 tab
+/// bar (Appearance / Font / Keybindings / Window / Logo) has been replaced
+/// by a 6-entry split sidebar. Logo and Font merged into Appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
+    /// Theme list, logo variant, font family/size/line-height, window opacity.
     Appearance,
-    Font,
+    /// Scrollback, padding X/Y, alt-screen behavior.
+    Terminal,
+    /// Editor mode (submit_on_ctrl_enter), IME / mouse settings.
+    Input,
+    /// Keybinding list + conflict detection + restore defaults.
     Keybindings,
+    /// Window size, sidebar width, tab bar.
     Window,
-    /// v1.0 Logo: Dock icon variant selection (←/→ cycles Cool/Warm/Light/Transparent).
-    Logo,
+    /// Debug logging, experimental features (restart-required badges).
+    Advanced,
 }
 
 impl SettingsTab {
-    /// All tabs in display order.
-    pub const ALL: [SettingsTab; 5] = [
+    /// All categories in sidebar display order.
+    pub const ALL: [SettingsTab; 6] = [
         SettingsTab::Appearance,
-        SettingsTab::Font,
+        SettingsTab::Terminal,
+        SettingsTab::Input,
         SettingsTab::Keybindings,
         SettingsTab::Window,
-        SettingsTab::Logo,
+        SettingsTab::Advanced,
     ];
 
-    /// Human-readable label for the tab bar.
+    /// Human-readable label for the sidebar.
     pub fn label(self) -> &'static str {
         match self {
             SettingsTab::Appearance => "Appearance",
-            SettingsTab::Font => "Font",
+            SettingsTab::Terminal => "Terminal",
+            SettingsTab::Input => "Input",
             SettingsTab::Keybindings => "Keybindings",
             SettingsTab::Window => "Window",
-            SettingsTab::Logo => "Logo",
+            SettingsTab::Advanced => "Advanced",
         }
     }
 }
@@ -129,18 +139,21 @@ pub struct SettingsKeybindingView {
     pub action: String,
     /// The key chord string (e.g. "cmd+c").
     pub binding: String,
+    /// F5: True when this chord is also bound to another action (conflict).
+    /// The renderer highlights the row and the controller surfaces a summary.
+    pub conflict: bool,
 }
 
-/// v1.0 S1: Settings panel rendering parameters. The renderer reads these
-/// to lay out the panel's tabs and content. All data is borrowed from the
+/// F5: Settings panel rendering parameters. The renderer reads these to lay
+/// out the panel's sidebar + content form. All data is borrowed from the
 /// `App` struct's settings-related fields.
 #[derive(Clone, Copy)]
 pub struct SettingsDrawParams<'a> {
-    /// Which tab is active.
+    /// Which category is active (sidebar selection).
     pub active_tab: SettingsTab,
-    /// Row cursor position within the active tab's content area.
+    /// Row cursor position within the active category's content area.
     pub selection: usize,
-    /// v1.0 fix: vertical scroll offset for list-based tabs (Keybindings).
+    /// v1.0 fix: vertical scroll offset for list-based categories (Keybindings).
     /// The renderer renders rows `[offset .. offset+max_rows]`.
     pub scroll_offset: usize,
     /// Current theme name (config value, e.g. "weft-warm").
@@ -161,14 +174,35 @@ pub struct SettingsDrawParams<'a> {
     pub window_padding_y: u32,
     /// Scrollback buffer size (lines).
     pub scrollback_lines: usize,
-    /// Keybindings to display (read-only in v1.0).
+    /// F5: Window width (px) — Window category.
+    pub window_width: u32,
+    /// F5: Window height (px) — Window category.
+    pub window_height: u32,
+    /// F5: Sidebar width override (logical pt) — Window category. None = default.
+    pub sidebar_width: Option<f32>,
+    /// F5: Submit-on-Ctrl+Enter toggle — Input category.
+    pub submit_on_ctrl_enter: bool,
+    /// Keybindings to display (with F5 conflict flag).
     pub keybindings: &'a [SettingsKeybindingView],
-    /// v1.0 Logo: currently-applied Dock icon variant (Logo tab displays its label).
+    /// v1.0 Logo: currently-applied Dock icon variant (Appearance category
+    /// displays its label; ←/→ cycles).
     pub logo_variant: weft_core::config::LogoVariant,
     /// v1.0 S2: Last save error message. `None` when the most recent save
     /// succeeded (or no save has been attempted). Surfaced as a red banner
-    /// at the top of the panel.
+    /// at the top of the panel + field-level errors.
     pub error: Option<&'a str>,
+    /// F5: True when the viewport is narrow (<640pt logical). The renderer
+    /// switches to single-column drill-down: sidebar only, or content only.
+    pub is_narrow: bool,
+    /// F5: In narrow mode, true = show content (user drilled into a category),
+    /// false = show sidebar. In wide mode this is ignored (both are visible).
+    pub drill_down: bool,
+    /// F5: Number of keybinding conflicts detected. Shown as a summary badge
+    /// in the Keybindings category header.
+    pub keybinding_conflict_count: usize,
+    /// F5: Field-level validation errors (field_label, message). Rendered
+    /// inline next to the offending field AND aggregated in the top summary.
+    pub field_errors: &'a [(String, String)],
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -297,10 +331,12 @@ impl OverlayWarmup for OverlayContent<'_> {
                 missing.extend("Workflow Builtin — 填写参数 Enter 下一项 Esc".chars());
             }
             OverlayContent::Settings(s) => {
-                // Tab labels + status text + theme names + keybinding strings.
-                missing.extend("Settings Appearance Font Keybindings Window Logo".chars());
+                // F5: sidebar category labels + status text + theme names + keybinding strings.
                 missing.extend(
-                    "Theme: Font: Size: Line: Window Opacity Padding Scrollback Lines Variant:"
+                    "Settings Appearance Terminal Input Keybindings Window Advanced".chars(),
+                );
+                missing.extend(
+                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart"
                         .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
@@ -312,6 +348,7 @@ impl OverlayWarmup for OverlayContent<'_> {
                 missing.extend("↑↓⏎⇥⌘←→esc navigate apply switch adjust close save".chars());
                 missing.insert('\u{26a0}');
                 missing.insert('\u{25cf}'); // ● current-theme marker
+                missing.insert('\u{21bb}'); // ↻ restart-required badge
                 missing.extend(s.theme_name.chars());
                 missing.extend(s.font_family.chars());
                 if let Some(err) = s.error {
@@ -325,7 +362,7 @@ impl OverlayWarmup for OverlayContent<'_> {
                     missing.extend(kb.binding.chars());
                 }
                 // v1.0 Logo: warm all variant labels (Cool/Warm/Light/Transparent
-                // + parenthetical descriptions) so the Logo tab renders correctly.
+                // + parenthetical descriptions) so the Appearance category renders correctly.
                 for v in weft_core::config::LogoVariant::ALL {
                     missing.extend(v.label().chars());
                 }
@@ -406,9 +443,17 @@ pub fn build_overlay_stack<'a>(
     settings_window_padding_x: u32,
     settings_window_padding_y: u32,
     settings_scrollback_lines: usize,
+    settings_window_width: u32,
+    settings_window_height: u32,
+    settings_sidebar_width: Option<f32>,
+    settings_submit_on_ctrl_enter: bool,
     settings_keybindings: &'a [SettingsKeybindingView],
     settings_logo_variant: weft_core::config::LogoVariant,
     settings_error: Option<&'a str>,
+    settings_is_narrow: bool,
+    settings_drill_down: bool,
+    settings_keybinding_conflict_count: usize,
+    settings_field_errors: &'a [(String, String)],
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -545,9 +590,17 @@ pub fn build_overlay_stack<'a>(
                 window_padding_x: settings_window_padding_x,
                 window_padding_y: settings_window_padding_y,
                 scrollback_lines: settings_scrollback_lines,
+                window_width: settings_window_width,
+                window_height: settings_window_height,
+                sidebar_width: settings_sidebar_width,
+                submit_on_ctrl_enter: settings_submit_on_ctrl_enter,
                 keybindings: settings_keybindings,
                 logo_variant: settings_logo_variant,
                 error: settings_error,
+                is_narrow: settings_is_narrow,
+                drill_down: settings_drill_down,
+                keybinding_conflict_count: settings_keybinding_conflict_count,
+                field_errors: settings_field_errors,
             }),
         });
     }
@@ -704,18 +757,24 @@ mod tests {
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(labels.len(), unique.len(), "tab labels must be distinct");
         assert!(labels.contains(&"Appearance"));
-        assert!(labels.contains(&"Font"));
+        assert!(labels.contains(&"Terminal"));
+        assert!(labels.contains(&"Input"));
         assert!(labels.contains(&"Keybindings"));
         assert!(labels.contains(&"Window"));
-        assert!(labels.contains(&"Logo"));
+        assert!(labels.contains(&"Advanced"));
     }
 
     #[test]
-    fn settings_tab_all_has_five_tabs() {
-        assert_eq!(SettingsTab::ALL.len(), 5);
+    fn settings_tab_all_has_six_categories() {
+        // F5: Logo merged into Appearance; Font merged into Appearance.
+        // New categories: Appearance, Terminal, Input, Keybindings, Window, Advanced.
+        assert_eq!(SettingsTab::ALL.len(), 6);
         assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
-        assert_eq!(SettingsTab::ALL[3], SettingsTab::Window);
-        assert_eq!(SettingsTab::ALL[4], SettingsTab::Logo);
+        assert_eq!(SettingsTab::ALL[1], SettingsTab::Terminal);
+        assert_eq!(SettingsTab::ALL[2], SettingsTab::Input);
+        assert_eq!(SettingsTab::ALL[3], SettingsTab::Keybindings);
+        assert_eq!(SettingsTab::ALL[4], SettingsTab::Window);
+        assert_eq!(SettingsTab::ALL[5], SettingsTab::Advanced);
     }
 
     #[test]
@@ -743,6 +802,7 @@ mod tests {
         let kbs = vec![SettingsKeybindingView {
             action: "Copy".to_string(),
             binding: "cmd+c".to_string(),
+            conflict: false,
         }];
         let s = SettingsDrawParams {
             active_tab: SettingsTab::Appearance,
@@ -757,9 +817,17 @@ mod tests {
             window_padding_x: 0,
             window_padding_y: 0,
             scrollback_lines: 10_000,
+            window_width: 800,
+            window_height: 600,
+            sidebar_width: None,
+            submit_on_ctrl_enter: false,
             keybindings: &kbs,
             logo_variant: weft_core::config::LogoVariant::Cool,
             error: None,
+            is_narrow: false,
+            drill_down: false,
+            keybinding_conflict_count: 0,
+            field_errors: &[],
         };
         let mut missing = HashSet::new();
         OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -798,9 +866,17 @@ mod tests {
                         window_padding_x: 0,
                         window_padding_y: 0,
                         scrollback_lines: 10_000,
+                        window_width: 800,
+                        window_height: 600,
+                        sidebar_width: None,
+                        submit_on_ctrl_enter: false,
                         keybindings: &[],
                         logo_variant: weft_core::config::LogoVariant::Cool,
                         error: None,
+                        is_narrow: false,
+                        drill_down: false,
+                        keybinding_conflict_count: 0,
+                        field_errors: &[],
                     }),
                 },
             ],
