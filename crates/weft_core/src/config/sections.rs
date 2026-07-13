@@ -1,0 +1,224 @@
+use serde::Deserialize;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct FontConfig {
+    pub family: String,
+    pub size: f32,
+    pub cjk_family: String,
+    pub emoji_family: String,
+    pub line_height: f32,
+}
+
+impl Default for FontConfig {
+    fn default() -> Self {
+        Self {
+            family: "Menlo".into(),
+            size: 14.0,
+            cjk_family: "PingFang SC".into(),
+            emoji_family: "Apple Color Emoji".into(),
+            line_height: 1.2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub name: String,
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub cursor: Option<String>,
+    pub selection: Option<String>,
+    /// v0.8: signature accent (prompt ❯, scrollbar thumb, cursor glow).
+    pub accent: Option<String>,
+    /// v0.8: dimmed accent (chevrons, completion hover, secondary chrome).
+    pub accent_dim: Option<String>,
+    /// v0.8: block separator color.
+    pub separator: Option<String>,
+    pub palette: Vec<String>,
+    /// v0.9 U-D1: follow macOS system appearance (light/dark). When true,
+    /// `light_name` / `dark_name` override `name` based on the current
+    /// system appearance. Manual `Cmd+Shift+T` toggle is a no-op while
+    /// this is enabled (the system overrides it on the next poll).
+    pub follow_system: bool,
+    /// v0.9 U-D1: theme name to use when system appearance is Light.
+    /// Defaults to "weft-light" when None.
+    pub light_name: Option<String>,
+    /// v0.9 U-D1: theme name to use when system appearance is Dark.
+    /// Defaults to "weft-warm" when None.
+    pub dark_name: Option<String>,
+    /// v1.0 S5: per-syntax-token color overrides. Each field is an optional
+    /// hex string (`"#rrggbb"`); when present it overrides the base theme's
+    /// `SyntaxColors` field of the same name. Applied after the inline
+    /// color overrides in [`Theme::resolve_named`].
+    pub syntax: Option<SyntaxConfig>,
+}
+
+/// v1.0 S5: TOML-facing syntax color overrides. All fields optional; absent
+/// fields inherit from the resolved base theme. Mirrors the 9 fields of
+/// [`SyntaxColors`].
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SyntaxConfig {
+    pub command: Option<String>,
+    pub flag: Option<String>,
+    pub path: Option<String>,
+    pub string: Option<String>,
+    pub number: Option<String>,
+    pub variable: Option<String>,
+    pub operator: Option<String>,
+    pub comment: Option<String>,
+    pub default: Option<String>,
+}
+
+// Manual Default (deriving would give name = "").
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: "weft-warm".into(),
+            foreground: None,
+            background: None,
+            cursor: None,
+            selection: None,
+            accent: None,
+            accent_dim: None,
+            separator: None,
+            palette: Vec::new(),
+            follow_system: false,
+            light_name: None,
+            dark_name: None,
+            syntax: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct WindowConfig {
+    pub width: u32,
+    pub height: u32,
+    pub title: String,
+    pub opacity: f32,
+    pub padding_x: u32,
+    pub padding_y: u32,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            width: 800,
+            height: 600,
+            title: "Weft".into(),
+            opacity: 1.0,
+            padding_x: 0,
+            padding_y: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct ScrollbackConfig {
+    pub lines: usize,
+}
+
+impl Default for ScrollbackConfig {
+    fn default() -> Self {
+        Self { lines: 10_000 }
+    }
+}
+
+/// Editor (input-box) options.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct EditorConfig {
+    /// If true, `Ctrl+Enter` submits and plain `Enter` inserts a newline
+    /// (Warp default). If false (default), `Enter` submits and `Shift+Enter`
+    /// inserts a newline.
+    pub submit_on_ctrl_enter: bool,
+}
+
+/// v1.0 Logo variant — the app icon shown in the Dock / app switcher.
+/// Not theme-bound: the user picks a preferred variant in Settings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogoVariant {
+    /// Cool dark — `#0b0e14` bg + neon cyan W.
+    /// Also the fallback for unknown config values.
+    #[default]
+    Cool,
+    /// Warm dark — `#221c18` bg + amber W.
+    Warm,
+    /// Light — `#f5f5f7` bg + deep cyan W.
+    Light,
+    /// Transparent — no bg fill, only grid + W.
+    Transparent,
+}
+
+impl<'de> Deserialize<'de> for LogoVariant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(LogoVariant::from_str(&s))
+    }
+}
+
+impl LogoVariant {
+    /// All variants in display order.
+    pub const ALL: [LogoVariant; 4] = [
+        LogoVariant::Cool,
+        LogoVariant::Warm,
+        LogoVariant::Light,
+        LogoVariant::Transparent,
+    ];
+
+    /// Human-readable label for the Settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            LogoVariant::Cool => "Cool (dark cyan)",
+            LogoVariant::Warm => "Warm (dark amber)",
+            LogoVariant::Light => "Light (pale cyan)",
+            LogoVariant::Transparent => "Transparent",
+        }
+    }
+
+    /// Identifier used in config.toml `[logo] variant = "..."`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogoVariant::Cool => "cool",
+            LogoVariant::Warm => "warm",
+            LogoVariant::Light => "light",
+            LogoVariant::Transparent => "transparent",
+        }
+    }
+
+    /// Parse from a config string. Unknown values fall back to `Cool`.
+    /// Infallible by design (never returns Err / always yields a valid variant).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        match s.trim() {
+            "warm" => LogoVariant::Warm,
+            "light" => LogoVariant::Light,
+            "transparent" => LogoVariant::Transparent,
+            _ => LogoVariant::Cool,
+        }
+    }
+}
+
+/// v1.0 Logo config — Dock icon variant selection.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LogoConfig {
+    /// Selected logo variant.
+    pub variant: LogoVariant,
+}
+
+impl Default for LogoConfig {
+    fn default() -> Self {
+        Self {
+            variant: LogoVariant::Cool,
+        }
+    }
+}
