@@ -120,6 +120,30 @@ impl App {
         // the renderer's per-row grid cache is stale — force a full
         // redraw before drawing.
         let tab_changed = active != prev_drawn;
+        // F2 P0-1: keep the editor cursor visible inside the clamped (30%
+        // viewport) prompt box. Computed once per frame so any cursor move,
+        // text edit, or resize is covered before the overlay stack is built.
+        let prompt_max_rows = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.layout_ctx)
+            .map(|ctx| {
+                let ch = ctx.cell_h;
+                if ch <= 0.0 {
+                    return 1usize;
+                }
+                let max_box_h = ctx.viewport.1 * 0.30;
+                (((max_box_h / ch).floor() - 2.0).max(1.0) as usize).max(1)
+            })
+            .unwrap_or(1);
+        if let Some(terminal) = tab.terminal.as_mut() {
+            if terminal.effective_input_mode() == weft_core::input::InputMode::Editor {
+                terminal
+                    .editor_mut()
+                    .buffer
+                    .ensure_cursor_visible(prompt_max_rows);
+            }
+        }
         if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
             if tab_changed {
                 renderer.force_full_grid_redraw();
@@ -204,6 +228,7 @@ impl App {
                 self.panel.expanded,
                 self.panel.search_focused,
                 &tab.ime_preedit,
+                tab.ime_preedit_cursor,
                 self.palette.open,
                 &self.palette.query,
                 self.palette.selection,
@@ -212,6 +237,7 @@ impl App {
                 &palette_submode_input,
                 palette_form_view.as_ref(),
                 terminal.editor().buffer.selection_range(),
+                self.config_state.config.editor.submit_on_ctrl_enter,
                 self.settings.open,
                 self.settings.tab,
                 self.settings.selection,
@@ -236,7 +262,11 @@ impl App {
                 let cols = terminal.grid().num_cols;
                 let (total, _) = block_content_metrics(terminal, cols);
                 let prompt_lines = terminal.editor().buffer.lines.len();
-                let visible = renderer.block_visible_rows(prompt_lines);
+                let cwd_header = crate::layout::block_cwd_header_active(
+                    terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
+                    terminal.cwd().is_some(),
+                );
+                let visible = renderer.block_visible_rows(prompt_lines, cwd_header);
                 let max_scroll = total.saturating_sub(visible);
                 Some((total, visible, max_scroll))
             } else {
@@ -249,6 +279,14 @@ impl App {
             // isn't in the grid).
             // Compute find state values BEFORE the mutable borrow
             // on `renderer` (renderer.find_state = ...).
+            // F2 P1-1: pre-compute cursor visibility so the Find highlight can
+            // leave a gap over the cursor cell. `has_selection` / `blink_on`
+            // are needed here AND again below for `renderer.draw()`, so we
+            // compute them once up front.
+            let has_selection = tab.selection_handler.selecting
+                || tab.selection_handler.block_view_selection.is_some()
+                || tab.selection_handler.selection.is_some();
+            let blink_on = self.window_runtime.cursor_blink_on && !has_selection;
             let find_state = if self.find.open {
                 let grid_total = self.find.matches.len();
                 let block_total = self.find.block_matches.len();
@@ -286,12 +324,26 @@ impl App {
                 } else {
                     None
                 };
+                // F2 P1-1: terminal cursor (row, col) + visibility so the
+                // Find highlight can leave a gap over the cursor cell.
+                let grid = terminal.grid();
+                let cursor_pos = Some((grid.cursor.row, grid.cursor.col));
+                let prompt_visible =
+                    terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
+                let show_cursor = crate::terminal_geometry::grid_cursor_visible(
+                    terminal.cursor_style,
+                    terminal.cursor_visible,
+                    blink_on,
+                    prompt_visible,
+                );
                 Some(FindDrawState {
                     query: self.find.query.clone(),
                     current,
                     total,
                     truncated,
                     highlight,
+                    cursor_pos,
+                    show_cursor,
                     block_highlight,
                     block_matches: if block_view { 0 } else { block_total },
                     regex_mode: self.find.regex_mode,
@@ -315,10 +367,8 @@ impl App {
             // moving or persistent selection is the focus of attention;
             // a blinking caret distracts. Resumes when the selection
             // is cleared (click on empty area / prompt / Esc).
-            let has_selection = tab.selection_handler.selecting
-                || tab.selection_handler.block_view_selection.is_some()
-                || tab.selection_handler.selection.is_some();
-            let blink_on = self.window_runtime.cursor_blink_on && !has_selection;
+            // (`has_selection` / `blink_on` were computed above before the
+            // Find state so the highlight can also use cursor visibility.)
             // M3.5: read block_scroll into a local before the mutable
             // `&mut tab.selection_handler` borrow below — `block_scroll()`
             // takes `&self` and would conflict with the mutable borrow.

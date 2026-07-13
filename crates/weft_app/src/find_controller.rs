@@ -371,7 +371,11 @@ impl App {
             let Some(renderer) = self.renderer.as_ref() else {
                 return;
             };
-            let visible = renderer.block_visible_rows(1);
+            let cwd_header = crate::layout::block_cwd_header_active(
+                term.effective_input_mode() == weft_core::input::InputMode::Editor,
+                term.cwd().is_some(),
+            );
+            let visible = renderer.block_visible_rows(1, cwd_header);
             // Scroll so the matching row lands at ~visible/2 from the bottom
             // of the viewport. block_scroll_offset is "rows scrolled up from
             // the bottom", so target = rows_from_bottom - visible/2.

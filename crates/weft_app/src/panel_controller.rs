@@ -100,6 +100,10 @@ impl App {
         let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
             return;
         };
+        let cwd_header_active = crate::layout::block_cwd_header_active(
+            term.effective_input_mode() == weft_core::input::InputMode::Editor,
+            term.cwd().is_some(),
+        );
         let blocks = term.block_tracker().session_blocks();
         let block_idx = blocks.iter().position(|b| b.id == block_id);
         let Some(block_idx) = block_idx else { return };
@@ -134,7 +138,7 @@ impl App {
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let visible = renderer.block_visible_rows(1);
+        let visible = renderer.block_visible_rows(1, cwd_header_active);
         let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
         self.sessions.active_mut().set_block_scroll(target);
 
@@ -161,7 +165,13 @@ impl App {
             let visible = self
                 .renderer
                 .as_ref()
-                .map(|r| r.block_visible_rows(prompt_lines))
+                .map(|r| {
+                    let cwd_header = crate::layout::block_cwd_header_active(
+                        terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
+                        terminal.cwd().is_some(),
+                    );
+                    r.block_visible_rows(prompt_lines, cwd_header)
+                })
                 .unwrap_or(rows);
             let max_scroll = total.saturating_sub(visible);
             match action {

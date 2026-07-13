@@ -326,20 +326,10 @@ impl MetalRenderer {
     /// full viewport (command-executing mode). The scroll handler clamps
     /// `block_scroll_offset` to `total - visible`, so this must match the
     /// renderer's actual capacity to avoid blank space when scrolling.
-    pub fn block_visible_rows(&self, prompt_lines: usize) -> usize {
-        let ch = self.cell_height() as f32;
-        let vp_h = self.viewport.1;
-        let pad_y = self.padding_y;
-        let pitch = ch * 1.1;
-        if ch <= 0.0 || vp_h <= 0.0 || pitch <= 0.0 {
-            return 1;
-        }
-        // Editor mode: block region is vp_h - pad_y - box_h, where box_h
-        // accounts for the prompt input box + its padding.
-        let box_h = ch * (prompt_lines.max(1) as f32 + 2.0);
-        let region_bottom = (vp_h - pad_y - box_h).max(0.0);
-        let region_h = (region_bottom - pad_y).max(0.0);
-        ((region_h / pitch).floor() as usize).max(1)
+    pub fn block_visible_rows(&self, prompt_lines: usize, cwd_header_active: bool) -> usize {
+        self.layout_ctx
+            .map(|ctx| crate::layout::block_visible_rows(&ctx, prompt_lines, cwd_header_active))
+            .unwrap_or(1)
     }
 
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
@@ -679,6 +669,8 @@ impl MetalRenderer {
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
             missing.extend(['×', '·', '…']);
+            // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
+            missing.extend("\u{25be} passthrough running".chars());
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
@@ -689,7 +681,6 @@ impl MetalRenderer {
         // `sudo su` sub-shell): the live grid fills the bottom while the
         // completed block history is overlaid on top, so the history never
         // reverts to raw text (matches Warp). Alt-screen / not-integrated: grid.
-        let ch = self.cell_height() as f32;
         let vp_h = self.viewport.1;
         let pad_y = self.padding_y;
         let show_blocks = terminal.show_block_view();
@@ -711,8 +702,14 @@ impl MetalRenderer {
         let mut instances: Vec<f32> = Vec::new();
         let mut vertices: Vec<f32> = if show_blocks {
             let (v, regions, _) = if let Some(p) = prompt {
-                let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
-                let box_top_y = (vp_h - pad_y - box_h).max(0.0);
+                let box_top_y = crate::layout::layout_prompt(
+                    &ctx,
+                    p.lines.len(),
+                    p.cursor.0,
+                    0,
+                    p.scroll_offset,
+                )
+                .box_rect[1];
                 self.build_block_view_vertices(
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
@@ -821,6 +818,11 @@ impl MetalRenderer {
                     );
                 }
             }
+        }
+
+        // F2 P0-2: subtle status hint for passthrough/running states.
+        if prompt.is_none() {
+            vertices.extend_from_slice(&self.build_status_hint_vertices(terminal));
         }
 
         // Overlay the editor input box at the bottom (Editor mode only).

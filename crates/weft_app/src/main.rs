@@ -440,6 +440,7 @@ impl App {
     fn reset_ime_context(&mut self, reason: &'static str) {
         for tab in self.sessions.tabs_mut() {
             tab.ime_preedit.clear();
+            tab.ime_preedit_cursor = None;
         }
         if let Some(window) = &self.window {
             ime::discard_marked_text(window);

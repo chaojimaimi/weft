@@ -22,6 +22,12 @@ pub struct EditorBuffer {
     /// and `selection_anchor` (order-independent). Cleared by any cursor
     /// movement key or text edit, and by `clear_selection`.
     pub selection_anchor: Option<(usize, usize)>,
+    /// F2 P0-1: vertical scroll offset for multi-line input when the box is
+    /// clamped to 30% of the viewport. Lines `[scroll_offset, scroll_offset +
+    /// visible_rows)` are rendered. Kept at 0 when all lines fit. `#[serde(default)]`
+    /// so persisted buffers from before this field deserialize with offset 0.
+    #[serde(default)]
+    pub scroll_offset: usize,
 }
 
 impl EditorBuffer {
@@ -30,6 +36,7 @@ impl EditorBuffer {
             lines: vec![String::new()],
             cursor: (0, 0),
             selection_anchor: None,
+            scroll_offset: 0,
         }
     }
 
@@ -133,6 +140,35 @@ impl EditorBuffer {
     pub fn move_line_end(&mut self) {
         let line = self.cursor.0;
         self.cursor.1 = self.lines[line].chars().count();
+    }
+
+    /// F2 P0-1: Adjust `scroll_offset` so the cursor line stays inside the
+    /// visible window `[scroll_offset, scroll_offset + visible_rows)`. When
+    /// all lines fit (`lines.len() <= visible_rows`), resets to 0. Called by
+    /// the redraw path before rendering the prompt box, so any cursor
+    /// movement / text edit / resize is covered.
+    pub fn ensure_cursor_visible(&mut self, visible_rows: usize) {
+        let n_lines = self.lines.len();
+        if n_lines <= 1 || visible_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        // If everything fits, no scrolling needed.
+        if n_lines <= visible_rows {
+            self.scroll_offset = 0;
+            return;
+        }
+        let cursor_line = self.cursor.0.min(n_lines - 1);
+        // Scroll up if the cursor is above the visible window.
+        if cursor_line < self.scroll_offset {
+            self.scroll_offset = cursor_line;
+            return;
+        }
+        // Scroll down if the cursor is at or below the visible window's end.
+        let last_visible = self.scroll_offset + visible_rows;
+        if cursor_line >= last_visible {
+            self.scroll_offset = cursor_line + 1 - visible_rows;
+        }
     }
 
     /// Delete the word (and trailing whitespace) to the left of the cursor.
@@ -775,6 +811,67 @@ mod tests {
         assert_eq!(b.text(), "ab\ncd");
         assert_eq!(b.cursor, (1, 0));
         assert_eq!(b.line_count(), 2);
+    }
+
+    // ── F2 P0-1: ensure_cursor_visible ──────────────────────────────────
+
+    #[test]
+    fn ensure_cursor_visible_no_scroll_when_lines_fit() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..3).map(|_| "x".into()).collect();
+        b.cursor = (2, 0);
+        b.ensure_cursor_visible(5);
+        assert_eq!(b.scroll_offset, 0);
+    }
+
+    #[test]
+    fn ensure_cursor_visible_scrolls_down_when_cursor_below_window() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..10).map(|_| "x".into()).collect();
+        b.cursor = (7, 0); // cursor on line 7
+        b.scroll_offset = 0;
+        b.ensure_cursor_visible(3); // window [0, 3)
+        assert_eq!(b.scroll_offset, 5); // → window [5, 8), cursor visible
+    }
+
+    #[test]
+    fn ensure_cursor_visible_scrolls_up_when_cursor_above_window() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..10).map(|_| "x".into()).collect();
+        b.cursor = (2, 0);
+        b.scroll_offset = 6; // window [6, 9)
+        b.ensure_cursor_visible(3);
+        assert_eq!(b.scroll_offset, 2); // → window [2, 5)
+    }
+
+    #[test]
+    fn ensure_cursor_visible_keeps_offset_when_cursor_in_window() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..10).map(|_| "x".into()).collect();
+        b.cursor = (4, 0);
+        b.scroll_offset = 3; // window [3, 6)
+        b.ensure_cursor_visible(3);
+        assert_eq!(b.scroll_offset, 3); // unchanged
+    }
+
+    #[test]
+    fn ensure_cursor_visible_resets_to_zero_when_all_fit() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..4).map(|_| "x".into()).collect();
+        b.cursor = (3, 0);
+        b.scroll_offset = 2;
+        b.ensure_cursor_visible(10);
+        assert_eq!(b.scroll_offset, 0);
+    }
+
+    #[test]
+    fn ensure_cursor_visible_cursor_at_last_line_scrolls_to_end() {
+        let mut b = EditorBuffer::new();
+        b.lines = (0..10).map(|_| "x".into()).collect();
+        b.cursor = (9, 0);
+        b.scroll_offset = 0;
+        b.ensure_cursor_visible(3); // window [0, 3)
+        assert_eq!(b.scroll_offset, 7); // → window [7, 10)
     }
 
     fn editor_with_history(history: &[&str]) -> Editor {

@@ -4,9 +4,6 @@
 //!
 //! See `docs/superpowers/App:Renderer Overlay 架构重构设计.md` for the full
 //! design rationale.
-//!
-//! Types defined here are not yet wired into the render path (commits 3-4
-//! will migrate panel/prompt/completion/hit-test to use them).
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -43,8 +40,6 @@ pub enum OverlayZ {
     Settings = 6,
 }
 
-// ── Input policy ──────────────────────────────────────────────────────
-
 /// How an overlay layer participates in keyboard/mouse input routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayInputPolicy {
@@ -57,8 +52,6 @@ pub enum OverlayInputPolicy {
     /// Captures all input while open (e.g. Command Palette, context menu).
     Modal,
 }
-
-// ── Overlay kind & content ────────────────────────────────────────────
 
 /// Identifies the overlay type for dispatch and debugging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,9 +256,6 @@ impl OverlayWarmup for OverlayContent<'_> {
             OverlayContent::HistoryPanel(p) => {
                 missing.extend("Search:".chars());
                 missing.extend(p.query.chars());
-                // Note: detailed block scanning is handled by the renderer's
-                // warm-up (which has access to panel_display/visible_panel_rows
-                // helpers). Here we just warm the query + label.
             }
             OverlayContent::Prompt(p) => {
                 missing.extend("❯ ".chars());
@@ -285,9 +275,9 @@ impl OverlayWarmup for OverlayContent<'_> {
                         missing.extend(m.chars());
                     }
                 }
+                missing.extend("⏎⇧⌃·RunNewline".chars());
             }
             OverlayContent::Completion(c) => {
-                // Emoji icons used by the popup (📁📄 via CoreText color path).
                 missing.extend(['📁', '📄', '»']);
                 for m in c.matches {
                     missing.extend(m.label.chars());
@@ -382,6 +372,7 @@ pub fn build_overlay_stack<'a>(
     panel_expanded: Option<BlockId>,
     panel_search_focused: bool,
     ime_preedit: &'a str,
+    ime_preedit_cursor: Option<(usize, usize)>,
     palette_open: bool,
     palette_query: &'a str,
     palette_selection: usize,
@@ -390,6 +381,7 @@ pub fn build_overlay_stack<'a>(
     palette_submode_input: &'a str,
     palette_form: Option<&'a PaletteFormView<'a>>,
     prompt_selection: Option<((usize, usize), (usize, usize))>,
+    submit_on_ctrl_enter: bool,
     settings_open: bool,
     settings_tab: SettingsTab,
     settings_selection: usize,
@@ -443,8 +435,15 @@ pub fn build_overlay_stack<'a>(
                 } else {
                     Some(ime_preedit)
                 },
+                preedit_cursor: if ime_preedit.is_empty() {
+                    None
+                } else {
+                    ime_preedit_cursor
+                },
                 search,
                 selection: prompt_selection,
+                scroll_offset: terminal.editor().buffer.scroll_offset,
+                submit_on_ctrl_enter,
             }),
         });
 
@@ -558,8 +557,11 @@ mod tests {
                 lines: &[],
                 cursor: (0, 0),
                 preedit: None,
+                preedit_cursor: None,
                 search: None,
                 selection: None,
+                scroll_offset: 0,
+                submit_on_ctrl_enter: false,
             }),
         }
     }
@@ -647,8 +649,11 @@ mod tests {
             lines: &["hello".to_string()],
             cursor: (0, 0),
             preedit: Some("あ"),
+            preedit_cursor: None,
             search: None,
             selection: None,
+            scroll_offset: 0,
+            submit_on_ctrl_enter: false,
         };
         let mut missing = HashSet::new();
         OverlayContent::Prompt(prompt).warm_chars(&mut missing);

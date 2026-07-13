@@ -14,7 +14,10 @@ impl App {
         }
         let cols = terminal.grid().num_cols;
         let (total, _) = block_content_metrics(terminal, cols);
-        let visible = renderer.block_visible_rows(terminal.editor().buffer.lines.len());
+        let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
+        let cwd_header =
+            crate::layout::block_cwd_header_active(editor_mode, terminal.cwd().is_some());
+        let visible = renderer.block_visible_rows(terminal.editor().buffer.lines.len(), cwd_header);
         let max_scroll = total.saturating_sub(visible);
         crate::scrollbar_component::scrollbar_layout(
             &ctx,
@@ -282,23 +285,23 @@ impl App {
         if lines.is_empty() {
             return None;
         }
-        // Recompute the prompt geometry (matches layout_prompt).
         let n_lines = lines.len().max(1);
-        let box_h = ch * (n_lines as f64 + 2.0);
-        let box_y1 = (ctx.viewport.1 as f64 - ctx.padding_y as f64).max(0.0);
-        let box_y0 = (box_y1 - box_h).max(0.0);
-        let text_y0 = box_y0 + ch;
-        let left = ctx.left() as f64;
-        let prompt_chars = 2usize;
-        let first_line_text_x = left + prompt_chars as f64 * cw;
-        // Which line was clicked? (clamped to [0, n_lines-1])
-        let mut line = ((y - text_y0) / ch) as isize;
-        if line < 0 {
-            line = 0;
+        let scroll_offset = terminal.editor().buffer.scroll_offset;
+        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0, scroll_offset);
+        if x < layout.box_rect[0] as f64
+            || x > layout.box_rect[2] as f64
+            || y < layout.box_rect[1] as f64
+            || y > layout.box_rect[3] as f64
+        {
+            return None;
         }
-        let line = (line as usize).min(n_lines - 1);
+        let line = crate::layout::prompt_line_at_y(&layout, y as f32, scroll_offset, n_lines);
         // X origin for this line.
-        let text_x = if line == 0 { first_line_text_x } else { left };
+        let text_x = if line == 0 {
+            layout.first_line_text_x as f64
+        } else {
+            layout.left as f64
+        };
         // Column offset in display units.
         let disp_col = ((x - text_x) / cw).max(0.0) as usize;
         // Walk the line's chars, accumulating display widths, to find the
@@ -334,7 +337,7 @@ impl App {
         }
         let n_lines = terminal.editor().buffer.lines.len();
         // box_rect only depends on ctx + n_lines; cursor position doesn't affect the box bounds.
-        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0);
+        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0, 0);
         Some(layout.box_rect)
     }
 
@@ -353,13 +356,30 @@ impl App {
         if !terminal.show_block_view() {
             return Vec::new();
         }
-        let region_bottom_y = renderer.viewport.1 - renderer.padding_y();
+        let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
+        let region_bottom_y = if editor_mode {
+            let Some(ctx) = renderer.layout_ctx else {
+                return Vec::new();
+            };
+            crate::layout::layout_prompt(
+                &ctx,
+                terminal.editor().buffer.lines.len(),
+                0,
+                0,
+                terminal.editor().buffer.scroll_offset,
+            )
+            .box_rect[1]
+        } else {
+            renderer.viewport.1 - renderer.padding_y()
+        };
         renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
             blocks: terminal.block_tracker().session_blocks(),
             region_bottom_y,
-            cwd: None,
+            cwd: editor_mode.then(|| terminal.cwd()).flatten(),
             git_branch: terminal.git_branch(),
-            live: terminal.block_tracker().in_flight(),
+            live: (!editor_mode)
+                .then(|| terminal.block_tracker().in_flight())
+                .flatten(),
             block_scroll: self.sessions.active().block_scroll(),
         })
     }

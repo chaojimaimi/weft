@@ -532,10 +532,20 @@ mod tests {
             lines: vec!["git status".to_string(), "second line".to_string()],
             cursor: (1, 5),
             selection_anchor: Some((0, 0)),
+            scroll_offset: 0,
         };
         let json = TabSnapshot::encode_editor_buffer(&buf);
         let decoded = TabSnapshot::decode_editor_buffer(&json).expect("decode");
         assert_eq!(decoded, buf);
+    }
+
+    #[test]
+    fn decode_legacy_editor_buffer_defaults_scroll_offset() {
+        let legacy = r#"{"lines":["echo old"],"cursor":[0,8],"selection_anchor":null}"#;
+        let decoded = TabSnapshot::decode_editor_buffer(legacy).expect("legacy buffer decodes");
+        assert_eq!(decoded.lines, ["echo old"]);
+        assert_eq!(decoded.cursor, (0, 8));
+        assert_eq!(decoded.scroll_offset, 0);
     }
 
     #[test]
@@ -552,6 +562,7 @@ mod tests {
             lines: vec!["ls -la /home".to_string()],
             cursor: (0, 13),
             selection_anchor: None,
+            scroll_offset: 0,
         };
         let snap = TabSnapshot {
             position: 0,

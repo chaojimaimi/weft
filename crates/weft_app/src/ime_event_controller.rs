@@ -6,18 +6,25 @@ impl App {
     pub(super) fn handle_ime_event(&mut self, ime_event: winit::event::Ime) {
         match ime_event {
             winit::event::Ime::Enabled => {}
-            winit::event::Ime::Preedit(text, _cursor) => {
+            winit::event::Ime::Preedit(text, cursor) => {
                 // Keyboard, preedit and commit must agree on the same
                 // focus owner. Any overlay suppresses terminal preedit;
                 // Settings intentionally has no text target yet.
                 if self.overlay_input_owner().is_some() {
                     self.sessions.active_mut().ime_preedit.clear();
+                    self.sessions.active_mut().ime_preedit_cursor = None;
                 } else {
                     self.sessions.active_mut().ime_preedit = text;
+                    // F2 P1-4: store the preedit cursor byte range so the
+                    // renderer can position the composition caret within the
+                    // preedit string (lightweight version — not a full
+                    // NSTextInputClient implementation).
+                    self.sessions.active_mut().ime_preedit_cursor = cursor;
                 }
             }
             winit::event::Ime::Commit(text) => {
                 self.sessions.active_mut().ime_preedit.clear();
+                self.sessions.active_mut().ime_preedit_cursor = None;
                 if !text.is_empty() {
                     tracing::debug!(
                         tab = self.sessions.active_idx(),
@@ -100,6 +107,7 @@ impl App {
             winit::event::Ime::Disabled => {
                 for tab in self.sessions.tabs_mut() {
                     tab.ime_preedit.clear();
+                    tab.ime_preedit_cursor = None;
                 }
             }
         }

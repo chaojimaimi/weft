@@ -14,6 +14,19 @@ impl App {
         use weft_core::input::{KeyCode::*, Modifiers};
         let shift = mods.contains(Modifiers::SHIFT);
 
+        // F2 P1-3: Cmd+Enter always submits the editor command (regardless of
+        // submit_on_ctrl_enter config). "Submit and keep editor" = the editor
+        // is cleared and stays in Editor mode until the shell's preexec marker
+        // transitions to Passthrough. Handled before the SUPER early return so
+        // it doesn't fall through to app-level shortcuts.
+        if key == Enter
+            && editor_enter_submits(self.config_state.config.editor.submit_on_ctrl_enter, mods)
+            && mods.contains(Modifiers::SUPER)
+        {
+            self.editor_submit();
+            return true;
+        }
+
         // v0.9 fix: Cmd (SUPER) chords are app-level shortcuts (copy/paste/
         // tab/panel…), not editor input. If a Cmd chord reaches here it
         // means no keybinding matched — drop it instead of inserting the
@@ -34,7 +47,7 @@ impl App {
         self.interaction.prompt_dragging = false;
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
-        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
+        if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) && key != Enter {
             let consumed = if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                 let e = t.editor_mut();
                 match key {
@@ -166,12 +179,10 @@ impl App {
                 // submit_on_ctrl_enter: Ctrl+Enter submits, plain Enter newlines
                 // (Warp default). Otherwise plain Enter submits, Shift+Enter
                 // newlines.
-                let ctrl = mods.contains(Modifiers::CONTROL);
-                let do_submit = if self.config_state.config.editor.submit_on_ctrl_enter {
-                    ctrl
-                } else {
-                    !shift
-                };
+                let do_submit = editor_enter_submits(
+                    self.config_state.config.editor.submit_on_ctrl_enter,
+                    mods,
+                );
                 if do_submit {
                     self.editor_submit();
                 } else if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
@@ -403,5 +414,31 @@ impl App {
         // the command completes.
         self.sessions.active_mut().snap_to_bottom();
         self.request_redraw();
+    }
+}
+
+fn editor_enter_submits(submit_on_ctrl_enter: bool, mods: Modifiers) -> bool {
+    if mods.contains(Modifiers::SUPER) {
+        return true;
+    }
+    if submit_on_ctrl_enter {
+        mods.contains(Modifiers::CONTROL)
+    } else {
+        !mods.contains(Modifiers::SHIFT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::editor_enter_submits;
+    use weft_core::input::Modifiers;
+
+    #[test]
+    fn enter_policy_matches_config_and_command_override() {
+        assert!(editor_enter_submits(false, Modifiers::empty()));
+        assert!(!editor_enter_submits(false, Modifiers::SHIFT));
+        assert!(!editor_enter_submits(true, Modifiers::empty()));
+        assert!(editor_enter_submits(true, Modifiers::CONTROL));
+        assert!(editor_enter_submits(true, Modifiers::SUPER));
     }
 }

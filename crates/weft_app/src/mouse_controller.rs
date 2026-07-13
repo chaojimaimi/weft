@@ -93,6 +93,12 @@ impl App {
             self.sessions.active_mut().input_handler.mouse_protocol = mp;
             self.sessions.active_mut().input_handler.sgr_mouse = sgr;
         }
+        // F2 P0-3: when mouse reporting is active (vim/less/htop), use Arrow
+        // so the TUI app controls the pointer. Otherwise use Text for normal
+        // terminal input, or NsResize when hovering the scrollbar.
+        let mouse_reporting_active = modes
+            .map(|(mp, _)| mp != MouseProtocol::Off)
+            .unwrap_or(false);
         // Update popup drag if active (clone to avoid borrow conflict).
         if let Some(drag) = self.interaction.drag_state.clone() {
             self.update_popup_drag(x, y, &drag);
@@ -102,16 +108,42 @@ impl App {
         let scrollbar_hovered = self.active_scrollbar_layout().is_some_and(|layout| {
             crate::scrollbar_component::contains(layout.hit, x as f32, y as f32)
         });
-        if scrollbar_hovered != self.interaction.scrollbar_hovered {
+        let scrollbar_changed = scrollbar_hovered != self.interaction.scrollbar_hovered;
+        if scrollbar_changed {
             self.interaction.scrollbar_hovered = scrollbar_hovered;
-            if let Some(window) = &self.window {
-                let icon = if scrollbar_hovered {
-                    winit::window::CursorIcon::NsResize
-                } else {
-                    winit::window::CursorIcon::Default
-                };
-                window.set_cursor(icon);
-            }
+        }
+        // F2 P0-3: set cursor based on mouse reporting + scrollbar hover.
+        // Default == arrow cursor; used when a TUI app (vim/less/htop) has
+        // enabled mouse reporting so it owns the pointer.
+        let in_terminal_content = self.terminal_layout().is_some_and(|layout| {
+            x >= layout.content.left
+                && x <= layout.content.right
+                && y >= layout.content.top
+                && y <= layout.content.bottom
+        });
+        let over_panel = self.panel.open
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| x < r.sidebar_width() as f64);
+        let terminal_cursor_allowed = in_terminal_content
+            && !over_panel
+            && !self.settings.open
+            && !self.palette.open
+            && self.interaction.context_menu.is_none();
+        if let Some(window) = &self.window {
+            let icon = if mouse_reporting_active {
+                winit::window::CursorIcon::Default
+            } else if scrollbar_hovered {
+                winit::window::CursorIcon::NsResize
+            } else if terminal_cursor_allowed {
+                winit::window::CursorIcon::Text
+            } else {
+                winit::window::CursorIcon::Default
+            };
+            window.set_cursor(icon);
+        }
+        if scrollbar_changed {
             self.request_redraw();
         }
 
@@ -597,7 +629,16 @@ impl App {
             let visible = self
                 .renderer
                 .as_ref()
-                .map(|r| r.block_visible_rows(prompt_lines))
+                .map(|r| {
+                    let terminal = self.sessions.active().terminal.as_ref();
+                    let cwd_header = terminal.is_some_and(|t| {
+                        crate::layout::block_cwd_header_active(
+                            t.effective_input_mode() == weft_core::input::InputMode::Editor,
+                            t.cwd().is_some(),
+                        )
+                    });
+                    r.block_visible_rows(prompt_lines, cwd_header)
+                })
                 .unwrap_or(1);
             let max_scroll = total.saturating_sub(visible);
             if up {

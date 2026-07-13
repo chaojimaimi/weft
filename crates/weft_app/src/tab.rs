@@ -37,6 +37,11 @@ pub struct Tab {
     pub input_handler: InputHandler,
     pub selection_handler: SelectionHandler,
     pub ime_preedit: String,
+    /// F2 P1-4: Preedit cursor byte range from `Ime::Preedit(text, cursor)`.
+    /// `None` when the IME has no cursor (should be hidden). `Some((s, e))`
+    /// gives the byte range `[s, e)` within `ime_preedit` to highlight or
+    /// position the caret at.
+    pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
     /// M3.5: private — use the block-scroll API methods below instead.
     block_scroll_offset: usize,
@@ -100,6 +105,7 @@ impl Tab {
             input_handler: InputHandler::new(),
             selection_handler: SelectionHandler::new(),
             ime_preedit: String::new(),
+            ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
             pending_tui_scroll: None,
@@ -119,6 +125,7 @@ impl Tab {
             input_handler: InputHandler::new(),
             selection_handler: SelectionHandler::new(),
             ime_preedit: String::new(),
+            ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
             pending_tui_scroll: None,
@@ -648,6 +655,7 @@ mod tests {
             input_handler: InputHandler::new(),
             selection_handler: SelectionHandler::new(),
             ime_preedit: String::new(),
+            ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
             pending_tui_scroll: None,

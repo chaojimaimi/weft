@@ -751,18 +751,26 @@ pub struct PromptLayout {
     pub cursor_y: f32,
     /// Caret bar width in physical pixels.
     pub bar_w: f32,
+    /// F2 P0-1: number of text rows visible in the clamped box. The renderer
+    /// only draws lines `[scroll_offset, scroll_offset + visible_rows)`.
+    pub visible_rows: usize,
+    /// Physical height of one editor text row.
+    pub row_height: f32,
 }
 
 /// Compute the prompt layout. `n_lines` is the editor buffer's line count
 /// (clamped to ≥1). `cursor_line`/`cursor_offset_cols` locate the caret;
 /// `cursor_offset_cols` is the cumulative display-column width of the
 /// chars before the cursor on that line (CJK = 2 cols), pre-computed by
-/// the renderer via `char_col_width`.
+/// the renderer via `char_col_width`. `scroll_offset` is the editor
+/// buffer's internal scroll offset (F2 P0-1) — cursor Y is adjusted so
+/// the caret lands in the visible window.
 pub fn layout_prompt(
     ctx: &LayoutCtx,
     n_lines: usize,
     cursor_line: usize,
     cursor_offset_cols: usize,
+    scroll_offset: usize,
 ) -> PromptLayout {
     let cw = ctx.cell_w;
     let ch = ctx.cell_h;
@@ -770,9 +778,17 @@ pub fn layout_prompt(
     let vp_h = ctx.viewport.1;
 
     let n_lines = n_lines.max(1);
-    // Box height: 1 pad row + N text rows + 1 pad row (matches
-    // `input_box_height_px` so the box never gaps from the grid above).
-    let box_h = ch * (n_lines as f32 + 2.0);
+    // F2 P0-1: clamp the box to 30% of the viewport so multi-line input
+    // scrolls internally instead of squeezing history content. The raw
+    // height is 1 pad row + N text rows + 1 pad row.
+    let raw_box_h = ch * (n_lines as f32 + 2.0);
+    let max_box_h = vp_h * 0.30;
+    let box_h = raw_box_h.min(max_box_h);
+    // Visible text rows that fit in the clamped box (≥1).
+    let visible_rows = (((box_h / ch).floor() - 2.0).max(1.0) as usize)
+        .max(1)
+        .min(n_lines);
+
     let box_y1 = (vp_h - ctx.padding_y).max(0.0);
     let box_y0 = (box_y1 - box_h).max(0.0);
     let box_x0 = ctx.left();
@@ -785,7 +801,10 @@ pub fn layout_prompt(
     let prompt_chars = 2usize; // "❯ "
     let first_line_text_x = left + prompt_chars as f32 * cw;
 
-    let cy = text_y0 + cursor_line as f32 * ch;
+    // F2 P0-1: cursor Y accounts for the scroll offset so the caret lands
+    // inside the visible window.
+    let cursor_row_in_window = cursor_line.saturating_sub(scroll_offset) as f32;
+    let cy = text_y0 + cursor_row_in_window * ch;
     let text_start_x = if cursor_line == 0 {
         first_line_text_x
     } else {
@@ -803,7 +822,47 @@ pub fn layout_prompt(
         cursor_x: cx,
         cursor_y: cy,
         bar_w,
+        visible_rows,
+        row_height: ch,
     }
+}
+
+/// Map a physical Y coordinate to a document line in the currently visible
+/// prompt window. Padding/hint-row clicks clamp to the nearest visible line.
+pub fn prompt_line_at_y(
+    layout: &PromptLayout,
+    y: f32,
+    scroll_offset: usize,
+    n_lines: usize,
+) -> usize {
+    let n_lines = n_lines.max(1);
+    let start = scroll_offset.min(n_lines - 1);
+    let visible = layout.visible_rows.min(n_lines - start).max(1);
+    let row =
+        if layout.row_height.is_finite() && layout.row_height > 0.0 && layout.text_y0.is_finite() {
+            ((y - layout.text_y0) / layout.row_height).floor() as isize
+        } else {
+            0
+        };
+    start + row.clamp(0, visible as isize - 1) as usize
+}
+
+/// Visible block rows above a prompt whose height is capped by
+/// [`layout_prompt`]. This is shared by drawing and scroll clamping.
+pub fn block_visible_rows(ctx: &LayoutCtx, prompt_lines: usize, cwd_header_active: bool) -> usize {
+    if ctx.cell_h <= 0.0 || ctx.height() <= 0.0 {
+        return 1;
+    }
+    let prompt = layout_prompt(ctx, prompt_lines, 0, 0, 0);
+    let block = layout_block_view(ctx, prompt.box_rect[1], cwd_header_active);
+    let height = (block.clip_bottom - ctx.top()).max(0.0);
+    ((height / block.pitch).floor() as usize).max(1)
+}
+
+/// The fixed CWD band exists only while the owned editor prompt is visible.
+/// A running command retains Terminal.cwd but renders a live block instead.
+pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
+    editor_mode && cwd_present
 }
 
 // ── Block view (Warp-style history) ────────────────────────────────────
@@ -1563,7 +1622,7 @@ mod tests {
     fn prompt_single_line_caret_after_prompt_glyph() {
         let ctx = sample_ctx(); // vp 1600×1200, cw 7.2, ch 16.8, pad 16
                                 // 1 line, cursor at (0, 0) — caret right after "❯ ".
-        let layout = layout_prompt(&ctx, 1, 0, 0);
+        let layout = layout_prompt(&ctx, 1, 0, 0, 0);
 
         // box_h = ch * (1 + 2) = 50.4; box_y1 = 1200 - 16 = 1184;
         // box_y0 = 1184 - 50.4 = 1133.6
@@ -1594,7 +1653,7 @@ mod tests {
     fn prompt_multi_line_cursor_on_last_line() {
         let ctx = sample_ctx();
         // 5 lines, cursor at (4, 0)
-        let layout = layout_prompt(&ctx, 5, 4, 0);
+        let layout = layout_prompt(&ctx, 5, 4, 0, 0);
 
         // box_h = ch * (5 + 2) = 117.6; box_y0 = 1184 - 117.6 = 1066.4
         assert!((layout.box_rect[1] - 1066.4).abs() < 1e-3);
@@ -1616,7 +1675,7 @@ mod tests {
         let ctx = sample_ctx();
         // "Weft项目" = 4 ASCII (4 cols) + 2 CJK (4 cols) = 8 display cols.
         let cursor_offset_cols = 8;
-        let layout = layout_prompt(&ctx, 1, 0, cursor_offset_cols);
+        let layout = layout_prompt(&ctx, 1, 0, cursor_offset_cols, 0);
         // cx = first_line_text_x + 8 * cw = 30.4 + 57.6 = 88.0
         assert!((layout.cursor_x - 88.0).abs() < 1e-3);
     }
@@ -1630,10 +1689,54 @@ mod tests {
     fn prompt_box_rect_invariant_to_cursor() {
         let ctx = sample_ctx();
         for n_lines in [1, 3, 10] {
-            let a = layout_prompt(&ctx, n_lines, 0, 0);
-            let b = layout_prompt(&ctx, n_lines, n_lines - 1, 42);
+            let a = layout_prompt(&ctx, n_lines, 0, 0, 0);
+            let b = layout_prompt(&ctx, n_lines, n_lines - 1, 42, 0);
             assert_eq!(a.box_rect, b.box_rect, "n_lines={n_lines}");
         }
+    }
+
+    /// F2 P0-1: when n_lines exceeds the 30% viewport clamp, the box height
+    /// is capped and `visible_rows` < n_lines. The caret Y is offset by
+    /// `scroll_offset` so it stays inside the visible window.
+    #[test]
+    fn prompt_clamps_box_height_and_offsets_cursor() {
+        let ctx = sample_ctx(); // vp_h=1200, ch=16.8 → max_box_h=360
+                                // raw_box_h = 16.8 * (30 + 2) = 537.6 > 360 → clamped.
+                                // visible_rows = floor(360 / 16.8) - 2 = 21 - 2 = 19.
+        let n_lines = 30;
+        let layout = layout_prompt(&ctx, n_lines, 25, 0, 20);
+        assert_eq!(layout.visible_rows, 19);
+        // cursor_y = text_y0 + (25 - 20) * ch = text_y0 + 5 * 16.8
+        // (caret on the 5th visible row, inside the window).
+        let expected_cy = layout.text_y0 + 5.0 * 16.8;
+        assert!((layout.cursor_y - expected_cy).abs() < 1e-3);
+    }
+
+    #[test]
+    fn prompt_hit_row_is_clamped_to_visible_scrolled_window() {
+        let ctx = sample_ctx();
+        let layout = layout_prompt(&ctx, 30, 25, 0, 20);
+        assert_eq!(prompt_line_at_y(&layout, layout.box_rect[1], 20, 30), 20);
+        assert_eq!(
+            prompt_line_at_y(&layout, layout.box_rect[3], 20, 30),
+            29.min(20 + layout.visible_rows - 1)
+        );
+    }
+
+    #[test]
+    fn block_visible_rows_use_clamped_prompt_height() {
+        let ctx = sample_ctx();
+        let thirty = block_visible_rows(&ctx, 30, true);
+        let hundred = block_visible_rows(&ctx, 100, true);
+        assert_eq!(thirty, hundred);
+        assert!(thirty > 0);
+    }
+
+    #[test]
+    fn cwd_header_is_reserved_only_in_editor_mode() {
+        assert!(block_cwd_header_active(true, true));
+        assert!(!block_cwd_header_active(false, true));
+        assert!(!block_cwd_header_active(true, false));
     }
 
     // ── Block view layout (stage 4 — U2) ────────────────────────────────

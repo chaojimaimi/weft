@@ -19,6 +19,14 @@ pub struct FindDrawState {
     /// no match is selected or in block view. The renderer highlights this
     /// rectangle.
     pub highlight: Option<(usize, usize, usize)>,
+    /// F2 P1-1: Terminal cursor `(row, col)` so the highlight can leave a gap
+    /// over the cursor cell, keeping the cursor visible underneath. `None`
+    /// when the cursor position is unknown or shouldn't be excluded.
+    pub cursor_pos: Option<(usize, usize)>,
+    /// F2 P1-1: Whether the grid cursor is drawn this frame (encodes
+    /// `cursor_visible && blink_on && prompt.is_none()`). When false, the
+    /// highlight covers the cursor cell as before.
+    pub show_cursor: bool,
     /// Current BLOCK match's `(block_id, line, is_command, col, len)` — used
     /// to highlight the match in block view. `None` in grid view or when no
     /// match is selected.
@@ -252,19 +260,29 @@ impl MetalRenderer {
 
         // ── Match highlight (yellow translucent overlay on grid cells) ──
         // Drawn over the grid content area, independent of the popup card.
+        // F2 P1-1: split the highlight around the cursor cell so the cursor
+        // stays visible underneath when `show_cursor` is true and the cursor
+        // sits inside the highlighted range.
         if let Some((row, col, len)) = find.highlight {
-            let hx0 = ctx.col_x(col);
             let hy0 = ctx.row_y(row);
-            let hx1 = hx0 + len as f32 * cw;
             let hy1 = hy0 + ch;
-            // Soft yellow with 0.5 alpha so the underlying text stays readable.
-            push_quad(
-                &mut verts,
-                [hx0, hy0, hx1, hy1],
-                bg_uv,
-                [0.0; 4],
-                [0.95, 0.78, 0.20, 0.50],
-            );
+            let highlight_color = [0.95f32, 0.78, 0.20, 0.50];
+            for (seg_col, seg_len) in split_highlight_around_cursor(
+                col,
+                len,
+                find.cursor_pos.filter(|(r, _)| *r == row),
+                find.show_cursor,
+            ) {
+                let sx0 = ctx.col_x(seg_col);
+                let sx1 = sx0 + seg_len as f32 * cw;
+                push_quad(
+                    &mut verts,
+                    [sx0, hy0, sx1, hy1],
+                    bg_uv,
+                    [0.0; 4],
+                    highlight_color,
+                );
+            }
         }
 
         // ── Popup text row ─────────────────────────────────────────────
@@ -651,5 +669,114 @@ impl MetalRenderer {
         }
 
         verts
+    }
+}
+
+/// F2 P1-1: Compute the column segments of a Find highlight after excluding
+/// the cursor cell, so the terminal cursor stays visible underneath the
+/// yellow translucent overlay.
+///
+/// Returns a list of `(start_col, len)` pairs. When the cursor should not be
+/// excluded (`show_cursor == false` or `cursor_pos` is `None` / outside the
+/// range), returns a single segment covering the whole highlight.
+///
+/// Pure function — no rendering side effects, so it can be unit-tested.
+fn split_highlight_around_cursor(
+    col: usize,
+    len: usize,
+    cursor_pos: Option<(usize, usize)>,
+    show_cursor: bool,
+) -> Vec<(usize, usize)> {
+    if !show_cursor {
+        return vec![(col, len)];
+    }
+    let (_, cur_col) = match cursor_pos {
+        Some(c) => c,
+        None => return vec![(col, len)],
+    };
+    // Cursor cell is [cur_col, cur_col+1). Skip it only when it overlaps
+    // the highlight range [col, col+len).
+    if cur_col < col || cur_col >= col + len {
+        return vec![(col, len)];
+    }
+    let mut segs = Vec::with_capacity(2);
+    // Left segment: [col, cur_col)
+    if cur_col > col {
+        segs.push((col, cur_col - col));
+    }
+    // Right segment: [cur_col+1, col+len)
+    let right_start = cur_col + 1;
+    if right_start < col + len {
+        segs.push((right_start, col + len - right_start));
+    }
+    segs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_highlight_no_cursor_returns_whole_range() {
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, None, true),
+            vec![(5, 3)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_show_cursor_false_returns_whole_range() {
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, Some((0, 6)), false),
+            vec![(5, 3)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_cursor_outside_range_returns_whole_range() {
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, Some((0, 10)), true),
+            vec![(5, 3)]
+        );
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, Some((0, 4)), true),
+            vec![(5, 3)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_cursor_at_start_leaves_right_segment() {
+        // col=5, len=3 → range [5,8). cursor at col 5 → skip [5,6), keep [6,8)
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, Some((0, 5)), true),
+            vec![(6, 2)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_cursor_at_end_leaves_left_segment() {
+        // col=5, len=3 → range [5,8). cursor at col 7 → keep [5,7), skip [7,8)
+        assert_eq!(
+            split_highlight_around_cursor(5, 3, Some((0, 7)), true),
+            vec![(5, 2)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_cursor_in_middle_splits_into_two() {
+        // col=5, len=4 → range [5,9). cursor at col 6 → [5,6) + [7,9)
+        assert_eq!(
+            split_highlight_around_cursor(5, 4, Some((0, 6)), true),
+            vec![(5, 1), (7, 2)]
+        );
+    }
+
+    #[test]
+    fn split_highlight_single_cell_with_cursor_returns_empty() {
+        // col=5, len=1 → range [5,6). cursor at col 5 → no segments
+        assert_eq!(
+            split_highlight_around_cursor(5, 1, Some((0, 5)), true),
+            vec![]
+        );
     }
 }

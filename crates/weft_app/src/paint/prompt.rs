@@ -48,7 +48,13 @@ impl MetalRenderer {
         // computed by the pure function in `layout.rs`. The renderer keeps
         // responsibility for vertex building, theming, and text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let layout = crate::layout::layout_prompt(&ctx, p.lines.len(), cl, cursor_offset_cols);
+        let layout = crate::layout::layout_prompt(
+            &ctx,
+            p.lines.len(),
+            cl,
+            cursor_offset_cols,
+            p.scroll_offset,
+        );
         let text_y0 = layout.text_y0;
         let left = layout.left;
         let box_cols = layout.box_cols;
@@ -56,6 +62,8 @@ impl MetalRenderer {
         let cx = layout.cursor_x;
         let cy = layout.cursor_y;
         let bar_w = layout.bar_w;
+        let visible_rows = layout.visible_rows;
+        let scroll_offset = p.scroll_offset;
 
         let theme_bg = color_to_normalized(self.theme.background);
         // The input area uses the SAME background as the window (Warp style —
@@ -91,14 +99,16 @@ impl MetalRenderer {
         let prompt_str = "❯ ";
         let prompt_chars = 2;
         let prompt_c = color_to_normalized(self.theme.accent);
-        self.push_text(
-            &mut verts,
-            left,
-            text_y0,
-            prompt_str,
-            prompt_c,
-            prompt_chars,
-        );
+        if scroll_offset == 0 {
+            self.push_text(
+                &mut verts,
+                left,
+                text_y0,
+                prompt_str,
+                prompt_c,
+                prompt_chars,
+            );
+        }
 
         // Editor buffer lines (line 0 starts after the prompt).
         // v0.9: draw a selection highlight for the active mouse-drag range.
@@ -114,11 +124,14 @@ impl MetalRenderer {
             ]
         };
         if let Some(((sl, sc), (el, ec))) = p.selection {
-            for i in sl..=el {
+            // F2 P0-1: only render selection highlight for visible lines,
+            // adjusting Y by scroll_offset.
+            let vis_end = (scroll_offset + visible_rows).min(p.lines.len());
+            for i in (sl.max(scroll_offset))..=(el.min(vis_end.saturating_sub(1))) {
                 let Some(line) = p.lines.get(i) else {
                     continue;
                 };
-                let y = text_y0 + i as f32 * ch;
+                let y = text_y0 + (i - scroll_offset) as f32 * ch;
                 let (line_start_x, max_chars) = if i == 0 {
                     let avail = box_cols.saturating_sub(prompt_chars).max(1);
                     (first_line_text_x, avail)
@@ -157,8 +170,12 @@ impl MetalRenderer {
                 }
             }
         }
-        for (i, line) in p.lines.iter().enumerate() {
-            let y = text_y0 + i as f32 * ch;
+        // F2 P0-1: only render the visible window [scroll_offset, scroll_offset +
+        // visible_rows), adjusting each line's Y by scroll_offset.
+        let vis_end = (scroll_offset + visible_rows).min(p.lines.len());
+        for i in scroll_offset..vis_end {
+            let line = &p.lines[i];
+            let y = text_y0 + (i - scroll_offset) as f32 * ch;
             let (start_x, max_chars) = if i == 0 {
                 let avail = box_cols.saturating_sub(prompt_chars).max(1);
                 (first_line_text_x, avail)
@@ -209,8 +226,72 @@ impl MetalRenderer {
         // IME preedit right after the cursor.
         if let Some(preedit) = p.preedit {
             if !preedit.is_empty() {
-                self.push_text(&mut verts, cx + bar_w, cy, preedit, accent, box_cols);
+                let preedit_x = cx + bar_w;
+                self.push_text(&mut verts, preedit_x, cy, preedit, accent, box_cols);
+
+                // F2 P1-4: render the composition caret within the preedit
+                // string using the byte-range cursor from `Ime::Preedit`.
+                // Lightweight version: a thin caret bar at `start` when
+                // `start == end`, or a translucent highlight over `[start, end)`.
+                if let Some((start, end)) = p.preedit_cursor {
+                    let (start_clamped, end_clamped) = normalize_preedit_range(preedit, start, end);
+                    // Convert byte offsets → display column widths.
+                    let prefix_str = &preedit[..start_clamped];
+                    let prefix_cols: usize = prefix_str.chars().map(Self::char_col_width).sum();
+                    let caret_x = preedit_x + prefix_cols as f32 * cw;
+                    if start_clamped == end_clamped {
+                        // Thin caret bar.
+                        let preedit_bar_w = (cw * 0.12).max(2.0);
+                        push_quad(
+                            &mut verts,
+                            [caret_x, cy, caret_x + preedit_bar_w, cy + ch],
+                            bg_uv,
+                            [0.0; 4],
+                            accent,
+                        );
+                    } else {
+                        // Highlight the selected range within the preedit.
+                        let sel_str = &preedit[start_clamped..end_clamped];
+                        let sel_cols: usize = sel_str.chars().map(Self::char_col_width).sum();
+                        if sel_cols > 0 {
+                            let sel_color = [
+                                accent[0] * 0.35 + theme_bg[0] * 0.65,
+                                accent[1] * 0.35 + theme_bg[1] * 0.65,
+                                accent[2] * 0.35 + theme_bg[2] * 0.65,
+                                0.70,
+                            ];
+                            push_quad(
+                                &mut verts,
+                                [caret_x, cy, caret_x + sel_cols as f32 * cw, cy + ch],
+                                bg_uv,
+                                [0.0; 4],
+                                sel_color,
+                            );
+                        }
+                    }
+                }
             }
+        }
+
+        // F2 P1-3: lightweight hint line at the bottom pad row of the prompt
+        // box. Shows the Enter / Shift+Enter (or Ctrl+Enter / Enter) key
+        // semantics. Dim color, more prominent when multi-line input is active.
+        let hint_y = layout.box_rect[3] - ch;
+        if hint_y >= text_y0 {
+            let hint_text = if p.submit_on_ctrl_enter {
+                "⌃⏎ Run · ⏎ Newline"
+            } else {
+                "⏎ Run · ⇧⏎ Newline"
+            };
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let dim_c = color_to_normalized(ui.text_secondary);
+            // Multi-line input makes the hint slightly more visible (0.70
+            // alpha vs 0.45) since the user is actively composing a multi-line
+            // command and the key semantics matter more.
+            let alpha = if p.lines.len() > 1 { 0.70 } else { 0.45 };
+            let hint_color = [dim_c[0], dim_c[1], dim_c[2], alpha];
+            let hint_cols = Self::text_col_width(hint_text);
+            self.push_text(&mut verts, left, hint_y, hint_text, hint_color, hint_cols);
         }
 
         verts
@@ -276,10 +357,49 @@ pub struct PromptDrawParams<'a> {
     pub cursor: (usize, usize),
     /// Active IME preedit string, drawn right after the cursor.
     pub preedit: Option<&'a str>,
+    /// F2 P1-4: Preedit cursor byte range `(start, end)` within `preedit`.
+    /// `None` hides the composition caret. `Some((s, e))` with `s == e`
+    /// renders a thin caret at byte offset `s`. `s < e` renders a highlight
+    /// over the `[s, e)` byte range.
+    pub preedit_cursor: Option<(usize, usize)>,
     /// `(query, selected_match)` when Ctrl+R search is active (replaces the
     /// normal prompt rendering).
     pub search: Option<(&'a str, Option<&'a str>)>,
     /// v0.9: active mouse-drag selection range `((start_line, start_col),
     /// (end_line, end_col))` in document order, or None when no selection.
     pub selection: Option<((usize, usize), (usize, usize))>,
+    /// F2 P0-1: vertical scroll offset for multi-line input when the box is
+    /// clamped to 30% of the viewport. The renderer only draws lines
+    /// `[scroll_offset, scroll_offset + visible_rows)`.
+    pub scroll_offset: usize,
+    /// F2 P1-3: When true, the hint line shows `⌃⏎ Run · ⏎ Newline`
+    /// (Ctrl+Enter submits). When false, `⏎ Run · ⇧⏎ Newline` (Enter submits,
+    /// Shift+Enter newlines).
+    pub submit_on_ctrl_enter: bool,
+}
+
+fn normalize_preedit_range(text: &str, start: usize, end: usize) -> (usize, usize) {
+    fn floor_boundary(text: &str, offset: usize) -> usize {
+        let mut offset = offset.min(text.len());
+        while offset > 0 && !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
+    }
+
+    let start = floor_boundary(text, start);
+    let end = floor_boundary(text, end).max(start);
+    (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preedit_range_clamps_to_utf8_boundaries() {
+        assert_eq!(normalize_preedit_range("啊b", 1, 2), (0, 0));
+        assert_eq!(normalize_preedit_range("啊b", 3, 4), (3, 4));
+        assert_eq!(normalize_preedit_range("啊b", 99, 99), (4, 4));
+    }
 }
