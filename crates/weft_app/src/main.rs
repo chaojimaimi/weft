@@ -9,6 +9,7 @@
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 
 mod app_state;
+mod block_component;
 mod completion_component;
 mod context_menu_component;
 mod editor_controller;

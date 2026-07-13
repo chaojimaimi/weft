@@ -103,8 +103,9 @@ impl MetalRenderer {
             fg[2] * 0.70 + theme_bg[2] * 0.30,
             1.0,
         ];
-        let green = [0.53, 0.80, 0.36, 1.0];
-        let red = [0.85, 0.36, 0.36, 1.0];
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let green = color_to_normalized(ui.success);
+        let red = color_to_normalized(ui.error);
 
         // v0.9 fix: Warp-style search input field — a distinct rounded-look
         // box with its own background and border, so it reads as an input

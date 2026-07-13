@@ -9,10 +9,11 @@
 
 use std::rc::Rc;
 
+use crate::block_component::{block_presentation, BlockTone};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
 use crate::paint::primitives::{color_to_normalized, push_quad};
-use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
+use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
 
@@ -71,7 +72,10 @@ impl MetalRenderer {
                 command: &'a str,
                 block_id: BlockId,
             },
-            Header,
+            Header {
+                text: String,
+                block_id: BlockId,
+            },
             Separator,
             LiveCommand {
                 command: &'a str,
@@ -141,7 +145,11 @@ impl MetalRenderer {
                 });
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
-                row_data.push(LaidRow::Header);
+                let presentation = block_presentation(b, cached.lines.len());
+                row_data.push(LaidRow::Header {
+                    text: presentation.label,
+                    block_id: b.id,
+                });
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
@@ -196,11 +204,11 @@ impl MetalRenderer {
                         y_bottom: row_top_y + pitch,
                     });
                 }
-                LaidRow::Header => {
+                LaidRow::Header { text, block_id } => {
                     bv_rows.push(BlockViewRow {
                         kind: BlockViewRowKind::Header,
-                        text: String::new(),
-                        block_id: None,
+                        text: text.clone(),
+                        block_id: Some(*block_id),
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
                     });
@@ -325,6 +333,8 @@ impl MetalRenderer {
             },
             Header {
                 text: String,
+                tone: BlockTone,
+                block_id: BlockId,
             },
             Separator,
             LiveCommand {
@@ -400,20 +410,14 @@ impl MetalRenderer {
                     foldable: cached.foldable,
                     block_id: b.id,
                 });
-                let dur = block_duration_str(b);
-                let bcwd = b
-                    .cwd
-                    .as_deref()
-                    .map(abbreviate_path)
-                    .unwrap_or_else(|| "~".to_string());
-                let header = if dur.is_empty() {
-                    bcwd
-                } else {
-                    format!("{bcwd} ({dur})")
-                };
+                let presentation = block_presentation(b, cached.lines.len());
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
-                row_data.push(LaidRow::Header { text: header });
+                row_data.push(LaidRow::Header {
+                    text: presentation.label,
+                    tone: presentation.tone,
+                    block_id: b.id,
+                });
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
@@ -487,11 +491,11 @@ impl MetalRenderer {
                         y_bottom: y + pitch,
                     });
                 }
-                LaidRow::Header { text: _ } => {
+                LaidRow::Header { text, block_id, .. } => {
                     bv_rows.push(weft_core::selection::BlockViewRow {
                         kind: weft_core::selection::BlockViewRowKind::Header,
-                        text: String::new(),
-                        block_id: None,
+                        text: text.clone(),
+                        block_id: Some(*block_id),
                         y_top: y,
                         y_bottom: y + pitch,
                     });
@@ -701,7 +705,7 @@ impl MetalRenderer {
                         });
                     }
                 }
-                LaidRow::Header { text } => {
+                LaidRow::Header { text, tone, .. } => {
                     if row_in_selection(y + pitch * 0.5) {
                         push_quad(
                             &mut verts,
@@ -711,7 +715,13 @@ impl MetalRenderer {
                             selection_bg,
                         );
                     }
-                    self.push_text(&mut verts, left, y, text, dim, cols);
+                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                    let color = match tone {
+                        BlockTone::Success => dim,
+                        BlockTone::Error => color_to_normalized(ui.error),
+                        BlockTone::Warning => color_to_normalized(ui.warning),
+                    };
+                    self.push_text(&mut verts, left, y, text, color, cols);
                 }
                 LaidRow::Separator => {
                     if row_in_selection(y + pitch * 0.5) {

@@ -80,6 +80,9 @@ pub struct UiColors {
     pub text_secondary: Color,
     pub border_subtle: Color,
     pub focus: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
 }
 
 impl UiColors {
@@ -100,6 +103,21 @@ impl UiColors {
             text_secondary: mix(bg, fg, 0.70),
             border_subtle: mix(bg, fg, 0.20),
             focus: theme.accent,
+            success: if dark {
+                Color::rgb(135, 204, 92)
+            } else {
+                Color::rgb(50, 120, 35)
+            },
+            warning: if dark {
+                Color::rgb(220, 166, 78)
+            } else {
+                Color::rgb(150, 95, 0)
+            },
+            error: if dark {
+                Color::rgb(217, 92, 92)
+            } else {
+                Color::rgb(180, 45, 45)
+            },
         }
     }
 }
@@ -183,6 +201,8 @@ mod tests {
             assert_ne!(colors.text_primary, colors.canvas);
             assert_ne!(colors.text_secondary, colors.canvas);
             assert_eq!(colors.focus, theme.accent);
+            assert_ne!(colors.success, colors.error);
+            assert_ne!(colors.warning, colors.error);
         }
     }
 }
