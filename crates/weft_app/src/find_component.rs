@@ -18,6 +18,7 @@ pub(crate) fn build_find_scene(layout: FindLayout) -> Scene<FindTarget> {
         label: "Find".into(),
         bounds: layout.popup_rect,
         focus: Some(FocusId::FindQuery),
+        state: String::new(),
     });
     let buttons = [
         (layout.up_rect, FindTarget::Previous, "Previous match"),
@@ -44,6 +45,7 @@ pub(crate) fn build_find_scene(layout: FindLayout) -> Scene<FindTarget> {
             label: label.into(),
             bounds,
             focus: Some(FocusId::FindQuery),
+            state: String::new(),
         });
     }
     scene

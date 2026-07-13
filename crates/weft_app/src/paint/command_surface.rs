@@ -20,7 +20,7 @@
 
 use crate::layout::Rect;
 use crate::paint::primitives::{push_quad, push_triangle};
-use crate::scene::FocusId;
+use crate::scene::{FocusId, FocusScope};
 use weft_core::input::{KeyCode, Modifiers};
 
 // ── Shell ──────────────────────────────────────────────────────────────
@@ -531,6 +531,78 @@ pub(crate) fn save_focus_for_modal(
     }
 }
 
+// ── F6: Focus scope stack ─────────────────────────────────────────────
+
+/// F6: Determine the current focus scope from the stack. Returns
+/// [`FocusScope::Terminal`] when the stack is empty (the default scope).
+///
+/// Pure function — the caller passes `&interaction.focus_stack`.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn current_focus_scope(stack: &[FocusScope]) -> FocusScope {
+    stack.last().copied().unwrap_or(FocusScope::Terminal)
+}
+
+/// F6: Push a scope onto the focus stack when a modal opens. The previous
+/// scope remains underneath so closing the modal restores it.
+///
+/// Pure function — returns the new stack so the caller can assign it.
+/// In practice the caller uses `stack.push(scope)` directly; this function
+/// exists so the push/pop semantics are unit-testable without an `App`.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn push_focus_scope(mut stack: Vec<FocusScope>, scope: FocusScope) -> Vec<FocusScope> {
+    stack.push(scope);
+    stack
+}
+
+/// F6: Pop a scope from the focus stack when a modal closes. Returns the
+/// popped scope, or `None` when the stack was already empty (defensive —
+/// the caller should only pop when a modal was pushed).
+///
+/// Pure function — returns `(popped, remaining_stack)`.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn pop_focus_scope(mut stack: Vec<FocusScope>) -> (Option<FocusScope>, Vec<FocusScope>) {
+    let popped = stack.pop();
+    (popped, stack)
+}
+
+/// F6: Cycle focus within a list of focusable elements in the current scope.
+/// Returns the next (forward) or previous (backward) `FocusId`. Wraps around.
+/// Returns `None` when the list is empty. When the current focus is not in
+/// the list, returns the first element (forward) or the last (backward).
+///
+/// Pure function — the caller builds the candidates list from the current
+/// scope and modal state, then passes it here. This keeps the cycling logic
+/// testable without an `App` instance.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn cycle_focus(
+    candidates: &[FocusId],
+    current: Option<FocusId>,
+    forward: bool,
+) -> Option<FocusId> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let idx = current
+        .and_then(|c| candidates.iter().position(|&f| f == c))
+        .map(|i| {
+            if forward {
+                (i + 1) % candidates.len()
+            } else {
+                (i + candidates.len() - 1) % candidates.len()
+            }
+        })
+        .unwrap_or_else(|| {
+            // Current focus not in the list — start from the first (forward)
+            // or the last (backward) so Tab always lands on a valid element.
+            if forward {
+                0
+            } else {
+                candidates.len() - 1
+            }
+        });
+    Some(candidates[idx])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -999,5 +1071,128 @@ mod tests {
     fn save_focus_returns_none_when_no_current_focus() {
         let result = save_focus_for_modal(None, None, FocusId::Settings);
         assert_eq!(result, None);
+    }
+
+    // ── F6: Focus scope stack ─────────────────────────────────────────
+
+    #[test]
+    fn current_focus_scope_defaults_to_terminal_when_empty() {
+        assert_eq!(current_focus_scope(&[]), FocusScope::Terminal);
+    }
+
+    #[test]
+    fn current_focus_scope_returns_last_pushed() {
+        let stack = vec![FocusScope::Terminal, FocusScope::Modal];
+        assert_eq!(current_focus_scope(&stack), FocusScope::Modal);
+    }
+
+    #[test]
+    fn push_focus_scope_appends_scope() {
+        let stack = push_focus_scope(vec![], FocusScope::Modal);
+        assert_eq!(stack, vec![FocusScope::Modal]);
+        let stack = push_focus_scope(stack, FocusScope::Sidebar);
+        assert_eq!(stack, vec![FocusScope::Modal, FocusScope::Sidebar]);
+    }
+
+    #[test]
+    fn pop_focus_scope_returns_last_and_remaining() {
+        let stack = vec![FocusScope::Terminal, FocusScope::Modal];
+        let (popped, remaining) = pop_focus_scope(stack);
+        assert_eq!(popped, Some(FocusScope::Modal));
+        assert_eq!(remaining, vec![FocusScope::Terminal]);
+    }
+
+    #[test]
+    fn pop_focus_scope_on_empty_returns_none() {
+        let (popped, remaining) = pop_focus_scope(vec![]);
+        assert_eq!(popped, None);
+        assert!(remaining.is_empty());
+    }
+
+    // ── F6: cycle_focus ───────────────────────────────────────────────
+
+    #[test]
+    fn cycle_focus_forward_wraps_around() {
+        let cands = [FocusId::FindQuery, FocusId::PaletteQuery];
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::FindQuery), true),
+            Some(FocusId::PaletteQuery)
+        );
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::PaletteQuery), true),
+            Some(FocusId::FindQuery) // wraps
+        );
+    }
+
+    #[test]
+    fn cycle_focus_backward_wraps_around() {
+        let cands = [FocusId::FindQuery, FocusId::PaletteQuery];
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::FindQuery), false),
+            Some(FocusId::PaletteQuery) // wraps backward
+        );
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::PaletteQuery), false),
+            Some(FocusId::FindQuery)
+        );
+    }
+
+    #[test]
+    fn cycle_focus_single_candidate_returns_it() {
+        let cands = [FocusId::Settings];
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Settings), true),
+            Some(FocusId::Settings)
+        );
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Settings), false),
+            Some(FocusId::Settings)
+        );
+    }
+
+    #[test]
+    fn cycle_focus_empty_returns_none() {
+        let cands: [FocusId; 0] = [];
+        assert_eq!(cycle_focus(&cands, Some(FocusId::FindQuery), true), None);
+        assert_eq!(cycle_focus(&cands, None, false), None);
+    }
+
+    #[test]
+    fn cycle_focus_current_not_in_list_starts_at_first_or_last() {
+        let cands = [FocusId::FindQuery, FocusId::PaletteQuery];
+        // Current not in list → forward starts at first (index 0).
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Settings), true),
+            Some(FocusId::FindQuery)
+        );
+        // Current not in list → backward starts at last.
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Settings), false),
+            Some(FocusId::PaletteQuery)
+        );
+    }
+
+    #[test]
+    fn cycle_focus_none_current_forward_starts_at_first() {
+        let cands = [FocusId::FindQuery, FocusId::PaletteQuery];
+        assert_eq!(cycle_focus(&cands, None, true), Some(FocusId::FindQuery));
+    }
+
+    #[test]
+    fn cycle_focus_three_candidates_cycles_in_order() {
+        let cands = [FocusId::Tab(0), FocusId::Completion, FocusId::SidebarSearch];
+        // Forward: 0 → 1 → 2 → 0
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Tab(0)), true),
+            Some(FocusId::Completion)
+        );
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::Completion), true),
+            Some(FocusId::SidebarSearch)
+        );
+        assert_eq!(
+            cycle_focus(&cands, Some(FocusId::SidebarSearch), true),
+            Some(FocusId::Tab(0))
+        );
     }
 }

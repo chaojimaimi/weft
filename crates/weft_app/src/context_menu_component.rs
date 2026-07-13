@@ -13,6 +13,7 @@ pub(crate) fn build_context_menu_scene(
         label: "Block actions".into(),
         bounds: layout.menu_rect,
         focus: Some(FocusId::ContextMenu),
+        state: String::new(),
     });
     for (index, (bounds, (label, _action))) in
         layout.item_rects.into_iter().zip(labels.iter()).enumerate()
@@ -30,6 +31,7 @@ pub(crate) fn build_context_menu_scene(
             label: (*label).into(),
             bounds,
             focus: Some(FocusId::ContextMenu),
+            state: String::new(),
         });
     }
     scene

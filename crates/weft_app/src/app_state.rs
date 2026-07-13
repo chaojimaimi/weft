@@ -269,6 +269,11 @@ pub struct WindowRuntimeState {
     /// F3-2: macOS Reduce Motion setting. When true, the spinner is replaced
     /// by a static `●` indicator. Polled alongside system appearance (1Hz).
     pub reduce_motion: bool,
+    /// F6: macOS Increase Contrast accessibility setting. When true, the
+    /// renderer strengthens borders, selection highlights and focus rings so
+    /// state is perceivable without relying on subtle color differences.
+    /// Polled alongside system appearance (1Hz).
+    pub increase_contrast: bool,
 }
 
 impl WindowRuntimeState {
@@ -286,6 +291,7 @@ impl WindowRuntimeState {
             spinner_anim_active: Arc::new(AtomicBool::new(false)),
             spinner_time: Instant::now(),
             reduce_motion: false,
+            increase_contrast: false,
         }
     }
 }
@@ -348,6 +354,13 @@ pub struct InteractionState {
     /// focus (visually / for accessibility) when the modal closes. `None`
     /// when no modal is open or the focus was already on the modal target.
     pub prev_focus: Option<crate::scene::FocusId>,
+    /// F6: Scope stack tracking which [`FocusScope`](crate::scene::FocusScope)
+    /// the keyboard focus currently belongs to. Pushed when a modal opens,
+    /// popped when it closes, so Tab/Shift+Tab cycles only within the active
+    /// scope. The last element is the current scope; an empty stack means
+    /// Terminal (the default scope).
+    #[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+    pub focus_stack: Vec<crate::scene::FocusScope>,
 }
 
 impl InteractionState {
@@ -366,6 +379,7 @@ impl InteractionState {
             block_hovered: None,
             sidebar_drag: None,
             prev_focus: None,
+            focus_stack: Vec::new(),
         }
     }
 }

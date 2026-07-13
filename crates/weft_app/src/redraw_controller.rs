@@ -419,10 +419,18 @@ impl App {
             // view it animates when the cursor isn't hidden. When no
             // caret is visible, skipping the wake avoids pointless
             // full redraws (the main cause of idle-terminal flicker).
-            let anim_active = if terminal.show_block_view() {
+            //
+            // F6: Steady cursors (Block/Underline/Bar) don't blink, so they
+            // don't need the blink wake either — only BlinkingBlock/
+            // BlinkingUnderline/BlinkingBar participate in the timer. When
+            // Reduce Motion is on, the cursor is frozen visible (see
+            // `update_cursor_blink`), so the wake is also unnecessary.
+            let anim_active = if self.window_runtime.reduce_motion {
+                false
+            } else if terminal.show_block_view() {
                 terminal.block_tracker().phase() == ShellPhase::AtPrompt
             } else {
-                terminal.cursor_visible
+                terminal.cursor_visible && terminal.cursor_style.is_blinking()
             };
             self.window_runtime
                 .cursor_anim_active

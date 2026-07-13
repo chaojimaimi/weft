@@ -967,6 +967,15 @@ impl App {
     ///   (v0.8 §0.3 signature). The phase advances continuously and wraps at
     ///   2π; the renderer maps it to an alpha curve 0.25↔1.0 + amber glow.
     fn update_cursor_blink(&mut self) {
+        // F6: When Reduce Motion is on, freeze the cursor visible (no blink
+        // toggle, no breath phase). This mirrors the spinner behavior and
+        // ensures a steady, non-distracting caret for motion-sensitive users.
+        if self.window_runtime.reduce_motion {
+            self.window_runtime.cursor_blink_on = true;
+            self.window_runtime.cursor_blink_phase = 0.0;
+            return;
+        }
+
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.window_runtime.cursor_blink_time);
 
@@ -1076,6 +1085,28 @@ unsafe fn system_reduce_motion() -> bool {
     }
     let reduce: bool = msg_send![shared, accessibilityDisplayShouldReduceMotion];
     reduce
+}
+
+/// F6: Query the macOS "Increase Contrast" accessibility setting.
+/// Returns `true` when the user has enabled System Settings → Accessibility →
+/// Display → Increase Contrast. When true, the renderer strengthens borders,
+/// selection highlights and focus rings so state is perceivable without
+/// relying on subtle color differences. Polled at 1Hz alongside
+/// `system_appearance_is_dark` (see `poll_system_appearance`).
+unsafe fn system_increase_contrast() -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
+    if workspace_cls.is_null() {
+        return false;
+    }
+    let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
+    if shared.is_null() {
+        return false;
+    }
+    let contrast: bool = msg_send![shared, accessibilityDisplayShouldIncreaseContrast];
+    contrast
 }
 
 /// Copy text to macOS system clipboard using NSPasteboard.

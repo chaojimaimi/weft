@@ -149,6 +149,31 @@ impl UiColors {
             },
         }
     }
+
+    /// F6: Strengthen colors for the macOS Increase Contrast accessibility
+    /// setting. When `increase_contrast` is true:
+    /// - `border_subtle` is pushed from 20% → 45% toward the foreground so
+    ///   borders are clearly visible against any background.
+    /// - `text_secondary` is pushed from 70% → 90% toward the foreground so
+    ///   secondary text stays readable.
+    /// - `find_match` is brightened so search highlights stand out more.
+    ///
+    /// Returns a new `UiColors` (the original is unchanged). Pure function
+    /// so it can be unit-tested without a renderer.
+    #[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+    pub fn with_increase_contrast(self, increase_contrast: bool) -> Self {
+        if !increase_contrast {
+            return self;
+        }
+        let bg = self.canvas;
+        let fg = self.text_primary;
+        Self {
+            border_subtle: mix(bg, fg, 0.45),
+            text_secondary: mix(bg, fg, 0.90),
+            find_match: mix(self.find_match, Color::rgb(255, 255, 255), 0.20),
+            ..self
+        }
+    }
 }
 
 fn scale(color: Color, factor: f32) -> Color {
@@ -284,5 +309,57 @@ mod tests {
         assert!(!sidebar_edge_hit(edge, edge, tol, vp_h, vp_h + 0.001));
         // Far from edge horizontally.
         assert!(!sidebar_edge_hit(500.0, edge, tol, vp_h, 100.0));
+    }
+
+    // ── F6: Increase Contrast ────────────────────────────────────────
+
+    #[test]
+    fn with_increase_contrast_false_returns_unchanged() {
+        let theme = Theme::weft_warm();
+        let colors = UiColors::from_theme(&theme);
+        let adjusted = colors.with_increase_contrast(false);
+        assert_eq!(adjusted.border_subtle, colors.border_subtle);
+        assert_eq!(adjusted.text_secondary, colors.text_secondary);
+        assert_eq!(adjusted.find_match, colors.find_match);
+    }
+
+    #[test]
+    fn with_increase_contrast_true_strengthens_border_and_text() {
+        let theme = Theme::weft_warm();
+        let colors = UiColors::from_theme(&theme);
+        let adjusted = colors.with_increase_contrast(true);
+        // border_subtle goes from mix(bg, fg, 0.20) to mix(bg, fg, 0.45).
+        // The adjusted border should be closer to the foreground than the
+        // original, i.e. more visible.
+        assert_ne!(adjusted.border_subtle, colors.border_subtle);
+        // text_secondary goes from 0.70 to 0.90 — closer to foreground.
+        assert_ne!(adjusted.text_secondary, colors.text_secondary);
+        // find_match is brightened toward white.
+        assert_ne!(adjusted.find_match, colors.find_match);
+        // Other colors are unchanged (struct update syntax ..self).
+        assert_eq!(adjusted.canvas, colors.canvas);
+        assert_eq!(adjusted.chrome, colors.chrome);
+        assert_eq!(adjusted.focus, colors.focus);
+        assert_eq!(adjusted.error, colors.error);
+    }
+
+    #[test]
+    fn with_increase_contrast_border_closer_to_foreground() {
+        // In dark theme, border_subtle is a mix of dark bg and light fg.
+        // Increase Contrast pushes it closer to fg, so the resulting color
+        // should have a higher sum of RGB channels (brighter in dark theme).
+        let theme = Theme::weft_warm();
+        let colors = UiColors::from_theme(&theme);
+        let adjusted = colors.with_increase_contrast(true);
+        let orig_sum = u16::from(colors.border_subtle.r)
+            + u16::from(colors.border_subtle.g)
+            + u16::from(colors.border_subtle.b);
+        let adj_sum = u16::from(adjusted.border_subtle.r)
+            + u16::from(adjusted.border_subtle.g)
+            + u16::from(adjusted.border_subtle.b);
+        assert!(
+            adj_sum > orig_sum,
+            "increase contrast should brighten border in dark theme: {orig_sum} → {adj_sum}"
+        );
     }
 }

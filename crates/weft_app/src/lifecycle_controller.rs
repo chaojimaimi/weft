@@ -542,6 +542,15 @@ impl App {
             self.window_runtime.reduce_motion = reduce;
         }
 
+        // F6: Poll macOS Increase Contrast setting (always, regardless of
+        // follow_system). When true, the renderer strengthens borders,
+        // selection highlights and focus rings.
+        let contrast = unsafe { system_increase_contrast() };
+        if contrast != self.window_runtime.increase_contrast {
+            self.window_runtime.increase_contrast = contrast;
+            self.request_redraw();
+        }
+
         if !self.config_state.config.theme.follow_system {
             return;
         }

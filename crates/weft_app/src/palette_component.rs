@@ -63,6 +63,7 @@ pub(crate) fn build_palette_scene(
         label: "Command Palette".into(),
         bounds: popup_rect,
         focus: Some(FocusId::PaletteQuery),
+        state: String::new(),
     });
 
     if let PaletteLayout::Search(search) = layout {
@@ -76,6 +77,7 @@ pub(crate) fn build_palette_scene(
                 search.query_y + cell_h,
             ],
             focus: Some(FocusId::PaletteQuery),
+            state: String::new(),
         });
         for index in search.start..search.end {
             let y0 = search.results_y + (index - search.start) as f32 * cell_h;
@@ -92,6 +94,7 @@ pub(crate) fn build_palette_scene(
                 label: item_labels.get(index).cloned().unwrap_or_default(),
                 bounds,
                 focus: Some(FocusId::PaletteQuery),
+                state: String::new(),
             });
         }
     }

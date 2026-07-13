@@ -44,6 +44,7 @@ pub(crate) fn build_settings_scene(
         label: "Settings".into(),
         bounds: layout.box_rect,
         focus: Some(FocusId::Settings),
+        state: String::new(),
     });
 
     // F5: Sidebar category hit regions (vertical list).
@@ -65,6 +66,7 @@ pub(crate) fn build_settings_scene(
                 label: tab.label().into(),
                 bounds: row_rect,
                 focus: Some(FocusId::Settings),
+                state: String::new(),
             });
         }
     }
@@ -82,6 +84,7 @@ pub(crate) fn build_settings_scene(
                 label: format!("Theme {}", i + 1),
                 bounds: row_rect,
                 focus: None,
+                state: String::new(),
             });
         }
     }

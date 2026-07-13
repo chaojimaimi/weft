@@ -36,6 +36,7 @@ pub(crate) fn build_panel_scene(
         label: "Search history".into(),
         bounds: search_field_rect,
         focus: Some(crate::scene::FocusId::SidebarSearch),
+        state: String::new(),
     });
     scene.hits.push(HitRegion::from_rect(
         search_field_rect,
@@ -54,6 +55,7 @@ pub(crate) fn build_panel_scene(
             label: format!("History row {}", i + 1),
             bounds: row_rect,
             focus: None,
+            state: String::new(),
         });
     }
 

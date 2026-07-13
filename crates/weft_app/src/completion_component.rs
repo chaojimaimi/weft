@@ -64,6 +64,7 @@ pub(crate) fn build_completion_scene(
         label: "Completions".into(),
         bounds: layout.popup_rect,
         focus: None,
+        state: String::new(),
     });
 
     let [x0, y0, x1, y1] = layout.popup_rect;
@@ -84,6 +85,7 @@ pub(crate) fn build_completion_scene(
             label: matches[index].label.clone(),
             bounds,
             focus: Some(FocusId::Completion),
+            state: String::new(),
         });
     }
     scene.hits.push(HitRegion {

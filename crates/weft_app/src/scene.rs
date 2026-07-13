@@ -25,6 +25,39 @@ pub(crate) enum FocusId {
     ContextMenu,
 }
 
+impl FocusId {
+    /// F6: Map a `FocusId` to its containing [`FocusScope`]. Tab/Shift+Tab
+    /// cycles only within the current scope so focus doesn't escape a modal
+    /// surface or jump from the sidebar to the terminal unexpectedly.
+    pub(crate) fn scope(self) -> FocusScope {
+        match self {
+            FocusId::Tab(_) | FocusId::Completion => FocusScope::Terminal,
+            FocusId::SidebarSearch => FocusScope::Sidebar,
+            FocusId::FindQuery
+            | FocusId::PaletteQuery
+            | FocusId::Settings
+            | FocusId::ContextMenu => FocusScope::Modal,
+        }
+    }
+}
+
+/// F6: Top-level focus scope. Mirrors the scope stack from the design plan:
+///
+/// ```text
+/// Window
+///   Terminal | Sidebar
+///   Modal(Settings | Palette | Find | ContextMenu)
+/// ```
+///
+/// Tab/Shift+Tab cycles within the current scope. When a modal opens, the
+/// previous scope is saved on the focus stack; closing the modal restores it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusScope {
+    Terminal,
+    Sidebar,
+    Modal,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Primitive {
     Rect {
@@ -86,14 +119,27 @@ pub(crate) enum SemanticRole {
     Menu,
     MenuItem,
     Tab,
+    /// F6: A tab list container (the tab bar as a whole).
+    TabList,
 }
 
+/// F6: Accessibility state descriptor. Conveys status beyond color so screen
+/// readers and high-contrast users can perceive state changes (e.g. a block
+/// exiting with an error, a row being selected, a tab being active).
+///
+/// Stored as a `String` rather than an enum so callers can compose arbitrary
+/// status text (e.g. "exit 1", "selected", "expanded") without bloating the
+/// type. Empty string means "no extra state".
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SemanticNode {
     pub(crate) role: SemanticRole,
     pub(crate) label: String,
     pub(crate) bounds: Rect,
     pub(crate) focus: Option<FocusId>,
+    /// F6: Human-readable state description for accessibility. Empty when
+    /// the node has no extra state to announce. Examples: "selected",
+    /// "exit 1", "running", "expanded".
+    pub(crate) state: String,
 }
 
 pub(crate) struct Scene<T> {
@@ -116,7 +162,7 @@ impl<T> Default for Scene<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusId, HitRegion, Scene, SemanticNode, SemanticRole};
+    use super::{FocusId, FocusScope, HitRegion, Scene, SemanticNode, SemanticRole};
 
     #[test]
     fn hit_region_and_semantic_node_can_share_exact_bounds() {
@@ -132,6 +178,7 @@ mod tests {
             label: "Find".into(),
             bounds: hit.bounds(),
             focus: Some(FocusId::FindQuery),
+            state: String::new(),
         };
         assert_eq!(semantic.bounds, hit.bounds());
         assert!(hit.contains(10.0, 52.0));
@@ -156,5 +203,34 @@ mod tests {
         assert_eq!(scene.hits.len(), 1);
         assert!(scene.primitives.is_empty());
         assert!(scene.semantics.is_empty());
+    }
+
+    // ── F6: FocusScope ────────────────────────────────────────────────
+
+    #[test]
+    fn focus_scope_maps_modal_targets_to_modal() {
+        assert_eq!(FocusId::FindQuery.scope(), FocusScope::Modal);
+        assert_eq!(FocusId::PaletteQuery.scope(), FocusScope::Modal);
+        assert_eq!(FocusId::Settings.scope(), FocusScope::Modal);
+        assert_eq!(FocusId::ContextMenu.scope(), FocusScope::Modal);
+    }
+
+    #[test]
+    fn focus_scope_maps_terminal_targets_to_terminal() {
+        assert_eq!(FocusId::Tab(0).scope(), FocusScope::Terminal);
+        assert_eq!(FocusId::Tab(5).scope(), FocusScope::Terminal);
+        assert_eq!(FocusId::Completion.scope(), FocusScope::Terminal);
+    }
+
+    #[test]
+    fn focus_scope_maps_sidebar_search_to_sidebar() {
+        assert_eq!(FocusId::SidebarSearch.scope(), FocusScope::Sidebar);
+    }
+
+    #[test]
+    fn focus_scope_terminal_and_modal_are_distinct() {
+        assert_ne!(FocusScope::Terminal, FocusScope::Modal);
+        assert_ne!(FocusScope::Sidebar, FocusScope::Modal);
+        assert_ne!(FocusScope::Terminal, FocusScope::Sidebar);
     }
 }

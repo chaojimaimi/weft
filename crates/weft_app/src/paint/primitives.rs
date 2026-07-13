@@ -191,6 +191,62 @@ pub(crate) fn syntax_color(kind: TokenKind, theme: &Theme) -> [f32; 4] {
     }
 }
 
+/// F6: Draw a focus ring (accent-colored border) around a semantic bounds
+/// rect. Emits 4 edge quads (top/bottom/left/right) into `verts`. The ring
+/// is drawn *inside* the bounds so it doesn't overflow into adjacent elements.
+///
+/// - `bounds`: `[x0, y0, x1, y1]` of the focused element.
+/// - `color`: accent/focus color (normalized RGBA). Alpha is applied as-is;
+///   callers should pre-multiply for the desired translucency.
+/// - `thickness`: border width in physical pixels (typically 2.0, or 3.0
+///   when Increase Contrast is on).
+///
+/// Pure vertex emitter — no renderer dependency. The caller passes the
+/// resulting `verts` to the same vertex buffer used by other overlay quads.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn build_focus_ring(
+    verts: &mut Vec<f32>,
+    bounds: [f32; 4],
+    color: [f32; 4],
+    thickness: f32,
+) {
+    let [x0, y0, x1, y1] = bounds;
+    let t = thickness.max(0.5);
+    let uv = [0.0f32; 4];
+    let fg = [0.0f32; 4];
+    // Top edge
+    push_quad(verts, [x0, y0, x1, y0 + t], uv, fg, color);
+    // Bottom edge
+    push_quad(verts, [x0, y1 - t, x1, y1], uv, fg, color);
+    // Left edge
+    push_quad(verts, [x0, y0, x0 + t, y1], uv, fg, color);
+    // Right edge
+    push_quad(verts, [x1 - t, y0, x1, y1], uv, fg, color);
+}
+
+/// F6: Resolve the focus ring thickness based on the Increase Contrast
+/// setting. Pure function so callers don't hardcode the contrast multiplier.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn focus_ring_thickness(increase_contrast: bool) -> f32 {
+    if increase_contrast {
+        3.0
+    } else {
+        2.0
+    }
+}
+
+/// F6: Resolve the focus ring alpha based on the Increase Contrast setting.
+/// When contrast is increased, the ring uses full opacity so it's visible
+/// against any background; otherwise it uses 0.70 for a subtler appearance.
+#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
+pub(crate) fn focus_ring_alpha(increase_contrast: bool) -> f32 {
+    if increase_contrast {
+        1.0
+    } else {
+        0.70
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +278,80 @@ mod tests {
         let default_c = color_to_normalized(theme.syntax.default);
         assert_eq!(syntax_color(TokenKind::Default, &theme), default_c);
         assert_eq!(syntax_color(TokenKind::Whitespace, &theme), default_c);
+    }
+
+    // ── F6: Focus ring ────────────────────────────────────────────────
+
+    #[test]
+    fn build_focus_ring_emits_four_edge_quads() {
+        let mut verts = Vec::new();
+        let color = [0.3, 0.6, 0.9, 0.7];
+        build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
+        // 4 quads × 6 verts × 12 floats = 288 floats.
+        assert_eq!(verts.len(), 288);
+    }
+
+    #[test]
+    fn build_focus_ring_top_edge_starts_at_y0() {
+        let mut verts = Vec::new();
+        let color = [0.3, 0.6, 0.9, 0.7];
+        build_focus_ring(&mut verts, [10.0, 20.0, 110.0, 52.0], color, 2.0);
+        // First quad: top edge → first vertex is (x0, y0) = (10, 20).
+        assert_eq!(verts[0], 10.0); // x0
+        assert_eq!(verts[1], 20.0); // y0
+    }
+
+    #[test]
+    fn build_focus_ring_clamps_thickness_to_minimum() {
+        let mut verts_a = Vec::new();
+        let mut verts_b = Vec::new();
+        let color = [1.0; 4];
+        build_focus_ring(&mut verts_a, [0.0, 0.0, 100.0, 50.0], color, 0.0);
+        build_focus_ring(&mut verts_b, [0.0, 0.0, 100.0, 50.0], color, 0.5);
+        // thickness=0 clamps to 0.5, same as thickness=0.5.
+        assert_eq!(verts_a.len(), verts_b.len());
+    }
+
+    #[test]
+    fn focus_ring_thickness_increases_with_contrast() {
+        assert_eq!(focus_ring_thickness(false), 2.0);
+        assert_eq!(focus_ring_thickness(true), 3.0);
+    }
+
+    #[test]
+    fn focus_ring_alpha_full_when_contrast_increased() {
+        assert!((focus_ring_alpha(false) - 0.70).abs() < 1e-4);
+        assert!((focus_ring_alpha(true) - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn build_focus_ring_with_increase_contrast_uses_more_vertices_area() {
+        // Both emit 4 quads, but the contrast version has thicker edges.
+        let mut verts_normal = Vec::new();
+        let mut verts_contrast = Vec::new();
+        let color = [0.3, 0.6, 0.9, 1.0];
+        let bounds = [10.0, 20.0, 110.0, 52.0];
+        build_focus_ring(
+            &mut verts_normal,
+            bounds,
+            color,
+            focus_ring_thickness(false),
+        );
+        build_focus_ring(
+            &mut verts_contrast,
+            bounds,
+            color,
+            focus_ring_thickness(true),
+        );
+        // Same vertex count (4 quads × 6 verts × 12 floats = 288), but
+        // different edge geometry (thicker edges with contrast).
+        assert_eq!(verts_normal.len(), verts_contrast.len());
+        // Top edge = first quad with dst [x0, y0, x1, y0 + thickness].
+        // push_quad vertex order: (x0,y0), (x0,y1), (x1,y1), ...
+        // Each vertex is 12 floats, so vertex 1's y-coordinate is at
+        // index 12 (vertex 1 offset) + 1 (y slot) = 13.
+        // Normal: thickness=2 → y0+2 = 22; Contrast: thickness=3 → y0+3 = 23.
+        assert_eq!(verts_normal[13], 22.0); // y1 of top edge (vertex 1)
+        assert_eq!(verts_contrast[13], 23.0);
     }
 }

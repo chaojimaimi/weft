@@ -96,6 +96,7 @@ pub(crate) fn build_tab_bar_scene(
             label: "Scroll tabs left".into(),
             bounds: left,
             focus: None,
+            state: String::new(),
         });
     }
     if let Some(right) = strip.right_arrow_rect {
@@ -107,6 +108,7 @@ pub(crate) fn build_tab_bar_scene(
             label: "Scroll tabs right".into(),
             bounds: right,
             focus: None,
+            state: String::new(),
         });
     }
 
@@ -128,6 +130,7 @@ pub(crate) fn build_tab_bar_scene(
             label: format!("Tab {}", index + 1),
             bounds: tab_rect,
             focus: None,
+            state: String::new(),
         });
     }
 
@@ -140,6 +143,7 @@ pub(crate) fn build_tab_bar_scene(
         label: "New tab".into(),
         bounds: strip.plus_rect,
         focus: None,
+        state: String::new(),
     });
 
     scene
