@@ -217,11 +217,6 @@ pub struct MetalRenderer {
     pub(crate) popup_max_rows: usize,
     /// Context menu position + target block (F7). Set per-frame by the app.
     pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>)>,
-    /// Last-rendered block-view rows (scroll-adjusted y bands + visible text),
-    /// for mouse hit-testing and selection in the block view. Repopulated each
-    /// draw when `show_block_view()` is true; cleared otherwise. Empty when the
-    /// classic grid view is active (selection then uses Grid coordinates).
-    pub block_view_rows: Vec<weft_core::selection::BlockViewRow>,
     /// Layout context for the current frame (viewport + cell + padding + clip).
     /// Constructed at the top of `draw()` and used by overlay builders to derive
     /// coordinates from semantic methods instead of hand-rolled f32 math.
@@ -241,12 +236,6 @@ pub struct MetalRenderer {
     /// builders (palette, panel) can draw a blinking caret without it being
     /// threaded through every helper signature.
     pub(crate) cursor_blink_on: bool,
-    /// v0.9: last-rendered prompt input box rect `[x0, y0, x1, y1]` in
-    /// physical pixels. Used by the app to detect clicks on the prompt box
-    /// (for select-all-then-copy). None when no prompt was drawn this frame.
-    /// Uses `Cell` for interior mutability — `draw` holds an immutable borrow
-    /// of `self.layer` (from `next_drawable`) so `&mut self` is unavailable.
-    pub prompt_box_rect: Cell<Option<[f32; 4]>>,
     /// v1.0 P0-a: Cache for block view layouts. Eliminates redundant O(n)
     /// per-frame wrapping computation for finished historical blocks.
     /// Uses `RefCell` because `draw()` holds an immutable borrow of
@@ -682,12 +671,10 @@ fragment float4 text_fragment(
             popup_width_scale: 0.6,
             popup_max_rows: 8,
             context_menu_target: None,
-            block_view_rows: Vec::new(),
             layout_ctx: None,
             find_state: None,
             panel_highlight: None,
             cursor_blink_on: true,
-            prompt_box_rect: Cell::new(None),
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
             grid_row_cache: RefCell::new(Vec::new()),
             force_full_grid: Cell::new(true),
@@ -1272,7 +1259,7 @@ fragment float4 text_fragment(
         // in block view, `instances` is empty and `vertices` carries everything.
         let mut instances: Vec<f32> = Vec::new();
         let mut vertices: Vec<f32> = if show_blocks {
-            let (v, regions, bv_rows) = if let Some(p) = prompt {
+            let (v, regions, _) = if let Some(p) = prompt {
                 let box_h = ch * (p.lines.len().max(1) as f32 + 2.0);
                 let box_top_y = (vp_h - pad_y - box_h).max(0.0);
                 self.build_block_view_vertices(
@@ -1305,14 +1292,11 @@ fragment float4 text_fragment(
                 )
             };
             pending_hit_regions = regions;
-            self.block_view_rows = bv_rows;
             v
         } else {
-            // Grid view (alt-screen apps): clear the block-view row cache so
-            // hit-testing falls back to Grid coordinates. Build per-cell
-            // instances (P1.5-B1) into `instances`; overlays go into
-            // `vertices` (appended below).
-            self.block_view_rows.clear();
+            // Grid view (alt-screen apps): build per-cell instances
+            // (P1.5-B1) into `instances`; overlays go into `vertices`
+            // (appended below).
             // v1.0 fix (vim scroll): alt-screen TUIs (vim/less/man) scroll via
             // IL/DL (CSI L/M) which PHYSICALLY move viewport rows, then repaint
             // the moved rows. The renderer's per-row vertex cache is indexed by
@@ -1395,8 +1379,6 @@ fragment float4 text_fragment(
                 cursor_blink_phase,
                 cursor_blink_on,
             ));
-        } else {
-            self.prompt_box_rect.set(None);
         }
 
         // Completion popup (split out from prompt — overlay refactor commit 2).
@@ -2262,7 +2244,6 @@ fragment float4 text_fragment(
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            self.prompt_box_rect.set(None);
             return verts;
         }
 
@@ -2287,11 +2268,6 @@ fragment float4 text_fragment(
         // responsibility for vertex building, theming, and text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
         let layout = crate::layout::layout_prompt(&ctx, p.lines.len(), cl, cursor_offset_cols);
-        // v0.9: cache the prompt box rect so the app can detect clicks on it
-        // (for select-all-then-copy after double-click sends a command here).
-        // Uses Cell for interior mutability — `draw` holds an immutable borrow
-        // of `self.layer` (from next_drawable) so `&mut self` is unavailable.
-        self.prompt_box_rect.set(Some(layout.box_rect));
         let text_y0 = layout.text_y0;
         let left = layout.left;
         let box_cols = layout.box_cols;

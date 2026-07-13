@@ -1616,6 +1616,21 @@ mod tests {
         assert!((layout.cursor_x - 88.0).abs() < 1e-3);
     }
 
+    /// M1: `box_rect` must be invariant to cursor position — the prompt
+    /// input box bounds depend only on `n_lines` + `LayoutCtx`, never on
+    /// where the caret is. This validates that the geometry_controller's
+    /// `prompt_box_rect()` (which passes cursor=(0,0)) produces the same
+    /// box_rect as the draw path (which passes the actual cursor).
+    #[test]
+    fn prompt_box_rect_invariant_to_cursor() {
+        let ctx = sample_ctx();
+        for n_lines in [1, 3, 10] {
+            let a = layout_prompt(&ctx, n_lines, 0, 0);
+            let b = layout_prompt(&ctx, n_lines, n_lines - 1, 42);
+            assert_eq!(a.box_rect, b.box_rect, "n_lines={n_lines}");
+        }
+    }
+
     // ── Block view layout (stage 4 — U2) ────────────────────────────────
 
     /// Editor mode (cwd_header_active=true): clip_bottom retreats by 2

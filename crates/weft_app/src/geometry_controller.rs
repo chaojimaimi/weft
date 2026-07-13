@@ -218,7 +218,7 @@ impl App {
             0.0
         };
         let left = renderer.padding_x() as f64 + chrome_left;
-        let rows = renderer.block_view_rows.as_slice();
+        let rows = self.compute_block_view_rows();
         if rows.is_empty() {
             return None;
         }
@@ -328,6 +328,53 @@ impl App {
         Some((line, line_str.chars().count()))
     }
 
+    /// Compute the prompt input box rect on-demand from the layout function,
+    /// instead of reading the renderer's previous-frame cache. Returns None
+    /// when not in block view or the terminal/editor isn't available.
+    pub(super) fn prompt_box_rect(&self) -> Option<[f32; 4]> {
+        let renderer = self.renderer.as_ref()?;
+        let ctx = renderer.layout_ctx?;
+        let terminal = self.sessions.tabs[self.sessions.active_tab]
+            .terminal
+            .as_ref()?;
+        if !terminal.show_block_view() {
+            return None;
+        }
+        let n_lines = terminal.editor().buffer.lines.len();
+        // box_rect only depends on ctx + n_lines; cursor position doesn't affect the box bounds.
+        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0);
+        Some(layout.box_rect)
+    }
+
+    /// Compute block-view rows on-demand for hit-testing, instead of reading
+    /// the renderer's previous-frame `block_view_rows` cache. Returns empty
+    /// when not in block view.
+    pub(super) fn compute_block_view_rows(&self) -> Vec<weft_core::selection::BlockViewRow> {
+        let renderer = match self.renderer.as_ref() {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let terminal = match self.sessions.tabs[self.sessions.active_tab]
+            .terminal
+            .as_ref()
+        {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        if !terminal.show_block_view() {
+            return Vec::new();
+        }
+        let region_bottom_y = renderer.viewport.1 - renderer.padding_y();
+        renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
+            blocks: terminal.block_tracker().session_blocks(),
+            region_bottom_y,
+            cwd: None,
+            git_branch: terminal.git_branch(),
+            live: terminal.block_tracker().in_flight(),
+            block_scroll: self.sessions.tabs[self.sessions.active_tab].block_scroll_offset,
+        })
+    }
+
     /// True when the block view is the active renderer (Editor mode, not in
     /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
     /// consistent.
@@ -361,10 +408,10 @@ impl App {
     /// completed blocks, `Some(None)` for the in-flight (running) command,
     /// or `None` when not on a block row.
     pub(super) fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
-        let rows = &self.renderer.as_ref()?.block_view_rows;
+        let rows = self.compute_block_view_rows();
         // Find the row whose y-range contains `y`. Prefer Command/LiveCommand
         // rows; Output rows fall back to their owning block.
-        for row in rows {
+        for row in &rows {
             if y >= row.y_top && y < row.y_bottom {
                 use weft_core::selection::BlockViewRowKind;
                 match row.kind {

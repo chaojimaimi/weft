@@ -278,7 +278,7 @@ impl App {
                 let yf = y as f32;
                 // Chevron occupies the first cell [content_left, content_left + cw).
                 if xf >= content_left && xf < content_left + cw {
-                    for row in &renderer.block_view_rows {
+                    for row in &self.compute_block_view_rows() {
                         if row.kind == weft_core::selection::BlockViewRowKind::Command
                             && yf >= row.y_top
                             && yf < row.y_bottom
@@ -390,9 +390,7 @@ impl App {
         // prompt box clear any active editor selection.
         if button == winit::event::MouseButton::Left {
             let in_prompt = self
-                .renderer
-                .as_ref()
-                .and_then(|r| r.prompt_box_rect.get())
+                .prompt_box_rect()
                 .map(|[x0, y0, x1, y1]| {
                     let xf = x as f32;
                     let yf = y as f32;
@@ -440,11 +438,7 @@ impl App {
                         // with what the user saw at drag start, even if a PTY
                         // update re-lays-out the view mid-drag.
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            let rows_snapshot = self
-                                .renderer
-                                .as_ref()
-                                .map(|r| r.block_view_rows.clone())
-                                .unwrap_or_default();
+                            let rows_snapshot = self.compute_block_view_rows();
                             self.sessions.tabs[self.sessions.active_tab]
                                 .selection_handler
                                 .start_block_view(bv_pos, rows_snapshot);
@@ -516,11 +510,7 @@ impl App {
                                 .block_view_selection
                                 .is_none()
                             {
-                                let rows_snapshot = self
-                                    .renderer
-                                    .as_ref()
-                                    .map(|r| r.block_view_rows.clone())
-                                    .unwrap_or_default();
+                                let rows_snapshot = self.compute_block_view_rows();
                                 self.sessions.tabs[self.sessions.active_tab]
                                     .selection_handler
                                     .start_block_view(bv_pos, rows_snapshot);
