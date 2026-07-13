@@ -1,3 +1,8 @@
+// arch-gate: allow-over-800
+// GlyphAtlas: rasterization + LRU eviction + CJK wide-glyph handling +
+// Metal texture management. The atlas state is tightly coupled (a cache
+// miss triggers rasterize+pack+upload in one path); splitting would leak
+// Metal buffer ownership across modules.
 //! Glyph atlas: rasterize glyphs with font-kit, pack into a Metal texture.
 //!
 //! v0.2: Dynamic atlas with LRU eviction for CJK support.

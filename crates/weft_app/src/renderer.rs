@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// MetalRenderer: frame orchestration + accessor methods. Already reduced
+// from 2424 → 930 lines via M2/M4 extraction (paint/ + metal_backend.rs).
+// Remaining is the irreducible struct + draw() orchestration.
 //! Metal GPU renderer for the terminal Grid.
 
 use core_graphics_types::geometry::CGSize;

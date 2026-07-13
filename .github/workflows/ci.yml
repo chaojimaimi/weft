@@ -39,6 +39,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Architecture gate
+        run: ./scripts/architecture_gate.sh
+
       - name: Test
         run: cargo test --verbose
 

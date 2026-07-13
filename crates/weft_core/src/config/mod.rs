@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// Config struct + impl Config + mod tests. Already extracted theme/action/
+// keybindings/sections/save/parsers to submodules; remaining is the Config
+// struct + save_to_path + tests (~1140 lines of tests).
 //! Configuration & theming.
 //!
 //! TOML config at `$XDG_CONFIG_HOME/weft/config.toml` (or
@@ -364,6 +368,43 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Generates a unique temp path for a test artifact. Combines a tag,
+    /// process id, monotonic counter, and nanosecond timestamp so parallel
+    /// tests (even within the same process) never collide on the same file
+    /// or directory name.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "weft-config-{tag}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap_or_default()
+                .as_nanos(),
+            id
+        ))
+    }
+
+    /// Serializes tests that mutate `XDG_CONFIG_HOME` — env vars are
+    /// process-global, so parallel tests that touch the same var would
+    /// clobber each other's values. The original value is saved and
+    /// restored around `f` to keep tests hermetic.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_xdg_config<F: FnOnce(&std::path::Path)>(tmp: &std::path::Path, f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os("XDG_CONFIG_HOME");
+        std::fs::create_dir_all(tmp).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", tmp);
+        f(tmp);
+        match old {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 
     #[test]
     fn defaults_are_dark_menlo_10000() {
@@ -769,7 +810,7 @@ name = "weft-light"
     #[test]
     fn load_theme_missing_file_returns_none() {
         // v0.9 W2+: when no file matches, returns None (falls back to default).
-        let dir = std::env::temp_dir().join("weft-theme-test-nonexistent");
+        let dir = temp_path("theme-nonexistent");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let result = Theme::load_from_dir(&dir, "does-not-exist");
@@ -882,10 +923,13 @@ name = "weft-light"
         // cannot find a user config file, guaranteeing we hit the default path.
         // Without this isolation the test picks up the developer's real
         // config.toml and fails on the font-family assertion.
-        let tmp = std::env::temp_dir().join("weft-test-nonexistent");
-        std::env::set_var("XDG_CONFIG_HOME", &tmp);
-        let c = Config::load();
-        assert_eq!(c.font.family, "Menlo");
+        // `with_xdg_config` serializes env mutation and restores the original
+        // value so parallel tests don't clobber each other's XDG_CONFIG_HOME.
+        let tmp = temp_path("load-missing");
+        with_xdg_config(&tmp, |_| {
+            let c = Config::load();
+            assert_eq!(c.font.family, "Menlo");
+        });
     }
 
     #[test]
@@ -1414,7 +1458,7 @@ path = "#0000ff"
 
     #[test]
     fn logo_variant_save_writes_non_default() {
-        let tmp = std::env::temp_dir().join("weft_logo_save_test.toml");
+        let tmp = temp_path("logo-save");
         let _ = std::fs::remove_file(&tmp);
         let mut cfg = Config::default();
         cfg.logo.variant = LogoVariant::Warm;
@@ -1430,7 +1474,7 @@ path = "#0000ff"
 
     #[test]
     fn logo_variant_default_not_written() {
-        let tmp = std::env::temp_dir().join("weft_logo_default_test.toml");
+        let tmp = temp_path("logo-default");
         let _ = std::fs::remove_file(&tmp);
         let cfg = Config::default();
         cfg.save_to_path(&tmp).unwrap();
@@ -1458,7 +1502,7 @@ path = "#0000ff"
 
     #[test]
     fn logo_variant_preserves_other_sections() {
-        let tmp = std::env::temp_dir().join("weft_logo_preserve_test.toml");
+        let tmp = temp_path("logo-preserve");
         let _ = std::fs::remove_file(&tmp);
         let initial = "[font]\nfamily = \"Monaco\"\nsize = 14.0\n\n[logo]\nvariant = \"light\"\n";
         std::fs::write(&tmp, initial).unwrap();
@@ -1481,7 +1525,7 @@ path = "#0000ff"
         // variant must clear the stale `variant = "warm"` from the file.
         // Otherwise the saved non-default value would override the default
         // on next load.
-        let tmp = std::env::temp_dir().join("weft_logo_clear_stale_test.toml");
+        let tmp = temp_path("logo-clear-stale");
         let _ = std::fs::remove_file(&tmp);
         // Step 1: save with Warm — writes [logo] variant = "warm".
         let mut cfg = Config::default();

@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// BlockView vertex builder: layout/cache/selection algorithms for the
+// block view. Already extracted from renderer.rs; remaining size is the
+// interdependent build_block_view_vertices + wrap + selection geometry.
 //! BlockView vertex builder extracted from renderer.rs (A5).
 //!
 //! Layout/cache/selection algorithms are unchanged; immutable frame inputs are

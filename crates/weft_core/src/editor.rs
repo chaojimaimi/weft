@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// EditorBuffer: multi-line text editor with cursor + editing operations.
+// Tightly coupled state (text + cursor + selection + history); splitting
+// would require threading mutable borrows across modules.
 //! Multi-line editor buffer for the owned input box (v0.5 "Shuttle", phase 2).
 //!
 //! Pure logic: text + cursor + editing operations. No I/O, no rendering.

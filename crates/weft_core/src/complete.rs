@@ -198,8 +198,15 @@ mod tests {
     }
 
     fn scratch_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut d = std::env::temp_dir();
-        d.push(format!("weft_complete_{}_{name}", std::process::id()));
+        d.push(format!(
+            "weft_complete_{}_{name}_{}",
+            std::process::id(),
+            id
+        ));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d

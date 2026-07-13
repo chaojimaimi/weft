@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// find_in_grid/find_in_blocks/find_in_snapshot: pure search logic with
+// regex + case-sensitive variants. Functions share private helpers
+// (match_at, advance); splitting would duplicate the match logic.
 //! In-grid + in-block text search (v0.8 stage 5 — B3; v0.9 U-P1/U-P2 — async + regex).
 //!
 //! Pure search logic operating on `Grid` and `BlockTracker` content. The App

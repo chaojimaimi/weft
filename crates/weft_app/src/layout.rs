@@ -1,3 +1,8 @@
+// arch-gate: allow-over-800
+// LayoutCtx + TerminalLayout + all shared layout formulas (grid position,
+// sidebar metrics, chrome offsets). These are interdependent formulas that
+// share private helpers; splitting would require re-exporting dozens of
+// private fns or duplicating math.
 //! Layout context and spacing tokens (v0.8 "Plisse" stage 1).
 //!
 //! All overlay vertex builders share a single [`LayoutCtx`] so coordinates

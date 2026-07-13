@@ -33,7 +33,10 @@ async fn collect(pty: &mut Pty, deadline: tokio::time::Instant) -> Vec<u8> {
 /// isolated empty HOME (so the user's real `~/.zshrc` never loads). Returns
 /// the PTY and the sandbox dir (caller removes it).
 fn spawn_sandboxed_zsh() -> (Pty, std::path::PathBuf) {
-    let sandbox = std::env::temp_dir().join(format!("weft-shell-it-{}", std::process::id()));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sandbox = std::env::temp_dir().join(format!("weft-shell-it-{}-{}", std::process::id(), id));
     let redirect_dir = sandbox.join("zsh"); // ZDOTDIR → here (holds our .zshenv)
     let fake_home = sandbox.join("home"); // restored ZDOTDIR/HOME → empty, no user rc
     std::fs::create_dir_all(&redirect_dir).unwrap();

@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// Terminal struct + impl Terminal (~725 lines): VT100/VT520 state machine
+// + grid manipulation. Already extracted attrs/osc/perform/tests to
+// submodules; impl Terminal is the irreducible core.
 //! VT100/VT520 escape sequence parser.
 //!
 //! Wraps the `vte` crate with a `Terminal` struct that implements

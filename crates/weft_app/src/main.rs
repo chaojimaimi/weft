@@ -1,3 +1,8 @@
+// arch-gate: allow-over-800
+// App struct + event dispatch + controller orchestration. Already reduced from
+// 7316 → 2269 lines via A2/A3 controller extraction. Remaining size is the
+// irreducible App struct + winit event mapping; further split would just
+// shuffle code between files without reducing complexity.
 //! Weft v1.0 "Weave" — Metal GPU-rendered terminal emulator
 //!
 //! Full pipeline: PTY → VT parser → Grid → Metal renderer

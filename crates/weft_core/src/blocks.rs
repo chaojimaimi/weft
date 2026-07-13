@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// Block + BlockTracker + BlockStore: command block metadata, shell
+// integration state machine, and SQLite persistence. Already a focused
+// module; BlockTracker state transitions share private helpers.
 //! Command blocks — the metadata layer (v0.4 "Fabric", phase 1).
 //!
 //! A [`Block`] binds one shell command to its output, exit code, and timing.

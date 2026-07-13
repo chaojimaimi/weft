@@ -1,3 +1,6 @@
+// arch-gate: allow-over-800
+// Theme + impl Theme: 11 built-in theme constructors (weft_warm/dracula/
+// nord/etc.), each ~50-80 lines of palette literals. Intrinsic volume.
 // ── Theme (resolved colors the renderer needs) ─────────────────────────
 
 use std::path::PathBuf;
