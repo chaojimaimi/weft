@@ -11,6 +11,7 @@ pub(crate) mod block_view;
 pub(crate) mod block_view_model;
 pub(crate) mod grid;
 pub(crate) mod grid_cache;
+pub(crate) mod metal_backend;
 pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod panel;
