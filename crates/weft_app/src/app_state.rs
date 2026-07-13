@@ -343,6 +343,11 @@ pub struct InteractionState {
     /// F3-3: Active sidebar resize drag. Set on press at the sidebar's right
     /// edge; cleared on release (which persists the width to config).
     pub sidebar_drag: Option<SidebarDragState>,
+    /// F4: FocusId of the element that had keyboard focus before a modal
+    /// surface (Palette/Find/Settings/ContextMenu) opened. Used to restore
+    /// focus (visually / for accessibility) when the modal closes. `None`
+    /// when no modal is open or the focus was already on the modal target.
+    pub prev_focus: Option<crate::scene::FocusId>,
 }
 
 impl InteractionState {
@@ -360,6 +365,7 @@ impl InteractionState {
             context_menu: None,
             block_hovered: None,
             sidebar_drag: None,
+            prev_focus: None,
         }
     }
 }

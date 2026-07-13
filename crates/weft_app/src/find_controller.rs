@@ -34,6 +34,7 @@ impl App {
         match key {
             KeyCode::Escape => {
                 self.find.open = false;
+                self.clear_prev_focus_if_no_modal();
                 self.request_redraw();
                 true
             }
@@ -45,6 +46,17 @@ impl App {
             KeyCode::Up | KeyCode::Down => {
                 // Arrow keys cycle prev/next, mirroring Warp's find popup.
                 self.find_cycle_next_prev(key == KeyCode::Down);
+                true
+            }
+            // F4: unified keyboard protocol — PageUp/PageDown also cycle
+            // matches (consistent with Up/Down in Find; Palette uses them for
+            // page-sized jumps in its results list).
+            KeyCode::PageUp => {
+                self.find_cycle_next_prev(false);
+                true
+            }
+            KeyCode::PageDown => {
+                self.find_cycle_next_prev(true);
                 true
             }
             KeyCode::Backspace => {

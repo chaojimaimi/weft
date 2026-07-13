@@ -81,6 +81,7 @@ impl App {
         match key {
             KeyCode::Escape => {
                 self.palette.open = false;
+                self.clear_prev_focus_if_no_modal();
                 self.request_redraw();
                 true
             }
@@ -95,6 +96,28 @@ impl App {
                 if self.palette.selection + 1 < self.palette.results.len() {
                     self.palette.selection += 1;
                 }
+                self.request_redraw();
+                true
+            }
+            // F4: unified keyboard protocol — PageUp/PageDown move by a page
+            // of results, consistent with Find and Completion surfaces.
+            KeyCode::PageUp => {
+                self.palette.selection = crate::paint::command_surface::apply_page_selection(
+                    self.palette.selection,
+                    self.palette.results.len(),
+                    self.interaction.popup_max_rows,
+                    false,
+                );
+                self.request_redraw();
+                true
+            }
+            KeyCode::PageDown => {
+                self.palette.selection = crate::paint::command_surface::apply_page_selection(
+                    self.palette.selection,
+                    self.palette.results.len(),
+                    self.interaction.popup_max_rows,
+                    true,
+                );
                 self.request_redraw();
                 true
             }

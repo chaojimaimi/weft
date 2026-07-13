@@ -157,6 +157,16 @@ impl App {
                     self.editor_completion_next();
                     true
                 }
+                // F4: unified keyboard protocol — PageUp/PageDown navigate
+                // completion candidates, consistent with Palette/Find.
+                PageUp => {
+                    self.editor_completion_prev();
+                    true
+                }
+                PageDown => {
+                    self.editor_completion_next();
+                    true
+                }
                 Escape => {
                     self.editor_completion_cancel();
                     true

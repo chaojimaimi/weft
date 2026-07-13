@@ -1,6 +1,6 @@
 //! Context menu, Find and Completion vertex builders.
 
-use crate::paint::primitives::{color_to_normalized, push_quad, push_triangle};
+use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::renderer::MetalRenderer;
 
 /// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
@@ -50,13 +50,17 @@ pub struct FindDrawState {
 
 impl MetalRenderer {
     /// Build the right-click context menu (F7) as a small popup at (x, y).
+    ///
+    /// F4: shell now uses the shared `command_surface` builder so the menu
+    /// shares the same 8% lifted bg + unified border as Palette/Find/
+    /// Completion. Item text + separators remain menu-specific.
     pub(crate) fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
+        use crate::paint::command_surface::{build_command_surface_shell, CommandSurfaceShell};
+
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
         let fg = color_to_normalized(ui.text_primary);
-        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
-        // accent_dim is invisible in Nord/Warp themes.
         let prompt_c = color_to_normalized(ui.text_secondary);
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
@@ -69,29 +73,18 @@ impl MetalRenderer {
             "Send to Input",
         ];
 
-        // v0.8 stage 4: layout (menu rect, per-item Y, separators, text X)
-        // is computed by the pure function in `layout.rs`. The renderer keeps
-        // responsibility for vertex building, theming, and text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
         let layout = crate::layout::layout_context_menu(&ctx, x, y, self.scale as f32);
-        let [menu_x0, menu_y0, menu_x1, menu_y1] = layout.menu_rect;
+        let [menu_x0, _menu_y0, menu_x1, _menu_y1] = layout.menu_rect;
         let menu_w = menu_x1 - menu_x0;
         let text_x = layout.text_x;
 
-        let popup_bg = color_to_normalized(ui.raised);
-        let border_c = color_to_normalized(ui.border_subtle);
-
-        // Background.
-        push_quad(&mut verts, layout.menu_rect, bg_uv, [0.0; 4], popup_bg);
-        // Border.
-        for (bx0, by0, bx1, by1) in [
-            (menu_x0, menu_y0, menu_x1, menu_y0 + 1.0),
-            (menu_x0, menu_y1 - 1.0, menu_x1, menu_y1),
-            (menu_x0, menu_y0, menu_x0 + 1.0, menu_y1),
-            (menu_x1 - 1.0, menu_y0, menu_x1, menu_y1),
-        ] {
-            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
-        }
+        let theme_bg = color_to_normalized(self.theme.background);
+        // F4: shared shell (bg + border, no shadow, no resize handles).
+        build_command_surface_shell(
+            &mut verts,
+            CommandSurfaceShell::canonical(layout.menu_rect, 0.0, false, theme_bg, bg_uv),
+        );
 
         // Items.
         for (i, label) in items.iter().enumerate() {
@@ -142,6 +135,10 @@ impl MetalRenderer {
     /// renderer: text is sampled from the glyph atlas, card surfaces are
     /// bg-only quads sampling the space glyph (mask 0 → solid bg color).
     pub(crate) fn build_find_vertices(&self, find: &FindDrawState) -> Vec<f32> {
+        use crate::paint::command_surface::{
+            build_command_surface_shell, find_surface_state, CommandSurfaceShell,
+        };
+
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let ctx = match &self.layout_ctx {
@@ -154,20 +151,12 @@ impl MetalRenderer {
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv]; // V-flipped for layer
 
-        // ── Popup geometry ──────────────────────────────────────────────
-        // Target ~500px wide (Warp's default), capped by available content
-        // width so it never overflows the left edge. Height: at least one
-        // cell + 16px padding, at most 1.75× cell height for legibility.
-        let [popup_x0, popup_y0, popup_x1, popup_y1] = layout.popup_rect;
+        let [popup_x0, popup_y0, _popup_x1, popup_y1] = layout.popup_rect;
 
         let theme_bg = color_to_normalized(self.theme.background);
         let accent = color_to_normalized(self.theme.accent);
         let sep = color_to_normalized(self.theme.separator);
         let fg = color_to_normalized(self.theme.foreground);
-        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
-        // accent_dim is too close to bg in Nord (#4c566a vs #2e3440) and
-        // Warp themes, making buttons/status text invisible. label_c is
-        // always readable across all themes.
         let accent_dim = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,
@@ -175,76 +164,21 @@ impl MetalRenderer {
             1.0,
         ];
 
-        // ── Drop shadow (Warp-style: tight offset, low opacity) ──────────
-        let shadow_offset = 2.0;
-        push_quad(
+        // F4: shared shell (shadow + bg + border). Find uses a 2px shadow
+        // pad and no resize handles (it's a utility bar, not a resizable
+        // popup). Replaces the hand-rolled shadow/bg/border quads with the
+        // unified command-surface shell so Find, Palette, Completion and
+        // ContextMenu share the same visual language.
+        build_command_surface_shell(
             &mut verts,
-            [
-                popup_x0 - shadow_offset,
-                popup_y0 - shadow_offset,
-                popup_x1 + shadow_offset,
-                popup_y1 + shadow_offset,
-            ],
-            bg_uv,
-            [0.0; 4],
-            [0.0, 0.0, 0.0, 0.15],
-        );
-
-        // ── Card background — v1.0: unified with Settings/Palette to 8%
-        // lighten (was a dual-branch 45% darken / 60% lighten, which made
-        // Find read as "darker than window" while other popups read as
-        // "lighter than window" — visually inconsistent). Opaque (α=1.0)
-        // to fully occlude underlying grid content.
-        let card_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_y0, popup_x1, popup_y1],
-            bg_uv,
-            [0.0; 4],
-            card_bg,
-        );
-
-        // ── 1px border — Warp-style: low opacity, subtle ──────────────────
-        let border_w = 1.0;
-        let border_bg = [0.5, 0.5, 0.5, 0.20];
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_y0, popup_x1, popup_y0 + border_w],
-            bg_uv,
-            [0.0; 4],
-            border_bg,
-        );
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_y1 - border_w, popup_x1, popup_y1],
-            bg_uv,
-            [0.0; 4],
-            border_bg,
-        );
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_y0, popup_x0 + border_w, popup_y1],
-            bg_uv,
-            [0.0; 4],
-            border_bg,
-        );
-        push_quad(
-            &mut verts,
-            [popup_x1 - border_w, popup_y0, popup_x1, popup_y1],
-            bg_uv,
-            [0.0; 4],
-            border_bg,
+            CommandSurfaceShell::canonical(layout.popup_rect, 2.0, false, theme_bg, bg_uv),
         );
 
         // ── Accent-colored left stripe (3px) — v0.8 signature accent ────
         // Replaces the previous top accent stripe so the popup still reads
         // as branded without occupying vertical space at the card edge.
         let stripe_w = 3.0;
+        let border_w = 1.0;
         push_quad(
             &mut verts,
             [
@@ -355,7 +289,18 @@ impl MetalRenderer {
         // v0.9 fix: if the status text would push `status_x` so far left that
         // the query has < MIN_QUERY_BUDGET cols, skip rendering the status
         // text entirely. The query visibility is more important than status.
-        let (status, status_color) = if find.regex_error.is_some() {
+        // F4: derive the formal surface state (Ready/Loading/Empty/Error)
+        // from the observable inputs. The existing inline status text is
+        // kept (it has more nuance: truncated, block_matches, etc.), but the
+        // error color now comes from the unified state so Find, Palette and
+        // Completion all treat "invalid regex" as a formal Error state.
+        let surface_state = find_surface_state(
+            &find.query,
+            false, // worker_busy — not yet wired to FindDrawState
+            find.total,
+            find.regex_error.as_deref(),
+        );
+        let (status, status_color) = if surface_state.is_error() {
             ("invalid regex  ".to_string(), accent)
         } else if find.query.is_empty() {
             (String::new(), accent_dim)
@@ -462,100 +407,28 @@ impl MetalRenderer {
     }
 
     /// Build the Tab-completion dropdown as a floating popup above the prompt
-    /// input box. Split out from `build_prompt_vertices` for the overlay stack
-    /// Draw a Warp-style resize drag handle on the right and/or top border
-    /// of a popup. The handle is two small triangles pointing inward, with a
-    /// short line between them — signaling "drag to resize".
-    pub(crate) fn draw_resize_handles(
-        &self,
-        verts: &mut Vec<f32>,
-        popup_x0: f32,
-        popup_top: f32,
-        popup_x1: f32,
-        popup_bottom: f32,
-        bg_uv: [f32; 4],
-    ) {
-        let handle_color = [0.55, 0.55, 0.55, 0.85];
-        let s = 4.0; // triangle half-size
-        let gap = 6.0; // gap between the two triangles (line length)
-
-        // Right border: two triangles pointing inward (◀ ▶) + connecting line.
-        let mid_y = (popup_top + popup_bottom) / 2.0;
-        let rx = popup_x1;
-        // Upper triangle: points toward center (tip at rx, base at rx-s).
-        push_triangle(
-            verts,
-            [rx - s, mid_y - gap - s],
-            [rx, mid_y - gap],
-            [rx - s, mid_y - gap],
-            handle_color,
-            bg_uv,
-        );
-        // Lower triangle: points toward center.
-        push_triangle(
-            verts,
-            [rx - s, mid_y + gap + s],
-            [rx, mid_y + gap],
-            [rx - s, mid_y + gap],
-            handle_color,
-            bg_uv,
-        );
-        // Connecting line.
-        push_quad(
-            verts,
-            [rx - 1.5, mid_y - gap, rx, mid_y + gap],
-            bg_uv,
-            [0.0; 4],
-            handle_color,
-        );
-
-        // Top border: two triangles pointing inward + connecting line.
-        let mid_x = (popup_x0 + popup_x1) / 2.0;
-        let ty = popup_top;
-        // Left triangle: points toward center (tip at mid_x-gap).
-        push_triangle(
-            verts,
-            [mid_x - gap - s, ty],
-            [mid_x - gap - s, ty + s],
-            [mid_x - gap, ty + s / 2.0],
-            handle_color,
-            bg_uv,
-        );
-        // Right triangle: points toward center.
-        push_triangle(
-            verts,
-            [mid_x + gap + s, ty],
-            [mid_x + gap + s, ty + s],
-            [mid_x + gap, ty + s / 2.0],
-            handle_color,
-            bg_uv,
-        );
-        // Connecting line.
-        push_quad(
-            verts,
-            [mid_x - gap, ty, mid_x + gap, ty + 1.5],
-            bg_uv,
-            [0.0; 4],
-            handle_color,
-        );
-    }
-
-    /// Build the Tab-completion dropdown as a floating popup above the prompt
     /// z-order (Completion) and hit-test regions.
     ///
+    /// F4: shell + row backgrounds now use the shared `command_surface`
+    /// builders so Completion, Palette, Find and ContextMenu share the same
+    /// visual language (8% lifted bg, unified border, resize handles, and
+    /// selection/hover/disabled row states).
     pub(crate) fn build_completion_vertices(
         &self,
         matches: &[weft_core::complete::Match],
         selected: usize,
         layout: crate::layout::CompletionLayout,
     ) -> Vec<f32> {
+        use crate::paint::command_surface::{
+            build_command_surface_row_bg, build_command_surface_shell, completion_surface_state,
+            CommandSurfaceRowState, CommandSurfaceShell,
+        };
+
         let mut verts = Vec::new();
-        if matches.is_empty() {
-            return verts;
-        }
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.accent);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -566,8 +439,6 @@ impl MetalRenderer {
             1.0,
         ];
         let sel_label_color = fg;
-        // v1.0 fix: blend with bg (same fix as palette popup). The old
-        // fg*0.40 was invisible in Solarized Dark / One Dark / Nord.
         let suffix_color = [
             fg[0] * 0.50 + theme_bg[0] * 0.50,
             fg[1] * 0.50 + theme_bg[1] * 0.50,
@@ -582,33 +453,38 @@ impl MetalRenderer {
         let label_cols = layout.label_cols;
         let suffix_cols = layout.suffix_cols;
 
-        let border_c = [0.5, 0.5, 0.5, 0.35];
-        let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.05,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.05,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.05,
-            1.0,
-        ];
-
-        push_quad(&mut verts, layout.popup_rect, bg_uv, [0.0; 4], popup_bg);
-        for (bx0, by0, bx1, by1) in [
-            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
-            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
-            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
-            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
-        ] {
-            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
-        }
-
-        // Warp-style resize handles on right + top borders.
-        self.draw_resize_handles(
+        // F4: shared shell (bg + border + resize handles, no drop shadow).
+        build_command_surface_shell(
             &mut verts,
-            popup_x0,
-            popup_top,
-            popup_x1,
-            popup_bottom,
-            bg_uv,
+            CommandSurfaceShell::canonical(layout.popup_rect, 0.0, true, theme_bg, bg_uv),
         );
+
+        // F4: formal state. When there are no matches, show the Empty status
+        // text instead of returning a bare popup (so the user sees why the
+        // popup appeared).
+        let state = completion_surface_state(matches.len());
+        if !state.shows_results() {
+            let status = state.status_text();
+            if !status.is_empty() {
+                let status_color = [
+                    fg[0] * 0.50 + theme_bg[0] * 0.50,
+                    fg[1] * 0.50 + theme_bg[1] * 0.50,
+                    fg[2] * 0.50 + theme_bg[2] * 0.50,
+                    1.0,
+                ];
+                let cw = self.cell_width() as f32;
+                let cols = (((popup_x1 - popup_x0) / cw).max(1.0)) as usize;
+                self.push_text(
+                    &mut verts,
+                    popup_x0 + cw,
+                    popup_bottom - ch,
+                    &status,
+                    status_color,
+                    cols,
+                );
+            }
+            return verts;
+        }
 
         // Each row occupies exactly `ch` pixels. The bottom-most row starts at
         // `popup_bottom - ch` and extends to `popup_bottom` — fully inside the
@@ -620,24 +496,18 @@ impl MetalRenderer {
             }
             let is_sel = i == selected;
             let lcolor = if is_sel { sel_label_color } else { label_color };
-            if is_sel {
-                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
-                // bg*0.65) — was [prompt_c, 0.20] which is low-contrast.
-                let accent = color_to_normalized(self.theme.accent);
-                let selection_bg = [
-                    accent[0] * 0.35 + theme_bg[0] * 0.65,
-                    accent[1] * 0.35 + theme_bg[1] * 0.65,
-                    accent[2] * 0.35 + theme_bg[2] * 0.65,
-                    1.0,
-                ];
-                push_quad(
-                    &mut verts,
-                    [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
-                    bg_uv,
-                    [0.0; 4],
-                    selection_bg,
-                );
-            }
+            // F4: unified row background (selected/hovered/disabled).
+            build_command_surface_row_bg(
+                &mut verts,
+                [popup_x0, y, popup_x1, y + ch],
+                CommandSurfaceRowState {
+                    selected: is_sel,
+                    ..Default::default()
+                },
+                theme_bg,
+                accent,
+                bg_uv,
+            );
             let (icon, icon_color, suffix) = match matches[i].kind {
                 weft_core::complete::MatchKind::Path => {
                     if matches[i].is_dir {

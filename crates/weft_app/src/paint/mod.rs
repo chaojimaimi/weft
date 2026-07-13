@@ -9,6 +9,7 @@
 
 pub(crate) mod block_view;
 pub(crate) mod block_view_model;
+pub(crate) mod command_surface;
 pub(crate) mod grid;
 pub(crate) mod grid_cache;
 pub(crate) mod metal_backend;

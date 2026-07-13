@@ -13,10 +13,20 @@ impl MetalRenderer {
     /// Build the Command Palette as a centered floating window. Renders a
     /// search box at the top, a scrollable results list, and an optional
     /// variable-fill form when a workflow is selected.
+    ///
+    /// F4: shell + row backgrounds now use the shared `command_surface`
+    /// builders so Palette, Completion, Find and ContextMenu share the same
+    /// visual language (8% lifted bg, unified border, resize handles, and
+    /// selection/hover/disabled row states).
     pub(crate) fn build_palette_vertices(
         &self,
         p: &crate::overlay::PaletteDrawParams<'_>,
     ) -> Vec<f32> {
+        use crate::paint::command_surface::{
+            build_command_surface_row_bg, build_command_surface_shell, palette_surface_state,
+            CommandSurfaceRowState, CommandSurfaceShell,
+        };
+
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -28,10 +38,7 @@ impl MetalRenderer {
 
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v1.0 fix: replace accent_dim with label_c (70% fg + 30% bg) —
-        // accent_dim is too close to bg in Nord/Warp themes, making prompt
-        // marks (❯), chevrons, and dim text invisible. label_c is always
-        // readable across all themes.
+        let accent = color_to_normalized(self.theme.accent);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,
@@ -39,28 +46,15 @@ impl MetalRenderer {
             1.0,
         ];
         let dim = prompt_c;
-        // Block separator: theme.separator (barely-visible warm dark).
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
-        // v1.0 Warp-style: thin low-opacity border.
-        let border_c = [0.5, 0.5, 0.5, 0.20];
-        let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
 
         let pad_x = self.padding_x;
         let left = pad_x;
         let right = vp_w - pad_x;
         let cols = (((right - left) / cw).max(1.0)) as usize;
 
-        // v0.8 stage 4: layout (popup rect, query/sep/results Y, column
-        // anchors) is computed by the pure functions in `layout.rs`. The
-        // renderer keeps responsibility for vertex building, theming, and
-        // text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
 
         // If we're in form mode, render the form instead of the search list.
@@ -93,46 +87,17 @@ impl MetalRenderer {
         let start = layout.start;
         let end = layout.end;
 
-        // v1.0 Warp-style: subtle drop shadow behind the popup.
+        // F4: shared shell (shadow + bg + border + resize handles).
         let shadow_pad = ch * 0.15;
-        push_quad(
+        build_command_surface_shell(
             &mut verts,
-            [
-                popup_x0 - shadow_pad,
-                popup_top - shadow_pad,
-                popup_x1 + shadow_pad,
-                popup_bottom + shadow_pad,
-            ],
-            bg_uv,
-            [0.0; 4],
-            [0.0, 0.0, 0.0, 0.15],
-        );
-
-        // Background + border.
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_top, popup_x1, popup_bottom],
-            bg_uv,
-            [0.0; 4],
-            popup_bg,
-        );
-        for (bx0, by0, bx1, by1) in [
-            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
-            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
-            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
-            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
-        ] {
-            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
-        }
-
-        // Warp-style resize handles on right + top borders.
-        self.draw_resize_handles(
-            &mut verts,
-            popup_x0,
-            popup_top,
-            popup_x1,
-            popup_bottom,
-            bg_uv,
+            CommandSurfaceShell::canonical(
+                [popup_x0, popup_top, popup_x1, popup_bottom],
+                shadow_pad,
+                true,
+                theme_bg,
+                bg_uv,
+            ),
         );
 
         // Banner / query row. When a sub-mode banner is active, show it
@@ -156,7 +121,6 @@ impl MetalRenderer {
             if self.cursor_blink_on {
                 let qcols = Self::text_col_width(p.query);
                 let cx = qx + qcols as f32 * cw;
-                let accent = color_to_normalized(self.theme.accent);
                 push_quad(
                     &mut verts,
                     [cx, query_y, cx + cw * 0.15, query_y + ch],
@@ -176,46 +140,54 @@ impl MetalRenderer {
             separator,
         );
 
+        // F4: formal state — show "No results" when the query has no matches.
+        let surface_state = palette_surface_state(p.query, p.entries.len(), true);
+        if !surface_state.shows_results() && !p.query.is_empty() {
+            let status = surface_state.status_text();
+            let status_color = [
+                fg[0] * 0.50 + theme_bg[0] * 0.50,
+                fg[1] * 0.50 + theme_bg[1] * 0.50,
+                fg[2] * 0.50 + theme_bg[2] * 0.50,
+                1.0,
+            ];
+            let status_w = Self::text_col_width(&status);
+            self.push_text(
+                &mut verts,
+                label_x,
+                layout.results_y,
+                &status,
+                status_color,
+                status_w,
+            );
+        }
+
         // Results rows.
+        let suffix_color = [
+            fg[0] * 0.50 + theme_bg[0] * 0.50,
+            fg[1] * 0.50 + theme_bg[1] * 0.50,
+            fg[2] * 0.50 + theme_bg[2] * 0.50,
+            1.0,
+        ];
         let mut y = layout.results_y;
         for i in start..end {
             if y + ch > popup_bottom {
                 break;
             }
             let is_sel = i == p.selection;
-            if is_sel {
-                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
-                // bg*0.65) — was [prompt_c, 0.20] which is low-contrast.
-                let accent = color_to_normalized(self.theme.accent);
-                let selection_bg = [
-                    accent[0] * 0.35 + theme_bg[0] * 0.65,
-                    accent[1] * 0.35 + theme_bg[1] * 0.65,
-                    accent[2] * 0.35 + theme_bg[2] * 0.65,
-                    1.0,
-                ];
-                push_quad(
-                    &mut verts,
-                    [popup_x0 + 1.0, y, popup_x1 - 1.0, y + ch],
-                    bg_uv,
-                    [0.0; 4],
-                    selection_bg,
-                );
-            }
+            // F4: unified row background (selected/hovered/disabled).
+            build_command_surface_row_bg(
+                &mut verts,
+                [popup_x0, y, popup_x1, y + ch],
+                CommandSurfaceRowState {
+                    selected: is_sel,
+                    ..Default::default()
+                },
+                theme_bg,
+                accent,
+                bg_uv,
+            );
             let entry = &p.entries[i];
             let lcolor = if is_sel { fg } else { dim };
-            // v1.0 fix: blend fg with theme_bg instead of pure fg*0.40.
-            // The old fg*0.40 drops foreground towards black — on dark
-            // themes with low fg values (Solarized Dark fg=0x93, One Dark
-            // fg=0xab), the result is nearly identical to the popup
-            // background, making "Workflow"/"Builtin"/"Theme" labels
-            // invisible. Blending guarantees the color sits halfway between
-            // fg and bg, ensuring readable contrast in ALL themes.
-            let suffix_color = [
-                fg[0] * 0.50 + theme_bg[0] * 0.50,
-                fg[1] * 0.50 + theme_bg[1] * 0.50,
-                fg[2] * 0.50 + theme_bg[2] * 0.50,
-                1.0,
-            ];
 
             // Label + description.
             let label_avail = (((popup_x1 - label_x) / cw) as usize)
@@ -232,6 +204,9 @@ impl MetalRenderer {
     }
 
     /// Render the palette's variable-fill form (sub-mode when a workflow is selected).
+    ///
+    /// F4: shell now uses the shared `command_surface` builder; field
+    /// selection backgrounds use the unified row-state helper.
     pub(crate) fn build_palette_form_vertices(
         &self,
         form: &crate::overlay::PaletteFormView<'_>,
@@ -239,13 +214,17 @@ impl MetalRenderer {
         popup_x1: f32,
         vp_h: f32,
     ) -> Vec<f32> {
+        use crate::paint::command_surface::{
+            build_command_surface_row_bg, build_command_surface_shell, CommandSurfaceRowState,
+            CommandSurfaceShell,
+        };
+
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let theme_bg = color_to_normalized(self.theme.background);
         let fg = color_to_normalized(self.theme.foreground);
-        // v1.0 fix: replace accent_dim with label_c — same fix as Settings
-        // and Palette search mode. accent_dim is invisible in Nord/Warp.
+        let accent = color_to_normalized(self.theme.accent);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,
@@ -255,53 +234,24 @@ impl MetalRenderer {
         let dim = prompt_c;
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
-        // v1.0 P2: unify with Settings baseline — border α 0.35→0.20,
-        // popup_bg 5%→8% lighten.
-        let border_c = [0.5, 0.5, 0.5, 0.20];
-        let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
 
         let n_fields = form.fields.len();
         let popup_h = (n_fields as f32 + 3.0) * ch + ch * 0.5;
         let popup_top = vp_h * 0.15;
         let popup_bottom = popup_top + popup_h;
 
-        // v1.0 P2: add Warp-style shadow (was missing — form mode had no
-        // shadow while search mode did, causing visual discontinuity).
+        // F4: shared shell (shadow + bg + border, no resize handles).
         let shadow_pad = ch * 0.15;
-        push_quad(
+        build_command_surface_shell(
             &mut verts,
-            [
-                popup_x0 - shadow_pad,
-                popup_top - shadow_pad,
-                popup_x1 + shadow_pad,
-                popup_bottom + shadow_pad,
-            ],
-            bg_uv,
-            [0.0; 4],
-            [0.0, 0.0, 0.0, 0.15],
+            CommandSurfaceShell::canonical(
+                [popup_x0, popup_top, popup_x1, popup_bottom],
+                shadow_pad,
+                false,
+                theme_bg,
+                bg_uv,
+            ),
         );
-
-        // Background + border.
-        push_quad(
-            &mut verts,
-            [popup_x0, popup_top, popup_x1, popup_bottom],
-            bg_uv,
-            [0.0; 4],
-            popup_bg,
-        );
-        for (bx0, by0, bx1, by1) in [
-            (popup_x0, popup_top, popup_x1, popup_top + 1.0),
-            (popup_x0, popup_bottom - 1.0, popup_x1, popup_bottom),
-            (popup_x0, popup_top, popup_x0 + 1.0, popup_bottom),
-            (popup_x1 - 1.0, popup_top, popup_x1, popup_bottom),
-        ] {
-            push_quad(&mut verts, [bx0, by0, bx1, by1], bg_uv, [0.0; 4], border_c);
-        }
 
         // Title row.
         let title_y = popup_top + ch * 0.5;
@@ -334,25 +284,18 @@ impl MetalRenderer {
 
             // Value bracket area.
             let val_x = popup_x0 + cw * 0.5 + 12.0 * cw;
-            if *is_current {
-                // v1.0 P3: unify with Settings selection_bg (accent*0.35 +
-                // bg*0.65) — was [accent_dim, 0.15] which is invisible in
-                // Nord/Warp themes.
-                let accent = color_to_normalized(self.theme.accent);
-                let selection_bg = [
-                    accent[0] * 0.35 + theme_bg[0] * 0.65,
-                    accent[1] * 0.35 + theme_bg[1] * 0.65,
-                    accent[2] * 0.35 + theme_bg[2] * 0.65,
-                    1.0,
-                ];
-                push_quad(
-                    &mut verts,
-                    [val_x, y, popup_x1 - cw * 0.5, y + ch],
-                    bg_uv,
-                    [0.0; 4],
-                    selection_bg,
-                );
-            }
+            // F4: unified row background for the current field.
+            build_command_surface_row_bg(
+                &mut verts,
+                [val_x, y, popup_x1 - cw * 0.5, y + ch],
+                CommandSurfaceRowState {
+                    selected: *is_current,
+                    ..Default::default()
+                },
+                theme_bg,
+                accent,
+                bg_uv,
+            );
             let val_avail = (((popup_x1 - cw * 0.5 - val_x) / cw).max(1.0)) as usize;
             self.push_text(&mut verts, val_x, y, value, color, val_avail);
 
