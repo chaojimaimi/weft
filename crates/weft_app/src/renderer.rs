@@ -16,12 +16,10 @@ use winit::window::Window;
 
 use crate::glyph::GlyphAtlas;
 // A5: vertex primitives + color helpers live in paint::primitives.
-use crate::paint::primitives::{
-    color_to_normalized, push_cell_instance, push_quad, resolve_cell_color,
-};
+use crate::paint::primitives::{color_to_normalized, push_quad};
 use weft_core::blocks::{Block, BlockId};
 use weft_core::config::{FontConfig, Theme};
-use weft_core::grid::{CellFlags, CellWidth, Color, CursorStyle};
+use weft_core::grid::Color;
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
@@ -201,13 +199,13 @@ pub struct MetalRenderer {
     /// Cells are positioned `pad_x + col·cw`, `pad_y + row·ch`; the usable
     /// area for row/col math is the viewport minus `2·pad`.
     pub(crate) padding_x: f32,
-    padding_y: f32,
+    pub(crate) padding_y: f32,
     /// Window background opacity [0,1]. Below 1.0 the background is
     /// see-through (text/selection/cursor stay opaque); the cell bg alpha is
     /// scaled by this value per-frame, so a live `set_opacity` recolors
     /// instantly. The window's own transparency flag is set at startup, so
     /// crossing the 1.0 boundary needs a relaunch.
-    opacity: f32,
+    pub(crate) opacity: f32,
     /// Last-rendered hit-test regions (foldable blocks, completion rows, etc.)
     /// in physical pixels, for click dispatch. Repopulated each draw.
     pub hit_regions: Vec<crate::overlay::HitRegion>,
@@ -247,42 +245,42 @@ pub struct MetalRenderer {
     /// the previous frame. Eliminates per-frame iteration of all
     /// `num_rows × num_cols` cells when only a few rows changed (typical
     /// terminal output: 1-3 rows per frame).
-    grid_row_cache: RefCell<Vec<Vec<f32>>>,
+    pub(crate) grid_row_cache: RefCell<Vec<Vec<f32>>>,
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Set by the caller
     /// on resize / theme / tab switch / selection change. Cleared after the
     /// full redraw is performed.
-    force_full_grid: Cell<bool>,
+    pub(crate) force_full_grid: Cell<bool>,
     /// v1.0 P0-b: Previous frame's cursor row. The cursor cell renders
     /// differently (block/bar/underline overlay), so both the old and new
     /// cursor rows must be rebuilt when the cursor moves or blinks.
-    prev_cursor_row: Cell<Option<usize>>,
+    pub(crate) prev_cursor_row: Cell<Option<usize>>,
     /// v1.0 P1.5-B2: Previous frame's cursor column. Together with
     /// `prev_cursor_row` and `prev_show_cursor`, detects cursor stability
     /// so the cursor row can be skipped when nothing moved or blinked.
-    prev_cursor_col: Cell<Option<usize>>,
+    pub(crate) prev_cursor_col: Cell<Option<usize>>,
     /// v1.0 P1.5-B2: Previous frame's `show_cursor` parameter (encodes
     /// `cursor_visible && cursor_blink_on && prompt.is_none()`). When this
     /// flips (blink toggle / focus change / prompt open-close), the cursor
     /// row must be rebuilt to add or remove the cursor overlay.
-    prev_show_cursor: Cell<bool>,
+    pub(crate) prev_show_cursor: Cell<bool>,
     /// v1.0 P1.5-B2: Set by `build_grid_instances` when no rows needed
     /// rebuilding this frame (no dirty rows, no cursor change, no scroll).
     /// `draw()` reads this to skip instance upload + draw call, relying on
     /// the offscreen `Load` action to preserve the previous frame's grid
     /// content. Saves the per-row rebuild loop + flatten memcpy + GPU
     /// upload for idle frames (target: < 0.5ms no-op frame).
-    instances_unchanged: Cell<bool>,
+    pub(crate) instances_unchanged: Cell<bool>,
     /// v1.0 P1.5-B2: Previous frame's `show_blocks` flag. When the view mode
     /// switches between block view and grid view (alt screen enter/exit), the
     /// grid_row_cache and offscreen content are stale — force a full rebuild.
     prev_show_blocks: Cell<bool>,
     /// v1.0 P0-b: Cached grid dimensions (rows × cols) for cache invalidation
     /// on resize.
-    grid_cache_dims: Cell<(usize, usize)>,
+    pub(crate) grid_cache_dims: Cell<(usize, usize)>,
     /// v1.0 P0-b: Previous frame's scroll offset. When the user scrolls
     /// scrollback, the rendered cells come from history (not dirty-tracked),
     /// so a full redraw is needed.
-    prev_scroll_offset: Cell<usize>,
+    pub(crate) prev_scroll_offset: Cell<usize>,
     /// v1.0 P0-c: Persistent offscreen texture used as the render target
     /// instead of drawing directly to the drawable. This enables GPU-side
     /// scroll blit: on scroll, copy the unchanged region within the
@@ -297,12 +295,12 @@ pub struct MetalRenderer {
     /// v1.0 P0-c: Pending scroll delta captured during build_grid_vertices
     /// (via grid.take_pending_scroll()). Used by the draw() epilogue to
     /// decide whether to issue a GPU blit before the render pass.
-    pending_scroll_delta: Cell<i32>,
+    pub(crate) pending_scroll_delta: Cell<i32>,
     /// v1.0 P0-c: Cached result of the `force_full` computation from
     /// build_grid_vertices. Stashed on self so the draw() epilogue (which
     /// runs after build_grid_vertices returns) can decide whether to skip
     /// the GPU scroll blit on forced-full frames (resize/theme/tab-switch).
-    force_full_cached: Cell<bool>,
+    pub(crate) force_full_cached: Cell<bool>,
     /// v1.0 P1.5-B0: Triple-buffered vertex buffer ring. Avoids per-frame
     /// `new_buffer_with_data` allocation (~11520 vertices × 48 bytes = 540KB
     /// per frame). Three buffers ensure GPU never stalls on CPU writes
@@ -1853,635 +1851,6 @@ fragment float4 text_fragment(
         command_buffer.commit();
         self.hit_regions = pending_hit_regions;
     }
-
-    /// v1.0 P1.5-B1: Build per-cell instance data for the grid. Each cell
-    /// becomes a single 64-byte instance (origin/size/uv_rect/fg/bg) drawn
-    /// against a static 4-vertex quad + 6-index buffer. Replaces the old
-    /// 6-vertex-per-cell emission (~288 B/cell) — ~4.5x smaller per-frame
-    /// upload. The per-row cache (`grid_row_cache`) stores instance floats
-    /// (16 per cell) instead of vertex floats (72 per cell).
-    fn build_grid_instances(
-        &self,
-        grid: &weft_core::grid::Grid,
-        palette: &[Color; 256],
-        cursor: &weft_core::grid::Cursor,
-        selection: &SelectionHandler,
-        show_cursor: bool,
-        cursor_style: CursorStyle,
-    ) -> Vec<f32> {
-        // Render at the atlas's native cell size — do NOT stretch cells to
-        // fill the viewport (cw = viewport / num_cols). Stretching distorts
-        // glyphs and, for full-width CJK, amplifies the baked intra-slot
-        // padding into a gap that drifts wider on every resize (cw diverges
-        // from cell_width as the window resizes within a column bucket). The
-        // grid occupies num_cols * cell_width px; any remainder is background.
-        // This also keeps rendered positions aligned with mouse hit-testing,
-        // which already divides by cell_width.
-        let cw = self.cell_width() as f32;
-        let ch = self.cell_height() as f32;
-        let num_rows = grid.num_rows;
-        let num_cols = grid.num_cols;
-
-        // Theme-derived colors (resolved per-frame from the active theme).
-        let default_fg = color_to_normalized(self.theme.foreground);
-        let default_bg = color_to_normalized(self.theme.background);
-        let cursor_color = color_to_normalized(self.theme.cursor);
-        // v1.0 fix: use an accent-based blend (35% accent + 65% background)
-        // for the selection color. The old approach used `theme.selection`
-        // directly, but many themes had selection colors too close to the
-        // background (e.g. solarized-dark: bg #002b36, selection #073642 —
-        // nearly invisible at 55% opacity). The accent color is designed
-        // to contrast with the background, so blending it in ensures the
-        // selection is visible across ALL themes. Each theme gets a
-        // different selection tint because the accent varies per theme.
-        let selection_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let mut c = [
-                accent[0] * 0.35 + default_bg[0] * 0.65,
-                accent[1] * 0.35 + default_bg[1] * 0.65,
-                accent[2] * 0.35 + default_bg[2] * 0.65,
-                1.0,
-            ];
-            // Semi-transparent so the underlying text stays readable.
-            c[3] = 0.60;
-            c
-        };
-
-        // v1.0 P0-b: incremental grid rendering. Instead of iterating every
-        // cell every frame, we cache per-row vertices and only rebuild rows
-        // that changed (dirty-tracked by Grid). A full redraw is forced when:
-        //   - the caller signals a global change (resize/theme/tab-switch)
-        //   - the grid scrolled (scroll_offset differs → scrollback cells shown)
-        //   - the grid dimensions changed (resize reflow)
-        // Cursor row is always rebuilt (blink / move changes the cursor cell).
-        let force_full = self.force_full_grid.get()
-            || grid.scroll_offset != self.prev_scroll_offset.get()
-            || self.grid_cache_dims.get() != (num_rows, num_cols)
-            // Selection overlay changes cell colors — rebuild all rows while
-            // a selection is active or being dragged.
-            || selection.selection.is_some()
-            || selection.selecting;
-
-        // v1.0 P0-c: stash force_full on self so draw()'s epilogue (which
-        // runs after this method returns) can decide whether to skip the
-        // GPU scroll blit on forced-full frames.
-        self.force_full_cached.set(force_full);
-
-        // v1.0 P0-c: CPU-side cache shift for viewport scrolls. When the
-        // terminal scrolls (newline at bottom), the viewport rows shift up
-        // by N — the previously-rendered content at rows 0..rows-N is now
-        // at rows N..rows. Instead of rebuilding all rows, we shift the
-        // per-row vertex cache to match and only rebuild the newly exposed
-        // rows (empty cache entries).
-        //
-        // Key correctness: pre-scroll cell writes set dirty_occ on those
-        // rows, which moves WITH the rows during scroll_up. So dirty rows
-        // are still detected and rebuilt even after the cache shift.
-        let pending_scroll = grid.take_pending_scroll();
-        // v1.0 P0-c: stash on self so draw()'s epilogue can issue a GPU blit.
-        self.pending_scroll_delta.set(pending_scroll);
-        if !force_full && pending_scroll != 0 {
-            let mut cache = self.grid_row_cache.borrow_mut();
-            if cache.len() == num_rows {
-                if pending_scroll > 0 {
-                    // Scroll up: rows moved up, new blank rows at bottom.
-                    let d = pending_scroll as usize;
-                    if d < cache.len() {
-                        cache.drain(0..d);
-                        for _ in 0..d {
-                            cache.push(Vec::new());
-                        }
-                    } else {
-                        for c in cache.iter_mut() {
-                            c.clear();
-                        }
-                    }
-                } else {
-                    // Scroll down: rows moved down, new blank rows at top.
-                    let d = (-pending_scroll) as usize;
-                    if d < cache.len() {
-                        for _ in 0..d {
-                            cache.insert(0, Vec::new());
-                        }
-                        cache.truncate(num_rows);
-                    } else {
-                        for c in cache.iter_mut() {
-                            c.clear();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Determine which rows need rebuilding.
-        // v1.0 P1.5-B2: only rebuild the cursor row when its state actually
-        // changed (blink toggle, move, or show/hide). Previously the cursor
-        // row was rebuilt every frame — wasteful for steady (non-blinking)
-        // cursors or idle terminals where nothing changes. `show_cursor`
-        // already encodes blink phase (caller passes
-        // `cursor_visible && cursor_blink_on && prompt.is_none()`), so a
-        // stable `show_cursor` + stable position means the cached cursor
-        // cell is still correct.
-        let cursor_changed = force_full
-            || self.prev_show_cursor.get() != show_cursor
-            || self.prev_cursor_row.get() != Some(cursor.row)
-            || self.prev_cursor_col.get() != Some(cursor.col);
-        let mut rows_to_rebuild: Vec<usize> = if force_full {
-            (0..num_rows).collect()
-        } else {
-            let mut dirty: Vec<usize> = grid.dirty_rows().map(|(r, _)| r).collect();
-            if cursor_changed {
-                if !dirty.contains(&cursor.row) {
-                    dirty.push(cursor.row);
-                }
-                // Previous cursor row: when the cursor moves, the old row
-                // loses its cursor overlay and must be rebuilt to show plain
-                // content.
-                if let Some(prev) = self.prev_cursor_row.get() {
-                    if prev != cursor.row && !dirty.contains(&prev) {
-                        dirty.push(prev);
-                    }
-                }
-            }
-            dirty
-        };
-
-        // Update cached state for next frame's comparison.
-        self.force_full_grid.set(false);
-        self.prev_cursor_row.set(Some(cursor.row));
-        self.prev_cursor_col.set(Some(cursor.col));
-        self.prev_show_cursor.set(show_cursor);
-        self.prev_scroll_offset.set(grid.scroll_offset);
-        self.grid_cache_dims.set((num_rows, num_cols));
-
-        // Build vertices for dirty rows only. We build into a local Vec
-        // (not the RefCell) to avoid holding a RefMut while accessing self
-        // fields (atlas, layout_ctx, etc.) inside the per-cell loop.
-        let mut cache = self.grid_row_cache.borrow_mut();
-        if cache.len() != num_rows {
-            cache.resize(num_rows, Vec::new());
-        }
-
-        // v1.0 P0-c: after cache shift, add rows with empty cache entries
-        // (newly exposed by scroll) to the rebuild set.
-        if !force_full && pending_scroll != 0 {
-            for (i, rv) in cache.iter().enumerate() {
-                if rv.is_empty() && !rows_to_rebuild.contains(&i) {
-                    rows_to_rebuild.push(i);
-                }
-            }
-        }
-
-        // v1.0 P1.5-B2: if no rows need rebuilding this frame, skip the
-        // per-cell loop + flatten memcpy + GPU upload entirely. The draw()
-        // method reads `instances_unchanged` and relies on the offscreen
-        // render pass's `Load` action to preserve the previous frame's grid
-        // content. This is the key optimization for idle frames: no terminal
-        // output, no cursor blink toggle, no scroll → no work.
-        if rows_to_rebuild.is_empty() {
-            drop(cache);
-            self.instances_unchanged.set(true);
-            return Vec::new();
-        }
-        self.instances_unchanged.set(false);
-
-        for &row in &rows_to_rebuild {
-            // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
-            // for cursor bar/underline + hyperlink underline decorations.
-            let mut instances = Vec::with_capacity(num_cols * 16 + 48);
-            for col in 0..num_cols {
-                let cell = grid.cell(row, col);
-
-                // Skip wide char spacers (rendered as part of the preceding cell)
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-
-                let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-                let x = self.padding_x + chrome_left + col as f32 * cw;
-                // v0.9 H1 fix: shift grid down by chrome_top (tab bar height)
-                // so the first row isn't covered by the tab bar. The LayoutCtx
-                // is set on self at the top of draw(); chrome_top is 0 when
-                // there's only one tab (no tab bar drawn).
-                let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
-                let y = self.padding_y + chrome_top + row as f32 * ch;
-
-                // Determine cell colors (resolve the cell's color-origin against
-                // the palette / theme defaults).
-                let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
-                let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
-
-                // v1.0 fix: honor SGR reverse video (DEC SGR 7 / `CSI 7m`).
-                // The VT parser sets CellFlags::REVERSE on cells printed while
-                // inverse video is active (e.g. `less` search-match highlight).
-                // Without this swap, matched text in `less` jumps to the right
-                // place but is never highlighted — it renders with normal
-                // fg/bg. Swap BEFORE the alpha scaling below so the opacity is
-                // applied to the (now background) color consistently.
-                if cell.flags.contains(CellFlags::REVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                // Scale the plain background alpha by window opacity so empty
-                // cells show the desktop through them. Text/selection/cursor
-                // pick their own colors with alpha 1.0 in `final_bg` below, so
-                // they stay fully opaque regardless of this scaling.
-                bg[3] *= self.opacity;
-
-                // Check if this is the cursor position
-                let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
-
-                // Check if this cell is in the selection
-                let is_selected = selection
-                    .selection
-                    .as_ref()
-                    .is_some_and(|sel| sel.contains(row, col));
-
-                // Look up glyph UV
-                let ch_char =
-                    if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
-                        ' '
-                    } else {
-                        cell.character
-                    };
-
-                let (u0, v0, u1, v1) = if let Some(glyph) = self.atlas.get(ch_char) {
-                    let (u, v) = glyph.uv_origin;
-                    let (uw, vh) = glyph.uv_size;
-                    (u, v, u + uw, v + vh)
-                } else {
-                    // Character not in atlas — use space
-                    let (u, v) = self
-                        .atlas
-                        .get(' ')
-                        .map(|g| g.uv_origin)
-                        .unwrap_or((0.0, 0.0));
-                    let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-                    (u, v, u + uw, v + vh)
-                };
-                // Swap V to compensate for the CAMetalLayer's vertical flip: keep the
-                // glyph upright on screen while clip.y maps row 0 to the top.
-                let (v0, v1) = (v1, v0);
-
-                // Override colors for cursor
-                let final_fg = if is_cursor {
-                    if cursor_style.is_block() {
-                        [0.0, 0.0, 0.0, 1.0] // Black text on cursor block
-                    } else {
-                        cursor_color
-                    }
-                } else {
-                    fg
-                };
-
-                let final_bg = if is_cursor && cursor_style.is_block() {
-                    cursor_color
-                } else if is_selected {
-                    selection_bg
-                } else if is_cursor && cursor_style.is_bar() {
-                    // Bar cursor: only highlight the left 2 pixels
-                    // We'll draw the full cell with normal bg, then overlay bar later
-                    bg
-                } else {
-                    bg
-                };
-
-                // Determine cell width for rendering
-                let cell_render_width = if cell.width == CellWidth::Full && col + 1 < num_cols {
-                    cw * 2.0
-                } else {
-                    cw
-                };
-
-                let x0 = x;
-                let y0 = y;
-                let x1 = x + cell_render_width;
-                let y1 = y + ch;
-
-                // v1.0 P1.5-B1: emit one instance per cell. The V-swap
-                // (`(v0, v1) = (v1, v0)` above) is stored directly in the
-                // instance's uv_rect: corner.y=0 (top of cell) samples v0
-                // (bottom of glyph in atlas space), compensating for the
-                // CAMetalLayer vertical flip — same convention as the old
-                // per-vertex emission.
-                push_cell_instance(
-                    &mut instances,
-                    [x0, y0, x1, y1],
-                    [u0, v0, u1, v1],
-                    final_fg,
-                    final_bg,
-                );
-
-                // Draw bar/underline cursor overlay
-                if is_cursor && show_cursor {
-                    if cursor_style.is_bar() {
-                        let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
-                        let bar_w = bar_w.max(1.0).min(cw * 0.15);
-                        // v1.0 P1.5-B1: decoration instance. UV rect
-                        // (0,0,0,1) samples the atlas at u=0 (empty)
-                        // so mask=0 → only bg (cursor color) shows.
-                        push_cell_instance(
-                            &mut instances,
-                            [x0, y0, x0 + bar_w, y1],
-                            [0.0, 0.0, 0.0, 1.0],
-                            [0.0; 4],
-                            cursor_color,
-                        );
-                    } else if cursor_style.is_underline() {
-                        let line_h = 2.0;
-                        push_cell_instance(
-                            &mut instances,
-                            [x0, y1 - line_h, x1, y1],
-                            [0.0, 0.0, 0.0, 1.0],
-                            [0.0; 4],
-                            cursor_color,
-                        );
-                    }
-                }
-
-                // OSC 8 hyperlink underline: a thin cyan line at the cell's
-                // baseline. Click handling is in main.rs (Cmd+Click → open URL
-                // from the registry's side-map). Wide-char cells span 2 cols.
-                if cell.flags.contains(CellFlags::HYPERLINK) {
-                    let line_h = 1.5;
-                    let link_color = [0.36, 0.62, 0.94, 1.0]; // soft cyan
-                    push_cell_instance(
-                        &mut instances,
-                        [x0, y1 - line_h, x1, y1],
-                        [0.0, 0.0, 0.0, 1.0],
-                        [0.0; 4],
-                        link_color,
-                    );
-                }
-            }
-            // v1.0 P1.5-B1: store this row's instances into the cache.
-            cache[row] = instances;
-        }
-
-        // v1.0 P0-b: flatten the per-row cache into a single instance buffer.
-        // Clean rows are reused from the previous frame; dirty rows were
-        // rebuilt above. Each cell is 16 floats (one CellInstance).
-        let mut out = Vec::with_capacity(num_rows * num_cols * 16);
-        for rv in cache.iter() {
-            out.extend_from_slice(rv);
-        }
-        out
-    }
-
-    /// Build vertices for the bottom editor input box (v0.5 editor takeover):
-    /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
-    /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
-    /// after the grid so it composites on top via the enabled alpha blend.
-    fn build_prompt_vertices(
-        &self,
-        p: &PromptDrawParams,
-        cursor_blink_phase: f32,
-        cursor_blink_on: bool,
-    ) -> Vec<f32> {
-        let mut verts = Vec::new();
-        let cw = self.cell_width() as f32;
-        let ch = self.cell_height() as f32;
-        let vp_w = self.viewport.0;
-        let vp_h = self.viewport.1;
-        if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return verts;
-        }
-
-        // v0.8: cursor X must use the DISPLAY width of chars before the cursor,
-        // not the char count — CJK chars occupy 2 columns each, so `cc × cw`
-        // leaves the caret stranded mid-cell for input like "Weft项目设计.md".
-        // Sum the actual rendered columns of the first `cc` chars on this line.
-        let (cl, cc) = p.cursor;
-        let cursor_offset_cols = p
-            .lines
-            .get(cl)
-            .map(|line| {
-                line.chars()
-                    .take(cc)
-                    .map(Self::char_col_width)
-                    .sum::<usize>()
-            })
-            .unwrap_or(cc);
-
-        // v0.8 stage 4: layout (box rect, text_y0, cursor X/Y, bar_w) is
-        // computed by the pure function in `layout.rs`. The renderer keeps
-        // responsibility for vertex building, theming, and text rasterization.
-        let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let layout = crate::layout::layout_prompt(&ctx, p.lines.len(), cl, cursor_offset_cols);
-        let text_y0 = layout.text_y0;
-        let left = layout.left;
-        let box_cols = layout.box_cols;
-        let first_line_text_x = layout.first_line_text_x;
-        let cx = layout.cursor_x;
-        let cy = layout.cursor_y;
-        let bar_w = layout.bar_w;
-
-        let theme_bg = color_to_normalized(self.theme.background);
-        // The input area uses the SAME background as the window (Warp style —
-        // no distinct input panel). Still opaque so it cleanly covers the grid
-        // rows behind it (the shell's blank prompt sits under the box).
-        let box_bg = theme_bg;
-        let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.cursor);
-        let (su, sv, suw, svh) = self.space_uv();
-        // V-swap to match grid rendering (CAMetalLayer flip compensation).
-        let bg_uv = [su, sv + svh, su + suw, sv];
-
-        // Uniform window background for the input area (no distinct panel).
-        push_quad(&mut verts, layout.box_rect, bg_uv, [0.0; 4], box_bg);
-
-        // Ctrl+R search UI replaces the normal prompt.
-        if let Some((query, selected)) = p.search {
-            let label = "search: ";
-            self.push_text(&mut verts, left, text_y0, label, fg, box_cols);
-            let qx = left + label.chars().count() as f32 * cw;
-            self.push_text(&mut verts, qx, text_y0, query, accent, box_cols);
-            if let Some(m) = selected {
-                self.push_text(&mut verts, left, text_y0 + ch, m, fg, box_cols);
-            }
-            return verts;
-        }
-
-        // Prompt glyph only — cwd lives in the block history, not the input
-        // box (Warp style), so the typed command never runs into the path.
-        // v1.0 fix: use accent (not accent_dim) for the prompt marker ❯ —
-        // accent_dim is invisible in Nord/Warp themes. The prompt ❯ is a
-        // primary UI element, not dim chrome, so accent is appropriate.
-        let prompt_str = "❯ ";
-        let prompt_chars = 2;
-        let prompt_c = color_to_normalized(self.theme.accent);
-        self.push_text(
-            &mut verts,
-            left,
-            text_y0,
-            prompt_str,
-            prompt_c,
-            prompt_chars,
-        );
-
-        // Editor buffer lines (line 0 starts after the prompt).
-        // v0.9: draw a selection highlight for the active mouse-drag range.
-        // v1.0 fix: accent-based blend for selection visibility across all themes.
-        let sel_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let bg = color_to_normalized(self.theme.background);
-            [
-                accent[0] * 0.35 + bg[0] * 0.65,
-                accent[1] * 0.35 + bg[1] * 0.65,
-                accent[2] * 0.35 + bg[2] * 0.65,
-                0.60,
-            ]
-        };
-        if let Some(((sl, sc), (el, ec))) = p.selection {
-            for i in sl..=el {
-                let Some(line) = p.lines.get(i) else {
-                    continue;
-                };
-                let y = text_y0 + i as f32 * ch;
-                let (line_start_x, max_chars) = if i == 0 {
-                    let avail = box_cols.saturating_sub(prompt_chars).max(1);
-                    (first_line_text_x, avail)
-                } else {
-                    (left, box_cols)
-                };
-                // Char column range within this line.
-                let col_start = if i == sl { sc } else { 0 };
-                let col_end = if i == el { ec } else { line.chars().count() };
-                if col_start >= col_end {
-                    continue;
-                }
-                // Convert char columns → display columns (CJK = 2 cells).
-                let chars: Vec<char> = line.chars().collect();
-                let disp_start: usize = chars
-                    .iter()
-                    .take(col_start)
-                    .map(|c| Self::char_col_width(*c))
-                    .sum();
-                let disp_len: usize = chars
-                    .iter()
-                    .skip(col_start)
-                    .take(col_end - col_start)
-                    .map(|c| Self::char_col_width(*c))
-                    .sum();
-                let disp_len = disp_len.min(max_chars.saturating_sub(disp_start));
-                if disp_len > 0 {
-                    let x0 = line_start_x + disp_start as f32 * cw;
-                    push_quad(
-                        &mut verts,
-                        [x0, y, x0 + disp_len as f32 * cw, y + ch],
-                        bg_uv,
-                        [0.0; 4],
-                        sel_bg,
-                    );
-                }
-            }
-        }
-        for (i, line) in p.lines.iter().enumerate() {
-            let y = text_y0 + i as f32 * ch;
-            let (start_x, max_chars) = if i == 0 {
-                let avail = box_cols.saturating_sub(prompt_chars).max(1);
-                (first_line_text_x, avail)
-            } else {
-                (left, box_cols)
-            };
-            self.push_line_tokenized(&mut verts, start_x, y, line, max_chars);
-        }
-
-        // ── v0.8 signature: warm cursor breath + amber glow ─────────────
-        // Smooth sin() alpha over a 2400ms period (phase in radians).
-        // sin maps [0, 2π) → [-1, 1]; we remap to [0.25, 1.0] so the caret
-        // never fully disappears (calmer than hard on/off). The glow halo
-        // is a wider, very-low-alpha amber quad behind the caret that
-        // breathes in sync (peaks at ~0.25 alpha).
-        //
-        // When `cursor_blink_on` is false (window unfocused OR user is
-        // actively selecting — see main.rs::RedrawRequested), the breath
-        // freezes at peak alpha so the caret stays visible but calm.
-        let s = if cursor_blink_on {
-            cursor_blink_phase.sin()
-        } else {
-            1.0_f32
-        };
-        let caret_alpha = 0.625 + 0.375 * s; // → [0.25, 1.0]
-        let glow_alpha = 0.15 + 0.10 * s; // → [0.05, 0.25]
-        let accent_color = [accent[0], accent[1], accent[2], accent[3] * caret_alpha];
-        // Glow: a wider quad (~3× bar width, full cell height) behind the
-        // caret. Drawn first so the caret composites on top.
-        let glow_pad = bar_w * 1.5;
-        let glow_color = [accent[0], accent[1], accent[2], glow_alpha.max(0.0)];
-        push_quad(
-            &mut verts,
-            [cx - glow_pad, cy, cx + bar_w + glow_pad, cy + ch],
-            bg_uv,
-            [0.0; 4],
-            glow_color,
-        );
-        // Caret itself.
-        push_quad(
-            &mut verts,
-            [cx, cy, cx + bar_w, cy + ch],
-            bg_uv,
-            [0.0; 4],
-            accent_color,
-        );
-
-        // IME preedit right after the cursor.
-        if let Some(preedit) = p.preedit {
-            if !preedit.is_empty() {
-                self.push_text(&mut verts, cx + bar_w, cy, preedit, accent, box_cols);
-            }
-        }
-
-        verts
-    }
-
-    /// Push a selection-highlight background quad for a character range of
-    /// `text`, honoring CJK double-width so the highlight exactly covers the
-    /// selected glyphs. Called before `push_text` so the text renders on top
-    /// of the highlight (matching grid-view selection rendering).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_block_view_highlight(
-        &self,
-        vertices: &mut Vec<f32>,
-        x_left: f32,
-        y_top: f32,
-        height: f32,
-        text: &str,
-        c_start: usize,
-        c_end: usize,
-        bg_color: [f32; 4],
-        bg_uv: [f32; 4],
-    ) {
-        if c_end <= c_start || text.is_empty() {
-            return;
-        }
-        let cw = self.cell_width() as f32;
-        let mut px = x_left;
-        let mut col = 0f32; // column units consumed
-        for (ci, c) in text.chars().enumerate() {
-            let w = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
-            if w == 0 {
-                continue;
-            }
-            if ci >= c_end {
-                break;
-            }
-            let cell_w = w as f32 * cw;
-            if ci >= c_start {
-                // This char is inside the highlight range.
-                push_quad(
-                    vertices,
-                    [px, y_top, px + cell_w, y_top + height],
-                    bg_uv,
-                    [0.0; 4], // fg mask: no text contribution (pure background)
-                    bg_color,
-                );
-            }
-            px += cell_w;
-            col += w as f32;
-            let _ = col; // (kept for symmetry with push_text's col accounting)
-        }
-    }
 }
 
 /// What the sidebar history panel should draw. Built by the app only when the
@@ -2500,25 +1869,6 @@ pub struct PanelDrawParams<'a> {
     /// v0.9 fix: whether the search box has keyboard focus (draws accent
     /// underline so the user knows typing will go to the filter).
     pub search_focused: bool,
-}
-
-/// What the bottom editor input box should draw (v0.5 editor takeover). Built
-/// by the app only in Editor mode and passed to [`MetalRenderer::draw`].
-pub struct PromptDrawParams<'a> {
-    /// Current working directory (from OSC 7) shown after the `❯` glyph.
-    pub cwd: Option<&'a str>,
-    /// Editor buffer lines (line 0 follows the prompt).
-    pub lines: &'a [String],
-    /// Cursor position (line index, char column).
-    pub cursor: (usize, usize),
-    /// Active IME preedit string, drawn right after the cursor.
-    pub preedit: Option<&'a str>,
-    /// `(query, selected_match)` when Ctrl+R search is active (replaces the
-    /// normal prompt rendering).
-    pub search: Option<(&'a str, Option<&'a str>)>,
-    /// v0.9: active mouse-drag selection range `((start_line, start_col),
-    /// (end_line, end_col))` in document order, or None when no selection.
-    pub selection: Option<((usize, usize), (usize, usize))>,
 }
 
 /// Whether a block matches the panel search query (empty query = match all).

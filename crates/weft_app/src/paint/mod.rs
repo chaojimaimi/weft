@@ -9,10 +9,12 @@
 
 pub(crate) mod block_view;
 pub(crate) mod block_view_model;
+pub(crate) mod grid;
 pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod panel;
 pub(crate) mod primitives;
+pub(crate) mod prompt;
 pub(crate) mod settings;
 pub(crate) mod tab_bar;
 pub(crate) mod text;
