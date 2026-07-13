@@ -16,14 +16,19 @@ use crate::find_worker::FindWorker;
 use crate::overlay::SettingsTab;
 use crate::tab::Tab;
 
-pub struct SessionState {
-    pub tabs: Vec<Tab>,
-    pub active_tab: usize,
-    pub prev_drawn_tab: usize,
-    pub block_store: Option<BlockStore>,
+/// M3: Encapsulated tab lifecycle owner. Controllers go through accessor
+/// methods (`active()`, `active_mut()`, `tab(idx)`, …) and lifecycle methods
+/// (`open_tab`, `switch_to`, `next`, `prev`, `close_active`, …) instead of
+/// reaching into `tabs` / `active_tab` directly. The collection is the
+/// encapsulation boundary; individual `Tab` fields stay public.
+pub struct SessionManager {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    prev_drawn_tab: usize,
+    block_store: Option<BlockStore>,
 }
 
-impl SessionState {
+impl SessionManager {
     pub fn new() -> Self {
         Self {
             tabs: Vec::new(),
@@ -31,6 +36,181 @@ impl SessionState {
             prev_drawn_tab: 0,
             block_store: None,
         }
+    }
+
+    // ── Read accessors ────────────────────────────────────────────────
+
+    pub fn active(&self) -> &Tab {
+        &self.tabs[self.active_tab]
+    }
+
+    pub fn active_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    pub fn active_idx(&self) -> usize {
+        self.active_tab
+    }
+
+    pub fn tabs(&self) -> &[Tab] {
+        &self.tabs
+    }
+
+    pub fn tabs_mut(&mut self) -> &mut [Tab] {
+        &mut self.tabs
+    }
+
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
+    #[allow(dead_code)] // test-only helper
+    pub fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    pub fn block_store(&self) -> Option<&BlockStore> {
+        self.block_store.as_ref()
+    }
+
+    pub fn set_block_store(&mut self, store: Option<BlockStore>) {
+        self.block_store = store;
+    }
+
+    pub fn prev_drawn_tab(&self) -> usize {
+        self.prev_drawn_tab
+    }
+
+    pub fn set_prev_drawn_tab(&mut self, idx: usize) {
+        self.prev_drawn_tab = idx;
+    }
+
+    pub fn tab(&self, idx: usize) -> Option<&Tab> {
+        self.tabs.get(idx)
+    }
+
+    pub fn tab_mut(&mut self, idx: usize) -> Option<&mut Tab> {
+        self.tabs.get_mut(idx)
+    }
+
+    // ── Tab lifecycle ─────────────────────────────────────────────────
+
+    /// Open a new tab and make it active. Returns the new tab index.
+    pub fn open_tab(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        scrollback: usize,
+        proxy: &winit::event_loop::EventLoopProxy<crate::AppEvent>,
+        cwd: Option<&str>,
+    ) -> usize {
+        let tab = Tab::new(rows, cols, scrollback, proxy, cwd);
+        self.tabs.push(tab);
+        let idx = self.tabs.len() - 1;
+        self.active_tab = idx;
+        idx
+    }
+
+    /// Switch to tab at `idx` (clamped). Returns `(new_idx, prev_idx)` so
+    /// callers can run post-switch hooks (IME reset, find refresh).
+    pub fn switch_to(&mut self, idx: usize) -> (usize, usize) {
+        let prev = self.active_tab;
+        let new = idx.min(self.tabs.len().saturating_sub(1));
+        self.active_tab = new;
+        (new, prev)
+    }
+
+    /// Switch to next tab (wraps around). Returns `(new_idx, prev_idx)`.
+    pub fn next(&mut self) -> (usize, usize) {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return (self.active_tab, self.active_tab);
+        }
+        let prev = self.active_tab;
+        self.active_tab = (self.active_tab + 1) % n;
+        (self.active_tab, prev)
+    }
+
+    /// Switch to previous tab (wraps around). Returns `(new_idx, prev_idx)`.
+    pub fn prev(&mut self) -> (usize, usize) {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return (self.active_tab, self.active_tab);
+        }
+        let prev = self.active_tab;
+        self.active_tab = (self.active_tab + n - 1) % n;
+        (self.active_tab, prev)
+    }
+
+    /// Close the active tab. Returns `is_last` so the caller can emit Exit.
+    /// After close, `active_tab` moves to the previous tab (wrapping to the
+    /// last tab when the first is closed), matching the original close_tab UX.
+    pub fn close_active(&mut self) -> bool {
+        if self.tabs.is_empty() {
+            return true;
+        }
+        self.tabs.remove(self.active_tab);
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+            return true;
+        }
+        if self.active_tab > 0 {
+            self.active_tab -= 1;
+        } else {
+            self.active_tab = self.tabs.len() - 1;
+        }
+        false
+    }
+
+    /// Close a background tab at `idx`. Returns `is_last`. If the closed
+    /// tab was before `active_tab`, adjust `active_tab` down.
+    pub fn close_background(&mut self, idx: usize) -> bool {
+        if idx >= self.tabs.len() {
+            return self.tabs.is_empty();
+        }
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+            return true;
+        }
+        if idx < self.active_tab {
+            self.active_tab -= 1;
+        } else if self.active_tab >= self.tabs.len() {
+            self.active_tab = self.tabs.len() - 1;
+        }
+        false
+    }
+
+    /// Remove a dead tab (shell exited) at `idx`. Same as `close_background`
+    /// but semantically distinct for future cleanup hooks.
+    pub fn remove_dead(&mut self, idx: usize) -> bool {
+        self.close_background(idx)
+    }
+
+    // ── Restore path ──────────────────────────────────────────────────
+
+    /// Push a pre-built tab (restore path). Does NOT change `active_tab`.
+    pub fn push_tab(&mut self, tab: Tab) {
+        self.tabs.push(tab);
+    }
+
+    /// Replace the tab at `idx` (restore first-tab rebuild). No-op when the
+    /// index is out of bounds.
+    pub fn replace_tab(&mut self, idx: usize, tab: Tab) {
+        if idx < self.tabs.len() {
+            self.tabs[idx] = tab;
+        }
+    }
+
+    /// Set active tab (restore completion). Clamped to the last valid index.
+    pub fn set_active(&mut self, idx: usize) {
+        self.active_tab = idx.min(self.tabs.len().saturating_sub(1));
+    }
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -299,9 +479,10 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigState, FindState, InteractionState, PanelState, SessionState, SettingsState,
+        ConfigState, FindState, InteractionState, PanelState, SessionManager, SettingsState,
         TabBarState, WindowRuntimeState,
     };
+    use crate::tab::Tab;
     use std::time::Instant;
     use weft_core::config::Config;
 
@@ -397,11 +578,80 @@ mod tests {
     }
 
     #[test]
-    fn session_state_starts_without_an_invalid_active_tab() {
-        let state = SessionState::new();
-        assert!(state.tabs.is_empty());
-        assert_eq!(state.active_tab, 0);
-        assert_eq!(state.prev_drawn_tab, 0);
+    fn session_manager_starts_without_an_invalid_active_tab() {
+        let state = SessionManager::new();
+        assert!(state.is_empty());
+        assert_eq!(state.active_idx(), 0);
+        assert_eq!(state.prev_drawn_tab(), 0);
+    }
+
+    #[test]
+    fn open_tab_increments_active() {
+        let mut sm = SessionManager::new();
+        sm.push_tab(Tab::empty());
+        sm.set_active(0);
+        assert_eq!(sm.len(), 1);
+        assert_eq!(sm.active_idx(), 0);
+        sm.push_tab(Tab::empty());
+        sm.set_active(1);
+        assert_eq!(sm.active_idx(), 1);
+    }
+
+    #[test]
+    fn close_last_tab_signals_exit() {
+        let mut sm = SessionManager::new();
+        sm.push_tab(Tab::empty());
+        // Closing the only tab → is_last = true
+        assert!(sm.close_active());
+        assert!(sm.is_empty());
+    }
+
+    #[test]
+    fn close_non_last_tab_keeps_session() {
+        let mut sm = SessionManager::new();
+        sm.push_tab(Tab::empty());
+        sm.push_tab(Tab::empty());
+        sm.set_active(1);
+        // Closing active (tab 1, not the last remaining) → is_last = false
+        assert!(!sm.close_active());
+        assert_eq!(sm.len(), 1);
+    }
+
+    #[test]
+    fn close_background_reindexes_active() {
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(2);
+        // Close tab 0 (before active) → active should shift to 1
+        assert!(!sm.close_background(0));
+        assert_eq!(sm.active_idx(), 1);
+        assert_eq!(sm.len(), 2);
+    }
+
+    #[test]
+    fn switch_wraps_around() {
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(2);
+        let (new, prev) = sm.next();
+        assert_eq!(prev, 2);
+        assert_eq!(new, 0); // wraps
+        let (new, prev) = sm.prev();
+        assert_eq!(prev, 0);
+        assert_eq!(new, 2); // wraps back
+    }
+
+    #[test]
+    fn switch_to_clamps_index() {
+        let mut sm = SessionManager::new();
+        sm.push_tab(Tab::empty());
+        let (new, prev) = sm.switch_to(99);
+        assert_eq!(new, 0);
+        assert_eq!(prev, 0);
     }
 
     #[test]

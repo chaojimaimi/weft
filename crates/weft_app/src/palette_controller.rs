@@ -525,7 +525,7 @@ impl App {
     /// Execute a workflow: render variables → submit commands to PTY.
     pub(super) fn execute_workflow(&mut self, form: WorkflowForm) {
         self.reset_ime_context("workflow submitted");
-        self.sessions.tabs[self.sessions.active_tab].arm_tui_scroll_window();
+        self.sessions.active_mut().arm_tui_scroll_window();
         let Some(store) = &self.palette.store else {
             return;
         };
@@ -543,7 +543,7 @@ impl App {
         match wf.render(&values) {
             Ok(commands) => {
                 for cmd in &commands {
-                    let tab = &mut self.sessions.tabs[self.sessions.active_tab];
+                    let tab = self.sessions.active_mut();
                     if let Some(terminal) = &mut tab.terminal {
                         // Set the command text and submit via the editor path.
                         terminal.editor_mut().buffer.set_text(cmd);

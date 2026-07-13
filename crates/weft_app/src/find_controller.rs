@@ -109,10 +109,7 @@ impl App {
                 .unwrap_or(false);
             if need_expand {
                 if let Some(bm) = self.find.block_matches.get(self.find.block_index) {
-                    if let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-                        .terminal
-                        .as_mut()
-                    {
+                    if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
                         let block = term
                             .block_tracker()
                             .session_blocks()
@@ -161,14 +158,10 @@ impl App {
         }
         self.find.last_key = None;
 
-        // Access the active tab's terminal via direct field indexing so the
-        // borrow is split to `self.sessions.tabs` — the find_* fields below can then
-        // be mutated without a borrow conflict (going through `self.tab()`
-        // would borrow all of `self`).
-        let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()
-        else {
+        // Borrow the active tab's terminal via `active_mut()` — this borrows
+        // `self.sessions` mutably, but `self.find` is a disjoint field of
+        // `self`, so the find_* fields below can be mutated without conflict.
+        let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
             return;
         };
 
@@ -320,10 +313,7 @@ impl App {
         if self.block_view_active() && !self.find.block_matches.is_empty() {
             let bm = self.find.block_matches.get(self.find.block_index).cloned();
             let Some(bm) = bm else { return };
-            let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_ref()
-            else {
+            let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
                 return;
             };
             // Find the block's index in session_blocks to compute its row
@@ -391,17 +381,14 @@ impl App {
             let (total, _) = block_content_metrics(term, cols);
             let max_scroll = total.saturating_sub(visible);
             let target = rows_from_bottom.saturating_sub(visible / 2).min(max_scroll);
-            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = target;
+            self.sessions.active_mut().set_block_scroll(target);
             return;
         }
         // Grid view: scroll grid to bring the match to the middle row.
         let Some(m) = self.find.matches.get(self.find.index).copied() else {
             return;
         };
-        let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        else {
+        let Some(term) = self.sessions.active_mut().terminal.as_mut() else {
             return;
         };
         let grid = term.grid_mut();

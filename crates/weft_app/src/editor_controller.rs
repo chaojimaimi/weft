@@ -25,10 +25,7 @@ impl App {
         // v0.9: any non-Cmd editor key clears the mouse-drag selection so
         // typing replaces the selection. Cmd+C is handled above (returns
         // false) so it won't clear the selection — copy still works.
-        if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             if t.editor().buffer.has_selection() {
                 t.editor_mut().buffer.clear_selection();
                 self.request_redraw();
@@ -38,10 +35,7 @@ impl App {
 
         // Ctrl editor ops (Ctrl+C / other Ctrl chords fall through to the PTY).
         if mods.contains(Modifiers::CONTROL) && !mods.contains(Modifiers::ALT) {
-            let consumed = if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_mut()
-            {
+            let consumed = if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                 let e = t.editor_mut();
                 match key {
                     Char('a') => {
@@ -81,16 +75,15 @@ impl App {
         }
 
         // Ctrl+R search mode intercepts printable/backspace/enter/esc/arrows.
-        let searching = self.sessions.tabs[self.sessions.active_tab]
+        let searching = self
+            .sessions
+            .active_mut()
             .terminal
             .as_ref()
             .map(|t| t.editor().is_searching())
             .unwrap_or(false);
         if searching {
-            if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_mut()
-            {
+            if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                 let e = t.editor_mut();
                 match key {
                     Char(c) => {
@@ -126,7 +119,9 @@ impl App {
         // Tab-completion mode: Tab cycles, Enter accepts (no submit), Up/Down
         // navigate, Esc cancels. Any other key cancels and falls through to
         // normal editing (so typing/deleting ends the session).
-        let completing = self.sessions.tabs[self.sessions.active_tab]
+        let completing = self
+            .sessions
+            .active_mut()
             .terminal
             .as_ref()
             .map(|t| t.editor().is_completing())
@@ -179,19 +174,13 @@ impl App {
                 };
                 if do_submit {
                     self.editor_submit();
-                } else if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                } else if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.split_newline();
                 }
                 true
             }
             Char(c) => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut()
                         .buffer
                         .insert_char(resolve_text_char(text, c, shift));
@@ -199,64 +188,43 @@ impl App {
                 true
             }
             Backspace => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.delete_backspace();
                 }
                 true
             }
             Delete => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.delete_forward();
                 }
                 true
             }
             Left => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.move_left();
                 }
                 true
             }
             Right => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.move_right();
                 }
                 true
             }
             Home => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.move_line_home();
                 }
                 true
             }
             End => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.move_line_end();
                 }
                 true
             }
             Up => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     let e = t.editor_mut();
                     if e.buffer.cursor.0 == 0 {
                         e.history_prev();
@@ -269,10 +237,7 @@ impl App {
                 true
             }
             Down => {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     let e = t.editor_mut();
                     let last = e.buffer.line_count() - 1;
                     if e.buffer.cursor.0 == last {
@@ -294,10 +259,7 @@ impl App {
 
     pub(super) fn editor_start_completion(&mut self) {
         // Gather context under an immutable borrow, then mutate the editor.
-        let (line_owned, col, cwd, history) = match self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()
-        {
+        let (line_owned, col, cwd, history) = match self.sessions.active_mut().terminal.as_ref() {
             Some(t) => {
                 let line_idx = t.editor().buffer.cursor.0;
                 let col = t.editor().buffer.cursor.1;
@@ -361,10 +323,7 @@ impl App {
         if matches.is_empty() {
             return;
         }
-        let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        else {
+        let Some(t) = self.sessions.active_mut().terminal.as_mut() else {
             return;
         };
         let e = t.editor_mut();
@@ -378,37 +337,25 @@ impl App {
     }
 
     pub(super) fn editor_completion_next(&mut self) {
-        if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_next();
         }
     }
 
     pub(super) fn editor_completion_prev(&mut self) {
-        if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_prev();
         }
     }
 
     pub(super) fn editor_completion_accept(&mut self) {
-        if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_accept();
         }
     }
 
     pub(super) fn editor_completion_cancel(&mut self) {
-        if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_mut()
-        {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_cancel();
         }
     }
@@ -421,24 +368,28 @@ impl App {
         // becomes the input owner, otherwise its first key can commit stale
         // text into less/vim.
         self.reset_ime_context("editor command submitted");
-        self.sessions.tabs[self.sessions.active_tab].arm_tui_scroll_window();
-        let bytes = self.sessions.tabs[self.sessions.active_tab]
+        self.sessions.active_mut().arm_tui_scroll_window();
+        let bytes = self
+            .sessions
+            .active_mut()
             .terminal
             .as_mut()
             .map(|t| t.submit_command())
             .unwrap_or_default();
         if !bytes.is_empty() {
-            if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
+            if let Some(pty) = &self.sessions.active_mut().pty {
                 let _ = pty.write_sync(&bytes);
             }
         }
-        let resp = self.sessions.tabs[self.sessions.active_tab]
+        let resp = self
+            .sessions
+            .active_mut()
             .terminal
             .as_mut()
             .map(|t| t.take_response())
             .unwrap_or_default();
         if !resp.is_empty() {
-            if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
+            if let Some(pty) = &self.sessions.active_mut().pty {
                 let _ = pty.write_sync(&resp);
             }
         }
@@ -450,7 +401,7 @@ impl App {
         // the view stays scrolled up on history. Snapping here, at submit
         // time, guarantees the user sees the result regardless of how fast
         // the command completes.
-        self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = 0;
+        self.sessions.active_mut().snap_to_bottom();
         self.request_redraw();
     }
 }

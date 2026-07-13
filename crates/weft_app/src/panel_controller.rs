@@ -5,7 +5,7 @@ use super::*;
 impl App {
     /// Count of blocks visible in the panel (newest-first, query-filtered).
     pub(super) fn panel_visible_count(&self) -> usize {
-        let Some(terminal) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
             return 0;
         };
         let blocks = terminal.block_tracker().blocks();
@@ -30,9 +30,7 @@ impl App {
 
     /// The [`BlockId`] of the currently selected panel row, if any.
     pub(super) fn panel_selected_block_id(&self) -> Option<BlockId> {
-        let terminal = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         let visible = terminal.grid().num_rows;
         terminal
             .block_tracker()
@@ -58,7 +56,7 @@ impl App {
         // Borrow the terminal immutably to find the command, then release
         // before mutating the editor.
         let cmd: Option<String> = {
-            let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+            let Some(t) = self.sessions.active().terminal.as_ref() else {
                 return;
             };
             if t.effective_input_mode() != weft_core::input::InputMode::Editor {
@@ -72,10 +70,7 @@ impl App {
         };
         if let Some(cmd) = cmd {
             if !cmd.is_empty() {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.set_text(&cmd);
                     // v0.9: select all so Cmd+C copies the command without
                     // needing a drag-select first. The user can still adjust
@@ -102,10 +97,7 @@ impl App {
         if !self.block_view_active() {
             return;
         }
-        let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()
-        else {
+        let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
             return;
         };
         let blocks = term.block_tracker().session_blocks();
@@ -144,7 +136,7 @@ impl App {
         };
         let visible = renderer.block_visible_rows(1);
         let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
-        self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = target;
+        self.sessions.active_mut().set_block_scroll(target);
 
         // Arm the highlight: accent border around the block for 1.5s.
         self.panel.highlight = Some(block_id);
@@ -155,7 +147,7 @@ impl App {
 
     /// Local scrollback navigation (page up/down, top, bottom).
     pub(super) fn scroll_action(&mut self, action: Action) {
-        let tab = &mut self.sessions.tabs[self.sessions.active_tab];
+        let tab = self.sessions.active_mut();
         let Some(terminal) = &mut tab.terminal else {
             return;
         };
@@ -174,23 +166,23 @@ impl App {
             let max_scroll = total.saturating_sub(visible);
             match action {
                 Action::ScrollPageUp => {
-                    tab.block_scroll_offset =
-                        tab.block_scroll_offset.saturating_add(rows).min(max_scroll);
+                    tab.scroll_up_by(rows);
+                    tab.clamp_block_scroll(max_scroll);
                 }
                 Action::ScrollPageDown => {
-                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(rows);
+                    tab.scroll_down_by(rows);
                 }
                 Action::ScrollLineUp => {
-                    tab.block_scroll_offset =
-                        tab.block_scroll_offset.saturating_add(1).min(max_scroll);
+                    tab.scroll_up_by(1);
+                    tab.clamp_block_scroll(max_scroll);
                 }
                 Action::ScrollLineDown => {
-                    tab.block_scroll_offset = tab.block_scroll_offset.saturating_sub(1);
+                    tab.scroll_down_by(1);
                 }
                 Action::ScrollToTop => {
-                    tab.block_scroll_offset = max_scroll;
+                    tab.set_block_scroll(max_scroll);
                 }
-                Action::ScrollToBottom => tab.block_scroll_offset = 0,
+                Action::ScrollToBottom => tab.snap_to_bottom(),
                 _ => {}
             }
         } else {

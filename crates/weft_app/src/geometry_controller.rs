@@ -8,9 +8,7 @@ impl App {
     ) -> Option<crate::scrollbar_component::ScrollbarLayout> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -23,7 +21,7 @@ impl App {
             total,
             visible,
             max_scroll,
-            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset,
+            self.sessions.active().block_scroll(),
         )
     }
     pub(super) fn palette_scene(
@@ -70,12 +68,7 @@ impl App {
     ) -> Option<crate::scene::Scene<crate::completion_component::CompletionTarget>> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self
-            .sessions
-            .tabs
-            .get(self.sessions.active_tab)?
-            .terminal
-            .as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         if terminal.effective_input_mode() != weft_core::input::InputMode::Editor
             || terminal.editor().search_view().is_some()
         {
@@ -142,14 +135,15 @@ impl App {
         // up the new chrome_left (sidebar open/close shifts the grid). Only
         // the active tab sends a PTY resize immediately; background tabs get
         // their PTY resize on activation (refresh_grid_for_active_tab).
-        for (i, tab) in self.sessions.tabs.iter_mut().enumerate() {
+        let active = self.sessions.active_idx();
+        for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if let Some(terminal) = &mut tab.terminal {
                 terminal.resize(new_rows, new_cols);
-                if i == self.sessions.active_tab {
+                if i == active {
                     info!(rows = new_rows, cols = new_cols, "terminal resized");
                 }
             }
-            if i == self.sessions.active_tab {
+            if i == active {
                 tab.pending_pty_resize = Some((new_rows, new_cols));
             }
         }
@@ -164,7 +158,9 @@ impl App {
         // Clamp to valid grid bounds. A click past the right/bottom edge (e.g.
         // a drag-to-select ending at the window margin) would otherwise yield
         // col == num_cols / row == num_rows and panic text_from_grid on copy.
-        let (num_rows, num_cols) = self.sessions.tabs[self.sessions.active_tab]
+        let (num_rows, num_cols) = self
+            .sessions
+            .active()
             .terminal
             .as_ref()
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
@@ -178,9 +174,7 @@ impl App {
     /// the cell_map has been invalidated by a scroll (MVP trade-off: links
     /// in scrolled-off content aren't clickable).
     pub(super) fn hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let terminal = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         // Block view uses a separate scrollable layout — skip OSC 8 there.
         if self.block_view_active() {
             return None;
@@ -278,7 +272,7 @@ impl App {
         if cw <= 0.0 || ch <= 0.0 {
             return None;
         }
-        let Some(terminal) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+        let Some(terminal) = &self.sessions.active().terminal else {
             return None;
         };
         if terminal.effective_input_mode() != weft_core::input::InputMode::Editor {
@@ -334,9 +328,7 @@ impl App {
     pub(super) fn prompt_box_rect(&self) -> Option<[f32; 4]> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
-        let terminal = self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         if !terminal.show_block_view() {
             return None;
         }
@@ -354,10 +346,7 @@ impl App {
             Some(r) => r,
             None => return Vec::new(),
         };
-        let terminal = match self.sessions.tabs[self.sessions.active_tab]
-            .terminal
-            .as_ref()
-        {
+        let terminal = match self.sessions.active().terminal.as_ref() {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -371,7 +360,7 @@ impl App {
             cwd: None,
             git_branch: terminal.git_branch(),
             live: terminal.block_tracker().in_flight(),
-            block_scroll: self.sessions.tabs[self.sessions.active_tab].block_scroll_offset,
+            block_scroll: self.sessions.active().block_scroll(),
         })
     }
 
@@ -379,7 +368,8 @@ impl App {
     /// an alt-screen app). Centralises the dispatch so mouse/copy paths stay
     /// consistent.
     pub(super) fn block_view_active(&self) -> bool {
-        self.sessions.tabs[self.sessions.active_tab]
+        self.sessions
+            .active()
             .terminal
             .as_ref()
             .map(|t| t.show_block_view())
@@ -395,7 +385,8 @@ impl App {
         if self.interaction.mods.state().shift_key() {
             return false; // Shift = force terminal selection
         }
-        self.sessions.tabs[self.sessions.active_tab]
+        self.sessions
+            .active()
             .terminal
             .as_ref()
             .map(|t| t.mouse_protocol != MouseProtocol::Off)
@@ -485,12 +476,12 @@ impl App {
             padding_x: renderer.padding_x(),
             chrome_left,
             traffic_lights_width: renderer.traffic_lights_width(),
-            tab_count: self.sessions.tabs.len(),
+            tab_count: self.sessions.len(),
             requested_scroll_offset: self.tab_bar.scroll_offset,
         });
         let scene = crate::tab_bar_component::build_tab_bar_scene(
             strip,
-            self.sessions.tabs.len(),
+            self.sessions.len(),
             renderer.cell_width() as f32,
             renderer.cell_height() as f32,
         );

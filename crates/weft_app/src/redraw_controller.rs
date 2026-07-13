@@ -19,10 +19,15 @@ impl App {
         // block view to the bottom so the user sees fresh content.
         // (At prompt / idle, preserve the user's scroll position.)
         if had_output {
-            if let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal {
-                if t.block_tracker().phase() == ShellPhase::CommandExecuting {
-                    self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = 0;
-                }
+            let snap_to_bottom = self
+                .sessions
+                .active()
+                .terminal
+                .as_ref()
+                .map(|t| t.block_tracker().phase() == ShellPhase::CommandExecuting)
+                .unwrap_or(false);
+            if snap_to_bottom {
+                self.sessions.active_mut().snap_to_bottom();
             }
         }
 
@@ -32,7 +37,9 @@ impl App {
         // transitions no longer cause drift: the grid is always
         // full-window and the input box is a non-resizing overlay.
         let desired = self.grid_dims();
-        let current = self.sessions.tabs[self.sessions.active_tab]
+        let current = self
+            .sessions
+            .active()
             .terminal
             .as_ref()
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
@@ -62,13 +69,13 @@ impl App {
             > std::time::Duration::from_millis(100);
         let pending: Vec<_> = self
             .sessions
-            .tabs
+            .tabs()
             .iter()
             .map(|tab| tab.pending_pty_resize)
             .collect();
         let resize_effects = effect::pending_resize_effects(
             &pending,
-            self.sessions.active_tab,
+            self.sessions.active_idx(),
             active_ready,
             cascade_settled,
         );
@@ -76,23 +83,20 @@ impl App {
 
         // v0.9 H1: borrow the active Tab once and access its fields
         // (terminal / ime_preedit / selection_handler / block_scroll_offset)
-        // as disjoint field borrows. Indexing `self.sessions.tabs[i]` repeatedly
-        // would prevent Rust from splitting borrows across the
-        // `&tab.terminal` (immutable) and `&mut tab.selection_handler`
-        // (mutable) needed by `renderer.draw`. `self.sessions.tabs` and
-        // `self.renderer` are disjoint fields of `App`, so both can be
-        // mutably borrowed at once.
-        let active = self.sessions.active_tab;
-        // Compute the tab bar state BEFORE borrowing `self.sessions.tabs`
-        // mutably below: `tab_bar_state()` reads `self.sessions.tabs[*]`
-        // labels and would conflict with `&mut self.sessions.tabs[active]`.
-        // The returned `TabBarDrawState` is owned and lives for the
-        // whole draw call.
+        // as disjoint field borrows. `active_mut()` borrows `self.sessions`
+        // mutably; `self.renderer` is a disjoint field of `App`, so
+        // `(&mut self.renderer, &tab.terminal)` can coexist. Reading
+        // `prev_drawn_tab()` before `active_mut()` avoids a borrow conflict.
+        let active = self.sessions.active_idx();
+        // Compute the tab bar state BEFORE borrowing `self.sessions`
+        // mutably below: `tab_bar_state()` reads tab labels and would
+        // conflict with `active_mut()`. The returned `TabBarDrawState`
+        // is owned and lives for the whole draw call.
         let tab_bar = self.tab_bar_state();
         // v1.0 S1: compute Settings panel view data before the
         // mutable `tab` borrow below — settings_theme_views() and
         // settings_keybinding_views() borrow self immutably, which
-        // would conflict with &mut self.sessions.tabs[active].
+        // would conflict with `active_mut()`.
         let settings_themes = self.settings_theme_views();
         let settings_keybindings = self.settings_keybinding_views();
         let palette_form_fields = self
@@ -110,11 +114,12 @@ impl App {
                     fields: &palette_form_fields,
                     current_field: form.current_field,
                 });
-        let tab = &mut self.sessions.tabs[active];
+        let prev_drawn = self.sessions.prev_drawn_tab();
+        let tab = self.sessions.active_mut();
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
         // redraw before drawing.
-        let tab_changed = active != self.sessions.prev_drawn_tab;
+        let tab_changed = active != prev_drawn;
         if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
             if tab_changed {
                 renderer.force_full_grid_redraw();
@@ -314,13 +319,17 @@ impl App {
                 || tab.selection_handler.block_view_selection.is_some()
                 || tab.selection_handler.selection.is_some();
             let blink_on = self.window_runtime.cursor_blink_on && !has_selection;
+            // M3.5: read block_scroll into a local before the mutable
+            // `&mut tab.selection_handler` borrow below — `block_scroll()`
+            // takes `&self` and would conflict with the mutable borrow.
+            let block_scroll = tab.block_scroll();
             renderer.draw(
                 terminal,
                 &mut tab.selection_handler,
                 blink_on,
                 self.window_runtime.cursor_blink_phase,
                 &overlays,
-                tab.block_scroll_offset,
+                block_scroll,
                 scroll_metrics,
                 self.interaction.scrollbar_hovered || self.interaction.scrollbar_drag.is_some(),
                 &tab_bar,
@@ -344,11 +353,12 @@ impl App {
         // v1.0 P0-b: clear the grid's per-row dirty flags now that
         // the renderer has consumed them. The next frame will mark
         // rows dirty only if new PTY output / cursor movement changes
-        // them, enabling incremental rendering.
-        self.sessions.prev_drawn_tab = active;
+        // them, enabling incremental rendering. The `set_prev_drawn_tab`
+        // call comes after `tab`'s last use so NLL releases the borrow.
         if let Some(t) = &mut tab.terminal {
             t.grid_mut().clear_all_dirty();
         }
+        self.sessions.set_prev_drawn_tab(active);
 
         // No busy-loop redraw here: the PTY reader thread and the
         // cursor-blink timer wake the loop via `AppEvent::Wake`

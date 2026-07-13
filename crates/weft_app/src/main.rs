@@ -42,7 +42,7 @@ mod window_event_controller;
 
 use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
-    SessionState, SettingsState, TabBarState, WindowRuntimeState,
+    SessionManager, SettingsState, TabBarState, WindowRuntimeState,
 };
 use effect::Effect;
 use input_router::{OverlayInputContext, OverlayInputOwner};
@@ -102,7 +102,7 @@ struct App {
     renderer: Option<MetalRenderer>,
     /// v0.9 H1: per-tab session state. The active tab is `tabs[active_tab]`.
     /// Currently always has exactly one tab; Stage 2 adds Cmd+T/W multi-tab.
-    sessions: SessionState,
+    sessions: SessionManager,
     /// v0.9 W1+: index of the tab currently hovered by the mouse, or `None`
     /// when the cursor is outside the tab bar. Drives the Warp-style
     /// hover-to-show close "×" button. Reset on tab close/switch and on
@@ -162,12 +162,12 @@ enum FindButtonAction {
 impl App {
     /// Immutable borrow of the active tab.
     fn tab(&self) -> &Tab {
-        &self.sessions.tabs[self.sessions.active_tab]
+        self.sessions.active()
     }
 
     /// Mutable borrow of the active tab.
     fn tab_mut(&mut self) -> &mut Tab {
-        &mut self.sessions.tabs[self.sessions.active_tab]
+        self.sessions.active_mut()
     }
 
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
@@ -182,7 +182,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            sessions: SessionState::new(),
+            sessions: SessionManager::new(),
             tab_bar: TabBarState::default(),
             window_runtime: WindowRuntimeState::new(),
             interaction: InteractionState::new(),
@@ -213,7 +213,7 @@ impl App {
                 let _ = p.write_sync(cmd.as_bytes());
             }
         }
-        self.sessions.tabs.push(tab);
+        self.sessions.push_tab(tab);
     }
 
     /// Non-blocking drain of PTY events into channel. Drains ALL tabs per
@@ -221,7 +221,7 @@ impl App {
     /// flushed so switching to them is instant; only the active tab is
     /// rendered).
     fn pump_pty(&mut self) {
-        for tab in &mut self.sessions.tabs {
+        for tab in self.sessions.tabs_mut() {
             tab.pump_pty();
         }
     }
@@ -232,8 +232,8 @@ impl App {
         let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
         let mut exit_requested = false;
-        for i in 0..self.sessions.tabs.len() {
-            let (alive, drained, need_redraw) = self.sessions.tabs[i].process_messages();
+        for i in 0..self.sessions.len() {
+            let (alive, drained, need_redraw) = self.sessions.tabs_mut()[i].process_messages();
             // A dying shell can complete its final block in the same batch as
             // the exit event. Collect before branching so persistence never
             // loses that last command.
@@ -242,32 +242,28 @@ impl App {
                 // Shell exited on tab `i`. For now (Stage 2) we only exit
                 // the app when the LAST tab's shell exits. A closed tab
                 // via Cmd+W is handled by `close_tab`, not here.
-                if self.sessions.tabs.len() <= 1 {
+                let is_last = self.sessions.remove_dead(i);
+                if is_last {
                     exit_requested = true;
                     break;
                 }
-                // Otherwise: remove the exited tab and switch to the prev.
-                self.sessions.tabs.remove(i);
-                if self.sessions.active_tab >= self.sessions.tabs.len() {
-                    self.sessions.active_tab = self.sessions.tabs.len() - 1;
-                }
                 info!(
                     closed = i,
-                    active = self.sessions.active_tab,
+                    active = self.sessions.active_idx(),
                     "tab shell exited"
                 );
                 break;
             }
-            if let Some(resolution) = self.sessions.tabs[i].resolve_pending_tui_scroll() {
+            if let Some(resolution) = self.sessions.tabs_mut()[i].resolve_pending_tui_scroll() {
                 match resolution {
                     TuiScrollResolution::PtyBytes(bytes) => {
-                        if let Some(pty) = &self.sessions.tabs[i].pty {
+                        if let Some(pty) = self.sessions.tab(i).and_then(|t| t.pty.as_ref()) {
                             if let Err(e) = pty.write_sync(&bytes) {
                                 warn!(error = %e, tab = i, "failed to replay queued TUI scroll");
                             }
                         }
                     }
-                    TuiScrollResolution::LocalRows(rows) if i == self.sessions.active_tab => {
+                    TuiScrollResolution::LocalRows(rows) if i == self.sessions.active_idx() => {
                         deferred_local_scroll =
                             deferred_local_scroll.saturating_add(rows).clamp(-100, 100);
                     }
@@ -298,26 +294,24 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::WritePty { tab, bytes } => {
-                    if let Some(pty) = self.sessions.tabs.get(tab).and_then(|tab| tab.pty.as_ref())
-                    {
+                    if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
                         if let Err(error) = pty.write_sync(&bytes) {
                             warn!(%error, tab, "failed to apply PTY write effect");
                         }
                     }
                 }
                 Effect::InterruptPty { tab } => {
-                    if let Some(pty) = self.sessions.tabs.get(tab).and_then(|tab| tab.pty.as_ref())
-                    {
+                    if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
                         pty.send_interrupt();
                     }
                 }
                 Effect::FlushPtyOutput { tab } => {
-                    if let Some(tab) = self.sessions.tabs.get_mut(tab) {
+                    if let Some(tab) = self.sessions.tab_mut(tab) {
                         tab.flush_pty_output();
                     }
                 }
                 Effect::ResizePty { tab, rows, cols } => {
-                    if let Some(session) = self.sessions.tabs.get_mut(tab) {
+                    if let Some(session) = self.sessions.tab_mut(tab) {
                         if let Some(pty) = &session.pty {
                             if let Err(error) = pty.resize(rows as u16, cols as u16) {
                                 warn!(%error, tab, rows, cols, "failed to apply PTY resize effect");
@@ -333,6 +327,24 @@ impl App {
                 Effect::PersistBlocks { blocks } => self.persist_blocks(&blocks),
                 Effect::Paste { tab } => self.apply_paste(tab),
                 Effect::Exit => self.should_exit = true,
+                Effect::TabClosed {
+                    removed_idx,
+                    new_active,
+                    is_last,
+                } => {
+                    // Synchronous mutation (close_active, IME reset, hover
+                    // clear, find refresh, tab-bar scroll) already ran in
+                    // `close_tab`. This arm is the declarative extension point
+                    // for future post-close consumers (e.g. analytics).
+                    info!(removed_idx, new_active, is_last, "tab closed effect");
+                }
+                Effect::TabSwitched { new_idx, prev_idx } => {
+                    // Synchronous mutation (sessions.next/prev, IME reset,
+                    // find refresh, tab-bar scroll) already ran in
+                    // `next_tab`/`prev_tab`. Extension point for future
+                    // post-switch consumers.
+                    info!(new_idx, prev_idx, "tab switched effect");
+                }
                 Effect::RequestRedraw => self.request_redraw(),
             }
         }
@@ -342,7 +354,7 @@ impl App {
     /// each failure is logged but does not abort the remaining inserts. Extracted
     /// from `process_messages` so the same logic serves the `PersistBlocks` effect.
     fn persist_blocks(&self, blocks: &[weft_core::blocks::Block]) {
-        let Some(store) = &self.sessions.block_store else {
+        let Some(store) = self.sessions.block_store() else {
             return;
         };
         for block in blocks {
@@ -373,8 +385,7 @@ impl App {
     fn apply_paste_text(&mut self, tab: usize, text: &str) {
         let mode = self
             .sessions
-            .tabs
-            .get(tab)
+            .tab(tab)
             .and_then(|t| t.terminal.as_ref())
             .map(|t| t.effective_input_mode())
             .unwrap_or(weft_core::input::InputMode::Passthrough);
@@ -383,11 +394,10 @@ impl App {
             // Editor takeover: paste into the input box. Multi-line text is
             // split on \n (insert_char rejects control chars including \n,
             // so we must drive split_newline explicitly to preserve line
-            // breaks). \r is dropped to handle CRLF paste from external apps.
+            // breaks). \r is dropped to handle CRLF paste from external apps).
             if let Some(t) = self
                 .sessions
-                .tabs
-                .get_mut(tab)
+                .tab_mut(tab)
                 .and_then(|tab| tab.terminal.as_mut())
             {
                 let buf = &mut t.editor_mut().buffer;
@@ -404,13 +414,12 @@ impl App {
             // Passthrough: forward to the PTY.
             let bracketed = self
                 .sessions
-                .tabs
-                .get(tab)
+                .tab(tab)
                 .and_then(|t| t.terminal.as_ref())
                 .map(|t| t.bracketed_paste)
                 .unwrap_or(false);
             let bytes = encode_paste(text, bracketed);
-            if let Some(pty) = self.sessions.tabs.get(tab).and_then(|t| t.pty.as_ref()) {
+            if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
                 if let Err(e) = pty.write_sync(&bytes) {
                     warn!(error = %e, tab, "failed to paste to PTY");
                 }
@@ -421,7 +430,7 @@ impl App {
     /// Cancel native marked text before keyboard ownership changes. macOS
     /// keeps this state on the window rather than on an individual Weft tab.
     fn reset_ime_context(&mut self, reason: &'static str) {
-        for tab in &mut self.sessions.tabs {
+        for tab in self.sessions.tabs_mut() {
             tab.ime_preedit.clear();
         }
         if let Some(window) = &self.window {
@@ -637,7 +646,7 @@ impl App {
             ?bytes,
             "key → pty"
         );
-        let effects = effect::passthrough_key_effects(self.sessions.active_tab, bytes);
+        let effects = effect::passthrough_key_effects(self.sessions.active_idx(), bytes);
         self.drain_effects(effects);
     }
 
@@ -651,7 +660,7 @@ impl App {
             }
             Action::Paste => {
                 self.drain_effects(vec![Effect::Paste {
-                    tab: self.sessions.active_tab,
+                    tab: self.sessions.active_idx(),
                 }]);
                 true
             }
@@ -736,11 +745,13 @@ impl App {
                 true
             }
             Action::NextTab => {
-                self.next_tab();
+                let effects = self.next_tab();
+                self.drain_effects(effects);
                 true
             }
             Action::PrevTab => {
-                self.prev_tab();
+                let effects = self.prev_tab();
+                self.drain_effects(effects);
                 true
             }
             Action::ToggleSettings => {
@@ -852,7 +863,8 @@ impl App {
     /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
     fn copy_selection(&mut self) {
         let text = {
-            let Some(terminal) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+            let tab = self.sessions.active();
+            let Some(terminal) = tab.terminal.as_ref() else {
                 return;
             };
             // Editor drag-selection takes priority over block/grid selection.
@@ -863,13 +875,9 @@ impl App {
                 .filter(|text| !text.is_empty())
                 .or_else(|| {
                     if terminal.show_block_view() {
-                        self.sessions.tabs[self.sessions.active_tab]
-                            .selection_handler
-                            .block_view_text()
+                        tab.selection_handler.block_view_text()
                     } else {
-                        self.sessions.tabs[self.sessions.active_tab]
-                            .selection_handler
-                            .selected_text(terminal.grid())
+                        tab.selection_handler.selected_text(terminal.grid())
                     }
                 })
         };
@@ -1180,13 +1188,11 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
-        self.sessions.block_store = weft_cache_dir().and_then(|cache| {
+        let block_store = weft_cache_dir().and_then(|cache| {
             let path = cache.join("blocks.db");
             match BlockStore::open(&path) {
                 Ok(store) => {
-                    if let Some(terminal) =
-                        &mut self.sessions.tabs[self.sessions.active_tab].terminal
-                    {
+                    if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
                         match store.recent(1000) {
                             Ok(history) => {
                                 // Hydrate editor history from persisted commands so
@@ -1215,6 +1221,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
         });
+        self.sessions.set_block_store(block_store);
 
         // v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
         // session layout survives restarts. The first tab (spawned above by
@@ -1230,8 +1237,13 @@ impl ApplicationHandler<AppEvent> for App {
         // stays clean. If the saved cwd equals the weft process's cwd (the
         // common case when launching from the same directory), no rebuild
         // is needed — the initial tab already has the right cwd.
-        if let Some(store) = &self.sessions.block_store {
-            match store.load_tabs() {
+        if let Some(store) = self.sessions.block_store() {
+            let snaps_result = store.load_tabs();
+            // Clear saved tabs now so the immutable borrow of self.sessions
+            // ends before the mutations below. The periodic auto-save will
+            // re-persist the live state.
+            let _ = store.clear_tabs();
+            match snaps_result {
                 Ok(snaps) if !snaps.is_empty() => {
                     info!(count = snaps.len(), "restoring saved tab snapshots");
                     let (rows, cols) = self.current_size();
@@ -1254,20 +1266,23 @@ impl ApplicationHandler<AppEvent> for App {
                             // cwd is needed; otherwise reuse the existing tab
                             // (already spawned with weft's cwd).
                             if cwd_to_apply.is_some() {
-                                self.sessions.tabs[0] = Tab::new(
+                                let mut tab = Tab::new(
                                     rows,
                                     cols,
                                     self.config_state.config.scrollback.lines,
                                     &self.proxy,
                                     cwd_to_apply,
                                 );
-                                if let Some(t) = &mut self.sessions.tabs[0].terminal {
+                                if let Some(t) = &mut tab.terminal {
                                     if let Some(r) = &self.renderer {
                                         t.set_palette(r.theme().palette);
                                     }
                                 }
+                                tab.restore_from_snapshot(snap);
+                                self.sessions.replace_tab(0, tab);
+                            } else if let Some(t) = self.sessions.tab_mut(0) {
+                                t.restore_from_snapshot(snap);
                             }
-                            self.sessions.tabs[0].restore_from_snapshot(snap);
                         } else {
                             let mut tab = Tab::new(
                                 rows,
@@ -1282,14 +1297,10 @@ impl ApplicationHandler<AppEvent> for App {
                                     t.set_palette(r.theme().palette);
                                 }
                             }
-                            self.sessions.tabs.push(tab);
+                            self.sessions.push_tab(tab);
                         }
                     }
-                    // Clear saved tabs so a crash during the session doesn't
-                    // re-restore stale state on the next launch — the periodic
-                    // auto-save will re-persist the live state.
-                    let _ = store.clear_tabs();
-                    self.sessions.active_tab = 0;
+                    self.sessions.set_active(0);
                     info!(restored = total, "tab snapshots restored");
                 }
                 Ok(_) => {

@@ -17,7 +17,7 @@ impl App {
     /// back to the renderer's viewport estimate if the terminal is not yet
     /// initialized.
     pub(super) fn current_size(&self) -> (usize, usize) {
-        if let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal {
+        if let Some(t) = self.sessions.active().terminal.as_ref() {
             let grid = t.grid();
             return (grid.num_rows, grid.num_cols);
         }
@@ -36,24 +36,22 @@ impl App {
         self.reset_ime_context("new tab");
         let (rows, cols) = self.current_size();
         // New tabs inherit the weft process's cwd (None = no chdir).
-        let tab = Tab::new(
+        let idx = self.sessions.open_tab(
             rows,
             cols,
             self.config_state.config.scrollback.lines,
             &self.proxy,
             None,
         );
-        self.sessions.tabs.push(tab);
-        self.sessions.active_tab = self.sessions.tabs.len() - 1;
         // Apply the current theme palette to the new terminal so it matches
         // the window's renderer theme (the atlas is shared per-window, not
         // per-tab — no atlas rebuild needed).
-        if let Some(t) = &mut self.sessions.tabs[self.sessions.active_tab].terminal {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
             }
         }
-        info!(tab_idx = self.sessions.active_tab, "new tab created");
+        info!(tab_idx = idx, "new tab created");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
         self.request_redraw();
@@ -63,32 +61,25 @@ impl App {
     /// application shell must drain. Closing the last tab requests exit;
     /// otherwise the previous tab becomes active and a redraw is requested.
     pub(super) fn close_tab(&mut self) -> Vec<Effect> {
-        if self.sessions.tabs.len() <= 1 {
+        if self.sessions.len() <= 1 {
             info!("closing last tab, exiting app");
-            return effect::close_tab_effects(true);
+            let removed_idx = self.sessions.active_idx();
+            // new_active is irrelevant when exiting; pass 0 as a sentinel.
+            return effect::close_tab_effects(removed_idx, 0, true);
         }
         self.reset_ime_context("tab closed");
-        let removed_idx = self.sessions.active_tab;
-        let _tab = self.sessions.tabs.remove(removed_idx);
+        let removed_idx = self.sessions.active_idx();
+        let _is_last = self.sessions.close_active();
+        let new_active = self.sessions.active_idx();
         // v0.9 W1+: clear hover state — tab indices shift after removal, so
         // a stale hovered_tab would point at the wrong tab. The next
         // CursorMoved will recompute it.
         self.tab_bar.hovered_tab = None;
-        // Switch to the previous tab (or wrap to last).
-        if self.sessions.active_tab > 0 {
-            self.sessions.active_tab -= 1;
-        } else {
-            self.sessions.active_tab = self.sessions.tabs.len() - 1;
-        }
-        info!(
-            closed = removed_idx,
-            active = self.sessions.active_tab,
-            "tab closed"
-        );
+        info!(closed = removed_idx, active = new_active, "tab closed");
         self.clamp_tab_scroll();
         self.scroll_active_tab_into_view();
         self.refresh_find_for_active_tab();
-        effect::close_tab_effects(false)
+        effect::close_tab_effects(removed_idx, new_active, false)
     }
 
     /// v1.0 H4: Serialize all live tabs to the SQLite `tabs` table so the
@@ -96,12 +87,12 @@ impl App {
     /// failures are logged but don't interrupt the caller. The PTY itself
     /// is NOT persisted (impossible to revive); only UI state is saved.
     pub(super) fn save_all_tabs(&self) {
-        let Some(store) = &self.sessions.block_store else {
+        let Some(store) = self.sessions.block_store() else {
             return;
         };
         let snaps: Vec<_> = self
             .sessions
-            .tabs
+            .tabs()
             .iter()
             .enumerate()
             .filter_map(|(i, tab)| tab.to_snapshot(i))
@@ -143,34 +134,45 @@ impl App {
         self.find.last_key = Some(std::time::Instant::now());
     }
 
-    /// Cmd+Shift+] — switch to the next tab (wraps around).
-    pub(super) fn next_tab(&mut self) {
-        if self.sessions.tabs.len() <= 1 {
-            return;
+    /// Cmd+Shift+] — switch to the next tab (wraps around). Returns effects
+    /// for the shell to drain: a declarative `TabSwitched` event (for future
+    /// consumers) plus a redraw request.
+    pub(super) fn next_tab(&mut self) -> Vec<Effect> {
+        if self.sessions.len() <= 1 {
+            return Vec::new();
         }
         self.reset_ime_context("next tab");
-        self.sessions.active_tab = (self.sessions.active_tab + 1) % self.sessions.tabs.len();
-        info!(active = self.sessions.active_tab, "switched to next tab");
+        let (new, prev) = self.sessions.next();
+        info!(active = new, "switched to next tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
-        self.request_redraw();
+        vec![
+            Effect::TabSwitched {
+                new_idx: new,
+                prev_idx: prev,
+            },
+            Effect::RequestRedraw,
+        ]
     }
 
-    /// Cmd+Shift+[ — switch to the previous tab (wraps around).
-    pub(super) fn prev_tab(&mut self) {
-        if self.sessions.tabs.len() <= 1 {
-            return;
+    /// Cmd+Shift+[ — switch to the previous tab (wraps around). Returns
+    /// effects for the shell to drain.
+    pub(super) fn prev_tab(&mut self) -> Vec<Effect> {
+        if self.sessions.len() <= 1 {
+            return Vec::new();
         }
         self.reset_ime_context("previous tab");
-        self.sessions.active_tab = if self.sessions.active_tab == 0 {
-            self.sessions.tabs.len() - 1
-        } else {
-            self.sessions.active_tab - 1
-        };
-        info!(active = self.sessions.active_tab, "switched to prev tab");
+        let (new, prev) = self.sessions.prev();
+        info!(active = new, "switched to prev tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
-        self.request_redraw();
+        vec![
+            Effect::TabSwitched {
+                new_idx: new,
+                prev_idx: prev,
+            },
+            Effect::RequestRedraw,
+        ]
     }
 
     pub(super) fn tab_strip_layout(&self) -> Option<crate::layout::TabStripLayout> {
@@ -187,7 +189,7 @@ impl App {
                 padding_x: renderer.padding_x(),
                 chrome_left,
                 traffic_lights_width: renderer.traffic_lights_width(),
-                tab_count: self.sessions.tabs.len(),
+                tab_count: self.sessions.len(),
                 requested_scroll_offset: self.tab_bar.scroll_offset,
             },
         ))
@@ -206,7 +208,7 @@ impl App {
     /// no scroll happens.
     pub(super) fn scroll_active_tab_into_view(&mut self) {
         if let Some(layout) = self.tab_strip_layout() {
-            self.tab_bar.scroll_offset = layout.scroll_offset_for_tab(self.sessions.active_tab);
+            self.tab_bar.scroll_offset = layout.scroll_offset_for_tab(self.sessions.active_idx());
         }
     }
 
@@ -215,7 +217,7 @@ impl App {
     pub(super) fn tab_bar_state(&self) -> TabBarDrawState {
         let labels: Vec<String> = self
             .sessions
-            .tabs
+            .tabs()
             .iter()
             .enumerate()
             .map(|(i, tab)| {
@@ -263,8 +265,8 @@ impl App {
             })
             .collect();
         TabBarDrawState {
-            tab_count: self.sessions.tabs.len(),
-            active_tab: self.sessions.active_tab,
+            tab_count: self.sessions.len(),
+            active_tab: self.sessions.active_idx(),
             labels,
             hovered_tab: self.tab_bar.hovered_tab,
             scroll_offset: self.tab_bar.scroll_offset,
@@ -308,7 +310,7 @@ impl App {
         }
         // Reseed ALL tabs' palettes, not just the active one — otherwise
         // switching tabs shows the old theme's ANSI colors.
-        for tab in &mut self.sessions.tabs {
+        for tab in self.sessions.tabs_mut() {
             if let Some(t) = &mut tab.terminal {
                 t.set_palette(theme.palette);
             }
@@ -326,7 +328,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = &mut self.sessions.tabs[self.sessions.active_tab].terminal {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.set_palette(theme.palette);
         }
         self.config_state.theme_is_dark = dark;
@@ -586,7 +588,7 @@ impl App {
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
         }
-        if let Some(t) = &mut self.sessions.tabs[self.sessions.active_tab].terminal {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.set_palette(theme.palette);
         }
         // v1.0: sync preferred_dark_theme from the freshly loaded config.
@@ -636,7 +638,7 @@ impl App {
         self.config_state.keybindings = config.keybindings();
 
         // Scrollback capacity.
-        if let Some(t) = &mut self.sessions.tabs[self.sessions.active_tab].terminal {
+        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             let cols = t.grid().num_cols;
             t.grid_mut()
                 .scrollback

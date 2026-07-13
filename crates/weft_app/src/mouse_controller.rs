@@ -40,10 +40,7 @@ impl App {
             self.interaction.prompt_dragging = false;
             // A click without drag (anchor == cursor) leaves an empty
             // selection — clear it so the caret shows normally.
-            if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_mut()
-            {
+            if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                 if !t.editor().buffer.has_selection() {
                     // has_selection returns false when anchor==cursor, so
                     // explicitly clear the anchor to drop the empty selection.
@@ -54,9 +51,7 @@ impl App {
         }
 
         let pos = self.pixel_to_grid(_x, _y);
-        self.sessions.tabs[self.sessions.active_tab]
-            .selection_handler
-            .end();
+        self.sessions.active_mut().selection_handler.end();
 
         let btn = match button {
             winit::event::MouseButton::Left => MouseButton::Left,
@@ -81,21 +76,22 @@ impl App {
                 y as f32,
                 drag.grab_offset,
             );
-            self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = offset;
+            self.sessions.active_mut().set_block_scroll(offset);
             self.request_redraw();
             return;
         }
         // v1.0 fix: sync mouse_protocol + sgr_mouse (see handle_mouse_press)
         // so move-event encoding (ButtonEvent/AnyEvent drag reporting) reflects
         // the app's actual mouse mode and report format.
-        if let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal {
-            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
-            self.sessions.tabs[self.sessions.active_tab]
-                .input_handler
-                .mouse_protocol = mp;
-            self.sessions.tabs[self.sessions.active_tab]
-                .input_handler
-                .sgr_mouse = sgr;
+        let modes = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .map(|t| (t.mouse_protocol, t.sgr_mouse));
+        if let Some((mp, sgr)) = modes {
+            self.sessions.active_mut().input_handler.mouse_protocol = mp;
+            self.sessions.active_mut().input_handler.sgr_mouse = sgr;
         }
         // Update popup drag if active (clone to avoid borrow conflict).
         if let Some(drag) = self.interaction.drag_state.clone() {
@@ -150,32 +146,25 @@ impl App {
         // v0.9: extend editor drag-selection inside the prompt box.
         if self.interaction.prompt_dragging {
             if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                    .terminal
-                    .as_mut()
-                {
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                     t.editor_mut().buffer.extend_selection(pos);
                     self.request_redraw();
                 }
             }
         }
 
-        if self.sessions.tabs[self.sessions.active_tab]
-            .selection_handler
-            .selecting
-        {
+        if self.sessions.active_mut().selection_handler.selecting {
             if self.block_view_active() {
                 if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                    self.sessions.tabs[self.sessions.active_tab]
+                    self.sessions
+                        .active_mut()
                         .selection_handler
                         .extend_block_view(bv_pos);
                     self.request_redraw();
                 }
             } else {
                 let pos = self.pixel_to_grid(x, y);
-                self.sessions.tabs[self.sessions.active_tab]
-                    .selection_handler
-                    .extend(pos);
+                self.sessions.active_mut().selection_handler.extend(pos);
                 self.request_redraw();
             }
         }
@@ -293,7 +282,7 @@ impl App {
     pub(super) fn run_context_action(&mut self, block_id: Option<BlockId>, action: &str) {
         let mut clipboard_text = None;
         {
-            let Some(terminal) = &mut self.sessions.tabs[self.sessions.active_tab].terminal else {
+            let Some(terminal) = &mut self.sessions.active_mut().terminal else {
                 return;
             };
 
@@ -383,7 +372,7 @@ impl App {
         // lets the user navigate overflowed tabs via trackpad / wheel.
         if let Some(renderer) = &self.renderer {
             let bar_h = renderer.tab_bar_height();
-            if y as f32 <= bar_h && self.sessions.tabs.len() > 1 {
+            if y as f32 <= bar_h && self.sessions.len() > 1 {
                 let cw = renderer.cell_width() as f32;
                 let scroll_step = cw * 15.0; // scroll ~1 tab width per notch
                 let delta_px = match delta {
@@ -432,9 +421,9 @@ impl App {
         // Short-lived immutable borrow to read the mode flags up-front —
         // avoids holding a long-lived mutable borrow of `terminal` across
         // later accesses to `block_scroll_offset`, `renderer`, etc.
-        let tui_starting = self.sessions.tabs[self.sessions.active_tab].tui_scroll_window_active();
+        let tui_starting = self.sessions.active_mut().tui_scroll_window_active();
         let (mouse_protocol_active, alt_screen_active, app_cursor_keys, mouse_protocol, sgr_mouse) = {
-            let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+            let Some(t) = self.sessions.active().terminal.as_ref() else {
                 return;
             };
             // v1.0 fix: capture mouse_protocol here and sync it into the
@@ -458,15 +447,9 @@ impl App {
         // Apply all terminal-controlled input modes before encoding this
         // gesture. Vim/less commonly enable DECCKM before the first wheel;
         // using a stale default would emit CSI arrows instead of SS3 arrows.
-        self.sessions.tabs[self.sessions.active_tab]
-            .input_handler
-            .app_cursor_keys = app_cursor_keys;
-        self.sessions.tabs[self.sessions.active_tab]
-            .input_handler
-            .mouse_protocol = mouse_protocol;
-        self.sessions.tabs[self.sessions.active_tab]
-            .input_handler
-            .sgr_mouse = sgr_mouse;
+        self.sessions.active_mut().input_handler.app_cursor_keys = app_cursor_keys;
+        self.sessions.active_mut().input_handler.mouse_protocol = mouse_protocol;
+        self.sessions.active_mut().input_handler.sgr_mouse = sgr_mouse;
 
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
@@ -485,11 +468,13 @@ impl App {
             if self.interaction.mods.state().control_key() {
                 m |= Modifiers::CONTROL;
             }
-            if let Some(bytes) = self.sessions.tabs[self.sessions.active_tab]
+            if let Some(bytes) = self
+                .sessions
+                .active_mut()
                 .input_handler
                 .encode_scroll(up, pos.col, pos.row, m)
             {
-                if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
+                if let Some(pty) = &self.sessions.active_mut().pty {
                     let _ = pty.write_sync(&bytes);
                 }
             }
@@ -519,12 +504,12 @@ impl App {
             if self.interaction.mods.state().control_key() {
                 m |= Modifiers::CONTROL;
             }
-            if self.sessions.tabs[self.sessions.active_tab]
+            if self
+                .sessions
+                .active_mut()
                 .queue_tui_scroll(rows, pos.col, pos.row, m)
             {
-                if let Some(delay) =
-                    self.sessions.tabs[self.sessions.active_tab].take_tui_scroll_wake_delay()
-                {
+                if let Some(delay) = self.sessions.active_mut().take_tui_scroll_wake_delay() {
                     let proxy = self.proxy.clone();
                     std::thread::spawn(move || {
                         std::thread::sleep(delay);
@@ -548,15 +533,13 @@ impl App {
             if self.interaction.mods.state().shift_key() {
                 m |= Modifiers::SHIFT;
             }
-            let single = self.sessions.tabs[self.sessions.active_tab]
-                .input_handler
-                .encode_key(key, m);
+            let single = self.sessions.active_mut().input_handler.encode_key(key, m);
             if !single.is_empty() {
                 let mut batch = Vec::with_capacity(single.len() * lines);
                 for _ in 0..lines {
                     batch.extend_from_slice(&single);
                 }
-                if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
+                if let Some(pty) = &self.sessions.active_mut().pty {
                     let _ = pty.write_sync(&batch);
                 }
             }
@@ -580,7 +563,9 @@ impl App {
         }
         let up = rows > 0;
         let lines = rows.unsigned_abs() as usize;
-        let block_view = self.sessions.tabs[self.sessions.active_tab]
+        let block_view = self
+            .sessions
+            .active_mut()
             .terminal
             .as_ref()
             .is_some_and(Terminal::show_block_view);
@@ -597,7 +582,7 @@ impl App {
             // so we can later mutate `block_scroll_offset` (same Tab, but a
             // disjoint field — allowed once the immutable borrow ends).
             let (total, prompt_lines) = {
-                let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+                let Some(t) = self.sessions.active().terminal.as_ref() else {
                     return;
                 };
                 let cols = t.grid().num_cols;
@@ -616,20 +601,15 @@ impl App {
                 .unwrap_or(1);
             let max_scroll = total.saturating_sub(visible);
             if up {
-                self.sessions.tabs[self.sessions.active_tab].block_scroll_offset =
-                    self.sessions.tabs[self.sessions.active_tab]
-                        .block_scroll_offset
-                        .saturating_add(scroll_lines)
-                        .min(max_scroll);
+                let tab = self.sessions.active_mut();
+                tab.scroll_up_by(scroll_lines);
+                tab.clamp_block_scroll(max_scroll);
             } else {
-                self.sessions.tabs[self.sessions.active_tab].block_scroll_offset =
-                    self.sessions.tabs[self.sessions.active_tab]
-                        .block_scroll_offset
-                        .saturating_sub(scroll_lines);
+                self.sessions.active_mut().scroll_down_by(scroll_lines);
             }
         } else {
             // Grid view scroll — needs mutable terminal.
-            if let Some(terminal) = &mut self.sessions.tabs[self.sessions.active_tab].terminal {
+            if let Some(terminal) = &mut self.sessions.active_mut().terminal {
                 let grid = &mut terminal.grid_mut();
                 if up {
                     grid.scroll_up_history(lines);
@@ -643,7 +623,7 @@ impl App {
 
     /// Send a mouse event to the PTY if mouse protocol is active.
     pub(super) fn send_mouse_event(&self, button: MouseButton, action: MouseAction, pos: GridPos) {
-        let Some(terminal) = &self.sessions.tabs[self.sessions.active_tab].terminal else {
+        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
             return;
         };
         if terminal.mouse_protocol == MouseProtocol::Off {
@@ -659,11 +639,13 @@ impl App {
         if self.interaction.mods.state().control_key() {
             m |= Modifiers::CONTROL;
         }
-        if let Some(bytes) = self.sessions.tabs[self.sessions.active_tab]
+        let bytes = self
+            .sessions
+            .active()
             .input_handler
-            .encode_mouse(button, action, pos.col, pos.row, m)
-        {
-            if let Some(pty) = &self.sessions.tabs[self.sessions.active_tab].pty {
+            .encode_mouse(button, action, pos.col, pos.row, m);
+        if let Some(bytes) = bytes {
+            if let Some(pty) = &self.sessions.active().pty {
                 let _ = pty.write_sync(&bytes);
             }
         }

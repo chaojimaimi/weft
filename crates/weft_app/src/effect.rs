@@ -39,15 +39,43 @@ pub(crate) enum Effect {
     /// Request application exit. Sets `should_exit`; the actual
     /// `event_loop.exit()` still happens in the winit callback tail.
     Exit,
+    /// A tab was closed. `removed_idx` is the old position; `new_active` is
+    /// the now-active tab; `is_last` signals the last tab was closed (app
+    /// should exit). The synchronous mutation already happened in
+    /// SessionManager; this effect lets the app shell run post-close hooks
+    /// (IME reset, find refresh, tab bar scroll) in one place.
+    TabClosed {
+        removed_idx: usize,
+        new_active: usize,
+        is_last: bool,
+    },
+    /// The active tab switched. `new_idx` / `prev_idx` are the tab positions.
+    /// The synchronous `active_tab` mutation already happened in
+    /// SessionManager; this effect lets the app shell run post-switch hooks.
+    TabSwitched {
+        new_idx: usize,
+        prev_idx: usize,
+    },
     RequestRedraw,
 }
 
-pub(crate) fn close_tab_effects(last_tab: bool) -> Vec<Effect> {
+pub(crate) fn close_tab_effects(
+    removed_idx: usize,
+    new_active: usize,
+    last_tab: bool,
+) -> Vec<Effect> {
+    let mut effects = vec![Effect::TabClosed {
+        removed_idx,
+        new_active,
+        is_last: last_tab,
+    }];
     if last_tab {
-        vec![Effect::Exit, Effect::PersistTabs]
+        effects.push(Effect::Exit);
     } else {
-        vec![Effect::RequestRedraw, Effect::PersistTabs]
+        effects.push(Effect::RequestRedraw);
     }
+    effects.push(Effect::PersistTabs);
+    effects
 }
 
 pub(crate) fn process_message_effects(
@@ -239,10 +267,31 @@ mod tests {
 
     #[test]
     fn close_tab_effects_preserve_exit_persist_and_redraw_order() {
-        assert_eq!(close_tab_effects(true), [Effect::Exit, Effect::PersistTabs]);
+        // Last tab: TabClosed (is_last=true) + Exit + PersistTabs.
         assert_eq!(
-            close_tab_effects(false),
-            [Effect::RequestRedraw, Effect::PersistTabs]
+            close_tab_effects(0, 0, true),
+            [
+                Effect::TabClosed {
+                    removed_idx: 0,
+                    new_active: 0,
+                    is_last: true
+                },
+                Effect::Exit,
+                Effect::PersistTabs,
+            ]
+        );
+        // Non-last tab: TabClosed (is_last=false) + RequestRedraw + PersistTabs.
+        assert_eq!(
+            close_tab_effects(2, 1, false),
+            [
+                Effect::TabClosed {
+                    removed_idx: 2,
+                    new_active: 1,
+                    is_last: false
+                },
+                Effect::RequestRedraw,
+                Effect::PersistTabs,
+            ]
         );
     }
 

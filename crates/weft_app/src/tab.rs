@@ -38,7 +38,8 @@ pub struct Tab {
     pub selection_handler: SelectionHandler,
     pub ime_preedit: String,
     pub pending_pty_resize: Option<(usize, usize)>,
-    pub block_scroll_offset: usize,
+    /// M3.5: private — use the block-scroll API methods below instead.
+    block_scroll_offset: usize,
     /// Wheel rows received while a TUI command is starting but before its
     /// alternate-screen sequence has reached the parser. Replayed once the
     /// alt screen becomes active, so the first trackpad gesture is not lost.
@@ -108,7 +109,7 @@ impl Tab {
     }
 
     /// Empty tab (used when PTY spawn fails — terminal/pty stay None).
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             terminal: None,
@@ -415,7 +416,7 @@ impl Tab {
         Some(weft_core::persistence::TabSnapshot {
             position,
             cwd,
-            block_scroll_offset: self.block_scroll_offset,
+            block_scroll_offset: self.block_scroll(),
             editor_buffer,
             shell_phase: shell_phase.to_string(),
         })
@@ -442,6 +443,43 @@ impl Tab {
                 tracing::warn!("failed to deserialize editor buffer; using empty");
                 false
             }
+        }
+    }
+
+    // ── Block-scroll API (M3.5) ──────────────────────────────────────
+    // Encapsulates block_scroll_offset writes so controllers don't set
+    // the field directly. Each method encodes one intent.
+
+    /// Current block-scroll offset (0 = bottom / most recent).
+    pub fn block_scroll(&self) -> usize {
+        self.block_scroll_offset
+    }
+
+    /// Set the block-scroll offset to an exact value (clamped to 0).
+    pub fn set_block_scroll(&mut self, offset: usize) {
+        self.block_scroll_offset = offset;
+    }
+
+    /// Scroll to bottom (offset = 0, the most recent content).
+    pub fn snap_to_bottom(&mut self) {
+        self.block_scroll_offset = 0;
+    }
+
+    /// Scroll up by `rows` (away from bottom, offset increases).
+    pub fn scroll_up_by(&mut self, rows: usize) {
+        self.block_scroll_offset = self.block_scroll_offset.saturating_add(rows);
+    }
+
+    /// Scroll down by `rows` (toward bottom, offset decreases).
+    pub fn scroll_down_by(&mut self, rows: usize) {
+        self.block_scroll_offset = self.block_scroll_offset.saturating_sub(rows);
+    }
+
+    /// Clamp the offset to `max_scroll` (called after the terminal updates
+    /// its block count so offset can't point past the last block).
+    pub fn clamp_block_scroll(&mut self, max_scroll: usize) {
+        if self.block_scroll_offset > max_scroll {
+            self.block_scroll_offset = max_scroll;
         }
     }
 }
@@ -482,7 +520,7 @@ mod tests {
     #[test]
     fn empty_tab_has_zero_block_scroll() {
         let t = Tab::empty();
-        assert_eq!(t.block_scroll_offset, 0);
+        assert_eq!(t.block_scroll(), 0);
     }
 
     #[test]
@@ -634,7 +672,7 @@ mod tests {
     #[test]
     fn snapshot_roundtrip_preserves_scroll_offset_and_editor() {
         let mut t = tab_with_terminal(1000);
-        t.block_scroll_offset = 7;
+        t.set_block_scroll(7);
         t.terminal
             .as_mut()
             .unwrap()
@@ -650,7 +688,7 @@ mod tests {
         // Restore into a fresh tab.
         let mut restored = tab_with_terminal(1000);
         assert!(restored.restore_from_snapshot(&snap));
-        assert_eq!(restored.block_scroll_offset, 7);
+        assert_eq!(restored.block_scroll(), 7);
         let editor_text = restored.terminal.as_ref().unwrap().editor().buffer.text();
         assert_eq!(editor_text, "echo hi");
     }
@@ -684,7 +722,7 @@ mod tests {
         };
         assert!(!t.restore_from_snapshot(&snap));
         // scroll offset still applied even if editor restore failed.
-        assert_eq!(t.block_scroll_offset, 3);
+        assert_eq!(t.block_scroll(), 3);
         let editor_text = t.terminal.as_ref().unwrap().editor().buffer.text();
         assert!(editor_text.is_empty());
     }

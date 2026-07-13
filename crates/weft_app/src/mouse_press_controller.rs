@@ -11,14 +11,15 @@ impl App {
         // tmux, htop) never receive clicks/drags. sgr_mouse selects the report
         // format (SGR-1006 vs legacy) — sending the wrong format corrupts the
         // app (vim `~@k`). Mirrors the scroll-path sync.
-        if let Some(t) = &self.sessions.tabs[self.sessions.active_tab].terminal {
-            let (mp, sgr) = (t.mouse_protocol, t.sgr_mouse);
-            self.sessions.tabs[self.sessions.active_tab]
-                .input_handler
-                .mouse_protocol = mp;
-            self.sessions.tabs[self.sessions.active_tab]
-                .input_handler
-                .sgr_mouse = sgr;
+        let modes = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .map(|t| (t.mouse_protocol, t.sgr_mouse));
+        if let Some((mp, sgr)) = modes {
+            self.sessions.active_mut().input_handler.mouse_protocol = mp;
+            self.sessions.active_mut().input_handler.sgr_mouse = sgr;
         }
         // v1.0 S1-b: Settings panel click handling — checked first so
         // settings clicks work even inside TUI apps that captured the mouse
@@ -114,15 +115,12 @@ impl App {
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Close(idx)) => {
-                            if idx == self.sessions.active_tab {
+                            if idx == self.sessions.active_idx() {
                                 let effects = self.close_tab();
                                 self.drain_effects(effects);
                             } else {
                                 // Close a background tab — remove and adjust index.
-                                self.sessions.tabs.remove(idx);
-                                if idx < self.sessions.active_tab {
-                                    self.sessions.active_tab -= 1;
-                                }
+                                self.sessions.close_background(idx);
                                 self.tab_bar.hovered_tab = None;
                                 self.request_redraw();
                                 self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
@@ -130,9 +128,9 @@ impl App {
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Tab(hit_index)) => {
-                            if self.sessions.active_tab != hit_index {
+                            if self.sessions.active_idx() != hit_index {
                                 self.reset_ime_context("tab clicked");
-                                self.sessions.active_tab = hit_index;
+                                self.sessions.switch_to(hit_index);
                                 self.refresh_find_for_active_tab();
                             }
                             self.tab_bar.hovered_tab = None;
@@ -243,7 +241,7 @@ impl App {
                         yf,
                         grab_offset,
                     );
-                    self.sessions.tabs[self.sessions.active_tab].block_scroll_offset = offset;
+                    self.sessions.active_mut().set_block_scroll(offset);
                     self.interaction.scrollbar_drag =
                         Some(crate::scrollbar_component::ScrollbarDragState {
                             layout,
@@ -253,9 +251,7 @@ impl App {
                     if let Some(window) = &self.window {
                         window.set_cursor(winit::window::CursorIcon::NsResize);
                     }
-                    self.sessions.tabs[self.sessions.active_tab]
-                        .selection_handler
-                        .clear();
+                    self.sessions.active_mut().selection_handler.clear();
                     self.request_redraw();
                     return;
                 }
@@ -284,10 +280,7 @@ impl App {
                             && yf < row.y_bottom
                         {
                             if let Some(bid) = row.block_id {
-                                if let Some(term) = self.sessions.tabs[self.sessions.active_tab]
-                                    .terminal
-                                    .as_mut()
-                                {
+                                if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
                                     term.block_tracker_mut().toggle_collapse(bid);
                                     self.request_redraw();
                                 }
@@ -399,24 +392,16 @@ impl App {
                 .unwrap_or(false);
             if in_prompt {
                 if let Some(pos) = self.pixel_to_editor_pos(x, y) {
-                    if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                        .terminal
-                        .as_mut()
-                    {
+                    if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                         t.editor_mut().buffer.start_selection(pos);
                     }
                     self.interaction.prompt_dragging = true;
                     // Clear any block/grid selection so Cmd+C targets the editor.
-                    self.sessions.tabs[self.sessions.active_tab]
-                        .selection_handler
-                        .clear();
+                    self.sessions.active_mut().selection_handler.clear();
                     self.request_redraw();
                 }
                 return;
-            } else if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                .terminal
-                .as_mut()
-            {
+            } else if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                 if t.editor().buffer.has_selection() {
                     t.editor_mut().buffer.clear_selection();
                     self.request_redraw();
@@ -439,7 +424,8 @@ impl App {
                         // update re-lays-out the view mid-drag.
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
                             let rows_snapshot = self.compute_block_view_rows();
-                            self.sessions.tabs[self.sessions.active_tab]
+                            self.sessions
+                                .active_mut()
                                 .selection_handler
                                 .start_block_view(bv_pos, rows_snapshot);
                         } else {
@@ -447,9 +433,7 @@ impl App {
                             // prompt box, CWD bar, or empty padding). Clear the
                             // existing selection so the user gets visual
                             // feedback that the previous selection is gone.
-                            self.sessions.tabs[self.sessions.active_tab]
-                                .selection_handler
-                                .clear();
+                            self.sessions.active_mut().selection_handler.clear();
                         }
                     } else {
                         // Grid view (alt-screen): classic grid selection.
@@ -459,7 +443,8 @@ impl App {
                         } else {
                             SelectionMode::Simple
                         };
-                        self.sessions.tabs[self.sessions.active_tab]
+                        self.sessions
+                            .active_mut()
                             .selection_handler
                             .start(pos, mode);
                     }
@@ -474,7 +459,7 @@ impl App {
             winit::event::MouseButton::Middle => {
                 // Middle click: paste
                 self.drain_effects(vec![crate::effect::Effect::Paste {
-                    tab: self.sessions.active_tab,
+                    tab: self.sessions.active_idx(),
                 }]);
                 let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
@@ -505,35 +490,40 @@ impl App {
                     // Right click: extend selection.
                     if block_view {
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            if self.sessions.tabs[self.sessions.active_tab]
+                            if self
+                                .sessions
+                                .active_mut()
                                 .selection_handler
                                 .block_view_selection
                                 .is_none()
                             {
                                 let rows_snapshot = self.compute_block_view_rows();
-                                self.sessions.tabs[self.sessions.active_tab]
+                                self.sessions
+                                    .active_mut()
                                     .selection_handler
                                     .start_block_view(bv_pos, rows_snapshot);
                             } else {
-                                self.sessions.tabs[self.sessions.active_tab]
+                                self.sessions
+                                    .active_mut()
                                     .selection_handler
                                     .extend_block_view(bv_pos);
                             }
                         }
                     } else {
                         let pos = self.pixel_to_grid(x, y);
-                        if self.sessions.tabs[self.sessions.active_tab]
+                        if self
+                            .sessions
+                            .active_mut()
                             .selection_handler
                             .selection
                             .is_none()
                         {
-                            self.sessions.tabs[self.sessions.active_tab]
+                            self.sessions
+                                .active_mut()
                                 .selection_handler
                                 .start(pos, SelectionMode::Simple);
                         } else {
-                            self.sessions.tabs[self.sessions.active_tab]
-                                .selection_handler
-                                .extend(pos);
+                            self.sessions.active_mut().selection_handler.extend(pos);
                         }
                     }
                 }

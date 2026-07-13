@@ -11,20 +11,16 @@ impl App {
                 // focus owner. Any overlay suppresses terminal preedit;
                 // Settings intentionally has no text target yet.
                 if self.overlay_input_owner().is_some() {
-                    self.sessions.tabs[self.sessions.active_tab]
-                        .ime_preedit
-                        .clear();
+                    self.sessions.active_mut().ime_preedit.clear();
                 } else {
-                    self.sessions.tabs[self.sessions.active_tab].ime_preedit = text;
+                    self.sessions.active_mut().ime_preedit = text;
                 }
             }
             winit::event::Ime::Commit(text) => {
-                self.sessions.tabs[self.sessions.active_tab]
-                    .ime_preedit
-                    .clear();
+                self.sessions.active_mut().ime_preedit.clear();
                 if !text.is_empty() {
                     tracing::debug!(
-                        tab = self.sessions.active_tab,
+                        tab = self.sessions.active_idx(),
                         len = text.len(),
                         "routing fresh IME commit"
                     );
@@ -53,17 +49,16 @@ impl App {
                             self.request_redraw();
                         }
                         None => {
-                            let mode = self.sessions.tabs[self.sessions.active_tab]
+                            let mode = self
+                                .sessions
+                                .active_mut()
                                 .terminal
                                 .as_ref()
                                 .map(|t| t.effective_input_mode())
                                 .unwrap_or(weft_core::input::InputMode::Passthrough);
                             if mode == weft_core::input::InputMode::Editor {
                                 // Editor takeover: composed text goes into the box.
-                                if let Some(t) = self.sessions.tabs[self.sessions.active_tab]
-                                    .terminal
-                                    .as_mut()
-                                {
+                                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                                     for c in text.chars() {
                                         t.editor_mut().buffer.insert_char(c);
                                     }
@@ -95,7 +90,7 @@ impl App {
                                 // because `swap_alt` doesn't save/restore
                                 // it, so we must not consult it here.)
                                 let effects =
-                                    effect::ime_commit_effects(self.sessions.active_tab, &text);
+                                    effect::ime_commit_effects(self.sessions.active_idx(), &text);
                                 self.drain_effects(effects);
                             }
                         }
@@ -103,7 +98,7 @@ impl App {
                 }
             }
             winit::event::Ime::Disabled => {
-                for tab in &mut self.sessions.tabs {
+                for tab in self.sessions.tabs_mut() {
                     tab.ime_preedit.clear();
                 }
             }

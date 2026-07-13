@@ -42,7 +42,7 @@ impl App {
                         // (<1ms) so doing it on every intermediate event is
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
-                        for tab in &mut self.sessions.tabs {
+                        for tab in self.sessions.tabs_mut() {
                             if let Some(terminal) = &mut tab.terminal {
                                 terminal.resize(new_rows, new_cols);
                             }
