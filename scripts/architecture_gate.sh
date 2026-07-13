@@ -18,10 +18,11 @@ APP_SRC=(crates/weft_app/src)
 CORE_SRC=(crates/weft_core/src)
 
 # File budget: production .rs files must stay <= 800 lines.
-# Exceptions: tests.rs files (pure test code) and files with an inline
-# `// arch-gate: allow-over-800` comment explaining why the size is
-# intrinsic and cannot be further reduced.
+# Exceptions: tests.rs files (pure test code) and files listed in the central
+# budget file. Each listed file has a frozen ceiling, so an exception cannot
+# silently grow and a new inline source comment cannot authorize itself.
 MAX_LINES=800
+BUDGET_FILE="scripts/architecture_allowlist.txt"
 
 # Layering: weft_core must NOT depend on weft_app (no `use weft_app::`
 # anywhere in weft_core). This prevents the core terminal emulation layer
@@ -40,17 +41,58 @@ while IFS= read -r -d '' file; do
 
     lines=$(wc -l < "$file" | tr -d ' ')
     if [ "$lines" -gt "$MAX_LINES" ]; then
-        # Check for inline allow comment.
-        if ! grep -q '// arch-gate: allow-over-800' "$file"; then
+        entry=$(awk -F '|' -v path="$file" '$1 == path { print; exit }' "$BUDGET_FILE")
+        if [ -z "$entry" ]; then
             echo "  FAIL: $file is $lines lines (limit $MAX_LINES)"
-            echo "         Add '// arch-gate: allow-over-800' with justification"
-            echo "         if the size is intrinsic (e.g. large impl block)."
+            echo "         Add an audited ceiling and reason to $BUDGET_FILE."
             failures=$((failures + 1))
         else
-            echo "  OK (allowed): $file ($lines lines)"
+            IFS='|' read -r _ allowed_max reason <<< "$entry"
+            case "$allowed_max" in
+                ''|*[!0-9]*)
+                    echo "  FAIL: invalid ceiling '$allowed_max' for $file in $BUDGET_FILE"
+                    failures=$((failures + 1))
+                    continue
+                    ;;
+            esac
+            if [ "$lines" -gt "$allowed_max" ]; then
+                echo "  FAIL: $file grew to $lines lines (audited ceiling $allowed_max)"
+                echo "         Reason: $reason"
+                failures=$((failures + 1))
+            else
+                echo "  OK (budgeted): $file ($lines/$allowed_max lines)"
+            fi
         fi
     fi
 done < <(find crates -name "*.rs" -not -path "*/target/*" -print0)
+
+echo "==> Architecture gate: budget inventory"
+
+while IFS='|' read -r file allowed_max reason; do
+    case "$file" in
+        ''|'#'*) continue ;;
+    esac
+    if [ ! -f "$file" ]; then
+        echo "  FAIL: budget entry points to missing file: $file"
+        failures=$((failures + 1))
+        continue
+    fi
+    case "$allowed_max" in
+        ''|*[!0-9]*)
+            echo "  FAIL: invalid ceiling '$allowed_max' for $file"
+            failures=$((failures + 1))
+            continue
+            ;;
+    esac
+    if [ -z "$reason" ]; then
+        echo "  FAIL: budget entry has no reason: $file"
+        failures=$((failures + 1))
+    fi
+done < "$BUDGET_FILE"
+
+if [ "$failures" -eq 0 ]; then
+    echo "  OK: centralized budget inventory is valid"
+fi
 
 echo "==> Architecture gate: layering (weft_core must not depend on weft_app)"
 

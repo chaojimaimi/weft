@@ -1,0 +1,22 @@
+# Centralized production-file budgets for files that currently exceed 800 lines.
+# Format: path|max_lines|reason
+#
+# The ceiling is the audited 2026-07-14 size. A listed file may shrink, but it
+# may not grow beyond its ceiling. New exceptions require an explicit review of
+# this file instead of a self-authorizing comment in the Rust source.
+crates/weft_app/src/glyph.rs|1271|CoreText rasterization, fallback, atlas cache, and transform probes remain coupled
+crates/weft_app/src/layout.rs|1862|Shared pure geometry and its colocated regression tests await domain splitting
+crates/weft_app/src/main.rs|2437|Legacy App shell is reduced from 7316 lines but still awaits the second extraction pass
+crates/weft_app/src/mouse_controller.rs|811|Pointer routing and drag state are still coupled at the App controller boundary
+crates/weft_app/src/overlay.rs|888|Overlay models and compatibility draw parameters await final component ownership cleanup
+crates/weft_app/src/paint/block_view.rs|1080|Block layout, selection snapshot, paint, and hit output still share one implementation
+crates/weft_app/src/paint/command_surface.rs|1198|Shared command-surface shell, state, keyboard protocol, and tests are colocated
+crates/weft_app/src/paint/settings.rs|817|Responsive Settings painter and row helpers are kept together pending GUI acceptance
+crates/weft_app/src/renderer.rs|980|Thin frame orchestration and Metal-owned caches remain after backend extraction
+crates/weft_core/src/blocks.rs|829|Block tracker state machine and persistence-facing model remain one domain
+crates/weft_core/src/config/mod.rs|1567|Config facade still contains the legacy compatibility and integration test suite
+crates/weft_core/src/config/theme.rs|853|Built-in theme constructors are intentionally data-heavy
+crates/weft_core/src/editor.rs|1107|Editor state machine and behavior tests remain one domain
+crates/weft_core/src/find.rs|977|Grid and block search algorithms plus tests remain one domain
+crates/weft_core/src/grid/mod.rs|1228|Core Grid implementation remains cohesive after cell, row, cursor, and scrollback extraction
+crates/weft_core/src/vt/mod.rs|835|Terminal state and parser facade remain cohesive after Perform and OSC extraction

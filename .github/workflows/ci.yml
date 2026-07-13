@@ -50,3 +50,6 @@ jobs:
 
       - name: Verify .app bundle
         run: ./scripts/build-app.sh
+
+      - name: Acceptance preflight
+        run: ./scripts/acceptance_preflight.sh
