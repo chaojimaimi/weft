@@ -52,6 +52,7 @@ impl App {
                         }
                         Some(OverlayInputOwner::PanelSearch) => {
                             self.panel.query.push_str(&text);
+                            self.clamp_panel_scroll();
                             self.clamp_panel_selection();
                             self.request_redraw();
                         }

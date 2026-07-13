@@ -7,6 +7,7 @@ impl App {
         self.pump_pty();
         let had_output = self.process_messages();
         self.update_cursor_blink();
+        self.update_spinner();
         // FindInGrid debounce: when 150ms have elapsed since the last
         // keystroke, run the search and update `find_matches`.
         self.maybe_refresh_find_results();
@@ -227,6 +228,7 @@ impl App {
                 self.panel.selection,
                 self.panel.expanded,
                 self.panel.search_focused,
+                self.panel.scroll_offset,
                 &tab.ime_preedit,
                 tab.ime_preedit_cursor,
                 self.palette.open,
@@ -362,6 +364,18 @@ impl App {
                 }
             }
             renderer.panel_highlight = self.panel.highlight;
+            renderer.block_hovered = self.interaction.block_hovered;
+            renderer.reduce_motion = self.window_runtime.reduce_motion;
+            // F3-2: compute spinner phase for the running-command indicator.
+            // Only active when a command is executing in block view and the
+            // user hasn't enabled Reduce Motion.
+            let is_running = terminal.block_tracker().phase() == ShellPhase::CommandExecuting;
+            let spinner_phase = if is_running && !self.window_runtime.reduce_motion {
+                self.window_runtime.spinner_phase
+            } else {
+                -1.0
+            };
+            renderer.spinner_phase = spinner_phase;
             // Pause cursor blink while the user is actively selecting
             // OR while a selection is visible (not yet cleared). A
             // moving or persistent selection is the focus of attention;
@@ -398,6 +412,13 @@ impl App {
             self.window_runtime
                 .cursor_anim_active
                 .store(anim_active, Ordering::Relaxed);
+            // F3-2: keep the spinner timer running while a command is executing
+            // so the braille activity indicator animates even without PTY output.
+            let spinner_active = terminal.block_tracker().phase() == ShellPhase::CommandExecuting
+                && !self.window_runtime.reduce_motion;
+            self.window_runtime
+                .spinner_anim_active
+                .store(spinner_active, Ordering::Relaxed);
         }
 
         // v1.0 P0-b: clear the grid's per-row dirty flags now that

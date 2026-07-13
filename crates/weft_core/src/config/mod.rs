@@ -60,7 +60,7 @@ pub use parsers::{parse_binding, parse_hex};
 pub use save::ConfigSaveError;
 pub use sections::{
     EditorConfig, FontConfig, LogoConfig, LogoVariant, ScrollbackConfig, SyntaxConfig, ThemeConfig,
-    WindowConfig,
+    WindowConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{SyntaxColors, Theme};
 
@@ -94,10 +94,17 @@ impl Config {
             return Self::default();
         };
         match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-                tracing::warn!(path = %path.display(), error = %e, "failed to parse config; using defaults");
-                Self::default()
-            }),
+            Ok(text) => {
+                let mut cfg: Config = toml::from_str(&text).unwrap_or_else(|e| {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to parse config; using defaults");
+                    Self::default()
+                });
+                // F3-3: clamp user-provided sidebar_width to the valid range.
+                if let Some(w) = cfg.window.sidebar_width {
+                    cfg.window.sidebar_width = Some(w.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
+                }
+                cfg
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "failed to read config; using defaults");
@@ -247,6 +254,19 @@ impl Config {
             self.window.padding_y,
             default_window.padding_y,
         );
+        // F3-3: sidebar_width (Option<f32>, logical points). Only write when
+        // Some (user has dragged the sidebar). When None, remove any stale
+        // entry so the responsive default takes effect on reload.
+        match self.window.sidebar_width {
+            Some(w) => {
+                window["sidebar_width"] = toml_edit::value(f64::from(w));
+            }
+            None => {
+                if window.contains_key("sidebar_width") {
+                    window.remove("sidebar_width");
+                }
+            }
+        }
 
         // [scrollback] section.
         let default_scrollback = ScrollbackConfig::default();

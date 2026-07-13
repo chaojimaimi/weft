@@ -10,6 +10,25 @@ use weft_core::grid::Color;
 pub const MIN_WINDOW_WIDTH: f64 = 360.0;
 pub const MIN_WINDOW_HEIGHT: f64 = 240.0;
 
+/// F3-3: Re-export the sidebar width bounds defined in weft_core::config so
+/// app-level helpers and config load share one source of truth.
+pub use weft_core::config::{SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
+
+/// F3-3: Clamp a candidate sidebar width (logical points) to the allowed
+/// range. Pure function so drag-move, config load, and `set_sidebar_width`
+/// share one source of truth.
+pub fn clamp_sidebar_width(width: f32) -> f32 {
+    width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+}
+
+/// F3-3: Pure hit-test for the sidebar's right-edge resize handle. Returns
+/// `true` when `x` is within `tolerance` px of `edge` and `y` is inside the
+/// viewport's vertical extent. Extracted from `App::sidebar_resize_hit` so
+/// the geometry is unit-testable without an `App` instance.
+pub fn sidebar_edge_hit(x: f32, edge: f32, tolerance: f32, vp_h: f32, y: f32) -> bool {
+    (x - edge).abs() <= tolerance && y >= 0.0 && y <= vp_h
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResponsiveClass {
     Compact,
@@ -83,6 +102,11 @@ pub struct UiColors {
     pub success: Color,
     pub warning: Color,
     pub error: Color,
+    /// F3-5: Find/replace match highlight color (translucent yellow). The
+    /// renderer applies a 0.50 alpha overlay so the matched text stays
+    /// readable underneath. Kept distinct from `warning` so theme tweaks
+    /// don't accidentally change find highlighting.
+    pub find_match: Color,
 }
 
 impl UiColors {
@@ -118,6 +142,11 @@ impl UiColors {
             } else {
                 Color::rgb(180, 45, 45)
             },
+            find_match: if dark {
+                Color::rgb(242, 199, 51)
+            } else {
+                Color::rgb(200, 150, 0)
+            },
         }
     }
 }
@@ -146,7 +175,10 @@ fn mix(from: Color, to: Color, amount: f32) -> Color {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResponsiveClass, SidebarMetrics, UiColors, UiMetrics};
+    use super::{
+        clamp_sidebar_width, sidebar_edge_hit, ResponsiveClass, SidebarMetrics, UiColors,
+        UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    };
     use weft_core::config::Theme;
 
     #[test]
@@ -203,6 +235,54 @@ mod tests {
             assert_eq!(colors.focus, theme.accent);
             assert_ne!(colors.success, colors.error);
             assert_ne!(colors.warning, colors.error);
+            // F3-5: find_match must be visible against the canvas background.
+            assert_ne!(colors.find_match, colors.canvas);
         }
+    }
+
+    #[test]
+    fn sidebar_width_bounds_are_consistent_with_metrics() {
+        // The clamp range must cover the Regular/Wide panel_width range so a
+        // drag can't produce a width narrower than the responsive default.
+        let regular = SidebarMetrics::for_logical_width(900.0);
+        let wide = SidebarMetrics::for_logical_width(1600.0);
+        assert!(regular.panel_width >= SIDEBAR_MIN_WIDTH);
+        assert!(wide.panel_width <= SIDEBAR_MAX_WIDTH);
+    }
+
+    #[test]
+    fn clamp_sidebar_width_enforces_range() {
+        // Below min → min, above max → max, in-range unchanged.
+        assert_eq!(clamp_sidebar_width(0.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(100.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(SIDEBAR_MIN_WIDTH), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(300.0), 300.0);
+        assert_eq!(clamp_sidebar_width(SIDEBAR_MAX_WIDTH), SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(999.0), SIDEBAR_MAX_WIDTH);
+        // NaN must not slip through (clamp keeps NaN, so callers must guard
+        // their inputs; document that contract here).
+        assert!(clamp_sidebar_width(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn sidebar_edge_hit_detects_within_tolerance_and_vertical_extent() {
+        let edge = 240.0_f32;
+        let vp_h = 800.0_f32;
+        let tol = 4.0_f32;
+
+        // Exactly on edge.
+        assert!(sidebar_edge_hit(edge, edge, tol, vp_h, 100.0));
+        // Just inside tolerance (±4 px).
+        assert!(sidebar_edge_hit(edge - 4.0, edge, tol, vp_h, 0.0));
+        assert!(sidebar_edge_hit(edge + 4.0, edge, tol, vp_h, vp_h));
+        // Just outside tolerance.
+        assert!(!sidebar_edge_hit(edge - 4.001, edge, tol, vp_h, 100.0));
+        assert!(!sidebar_edge_hit(edge + 4.001, edge, tol, vp_h, 100.0));
+        // Above viewport top.
+        assert!(!sidebar_edge_hit(edge, edge, tol, vp_h, -0.001));
+        // Below viewport bottom.
+        assert!(!sidebar_edge_hit(edge, edge, tol, vp_h, vp_h + 0.001));
+        // Far from edge horizontally.
+        assert!(!sidebar_edge_hit(500.0, edge, tol, vp_h, 100.0));
     }
 }

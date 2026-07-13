@@ -3,17 +3,51 @@
 use super::*;
 
 impl App {
-    /// Count of blocks visible in the panel (newest-first, query-filtered).
+    /// F3-4: Maximum number of block rows that fit in the panel's visible list
+    /// area, based on the renderer's actual viewport and cell height. Falls
+    /// back to the grid row count when the renderer isn't available yet.
+    fn panel_max_visible(&self) -> usize {
+        if let Some(r) = self.renderer.as_ref() {
+            return visible_panel_rows(r.viewport.1, r.cell_height());
+        }
+        self.sessions
+            .active()
+            .terminal
+            .as_ref()
+            .map(|t| t.grid().num_rows)
+            .unwrap_or(0)
+    }
+
+    /// F3-4: Total count of blocks matching the panel query (no truncation).
+    /// Used to clamp `scroll_offset` so the list can't scroll past the end.
+    pub(super) fn panel_total_filtered(&self) -> usize {
+        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
+            return 0;
+        };
+        panel_filtered_count(terminal.block_tracker().blocks(), &self.panel.query)
+    }
+
+    /// F3-4: Clamp `panel.scroll_offset` to `[0, max(0, total - visible)]`.
+    pub(super) fn clamp_panel_scroll(&mut self) {
+        let total = self.panel_total_filtered();
+        let visible = self.panel_max_visible();
+        self.panel.scroll_offset =
+            crate::paint::ui_helpers::clamp_panel_scroll(total, visible, self.panel.scroll_offset);
+    }
+
+    /// Count of blocks visible in the current panel window (after
+    /// `scroll_offset` skip, newest-first, query-filtered).
     pub(super) fn panel_visible_count(&self) -> usize {
         let Some(terminal) = self.sessions.active().terminal.as_ref() else {
             return 0;
         };
         let blocks = terminal.block_tracker().blocks();
-        let visible = terminal.grid().num_rows;
+        let visible = self.panel_max_visible();
         blocks
             .iter()
             .rev()
             .filter(|b| block_matches_query(b, &self.panel.query))
+            .skip(self.panel.scroll_offset)
             .take(visible)
             .count()
     }
@@ -31,13 +65,14 @@ impl App {
     /// The [`BlockId`] of the currently selected panel row, if any.
     pub(super) fn panel_selected_block_id(&self) -> Option<BlockId> {
         let terminal = self.sessions.active().terminal.as_ref()?;
-        let visible = terminal.grid().num_rows;
+        let visible = self.panel_max_visible();
         terminal
             .block_tracker()
             .blocks()
             .iter()
             .rev()
             .filter(|b| block_matches_query(b, &self.panel.query))
+            .skip(self.panel.scroll_offset)
             .take(visible)
             .nth(self.panel.selection)
             .map(|b| b.id)

@@ -134,6 +134,7 @@ impl App {
                                 self.refresh_find_for_active_tab();
                             }
                             self.tab_bar.hovered_tab = None;
+                            self.interaction.block_hovered = None;
                             self.scroll_active_tab_into_view();
                             self.request_redraw();
                             return;
@@ -178,6 +179,27 @@ impl App {
         // v0.9 W2: history panel click → select row + scroll terminal to block.
         // Handled before PTY mouse reporting so panel clicks work even inside
         // TUI apps that captured the mouse.
+        // F3-3: sidebar resize handle is checked first — a click on the right
+        // edge starts a width drag instead of selecting a panel row.
+        if button == winit::event::MouseButton::Left && self.panel.open {
+            let xf = x as f32;
+            let yf = y as f32;
+            if self.sidebar_resize_hit(xf, yf, 4.0) {
+                let start_width = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.sidebar_width() / r.scale() as f32)
+                    .unwrap_or(240.0);
+                self.interaction.sidebar_drag = Some(crate::app_state::SidebarDragState {
+                    start_x: x,
+                    start_width,
+                });
+                if let Some(window) = &self.window {
+                    window.set_cursor(winit::window::CursorIcon::EwResize);
+                }
+                return;
+            }
+        }
         if button == winit::event::MouseButton::Left && self.panel.open {
             let xf = x as f32;
             let yf = y as f32;
@@ -252,6 +274,40 @@ impl App {
                         window.set_cursor(winit::window::CursorIcon::NsResize);
                     }
                     self.sessions.active_mut().selection_handler.clear();
+                    self.request_redraw();
+                    return;
+                }
+            }
+        }
+
+        // F3-1: Block header hover-action buttons (copy / fold). These are
+        // registered as HitRegions during draw() on the header row's right
+        // side. Check the renderer's cached hit_regions BEFORE the chevron
+        // handler so clicks on the small action buttons don't fall through to
+        // text selection. Buttons only render when the block is hovered, but
+        // the hit regions are always registered (so clicks work even if the
+        // hover state lagged behind by a frame).
+        if button == winit::event::MouseButton::Left && self.block_view_active() {
+            if let Some(renderer) = &self.renderer {
+                let xf = x as f32;
+                let yf = y as f32;
+                let hit = renderer.hit_regions.iter().find_map(|region| {
+                    if region.contains(xf, yf) {
+                        match region.target {
+                            crate::overlay::HitTarget::BlockActionCopy(bid) => {
+                                Some((bid, "copy_command"))
+                            }
+                            crate::overlay::HitTarget::BlockActionFold(bid) => {
+                                Some((bid, "toggle_fold"))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some((block_id, action)) = hit {
+                    self.run_context_action(Some(block_id), action);
                     self.request_redraw();
                     return;
                 }

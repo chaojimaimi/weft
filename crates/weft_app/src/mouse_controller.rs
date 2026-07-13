@@ -1,3 +1,8 @@
+// arch-gate: allow-over-800
+// Mouse move/drag/scroll/context-menu dispatch. Grew with F3 sidebar resize
+// + panel virtualization scroll handling; remaining size is the irreducible
+// per-event-type dispatch (move/press/release/wheel) with overlay-specific
+// branches.
 //! Mouse movement, drag, context-menu, and scroll controller.
 
 use super::*;
@@ -10,6 +15,30 @@ impl App {
         _y: f64,
         button: winit::event::MouseButton,
     ) {
+        // F3-3: sidebar resize drag end — persist the new width to config.
+        if button == winit::event::MouseButton::Left
+            && self.interaction.sidebar_drag.take().is_some()
+        {
+            let new_width = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.sidebar_width_override);
+            self.config_state.config.window.sidebar_width = new_width;
+            if let Err(e) = self.config_state.config.save() {
+                tracing::warn!(error = ?e, "failed to persist sidebar_width");
+            }
+            // Restore cursor based on current hover state.
+            let icon = if self.sidebar_resize_hit(_x as f32, _y as f32, 4.0) {
+                winit::window::CursorIcon::EwResize
+            } else {
+                winit::window::CursorIcon::Default
+            };
+            if let Some(window) = &self.window {
+                window.set_cursor(icon);
+            }
+            self.request_redraw();
+            return;
+        }
         // End popup border drag if active.
         if button == winit::event::MouseButton::Left
             && self.interaction.scrollbar_drag.take().is_some()
@@ -64,6 +93,22 @@ impl App {
 
     /// Handle mouse movement.
     pub(super) fn handle_mouse_move(&mut self, x: f64, y: f64) {
+        // F3-3: sidebar resize drag — update the renderer's sidebar width
+        // from the pointer delta. The drag persists on release.
+        if let Some(drag) = self.interaction.sidebar_drag {
+            if let Some(renderer) = &mut self.renderer {
+                let scale = renderer.scale() as f32;
+                if scale > 0.0 {
+                    let dx_logical = ((x - drag.start_x) as f32 / scale).max(0.0);
+                    let new_width =
+                        crate::ui_tokens::clamp_sidebar_width(drag.start_width + dx_logical);
+                    renderer.set_sidebar_width(Some(new_width));
+                    self.recompute_layout();
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
         if let Some(drag) = self.interaction.scrollbar_drag {
             if !self.interaction.scrollbar_hovered {
                 self.interaction.scrollbar_hovered = true;
@@ -131,8 +176,15 @@ impl App {
             && !self.settings.open
             && !self.palette.open
             && self.interaction.context_menu.is_none();
+        // F3-3: hover the sidebar's right edge → EwResize cursor. Takes
+        // precedence over text/arrow so the resize affordance is discoverable
+        // even when the pointer came from inside the terminal content or a
+        // TUI app has mouse reporting on (the sidebar is app chrome, not PTY).
+        let sidebar_resize_hovered = self.sidebar_resize_hit(x as f32, y as f32, 4.0);
         if let Some(window) = &self.window {
-            let icon = if mouse_reporting_active {
+            let icon = if sidebar_resize_hovered {
+                winit::window::CursorIcon::EwResize
+            } else if mouse_reporting_active {
                 winit::window::CursorIcon::Default
             } else if scrollbar_hovered {
                 winit::window::CursorIcon::NsResize
@@ -173,6 +225,28 @@ impl App {
             if changed {
                 self.request_redraw();
             }
+        }
+
+        // F3-1: Block hover detection — track which finalized block the
+        // cursor is over so the renderer can show inline copy/fold action
+        // buttons on the header row. Only active in block view, with no
+        // modal overlays open and no active drag/selection.
+        let new_block_hovered = if self.block_view_active()
+            && self.interaction.context_menu.is_none()
+            && !self.settings.open
+            && !self.palette.open
+            && !self.interaction.prompt_dragging
+        {
+            match self.block_at(y as f32) {
+                Some(Some(id)) => Some(id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if new_block_hovered != self.interaction.block_hovered {
+            self.interaction.block_hovered = new_block_hovered;
+            self.request_redraw();
         }
 
         // v0.9: extend editor drag-selection inside the prompt box.
@@ -426,6 +500,49 @@ impl App {
                 self.request_redraw();
                 return;
             }
+        }
+
+        // F3-4: When the scroll event is over the history sidebar, adjust the
+        // panel's block-level scroll offset instead of scrolling the terminal.
+        // Up (toward older history) → scroll_offset increases; Down → decreases.
+        let over_panel = self.panel.open
+            && self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| x < r.sidebar_width() as f64);
+        if over_panel {
+            let panel_lines = match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, v) => {
+                    if v > 0.0 {
+                        v.ceil() as usize
+                    } else {
+                        v.floor().abs() as usize
+                    }
+                }
+                winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                    let v = pos.y / 40.0;
+                    if v > 0.0 {
+                        v.ceil() as usize
+                    } else {
+                        v.floor().abs() as usize
+                    }
+                }
+            };
+            if panel_lines > 0 {
+                let up = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
+                };
+                if up {
+                    self.panel.scroll_offset = self.panel.scroll_offset.saturating_add(panel_lines);
+                } else {
+                    self.panel.scroll_offset = self.panel.scroll_offset.saturating_sub(panel_lines);
+                }
+                self.clamp_panel_scroll();
+                self.clamp_panel_selection();
+                self.request_redraw();
+            }
+            return;
         }
 
         let lines = match delta {

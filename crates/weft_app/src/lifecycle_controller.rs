@@ -525,14 +525,26 @@ impl App {
     /// to avoid per-frame `NSUserDefaults` overhead. No-op when
     /// `[theme] follow_system = false`.
     pub(super) fn poll_system_appearance(&mut self) {
-        if !self.config_state.config.theme.follow_system {
-            return;
-        }
-        // Throttle: at most one query per second.
+        // Throttle: at most one query per second. The throttle is shared
+        // between the appearance check (below) and the F3-2 reduce-motion
+        // check, since both read NSUserDefaults / NSWorkspace and 1Hz is
+        // sufficient for both.
         if self.window_runtime.last_appearance_check.elapsed() < std::time::Duration::from_secs(1) {
             return;
         }
         self.window_runtime.last_appearance_check = std::time::Instant::now();
+
+        // F3-2: Poll macOS Reduce Motion setting (always, regardless of
+        // follow_system). When true, the running-command spinner uses a
+        // static ● indicator instead of animated braille glyphs.
+        let reduce = unsafe { system_reduce_motion() };
+        if reduce != self.window_runtime.reduce_motion {
+            self.window_runtime.reduce_motion = reduce;
+        }
+
+        if !self.config_state.config.theme.follow_system {
+            return;
+        }
         let dark = unsafe { system_appearance_is_dark() };
         if Some(dark) != self.window_runtime.last_system_appearance_dark {
             self.window_runtime.last_system_appearance_dark = Some(dark);
@@ -651,6 +663,14 @@ impl App {
             unsafe {
                 set_dock_icon(self.window_runtime.current_logo_variant);
             }
+        }
+
+        // F3-3: sync the persisted sidebar width override from config to the
+        // renderer so a reload (Cmd+Shift+,) or external edit picks up the new
+        // value. `None` clears any in-flight drag override and falls back to
+        // the responsive SidebarMetrics default.
+        if let Some(r) = &mut self.renderer {
+            r.set_sidebar_width(config.window.sidebar_width);
         }
 
         self.config_state.config = config;

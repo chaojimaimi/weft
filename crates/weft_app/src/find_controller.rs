@@ -367,7 +367,8 @@ impl App {
                 matching_output_lines.saturating_sub(bm.line)
             };
             rows_from_bottom += line_in_block;
-            // Bring it to roughly the middle of the viewport.
+            // Bring it to roughly the upper-middle of the viewport so the
+            // user sees context below and above the match.
             let Some(renderer) = self.renderer.as_ref() else {
                 return;
             };
@@ -376,19 +377,20 @@ impl App {
                 term.cwd().is_some(),
             );
             let visible = renderer.block_visible_rows(1, cwd_header);
-            // Scroll so the matching row lands at ~visible/2 from the bottom
-            // of the viewport. block_scroll_offset is "rows scrolled up from
-            // the bottom", so target = rows_from_bottom - visible/2.
-            // (Previously this was ADDING visible/2, which scrolled PAST the
-            // match — the highlight was drawn but outside the clip region.)
+            // Scroll so the matching row lands at ~2/3 from the bottom of the
+            // viewport (upper-middle). block_scroll_offset is "rows scrolled
+            // up from the bottom", so target = rows_from_bottom - visible*2/3.
             let cols = term.grid().num_cols;
             let (total, _) = block_content_metrics(term, cols);
             let max_scroll = total.saturating_sub(visible);
-            let target = rows_from_bottom.saturating_sub(visible / 2).min(max_scroll);
+            let target = rows_from_bottom
+                .saturating_sub(visible * 2 / 3)
+                .min(max_scroll);
             self.sessions.active_mut().set_block_scroll(target);
             return;
         }
-        // Grid view: scroll grid to bring the match to the middle row.
+        // Grid view: scroll grid to bring the match to the upper-middle of the
+        // viewport (2/3 from the bottom) so context is visible below the match.
         let Some(m) = self.find.matches.get(self.find.index).copied() else {
             return;
         };
@@ -397,7 +399,7 @@ impl App {
         };
         let grid = term.grid_mut();
         let sb_len = grid.scrollback_len();
-        let mid = grid.num_rows / 2;
+        let mid = grid.num_rows * 2 / 3;
         let target_offset = if m.row >= sb_len {
             0
         } else {

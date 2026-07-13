@@ -400,11 +400,13 @@ pub fn find_in_snapshot(
 /// (not cell — block output is plain text, not grid cells). `len` is in
 /// chars.
 ///
-/// These are NOT scrollable directly — the app layer must convert a block
-/// match into a scroll position by finding the block's row offset in the
-/// block-view layout. The renderer currently only highlights grid matches;
-/// block matches are surfaced via the status count and a "jump to block"
-/// could be added later.
+/// These are NOT scrollable directly — the app layer converts a block match
+/// into a scroll position via `scroll_to_current_find_match` (find_controller),
+/// which computes the block's row offset in the block-view layout and adjusts
+/// `block_scroll_offset`. The renderer highlights both grid matches (via
+/// `FindDrawState.highlight`) and block matches (via
+/// `FindDrawState.block_highlight`) using the semantic `find_match` color
+/// token from `UiColors`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMatch {
     pub block_id: crate::blocks::BlockId,

@@ -381,6 +381,8 @@ impl App {
                 .then(|| terminal.block_tracker().in_flight())
                 .flatten(),
             block_scroll: self.sessions.active().block_scroll(),
+            block_hovered: self.interaction.block_hovered,
+            spinner_phase: -1.0,
         })
     }
 
@@ -394,6 +396,32 @@ impl App {
             .as_ref()
             .map(|t| t.show_block_view())
             .unwrap_or(false)
+    }
+
+    /// F3-3: Check whether a physical-pixel point `(x, y)` lands on the
+    /// sidebar's right-edge resize handle. Returns `true` only when:
+    ///   - the history panel is open,
+    ///   - the window is NOT Compact (sidebar is push mode, not overlay),
+    ///   - the point is within `tolerance` px of the sidebar's right edge,
+    ///   - the point is within the viewport's vertical extent.
+    ///
+    /// `tolerance` is in physical pixels (≈4 px each side of the edge). The
+    /// pure geometry lives in `ui_tokens::sidebar_edge_hit` (unit-tested
+    /// independently of the renderer/App state).
+    pub(super) fn sidebar_resize_hit(&self, x: f32, y: f32, tolerance: f32) -> bool {
+        if !self.panel.open {
+            return false;
+        }
+        let Some(renderer) = &self.renderer else {
+            return false;
+        };
+        // Compact windows don't support sidebar resize (overlay drawer).
+        if renderer.sidebar_push_width() == 0.0 {
+            return false;
+        }
+        let edge = renderer.sidebar_width();
+        let vp_h = renderer.viewport().1;
+        crate::ui_tokens::sidebar_edge_hit(x, edge, tolerance, vp_h, y)
     }
 
     /// True when the foreground program has grabbed the mouse (mouse reporting

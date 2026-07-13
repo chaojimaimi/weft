@@ -9,10 +9,10 @@
 
 use std::rc::Rc;
 
-use crate::block_component::{block_presentation, BlockTone};
+use crate::block_component::{block_presentation, spinner_char_for_phase, BlockTone};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
-use crate::paint::primitives::{color_to_normalized, push_quad};
+use crate::paint::primitives::{color_to_normalized, push_line, push_quad};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
@@ -40,6 +40,8 @@ impl MetalRenderer {
             git_branch: _,
             live,
             block_scroll,
+            block_hovered: _,
+            spinner_phase: _,
         } = model;
 
         let cw = self.cell_width() as f32;
@@ -254,6 +256,8 @@ impl MetalRenderer {
             git_branch,
             live,
             block_scroll,
+            block_hovered,
+            spinner_phase,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -526,6 +530,13 @@ impl MetalRenderer {
         }
         let sel_bv = selection.block_view_selection.as_ref();
         let find_block_highlight = self.find_state.as_ref().and_then(|f| f.block_highlight);
+        // F3-5: find match highlight color from the semantic token (was
+        // hardcoded [0.95, 0.78, 0.20, 0.50]).
+        let find_hl_bg = {
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let fm = color_to_normalized(ui.find_match);
+            [fm[0], fm[1], fm[2], 0.50]
+        };
         let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
             let s = sel_bv?;
             let snap_idx = s.rows.iter().position(|r| r.contains_y(row_mid_y))?;
@@ -604,7 +615,7 @@ impl MetalRenderer {
                             {
                                 let hx0 = left + bh.3 as f32 * cw;
                                 let hx1 = hx0 + bh.4 as f32 * cw;
-                                let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                                let hl_bg = find_hl_bg;
                                 push_quad(
                                     &mut verts,
                                     [hx0, y, hx1, y + ch],
@@ -640,7 +651,7 @@ impl MetalRenderer {
                                         {
                                             let hx0 = left + bh.3 as f32 * cw;
                                             let hx1 = hx0 + bh.4 as f32 * cw;
-                                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                                            let hl_bg = find_hl_bg;
                                             push_quad(
                                                 &mut verts,
                                                 [hx0, cy, hx1, cy + ch],
@@ -689,7 +700,7 @@ impl MetalRenderer {
                         if bh.0 == block_id.0 && bh.2 {
                             let hx0 = cmd_x + bh.3 as f32 * cw;
                             let hx1 = hx0 + bh.4 as f32 * cw;
-                            let hl_bg = [0.95, 0.78, 0.20, 0.50];
+                            let hl_bg = find_hl_bg;
                             push_quad(&mut verts, [hx0, y, hx1, y + ch], bg_uv, [0.0; 4], hl_bg);
                         }
                     }
@@ -705,7 +716,11 @@ impl MetalRenderer {
                         });
                     }
                 }
-                LaidRow::Header { text, tone, .. } => {
+                LaidRow::Header {
+                    text,
+                    tone,
+                    block_id,
+                } => {
                     if row_in_selection(y + pitch * 0.5) {
                         push_quad(
                             &mut verts,
@@ -720,8 +735,171 @@ impl MetalRenderer {
                         BlockTone::Success => dim,
                         BlockTone::Error => color_to_normalized(ui.error),
                         BlockTone::Warning => color_to_normalized(ui.warning),
+                        BlockTone::Running => color_to_normalized(ui.focus),
                     };
                     self.push_text(&mut verts, left, y, text, color, cols);
+
+                    // F3-1: Hover action buttons (copy + fold) on the header
+                    // row's right side. Hit regions are always registered (so
+                    // clicks work even when not visible), but the icons are
+                    // only drawn when this block is hovered.
+                    let is_hovered = block_hovered == Some(*block_id);
+                    let btn_w = cw * 2.0;
+                    let btn_gap = cw * 0.5;
+                    let btn_cy = y + pitch * 0.5;
+                    let line_w = crate::ui_tokens::UiMetrics::for_scale(self.scale).stroke;
+                    let btn_color = if is_hovered { fg } else { [0.0; 4] };
+
+                    // Fold button (rightmost).
+                    let fold_cx = right - btn_w * 0.5;
+                    let fold_x0 = fold_cx - btn_w * 0.5;
+                    hit_regions.push(crate::overlay::HitRegion {
+                        x0: fold_x0,
+                        y0: y,
+                        x1: fold_x0 + btn_w,
+                        y1: y + pitch,
+                        target: crate::overlay::HitTarget::BlockActionFold(*block_id),
+                    });
+                    if is_hovered {
+                        // Draw a chevron: ▾ (expanded) or ▸ (collapsed).
+                        let chev_r = ch * 0.14;
+                        // Look up collapsed state from the block list.
+                        let collapsed = blocks
+                            .iter()
+                            .find(|b| b.id == *block_id)
+                            .map(|b| b.collapsed)
+                            .unwrap_or(false);
+                        if collapsed {
+                            // ▸ (right-pointing triangle).
+                            push_line(
+                                &mut verts,
+                                fold_cx - chev_r * 0.5,
+                                btn_cy - chev_r,
+                                fold_cx + chev_r * 0.5,
+                                btn_cy,
+                                line_w,
+                                btn_color,
+                            );
+                            push_line(
+                                &mut verts,
+                                fold_cx + chev_r * 0.5,
+                                btn_cy,
+                                fold_cx - chev_r * 0.5,
+                                btn_cy + chev_r,
+                                line_w,
+                                btn_color,
+                            );
+                        } else {
+                            // ▾ (down-pointing chevron).
+                            push_line(
+                                &mut verts,
+                                fold_cx - chev_r,
+                                btn_cy - chev_r * 0.5,
+                                fold_cx,
+                                btn_cy + chev_r * 0.5,
+                                line_w,
+                                btn_color,
+                            );
+                            push_line(
+                                &mut verts,
+                                fold_cx,
+                                btn_cy + chev_r * 0.5,
+                                fold_cx + chev_r,
+                                btn_cy - chev_r * 0.5,
+                                line_w,
+                                btn_color,
+                            );
+                        }
+                    }
+
+                    // Copy button (to the left of fold).
+                    let copy_cx = fold_cx - btn_w - btn_gap;
+                    let copy_x0 = copy_cx - btn_w * 0.5;
+                    hit_regions.push(crate::overlay::HitRegion {
+                        x0: copy_x0,
+                        y0: y,
+                        x1: copy_x0 + btn_w,
+                        y1: y + pitch,
+                        target: crate::overlay::HitTarget::BlockActionCopy(*block_id),
+                    });
+                    if is_hovered {
+                        // Draw a simple copy icon: two overlapping squares.
+                        let sq_r = ch * 0.14;
+                        // Back square (top-right).
+                        push_line(
+                            &mut verts,
+                            copy_cx - sq_r * 0.3,
+                            btn_cy - sq_r,
+                            copy_cx + sq_r * 0.7,
+                            btn_cy - sq_r,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx + sq_r * 0.7,
+                            btn_cy - sq_r,
+                            copy_cx + sq_r * 0.7,
+                            btn_cy + sq_r * 0.4,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx + sq_r * 0.7,
+                            btn_cy + sq_r * 0.4,
+                            copy_cx - sq_r * 0.3,
+                            btn_cy + sq_r * 0.4,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx - sq_r * 0.3,
+                            btn_cy + sq_r * 0.4,
+                            copy_cx - sq_r * 0.3,
+                            btn_cy - sq_r,
+                            line_w,
+                            btn_color,
+                        );
+                        // Front square (bottom-left).
+                        push_line(
+                            &mut verts,
+                            copy_cx - sq_r,
+                            btn_cy - sq_r * 0.4,
+                            copy_cx,
+                            btn_cy - sq_r * 0.4,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx,
+                            btn_cy - sq_r * 0.4,
+                            copy_cx,
+                            btn_cy + sq_r,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx,
+                            btn_cy + sq_r,
+                            copy_cx - sq_r,
+                            btn_cy + sq_r,
+                            line_w,
+                            btn_color,
+                        );
+                        push_line(
+                            &mut verts,
+                            copy_cx - sq_r,
+                            btn_cy + sq_r,
+                            copy_cx - sq_r,
+                            btn_cy - sq_r * 0.4,
+                            line_w,
+                            btn_color,
+                        );
+                    }
                 }
                 LaidRow::Separator => {
                     if row_in_selection(y + pitch * 0.5) {
@@ -760,6 +938,26 @@ impl MetalRenderer {
                         );
                     }
                     self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
+
+                    // F3-2: Running-command activity indicator (braille spinner
+                    // or static ● under Reduce Motion). Rendered at the right
+                    // edge of the LiveCommand row so it doesn't overlap the
+                    // command text.
+                    if spinner_phase >= 0.0 {
+                        let spinner_char =
+                            spinner_char_for_phase(spinner_phase, self.reduce_motion);
+                        let spinner_x = right - cw;
+                        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                        let spinner_color = color_to_normalized(ui.focus);
+                        self.push_text(
+                            &mut verts,
+                            spinner_x,
+                            y,
+                            &spinner_char.to_string(),
+                            spinner_color,
+                            1,
+                        );
+                    }
                 }
                 LaidRow::Blank => {}
             }

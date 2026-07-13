@@ -93,6 +93,12 @@ impl Default for ThemeConfig {
     }
 }
 
+/// F3-3: Sidebar width bounds in logical points. Applied at config load and
+/// during drag so the persisted value stays in a usable range regardless of
+/// where it's written/read. Shared with weft_app via the crate re-export.
+pub const SIDEBAR_MIN_WIDTH: f32 = 240.0;
+pub const SIDEBAR_MAX_WIDTH: f32 = 360.0;
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct WindowConfig {
@@ -102,6 +108,10 @@ pub struct WindowConfig {
     pub opacity: f32,
     pub padding_x: u32,
     pub padding_y: u32,
+    /// F3-3: User-overridden sidebar width in logical points. `None` when
+    /// the user hasn't dragged the sidebar (falls back to the responsive
+    /// `SidebarMetrics::for_logical_width`). Clamped to [240, 360] on load.
+    pub sidebar_width: Option<f32>,
 }
 
 impl Default for WindowConfig {
@@ -113,6 +123,7 @@ impl Default for WindowConfig {
             opacity: 1.0,
             padding_x: 0,
             padding_y: 0,
+            sidebar_width: None,
         }
     }
 }

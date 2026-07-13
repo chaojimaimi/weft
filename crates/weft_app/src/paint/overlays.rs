@@ -266,7 +266,11 @@ impl MetalRenderer {
         if let Some((row, col, len)) = find.highlight {
             let hy0 = ctx.row_y(row);
             let hy1 = hy0 + ch;
-            let highlight_color = [0.95f32, 0.78, 0.20, 0.50];
+            // F3-5: use the semantic find_match token instead of a hardcoded
+            // yellow so the color adapts to the active theme.
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let fm = color_to_normalized(ui.find_match);
+            let highlight_color = [fm[0], fm[1], fm[2], 0.50];
             for (seg_col, seg_len) in split_highlight_around_cursor(
                 col,
                 len,

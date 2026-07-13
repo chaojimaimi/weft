@@ -2,7 +2,8 @@
 
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{
-    block_duration_str, panel_display, strip_prompt_prefix, truncate_str, visible_panel_rows,
+    block_duration_str, panel_display, panel_filtered_count, strip_prompt_prefix, truncate_str,
+    visible_panel_rows,
 };
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::{Block, BlockId};
@@ -23,6 +24,9 @@ pub struct PanelDrawParams<'a> {
     /// v0.9 fix: whether the search box has keyboard focus (draws accent
     /// underline so the user knows typing will go to the filter).
     pub search_focused: bool,
+    /// F3-4: Block-level scroll offset (number of filtered blocks skipped
+    /// from the newest end). 0 = newest visible.
+    pub scroll_offset: usize,
 }
 
 impl MetalRenderer {
@@ -213,9 +217,13 @@ impl MetalRenderer {
             }
         }
 
-        // Display list: newest-first, filtered by query (capped to fit).
+        // Display list: newest-first, filtered by query, virtualized via
+        // scroll_offset (skip + take).
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
-        let display = panel_display(p.blocks, p.query, max_rows);
+        let total_filtered = panel_filtered_count(p.blocks, p.query);
+        let max_scroll = total_filtered.saturating_sub(max_rows);
+        let scroll_offset = p.scroll_offset.min(max_scroll);
+        let display = panel_display(p.blocks, p.query, scroll_offset, max_rows);
         let row_h = panel_layout.row_height;
         let mut y = panel_layout.list_top;
         let mut drawn = 0usize;
@@ -285,6 +293,64 @@ impl MetalRenderer {
                     y += row_h;
                     drawn += 1;
                 }
+            }
+        }
+
+        // F3-4: Scrollbar indicator on the right edge of the panel list area.
+        // Only drawn when there are more filtered blocks than visible (i.e.
+        // the list can scroll).
+        if total_filtered > max_rows {
+            let track_x = panel_x + width_px - 3.0;
+            let track_w = 2.0;
+            let track_y0 = panel_layout.list_top;
+            let track_y1 = vp_h;
+            let track_h = track_y1 - track_y0;
+            // Track background (subtle).
+            let track_bg = [
+                theme_bg[0] * 0.5 + fg[0] * 0.1,
+                theme_bg[1] * 0.5 + fg[1] * 0.1,
+                theme_bg[2] * 0.5 + fg[2] * 0.1,
+                0.50,
+            ];
+            push_quad(
+                &mut vertices,
+                [track_x, track_y0, track_x + track_w, track_y1],
+                bg_uv,
+                [0.0; 4],
+                track_bg,
+            );
+            // Thumb: proportional height, positioned by scroll_offset.
+            let thumb_frac = max_rows as f32 / total_filtered as f32;
+            let thumb_h = (track_h * thumb_frac).max(ch * 0.8);
+            let pos_frac = if max_scroll > 0 {
+                scroll_offset as f32 / max_scroll as f32
+            } else {
+                0.0
+            };
+            let avail = (track_h - thumb_h).max(0.0);
+            let thumb_y0 = track_y0 + avail * pos_frac;
+            let thumb_color = color_to_normalized(self.theme.accent);
+            push_quad(
+                &mut vertices,
+                [track_x, thumb_y0, track_x + track_w, thumb_y0 + thumb_h],
+                bg_uv,
+                [0.0; 4],
+                [thumb_color[0], thumb_color[1], thumb_color[2], 0.70],
+            );
+            // Up arrow indicator when not at the newest.
+            if scroll_offset > 0 {
+                self.push_text(&mut vertices, track_x - cw * 0.5, track_y0, "▲", dim, 2);
+            }
+            // Down arrow indicator when not at the oldest.
+            if scroll_offset < max_scroll {
+                self.push_text(
+                    &mut vertices,
+                    track_x - cw * 0.5,
+                    track_y1 - ch,
+                    "▼",
+                    dim,
+                    2,
+                );
             }
         }
 

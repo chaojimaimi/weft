@@ -1,3 +1,7 @@
+// arch-gate: allow-over-800
+// Overlay stack builder: z-order + warm-up + hit-testing for all overlay
+// layers. Grew with F3 panel scroll_offset param and block hover actions;
+// remaining size is the per-overlay build_overlay_stack dispatch.
 //! Unified overlay stack — manages z-order, rendering, warm-up, and hit-testing
 //! for all overlay UI layers (history panel, prompt input box, completion
 //! dropdown, and future Command Palette / context menu).
@@ -340,12 +344,18 @@ pub type HitRegion = crate::scene::HitRegion<HitTarget>;
 pub enum HitTarget {
     /// A foldable block's command line (click toggles collapse).
     BlockFold(BlockId),
+    /// F3-1: Block header hover-action "copy command" button.
+    BlockActionCopy(BlockId),
+    /// F3-1: Block header hover-action "toggle fold" button.
+    BlockActionFold(BlockId),
     /// A completion popup row (click accepts candidate).
     CompletionItem(usize),
     /// Completion popup right border (drag to resize width) — v0.7 W2b.
     CompletionResizeWidth,
     /// Completion popup top border (drag to resize height) — v0.7 W2b.
     CompletionResizeHeight,
+    /// F3-3: Sidebar right-edge resize handle (drag to adjust sidebar width).
+    SidebarResize,
     // v0.7预留：
     // PaletteItem(usize),
     // PaletteResizeWidth,
@@ -371,6 +381,7 @@ pub fn build_overlay_stack<'a>(
     panel_selection: usize,
     panel_expanded: Option<BlockId>,
     panel_search_focused: bool,
+    panel_scroll_offset: usize,
     ime_preedit: &'a str,
     ime_preedit_cursor: Option<(usize, usize)>,
     palette_open: bool,
@@ -414,6 +425,7 @@ pub fn build_overlay_stack<'a>(
                 selection: panel_selection,
                 expanded_id: panel_expanded,
                 search_focused: panel_search_focused,
+                scroll_offset: panel_scroll_offset,
             }),
         });
     }

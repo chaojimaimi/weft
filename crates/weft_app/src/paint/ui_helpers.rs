@@ -54,13 +54,38 @@ pub fn block_matches_query(block: &Block, query: &str) -> bool {
     }
 }
 
-/// Newest-first, query-filtered block list capped to `max` entries. Shared by
-/// the warm-up pass and `build_panel_vertices` so they render the same set.
-pub(crate) fn panel_display<'a>(blocks: &'a [Block], query: &str, max: usize) -> Vec<&'a Block> {
+/// F3-4: Total count of blocks matching the panel query (newest-first, no
+/// truncation). Used to clamp `scroll_offset` so the list can't scroll past
+/// the last filtered block.
+pub(crate) fn panel_filtered_count(blocks: &[Block], query: &str) -> usize {
     blocks
         .iter()
         .rev()
         .filter(|b| block_matches_query(b, query))
+        .count()
+}
+
+/// F3-4: Clamp a candidate panel scroll offset to `[0, max(0, total -
+/// visible)]`. Pure so the mouse handler, controller, and tests share one
+/// source of truth.
+pub fn clamp_panel_scroll(total: usize, visible: usize, offset: usize) -> usize {
+    offset.min(total.saturating_sub(visible))
+}
+
+/// Newest-first, query-filtered block list with `scroll_offset` blocks
+/// skipped, capped to `max` entries. Shared by the warm-up pass and
+/// `build_panel_vertices` so they render the same set.
+pub(crate) fn panel_display<'a>(
+    blocks: &'a [Block],
+    query: &str,
+    scroll_offset: usize,
+    max: usize,
+) -> Vec<&'a Block> {
+    blocks
+        .iter()
+        .rev()
+        .filter(|b| block_matches_query(b, query))
+        .skip(scroll_offset)
         .take(max)
         .collect()
 }
@@ -289,5 +314,88 @@ mod tests {
         // "weft" is part of the prompt (cwd), not the command — must not match
         // the stripped command "git status".
         assert!(!block_matches_query(&b, "weft"));
+    }
+
+    // ── F3-4: virtualization helpers ───────────────────────────────────
+
+    #[test]
+    fn panel_filtered_count_counts_all_matching_blocks() {
+        let blocks = vec![
+            Block {
+                id: BlockId(1),
+                command: "git status".into(),
+                cwd: None,
+                output: String::new(),
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                collapsed: false,
+            },
+            Block {
+                id: BlockId(2),
+                command: "ls".into(),
+                cwd: None,
+                output: String::new(),
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                collapsed: false,
+            },
+            Block {
+                id: BlockId(3),
+                command: "git push".into(),
+                cwd: None,
+                output: String::new(),
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                collapsed: false,
+            },
+        ];
+        // Empty query matches all.
+        assert_eq!(panel_filtered_count(&blocks, ""), 3);
+        // "git" matches two blocks (git status, git push).
+        assert_eq!(panel_filtered_count(&blocks, "git"), 2);
+        // No matches.
+        assert_eq!(panel_filtered_count(&blocks, "cargo"), 0);
+    }
+
+    #[test]
+    fn panel_display_applies_scroll_offset() {
+        let blocks: Vec<Block> = (1..=5)
+            .map(|i| Block {
+                id: BlockId(i),
+                command: format!("cmd{}", i),
+                cwd: None,
+                output: String::new(),
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                collapsed: false,
+            })
+            .collect();
+        // No scroll: newest first → [cmd5, cmd4, cmd3, cmd2, cmd1].
+        let d = panel_display(&blocks, "", 0, 10);
+        assert_eq!(d.len(), 5);
+        assert_eq!(d[0].command, "cmd5");
+        // Skip 2 from newest: [cmd3, cmd2, cmd1].
+        let d = panel_display(&blocks, "", 2, 10);
+        assert_eq!(d.len(), 3);
+        assert_eq!(d[0].command, "cmd3");
+        // Skip past the end → empty.
+        let d = panel_display(&blocks, "", 10, 10);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn clamp_panel_scroll_enforces_bounds() {
+        // offset within range → unchanged.
+        assert_eq!(clamp_panel_scroll(10, 5, 3), 3);
+        // offset exceeds max_scroll → clamped to total - visible.
+        assert_eq!(clamp_panel_scroll(10, 5, 8), 5);
+        // total < visible → max_scroll = 0, so offset = 0.
+        assert_eq!(clamp_panel_scroll(3, 5, 2), 0);
+        // offset = 0 → 0 (newest visible).
+        assert_eq!(clamp_panel_scroll(10, 5, 0), 0);
     }
 }

@@ -56,7 +56,7 @@ use input_router::{OverlayInputContext, OverlayInputOwner};
 use macos_window::configure_titlebar;
 use paint::overlays::FindDrawState;
 use paint::tab_bar::TabBarDrawState;
-use paint::ui_helpers::block_matches_query;
+use paint::ui_helpers::{block_matches_query, panel_filtered_count, visible_panel_rows};
 use palette_state::{
     BuiltinCmd, CreateStep, PaletteEntry, PaletteState, PaletteSubMode, WorkflowForm,
 };
@@ -811,6 +811,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.panel.query.pop();
+                self.clamp_panel_scroll();
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
@@ -823,6 +824,7 @@ impl App {
             }
             KeyCode::Char(c) if !c.is_control() => {
                 self.panel.query.push(c);
+                self.clamp_panel_scroll();
                 self.clamp_panel_selection();
                 self.request_redraw();
                 true
@@ -923,6 +925,27 @@ impl App {
             self.window_runtime.cursor_blink_phase -= std::f32::consts::TAU;
         }
     }
+
+    /// F3-2: Advance the running-command spinner phase based on real elapsed
+    /// time. The spinner cycles every 800ms (10 braille glyphs × 80ms each).
+    /// When `reduce_motion` is on, the phase is frozen at 0 so the renderer
+    /// draws a static `●` instead of animating.
+    fn update_spinner(&mut self) {
+        if self.window_runtime.reduce_motion {
+            self.window_runtime.spinner_phase = 0.0;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.window_runtime.spinner_time);
+        const SPINNER_PERIOD_MS: f64 = 800.0;
+        let elapsed_ms = elapsed.as_millis() as f64;
+        let delta = (elapsed_ms / SPINNER_PERIOD_MS) as f32;
+        self.window_runtime.spinner_phase += delta;
+        if self.window_runtime.spinner_phase >= 1.0 {
+            self.window_runtime.spinner_phase -= 1.0;
+        }
+        self.window_runtime.spinner_time = now;
+    }
 }
 
 /// v0.9 U-D1: Query macOS system appearance via `NSUserDefaults`.
@@ -969,6 +992,27 @@ unsafe fn system_appearance_is_dark() -> bool {
     let raw = std::ffi::CStr::from_ptr(c_str);
     let s = raw.to_str().unwrap_or("").trim().to_ascii_lowercase();
     s == "dark"
+}
+
+/// F3-2: Query the macOS "Reduce Motion" accessibility setting.
+/// Returns `true` when the user has enabled System Settings → Accessibility →
+/// Display → Reduce Motion. When true, the running-command spinner uses a
+/// static `●` instead of the animated braille glyphs. Polled at 1Hz alongside
+/// `system_appearance_is_dark` (see `poll_system_appearance`).
+unsafe fn system_reduce_motion() -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
+    if workspace_cls.is_null() {
+        return false;
+    }
+    let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
+    if shared.is_null() {
+        return false;
+    }
+    let reduce: bool = msg_send![shared, accessibilityDisplayShouldReduceMotion];
+    reduce
 }
 
 /// Copy text to macOS system clipboard using NSPasteboard.
@@ -1177,6 +1221,13 @@ impl ApplicationHandler<AppEvent> for App {
         self.window = Some(window);
         self.renderer = Some(renderer);
 
+        // F3-3: apply the persisted sidebar width override (if any) so the
+        // first frame opens with the user's last-dragged width instead of the
+        // responsive default.
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_sidebar_width(self.config_state.config.window.sidebar_width);
+        }
+
         // v1.0 Logo: apply the configured Dock icon variant on startup.
         // `with_window_icon` sets the window title-bar icon; this sets the
         // Dock / app-switcher icon. For `cargo run` both show; in a .app
@@ -1356,6 +1407,22 @@ impl ApplicationHandler<AppEvent> for App {
                 continue; // no cursor to animate — skip this wake
             }
             if blink_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
+
+        // F3-2: Spinner timer — wake the loop ~every 80ms while a command is
+        // running so the braille activity indicator animates smoothly even
+        // when no PTY output is streaming (e.g. `sleep 10`). The main thread
+        // sets `spinner_anim_active` after each redraw based on the shell phase.
+        let spinner_proxy = self.proxy.clone();
+        let spinner_flag = self.window_runtime.spinner_anim_active.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            if !spinner_flag.load(Ordering::Relaxed) {
+                continue; // no running command — skip this wake
+            }
+            if spinner_proxy.send_event(AppEvent::Wake).is_err() {
                 break; // event loop exited
             }
         });

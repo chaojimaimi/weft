@@ -75,6 +75,21 @@ pub struct MetalRenderer {
     /// the history panel click). The renderer draws an accent border around
     /// this block in block view. Cleared by the app after 1.5s.
     pub panel_highlight: Option<BlockId>,
+    /// F3-1: Block currently hovered by the mouse (set per-frame by the app
+    /// from `InteractionState.block_hovered`). Drives inline copy/fold action
+    /// buttons on the block header row.
+    pub block_hovered: Option<BlockId>,
+    /// F3-2: Spinner phase for the running-command activity indicator.
+    /// Normalized to [0,1); the renderer maps it to a braille spinner glyph.
+    /// Set to `-1.0` to disable (reduce-motion or no command running).
+    pub spinner_phase: f32,
+    /// F3-2: macOS Reduce Motion setting. When true, the spinner uses a
+    /// static `●` instead of animated braille glyphs.
+    pub reduce_motion: bool,
+    /// F3-3: User-overridden sidebar width in logical points. `None` falls
+    /// back to the responsive `SidebarMetrics::for_logical_width`. Set by
+    /// `set_sidebar_width` during drag, or synced from config on load.
+    pub(crate) sidebar_width_override: Option<f32>,
     /// v0.9: cached cursor-blink state for the current frame, so overlay
     /// builders (palette, panel) can draw a blinking caret without it being
     /// threaded through every helper signature.
@@ -370,19 +385,41 @@ impl MetalRenderer {
 
     /// v0.9 W5: Left sidebar width in physical pixels (240 logical px × scale).
     /// Used as `chrome_left` when the history panel is in sidebar mode.
+    /// F3-3: when a user override is set (via drag), it takes precedence over
+    /// the responsive `SidebarMetrics` default.
     pub fn sidebar_width(&self) -> f32 {
-        let logical_viewport = self.viewport.0 / self.scale as f32;
-        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).panel_width
-            * self.scale as f32
+        self.logical_sidebar_width() * self.scale as f32
     }
 
     /// Width reserved beside the terminal. In compact windows the history
     /// panel becomes an overlay drawer, so it keeps its visual width without
     /// shrinking the PTY or pushing tab controls outside the viewport.
+    /// F3-3: respects the user override in Regular/Wide mode; Compact windows
+    /// always push 0 (overlay drawer).
     pub fn sidebar_push_width(&self) -> f32 {
         let logical_viewport = self.viewport.0 / self.scale as f32;
-        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).push_width
-            * self.scale as f32
+        let class = crate::ui_tokens::ResponsiveClass::from_logical_width(logical_viewport);
+        if class == crate::ui_tokens::ResponsiveClass::Compact {
+            return 0.0;
+        }
+        self.logical_sidebar_width() * self.scale as f32
+    }
+
+    /// F3-3: The effective logical sidebar width — user override if set,
+    /// otherwise the responsive `SidebarMetrics` default.
+    fn logical_sidebar_width(&self) -> f32 {
+        if let Some(w) = self.sidebar_width_override {
+            return w;
+        }
+        let logical_viewport = self.viewport.0 / self.scale as f32;
+        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).panel_width
+    }
+
+    /// F3-3: Set the user sidebar width override (logical points). Clamped to
+    /// [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]. Pass `None` to clear and fall
+    /// back to the responsive default.
+    pub fn set_sidebar_width(&mut self, width: Option<f32>) {
+        self.sidebar_width_override = width.map(crate::ui_tokens::clamp_sidebar_width);
     }
 
     /// Draw the terminal Grid (and optional overlays) to screen.
@@ -570,7 +607,7 @@ impl MetalRenderer {
                 missing.extend("Search:".chars());
                 missing.extend(p.query.chars());
                 let max_blocks = visible_panel_rows(self.viewport.1, self.cell_height());
-                for b in panel_display(p.blocks, p.query, max_blocks) {
+                for b in panel_display(p.blocks, p.query, p.scroll_offset, max_blocks) {
                     missing.extend(b.command.chars());
                     missing.extend(block_duration_str(b).chars());
                     if Some(b.id) == p.expanded_id {
@@ -671,6 +708,9 @@ impl MetalRenderer {
             missing.extend(['×', '·', '…']);
             // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
             missing.extend("\u{25be} passthrough running".chars());
+            // F3-2: warm up the braille spinner glyphs (animated activity
+            // indicator) and the static ● used under Reduce Motion.
+            missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
             for ch in &missing {
                 self.atlas.get_or_rasterize(*ch);
             }
@@ -718,6 +758,8 @@ impl MetalRenderer {
                         git_branch: terminal.git_branch(),
                         live: None,
                         block_scroll,
+                        block_hovered: self.block_hovered,
+                        spinner_phase: self.spinner_phase,
                     },
                     selection,
                 )
@@ -735,6 +777,8 @@ impl MetalRenderer {
                         git_branch: terminal.git_branch(),
                         live: terminal.block_tracker().in_flight(),
                         block_scroll,
+                        block_hovered: self.block_hovered,
+                        spinner_phase: self.spinner_phase,
                     },
                     selection,
                 )

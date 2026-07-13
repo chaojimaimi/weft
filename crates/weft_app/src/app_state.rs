@@ -256,6 +256,19 @@ pub struct WindowRuntimeState {
     pub last_system_appearance_dark: Option<bool>,
     pub last_appearance_check: Instant,
     pub current_logo_variant: weft_core::config::LogoVariant,
+    /// F3-2: Spinner animation phase in [0, 1). Advances ~every 80ms while a
+    /// command is running (CommandExecuting). The renderer maps it to a braille
+    /// spinner glyph. Driven by a dedicated wake timer (see `spinner_anim_active`).
+    pub spinner_phase: f32,
+    /// F3-2: When true, a dedicated timer wakes the loop ~every 80ms so the
+    /// running-command spinner animates even when no PTY output is streaming.
+    pub spinner_anim_active: Arc<AtomicBool>,
+    /// F3-2: Last time the spinner phase was advanced. Anchors the phase
+    /// computation to real elapsed time (frame-count independent).
+    pub spinner_time: Instant,
+    /// F3-2: macOS Reduce Motion setting. When true, the spinner is replaced
+    /// by a static `●` indicator. Polled alongside system appearance (1Hz).
+    pub reduce_motion: bool,
 }
 
 impl WindowRuntimeState {
@@ -269,6 +282,10 @@ impl WindowRuntimeState {
             last_system_appearance_dark: None,
             last_appearance_check: Instant::now(),
             current_logo_variant: weft_core::config::LogoVariant::Cool,
+            spinner_phase: 0.0,
+            spinner_anim_active: Arc::new(AtomicBool::new(false)),
+            spinner_time: Instant::now(),
+            reduce_motion: false,
         }
     }
 }
@@ -277,6 +294,16 @@ impl WindowRuntimeState {
 pub enum DragTarget {
     Right,
     Top,
+}
+
+/// F3-3: Sidebar resize drag state. Captured at drag start so the new width
+/// can be computed from the pointer delta without accumulating rounding error.
+#[derive(Clone, Copy)]
+pub struct SidebarDragState {
+    /// Physical X where the drag started.
+    pub start_x: f64,
+    /// Logical sidebar width (points) at drag start.
+    pub start_width: f32,
 }
 
 #[derive(Clone)]
@@ -310,6 +337,12 @@ pub struct InteractionState {
     pub scrollbar_drag: Option<crate::scrollbar_component::ScrollbarDragState>,
     pub scrollbar_hovered: bool,
     pub context_menu: Option<ContextMenu>,
+    /// F3-1: Block currently hovered by the mouse in the block view, if any.
+    /// Drives the inline copy/fold action buttons rendered on the header row.
+    pub block_hovered: Option<BlockId>,
+    /// F3-3: Active sidebar resize drag. Set on press at the sidebar's right
+    /// edge; cleared on release (which persists the width to config).
+    pub sidebar_drag: Option<SidebarDragState>,
 }
 
 impl InteractionState {
@@ -325,6 +358,8 @@ impl InteractionState {
             scrollbar_drag: None,
             scrollbar_hovered: false,
             context_menu: None,
+            block_hovered: None,
+            sidebar_drag: None,
         }
     }
 }
@@ -358,6 +393,10 @@ pub struct PanelState {
     pub highlight: Option<BlockId>,
     pub highlight_until: Option<Instant>,
     pub last_click: Option<(Instant, usize)>,
+    /// F3-4: Block-level scroll offset for the sidebar history list (number
+    /// of filtered blocks skipped from the newest end). 0 = newest visible.
+    /// Clamped to `[0, total_filtered - visible_blocks]`.
+    pub scroll_offset: usize,
 }
 
 impl PanelState {
@@ -367,6 +406,7 @@ impl PanelState {
         self.highlight = None;
         self.highlight_until = None;
         self.last_click = None;
+        self.scroll_offset = 0;
     }
 
     pub fn clear_transient_selection(&mut self) {
@@ -375,6 +415,7 @@ impl PanelState {
         self.highlight = None;
         self.highlight_until = None;
         self.last_click = None;
+        self.scroll_offset = 0;
     }
 }
 
@@ -565,6 +606,7 @@ mod tests {
         assert!((3..=20).contains(&state.popup_max_rows));
         assert!(state.drag_state.is_none());
         assert!(state.context_menu.is_none());
+        assert!(state.block_hovered.is_none());
     }
 
     #[test]
