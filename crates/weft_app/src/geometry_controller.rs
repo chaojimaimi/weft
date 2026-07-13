@@ -509,8 +509,10 @@ impl App {
             renderer.sidebar_width(),
             renderer.viewport().1,
         );
-        let max_rows =
-            crate::renderer::visible_panel_rows(renderer.viewport().1, renderer.cell_height());
+        let max_rows = crate::paint::ui_helpers::visible_panel_rows(
+            renderer.viewport().1,
+            renderer.cell_height(),
+        );
         let scene = crate::panel_component::build_panel_scene(
             layout.panel_rect,
             layout.search_field_rect,

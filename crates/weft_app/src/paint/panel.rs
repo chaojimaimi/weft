@@ -1,10 +1,29 @@
 //! History panel vertex builder extracted from renderer.rs (A5).
 
 use crate::paint::primitives::{color_to_normalized, push_quad};
-use crate::renderer::{
+use crate::paint::ui_helpers::{
     block_duration_str, panel_display, strip_prompt_prefix, truncate_str, visible_panel_rows,
-    MetalRenderer, PanelDrawParams,
 };
+use crate::renderer::MetalRenderer;
+use weft_core::blocks::{Block, BlockId};
+
+/// What the sidebar history panel should draw. Built by the app only when the
+/// panel is open and passed to [`crate::renderer::MetalRenderer::draw`].
+pub struct PanelDrawParams<'a> {
+    /// Finished blocks (oldest-first; the renderer shows newest first).
+    pub blocks: &'a [Block],
+    /// Panel width in physical pixels.
+    pub width_px: f32,
+    /// Live search filter (matches command or output, case-insensitive).
+    pub query: &'a str,
+    /// Index of the selected row within the newest-first filtered list.
+    pub selection: usize,
+    /// Id of the block whose output is expanded inline (None = all collapsed).
+    pub expanded_id: Option<BlockId>,
+    /// v0.9 fix: whether the search box has keyboard focus (draws accent
+    /// underline so the user knows typing will go to the filter).
+    pub search_focused: bool,
+}
 
 impl MetalRenderer {
     /// Build vertices for the right-side history panel overlay: a translucent

@@ -46,12 +46,13 @@ use app_state::{
 };
 use effect::Effect;
 use input_router::{OverlayInputContext, OverlayInputOwner};
+use paint::overlays::FindDrawState;
+use paint::tab_bar::TabBarDrawState;
+use paint::ui_helpers::block_matches_query;
 use palette_state::{
     BuiltinCmd, CreateStep, PaletteEntry, PaletteState, PaletteSubMode, WorkflowForm,
 };
-use renderer::{
-    block_matches_query, configure_titlebar, FindDrawState, MetalRenderer, TabBarDrawState,
-};
+use renderer::{configure_titlebar, MetalRenderer};
 use std::sync::atomic::Ordering;
 use tab::{Tab, TuiScrollResolution};
 use terminal_geometry::{dimensions_for_renderer, terminal_layout_for_renderer, TerminalLayout};

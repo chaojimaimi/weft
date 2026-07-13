@@ -8,7 +8,8 @@ use std::rc::Rc;
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
 use crate::paint::primitives::{color_to_normalized, push_quad};
-use crate::renderer::{abbreviate_path, block_duration_str, strip_prompt_prefix, MetalRenderer};
+use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
+use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
 
 impl MetalRenderer {

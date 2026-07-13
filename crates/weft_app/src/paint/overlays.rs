@@ -1,7 +1,44 @@
 //! Context menu, Find and Completion vertex builders.
 
 use crate::paint::primitives::{color_to_normalized, push_quad, push_triangle};
-use crate::renderer::{FindDrawState, MetalRenderer};
+use crate::renderer::MetalRenderer;
+
+/// Per-frame FindInGrid draw state (v0.8 B3). Set by the app before `draw()`.
+#[derive(Clone, Debug, Default)]
+pub struct FindDrawState {
+    /// Live query string (rendered in the bar input).
+    pub query: String,
+    /// 1-based index of the current match, or 0 when there are no matches.
+    pub current: usize,
+    /// Total NAVIGABLE matches. In grid view this is grid matches; in block
+    /// view this is block matches (Enter cycles through them).
+    pub total: usize,
+    /// True when `total` hit MAX_MATCHES — surfaced as "too many matches".
+    pub truncated: bool,
+    /// Current GRID match's `(viewport_row, col, len_in_cells)` — `None` when
+    /// no match is selected or in block view. The renderer highlights this
+    /// rectangle.
+    pub highlight: Option<(usize, usize, usize)>,
+    /// Current BLOCK match's `(block_id, line, is_command, col, len)` — used
+    /// to highlight the match in block view. `None` in grid view or when no
+    /// match is selected.
+    pub block_highlight: Option<(u64, usize, bool, usize, usize)>,
+    /// Non-navigable matches found in block content (block view only). When
+    /// `total == 0` and this is > 0, the status shows "N matches in blocks"
+    /// so the user knows the search did find things (just not navigable).
+    pub block_matches: usize,
+    /// Regex mode toggle (v0.9 U-P2: now actually wired — when true, the
+    /// query is compiled as a `regex::Regex` and matched via `find_iter`).
+    /// When true, the ".*" indicator lights up in accent color.
+    pub regex_mode: bool,
+    /// Case-sensitive toggle. When true, the "Aa" indicator lights up in
+    /// accent color and the search matches exact character case.
+    pub case_sensitive: bool,
+    /// Regex compile error message (v0.9 U-P2). When `Some`, the FindUI
+    /// shows "invalid regex" in red instead of the match count. Cleared
+    /// when the query compiles successfully or regex mode is toggled off.
+    pub regex_error: Option<String>,
+}
 
 impl MetalRenderer {
     /// Build the right-click context menu (F7) as a small popup at (x, y).

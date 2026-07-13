@@ -1,7 +1,35 @@
 //! Tab bar vertex builder extracted from renderer.rs (A5).
 
 use crate::paint::primitives::{color_to_normalized, push_line, push_quad};
-use crate::renderer::{truncate_str, MetalRenderer, TabBarDrawState};
+use crate::paint::ui_helpers::truncate_str;
+use crate::renderer::MetalRenderer;
+
+/// v0.9 H1: Tab bar state passed to the renderer each frame.
+#[derive(Clone, Default)]
+pub struct TabBarDrawState {
+    /// Number of open tabs.
+    pub tab_count: usize,
+    /// Index of the active tab (0-based).
+    pub active_tab: usize,
+    /// Tab labels (e.g., shell cwd basename or "Tab N").
+    pub labels: Vec<String>,
+    /// v0.9 W1+: index of the tab currently hovered by the mouse (0-based),
+    /// or `None` when the cursor isn't over any tab. Used to show the close
+    /// "×" button on hover (Warp-style) — active tab always shows "×".
+    pub hovered_tab: Option<usize>,
+    /// v1.2: horizontal scroll offset in physical pixels. 0 = scrolled all
+    /// the way left (showing the first tab). Applied as `x0 -= scroll_offset`
+    /// in `build_tab_bar_vertices`. The app clamps this to the valid range
+    /// (0 .. total_tab_width - visible_width) on each frame.
+    pub scroll_offset: f32,
+    /// v1.2: true when the mouse is over the "+" (new tab) button. Drives a
+    /// hover highlight effect on the button.
+    pub plus_hovered: bool,
+    /// v1.2: true when the mouse is over the left scroll arrow.
+    pub arrow_left_hovered: bool,
+    /// v1.2: true when the mouse is over the right scroll arrow.
+    pub arrow_right_hovered: bool,
+}
 
 impl MetalRenderer {
     /// v0.9 H1: Build the tab bar vertices (background + tab labels + close

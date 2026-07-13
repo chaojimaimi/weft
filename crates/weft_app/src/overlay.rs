@@ -15,8 +15,8 @@ use weft_core::blocks::BlockId;
 use weft_core::complete::Match;
 use weft_core::vt::Terminal;
 
+use crate::paint::panel::PanelDrawParams;
 use crate::paint::prompt::PromptDrawParams;
-use crate::renderer::PanelDrawParams;
 
 // ── Z-order ───────────────────────────────────────────────────────────
 
