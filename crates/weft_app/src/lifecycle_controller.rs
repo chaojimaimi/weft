@@ -17,7 +17,11 @@ impl App {
     /// back to the renderer's viewport estimate if the terminal is not yet
     /// initialized.
     pub(super) fn current_size(&self) -> (usize, usize) {
-        if let Some(t) = self.sessions.active().terminal.as_ref() {
+        if let Some(t) = self
+            .sessions
+            .tab(self.sessions.active_idx())
+            .and_then(|tab| tab.terminal.as_ref())
+        {
             let grid = t.grid();
             return (grid.num_rows, grid.num_cols);
         }

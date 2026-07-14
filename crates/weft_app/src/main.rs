@@ -14,6 +14,7 @@ mod completion_component;
 mod context_menu_component;
 mod editor_controller;
 mod effect;
+mod event_replay;
 mod find_component;
 mod find_controller;
 mod find_worker;
@@ -28,6 +29,7 @@ mod macos_window;
 mod menu;
 mod mouse_controller;
 mod mouse_press_controller;
+mod mouse_protocol_controller;
 mod overlay;
 mod paint;
 mod palette_component;
@@ -251,6 +253,16 @@ impl App {
                 // Shell exited on tab `i`. For now (Stage 2) we only exit
                 // the app when the LAST tab's shell exits. A closed tab
                 // via Cmd+W is handled by `close_tab`, not here.
+                let dead_session_id = self.sessions.tab(i).map(|tab| tab.session_id);
+                let menu_belongs_to_dead_session = dead_session_id.is_some_and(|session_id| {
+                    self.interaction
+                        .context_menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.belongs_to_session(session_id))
+                });
+                if menu_belongs_to_dead_session {
+                    self.take_context_menu("context menu owner shell exited");
+                }
                 let is_last = self.sessions.remove_dead(i);
                 if is_last {
                     exit_requested = true;
@@ -436,24 +448,12 @@ impl App {
         }
     }
 
-    /// Cancel native marked text before keyboard ownership changes. macOS
-    /// keeps this state on the window rather than on an individual Weft tab.
-    fn reset_ime_context(&mut self, reason: &'static str) {
-        for tab in self.sessions.tabs_mut() {
-            tab.ime_preedit.clear();
-            tab.ime_preedit_cursor = None;
-        }
-        if let Some(window) = &self.window {
-            ime::discard_marked_text(window);
-        }
-        tracing::debug!(reason, "native IME context reset");
-    }
-
     fn overlay_input_owner(&self) -> Option<OverlayInputOwner> {
         OverlayInputOwner::resolve(OverlayInputContext {
             palette_open: self.palette.open,
             settings_open: self.settings.open,
             find_open: self.find.open,
+            context_menu_open: self.interaction.context_menu.is_some(),
             panel_search_focused: self.panel.open && self.panel.search_focused,
         })
     }
@@ -464,86 +464,8 @@ impl App {
         mods: winit::event::Modifiers,
         text: Option<&str>,
     ) {
-        if self.tab().terminal.is_none() {
+        let Some(key) = event_replay::map_winit_key(key_code) else {
             return;
-        }
-
-        let key = match key_code {
-            WinitKeyCode::Enter => KeyCode::Enter,
-            WinitKeyCode::Backspace => KeyCode::Backspace,
-            WinitKeyCode::Tab => KeyCode::Tab,
-            WinitKeyCode::Escape => KeyCode::Escape,
-            WinitKeyCode::ArrowUp => KeyCode::Up,
-            WinitKeyCode::ArrowDown => KeyCode::Down,
-            WinitKeyCode::ArrowLeft => KeyCode::Left,
-            WinitKeyCode::ArrowRight => KeyCode::Right,
-            WinitKeyCode::Home => KeyCode::Home,
-            WinitKeyCode::End => KeyCode::End,
-            WinitKeyCode::PageUp => KeyCode::PageUp,
-            WinitKeyCode::PageDown => KeyCode::PageDown,
-            WinitKeyCode::Delete => KeyCode::Delete,
-            WinitKeyCode::Insert => KeyCode::Insert,
-            WinitKeyCode::F1 => KeyCode::F(1),
-            WinitKeyCode::F2 => KeyCode::F(2),
-            WinitKeyCode::F3 => KeyCode::F(3),
-            WinitKeyCode::F4 => KeyCode::F(4),
-            WinitKeyCode::F5 => KeyCode::F(5),
-            WinitKeyCode::F6 => KeyCode::F(6),
-            WinitKeyCode::F7 => KeyCode::F(7),
-            WinitKeyCode::F8 => KeyCode::F(8),
-            WinitKeyCode::F9 => KeyCode::F(9),
-            WinitKeyCode::F10 => KeyCode::F(10),
-            WinitKeyCode::F11 => KeyCode::F(11),
-            WinitKeyCode::F12 => KeyCode::F(12),
-            WinitKeyCode::Space => KeyCode::Char(' '),
-            WinitKeyCode::KeyA => KeyCode::Char('a'),
-            WinitKeyCode::KeyB => KeyCode::Char('b'),
-            WinitKeyCode::KeyC => KeyCode::Char('c'),
-            WinitKeyCode::KeyD => KeyCode::Char('d'),
-            WinitKeyCode::KeyE => KeyCode::Char('e'),
-            WinitKeyCode::KeyF => KeyCode::Char('f'),
-            WinitKeyCode::KeyG => KeyCode::Char('g'),
-            WinitKeyCode::KeyH => KeyCode::Char('h'),
-            WinitKeyCode::KeyI => KeyCode::Char('i'),
-            WinitKeyCode::KeyJ => KeyCode::Char('j'),
-            WinitKeyCode::KeyK => KeyCode::Char('k'),
-            WinitKeyCode::KeyL => KeyCode::Char('l'),
-            WinitKeyCode::KeyM => KeyCode::Char('m'),
-            WinitKeyCode::KeyN => KeyCode::Char('n'),
-            WinitKeyCode::KeyO => KeyCode::Char('o'),
-            WinitKeyCode::KeyP => KeyCode::Char('p'),
-            WinitKeyCode::KeyQ => KeyCode::Char('q'),
-            WinitKeyCode::KeyR => KeyCode::Char('r'),
-            WinitKeyCode::KeyS => KeyCode::Char('s'),
-            WinitKeyCode::KeyT => KeyCode::Char('t'),
-            WinitKeyCode::KeyU => KeyCode::Char('u'),
-            WinitKeyCode::KeyV => KeyCode::Char('v'),
-            WinitKeyCode::KeyW => KeyCode::Char('w'),
-            WinitKeyCode::KeyX => KeyCode::Char('x'),
-            WinitKeyCode::KeyY => KeyCode::Char('y'),
-            WinitKeyCode::KeyZ => KeyCode::Char('z'),
-            WinitKeyCode::Digit0 => KeyCode::Char('0'),
-            WinitKeyCode::Digit1 => KeyCode::Char('1'),
-            WinitKeyCode::Digit2 => KeyCode::Char('2'),
-            WinitKeyCode::Digit3 => KeyCode::Char('3'),
-            WinitKeyCode::Digit4 => KeyCode::Char('4'),
-            WinitKeyCode::Digit5 => KeyCode::Char('5'),
-            WinitKeyCode::Digit6 => KeyCode::Char('6'),
-            WinitKeyCode::Digit7 => KeyCode::Char('7'),
-            WinitKeyCode::Digit8 => KeyCode::Char('8'),
-            WinitKeyCode::Digit9 => KeyCode::Char('9'),
-            WinitKeyCode::Minus => KeyCode::Char('-'),
-            WinitKeyCode::Equal => KeyCode::Char('='),
-            WinitKeyCode::BracketLeft => KeyCode::Char('['),
-            WinitKeyCode::BracketRight => KeyCode::Char(']'),
-            WinitKeyCode::Backslash => KeyCode::Char('\\'),
-            WinitKeyCode::Semicolon => KeyCode::Char(';'),
-            WinitKeyCode::Quote => KeyCode::Char('\''),
-            WinitKeyCode::Backquote => KeyCode::Char('`'),
-            WinitKeyCode::Comma => KeyCode::Char(','),
-            WinitKeyCode::Period => KeyCode::Char('.'),
-            WinitKeyCode::Slash => KeyCode::Char('/'),
-            _ => return,
         };
 
         let mut m = Modifiers::empty();
@@ -558,6 +480,24 @@ impl App {
         }
         if mods.state().super_key() {
             m |= Modifiers::SUPER;
+        }
+
+        let bound_action = self.config_state.keybindings.lookup(key, m);
+        let has_terminal = self
+            .sessions
+            .tab(self.sessions.active_idx())
+            .is_some_and(|tab| tab.terminal.is_some());
+        match input_router::route_keyboard_entry(
+            !self.sessions.is_empty(),
+            has_terminal,
+            bound_action,
+        ) {
+            input_router::KeyboardEntryRoute::Action(action) => {
+                self.execute_action(action);
+                return;
+            }
+            input_router::KeyboardEntryRoute::Consume => return,
+            input_router::KeyboardEntryRoute::Session => {}
         }
 
         // Configurable keybindings: resolve (key, mods) → action. If it maps to
@@ -587,7 +527,7 @@ impl App {
                 return;
             }
         }
-        if let Some(action) = self.config_state.keybindings.lookup(key, m) {
+        if let Some(action) = bound_action {
             if self.execute_action(action) {
                 return;
             }
@@ -598,6 +538,7 @@ impl App {
             Some(OverlayInputOwner::Palette) => self.handle_palette_key(key, m, text),
             Some(OverlayInputOwner::Settings) => self.handle_settings_key(key, m, text),
             Some(OverlayInputOwner::Find) => self.handle_find_key(key, m, text),
+            Some(OverlayInputOwner::ContextMenu) => self.handle_context_menu_key(key),
             Some(OverlayInputOwner::PanelSearch) => self.handle_panel_key(key, m),
             None => false,
         };
@@ -663,6 +604,16 @@ impl App {
     /// Dispatch a weft action resolved from a keybinding. Returns true if the
     /// key was consumed (must not be forwarded to the PTY).
     fn execute_action(&mut self, action: Action) -> bool {
+        if input_router::route_global_action(self.interaction.context_menu.is_some())
+            == input_router::GlobalActionOverlayRoute::DismissContextMenu
+        {
+            self.take_context_menu("global action dispatched");
+        }
+        if input_router::route_session_action(!self.sessions.is_empty(), action)
+            == input_router::SessionInputRoute::Consume
+        {
+            return true;
+        }
         match action {
             Action::Copy => {
                 self.copy_selection();
@@ -773,13 +724,14 @@ impl App {
                 true
             }
             Action::ToggleSettings => {
-                self.reset_ime_context("settings toggled");
                 if self.settings.open {
-                    self.settings.close();
+                    self.close_settings();
                 } else {
+                    self.reset_ime_context("settings opened");
                     // Mutual exclusion: close other modals.
                     self.close_palette();
                     self.close_find();
+                    self.save_focus_for_modal(crate::scene::FocusId::Settings);
                     self.settings.open_from(&self.config_state.config);
                 }
                 self.request_redraw();
@@ -887,6 +839,7 @@ impl App {
     /// Compute the current logical [`FocusId`] from the overlay state. Mirrors
     /// the priority in `OverlayInputOwner::resolve`.
     fn compute_current_focus(&self) -> Option<crate::scene::FocusId> {
+        let active_tab = self.sessions.active_idx();
         crate::paint::command_surface::compute_current_focus(
             self.palette.open,
             self.settings.open,
@@ -895,12 +848,11 @@ impl App {
             self.panel.open && self.panel.search_focused,
             /* editor_active */ true,
             self.sessions
-                .active()
-                .terminal
-                .as_ref()
+                .tab(active_tab)
+                .and_then(|tab| tab.terminal.as_ref())
                 .map(|t| t.editor().is_completing())
                 .unwrap_or(false),
-            self.sessions.active_idx(),
+            active_tab,
         )
     }
 

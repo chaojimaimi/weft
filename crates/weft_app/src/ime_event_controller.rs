@@ -3,112 +3,124 @@
 use super::*;
 
 impl App {
-    pub(super) fn handle_ime_event(&mut self, ime_event: winit::event::Ime) {
-        match ime_event {
-            winit::event::Ime::Enabled => {}
-            winit::event::Ime::Preedit(text, cursor) => {
-                // Keyboard, preedit and commit must agree on the same
-                // focus owner. Any overlay suppresses terminal preedit;
-                // Settings intentionally has no text target yet.
-                if self.overlay_input_owner().is_some() {
-                    self.sessions.active_mut().ime_preedit.clear();
-                    self.sessions.active_mut().ime_preedit_cursor = None;
-                } else {
-                    self.sessions.active_mut().ime_preedit = text;
-                    // F2 P1-4: store the preedit cursor byte range so the
-                    // renderer can position the composition caret within the
-                    // preedit string (lightweight version — not a full
-                    // NSTextInputClient implementation).
-                    self.sessions.active_mut().ime_preedit_cursor = cursor;
+    /// Cancel native marked text before keyboard ownership changes. macOS
+    /// keeps this state on the window rather than on an individual Weft tab.
+    pub(super) fn reset_ime_context(&mut self, reason: &'static str) {
+        for action in event_replay::reset_ime_context_actions() {
+            match action {
+                event_replay::ImeContextResetAction::ClearAllPreedit => {
+                    event_replay::clear_all_preedit(self.sessions.tabs_mut());
+                }
+                event_replay::ImeContextResetAction::DiscardNativeMarkedText => {
+                    if let Some(window) = &self.window {
+                        ime::discard_marked_text(window);
+                    }
                 }
             }
-            winit::event::Ime::Commit(text) => {
-                self.sessions.active_mut().ime_preedit.clear();
-                self.sessions.active_mut().ime_preedit_cursor = None;
-                if !text.is_empty() {
+        }
+        tracing::debug!(reason, "native IME context reset");
+    }
+
+    pub(super) fn handle_ime_event(&mut self, ime_event: winit::event::Ime) {
+        let input = match ime_event {
+            winit::event::Ime::Enabled => event_replay::ImeInput::Enabled,
+            winit::event::Ime::Preedit(text, cursor) => {
+                event_replay::ImeInput::Preedit { text, cursor }
+            }
+            winit::event::Ime::Commit(text) => event_replay::ImeInput::Commit(text),
+            winit::event::Ime::Disabled => event_replay::ImeInput::Disabled,
+        };
+        let (active_tab, input_mode) = if self.sessions.is_empty() {
+            (0, weft_core::input::InputMode::Passthrough)
+        } else {
+            (
+                self.sessions.active_idx(),
+                self.sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.effective_input_mode())
+                    .unwrap_or(weft_core::input::InputMode::Passthrough),
+            )
+        };
+        let context = event_replay::ImeRouteContext {
+            owner: self.overlay_input_owner(),
+            input_mode,
+            active_tab,
+        };
+        for action in event_replay::route_ime_input(input, context) {
+            match action {
+                event_replay::ImeRoutingAction::ClearActivePreedit => {
+                    if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                        tab.ime_preedit.clear();
+                        tab.ime_preedit_cursor = None;
+                    }
+                }
+                event_replay::ImeRoutingAction::SetActivePreedit { text, cursor } => {
+                    if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                        tab.ime_preedit = text;
+                        tab.ime_preedit_cursor = cursor;
+                    }
+                }
+                event_replay::ImeRoutingAction::ClearAllPreedit => {
+                    event_replay::clear_all_preedit(self.sessions.tabs_mut());
+                }
+                event_replay::ImeRoutingAction::Commit { target, text } => {
                     tracing::debug!(
-                        tab = self.sessions.active_idx(),
+                        tab = active_tab,
                         len = text.len(),
+                        ?target,
                         "routing fresh IME commit"
                     );
-                    match self.overlay_input_owner() {
-                        Some(OverlayInputOwner::Palette) => {
+                    match target {
+                        event_replay::ImeCommitTarget::Palette => {
                             self.palette.query.push_str(&text);
                             self.palette.selection = 0;
                             self.refresh_palette_results();
                             self.request_redraw();
                         }
-                        Some(OverlayInputOwner::Settings) => {
-                            // Settings currently has no free-text field.
-                            // Consume the commit so it cannot leak into
-                            // a covered prompt or passthrough PTY.
+                        event_replay::ImeCommitTarget::SettingsConsumed => {
                             tracing::debug!(len = text.len(), "IME commit consumed by settings");
                             self.request_redraw();
                         }
-                        Some(OverlayInputOwner::Find) => {
+                        event_replay::ImeCommitTarget::ContextMenuConsumed => {
+                            tracing::debug!(
+                                len = text.len(),
+                                "IME commit consumed by context menu"
+                            );
+                            self.request_redraw();
+                        }
+                        event_replay::ImeCommitTarget::Find => {
                             self.find.query.push_str(&text);
                             self.find.last_key = Some(std::time::Instant::now());
                             self.request_redraw();
                         }
-                        Some(OverlayInputOwner::PanelSearch) => {
+                        event_replay::ImeCommitTarget::PanelSearch => {
                             self.panel.query.push_str(&text);
                             self.clamp_panel_scroll();
                             self.clamp_panel_selection();
                             self.request_redraw();
                         }
-                        None => {
-                            let mode = self
+                        event_replay::ImeCommitTarget::Editor { tab } => {
+                            if let Some(terminal) = self
                                 .sessions
-                                .active_mut()
-                                .terminal
-                                .as_ref()
-                                .map(|t| t.effective_input_mode())
-                                .unwrap_or(weft_core::input::InputMode::Passthrough);
-                            if mode == weft_core::input::InputMode::Editor {
-                                // Editor takeover: composed text goes into the box.
-                                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
-                                    for c in text.chars() {
-                                        t.editor_mut().buffer.insert_char(c);
-                                    }
-                                    // v0.9: IME input clears the editor
-                                    // selection (typing replaces it).
-                                    t.editor_mut().buffer.clear_selection();
+                                .tab_mut(tab)
+                                .and_then(|session| session.terminal.as_mut())
+                            {
+                                for c in text.chars() {
+                                    terminal.editor_mut().buffer.insert_char(c);
                                 }
-                                self.interaction.prompt_dragging = false;
-                                self.request_redraw();
-                            } else {
-                                // Passthrough: send committed text to the PTY.
-                                //
-                                // v1.0 fix: send the text as RAW BYTES, not
-                                // via `encode_paste`. A typed/IME-committed
-                                // character is keyboard INPUT, not a paste —
-                                // wrapping it in bracketed-paste escapes
-                                // (`\x1b[200~ … \x1b[201~`) corrupts
-                                // alt-screen apps like `less`/`vim` which
-                                // don't understand bracketed paste: the
-                                // leading `\x1b[` is an unknown CSI to them,
-                                // so a typed `/` (intended to start a
-                                // search) put `less` into a confused state
-                                // and the window appeared frozen until a
-                                // resize forced a repaint. Real pastes
-                                // (Cmd+V → `Effect::Paste`) still use
-                                // `encode_paste` with bracketed wrapping.
-                                // (bracketed_paste is a shell-prompt mode;
-                                // it stays on inside alt-screen apps
-                                // because `swap_alt` doesn't save/restore
-                                // it, so we must not consult it here.)
-                                let effects =
-                                    effect::ime_commit_effects(self.sessions.active_idx(), &text);
-                                self.drain_effects(effects);
+                                terminal.editor_mut().buffer.clear_selection();
                             }
+                            self.interaction.prompt_dragging = false;
+                            self.request_redraw();
+                        }
+                        event_replay::ImeCommitTarget::Pty { tab } => {
+                            // Typed/IME text is raw keyboard input, not paste;
+                            // bracketed-paste wrapping would corrupt less/vim.
+                            self.drain_effects(effect::ime_commit_effects(tab, &text));
                         }
                     }
-                }
-            }
-            winit::event::Ime::Disabled => {
-                for tab in self.sessions.tabs_mut() {
-                    tab.ime_preedit.clear();
-                    tab.ime_preedit_cursor = None;
                 }
             }
         }

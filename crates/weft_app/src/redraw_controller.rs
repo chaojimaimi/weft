@@ -6,6 +6,11 @@ impl App {
     pub(super) fn handle_redraw_requested(&mut self) {
         self.pump_pty();
         let had_output = self.process_messages();
+        if crate::input_router::route_session_input(!self.sessions.is_empty())
+            == crate::input_router::SessionInputRoute::Consume
+        {
+            return;
+        }
         self.update_cursor_blink();
         self.update_spinner();
         // FindInGrid debounce: when 150ms have elapsed since the last
@@ -166,7 +171,7 @@ impl App {
                 .interaction
                 .context_menu
                 .as_ref()
-                .map(|m| (m.x, m.y, m.block_id));
+                .map(|m| (m.x, m.y, m.block_id, m.selection));
 
             // Build palette entries as (label, description, kind_label) tuples.
             // v0.9 W2+: in SelectTheme sub-mode, project theme names

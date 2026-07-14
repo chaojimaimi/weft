@@ -58,8 +58,8 @@ pub struct MetalRenderer {
     pub(crate) popup_width_scale: f32,
     /// User-adjustable popup max visible rows.
     pub(crate) popup_max_rows: usize,
-    /// Context menu position + target block (F7). Set per-frame by the app.
-    pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>)>,
+    /// Context menu position + target block + keyboard selection. Set per-frame.
+    pub context_menu_target: Option<(f32, f32, Option<weft_core::blocks::BlockId>, usize)>,
     /// Layout context for the current frame (viewport + cell + padding + clip).
     /// Constructed at the top of `draw()` and used by overlay builders to derive
     /// coordinates from semantic methods instead of hand-rolled f32 math.
@@ -912,8 +912,8 @@ impl MetalRenderer {
         }
 
         // Context menu overlay (F7) — drawn at mouse position.
-        if let Some((x, y, _block_id)) = &self.context_menu_target {
-            vertices.extend_from_slice(&self.build_context_menu_vertices(*x, *y));
+        if let Some((x, y, _block_id, selection)) = &self.context_menu_target {
+            vertices.extend_from_slice(&self.build_context_menu_vertices(*x, *y, *selection));
         }
 
         // FindInGrid bar (v0.8 B3) — top banner with query + match count,

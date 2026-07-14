@@ -3,7 +3,79 @@
 use super::*;
 
 impl App {
+    pub(super) fn take_context_menu(&mut self, reason: &'static str) -> Option<ContextMenu> {
+        self.interaction.context_menu.as_ref()?;
+        self.reset_ime_context(reason);
+        let menu = self.interaction.context_menu.take();
+        self.clear_prev_focus_if_no_modal();
+        menu
+    }
+
+    pub(super) fn handle_context_menu_key(&mut self, key: KeyCode) -> bool {
+        let Some(menu) = self.interaction.context_menu.as_ref() else {
+            return false;
+        };
+        let action = crate::context_menu_component::context_menu_key_action(
+            key,
+            menu.selection,
+            CONTEXT_MENU_ITEMS.len(),
+        );
+        match action {
+            crate::context_menu_component::ContextMenuKeyAction::Select(selection) => {
+                if let Some(menu) = self.interaction.context_menu.as_mut() {
+                    menu.selection = selection;
+                }
+                self.request_redraw();
+            }
+            crate::context_menu_component::ContextMenuKeyAction::Accept(selection) => {
+                if let Some(menu) = self.take_context_menu("context menu accepted") {
+                    let action = CONTEXT_MENU_ITEMS[selection].1;
+                    self.run_context_action(menu.block_id, action);
+                }
+                self.request_redraw();
+            }
+            crate::context_menu_component::ContextMenuKeyAction::Cancel => {
+                self.take_context_menu("context menu cancelled");
+                self.request_redraw();
+            }
+            crate::context_menu_component::ContextMenuKeyAction::Consume => {}
+        }
+        true
+    }
+
     pub(super) fn handle_mouse_press(&mut self, x: f64, y: f64, button: winit::event::MouseButton) {
+        match crate::input_router::route_modal_mouse(
+            self.palette.open,
+            self.settings.open,
+            self.interaction.context_menu.is_some(),
+            button,
+        ) {
+            crate::input_router::ModalMouseRoute::PaletteLeft => {}
+            crate::input_router::ModalMouseRoute::SettingsLeft => {
+                self.handle_settings_mouse_press(x as f32, y as f32);
+                return;
+            }
+            crate::input_router::ModalMouseRoute::ContextMenuLeft => {
+                if let Some(menu) = self.take_context_menu("context menu closed by click") {
+                    self.execute_context_menu(&menu, x as f32, y as f32);
+                }
+                return;
+            }
+            crate::input_router::ModalMouseRoute::DismissContextMenu => {
+                self.take_context_menu("context menu dismissed by mouse");
+                self.request_redraw();
+                return;
+            }
+            crate::input_router::ModalMouseRoute::Consume => return,
+            crate::input_router::ModalMouseRoute::Terminal => {}
+        }
+
+        if crate::input_router::route_session_input(!self.sessions.is_empty())
+            == crate::input_router::SessionInputRoute::Consume
+        {
+            return;
+        }
+
         // v1.0 fix: sync InputHandler.mouse_protocol + sgr_mouse from the
         // Terminal's VT-parsed values before any mouse-event encoding. Without
         // this the handler's copy stays `Off` (its setters are test-only) and
@@ -21,69 +93,6 @@ impl App {
             self.sessions.active_mut().input_handler.mouse_protocol = mp;
             self.sessions.active_mut().input_handler.sgr_mouse = sgr;
         }
-        // v1.0 S1-b: Settings panel click handling — checked first so
-        // settings clicks work even inside TUI apps that captured the mouse
-        // (the panel is modal and overlays everything). When the panel is
-        // open, ALL left-clicks are either dispatched to a hit region or
-        // consumed (clicks outside any region do nothing — they don't fall
-        // through to the terminal / PTY).
-        if button == winit::event::MouseButton::Left && self.settings.open {
-            let xf = x as f32;
-            let yf = y as f32;
-            use crate::settings_component::SettingsTarget;
-            match self.settings_target_at(xf, yf) {
-                Some(SettingsTarget::SidebarCategory(tab)) => {
-                    if self.settings.tab != tab {
-                        self.settings.tab = tab;
-                        self.settings.selection = 0;
-                        self.settings.scroll_offset = 0;
-                        // F5: narrow mode — clicking a category drills into it.
-                        if self.settings_is_narrow() {
-                            self.settings.drill_down = true;
-                        }
-                    }
-                    self.request_redraw();
-                    return;
-                }
-                Some(SettingsTarget::Theme(i)) => {
-                    self.settings.selection = i;
-                    self.apply_settings_selection();
-                    self.request_redraw();
-                    return;
-                }
-                Some(SettingsTarget::CloseButton) => {
-                    self.settings.open = false;
-                    self.settings.error = None;
-                    self.request_redraw();
-                    return;
-                }
-                Some(SettingsTarget::SaveButton) => {
-                    self.save_settings_draft(true);
-                    self.request_redraw();
-                    return;
-                }
-                Some(SettingsTarget::ApplyButton) => {
-                    self.save_settings_draft(false);
-                    self.request_redraw();
-                    return;
-                }
-                None => {
-                    // Distinguish "inside panel box but missed all hits"
-                    // (consume) from "outside panel" (close). We rebuild the
-                    // layout just for the box rect — the hit test already
-                    // failed so this is cheap.
-                    if self.point_inside_settings_box(xf, yf) {
-                        return;
-                    }
-                    // Click outside the panel — close it (Warp-style).
-                    self.settings.open = false;
-                    self.settings.error = None;
-                    self.request_redraw();
-                    return;
-                }
-            }
-        }
-
         // v0.9 H1: Tab bar click handling — check before everything else so
         // tab clicks work even inside TUI apps that captured the mouse.
         // v1.2: always active (even single tab) since the bar is always drawn.
@@ -422,19 +431,10 @@ impl App {
                     self.palette.selection = clicked_idx;
                     self.request_redraw();
                 }
-                return;
             }
-        }
-
-        // If context menu is open, handle click as menu selection.
-        // (v0.9 fix: removed the "click any block to fold" handler that
-        // prevented text selection on block output. Folding is now solely
-        // via the chevron click handler above — W3.)
-        if button == winit::event::MouseButton::Left {
-            if let Some(menu) = self.interaction.context_menu.take() {
-                self.execute_context_menu(&menu, x as f32, y as f32);
-                return;
-            }
+            // Palette is modal: a left click outside a row or resize handle is
+            // still consumed and must never fall through to terminal selection.
+            return;
         }
 
         // v0.9: click inside the prompt input box → position the editor
@@ -525,18 +525,14 @@ impl App {
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);
             }
             winit::event::MouseButton::Right => {
-                // If context menu is open, right-click closes it.
-                if self.interaction.context_menu.is_some() {
-                    self.interaction.context_menu = None;
-                    self.request_redraw();
-                    return;
-                }
-
                 // Block view: open context menu on a block. block_at now
                 // supports both completed blocks (including those with no
                 // output) and the in-flight (running) command.
                 if let Some(id) = self.block_at(y as f32) {
+                    self.reset_ime_context("context menu opened");
+                    self.save_focus_for_modal(crate::scene::FocusId::ContextMenu);
                     self.interaction.context_menu = Some(ContextMenu {
+                        session_id: self.sessions.active().session_id,
                         block_id: id,
                         x: x as f32,
                         y: y as f32,

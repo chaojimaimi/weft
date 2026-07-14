@@ -64,7 +64,6 @@ impl SessionManager {
         self.tabs.len()
     }
 
-    #[allow(dead_code)] // test-only helper
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
@@ -91,6 +90,12 @@ impl SessionManager {
 
     pub fn tab_mut(&mut self, idx: usize) -> Option<&mut Tab> {
         self.tabs.get_mut(idx)
+    }
+
+    pub fn tab_index_by_session_id(&self, session_id: u64) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.session_id == session_id)
     }
 
     // ── Tab lifecycle ─────────────────────────────────────────────────
@@ -326,10 +331,17 @@ pub struct DragState {
 
 #[allow(dead_code)]
 pub struct ContextMenu {
+    pub session_id: u64,
     pub block_id: Option<BlockId>,
     pub x: f32,
     pub y: f32,
     pub selection: usize,
+}
+
+impl ContextMenu {
+    pub fn belongs_to_session(&self, session_id: u64) -> bool {
+        self.session_id == session_id
+    }
 }
 
 pub struct InteractionState {
@@ -343,6 +355,7 @@ pub struct InteractionState {
     pub scrollbar_drag: Option<crate::scrollbar_component::ScrollbarDragState>,
     pub scrollbar_hovered: bool,
     pub precise_scroll: crate::scroll_input::PreciseScrollAccumulator,
+    pub modal_mouse_capture: crate::input_router::ModalMouseCapture,
     pub context_menu: Option<ContextMenu>,
     /// F3-1: Block currently hovered by the mouse in the block view, if any.
     /// Drives the inline copy/fold action buttons rendered on the header row.
@@ -377,6 +390,7 @@ impl InteractionState {
             scrollbar_drag: None,
             scrollbar_hovered: false,
             precise_scroll: crate::scroll_input::PreciseScrollAccumulator::default(),
+            modal_mouse_capture: crate::input_router::ModalMouseCapture::default(),
             context_menu: None,
             block_hovered: None,
             sidebar_drag: None,
@@ -554,8 +568,8 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigState, FindState, InteractionState, PanelState, SessionManager, SettingsState,
-        TabBarState, WindowRuntimeState,
+        ConfigState, ContextMenu, FindState, InteractionState, PanelState, SessionManager,
+        SettingsState, TabBarState, WindowRuntimeState,
     };
     use crate::tab::Tab;
     use std::time::Instant;
@@ -644,6 +658,19 @@ mod tests {
     }
 
     #[test]
+    fn context_menu_ownership_uses_stable_session_identity() {
+        let menu = ContextMenu {
+            session_id: 42,
+            block_id: None,
+            x: 0.0,
+            y: 0.0,
+            selection: 0,
+        };
+        assert!(menu.belongs_to_session(42));
+        assert!(!menu.belongs_to_session(7));
+    }
+
+    #[test]
     fn window_runtime_starts_with_visible_cursor_animation() {
         let state = WindowRuntimeState::new();
         assert!(state.cursor_blink_on);
@@ -704,6 +731,20 @@ mod tests {
         assert!(!sm.close_background(0));
         assert_eq!(sm.active_idx(), 1);
         assert_eq!(sm.len(), 2);
+    }
+
+    #[test]
+    fn stable_session_id_survives_reindex_and_removed_owner_disappears() {
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        let removed = sm.tab(0).unwrap().session_id;
+        let survivor = sm.tab(2).unwrap().session_id;
+
+        assert!(!sm.close_background(0));
+        assert_eq!(sm.tab_index_by_session_id(removed), None);
+        assert_eq!(sm.tab_index_by_session_id(survivor), Some(1));
     }
 
     #[test]

@@ -2,6 +2,36 @@
 
 use crate::layout::ContextMenuLayout;
 use crate::scene::{FocusId, HitRegion, Scene, SemanticNode, SemanticRole};
+use weft_core::input::KeyCode;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextMenuKeyAction {
+    Select(usize),
+    Accept(usize),
+    Cancel,
+    Consume,
+}
+
+pub(crate) fn clamped_context_menu_selection(selection: usize, item_count: usize) -> Option<usize> {
+    (item_count > 0).then(|| selection.min(item_count - 1))
+}
+
+pub(crate) fn context_menu_key_action(
+    key: KeyCode,
+    selection: usize,
+    item_count: usize,
+) -> ContextMenuKeyAction {
+    let current = clamped_context_menu_selection(selection, item_count);
+    match (key, current) {
+        (KeyCode::Escape, _) => ContextMenuKeyAction::Cancel,
+        (KeyCode::Enter, Some(current)) => ContextMenuKeyAction::Accept(current),
+        (KeyCode::Up, Some(current)) => ContextMenuKeyAction::Select(current.saturating_sub(1)),
+        (KeyCode::Down, Some(current)) => ContextMenuKeyAction::Select(
+            current.saturating_add(1).min(item_count.saturating_sub(1)),
+        ),
+        _ => ContextMenuKeyAction::Consume,
+    }
+}
 
 pub(crate) fn build_context_menu_scene(
     layout: ContextMenuLayout,
@@ -47,8 +77,12 @@ pub(crate) fn context_menu_item_at(scene: &Scene<usize>, x: f32, y: f32) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use super::{build_context_menu_scene, context_menu_item_at};
+    use super::{
+        build_context_menu_scene, clamped_context_menu_selection, context_menu_item_at,
+        context_menu_key_action, ContextMenuKeyAction,
+    };
     use crate::layout::{layout_context_menu, LayoutCtx};
+    use weft_core::input::KeyCode;
 
     const ITEMS: &[(&str, &str); 4] = &[
         ("Copy Command", "copy_command"),
@@ -81,5 +115,39 @@ mod tests {
             context_menu_item_at(&scene, layout.item_rects[0][2], boundary_y),
             None
         );
+    }
+
+    #[test]
+    fn keyboard_navigation_clamps_and_modal_keys_are_consumed() {
+        assert_eq!(
+            context_menu_key_action(KeyCode::Up, 0, ITEMS.len()),
+            ContextMenuKeyAction::Select(0)
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Down, ITEMS.len() - 1, ITEMS.len()),
+            ContextMenuKeyAction::Select(ITEMS.len() - 1)
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Enter, 2, ITEMS.len()),
+            ContextMenuKeyAction::Accept(2)
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Escape, 2, ITEMS.len()),
+            ContextMenuKeyAction::Cancel
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Char('x'), 2, ITEMS.len()),
+            ContextMenuKeyAction::Consume
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Enter, usize::MAX, ITEMS.len()),
+            ContextMenuKeyAction::Accept(ITEMS.len() - 1)
+        );
+        assert_eq!(
+            context_menu_key_action(KeyCode::Up, usize::MAX, ITEMS.len()),
+            ContextMenuKeyAction::Select(ITEMS.len() - 2)
+        );
+        assert_eq!(clamped_context_menu_selection(7, 0), None);
+        assert_eq!(clamped_context_menu_selection(7, ITEMS.len()), Some(3));
     }
 }

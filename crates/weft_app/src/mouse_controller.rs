@@ -13,6 +13,8 @@ impl App {
         _x: f64,
         _y: f64,
         button: winit::event::MouseButton,
+        terminal_session: Option<u64>,
+        report_to_pty: bool,
     ) {
         // F3-3: sidebar resize drag end — persist the new width to config.
         if button == winit::event::MouseButton::Left
@@ -68,7 +70,14 @@ impl App {
             self.interaction.prompt_dragging = false;
             // A click without drag (anchor == cursor) leaves an empty
             // selection — clear it so the caret shows normally.
-            if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+            let release_tab = match terminal_session {
+                Some(session_id) => self.sessions.tab_index_by_session_id(session_id),
+                None => Some(self.sessions.active_idx()),
+            };
+            if let Some(t) = release_tab
+                .and_then(|tab| self.sessions.tab_mut(tab))
+                .and_then(|tab| tab.terminal.as_mut())
+            {
                 if !t.editor().buffer.has_selection() {
                     // has_selection returns false when anchor==cursor, so
                     // explicitly clear the anchor to drop the empty selection.
@@ -79,7 +88,13 @@ impl App {
         }
 
         let pos = self.pixel_to_grid(_x, _y);
-        self.sessions.active_mut().selection_handler.end();
+        let release_tab = terminal_session
+            .and_then(|session_id| self.sessions.tab_index_by_session_id(session_id));
+        if let Some(tab) = release_tab.and_then(|idx| self.sessions.tab_mut(idx)) {
+            tab.selection_handler.end();
+        } else if terminal_session.is_none() && !self.sessions.is_empty() {
+            self.sessions.active_mut().selection_handler.end();
+        }
 
         let btn = match button {
             winit::event::MouseButton::Left => MouseButton::Left,
@@ -87,7 +102,11 @@ impl App {
             winit::event::MouseButton::Right => MouseButton::Right,
             _ => return,
         };
-        self.send_mouse_event(btn, MouseAction::Release, pos);
+        if report_to_pty {
+            if let Some(tab) = release_tab {
+                self.send_mouse_event_to_session(tab, btn, MouseAction::Release, pos);
+            }
+        }
     }
 
     /// Handle mouse movement.
@@ -772,35 +791,5 @@ impl App {
             }
         }
         self.request_redraw();
-    }
-
-    /// Send a mouse event to the PTY if mouse protocol is active.
-    pub(super) fn send_mouse_event(&self, button: MouseButton, action: MouseAction, pos: GridPos) {
-        let Some(terminal) = self.sessions.active().terminal.as_ref() else {
-            return;
-        };
-        if terminal.mouse_protocol == MouseProtocol::Off {
-            return;
-        }
-        let mut m = Modifiers::empty();
-        if self.interaction.mods.state().shift_key() {
-            m |= Modifiers::SHIFT;
-        }
-        if self.interaction.mods.state().alt_key() {
-            m |= Modifiers::ALT;
-        }
-        if self.interaction.mods.state().control_key() {
-            m |= Modifiers::CONTROL;
-        }
-        let bytes = self
-            .sessions
-            .active()
-            .input_handler
-            .encode_mouse(button, action, pos.col, pos.row, m);
-        if let Some(bytes) = bytes {
-            if let Some(pty) = &self.sessions.active().pty {
-                let _ = pty.write_sync(&bytes);
-            }
-        }
     }
 }

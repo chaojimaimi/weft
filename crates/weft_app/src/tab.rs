@@ -7,12 +7,15 @@
 //! per-tab find state is Stage 4.
 
 use crossbeam_channel::{Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use weft_core::input::InputHandler;
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
 use crate::{AppEvent, AppMsg};
+
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 struct PendingTuiScroll {
@@ -30,6 +33,7 @@ pub enum TuiScrollResolution {
 
 /// A single shell session (one PTY + one Terminal + per-session UI state).
 pub struct Tab {
+    pub session_id: u64,
     pub terminal: Option<Terminal>,
     pub pty: Option<Pty>,
     pub msg_rx: Receiver<AppMsg>,
@@ -98,6 +102,7 @@ impl Tab {
 
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             terminal: Some(terminal),
             pty: Some(pty),
             msg_rx,
@@ -118,6 +123,7 @@ impl Tab {
     pub(crate) fn empty() -> Self {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             terminal: None,
             pty: None,
             msg_rx,
@@ -648,6 +654,7 @@ mod tests {
     fn tab_with_terminal(scrollback_lines: usize) -> Tab {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Tab {
+            session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             terminal: Some(Terminal::with_scrollback(24, 80, scrollback_lines)),
             pty: None,
             msg_rx,

@@ -54,7 +54,7 @@ impl MetalRenderer {
     /// F4: shell now uses the shared `command_surface` builder so the menu
     /// shares the same 8% lifted bg + unified border as Palette/Find/
     /// Completion. Item text + separators remain menu-specific.
-    pub(crate) fn build_context_menu_vertices(&self, x: f32, y: f32) -> Vec<f32> {
+    pub(crate) fn build_context_menu_vertices(&self, x: f32, y: f32, selection: usize) -> Vec<f32> {
         use crate::paint::command_surface::{build_command_surface_shell, CommandSurfaceShell};
 
         let mut verts = Vec::new();
@@ -62,6 +62,8 @@ impl MetalRenderer {
         let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
         let fg = color_to_normalized(ui.text_primary);
         let prompt_c = color_to_normalized(ui.text_secondary);
+        let selection_bg = color_to_normalized(ui.selection);
+        let selection_fg = color_to_normalized(ui.selection_text);
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -87,9 +89,22 @@ impl MetalRenderer {
         );
 
         // Items.
+        let selected =
+            crate::context_menu_component::clamped_context_menu_selection(selection, items.len());
         for (i, label) in items.iter().enumerate() {
             let item_y = layout.item_y[i];
-            let color = if i >= items.len() - 2 {
+            if selected == Some(i) {
+                push_quad(
+                    &mut verts,
+                    layout.item_rects[i],
+                    bg_uv,
+                    [0.0; 4],
+                    selection_bg,
+                );
+            }
+            let color = if selected == Some(i) {
+                selection_fg
+            } else if i >= items.len() - 2 {
                 prompt_c // "Toggle Fold" + "Send to Input" in accent
             } else {
                 fg

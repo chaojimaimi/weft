@@ -100,24 +100,117 @@ impl App {
             }
             WindowEvent::MouseInput { state, button, .. } => match state {
                 winit::event::ElementState::Pressed => {
-                    self.handle_mouse_press(
-                        self.interaction.last_mouse_x,
-                        self.interaction.last_mouse_y,
+                    let modal_open = self.palette.open
+                        || self.settings.open
+                        || self.interaction.context_menu.is_some();
+                    let capture_active = self.interaction.modal_mouse_capture.is_active();
+                    if modal_open || capture_active {
+                        self.interaction
+                            .modal_mouse_capture
+                            .capture_press(true, button);
+                    } else if let Some(session) = self.sessions.tab(self.sessions.active_idx()) {
+                        self.interaction.modal_mouse_capture.capture_terminal_press(
+                            button,
+                            session.session_id,
+                            false,
+                        );
+                    }
+                    // A newly modal-owned press is delivered to that modal.
+                    // Extra presses during an already captured gesture stay
+                    // captured without falling through to the terminal.
+                    if modal_open || !capture_active {
+                        self.handle_mouse_press(
+                            self.interaction.last_mouse_x,
+                            self.interaction.last_mouse_y,
+                            button,
+                        );
+                    }
+                    // A terminal-routed press can itself open ContextMenu.
+                    // Record that ownership after the handler as well: the
+                    // menu consumed the press without emitting PTY bytes, so
+                    // its later release belongs to the same modal gesture.
+                    self.interaction.modal_mouse_capture.capture_press(
+                        self.palette.open
+                            || self.settings.open
+                            || self.interaction.context_menu.is_some(),
                         button,
                     );
                 }
                 winit::event::ElementState::Released => {
-                    self.handle_mouse_release(
-                        self.interaction.last_mouse_x,
-                        self.interaction.last_mouse_y,
-                        button,
-                    );
+                    match self.interaction.modal_mouse_capture.consume_release(button) {
+                        Some(crate::input_router::MouseGestureOwner::Modal)
+                        | Some(crate::input_router::MouseGestureOwner::Suppressed) => {}
+                        Some(crate::input_router::MouseGestureOwner::TerminalSession(
+                            session_id,
+                        )) => {
+                            self.handle_mouse_release(
+                                self.interaction.last_mouse_x,
+                                self.interaction.last_mouse_y,
+                                button,
+                                Some(session_id),
+                                true,
+                            );
+                        }
+                        Some(crate::input_router::MouseGestureOwner::LocalSession(session_id)) => {
+                            self.handle_mouse_release(
+                                self.interaction.last_mouse_x,
+                                self.interaction.last_mouse_y,
+                                button,
+                                Some(session_id),
+                                false,
+                            );
+                        }
+                        None if crate::input_router::route_modal_pointer(
+                            self.palette.open,
+                            self.settings.open,
+                            self.interaction.context_menu.is_some(),
+                            self.interaction.modal_mouse_capture.is_active(),
+                            !self.sessions.is_empty(),
+                        ) == crate::input_router::SessionInputRoute::Dispatch =>
+                        {
+                            self.handle_mouse_release(
+                                self.interaction.last_mouse_x,
+                                self.interaction.last_mouse_y,
+                                button,
+                                None,
+                                false,
+                            );
+                        }
+                        None => {}
+                    }
                 }
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.interaction.last_mouse_x = position.x;
                 self.interaction.last_mouse_y = position.y;
-                self.handle_mouse_move(position.x, position.y);
+                if crate::input_router::route_modal_pointer(
+                    self.palette.open,
+                    self.settings.open,
+                    self.interaction.context_menu.is_some(),
+                    self.interaction.modal_mouse_capture.is_active(),
+                    !self.sessions.is_empty(),
+                ) == crate::input_router::SessionInputRoute::Dispatch
+                {
+                    let active_session = self
+                        .sessions
+                        .tab(self.sessions.active_idx())
+                        .map(|tab| tab.session_id);
+                    let owner = self
+                        .interaction
+                        .modal_mouse_capture
+                        .terminal_move_owner()
+                        .map(|(_, owner)| owner);
+                    match crate::input_router::route_owned_pointer_move(active_session, owner) {
+                        crate::input_router::OwnedPointerMoveRoute::TerminalOwner(_) => {
+                            let pos = self.pixel_to_grid(position.x, position.y);
+                            self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+                        }
+                        crate::input_router::OwnedPointerMoveRoute::Suppress => {}
+                        crate::input_router::OwnedPointerMoveRoute::ActiveSession => {
+                            self.handle_mouse_move(position.x, position.y);
+                        }
+                    }
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 if self.interaction.scrollbar_hovered && self.interaction.scrollbar_drag.is_none() {
@@ -137,12 +230,21 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                self.handle_scroll(
-                    delta,
-                    phase,
-                    self.interaction.last_mouse_x,
-                    self.interaction.last_mouse_y,
-                );
+                if crate::input_router::route_modal_pointer(
+                    self.palette.open,
+                    self.settings.open,
+                    self.interaction.context_menu.is_some(),
+                    self.interaction.modal_mouse_capture.is_active(),
+                    !self.sessions.is_empty(),
+                ) == crate::input_router::SessionInputRoute::Dispatch
+                {
+                    self.handle_scroll(
+                        delta,
+                        phase,
+                        self.interaction.last_mouse_x,
+                        self.interaction.last_mouse_y,
+                    );
+                }
             }
             WindowEvent::Ime(ime_event) => self.handle_ime_event(ime_event),
             WindowEvent::Focused(focused) => {
@@ -151,6 +253,7 @@ impl App {
                     self.window_runtime.cursor_blink_on = true;
                     self.window_runtime.cursor_blink_time = std::time::Instant::now();
                 } else {
+                    self.interaction.modal_mouse_capture.suspend_active();
                     self.reset_ime_context("window focus lost");
                 }
             }

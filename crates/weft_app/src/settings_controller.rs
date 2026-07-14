@@ -9,6 +9,46 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 
 impl App {
+    pub(super) fn handle_settings_mouse_press(&mut self, x: f32, y: f32) {
+        use crate::settings_component::SettingsTarget;
+
+        match self.settings_target_at(x, y) {
+            Some(SettingsTarget::SidebarCategory(tab)) => {
+                if self.settings.tab != tab {
+                    self.settings.tab = tab;
+                    self.settings.selection = 0;
+                    self.settings.scroll_offset = 0;
+                    if self.settings_is_narrow() {
+                        self.settings.drill_down = true;
+                    }
+                }
+                self.request_redraw();
+            }
+            Some(SettingsTarget::Theme(i)) => {
+                self.settings.selection = i;
+                self.apply_settings_selection();
+                self.request_redraw();
+            }
+            Some(SettingsTarget::CloseButton) => {
+                self.close_settings();
+                self.request_redraw();
+            }
+            Some(SettingsTarget::SaveButton) => {
+                self.save_settings_draft(true);
+                self.request_redraw();
+            }
+            Some(SettingsTarget::ApplyButton) => {
+                self.save_settings_draft(false);
+                self.request_redraw();
+            }
+            None if !self.point_inside_settings_box(x, y) => {
+                self.close_settings();
+                self.request_redraw();
+            }
+            None => {}
+        }
+    }
+
     /// F5: Handle a key while the Settings panel is open. Returns true if
     /// consumed. Modal — captures all non-modifier-chord keys so the panel
     /// owns keyboard input while visible.
@@ -55,9 +95,7 @@ impl App {
                     true
                 } else {
                     // Wide mode or narrow sidebar mode: close without saving.
-                    self.settings.open = false;
-                    self.settings.error = None;
-                    self.settings.field_errors.clear();
+                    self.close_settings();
                     self.request_redraw();
                     true
                 }
@@ -199,9 +237,7 @@ impl App {
             self.settings.error = None;
         }
         if close {
-            self.settings.open = false;
-            self.settings.error = None;
-            self.settings.field_errors.clear();
+            self.close_settings();
         }
     }
 
