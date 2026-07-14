@@ -1,0 +1,1010 @@
+{
+  "schema": 1,
+  "themes": [
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.62
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.86
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 5.648
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.074
+        }
+      ],
+      "name": "weft-warm",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 11.532
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 12.057
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 9.16
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 13.055
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 6.308
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.596
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 5.011
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.141
+        },
+        {
+          "pair": "focus",
+          "ratio": 7.563
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 8.562
+        },
+        {
+          "pair": "success",
+          "ratio": 8.676
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.822
+        },
+        {
+          "pair": "warning",
+          "ratio": 7.703
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.72
+        },
+        {
+          "pair": "error",
+          "ratio": 4.518
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.115
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 6.2
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.085
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.235
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 4.025
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.048
+        }
+      ],
+      "name": "weft-light",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 11.106
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 11.878
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 11.212
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 9.753
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 5.161
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 5.52
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 5.21
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 4.532
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.182
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 4.55
+        },
+        {
+          "pair": "success",
+          "ratio": 5.141
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 4.514
+        },
+        {
+          "pair": "warning",
+          "ratio": 5.198
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 4.564
+        },
+        {
+          "pair": "error",
+          "ratio": 5.519
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 4.847
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.333
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.591
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.861
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 5.887
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.053
+        }
+      ],
+      "name": "warp-dark",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 12.143
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 12.676
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 9.692
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 13.62
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 6.573
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.862
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 5.246
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.372
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.571
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 6.249
+        },
+        {
+          "pair": "success",
+          "ratio": 8.77
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.836
+        },
+        {
+          "pair": "warning",
+          "ratio": 7.786
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.732
+        },
+        {
+          "pair": "error",
+          "ratio": 4.567
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.122
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 6.253
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.336
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.559
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 6.55
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.004
+        }
+      ],
+      "name": "dracula",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 13.359
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 14.488
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 10.435
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 16.76
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 7.337
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 7.957
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 5.731
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 9.206
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.903
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 7.406
+        },
+        {
+          "pair": "success",
+          "ratio": 7.338
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.207
+        },
+        {
+          "pair": "warning",
+          "ratio": 6.515
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.174
+        },
+        {
+          "pair": "error",
+          "ratio": 4.515
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.664
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.579
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.288
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.556
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 4.592
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.049
+        }
+      ],
+      "name": "solarized-dark",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 8.911
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 9.559
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 7.065
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 10.845
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 5.727
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.144
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.54
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 6.97
+        },
+        {
+          "pair": "focus",
+          "ratio": 4.553
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 5.542
+        },
+        {
+          "pair": "success",
+          "ratio": 7.736
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.415
+        },
+        {
+          "pair": "warning",
+          "ratio": 6.868
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.359
+        },
+        {
+          "pair": "error",
+          "ratio": 4.546
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.532
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.992
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.411
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.637
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 5.42
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.045
+        }
+      ],
+      "name": "gruvbox-dark",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 10.747
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 11.598
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 8.419
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 13.191
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 6.047
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.525
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.737
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.422
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.838
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 7.166
+        },
+        {
+          "pair": "success",
+          "ratio": 7.598
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.325
+        },
+        {
+          "pair": "warning",
+          "ratio": 6.745
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.279
+        },
+        {
+          "pair": "error",
+          "ratio": 4.518
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.546
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.943
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.111
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.318
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 4.927
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.083
+        }
+      ],
+      "name": "nord",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 9.245
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 10.365
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 7.226
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 12.523
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 5.792
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.493
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.527
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.845
+        },
+        {
+          "pair": "focus",
+          "ratio": 6.243
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 8.457
+        },
+        {
+          "pair": "success",
+          "ratio": 6.436
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 8.718
+        },
+        {
+          "pair": "warning",
+          "ratio": 5.714
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 7.74
+        },
+        {
+          "pair": "error",
+          "ratio": 4.521
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 6.123
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.488
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.592
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.876
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 4.508
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.048
+        }
+      ],
+      "name": "tokyo-night",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 8.826
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 9.21
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 7.053
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 9.879
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 5.748
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 5.998
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.593
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 6.433
+        },
+        {
+          "pair": "focus",
+          "ratio": 6.787
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 7.596
+        },
+        {
+          "pair": "success",
+          "ratio": 8.808
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.858
+        },
+        {
+          "pair": "warning",
+          "ratio": 7.819
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.751
+        },
+        {
+          "pair": "error",
+          "ratio": 4.587
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.134
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 6.276
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.549
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.79
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 5.598
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.077
+        }
+      ],
+      "name": "catppuccin-mocha",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 11.341
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 11.893
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 8.962
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 12.988
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 6.259
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.564
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.946
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.168
+        },
+        {
+          "pair": "focus",
+          "ratio": 8.073
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 9.245
+        },
+        {
+          "pair": "success",
+          "ratio": 8.452
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.679
+        },
+        {
+          "pair": "warning",
+          "ratio": 7.504
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.593
+        },
+        {
+          "pair": "error",
+          "ratio": 4.517
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.173
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 6.104
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.31
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.531
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 4.778
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.056
+        }
+      ],
+      "name": "one-dark",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 9.054
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 9.921
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 7.055
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 11.485
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 5.797
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 6.352
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 4.518
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 7.354
+        },
+        {
+          "pair": "focus",
+          "ratio": 5.924
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 7.515
+        },
+        {
+          "pair": "success",
+          "ratio": 7.214
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.152
+        },
+        {
+          "pair": "warning",
+          "ratio": 6.405
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.125
+        },
+        {
+          "pair": "error",
+          "ratio": 4.537
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.755
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.811
+        }
+      ]
+    },
+    {
+      "indicators": [
+        {
+          "pair": "find_match_composited",
+          "ratio": 3.35
+        },
+        {
+          "pair": "increased_find_match_composited",
+          "ratio": 3.558
+        },
+        {
+          "pair": "increased_border",
+          "ratio": 6.773
+        },
+        {
+          "pair": "panel_selection",
+          "ratio": 3.019
+        }
+      ],
+      "name": "monokai-pro",
+      "text": [
+        {
+          "pair": "primary_canvas",
+          "ratio": 13.793
+        },
+        {
+          "pair": "primary_chrome",
+          "ratio": 14.987
+        },
+        {
+          "pair": "primary_raised",
+          "ratio": 10.747
+        },
+        {
+          "pair": "primary_panel",
+          "ratio": 17.356
+        },
+        {
+          "pair": "secondary_canvas",
+          "ratio": 7.558
+        },
+        {
+          "pair": "secondary_chrome",
+          "ratio": 8.213
+        },
+        {
+          "pair": "secondary_raised",
+          "ratio": 5.89
+        },
+        {
+          "pair": "secondary_panel",
+          "ratio": 9.511
+        },
+        {
+          "pair": "focus",
+          "ratio": 10.3
+        },
+        {
+          "pair": "focus_panel",
+          "ratio": 12.96
+        },
+        {
+          "pair": "success",
+          "ratio": 7.301
+        },
+        {
+          "pair": "success_panel",
+          "ratio": 9.187
+        },
+        {
+          "pair": "warning",
+          "ratio": 6.482
+        },
+        {
+          "pair": "warning_panel",
+          "ratio": 8.156
+        },
+        {
+          "pair": "error",
+          "ratio": 4.525
+        },
+        {
+          "pair": "error_panel",
+          "ratio": 5.693
+        },
+        {
+          "pair": "panel_selection_text",
+          "ratio": 5.748
+        }
+      ]
+    }
+  ],
+  "wcag": {
+    "non_text": 3.0,
+    "normal_text": 4.5
+  }
+}

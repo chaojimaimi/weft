@@ -95,6 +95,9 @@ pub struct UiColors {
     pub canvas: Color,
     pub chrome: Color,
     pub raised: Color,
+    pub panel: Color,
+    pub selection: Color,
+    pub selection_text: Color,
     pub text_primary: Color,
     pub text_secondary: Color,
     pub border_subtle: Color,
@@ -113,50 +116,88 @@ impl UiColors {
     pub fn from_theme(theme: &Theme) -> Self {
         let bg = theme.background;
         let fg = theme.foreground;
-        let dark = u16::from(bg.r) + u16::from(bg.g) + u16::from(bg.b) < 384;
-        let chrome = if dark {
+        let canvas_target = preferred_contrast_extreme(&[bg]);
+        let light_text = canvas_target == Color::rgb(255, 255, 255);
+        let chrome = if light_text {
             scale(bg, 0.85)
         } else {
             mix(bg, Color::rgb(255, 255, 255), 0.50)
         };
+        let raised = mix(bg, Color::rgb(255, 255, 255), 0.08);
+        // Keep the panel in the same luminance family as the canvas. The old
+        // unconditional `bg * 0.55` turned light/custom themes into a dark
+        // sidebar, making one status-text color unable to pass on both.
+        let panel = if light_text {
+            scale(bg, 0.55)
+        } else {
+            mix(bg, Color::rgb(0, 0, 0), 0.06)
+        };
+        let text_surfaces = [bg, chrome, raised, panel];
+        // UI chrome is independent from terminal ANSI text. Give primary UI
+        // text enough headroom that a visibly distinct secondary token can
+        // still meet AA on canvas, chrome and raised surfaces.
+        let text_primary = ensure_contrast(fg, &text_surfaces, 7.0);
+        let text_secondary = ensure_contrast(mix(bg, text_primary, 0.70), &text_surfaces, 4.5);
+        let (selection, selection_text) = selection_colors(panel, theme.accent, text_primary);
         Self {
             canvas: bg,
             chrome,
-            raised: mix(bg, Color::rgb(255, 255, 255), 0.08),
-            text_primary: fg,
-            text_secondary: mix(bg, fg, 0.70),
+            raised,
+            panel,
+            selection,
+            selection_text,
+            text_primary,
+            text_secondary,
             border_subtle: mix(bg, fg, 0.20),
-            focus: theme.accent,
-            success: if dark {
-                Color::rgb(135, 204, 92)
-            } else {
-                Color::rgb(50, 120, 35)
-            },
-            warning: if dark {
-                Color::rgb(220, 166, 78)
-            } else {
-                Color::rgb(150, 95, 0)
-            },
-            error: if dark {
-                Color::rgb(217, 92, 92)
-            } else {
-                Color::rgb(180, 45, 45)
-            },
-            find_match: if dark {
+            // These tokens paint both indicators and normal-sized status
+            // text, so their canvas contrast follows the stricter 4.5 floor.
+            focus: ensure_contrast(theme.accent, &[bg, panel], 4.5),
+            success: ensure_contrast(
+                if light_text {
+                    Color::rgb(135, 204, 92)
+                } else {
+                    Color::rgb(50, 120, 35)
+                },
+                &[bg, panel],
+                4.5,
+            ),
+            warning: ensure_contrast(
+                if light_text {
+                    Color::rgb(220, 166, 78)
+                } else {
+                    Color::rgb(150, 95, 0)
+                },
+                &[bg, panel],
+                4.5,
+            ),
+            error: ensure_contrast(
+                if light_text {
+                    Color::rgb(217, 92, 92)
+                } else {
+                    Color::rgb(180, 45, 45)
+                },
+                &[bg, panel],
+                4.5,
+            ),
+            find_match: if light_text {
                 Color::rgb(242, 199, 51)
             } else {
-                Color::rgb(200, 150, 0)
+                // The renderer composites this token at 50% alpha. A dark
+                // ochre keeps the resulting light-theme highlight at 3:1
+                // against the canvas while preserving readable match text.
+                Color::rgb(65, 25, 0)
             },
         }
     }
 
     /// F6: Strengthen colors for the macOS Increase Contrast accessibility
     /// setting. When `increase_contrast` is true:
-    /// - `border_subtle` is pushed from 20% → 45% toward the foreground so
-    ///   borders are clearly visible against any background.
-    /// - `text_secondary` is pushed from 70% → 90% toward the foreground so
-    ///   secondary text stays readable.
-    /// - `find_match` is brightened so search highlights stand out more.
+    /// - `border_subtle` is pushed from 20% → 65% toward the foreground so
+    ///   borders meet the 3:1 non-text contrast floor on built-in themes.
+    /// - `text_secondary` is promoted to `text_primary`, preserving maximum
+    ///   text contrast while the accessibility setting is active.
+    /// - `find_match` moves away from the canvas luminance so composited
+    ///   search highlights gain contrast in both dark and light themes.
     ///
     /// Returns a new `UiColors` (the original is unchanged). Pure function
     /// so it can be unit-tested without a renderer.
@@ -167,10 +208,11 @@ impl UiColors {
         }
         let bg = self.canvas;
         let fg = self.text_primary;
+        let find_target = preferred_contrast_extreme(&[bg]);
         Self {
-            border_subtle: mix(bg, fg, 0.45),
-            text_secondary: mix(bg, fg, 0.90),
-            find_match: mix(self.find_match, Color::rgb(255, 255, 255), 0.20),
+            border_subtle: mix(bg, fg, 0.65),
+            text_secondary: fg,
+            find_match: mix(self.find_match, find_target, 0.20),
             ..self
         }
     }
@@ -198,11 +240,119 @@ fn mix(from: Color, to: Color, amount: f32) -> Color {
     )
 }
 
+fn relative_luminance(color: Color) -> f64 {
+    let linear = |channel: u8| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+}
+
+pub(crate) fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let a = relative_luminance(a);
+    let b = relative_luminance(b);
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn ensure_contrast(color: Color, backgrounds: &[Color], minimum_ratio: f64) -> Color {
+    let worst_ratio = |candidate: Color| {
+        backgrounds
+            .iter()
+            .map(|background| contrast_ratio(candidate, *background))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let original_ratio = worst_ratio(color);
+    if original_ratio >= minimum_ratio {
+        return color;
+    }
+    let extremes = [Color::rgb(0, 0, 0), Color::rgb(255, 255, 255)];
+    let mut best = (color, original_ratio);
+    for step in 1..=100 {
+        let amount = step as f32 / 100.0;
+        let mut passing = None;
+        for target in extremes {
+            let candidate = mix(color, target, amount);
+            let ratio = worst_ratio(candidate);
+            if ratio > best.1 {
+                best = (candidate, ratio);
+            }
+            let improves_passing = match passing.as_ref() {
+                None => true,
+                Some((_, passing_ratio)) => ratio > *passing_ratio,
+            };
+            if ratio >= minimum_ratio && improves_passing {
+                passing = Some((candidate, ratio));
+            }
+        }
+        if let Some((candidate, _)) = passing {
+            return candidate;
+        }
+    }
+    best.0
+}
+
+fn preferred_contrast_extreme(backgrounds: &[Color]) -> Color {
+    let worst_ratio = |candidate: Color| {
+        backgrounds
+            .iter()
+            .map(|background| contrast_ratio(candidate, *background))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let black = Color::rgb(0, 0, 0);
+    let white = Color::rgb(255, 255, 255);
+    if worst_ratio(white) > worst_ratio(black) {
+        white
+    } else {
+        black
+    }
+}
+
+fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Color, Color) {
+    let initial = mix(panel, accent, 0.35);
+    let extremes = [Color::rgb(0, 0, 0), Color::rgb(255, 255, 255)];
+    let text_for = |background| {
+        if contrast_ratio(preferred_text, background) >= 4.5 {
+            preferred_text
+        } else {
+            preferred_contrast_extreme(&[background])
+        }
+    };
+    for step in 0..=100 {
+        let amount = step as f32 / 100.0;
+        let mut passing = None;
+        for target in extremes {
+            let candidate = mix(initial, target, amount);
+            let text = text_for(candidate);
+            let indicator_ratio = contrast_ratio(candidate, panel);
+            let text_ratio = contrast_ratio(text, candidate);
+            if indicator_ratio >= 3.0 && text_ratio >= 4.5 {
+                let score = indicator_ratio.min(text_ratio);
+                let improves = match passing.as_ref() {
+                    None => true,
+                    Some((_, _, passing_score)) => score > *passing_score,
+                };
+                if improves {
+                    passing = Some((candidate, text, score));
+                }
+            }
+        }
+        if let Some((background, text, _)) = passing {
+            return (background, text);
+        }
+    }
+    let background = preferred_contrast_extreme(&[panel]);
+    (background, text_for(background))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_sidebar_width, sidebar_edge_hit, ResponsiveClass, SidebarMetrics, UiColors,
-        UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, ResponsiveClass, SidebarMetrics,
+        UiColors, UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     };
     use weft_core::config::Theme;
 
@@ -255,9 +405,12 @@ mod tests {
             let colors = UiColors::from_theme(&theme);
             assert_ne!(colors.chrome, colors.canvas);
             assert_ne!(colors.raised, colors.canvas);
+            assert_ne!(colors.panel, colors.canvas);
+            assert!(contrast_ratio(colors.selection, colors.panel) >= 3.0);
+            assert!(contrast_ratio(colors.selection_text, colors.selection) >= 4.5);
             assert_ne!(colors.text_primary, colors.canvas);
             assert_ne!(colors.text_secondary, colors.canvas);
-            assert_eq!(colors.focus, theme.accent);
+            assert!(contrast_ratio(colors.focus, colors.canvas) >= 4.5);
             assert_ne!(colors.success, colors.error);
             assert_ne!(colors.warning, colors.error);
             // F3-5: find_match must be visible against the canvas background.
@@ -328,17 +481,20 @@ mod tests {
         let theme = Theme::weft_warm();
         let colors = UiColors::from_theme(&theme);
         let adjusted = colors.with_increase_contrast(true);
-        // border_subtle goes from mix(bg, fg, 0.20) to mix(bg, fg, 0.45).
+        // border_subtle goes from mix(bg, fg, 0.20) to mix(bg, fg, 0.65).
         // The adjusted border should be closer to the foreground than the
         // original, i.e. more visible.
         assert_ne!(adjusted.border_subtle, colors.border_subtle);
-        // text_secondary goes from 0.70 to 0.90 — closer to foreground.
+        // text_secondary is promoted to the already contrast-corrected primary.
         assert_ne!(adjusted.text_secondary, colors.text_secondary);
-        // find_match is brightened toward white.
+        // Dark-theme find_match is brightened away from the canvas.
         assert_ne!(adjusted.find_match, colors.find_match);
         // Other colors are unchanged (struct update syntax ..self).
         assert_eq!(adjusted.canvas, colors.canvas);
         assert_eq!(adjusted.chrome, colors.chrome);
+        assert_eq!(adjusted.panel, colors.panel);
+        assert_eq!(adjusted.selection, colors.selection);
+        assert_eq!(adjusted.selection_text, colors.selection_text);
         assert_eq!(adjusted.focus, colors.focus);
         assert_eq!(adjusted.error, colors.error);
     }
@@ -361,5 +517,41 @@ mod tests {
             adj_sum > orig_sum,
             "increase contrast should brighten border in dark theme: {orig_sum} → {adj_sum}"
         );
+    }
+
+    #[test]
+    fn secondary_text_remains_distinct_while_meeting_all_surface_floors() {
+        for theme in [
+            Theme::weft_warm(),
+            Theme::weft_light(),
+            Theme::solarized_dark(),
+        ] {
+            let colors = UiColors::from_theme(&theme);
+            assert_ne!(colors.text_secondary, colors.text_primary);
+            for surface in [colors.canvas, colors.chrome, colors.raised, colors.panel] {
+                assert!(contrast_ratio(colors.text_secondary, surface) >= 4.5);
+            }
+        }
+    }
+
+    #[test]
+    fn saturated_custom_theme_chooses_the_non_degrading_contrast_direction() {
+        use weft_core::grid::Color;
+
+        let mut theme = Theme::weft_warm();
+        theme.background = Color::rgb(255, 0, 0);
+        theme.foreground = Color::rgb(0, 0, 0);
+        theme.accent = Color::rgb(180, 30, 30);
+        let colors = UiColors::from_theme(&theme);
+        for surface in [colors.canvas, colors.chrome, colors.raised, colors.panel] {
+            assert!(contrast_ratio(colors.text_primary, surface) >= 4.5);
+            assert!(contrast_ratio(colors.text_secondary, surface) >= 4.5);
+        }
+        for status in [colors.focus, colors.success, colors.warning, colors.error] {
+            assert!(contrast_ratio(status, colors.canvas) >= 4.5);
+            assert!(contrast_ratio(status, colors.panel) >= 4.5);
+        }
+        assert!(contrast_ratio(colors.selection, colors.panel) >= 3.0);
+        assert!(contrast_ratio(colors.selection_text, colors.selection) >= 4.5);
     }
 }

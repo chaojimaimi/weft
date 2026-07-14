@@ -471,9 +471,9 @@ impl TabStripLayout {
     pub fn tab_rect(self, index: usize) -> Rect {
         let x0 = self.tabs_start + index as f32 * self.tab_width - self.scroll_offset;
         [
-            x0.max(self.visible_left),
+            x0.clamp(self.visible_left, self.visible_right),
             self.bar_rect[1],
-            (x0 + self.tab_width).min(self.visible_right),
+            (x0 + self.tab_width).clamp(self.visible_left, self.visible_right),
             self.bar_rect[3],
         ]
     }

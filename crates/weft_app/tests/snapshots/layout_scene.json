@@ -1,0 +1,2786 @@
+{
+  "block_sidebar": {
+    "block": {
+      "bounds": [
+        248.0,
+        44.0,
+        792.0,
+        500.4
+      ],
+      "cols": 60,
+      "fixed_cwd_y": 520.2,
+      "pitch": 19.8
+    },
+    "panel": {
+      "list_top": 97.2,
+      "rect": [
+        0.0,
+        36.0,
+        240.0,
+        600.0
+      ],
+      "row_height": 19.8,
+      "scene": {
+        "clips": [],
+        "hit_count": 13,
+        "hits": [
+          {
+            "bounds": [
+              4.5,
+              64.8,
+              235.5,
+              90.0
+            ],
+            "target": "SearchField"
+          },
+          {
+            "bounds": [
+              0.0,
+              97.2,
+              240.0,
+              117.0
+            ],
+            "target": "Row(0)"
+          },
+          {
+            "bounds": [
+              0.0,
+              117.0,
+              240.0,
+              136.8
+            ],
+            "target": "Row(1)"
+          },
+          {
+            "bounds": [
+              0.0,
+              136.8,
+              240.0,
+              156.6
+            ],
+            "target": "Row(2)"
+          },
+          {
+            "bounds": [
+              0.0,
+              156.6,
+              240.0,
+              176.4
+            ],
+            "target": "Row(3)"
+          },
+          {
+            "bounds": [
+              0.0,
+              176.4,
+              240.0,
+              196.2
+            ],
+            "target": "Row(4)"
+          },
+          {
+            "bounds": [
+              0.0,
+              196.2,
+              240.0,
+              216.0
+            ],
+            "target": "Row(5)"
+          },
+          {
+            "bounds": [
+              0.0,
+              216.0,
+              240.0,
+              235.8
+            ],
+            "target": "Row(6)"
+          },
+          {
+            "bounds": [
+              0.0,
+              235.8,
+              240.0,
+              255.6
+            ],
+            "target": "Row(7)"
+          },
+          {
+            "bounds": [
+              0.0,
+              255.6,
+              240.0,
+              275.4
+            ],
+            "target": "Row(8)"
+          },
+          {
+            "bounds": [
+              0.0,
+              275.4,
+              240.0,
+              295.2
+            ],
+            "target": "Row(9)"
+          },
+          {
+            "bounds": [
+              0.0,
+              295.2,
+              240.0,
+              315.0
+            ],
+            "target": "Row(10)"
+          },
+          {
+            "bounds": [
+              0.0,
+              315.0,
+              240.0,
+              334.8
+            ],
+            "target": "Row(11)"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 13,
+        "semantics": [
+          {
+            "bounds": [
+              4.5,
+              64.8,
+              235.5,
+              90.0
+            ],
+            "focus": "SidebarSearch",
+            "label": "Search history",
+            "role": "TextField",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              97.2,
+              240.0,
+              117.0
+            ],
+            "focus": null,
+            "label": "History row 1",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              117.0,
+              240.0,
+              136.8
+            ],
+            "focus": null,
+            "label": "History row 2",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              136.8,
+              240.0,
+              156.6
+            ],
+            "focus": null,
+            "label": "History row 3",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              156.6,
+              240.0,
+              176.4
+            ],
+            "focus": null,
+            "label": "History row 4",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              176.4,
+              240.0,
+              196.2
+            ],
+            "focus": null,
+            "label": "History row 5",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              196.2,
+              240.0,
+              216.0
+            ],
+            "focus": null,
+            "label": "History row 6",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              216.0,
+              240.0,
+              235.8
+            ],
+            "focus": null,
+            "label": "History row 7",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              235.8,
+              240.0,
+              255.6
+            ],
+            "focus": null,
+            "label": "History row 8",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              255.6,
+              240.0,
+              275.4
+            ],
+            "focus": null,
+            "label": "History row 9",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              275.4,
+              240.0,
+              295.2
+            ],
+            "focus": null,
+            "label": "History row 10",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              295.2,
+              240.0,
+              315.0
+            ],
+            "focus": null,
+            "label": "History row 11",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              0.0,
+              315.0,
+              240.0,
+              334.8
+            ],
+            "focus": null,
+            "label": "History row 12",
+            "role": "ListItem",
+            "state": ""
+          }
+        ]
+      },
+      "search": [
+        4.5,
+        64.8,
+        235.5,
+        90.0
+      ]
+    }
+  },
+  "command_surface": {
+    "background": [
+      0.172,
+      0.154,
+      0.135,
+      1.0
+    ],
+    "border": [
+      0.5,
+      0.5,
+      0.5,
+      0.20000000298023224
+    ],
+    "popup": [
+      180.0,
+      120.0,
+      620.0,
+      420.0
+    ],
+    "resize_handles": true,
+    "shadow_pad": 6.0,
+    "vertex_floats": 720
+  },
+  "geometry": [
+    {
+      "logical_terminal": {
+        "cell": [
+          9.0,
+          18.0
+        ],
+        "cols": 38,
+        "content": [
+          8.0,
+          44.0,
+          352.0,
+          232.0
+        ],
+        "rows": 10,
+        "sidebar": null,
+        "viewport": [
+          0.0,
+          0.0,
+          360.0,
+          240.0
+        ]
+      },
+      "name": "minimum",
+      "responsive": "Compact",
+      "scale_equivalent": true,
+      "sidebar_panel_width": 240.0,
+      "sidebar_push_width": 0.0,
+      "window": [
+        360.0,
+        240.0
+      ]
+    },
+    {
+      "logical_terminal": {
+        "cell": [
+          9.0,
+          18.0
+        ],
+        "cols": 60,
+        "content": [
+          248.0,
+          44.0,
+          792.0,
+          592.0
+        ],
+        "rows": 30,
+        "sidebar": [
+          0.0,
+          36.0,
+          240.0,
+          600.0
+        ],
+        "viewport": [
+          0.0,
+          0.0,
+          800.0,
+          600.0
+        ]
+      },
+      "name": "regular",
+      "responsive": "Regular",
+      "scale_equivalent": true,
+      "sidebar_panel_width": 240.0,
+      "sidebar_push_width": 240.0,
+      "window": [
+        800.0,
+        600.0
+      ]
+    },
+    {
+      "logical_terminal": {
+        "cell": [
+          9.0,
+          18.0
+        ],
+        "cols": 119,
+        "content": [
+          353.6,
+          44.0,
+          1432.0,
+          892.0
+        ],
+        "rows": 47,
+        "sidebar": [
+          0.0,
+          36.0,
+          345.6,
+          900.0
+        ],
+        "viewport": [
+          0.0,
+          0.0,
+          1440.0,
+          900.0
+        ]
+      },
+      "name": "wide",
+      "responsive": "Wide",
+      "scale_equivalent": true,
+      "sidebar_panel_width": 345.6,
+      "sidebar_push_width": 345.6,
+      "window": [
+        1440.0,
+        900.0
+      ]
+    }
+  ],
+  "schema": 1,
+  "settings": {
+    "narrow_content": {
+      "box": [
+        70.0,
+        77.0,
+        430.0,
+        623.0
+      ],
+      "content_top": 140.0,
+      "content_x": [
+        83.5,
+        416.5
+      ],
+      "footer_y": 596.0,
+      "max_rows": 24,
+      "scene": {
+        "clips": [],
+        "hit_count": 12,
+        "hits": [
+          {
+            "bounds": [
+              83.5,
+              140.0,
+              416.5,
+              158.0
+            ],
+            "target": "Theme(0)"
+          },
+          {
+            "bounds": [
+              83.5,
+              158.0,
+              416.5,
+              176.0
+            ],
+            "target": "Theme(1)"
+          },
+          {
+            "bounds": [
+              83.5,
+              176.0,
+              416.5,
+              194.0
+            ],
+            "target": "Theme(2)"
+          },
+          {
+            "bounds": [
+              83.5,
+              194.0,
+              416.5,
+              212.0
+            ],
+            "target": "Theme(3)"
+          },
+          {
+            "bounds": [
+              83.5,
+              212.0,
+              416.5,
+              230.0
+            ],
+            "target": "Theme(4)"
+          },
+          {
+            "bounds": [
+              83.5,
+              230.0,
+              416.5,
+              248.0
+            ],
+            "target": "Theme(5)"
+          },
+          {
+            "bounds": [
+              83.5,
+              248.0,
+              416.5,
+              266.0
+            ],
+            "target": "Theme(6)"
+          },
+          {
+            "bounds": [
+              83.5,
+              266.0,
+              416.5,
+              284.0
+            ],
+            "target": "Theme(7)"
+          },
+          {
+            "bounds": [
+              83.5,
+              284.0,
+              416.5,
+              302.0
+            ],
+            "target": "Theme(8)"
+          },
+          {
+            "bounds": [
+              83.5,
+              302.0,
+              416.5,
+              320.0
+            ],
+            "target": "Theme(9)"
+          },
+          {
+            "bounds": [
+              83.5,
+              320.0,
+              416.5,
+              338.0
+            ],
+            "target": "Theme(10)"
+          },
+          {
+            "bounds": [
+              169.0,
+              596.0,
+              227.0,
+              614.0
+            ],
+            "target": "ApplyButton"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 12,
+        "semantics": [
+          {
+            "bounds": [
+              70.0,
+              77.0,
+              430.0,
+              623.0
+            ],
+            "focus": "Settings",
+            "label": "Settings",
+            "role": "Dialog",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              140.0,
+              416.5,
+              158.0
+            ],
+            "focus": null,
+            "label": "Theme 1",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              158.0,
+              416.5,
+              176.0
+            ],
+            "focus": null,
+            "label": "Theme 2",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              176.0,
+              416.5,
+              194.0
+            ],
+            "focus": null,
+            "label": "Theme 3",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              194.0,
+              416.5,
+              212.0
+            ],
+            "focus": null,
+            "label": "Theme 4",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              212.0,
+              416.5,
+              230.0
+            ],
+            "focus": null,
+            "label": "Theme 5",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              230.0,
+              416.5,
+              248.0
+            ],
+            "focus": null,
+            "label": "Theme 6",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              248.0,
+              416.5,
+              266.0
+            ],
+            "focus": null,
+            "label": "Theme 7",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              266.0,
+              416.5,
+              284.0
+            ],
+            "focus": null,
+            "label": "Theme 8",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              284.0,
+              416.5,
+              302.0
+            ],
+            "focus": null,
+            "label": "Theme 9",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              302.0,
+              416.5,
+              320.0
+            ],
+            "focus": null,
+            "label": "Theme 10",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              320.0,
+              416.5,
+              338.0
+            ],
+            "focus": null,
+            "label": "Theme 11",
+            "role": "ListItem",
+            "state": ""
+          }
+        ]
+      },
+      "show_content": true,
+      "show_sidebar": false,
+      "sidebar": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "narrow_sidebar": {
+      "box": [
+        70.0,
+        77.0,
+        430.0,
+        623.0
+      ],
+      "content_top": 122.0,
+      "content_x": [
+        430.0,
+        430.0
+      ],
+      "footer_y": 596.0,
+      "max_rows": 25,
+      "scene": {
+        "clips": [],
+        "hit_count": 7,
+        "hits": [
+          {
+            "bounds": [
+              70.0,
+              122.0,
+              430.0,
+              140.0
+            ],
+            "target": "SidebarCategory(Appearance)"
+          },
+          {
+            "bounds": [
+              70.0,
+              140.0,
+              430.0,
+              158.0
+            ],
+            "target": "SidebarCategory(Terminal)"
+          },
+          {
+            "bounds": [
+              70.0,
+              158.0,
+              430.0,
+              176.0
+            ],
+            "target": "SidebarCategory(Input)"
+          },
+          {
+            "bounds": [
+              70.0,
+              176.0,
+              430.0,
+              194.0
+            ],
+            "target": "SidebarCategory(Keybindings)"
+          },
+          {
+            "bounds": [
+              70.0,
+              194.0,
+              430.0,
+              212.0
+            ],
+            "target": "SidebarCategory(Window)"
+          },
+          {
+            "bounds": [
+              70.0,
+              212.0,
+              430.0,
+              230.0
+            ],
+            "target": "SidebarCategory(Advanced)"
+          },
+          {
+            "bounds": [
+              169.0,
+              596.0,
+              227.0,
+              614.0
+            ],
+            "target": "ApplyButton"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 7,
+        "semantics": [
+          {
+            "bounds": [
+              70.0,
+              77.0,
+              430.0,
+              623.0
+            ],
+            "focus": "Settings",
+            "label": "Settings",
+            "role": "Dialog",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              122.0,
+              430.0,
+              140.0
+            ],
+            "focus": "Settings",
+            "label": "Appearance",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              140.0,
+              430.0,
+              158.0
+            ],
+            "focus": "Settings",
+            "label": "Terminal",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              158.0,
+              430.0,
+              176.0
+            ],
+            "focus": "Settings",
+            "label": "Input",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              176.0,
+              430.0,
+              194.0
+            ],
+            "focus": "Settings",
+            "label": "Keybindings",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              194.0,
+              430.0,
+              212.0
+            ],
+            "focus": "Settings",
+            "label": "Window",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              212.0,
+              430.0,
+              230.0
+            ],
+            "focus": "Settings",
+            "label": "Advanced",
+            "role": "Tab",
+            "state": ""
+          }
+        ]
+      },
+      "show_content": false,
+      "show_sidebar": true,
+      "sidebar": [
+        70.0,
+        113.0,
+        430.0,
+        587.0
+      ]
+    },
+    "wide": {
+      "box": [
+        201.6,
+        99.0,
+        1238.4,
+        801.0
+      ],
+      "content_top": 144.0,
+      "content_x": [
+        496.404,
+        1224.9
+      ],
+      "footer_y": 774.0,
+      "max_rows": 34,
+      "scene": {
+        "clips": [],
+        "hit_count": 20,
+        "hits": [
+          {
+            "bounds": [
+              201.6,
+              144.0,
+              491.904,
+              162.0
+            ],
+            "target": "SidebarCategory(Appearance)"
+          },
+          {
+            "bounds": [
+              201.6,
+              162.0,
+              491.904,
+              180.0
+            ],
+            "target": "SidebarCategory(Terminal)"
+          },
+          {
+            "bounds": [
+              201.6,
+              180.0,
+              491.904,
+              198.0
+            ],
+            "target": "SidebarCategory(Input)"
+          },
+          {
+            "bounds": [
+              201.6,
+              198.0,
+              491.904,
+              216.0
+            ],
+            "target": "SidebarCategory(Keybindings)"
+          },
+          {
+            "bounds": [
+              201.6,
+              216.0,
+              491.904,
+              234.0
+            ],
+            "target": "SidebarCategory(Window)"
+          },
+          {
+            "bounds": [
+              201.6,
+              234.0,
+              491.904,
+              252.0
+            ],
+            "target": "SidebarCategory(Advanced)"
+          },
+          {
+            "bounds": [
+              496.404,
+              144.0,
+              1224.9,
+              162.0
+            ],
+            "target": "Theme(0)"
+          },
+          {
+            "bounds": [
+              496.404,
+              162.0,
+              1224.9,
+              180.0
+            ],
+            "target": "Theme(1)"
+          },
+          {
+            "bounds": [
+              496.404,
+              180.0,
+              1224.9,
+              198.0
+            ],
+            "target": "Theme(2)"
+          },
+          {
+            "bounds": [
+              496.404,
+              198.0,
+              1224.9,
+              216.0
+            ],
+            "target": "Theme(3)"
+          },
+          {
+            "bounds": [
+              496.404,
+              216.0,
+              1224.9,
+              234.0
+            ],
+            "target": "Theme(4)"
+          },
+          {
+            "bounds": [
+              496.404,
+              234.0,
+              1224.9,
+              252.0
+            ],
+            "target": "Theme(5)"
+          },
+          {
+            "bounds": [
+              496.404,
+              252.0,
+              1224.9,
+              270.0
+            ],
+            "target": "Theme(6)"
+          },
+          {
+            "bounds": [
+              496.404,
+              270.0,
+              1224.9,
+              288.0
+            ],
+            "target": "Theme(7)"
+          },
+          {
+            "bounds": [
+              496.404,
+              288.0,
+              1224.9,
+              306.0
+            ],
+            "target": "Theme(8)"
+          },
+          {
+            "bounds": [
+              496.404,
+              306.0,
+              1224.9,
+              324.0
+            ],
+            "target": "Theme(9)"
+          },
+          {
+            "bounds": [
+              496.404,
+              324.0,
+              1224.9,
+              342.0
+            ],
+            "target": "Theme(10)"
+          },
+          {
+            "bounds": [
+              581.904,
+              774.0,
+              639.904,
+              792.0
+            ],
+            "target": "ApplyButton"
+          },
+          {
+            "bounds": [
+              814.404,
+              774.0,
+              870.404,
+              792.0
+            ],
+            "target": "CloseButton"
+          },
+          {
+            "bounds": [
+              883.904,
+              774.0,
+              957.904,
+              792.0
+            ],
+            "target": "SaveButton"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 18,
+        "semantics": [
+          {
+            "bounds": [
+              201.6,
+              99.0,
+              1238.4,
+              801.0
+            ],
+            "focus": "Settings",
+            "label": "Settings",
+            "role": "Dialog",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              144.0,
+              491.904,
+              162.0
+            ],
+            "focus": "Settings",
+            "label": "Appearance",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              162.0,
+              491.904,
+              180.0
+            ],
+            "focus": "Settings",
+            "label": "Terminal",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              180.0,
+              491.904,
+              198.0
+            ],
+            "focus": "Settings",
+            "label": "Input",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              198.0,
+              491.904,
+              216.0
+            ],
+            "focus": "Settings",
+            "label": "Keybindings",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              216.0,
+              491.904,
+              234.0
+            ],
+            "focus": "Settings",
+            "label": "Window",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              234.0,
+              491.904,
+              252.0
+            ],
+            "focus": "Settings",
+            "label": "Advanced",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              144.0,
+              1224.9,
+              162.0
+            ],
+            "focus": null,
+            "label": "Theme 1",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              162.0,
+              1224.9,
+              180.0
+            ],
+            "focus": null,
+            "label": "Theme 2",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              180.0,
+              1224.9,
+              198.0
+            ],
+            "focus": null,
+            "label": "Theme 3",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              198.0,
+              1224.9,
+              216.0
+            ],
+            "focus": null,
+            "label": "Theme 4",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              216.0,
+              1224.9,
+              234.0
+            ],
+            "focus": null,
+            "label": "Theme 5",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              234.0,
+              1224.9,
+              252.0
+            ],
+            "focus": null,
+            "label": "Theme 6",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              252.0,
+              1224.9,
+              270.0
+            ],
+            "focus": null,
+            "label": "Theme 7",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              270.0,
+              1224.9,
+              288.0
+            ],
+            "focus": null,
+            "label": "Theme 8",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              288.0,
+              1224.9,
+              306.0
+            ],
+            "focus": null,
+            "label": "Theme 9",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              306.0,
+              1224.9,
+              324.0
+            ],
+            "focus": null,
+            "label": "Theme 10",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              324.0,
+              1224.9,
+              342.0
+            ],
+            "focus": null,
+            "label": "Theme 11",
+            "role": "ListItem",
+            "state": ""
+          }
+        ]
+      },
+      "show_content": true,
+      "show_sidebar": true,
+      "sidebar": [
+        201.6,
+        135.0,
+        491.904,
+        765.0
+      ]
+    }
+  },
+  "tabs": [
+    {
+      "count": 1,
+      "max_scroll": 0.0,
+      "overflowing": false,
+      "plus": [
+        260.0,
+        0.0,
+        287.0,
+        36.0
+      ],
+      "sample_tabs": [
+        {
+          "bounds": [
+            80.0,
+            0.0,
+            260.0,
+            36.0
+          ],
+          "index": 0
+        },
+        {
+          "bounds": [
+            80.0,
+            0.0,
+            260.0,
+            36.0
+          ],
+          "index": 0
+        },
+        {
+          "bounds": [
+            80.0,
+            0.0,
+            260.0,
+            36.0
+          ],
+          "index": 0
+        }
+      ],
+      "scene": {
+        "clips": [],
+        "hit_count": 3,
+        "hits": [
+          {
+            "bounds": [
+              237.5,
+              0.0,
+              255.5,
+              36.0
+            ],
+            "target": "Close(0)"
+          },
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              260.0,
+              36.0
+            ],
+            "target": "Tab(0)"
+          },
+          {
+            "bounds": [
+              260.0,
+              0.0,
+              287.0,
+              36.0
+            ],
+            "target": "NewTab"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 2,
+        "semantics": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              260.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 1",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              260.0,
+              0.0,
+              287.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "New tab",
+            "role": "Button",
+            "state": ""
+          }
+        ]
+      },
+      "scroll_offset": 0.0,
+      "tab_width": 180.0,
+      "visible": [
+        80.0,
+        769.0
+      ]
+    },
+    {
+      "count": 3,
+      "max_scroll": 0.0,
+      "overflowing": false,
+      "plus": [
+        620.0,
+        0.0,
+        647.0,
+        36.0
+      ],
+      "sample_tabs": [
+        {
+          "bounds": [
+            80.0,
+            0.0,
+            260.0,
+            36.0
+          ],
+          "index": 0
+        },
+        {
+          "bounds": [
+            260.0,
+            0.0,
+            440.0,
+            36.0
+          ],
+          "index": 1
+        },
+        {
+          "bounds": [
+            440.0,
+            0.0,
+            620.0,
+            36.0
+          ],
+          "index": 2
+        }
+      ],
+      "scene": {
+        "clips": [],
+        "hit_count": 7,
+        "hits": [
+          {
+            "bounds": [
+              237.5,
+              0.0,
+              255.5,
+              36.0
+            ],
+            "target": "Close(0)"
+          },
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              260.0,
+              36.0
+            ],
+            "target": "Tab(0)"
+          },
+          {
+            "bounds": [
+              417.5,
+              0.0,
+              435.5,
+              36.0
+            ],
+            "target": "Close(1)"
+          },
+          {
+            "bounds": [
+              260.0,
+              0.0,
+              440.0,
+              36.0
+            ],
+            "target": "Tab(1)"
+          },
+          {
+            "bounds": [
+              597.5,
+              0.0,
+              615.5,
+              36.0
+            ],
+            "target": "Close(2)"
+          },
+          {
+            "bounds": [
+              440.0,
+              0.0,
+              620.0,
+              36.0
+            ],
+            "target": "Tab(2)"
+          },
+          {
+            "bounds": [
+              620.0,
+              0.0,
+              647.0,
+              36.0
+            ],
+            "target": "NewTab"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 4,
+        "semantics": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              260.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 1",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              260.0,
+              0.0,
+              440.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 2",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              440.0,
+              0.0,
+              620.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 3",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              620.0,
+              0.0,
+              647.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "New tab",
+            "role": "Button",
+            "state": ""
+          }
+        ]
+      },
+      "scroll_offset": 0.0,
+      "tab_width": 180.0,
+      "visible": [
+        80.0,
+        769.0
+      ]
+    },
+    {
+      "count": 10,
+      "max_scroll": 706.0,
+      "overflowing": true,
+      "plus": [
+        769.0,
+        0.0,
+        796.0,
+        36.0
+      ],
+      "sample_tabs": [
+        {
+          "bounds": [
+            102.5,
+            0.0,
+            102.5,
+            36.0
+          ],
+          "index": 0
+        },
+        {
+          "bounds": [
+            102.5,
+            0.0,
+            184.0,
+            36.0
+          ],
+          "index": 5
+        },
+        {
+          "bounds": [
+            589.0,
+            0.0,
+            724.0,
+            36.0
+          ],
+          "index": 9
+        }
+      ],
+      "scene": {
+        "clips": [],
+        "hit_count": 18,
+        "hits": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "ArrowLeft"
+          },
+          {
+            "bounds": [
+              746.5,
+              0.0,
+              769.0,
+              36.0
+            ],
+            "target": "ArrowRight"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(0)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(1)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(2)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(3)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(4)"
+          },
+          {
+            "bounds": [
+              161.5,
+              0.0,
+              179.5,
+              36.0
+            ],
+            "target": "Close(5)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              184.0,
+              36.0
+            ],
+            "target": "Tab(5)"
+          },
+          {
+            "bounds": [
+              296.5,
+              0.0,
+              314.5,
+              36.0
+            ],
+            "target": "Close(6)"
+          },
+          {
+            "bounds": [
+              184.0,
+              0.0,
+              319.0,
+              36.0
+            ],
+            "target": "Tab(6)"
+          },
+          {
+            "bounds": [
+              431.5,
+              0.0,
+              449.5,
+              36.0
+            ],
+            "target": "Close(7)"
+          },
+          {
+            "bounds": [
+              319.0,
+              0.0,
+              454.0,
+              36.0
+            ],
+            "target": "Tab(7)"
+          },
+          {
+            "bounds": [
+              566.5,
+              0.0,
+              584.5,
+              36.0
+            ],
+            "target": "Close(8)"
+          },
+          {
+            "bounds": [
+              454.0,
+              0.0,
+              589.0,
+              36.0
+            ],
+            "target": "Tab(8)"
+          },
+          {
+            "bounds": [
+              701.5,
+              0.0,
+              719.5,
+              36.0
+            ],
+            "target": "Close(9)"
+          },
+          {
+            "bounds": [
+              589.0,
+              0.0,
+              724.0,
+              36.0
+            ],
+            "target": "Tab(9)"
+          },
+          {
+            "bounds": [
+              769.0,
+              0.0,
+              796.0,
+              36.0
+            ],
+            "target": "NewTab"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 13,
+        "semantics": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Scroll tabs left",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              746.5,
+              0.0,
+              769.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Scroll tabs right",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 1",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 2",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 3",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 4",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 5",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              184.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 6",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              184.0,
+              0.0,
+              319.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 7",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              319.0,
+              0.0,
+              454.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 8",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              454.0,
+              0.0,
+              589.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 9",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              589.0,
+              0.0,
+              724.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 10",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              769.0,
+              0.0,
+              796.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "New tab",
+            "role": "Button",
+            "state": ""
+          }
+        ]
+      },
+      "scroll_offset": 706.0,
+      "tab_width": 135.0,
+      "visible": [
+        102.5,
+        746.5
+      ]
+    },
+    {
+      "count": 30,
+      "max_scroll": 3406.0,
+      "overflowing": true,
+      "plus": [
+        769.0,
+        0.0,
+        796.0,
+        36.0
+      ],
+      "sample_tabs": [
+        {
+          "bounds": [
+            102.5,
+            0.0,
+            102.5,
+            36.0
+          ],
+          "index": 0
+        },
+        {
+          "bounds": [
+            102.5,
+            0.0,
+            102.5,
+            36.0
+          ],
+          "index": 15
+        },
+        {
+          "bounds": [
+            589.0,
+            0.0,
+            724.0,
+            36.0
+          ],
+          "index": 29
+        }
+      ],
+      "scene": {
+        "clips": [],
+        "hit_count": 38,
+        "hits": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "ArrowLeft"
+          },
+          {
+            "bounds": [
+              746.5,
+              0.0,
+              769.0,
+              36.0
+            ],
+            "target": "ArrowRight"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(0)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(1)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(2)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(3)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(4)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(5)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(6)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(7)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(8)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(9)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(10)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(11)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(12)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(13)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(14)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(15)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(16)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(17)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(18)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(19)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(20)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(21)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(22)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(23)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "target": "Tab(24)"
+          },
+          {
+            "bounds": [
+              161.5,
+              0.0,
+              179.5,
+              36.0
+            ],
+            "target": "Close(25)"
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              184.0,
+              36.0
+            ],
+            "target": "Tab(25)"
+          },
+          {
+            "bounds": [
+              296.5,
+              0.0,
+              314.5,
+              36.0
+            ],
+            "target": "Close(26)"
+          },
+          {
+            "bounds": [
+              184.0,
+              0.0,
+              319.0,
+              36.0
+            ],
+            "target": "Tab(26)"
+          },
+          {
+            "bounds": [
+              431.5,
+              0.0,
+              449.5,
+              36.0
+            ],
+            "target": "Close(27)"
+          },
+          {
+            "bounds": [
+              319.0,
+              0.0,
+              454.0,
+              36.0
+            ],
+            "target": "Tab(27)"
+          },
+          {
+            "bounds": [
+              566.5,
+              0.0,
+              584.5,
+              36.0
+            ],
+            "target": "Close(28)"
+          },
+          {
+            "bounds": [
+              454.0,
+              0.0,
+              589.0,
+              36.0
+            ],
+            "target": "Tab(28)"
+          },
+          {
+            "bounds": [
+              701.5,
+              0.0,
+              719.5,
+              36.0
+            ],
+            "target": "Close(29)"
+          },
+          {
+            "bounds": [
+              589.0,
+              0.0,
+              724.0,
+              36.0
+            ],
+            "target": "Tab(29)"
+          },
+          {
+            "bounds": [
+              769.0,
+              0.0,
+              796.0,
+              36.0
+            ],
+            "target": "NewTab"
+          }
+        ],
+        "primitive_count": 0,
+        "semantic_count": 33,
+        "semantics": [
+          {
+            "bounds": [
+              80.0,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Scroll tabs left",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              746.5,
+              0.0,
+              769.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Scroll tabs right",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 1",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 2",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 3",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 4",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 5",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 6",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 7",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 8",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 9",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 10",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 11",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 12",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 13",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 14",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 15",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 16",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 17",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 18",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 19",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 20",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 21",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 22",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 23",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 24",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              102.5,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 25",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              102.5,
+              0.0,
+              184.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 26",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              184.0,
+              0.0,
+              319.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 27",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              319.0,
+              0.0,
+              454.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 28",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              454.0,
+              0.0,
+              589.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 29",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              589.0,
+              0.0,
+              724.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "Tab 30",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              769.0,
+              0.0,
+              796.0,
+              36.0
+            ],
+            "focus": null,
+            "label": "New tab",
+            "role": "Button",
+            "state": ""
+          }
+        ]
+      },
+      "scroll_offset": 3406.0,
+      "tab_width": 135.0,
+      "visible": [
+        102.5,
+        746.5
+      ]
+    }
+  ]
+}

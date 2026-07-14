@@ -6,7 +6,8 @@
 //!
 //! Full pipeline: PTY → VT parser → Grid → Metal renderer
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
-
+#[cfg(test)]
+mod acceptance_snapshots;
 mod app_state;
 mod block_component;
 mod completion_component;
@@ -46,7 +47,6 @@ mod tab_bar_component;
 mod terminal_geometry;
 mod ui_tokens;
 mod window_event_controller;
-
 use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
     SessionManager, SettingsState, TabBarState, WindowRuntimeState,

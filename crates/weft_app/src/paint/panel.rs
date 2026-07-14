@@ -49,26 +49,15 @@ impl MetalRenderer {
         let panel_cols = ((width_px / cw) as usize).max(1);
         let mut vertices = Vec::new();
 
-        // v1.0 Warp-style: opaque panel background, slightly darkened.
+        // v1.0 Warp-style: opaque semantic panel surface. UiColors keeps the
+        // panel in the canvas luminance family for light/custom themes so
+        // status text can remain readable on both surfaces.
         let theme_bg = color_to_normalized(self.theme.background);
-        let panel_bg = [
-            theme_bg[0] * 0.55,
-            theme_bg[1] * 0.55,
-            theme_bg[2] * 0.55,
-            1.0,
-        ];
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let panel_bg = color_to_normalized(ui.panel);
+        let sel_bg = color_to_normalized(ui.selection);
+        let selection_fg = color_to_normalized(ui.selection_text);
         let separator_color = color_to_normalized(self.theme.separator);
-        // v1.0: accent-based selection highlight (consistent with grid/block).
-        // v1.0 P3: α 0.95→1.0 to match Settings/Palette selection_bg.
-        let sel_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            [
-                accent[0] * 0.35 + theme_bg[0] * 0.65,
-                accent[1] * 0.35 + theme_bg[1] * 0.65,
-                accent[2] * 0.35 + theme_bg[2] * 0.65,
-                1.0,
-            ]
-        };
         let (su, sv, suw, svh) = self.space_uv();
         // V-swap to match grid rendering (CAMetalLayer flip compensation).
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -98,16 +87,8 @@ impl MetalRenderer {
             separator_color,
         );
 
-        let fg = color_to_normalized(self.theme.foreground);
-        // v1.0 P0: replace fg*0.6 dim with label_c (70% fg + 30% bg) —
-        // consistent with Settings/Palette/Find and always readable.
-        let dim = [
-            fg[0] * 0.70 + theme_bg[0] * 0.30,
-            fg[1] * 0.70 + theme_bg[1] * 0.30,
-            fg[2] * 0.70 + theme_bg[2] * 0.30,
-            1.0,
-        ];
-        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let fg = color_to_normalized(ui.text_primary);
+        let dim = color_to_normalized(ui.text_secondary);
         let green = color_to_normalized(ui.success);
         let red = color_to_normalized(ui.error);
 
@@ -243,7 +224,7 @@ impl MetalRenderer {
                 );
             }
             let cmd_color = if selected {
-                fg
+                selection_fg
             } else {
                 match block.exit_code {
                     Some(0) => green,
@@ -269,7 +250,8 @@ impl MetalRenderer {
             );
             if !dur.is_empty() {
                 let dur_x = panel_x + width_px - cw * 0.5 - dur_len as f32 * cw;
-                self.push_text(&mut vertices, dur_x, y, &dur, dim, dur_len + 1);
+                let dur_color = if selected { selection_fg } else { dim };
+                self.push_text(&mut vertices, dur_x, y, &dur, dur_color, dur_len + 1);
             }
             y += row_h;
             drawn += 1;

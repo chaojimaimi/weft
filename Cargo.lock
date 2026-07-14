@@ -2213,6 +2213,7 @@ dependencies = [
  "objc2-quartz-core",
  "pathfinder_geometry",
  "regex",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
