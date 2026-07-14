@@ -398,4 +398,41 @@ mod tests {
         // offset = 0 → 0 (newest visible).
         assert_eq!(clamp_panel_scroll(10, 5, 0), 0);
     }
+
+    /// CI performance gate for F3 history virtualization. Kept ignored in the
+    /// normal suite because wall-clock assertions should run in isolation.
+    #[test]
+    #[ignore]
+    fn perf_panel_10k_history_filter_and_virtualize() {
+        let blocks: Vec<Block> = (0..10_000)
+            .map(|i| Block {
+                id: BlockId(i),
+                command: if i % 2 == 0 {
+                    format!("git status {i}")
+                } else {
+                    format!("cargo test {i}")
+                },
+                cwd: None,
+                output: String::new(),
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::UNIX_EPOCH,
+                finished_at: None,
+                collapsed: false,
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        assert_eq!(panel_filtered_count(&blocks, "git"), 5_000);
+        for offset in [0, 100, 2_500, 4_920] {
+            let visible = panel_display(&blocks, "git", offset, 80);
+            assert_eq!(visible.len(), 80);
+        }
+        let elapsed = started.elapsed();
+        println!("10k history filter + virtualize: {elapsed:?} (budget <100ms)");
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "10k history filtering/virtualization took {elapsed:?}, budget <100ms"
+        );
+    }
 }

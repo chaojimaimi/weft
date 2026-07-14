@@ -45,6 +45,9 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
+      - name: Performance budgets
+        run: ./scripts/performance_gate.sh
+
       - name: Build release
         run: cargo build --release
 

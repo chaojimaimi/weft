@@ -1224,6 +1224,33 @@ fn resize_marks_all_rows_dirty() {
     assert_eq!(grid.dirty_rows().count(), 5);
 }
 
+/// CI performance gate for live resize with the configured 10k scrollback.
+/// Ignored in the normal suite so wall-clock assertions run in isolation.
+#[test]
+#[ignore]
+fn perf_resize_10k_scrollback() {
+    let mut grid = Grid::with_scrollback(40, 120, 10_000);
+    for i in 0..10_000 {
+        for ch in format!("line {i:05} terminal resize payload").chars() {
+            grid.write_char(ch);
+        }
+        grid.newline();
+    }
+
+    let started = std::time::Instant::now();
+    for _ in 0..3 {
+        grid.resize(24, 80);
+        grid.resize(50, 160);
+    }
+    let elapsed = started.elapsed();
+    println!("six 10k-scrollback resize passes: {elapsed:?} (budget <1s)");
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "six 10k-scrollback resize passes took {elapsed:?}, budget <1s"
+    );
+}
+
 // ── IL/DL dirty marking tests ──────────────────────────────────
 
 #[test]
