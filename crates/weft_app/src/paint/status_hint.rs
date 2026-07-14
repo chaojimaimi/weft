@@ -1,8 +1,8 @@
 //! F2 P0-2: Lightweight status hint badge rendered when the terminal is in
-//! a non-editor state (passthrough / running command).
+//! a non-editor, non-integrated passthrough state.
 //!
 //! Drawn as a small, semi-transparent text label at the bottom-left of the
-//! content area so the user always knows why the editor input box is hidden.
+//! content area so the user knows why the editor input box is unavailable.
 //! "Non-disturbing" design: 50% alpha accent color, single text row.
 
 use crate::paint::primitives::color_to_normalized;
@@ -17,13 +17,9 @@ fn status_hint_text(terminal: &weft_core::vt::Terminal) -> Option<&'static str> 
         // Full-screen TUIs own every cell; never cover their status line.
         return None;
     }
-    if terminal.command_from_editor_pending() {
-        return Some("\u{25be} running");
-    }
     match terminal.block_tracker().phase() {
         ShellPhase::NotIntegrated => Some("\u{25be} passthrough"),
-        ShellPhase::CommandExecuting => Some("\u{25be} running"),
-        ShellPhase::AtPrompt => None,
+        ShellPhase::AtPrompt | ShellPhase::CommandExecuting => None,
     }
 }
 
@@ -91,12 +87,12 @@ mod tests {
     }
 
     #[test]
-    fn hint_running_when_command_executing() {
+    fn running_command_uses_block_indicator_instead_of_bottom_overlay() {
         let mut t = Terminal::new(24, 80);
         t.process(b"\x1b]133;A\x07"); // AtPrompt
         t.process(b"\x1b]133;B\x07"); // CommandExecuting
         assert_eq!(t.block_tracker().phase(), ShellPhase::CommandExecuting);
-        assert_eq!(status_hint_text(&t), Some("\u{25be} running"));
+        assert_eq!(status_hint_text(&t), None);
     }
 
     #[test]

@@ -342,6 +342,7 @@ pub struct InteractionState {
     pub drag_state: Option<DragState>,
     pub scrollbar_drag: Option<crate::scrollbar_component::ScrollbarDragState>,
     pub scrollbar_hovered: bool,
+    pub precise_scroll: crate::scroll_input::PreciseScrollAccumulator,
     pub context_menu: Option<ContextMenu>,
     /// F3-1: Block currently hovered by the mouse in the block view, if any.
     /// Drives the inline copy/fold action buttons rendered on the header row.
@@ -375,6 +376,7 @@ impl InteractionState {
             drag_state: None,
             scrollbar_drag: None,
             scrollbar_hovered: false,
+            precise_scroll: crate::scroll_input::PreciseScrollAccumulator::default(),
             context_menu: None,
             block_hovered: None,
             sidebar_drag: None,

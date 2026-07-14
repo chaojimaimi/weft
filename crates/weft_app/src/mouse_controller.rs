@@ -1,4 +1,3 @@
-// arch-gate: allow-over-800
 // Mouse move/drag/scroll/context-menu dispatch. Grew with F3 sidebar resize
 // + panel virtualization scroll handling; remaining size is the irreducible
 // per-event-type dispatch (move/press/release/wheel) with overlay-specific
@@ -456,7 +455,13 @@ impl App {
     }
 
     /// Handle scroll wheel.
-    pub(super) fn handle_scroll(&mut self, delta: winit::event::MouseScrollDelta, x: f64, y: f64) {
+    pub(super) fn handle_scroll(
+        &mut self,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+        x: f64,
+        y: f64,
+    ) {
         // v0.9 fix: drain pending PTY messages BEFORE checking alt-screen
         // state. When `less` (or any alt-screen app) starts, the enter
         // sequence (`\x1b[?1049h`) is still in the channel until the next
@@ -545,27 +550,31 @@ impl App {
             return;
         }
 
-        let lines = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, v) => {
-                if v > 0.0 {
-                    v.ceil() as usize
-                } else {
-                    v.floor().abs() as usize
-                }
-            }
-            winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                let v = pos.y / 40.0; // approx 40px per line
-                if v > 0.0 {
-                    v.ceil() as usize
-                } else {
-                    v.floor().abs() as usize
-                }
-            }
-        };
-
-        if lines == 0 {
+        // Precise macOS trackpads emit many sub-row PixelDelta events for one
+        // gesture. Accumulate them by physical cell height; treating every
+        // non-zero event as a wheel notch makes Vim jump straight to an edge.
+        let cell_height = self
+            .renderer
+            .as_ref()
+            .map_or(40.0, |renderer| renderer.cell_height() as f64);
+        let rows = crate::scroll_input::terminal_scroll_rows(
+            delta,
+            phase,
+            cell_height,
+            &mut self.interaction.precise_scroll,
+        );
+        tracing::debug!(
+            ?delta,
+            ?phase,
+            rows,
+            residual = self.interaction.precise_scroll.residual_pixels(),
+            "terminal scroll quantized"
+        );
+        if rows == 0 {
             return;
         }
+        let up = rows > 0;
+        let lines = rows.unsigned_abs() as usize;
 
         // Short-lived immutable borrow to read the mode flags up-front —
         // avoids holding a long-lived mutable borrow of `terminal` across
@@ -602,10 +611,6 @@ impl App {
 
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
             let pos = self.pixel_to_grid(x, y);
             let mut m = Modifiers::empty();
             if self.interaction.mods.state().shift_key() {
@@ -624,7 +629,11 @@ impl App {
                 .encode_scroll(up, pos.col, pos.row, m)
             {
                 if let Some(pty) = &self.sessions.active_mut().pty {
-                    let _ = pty.write_sync(&bytes);
+                    let mut batch = Vec::with_capacity(bytes.len() * lines);
+                    for _ in 0..lines {
+                        batch.extend_from_slice(&bytes);
+                    }
+                    let _ = pty.write_sync(&batch);
                 }
             }
             return;
@@ -637,11 +646,6 @@ impl App {
         // back to ordinary local viewport scrolling (so normal commands do not
         // lose their first gesture during the two-second launch window).
         if tui_starting && !alt_screen_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
-            let rows = if up { lines as i32 } else { -(lines as i32) };
             let pos = self.pixel_to_grid(x, y);
             let mut m = Modifiers::empty();
             if self.interaction.mods.state().shift_key() {
@@ -673,10 +677,6 @@ impl App {
         // still benefit from wheel scroll: translate to Up/Down arrow key
         // sequences so the pager scrolls its content natively.
         if alt_screen_active {
-            let up = match delta {
-                winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-                winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-            };
             let key = if up { KeyCode::Up } else { KeyCode::Down };
             let mut m = Modifiers::empty();
             if self.interaction.mods.state().shift_key() {
@@ -696,11 +696,6 @@ impl App {
         }
 
         // Otherwise, scroll the terminal viewport.
-        let up = match delta {
-            winit::event::MouseScrollDelta::LineDelta(_, v) => v > 0.0,
-            winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y > 0.0,
-        };
-        let rows = if up { lines as i32 } else { -(lines as i32) };
         self.scroll_local_view(rows);
     }
 

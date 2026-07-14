@@ -678,6 +678,20 @@ fn bracketed_paste_mode() {
     assert!(!t.bracketed_paste);
 }
 
+#[test]
+fn vim_mouse_a_sequence_enables_sgr_button_event_reporting() {
+    let mut t = term();
+    // Captured from macOS Vim 9.1 after `:set mouse=a`.
+    t.process(b"\x1b[?1049h\x1b[?1006;1000h\x1b[?1002h");
+    assert!(t.is_alt_screen_active());
+    assert_eq!(t.mouse_protocol, MouseProtocol::ButtonEvent);
+    assert!(t.sgr_mouse);
+
+    t.process(b"\x1b[?1006;1000l\x1b[?1002l");
+    assert_eq!(t.mouse_protocol, MouseProtocol::Off);
+    assert!(!t.sgr_mouse);
+}
+
 // ── Full reset ───────────────────────────────────────────────
 
 #[test]

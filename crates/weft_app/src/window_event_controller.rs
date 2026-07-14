@@ -136,9 +136,10 @@ impl App {
                     self.request_redraw();
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 self.handle_scroll(
                     delta,
+                    phase,
                     self.interaction.last_mouse_x,
                     self.interaction.last_mouse_y,
                 );

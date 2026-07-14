@@ -1,4 +1,3 @@
-// arch-gate: allow-over-800
 // App struct + event dispatch + controller orchestration. Already reduced from
 // 7316 → 2269 lines via A2/A3 controller extraction. Remaining size is the
 // irreducible App struct + winit event mapping; further split would just
@@ -38,6 +37,7 @@ mod panel_controller;
 mod redraw_controller;
 mod renderer;
 mod scene;
+mod scroll_input;
 mod scrollbar_component;
 mod settings_component;
 mod settings_controller;
