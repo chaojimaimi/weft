@@ -5,6 +5,7 @@
 //! `NSAccessibilityElement` children of winit's `NSView`. Press actions are
 //! sent back through the winit event loop and reuse the normal mouse router.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
@@ -16,13 +17,17 @@ use objc2_app_kit::{
     NSAccessibility, NSAccessibilityButtonRole, NSAccessibilityElement, NSAccessibilityFrameInView,
     NSAccessibilityGroupRole, NSAccessibilityListRole, NSAccessibilityMenuItemRole,
     NSAccessibilityMenuRole, NSAccessibilityRadioButtonRole, NSAccessibilityRowRole,
-    NSAccessibilityTextAreaRole, NSAccessibilityTextFieldRole, NSView,
+    NSAccessibilityTabGroupRole, NSAccessibilityTextAreaRole, NSAccessibilityTextFieldRole, NSView,
 };
 use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString};
 use winit::event_loop::EventLoopProxy;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+use crate::accessibility_model::{
+    append_keyed_semantics, role_is_pressable, stable_id, structure_changed, tree_is_valid,
+    AccessibilityNode,
+};
 use crate::scene::{SemanticNode, SemanticRole};
 use crate::{App, AppEvent, CONTEXT_MENU_ITEMS};
 
@@ -30,67 +35,6 @@ static EVENT_PROXY: OnceLock<EventLoopProxy<AppEvent>> = OnceLock::new();
 
 pub(crate) fn install_event_proxy(proxy: EventLoopProxy<AppEvent>) {
     let _ = EVENT_PROXY.set(proxy);
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct AccessibilityNode {
-    pub(crate) id: String,
-    pub(crate) parent: Option<String>,
-    pub(crate) role: SemanticRole,
-    pub(crate) label: String,
-    pub(crate) bounds: [f32; 4],
-    pub(crate) state: String,
-    pub(crate) pressable: bool,
-}
-
-impl AccessibilityNode {
-    pub(crate) fn from_semantic(
-        id: impl Into<String>,
-        parent: Option<&str>,
-        node: &SemanticNode,
-        pressable: bool,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            parent: parent.map(str::to_owned),
-            role: node.role.clone(),
-            label: node.label.clone(),
-            bounds: node.bounds,
-            state: node.state.clone(),
-            pressable,
-        }
-    }
-}
-
-fn role_is_pressable(role: &SemanticRole) -> bool {
-    matches!(
-        role,
-        SemanticRole::Button | SemanticRole::ListItem | SemanticRole::MenuItem | SemanticRole::Tab
-    )
-}
-
-fn append_semantics(
-    output: &mut Vec<AccessibilityNode>,
-    prefix: &str,
-    semantics: &[SemanticNode],
-    container: bool,
-    actions: bool,
-) {
-    let container_id = container.then(|| format!("{prefix}/container"));
-    for (index, semantic) in semantics.iter().enumerate() {
-        let id = if index == 0 && container {
-            container_id.clone().unwrap()
-        } else {
-            format!("{prefix}/node/{index}")
-        };
-        let parent = (container && index > 0).then_some(container_id.as_deref().unwrap());
-        output.push(AccessibilityNode::from_semantic(
-            id,
-            parent,
-            semantic,
-            actions && role_is_pressable(&semantic.role),
-        ));
-    }
 }
 
 fn push_semantic(
@@ -116,9 +60,9 @@ fn view_space_frame(bounds: [f32; 4], scale: f64) -> NSRect {
 
 #[derive(Debug)]
 struct ElementIvars {
-    generation: u64,
+    generation: Cell<u64>,
     node_id: u64,
-    pressable: bool,
+    pressable: Cell<bool>,
 }
 
 declare_class!(
@@ -140,7 +84,7 @@ declare_class!(
     unsafe impl WeftAccessibilityElement {
         #[method(accessibilityPerformPress)]
         fn accessibility_perform_press(&self) -> Bool {
-            if !self.ivars().pressable {
+            if !self.ivars().pressable.get() {
                 return false.into();
             }
             EVENT_PROXY
@@ -148,7 +92,7 @@ declare_class!(
                 .is_some_and(|proxy| {
                     proxy
                         .send_event(AppEvent::AccessibilityPress {
-                            generation: self.ivars().generation,
+                            generation: self.ivars().generation.get(),
                             node_id: self.ivars().node_id,
                         })
                         .is_ok()
@@ -161,9 +105,9 @@ declare_class!(
 impl WeftAccessibilityElement {
     fn new(node: &AccessibilityNode, generation: u64) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ElementIvars {
-            generation,
+            generation: Cell::new(generation),
             node_id: stable_id(&node.id),
-            pressable: node.pressable,
+            pressable: Cell::new(node.pressable),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -238,12 +182,15 @@ impl AccessibilityBridge {
             let structure_changed = structure_changed(&self.previous_nodes, &nodes);
             if structure_changed {
                 self.generation = self.generation.wrapping_add(1).max(1);
-                self.elements.clear();
+                let mut previous = std::mem::take(&mut self.elements);
                 for node in &nodes {
-                    self.elements.insert(
-                        stable_id(&node.id),
-                        WeftAccessibilityElement::new(node, self.generation),
-                    );
+                    let node_id = stable_id(&node.id);
+                    let element = previous
+                        .remove(&node_id)
+                        .unwrap_or_else(|| WeftAccessibilityElement::new(node, self.generation));
+                    element.ivars().generation.set(self.generation);
+                    element.ivars().pressable.set(node.pressable);
+                    self.elements.insert(node_id, element);
                 }
             }
 
@@ -254,6 +201,7 @@ impl AccessibilityBridge {
                 element.setAccessibilityRole(Some(native_role(&node.role)));
                 let label = NSString::from_str(&node.label);
                 element.setAccessibilityLabel(Some(&label));
+                element.setAccessibilityIdentifier(Some(&NSString::from_str(&node.id)));
                 let parent = node
                     .parent
                     .as_ref()
@@ -293,11 +241,8 @@ impl AccessibilityBridge {
                         .filter_map(|child| self.elements.get(&stable_id(&child.id)).cloned())
                         .map(|element| Retained::cast(element))
                         .collect();
-                    if !child_objects.is_empty() {
-                        let children = NSArray::from_vec(child_objects);
-                        self.elements[&stable_id(&node.id)]
-                            .setAccessibilityChildren(Some(&children));
-                    }
+                    let children = NSArray::from_vec(child_objects);
+                    self.elements[&stable_id(&node.id)].setAccessibilityChildren(Some(&children));
                 }
             }
             let root_children = NSArray::from_vec(
@@ -325,19 +270,6 @@ impl AccessibilityBridge {
     }
 }
 
-fn stable_id(id: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    id.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn structure_changed(previous: &[AccessibilityNode], current: &[AccessibilityNode]) -> bool {
-    previous.len() != current.len()
-        || previous.iter().zip(current).any(|(a, b)| {
-            a.id != b.id || a.parent != b.parent || a.role != b.role || a.pressable != b.pressable
-        })
-}
-
 fn native_role(role: &SemanticRole) -> &'static objc2_app_kit::NSAccessibilityRole {
     unsafe {
         match role {
@@ -345,10 +277,11 @@ fn native_role(role: &SemanticRole) -> &'static objc2_app_kit::NSAccessibilityRo
             SemanticRole::TextField => NSAccessibilityTextFieldRole,
             SemanticRole::List => NSAccessibilityListRole,
             SemanticRole::ListItem => NSAccessibilityRowRole,
-            SemanticRole::Dialog | SemanticRole::TabList => NSAccessibilityGroupRole,
+            SemanticRole::Dialog => NSAccessibilityGroupRole,
             SemanticRole::Menu => NSAccessibilityMenuRole,
             SemanticRole::MenuItem => NSAccessibilityMenuItemRole,
             SemanticRole::Tab => NSAccessibilityRadioButtonRole,
+            SemanticRole::TabList => NSAccessibilityTabGroupRole,
             SemanticRole::TextArea => NSAccessibilityTextAreaRole,
         }
     }
@@ -357,6 +290,10 @@ fn native_role(role: &SemanticRole) -> &'static objc2_app_kit::NSAccessibilityRo
 impl App {
     pub(super) fn update_accessibility_tree(&mut self) {
         let nodes = self.accessibility_snapshot();
+        if !tree_is_valid(&nodes) {
+            tracing::error!(node_count = nodes.len(), "invalid accessibility tree");
+            return;
+        }
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
@@ -378,7 +315,14 @@ impl App {
         let mut semantics = Vec::new();
         if self.settings.open {
             if let Some(scene) = self.accessibility_settings_scene() {
-                append_semantics(&mut semantics, "settings", &scene.semantics, true, true);
+                append_keyed_semantics(
+                    &mut semantics,
+                    "settings/dialog",
+                    &scene.semantics,
+                    true,
+                    true,
+                    |_index, node| format!("settings/item/{:016x}", stable_id(&node.label)),
+                );
             }
             return semantics;
         }
@@ -429,18 +373,36 @@ impl App {
                             .hits
                             .iter()
                             .find_map(|hit| (hit.bounds() == item.bounds).then_some(hit.target));
-                        let identity = match target {
-                            Some(crate::palette_component::PaletteTarget::Item(target)) => {
-                                format!("{target}/{}", item.label)
-                            }
-                            _ => format!("readonly/{index}/{}", item.label),
+                        let identity = match (&self.palette.submode, target) {
+                            (
+                                crate::palette_state::PaletteSubMode::SelectTheme { .. },
+                                Some(crate::palette_component::PaletteTarget::Item(_)),
+                            ) => Some(format!("theme/{:016x}", stable_id(&item.label))),
+                            (
+                                crate::palette_state::PaletteSubMode::Search,
+                                Some(crate::palette_component::PaletteTarget::Item(target)),
+                            ) => self
+                                .palette
+                                .results
+                                .get(target)
+                                .map(crate::palette_state::PaletteEntry::accessibility_key),
+                            _ => None,
                         };
+                        let (identity, pressable) = identity.map_or_else(
+                            || {
+                                (
+                                    format!("readonly/{index}/{:016x}", stable_id(&item.label)),
+                                    false,
+                                )
+                            },
+                            |identity| (identity, true),
+                        );
                         push_semantic(
                             &mut semantics,
                             &format!("palette/item/{identity}"),
                             Some("palette/list"),
                             item,
-                            true,
+                            pressable,
                         );
                     }
                 }
@@ -455,7 +417,14 @@ impl App {
             if let Some(item) = scene.semantics.get_mut(menu.selection + 1) {
                 item.state = "selected".into();
             }
-            append_semantics(&mut semantics, "context-menu", &scene.semantics, true, true);
+            append_keyed_semantics(
+                &mut semantics,
+                "context-menu/menu",
+                &scene.semantics,
+                true,
+                true,
+                |index, _node| format!("context-menu/action/{}", index - 1),
+            );
             return semantics;
         }
 
@@ -497,9 +466,33 @@ impl App {
             focus: None,
             state: String::new(),
         };
-        let mut tab_semantics = vec![tab_container];
-        tab_semantics.extend(tab_scene.semantics);
-        append_semantics(&mut semantics, "tabs", &tab_semantics, true, true);
+        push_semantic(
+            &mut semantics,
+            "tabs/container",
+            None,
+            &tab_container,
+            false,
+        );
+        let mut session_index = 0;
+        for node in &tab_scene.semantics {
+            let id = if node.role == SemanticRole::Tab {
+                let session_id = self
+                    .sessions
+                    .tab(session_index)
+                    .map_or(session_index as u64, |tab| tab.session_id);
+                session_index += 1;
+                format!("tabs/session/{session_id}")
+            } else {
+                format!("tabs/action/{:016x}", stable_id(&node.label))
+            };
+            push_semantic(
+                &mut semantics,
+                &id,
+                Some("tabs/container"),
+                node,
+                role_is_pressable(&node.role),
+            );
+        }
 
         if let Some(layout) = self.terminal_layout() {
             let mut block_cache_update = None;
@@ -695,7 +688,24 @@ impl App {
             }
             // Completion mouse acceptance is not implemented; expose readable
             // candidates without AXPress rather than falling through to PTY.
-            append_semantics(&mut semantics, "completion", &scene.semantics, true, false);
+            append_keyed_semantics(
+                &mut semantics,
+                "completion/container",
+                &scene.semantics,
+                true,
+                false,
+                |_index, node| {
+                    let target = scene
+                        .hits
+                        .iter()
+                        .find_map(|hit| (hit.bounds() == node.bounds).then_some(hit.target));
+                    let item = match target {
+                        Some(crate::completion_component::CompletionTarget::Item(item)) => item,
+                        _ => usize::MAX,
+                    };
+                    format!("completion/item/{item}/{:016x}", stable_id(&node.label))
+                },
+            );
         }
         semantics
     }

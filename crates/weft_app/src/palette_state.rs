@@ -11,6 +11,15 @@ pub(crate) enum PaletteEntry {
     Builtin(BuiltinCmd),
 }
 
+impl PaletteEntry {
+    pub(crate) fn accessibility_key(&self) -> String {
+        match self {
+            Self::Workflow(workflow) => format!("workflow/{}", workflow.id),
+            Self::Builtin(command) => format!("builtin/{}", command.accessibility_key()),
+        }
+    }
+}
+
 /// Built-in commands that appear in the palette.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BuiltinCmd {
@@ -27,6 +36,15 @@ impl BuiltinCmd {
             Self::SelectTheme => "Select Theme",
             Self::ToggleBlockPanel => "Toggle History Panel",
             Self::ReloadConfig => "Reload Config",
+        }
+    }
+
+    fn accessibility_key(self) -> &'static str {
+        match self {
+            Self::ToggleTheme => "toggle-theme",
+            Self::SelectTheme => "select-theme",
+            Self::ToggleBlockPanel => "toggle-history-panel",
+            Self::ReloadConfig => "reload-config",
         }
     }
 }
@@ -181,5 +199,24 @@ mod tests {
                 ("port".into(), String::new(), true),
             ]
         );
+    }
+
+    #[test]
+    fn palette_accessibility_keys_do_not_depend_on_result_index_or_label() {
+        let workflow = weft_core::workflow::Workflow {
+            id: 7,
+            name: "Reload Config".into(),
+            description: String::new(),
+            steps: Vec::new(),
+            variables: Vec::new(),
+            source: Default::default(),
+            use_count: 0,
+            last_used_ms: 0,
+        };
+        let workflow = PaletteEntry::Workflow(workflow);
+        let builtin = PaletteEntry::Builtin(super::BuiltinCmd::ReloadConfig);
+        assert_eq!(workflow.accessibility_key(), "workflow/7");
+        assert_eq!(builtin.accessibility_key(), "builtin/reload-config");
+        assert_ne!(workflow.accessibility_key(), builtin.accessibility_key());
     }
 }

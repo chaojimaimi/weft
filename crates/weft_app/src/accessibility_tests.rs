@@ -1,4 +1,5 @@
 use super::{role_is_pressable, structure_changed, view_space_frame, AccessibilityNode};
+use crate::accessibility_model::{append_keyed_semantics, tree_is_valid};
 use crate::scene::{FocusId, SemanticNode, SemanticRole};
 
 #[test]
@@ -78,4 +79,92 @@ fn stale_or_non_action_press_is_rejected_before_mouse_routing() {
     let mut non_action = bridge;
     non_action.previous_nodes[0].pressable = false;
     assert_eq!(non_action.resolve_press(7, node_id), None);
+}
+
+#[test]
+fn business_identity_survives_duplicate_label_filtering_and_reordering() {
+    let row = |label: &str| SemanticNode {
+        role: SemanticRole::ListItem,
+        label: label.into(),
+        bounds: [0.0, 0.0, 100.0, 20.0],
+        focus: None,
+        state: String::new(),
+    };
+    let mut initial = Vec::new();
+    let initial_records = [(41, "build"), (42, "build"), (43, "deploy")];
+    append_keyed_semantics(
+        &mut initial,
+        "history",
+        &initial_records.map(|(_, label)| row(label)),
+        false,
+        true,
+        |index, _node| format!("history/{}", initial_records[index].0),
+    );
+    let mut filtered = Vec::new();
+    let filtered_records = [(43, "deploy"), (42, "build")];
+    append_keyed_semantics(
+        &mut filtered,
+        "history",
+        &filtered_records.map(|(_, label)| row(label)),
+        false,
+        true,
+        |index, _node| format!("history/{}", filtered_records[index].0),
+    );
+
+    let id_for = |nodes: &[AccessibilityNode], id: &str| {
+        nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.id.clone())
+            .unwrap()
+    };
+    assert_eq!(
+        id_for(&initial, "history/42"),
+        id_for(&filtered, "history/42")
+    );
+    assert_eq!(
+        id_for(&initial, "history/43"),
+        id_for(&filtered, "history/43")
+    );
+    assert!(!filtered.iter().any(|node| node.id == "history/41"));
+}
+
+#[test]
+fn accessibility_tree_rejects_duplicate_or_orphaned_nodes() {
+    let semantic = SemanticNode {
+        role: SemanticRole::Button,
+        label: "New tab".into(),
+        bounds: [0.0, 0.0, 20.0, 20.0],
+        focus: None,
+        state: String::new(),
+    };
+    let root = AccessibilityNode::from_semantic("tabs", None, &semantic, false);
+    let child = AccessibilityNode::from_semantic("new-tab", Some("tabs"), &semantic, true);
+    assert!(tree_is_valid(&[root.clone(), child.clone()]));
+    assert!(!tree_is_valid(&[root.clone(), root]));
+
+    let orphan = AccessibilityNode {
+        parent: Some("missing".into()),
+        ..child
+    };
+    assert!(!tree_is_valid(&[orphan]));
+}
+
+#[test]
+fn accessibility_tree_rejects_parent_cycles() {
+    let semantic = SemanticNode {
+        role: SemanticRole::List,
+        label: "Cycle".into(),
+        bounds: [0.0, 0.0, 20.0, 20.0],
+        focus: None,
+        state: String::new(),
+    };
+    let a = AccessibilityNode::from_semantic("a", Some("b"), &semantic, false);
+    let b = AccessibilityNode::from_semantic("b", Some("a"), &semantic, false);
+    assert!(!tree_is_valid(&[a, b]));
+
+    let a = AccessibilityNode::from_semantic("a", Some("b"), &semantic, false);
+    let b = AccessibilityNode::from_semantic("b", Some("c"), &semantic, false);
+    let c = AccessibilityNode::from_semantic("c", Some("a"), &semantic, false);
+    assert!(!tree_is_valid(&[a, b, c]));
 }
