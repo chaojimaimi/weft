@@ -13,6 +13,8 @@ pub(crate) mod command_surface;
 pub(crate) mod grid;
 pub(crate) mod grid_cache;
 pub(crate) mod metal_backend;
+#[cfg(test)]
+mod offscreen_snapshots;
 pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod panel;
