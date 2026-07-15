@@ -14,6 +14,7 @@
 
 use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
 use crate::renderer::MetalRenderer;
+use crate::settings_component::settings_value_x;
 
 /// F5: Red color for inline field validation errors.
 const ERROR_COLOR: [f32; 4] = [0.85, 0.25, 0.25, 1.0];
@@ -129,7 +130,6 @@ impl MetalRenderer {
         let content_x1 = layout.content_x1;
         let content_cols = (((content_x1 - content_x0) / cw).max(1.0)) as usize;
 
-        // Shadow + background + border (same as before).
         let shadow_pad = ch * 0.15;
         push_quad(
             &mut verts,
@@ -241,7 +241,6 @@ impl MetalRenderer {
 
         // ── F5: Content area ─────────────────────────────────────────
         if layout.show_content {
-            // Error banner at the top of the content area.
             let content_base = layout.content_top - if s.error.is_some() { ch } else { 0.0 };
             let content_top = if let Some(err) = s.error {
                 let err_bg = [0.65, 0.18, 0.18, 1.0];
@@ -541,7 +540,6 @@ impl MetalRenderer {
             }
         }
 
-        // ── Footer ───────────────────────────────────────────────────
         let footer_y = layout.footer_y;
         push_quad(
             &mut verts,
@@ -563,6 +561,7 @@ impl MetalRenderer {
             content_x0
         };
         let footer_end = box_x1 - cw * 1.5;
+        let footer_cols = (((footer_end - footer_start) / cw).max(1.0)) as usize;
         let mut fx = footer_start;
         for (key, desc) in &pairs {
             let key_w = cw * scale * Self::text_col_width(key) as f32;
@@ -571,14 +570,14 @@ impl MetalRenderer {
             if fx + pair_w > footer_end {
                 break;
             }
-            self.push_text_scaled(&mut verts, fx, footer_y, key, accent, content_cols, scale);
+            self.push_text_scaled(&mut verts, fx, footer_y, key, accent, footer_cols, scale);
             self.push_text_scaled(
                 &mut verts,
                 fx + key_w + inner,
                 footer_y,
                 desc,
                 label_c,
-                content_cols,
+                footer_cols,
                 scale,
             );
             fx += pair_w + gap;
@@ -760,6 +759,7 @@ impl MetalRenderer {
         accent: [f32; 4],
         error_msg: Option<&str>,
     ) {
+        let value_x = settings_value_x(value_x, content_x0, cw, Self::text_col_width(label));
         if is_sel {
             push_quad(
                 verts,

@@ -10,6 +10,20 @@ use crate::settings_validation::{
     adjust_finite_value, detect_keybinding_conflicts, validate_settings,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsEnterAction {
+    DrillDown,
+    Apply,
+}
+
+fn settings_enter_action(is_narrow: bool, drill_down: bool) -> SettingsEnterAction {
+    if is_narrow && !drill_down {
+        SettingsEnterAction::DrillDown
+    } else {
+        SettingsEnterAction::Apply
+    }
+}
+
 impl App {
     pub(super) fn open_settings(&mut self) {
         self.settings.open_from(&self.config_state.config);
@@ -35,9 +49,9 @@ impl App {
                     self.settings.tab = tab;
                     self.settings.selection = 0;
                     self.settings.scroll_offset = 0;
-                    if self.settings_is_narrow() {
-                        self.settings.drill_down = true;
-                    }
+                }
+                if self.settings_is_narrow() {
+                    self.settings.drill_down = true;
                 }
                 self.request_redraw();
             }
@@ -179,18 +193,18 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                if is_narrow && !self.settings.drill_down {
-                    // Narrow sidebar mode: Enter drills into the selected category.
-                    self.settings.drill_down = true;
-                    self.settings.selection = 0;
-                    self.request_redraw();
-                    true
-                } else {
-                    // Content mode: apply the selected row.
-                    self.apply_settings_selection();
-                    self.request_redraw();
-                    true
+                match settings_enter_action(is_narrow, self.settings.drill_down) {
+                    SettingsEnterAction::DrillDown => {
+                        self.settings.drill_down = true;
+                        self.settings.selection = 0;
+                    }
+                    SettingsEnterAction::Apply => {
+                        self.apply_settings_selection();
+                        self.save_settings_draft(false);
+                    }
                 }
+                self.request_redraw();
+                true
             }
             // ←/→ nudges the value of the selected row (no-op for pick-list
             // categories like Appearance themes and Keybindings).
@@ -555,5 +569,26 @@ impl App {
         // Sort by action label for stable display.
         views.sort_by(|a, b| a.action.cmp(&b.action));
         views
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{settings_enter_action, SettingsEnterAction};
+
+    #[test]
+    fn enter_drills_only_from_narrow_sidebar() {
+        assert_eq!(
+            settings_enter_action(true, false),
+            SettingsEnterAction::DrillDown
+        );
+        assert_eq!(
+            settings_enter_action(true, true),
+            SettingsEnterAction::Apply
+        );
+        assert_eq!(
+            settings_enter_action(false, false),
+            SettingsEnterAction::Apply
+        );
     }
 }

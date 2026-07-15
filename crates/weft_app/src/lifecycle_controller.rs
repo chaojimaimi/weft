@@ -653,8 +653,10 @@ impl App {
             || self.config_state.font_scale != 1.0
         {
             if let Some(r) = &mut self.renderer {
-                let mut scaled = config.font.clone();
-                scaled.size *= self.config_state.font_scale;
+                let scaled = crate::settings_validation::runtime_scaled_font_config(
+                    &config.font,
+                    self.config_state.font_scale,
+                );
                 r.rebuild_atlas(scaled);
             }
             self.recompute_layout();
@@ -663,7 +665,9 @@ impl App {
         // Window background opacity (layer-level transparency; text stays
         // opaque). Recolors the next frame. Window-level transparency is
         // startup-only — see `resumed`.
-        if (self.config_state.config.window.opacity - config.window.opacity).abs() > f32::EPSILON {
+        if crate::settings_validation::runtime_opacity(self.config_state.config.window.opacity)
+            != crate::settings_validation::runtime_opacity(config.window.opacity)
+        {
             if let Some(r) = &mut self.renderer {
                 r.set_opacity(config.window.opacity);
             }
@@ -728,8 +732,10 @@ impl App {
         }
         self.config_state.font_scale = new_scale;
         if let Some(r) = &mut self.renderer {
-            let mut scaled = self.config_state.config.font.clone();
-            scaled.size *= self.config_state.font_scale;
+            let scaled = crate::settings_validation::runtime_scaled_font_config(
+                &self.config_state.config.font,
+                self.config_state.font_scale,
+            );
             r.rebuild_atlas(scaled);
         }
         self.recompute_layout();

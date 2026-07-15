@@ -244,7 +244,7 @@ impl MetalRenderer {
     /// Update window background opacity [0,1]. Recolors the next frame (bg
     /// alpha is resolved per-frame); also flips the CAMetalLayer opaque flag.
     pub fn set_opacity(&mut self, opacity: f32) {
-        self.opacity = opacity.clamp(0.0, 1.0);
+        self.opacity = crate::settings_validation::runtime_opacity(opacity);
         // SAFETY: layer is a valid CAMetalLayer; setOpaque: is its property setter.
         unsafe {
             set_layer_opaque(&self.layer, self.opacity >= 1.0);
@@ -352,7 +352,7 @@ impl MetalRenderer {
     /// the new cell dimensions so the caller can recompute grid rows/cols and
     /// PTY size.
     pub fn rebuild_atlas(&mut self, font_config: FontConfig) -> (u32, u32) {
-        self.font_config = font_config;
+        self.font_config = crate::settings_validation::runtime_atlas_font_config(&font_config);
         self.atlas = GlyphAtlas::new(&self.device, &self.font_config, self.scale);
         (self.atlas.cell_width, self.atlas.cell_height)
     }
@@ -416,7 +416,8 @@ impl MetalRenderer {
     /// [SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH]. Pass `None` to clear and fall
     /// back to the responsive default.
     pub fn set_sidebar_width(&mut self, width: Option<f32>) {
-        self.sidebar_width_override = width.map(crate::ui_tokens::clamp_sidebar_width);
+        self.sidebar_width_override = crate::settings_validation::runtime_sidebar_width(width)
+            .map(crate::ui_tokens::clamp_sidebar_width);
     }
 
     /// Draw the terminal Grid (and optional overlays) to screen.

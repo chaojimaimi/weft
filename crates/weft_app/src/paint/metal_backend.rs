@@ -30,6 +30,7 @@ impl MetalRenderer {
     ) -> Self {
         let device = Device::system_default().expect("No Metal device found");
         let queue = device.new_command_queue();
+        let font_config = crate::settings_validation::runtime_font_config(&font_config);
 
         info!("Metal device: {}", device.name());
 
@@ -39,7 +40,7 @@ impl MetalRenderer {
         // Logical padding (points) → physical pixels for rendering/layout.
         let padding_x = padding_logical.0 as f32 * scale as f32;
         let padding_y = padding_logical.1 as f32 * scale as f32;
-        let opacity = opacity.clamp(0.0, 1.0);
+        let opacity = crate::settings_validation::runtime_opacity(opacity);
 
         // Use physical pixels for viewport to stay consistent with drawable_size
         // and grid dimensions (which are calculated from physical cell sizes).

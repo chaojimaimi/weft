@@ -24,6 +24,15 @@ pub(crate) enum SettingsTarget {
     SaveButton,
 }
 
+pub(crate) fn settings_value_x(
+    base_x: f32,
+    content_x0: f32,
+    cell_w: f32,
+    label_cols: usize,
+) -> f32 {
+    base_x.max(content_x0 + cell_w * (label_cols as f32 + 1.0))
+}
+
 /// Build the settings Scene from a shared layout product + dynamic state.
 /// `theme_count` is the number of visible theme rows (already capped by
 /// `layout.max_rows`). `tabs` is the ordered list of settings categories.
@@ -274,5 +283,11 @@ mod tests {
         let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
         // Clicking where a sidebar row would be returns None (sidebar hidden).
         assert_eq!(settings_target_at(&scene, 300.0, 165.0), None);
+    }
+
+    #[test]
+    fn settings_value_starts_after_long_label() {
+        assert_eq!(settings_value_x(140.0, 10.0, 10.0, 20), 220.0);
+        assert_eq!(settings_value_x(240.0, 10.0, 10.0, 5), 240.0);
     }
 }

@@ -2,10 +2,56 @@
 
 use std::collections::{HashMap, HashSet};
 
-use weft_core::config::{Action, Config, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
+use weft_core::config::{Action, Config, FontConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use weft_core::input::{KeyCode, Modifiers};
 
 pub(crate) type FieldError = (String, String);
+
+pub(crate) fn runtime_font_config(config: &FontConfig) -> FontConfig {
+    let defaults = FontConfig::default();
+    let mut safe = config.clone();
+    if !(8.0..=24.0).contains(&safe.size) {
+        safe.size = defaults.size;
+    }
+    if !(1.0..=1.5).contains(&safe.line_height) {
+        safe.line_height = defaults.line_height;
+    }
+    safe
+}
+
+pub(crate) fn runtime_scaled_font_config(config: &FontConfig, scale: f32) -> FontConfig {
+    let mut safe = runtime_font_config(config);
+    let scale = if (0.5..=3.0).contains(&scale) {
+        scale
+    } else {
+        1.0
+    };
+    safe.size *= scale;
+    safe
+}
+
+pub(crate) fn runtime_atlas_font_config(config: &FontConfig) -> FontConfig {
+    let mut safe = config.clone();
+    if !(4.0..=72.0).contains(&safe.size) {
+        safe.size = FontConfig::default().size;
+    }
+    if !(1.0..=1.5).contains(&safe.line_height) {
+        safe.line_height = FontConfig::default().line_height;
+    }
+    safe
+}
+
+pub(crate) fn runtime_opacity(opacity: f32) -> f32 {
+    if (0.5..=1.0).contains(&opacity) {
+        opacity
+    } else {
+        1.0
+    }
+}
+
+pub(crate) fn runtime_sidebar_width(width: Option<f32>) -> Option<f32> {
+    width.filter(|value| (SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH).contains(value))
+}
 
 pub(crate) fn adjust_finite_value(
     current: f32,
@@ -140,6 +186,50 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert!(validate_settings(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_geometry_uses_safe_values_without_mutating_source() {
+        let font = FontConfig {
+            size: f32::NAN,
+            line_height: f32::INFINITY,
+            ..FontConfig::default()
+        };
+        let safe = runtime_font_config(&font);
+        assert_eq!(safe.size, FontConfig::default().size);
+        assert_eq!(safe.line_height, FontConfig::default().line_height);
+        assert!(font.size.is_nan());
+        assert!(font.line_height.is_infinite());
+        assert_eq!(runtime_opacity(f32::NAN), 1.0);
+        assert_ne!(runtime_opacity(f32::NAN), runtime_opacity(0.95));
+        assert_eq!(runtime_sidebar_width(Some(f32::NAN)), None);
+    }
+
+    #[test]
+    fn valid_runtime_geometry_is_preserved() {
+        let font = FontConfig {
+            size: 18.0,
+            line_height: 1.4,
+            ..FontConfig::default()
+        };
+        assert_eq!(runtime_font_config(&font).size, 18.0);
+        assert_eq!(runtime_font_config(&font).line_height, 1.4);
+        assert_eq!(runtime_opacity(0.75), 0.75);
+        assert_eq!(runtime_sidebar_width(Some(300.0)), Some(300.0));
+    }
+
+    #[test]
+    fn runtime_zoom_is_applied_after_base_font_validation() {
+        let font = FontConfig::default();
+        assert_eq!(runtime_scaled_font_config(&font, 0.5).size, 7.0);
+        assert_eq!(runtime_scaled_font_config(&font, 3.0).size, 42.0);
+
+        let invalid = FontConfig {
+            size: f32::NAN,
+            ..FontConfig::default()
+        };
+        assert_eq!(runtime_scaled_font_config(&invalid, 2.0).size, 28.0);
+        assert_eq!(runtime_atlas_font_config(&font).size, font.size);
     }
 
     #[test]

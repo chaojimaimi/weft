@@ -237,21 +237,16 @@ fn layout_scene_snapshot() -> Value {
         false,
         &footer_widths,
         true,
-        true,
-    )
-    .expect("narrow settings sidebar layout");
-    let narrow_content = layout_settings(
-        500.0,
-        700.0,
-        9.0,
-        18.0,
-        3,
-        true,
-        &footer_widths,
-        true,
         false,
     )
-    .expect("narrow settings content layout");
+    .expect("narrow settings sidebar layout");
+    assert!(narrow_sidebar.show_sidebar);
+    assert!(!narrow_sidebar.show_content);
+    let narrow_content =
+        layout_settings(500.0, 700.0, 9.0, 18.0, 3, true, &footer_widths, true, true)
+            .expect("narrow settings content layout");
+    assert!(!narrow_content.show_sidebar);
+    assert!(narrow_content.show_content);
     let settings_tabs = SettingsTab::ALL;
     let wide_scene = build_settings_scene(
         &wide_settings,

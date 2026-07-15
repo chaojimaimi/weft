@@ -1090,7 +1090,7 @@ pub fn layout_settings(
 
     // F5: visibility flags. Wide mode = both visible. Narrow mode = one at a time.
     let (show_sidebar, show_content) = if is_narrow {
-        (drill_down, !drill_down)
+        (!drill_down, drill_down)
     } else {
         (true, true)
     };
