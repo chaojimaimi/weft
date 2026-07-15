@@ -267,13 +267,17 @@ fn millis_to_system_time(ms: i64) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_STORE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// A unique temp DB path for one test (auto-cleaned by the OS temp dir
     /// lifecycle; we also clear() to keep tests independent).
     fn temp_store() -> BlockStore {
         let path = std::env::temp_dir().join(format!(
-            "weft-block-store-{}-{}.db",
+            "weft-block-store-{}-{}-{}.db",
             std::process::id(),
+            TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed),
             SystemTime::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()

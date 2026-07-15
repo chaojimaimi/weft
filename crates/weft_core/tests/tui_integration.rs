@@ -1,6 +1,6 @@
 //! Real PTY/TUI acceptance tests.
 //!
-//! These tests exercise the installed macOS Vim/less/nano binaries through Weft's
+//! These tests exercise installed macOS Vim/less/nano/tmux binaries through Weft's
 //! own PTY and VT parser. They complement deterministic unit tests: hardware
 //! trackpad feel still needs one manual check, while protocol, Grid, mouse
 //! mode, search prompt, CJK invariants, and exit behavior run automatically.
@@ -9,7 +9,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{require_command, sandbox, TuiSession};
+use support::{require_command, require_path_command, sandbox, TuiSession};
 use weft_core::input::{InputHandler, Modifiers, MouseProtocol};
 
 const START_TIMEOUT: Duration = Duration::from_secs(4);
@@ -306,4 +306,180 @@ async fn nano_edit_search_save_resize_and_exit_roundtrip() {
     );
     assert!(!session.terminal.is_alt_screen_active());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tmux_panes_mouse_scrollback_resize_and_exit_roundtrip() {
+    let require = std::env::var("WEFT_REQUIRE_TMUX_ACCEPTANCE").as_deref() == Ok("1");
+    let Some(tmux) = require_path_command("tmux", require) else {
+        return;
+    };
+
+    let dir = sandbox("tmux");
+    let config = dir.join("tmux.conf");
+    std::fs::write(
+        &config,
+        concat!(
+            "set -g mouse on\n",
+            "set -g mode-keys vi\n",
+            "set -g status on\n",
+            "set -g status-interval 0\n",
+            "set -g status-left 'WEFT_TMUX'\n",
+            "set -g status-right ''\n",
+            "set -g default-shell /bin/sh\n",
+            "set -g default-command /bin/sh\n",
+            "bind-key X kill-session\n",
+        ),
+    )
+    .expect("write tmux test config");
+    let socket = dir.join("tmux.sock");
+    let config_text = config.to_string_lossy().into_owned();
+    let socket_text = socket.to_string_lossy().into_owned();
+    let args = [
+        "-S",
+        socket_text.as_str(),
+        "-f",
+        config_text.as_str(),
+        "new-session",
+        "-s",
+        "weft-acceptance",
+        "/bin/sh",
+    ];
+    let tmux_text = tmux.to_string_lossy().into_owned();
+    let mut session = TuiSession::spawn(&tmux_text, &args, 24, 80, &dir);
+
+    let initialized = session
+        .wait_until(START_TIMEOUT, |s| {
+            s.terminal.is_alt_screen_active()
+                && s.bottom_line().contains("WEFT_TMUX")
+                && s.terminal.mouse_protocol != MouseProtocol::Off
+                && s.terminal.sgr_mouse
+        })
+        .await;
+    if !initialized {
+        let output = String::from_utf8_lossy(&session.raw_output);
+        let sandbox_denied = session.exited && output.contains("Operation not permitted");
+        if sandbox_denied && !require {
+            eprintln!("skipping tmux acceptance: sandbox denied Unix socket creation");
+            let _ = std::fs::remove_dir_all(dir);
+            return;
+        }
+    }
+    assert!(
+        initialized,
+        "tmux did not initialize alt screen, status, and SGR mouse; protocol={:?}, sgr={}, screen:\n{}",
+        session.terminal.mouse_protocol,
+        session.terminal.sgr_mouse,
+        session.visible_text()
+    );
+
+    session.send(b"printf 'TMUX_PANE_0\\n'\r");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| s.visible_text().contains("TMUX_PANE_0"))
+            .await,
+        "tmux first pane did not execute input; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(b"\x02%"); // Prefix + %: split left/right, new pane active.
+    session.send(b"printf 'TMUX_PANE_1\\n'\r");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                let midpoint = s.terminal.grid().num_cols / 2;
+                marker_columns(s, "TMUX_PANE_0")
+                    .iter()
+                    .any(|col| *col < midpoint)
+                    && marker_columns(s, "TMUX_PANE_1")
+                        .iter()
+                        .any(|col| *col > midpoint)
+            })
+            .await,
+        "tmux split panes did not render both markers; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(b"\x02o"); // Switch back to pane 0.
+    session.send(b"printf 'TMUX_SWITCHED_0\\n'\r");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                let midpoint = s.terminal.grid().num_cols / 2;
+                marker_columns(s, "TMUX_SWITCHED_0")
+                    .iter()
+                    .any(|col| *col < midpoint)
+            })
+            .await,
+        "tmux pane switch did not route input to pane 0; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(
+        b"i=1; while [ $i -le 80 ]; do printf 'TMUX_SCROLL_%03d\\n' \"$i\"; i=$((i+1)); done\r",
+    );
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| s
+                .visible_text()
+                .contains("TMUX_SCROLL_080"))
+            .await,
+        "tmux pane did not produce scrollback fixture; screen:\n{}",
+        session.visible_text()
+    );
+    let mut input = InputHandler::new();
+    input.mouse_protocol = session.terminal.mouse_protocol;
+    input.sgr_mouse = session.terminal.sgr_mouse;
+    let wheel_up = input
+        .encode_scroll(true, 10, 8, Modifiers::empty())
+        .expect("encode tmux wheel-up report");
+    let mut gesture = Vec::with_capacity(wheel_up.len() * 8);
+    for _ in 0..8 {
+        gesture.extend_from_slice(&wheel_up);
+    }
+    session.send(&gesture);
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                let screen = s.visible_text();
+                screen.contains("TMUX_SCROLL_0") && !screen.contains("TMUX_SCROLL_080")
+            })
+            .await,
+        "tmux did not reveal older pane history from Weft wheel reports; screen:\n{}",
+        session.visible_text()
+    );
+    session.assert_no_orphaned_wide_cells();
+
+    session.resize(18, 64);
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                s.terminal.grid().num_rows == 18
+                    && s.terminal.grid().num_cols == 64
+                    && s.bottom_line().contains("WEFT_TMUX")
+            })
+            .await,
+        "tmux did not redraw status at the resized bottom row; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(b"q"); // Leave copy mode entered by wheel scrolling.
+    session.pump_for(Duration::from_millis(100)).await;
+    session.send(b"\x02X"); // Isolated config binds Prefix + X to kill-session.
+    assert!(
+        session.wait_until(UPDATE_TIMEOUT, |s| s.exited).await,
+        "tmux did not exit after kill-session; status={:?}, screen:\n{}",
+        session.exit_status,
+        session.visible_text()
+    );
+    assert!(!session.terminal.is_alt_screen_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn marker_columns(session: &TuiSession, marker: &str) -> Vec<usize> {
+    session
+        .visible_lines()
+        .iter()
+        .filter_map(|line| line.find(marker))
+        .collect()
 }

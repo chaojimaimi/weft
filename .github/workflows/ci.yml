@@ -33,6 +33,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install pinned TUI dependencies
+        env:
+          WEFT_TMUX_PREFIX: ${{ runner.temp }}/weft-tmux-3.7b
+        run: ./scripts/install_tui_test_deps.sh
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -43,6 +48,8 @@ jobs:
         run: ./scripts/architecture_gate.sh
 
       - name: Test
+        env:
+          WEFT_REQUIRE_TMUX_ACCEPTANCE: "1"
         run: cargo test --verbose
 
       - name: Performance budgets

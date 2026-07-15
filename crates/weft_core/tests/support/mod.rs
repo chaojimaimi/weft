@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -21,6 +23,35 @@ pub fn require_command(path: &str) -> bool {
     {
         eprintln!("skipping macOS system TUI integration outside macOS: {path}");
         false
+    }
+}
+
+pub fn require_path_command(name: &str, required: bool) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(name))
+                .find(|candidate| {
+                    candidate.is_file()
+                        && candidate
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+                })
+        });
+        if path.is_none() {
+            assert!(
+                !required,
+                "required macOS TUI command is missing from PATH: {name}"
+            );
+            eprintln!("skipping optional macOS TUI integration: {name} is not in PATH");
+        }
+        path
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eprintln!("skipping macOS system TUI integration outside macOS: {name}");
+        None
     }
 }
 
@@ -59,6 +90,7 @@ impl TuiSession {
             ("GIT_PAGER", ""),
             ("VIMINIT", ""),
             ("EXINIT", ""),
+            ("TMUX", ""),
         ];
         let pty = Pty::spawn_with_args(
             program,

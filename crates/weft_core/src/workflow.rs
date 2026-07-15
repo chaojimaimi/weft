@@ -420,6 +420,9 @@ fn current_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_STORE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn wf(name: &str, command: &str, vars: Vec<(&str, Option<&str>, bool)>) -> Workflow {
         Workflow {
@@ -615,8 +618,9 @@ mod tests {
 
     fn temp_store() -> WorkflowStore {
         let path = std::env::temp_dir().join(format!(
-            "weft-workflow-{}-{}.db",
+            "weft-workflow-{}-{}-{}.db",
             std::process::id(),
+            TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::UNIX_EPOCH
                 .elapsed()
                 .unwrap_or_default()
