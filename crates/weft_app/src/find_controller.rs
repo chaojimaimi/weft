@@ -90,34 +90,42 @@ impl App {
         if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
             return false;
         }
-        match key {
-            KeyCode::Escape => {
-                self.find.open = false;
-                self.clear_prev_focus_if_no_modal();
+        use crate::paint::command_surface::CommandSurfaceKeyAction;
+        match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
+            CommandSurfaceKeyAction::Cancel => {
+                self.close_find();
                 self.request_redraw();
-                true
+                return true;
             }
-            KeyCode::Enter => {
+            CommandSurfaceKeyAction::Accept => {
                 // Shift+Enter = previous, Enter = next.
                 self.find_cycle_next_prev(!mods.contains(Modifiers::SHIFT));
-                true
+                return true;
             }
-            KeyCode::Up | KeyCode::Down => {
-                // Arrow keys cycle prev/next, mirroring Warp's find popup.
-                self.find_cycle_next_prev(key == KeyCode::Down);
-                true
-            }
-            // F4: unified keyboard protocol — PageUp/PageDown also cycle
-            // matches (consistent with Up/Down in Find; Palette uses them for
-            // page-sized jumps in its results list).
-            KeyCode::PageUp => {
+            CommandSurfaceKeyAction::MoveUp => {
                 self.find_cycle_next_prev(false);
-                true
+                return true;
             }
-            KeyCode::PageDown => {
+            CommandSurfaceKeyAction::MoveDown => {
                 self.find_cycle_next_prev(true);
-                true
+                return true;
             }
+            CommandSurfaceKeyAction::PageUp => {
+                self.find_cycle_next_prev(false);
+                return true;
+            }
+            CommandSurfaceKeyAction::PageDown => {
+                self.find_cycle_next_prev(true);
+                return true;
+            }
+            CommandSurfaceKeyAction::CycleFocus => {
+                self.find_cycle_next_prev(!mods.contains(Modifiers::SHIFT));
+                return true;
+            }
+            CommandSurfaceKeyAction::Unhandled => {}
+        }
+
+        match key {
             KeyCode::Backspace => {
                 if self.find.query.pop().is_some() {
                     self.arm_find_refresh();

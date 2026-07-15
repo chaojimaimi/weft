@@ -11,12 +11,13 @@ impl App {
         menu
     }
 
-    pub(super) fn handle_context_menu_key(&mut self, key: KeyCode) -> bool {
+    pub(super) fn handle_context_menu_key(&mut self, key: KeyCode, modifiers: Modifiers) -> bool {
         let Some(menu) = self.interaction.context_menu.as_ref() else {
             return false;
         };
         let action = crate::context_menu_component::context_menu_key_action(
             key,
+            modifiers,
             menu.selection,
             CONTEXT_MENU_ITEMS.len(),
         );

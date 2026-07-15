@@ -140,39 +140,43 @@ impl App {
             .map(|t| t.editor().is_completing())
             .unwrap_or(false);
         if completing {
-            let consumed = match key {
-                Tab => {
-                    self.editor_completion_next();
-                    true
-                }
-                Enter => {
-                    self.editor_completion_accept();
-                    true
-                }
-                Up => {
-                    self.editor_completion_prev();
-                    true
-                }
-                Down => {
-                    self.editor_completion_next();
-                    true
-                }
-                // F4: unified keyboard protocol — PageUp/PageDown navigate
-                // completion candidates, consistent with Palette/Find.
-                PageUp => {
-                    self.editor_completion_prev();
-                    true
-                }
-                PageDown => {
-                    self.editor_completion_next();
-                    true
-                }
-                Escape => {
-                    self.editor_completion_cancel();
-                    true
-                }
-                _ => false,
-            };
+            use crate::paint::command_surface::CommandSurfaceKeyAction;
+            let consumed =
+                match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
+                    CommandSurfaceKeyAction::CycleFocus => {
+                        if shift {
+                            self.editor_completion_prev();
+                        } else {
+                            self.editor_completion_next();
+                        }
+                        true
+                    }
+                    CommandSurfaceKeyAction::Accept => {
+                        self.editor_completion_accept();
+                        true
+                    }
+                    CommandSurfaceKeyAction::MoveUp => {
+                        self.editor_completion_prev();
+                        true
+                    }
+                    CommandSurfaceKeyAction::MoveDown => {
+                        self.editor_completion_next();
+                        true
+                    }
+                    CommandSurfaceKeyAction::PageUp => {
+                        self.editor_completion_page(false);
+                        true
+                    }
+                    CommandSurfaceKeyAction::PageDown => {
+                        self.editor_completion_page(true);
+                        true
+                    }
+                    CommandSurfaceKeyAction::Cancel => {
+                        self.editor_completion_cancel();
+                        true
+                    }
+                    CommandSurfaceKeyAction::Unhandled => false,
+                };
             if consumed {
                 self.request_redraw();
                 return true;
@@ -366,6 +370,36 @@ impl App {
     pub(super) fn editor_completion_prev(&mut self) {
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_prev();
+        }
+    }
+
+    fn editor_completion_page(&mut self, forward: bool) {
+        let Some((selected, target)) = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.editor().completion_view())
+            .map(|(matches, selected)| {
+                let target = crate::paint::command_surface::apply_page_selection(
+                    selected,
+                    matches.len(),
+                    self.interaction.popup_max_rows,
+                    forward,
+                );
+                (selected, target)
+            })
+        else {
+            return;
+        };
+        if target >= selected {
+            for _ in selected..target {
+                self.editor_completion_next();
+            }
+        } else {
+            for _ in target..selected {
+                self.editor_completion_prev();
+            }
         }
     }
 

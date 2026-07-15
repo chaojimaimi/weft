@@ -423,6 +423,7 @@ impl App {
     pub(super) fn handle_palette_select_theme_key(
         &mut self,
         key: KeyCode,
+        mods: Modifiers,
         text: Option<&str>,
     ) -> bool {
         let (buffer, themes) = match &self.palette.submode {
@@ -440,6 +441,12 @@ impl App {
                 .nth(sel)
                 .cloned()
         };
+        let filtered_len = themes
+            .iter()
+            .filter(|name| {
+                buffer.is_empty() || name.to_lowercase().contains(&buffer.to_lowercase())
+            })
+            .count();
 
         match key {
             KeyCode::Escape => {
@@ -459,9 +466,28 @@ impl App {
                 true
             }
             KeyCode::Down => {
-                if self.palette.selection + 1 < self.palette.results.len() {
+                if self.palette.selection + 1 < filtered_len {
                     self.palette.selection += 1;
                 }
+                self.request_redraw();
+                true
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                self.palette.selection = crate::paint::command_surface::apply_page_selection(
+                    self.palette.selection,
+                    filtered_len,
+                    self.interaction.popup_max_rows,
+                    key == KeyCode::PageDown,
+                );
+                self.request_redraw();
+                true
+            }
+            KeyCode::Tab => {
+                self.palette.selection = crate::input_router::cycle_list_selection(
+                    self.palette.selection,
+                    filtered_len,
+                    !mods.contains(Modifiers::SHIFT),
+                );
                 self.request_redraw();
                 true
             }
@@ -474,9 +500,9 @@ impl App {
                         "weft-light" | "solarized-light" | "gruvbox-light"
                     );
                     self.apply_theme_by_name(&name, dark);
-                    self.palette.open = false;
                     self.palette.submode = PaletteSubMode::Search;
                     self.palette.query.clear();
+                    self.close_palette();
                     self.request_redraw();
                 }
                 true

@@ -428,7 +428,6 @@ pub(crate) enum CommandSurfaceKeyAction {
 /// app-level shortcuts (Cmd+F, Cmd+P, Cmd+R, etc.) still fire while a
 /// surface is open. Shift is allowed through (Shift+Enter = previous match
 /// in Find, Shift+Tab = reverse cycle — surfaces decide).
-#[allow(dead_code)] // F4: formal protocol; controllers currently dispatch directly
 pub(crate) fn resolve_command_surface_key(
     key: KeyCode,
     mods: Modifiers,

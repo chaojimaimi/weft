@@ -2,6 +2,16 @@
 
 use super::*;
 
+pub(crate) fn palette_form_field_direction(key: KeyCode, mods: Modifiers) -> Option<bool> {
+    use crate::paint::command_surface::CommandSurfaceKeyAction;
+    match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
+        CommandSurfaceKeyAction::MoveUp | CommandSurfaceKeyAction::PageUp => Some(false),
+        CommandSurfaceKeyAction::MoveDown | CommandSurfaceKeyAction::PageDown => Some(true),
+        CommandSurfaceKeyAction::CycleFocus => Some(!mods.contains(Modifiers::SHIFT)),
+        _ => None,
+    }
+}
+
 impl App {
     /// Refresh the palette search results from the workflow store + builtin commands.
     pub(super) fn refresh_palette_results(&mut self) {
@@ -64,44 +74,43 @@ impl App {
         // Route to sub-mode handler if not in Search.
         match &self.palette.submode {
             PaletteSubMode::CreateWorkflow { .. } => {
-                return self.handle_palette_create_key(key, text);
+                return self.handle_palette_create_key(key, mods, text);
             }
             PaletteSubMode::EditWorkflow { .. } => {
-                return self.handle_palette_edit_key(key, text);
+                return self.handle_palette_edit_key(key, mods, text);
             }
             PaletteSubMode::ConfirmDelete { .. } => {
                 return self.handle_palette_delete_key(key);
             }
             PaletteSubMode::SelectTheme { .. } => {
-                return self.handle_palette_select_theme_key(key, text);
+                return self.handle_palette_select_theme_key(key, mods, text);
             }
             PaletteSubMode::Search => {}
         }
 
-        match key {
-            KeyCode::Escape => {
-                self.palette.open = false;
-                self.clear_prev_focus_if_no_modal();
+        use crate::paint::command_surface::CommandSurfaceKeyAction;
+        let protocol = crate::paint::command_surface::resolve_command_surface_key(key, mods);
+        match protocol {
+            CommandSurfaceKeyAction::Cancel => {
+                self.close_palette();
                 self.request_redraw();
-                true
+                return true;
             }
-            KeyCode::Up => {
+            CommandSurfaceKeyAction::MoveUp => {
                 if self.palette.selection > 0 {
                     self.palette.selection -= 1;
                 }
                 self.request_redraw();
-                true
+                return true;
             }
-            KeyCode::Down => {
+            CommandSurfaceKeyAction::MoveDown => {
                 if self.palette.selection + 1 < self.palette.results.len() {
                     self.palette.selection += 1;
                 }
                 self.request_redraw();
-                true
+                return true;
             }
-            // F4: unified keyboard protocol — PageUp/PageDown move by a page
-            // of results, consistent with Find and Completion surfaces.
-            KeyCode::PageUp => {
+            CommandSurfaceKeyAction::PageUp => {
                 self.palette.selection = crate::paint::command_surface::apply_page_selection(
                     self.palette.selection,
                     self.palette.results.len(),
@@ -109,9 +118,9 @@ impl App {
                     false,
                 );
                 self.request_redraw();
-                true
+                return true;
             }
-            KeyCode::PageDown => {
+            CommandSurfaceKeyAction::PageDown => {
                 self.palette.selection = crate::paint::command_surface::apply_page_selection(
                     self.palette.selection,
                     self.palette.results.len(),
@@ -119,14 +128,27 @@ impl App {
                     true,
                 );
                 self.request_redraw();
-                true
+                return true;
             }
-            KeyCode::Enter => {
+            CommandSurfaceKeyAction::CycleFocus => {
+                self.palette.selection = crate::input_router::cycle_list_selection(
+                    self.palette.selection,
+                    self.palette.results.len(),
+                    !mods.contains(Modifiers::SHIFT),
+                );
+                self.request_redraw();
+                return true;
+            }
+            CommandSurfaceKeyAction::Accept => {
                 if let Some(entry) = self.palette.results.get(self.palette.selection).cloned() {
                     self.activate_palette_entry(entry);
                 }
-                true
+                return true;
             }
+            CommandSurfaceKeyAction::Unhandled => {}
+        }
+
+        match key {
             KeyCode::Backspace => {
                 // If query is empty and we were typing '>', clear it.
                 if self.palette.query.is_empty() {
@@ -239,7 +261,12 @@ impl App {
     }
 
     /// Handle keys in CreateWorkflow sub-mode (guided step-by-step entry).
-    pub(super) fn handle_palette_create_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
+    pub(super) fn handle_palette_create_key(
+        &mut self,
+        key: KeyCode,
+        mods: Modifiers,
+        text: Option<&str>,
+    ) -> bool {
         let PaletteSubMode::CreateWorkflow {
             step,
             buffer,
@@ -310,6 +337,11 @@ impl App {
                 self.request_redraw();
                 true
             }
+            _ if crate::paint::command_surface::resolve_command_surface_key(key, mods)
+                != crate::paint::command_surface::CommandSurfaceKeyAction::Unhandled =>
+            {
+                true
+            }
             _ => {
                 let c = resolve_text_char(text, '\0', false);
                 if c != '\0' && !c.is_control() {
@@ -324,7 +356,12 @@ impl App {
     }
 
     /// Handle keys in EditWorkflow sub-mode.
-    pub(super) fn handle_palette_edit_key(&mut self, key: KeyCode, text: Option<&str>) -> bool {
+    pub(super) fn handle_palette_edit_key(
+        &mut self,
+        key: KeyCode,
+        mods: Modifiers,
+        text: Option<&str>,
+    ) -> bool {
         let (id, name) = match &self.palette.submode {
             PaletteSubMode::EditWorkflow { id, name, .. } => (*id, name.clone()),
             _ => return false,
@@ -372,6 +409,11 @@ impl App {
                     buffer.pop();
                 }
                 self.request_redraw();
+                true
+            }
+            _ if crate::paint::command_surface::resolve_command_surface_key(key, mods)
+                != crate::paint::command_surface::CommandSurfaceKeyAction::Unhandled =>
+            {
                 true
             }
             _ => {
@@ -423,24 +465,24 @@ impl App {
     pub(super) fn handle_palette_form_key(
         &mut self,
         key: KeyCode,
-        _mods: Modifiers,
+        mods: Modifiers,
         text: Option<&str>,
     ) -> bool {
+        if let Some(forward) = palette_form_field_direction(key, mods) {
+            if let Some(form) = &mut self.palette.form {
+                form.current_field = crate::input_router::cycle_list_selection(
+                    form.current_field,
+                    form.var_names.len(),
+                    forward,
+                );
+            }
+            self.request_redraw();
+            return true;
+        }
         match key {
             KeyCode::Escape => {
                 // Return to search mode (keep palette open).
                 self.palette.form = None;
-                self.request_redraw();
-                true
-            }
-            KeyCode::Tab => {
-                if let Some(form) = &mut self.palette.form {
-                    if form.current_field + 1 < form.var_names.len() {
-                        form.current_field += 1;
-                    } else {
-                        form.current_field = 0; // wrap
-                    }
-                }
                 self.request_redraw();
                 true
             }
@@ -450,7 +492,7 @@ impl App {
                 if let Some(form) = form {
                     self.execute_workflow(form);
                 }
-                self.palette.open = false;
+                self.close_palette();
                 self.request_redraw();
                 true
             }
@@ -495,7 +537,7 @@ impl App {
                         current_field: 0,
                     };
                     self.execute_workflow(form);
-                    self.palette.open = false;
+                    self.close_palette();
                     self.request_redraw();
                 } else {
                     // Has variables — enter form-fill mode.
@@ -515,7 +557,7 @@ impl App {
                 match cmd {
                     BuiltinCmd::ToggleTheme => {
                         self.toggle_theme();
-                        self.palette.open = false;
+                        self.close_palette();
                     }
                     BuiltinCmd::SelectTheme => {
                         // v0.9 W2+: enter theme picker sub-mode instead of
@@ -533,11 +575,11 @@ impl App {
                     }
                     BuiltinCmd::ToggleBlockPanel => {
                         self.execute_action(Action::ToggleBlockPanel);
-                        self.palette.open = false;
+                        self.close_palette();
                     }
                     BuiltinCmd::ReloadConfig => {
                         self.execute_action(Action::ReloadConfig);
-                        self.palette.open = false;
+                        self.close_palette();
                     }
                 }
                 self.request_redraw();
@@ -585,5 +627,43 @@ impl App {
                 warn!(error = %e, "workflow render failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::palette_form_field_direction;
+    use weft_core::input::{KeyCode, Modifiers};
+
+    #[test]
+    fn palette_form_owns_tab_arrows_and_page_navigation() {
+        assert_eq!(
+            palette_form_field_direction(KeyCode::Tab, Modifiers::empty()),
+            Some(true)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::Tab, Modifiers::SHIFT),
+            Some(false)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::Up, Modifiers::empty()),
+            Some(false)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::Down, Modifiers::empty()),
+            Some(true)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::PageUp, Modifiers::empty()),
+            Some(false)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::PageDown, Modifiers::empty()),
+            Some(true)
+        );
+        assert_eq!(
+            palette_form_field_direction(KeyCode::Char('x'), Modifiers::empty()),
+            None
+        );
     }
 }

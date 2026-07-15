@@ -4,6 +4,20 @@
 //! ownership priority is defined and tested here instead of being inferred
 //! from the order of unrelated `if` statements.
 
+/// Move one item with wraparound. Used by Tab/Shift+Tab on command surfaces
+/// so modal keyboard ownership never escapes to the terminal editor.
+pub(crate) fn cycle_list_selection(selection: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let current = selection.min(len - 1);
+    if forward {
+        (current + 1) % len
+    } else {
+        current.checked_sub(1).unwrap_or(len - 1)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OverlayInputOwner {
     Palette,
@@ -308,12 +322,20 @@ impl OverlayInputOwner {
 #[cfg(test)]
 mod tests {
     use super::{
-        route_global_action, route_keyboard_entry, route_modal_mouse, route_modal_pointer,
-        route_owned_pointer_move, route_session_action, route_session_input,
+        cycle_list_selection, route_global_action, route_keyboard_entry, route_modal_mouse,
+        route_modal_pointer, route_owned_pointer_move, route_session_action, route_session_input,
         GlobalActionOverlayRoute, KeyboardEntryRoute, ModalMouseCapture, ModalMouseRoute,
         MouseGestureOwner, OverlayInputContext, OverlayInputOwner, OwnedPointerMoveRoute,
         SessionInputRoute,
     };
+
+    #[test]
+    fn modal_tab_selection_wraps_both_directions_and_clamps_stale_index() {
+        assert_eq!(cycle_list_selection(2, 3, true), 0);
+        assert_eq!(cycle_list_selection(0, 3, false), 2);
+        assert_eq!(cycle_list_selection(usize::MAX, 3, true), 0);
+        assert_eq!(cycle_list_selection(usize::MAX, 0, true), 0);
+    }
     use weft_core::config::Action;
     use winit::event::MouseButton;
 

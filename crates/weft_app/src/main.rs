@@ -555,7 +555,7 @@ impl App {
             Some(OverlayInputOwner::Palette) => self.handle_palette_key(key, m, text),
             Some(OverlayInputOwner::Settings) => self.handle_settings_key(key, m, text),
             Some(OverlayInputOwner::Find) => self.handle_find_key(key, m, text),
-            Some(OverlayInputOwner::ContextMenu) => self.handle_context_menu_key(key),
+            Some(OverlayInputOwner::ContextMenu) => self.handle_context_menu_key(key, m),
             Some(OverlayInputOwner::PanelSearch) => self.handle_panel_key(key, m),
             None => false,
         };
