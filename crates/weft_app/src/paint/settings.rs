@@ -367,10 +367,13 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Keybindings => {
-                    // F5: conflict count badge.
                     let mut list_top = content_top;
-                    if s.keybinding_conflict_count > 0 {
-                        let badge = format!("\u{26a0} {} conflict(s)", s.keybinding_conflict_count);
+                    let validation_error = find_field_error(s.field_errors, "Keybindings");
+                    if s.keybinding_conflict_count > 0 || validation_error.is_some() {
+                        let badge = validation_error.map_or_else(
+                            || format!("\u{26a0} {} conflict(s)", s.keybinding_conflict_count),
+                            |error| format!("\u{26a0} {error}"),
+                        );
                         self.push_text(
                             &mut verts,
                             content_x0,
@@ -381,7 +384,6 @@ impl MetalRenderer {
                         );
                         list_top += ch;
                     }
-                    // Scrollable keybinding list.
                     let total = s.keybindings.len();
                     let available_rows =
                         ((layout.footer_y - ch * 0.5 - list_top) / ch).max(1.0) as usize;
@@ -431,7 +433,6 @@ impl MetalRenderer {
                             content_cols,
                         );
                     }
-                    // Scroll indicator.
                     if scrollable {
                         let indicator_y = list_top + visible as f32 * ch;
                         let mut indicator = String::new();
@@ -496,7 +497,6 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Advanced => {
-                    // Placeholder rows with restart-required badges.
                     let rows: [(&str, &str); 2] =
                         [("Debug Logging:", "Off"), ("Experimental:", "Disabled")];
                     for (i, (label, value)) in rows.iter().enumerate() {

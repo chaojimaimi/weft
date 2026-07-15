@@ -1,5 +1,4 @@
-// App state and controller orchestration. Runtime callbacks and macOS system
-// integration live in dedicated modules so this file can keep shrinking.
+// App orchestration; runtime callbacks and macOS integration live in modules.
 //! Weft v1.0 "Weave" — Metal GPU-rendered terminal emulator
 //!
 //! Full pipeline: PTY → VT parser → Grid → Metal renderer
@@ -47,6 +46,7 @@ mod scroll_input;
 mod scrollbar_component;
 mod settings_component;
 mod settings_controller;
+mod settings_validation;
 mod tab;
 mod tab_bar_component;
 mod terminal_geometry;
@@ -749,7 +749,7 @@ impl App {
                     self.close_palette();
                     self.close_find();
                     self.save_focus_for_modal(crate::scene::FocusId::Settings);
-                    self.settings.open_from(&self.config_state.config);
+                    self.open_settings();
                 }
                 self.request_redraw();
                 true

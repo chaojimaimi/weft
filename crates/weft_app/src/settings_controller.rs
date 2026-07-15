@@ -6,9 +6,26 @@
 //! validation, and narrow-window drill-down navigation.
 
 use super::*;
-use std::collections::{HashMap, HashSet};
+use crate::settings_validation::{
+    adjust_finite_value, detect_keybinding_conflicts, validate_settings,
+};
 
 impl App {
+    pub(super) fn open_settings(&mut self) {
+        self.settings.open_from(&self.config_state.config);
+        self.refresh_settings_validation();
+    }
+
+    fn refresh_settings_validation(&mut self) {
+        self.settings.field_errors = validate_settings(&self.settings.draft);
+        self.settings.error = (!self.settings.field_errors.is_empty()).then(|| {
+            format!(
+                "{} field(s) need attention",
+                self.settings.field_errors.len()
+            )
+        });
+    }
+
     pub(super) fn handle_settings_mouse_press(&mut self, x: f32, y: f32) {
         use crate::settings_component::SettingsTarget;
 
@@ -211,13 +228,8 @@ impl App {
     /// F5: Runs field-level validation before saving. If validation fails,
     /// `field_errors` is populated and the save is aborted.
     pub(super) fn save_settings_draft(&mut self, close: bool) {
-        // F5: validate before saving.
-        self.settings.field_errors = validate_settings(&self.settings.draft);
+        self.refresh_settings_validation();
         if !self.settings.field_errors.is_empty() {
-            self.settings.error = Some(format!(
-                "{} field(s) need attention",
-                self.settings.field_errors.len()
-            ));
             return;
         }
 
@@ -280,22 +292,38 @@ impl App {
                     }
                     2 => {
                         // Font Size: ±0.5 pt, clamped to [8.0, 24.0].
-                        self.settings.draft.font.size =
-                            (self.settings.draft.font.size + delta as f32 * 0.5).clamp(8.0, 24.0);
+                        self.settings.draft.font.size = adjust_finite_value(
+                            self.settings.draft.font.size,
+                            delta,
+                            0.5,
+                            8.0,
+                            24.0,
+                            14.0,
+                        );
                         self.settings.dirty = true;
                     }
                     3 => {
                         // Line height: ±0.05, clamped to [1.0, 1.5].
-                        self.settings.draft.font.line_height =
-                            (self.settings.draft.font.line_height + delta as f32 * 0.05)
-                                .clamp(1.0, 1.5);
+                        self.settings.draft.font.line_height = adjust_finite_value(
+                            self.settings.draft.font.line_height,
+                            delta,
+                            0.05,
+                            1.0,
+                            1.5,
+                            1.2,
+                        );
                         self.settings.dirty = true;
                     }
                     4 => {
                         // Window opacity: ±0.05, clamped to [0.5, 1.0].
-                        self.settings.draft.window.opacity = (self.settings.draft.window.opacity
-                            + delta as f32 * 0.05)
-                            .clamp(0.5, 1.0);
+                        self.settings.draft.window.opacity = adjust_finite_value(
+                            self.settings.draft.window.opacity,
+                            delta,
+                            0.05,
+                            0.5,
+                            1.0,
+                            1.0,
+                        );
                         self.settings.dirty = true;
                     }
                     _ => {}
@@ -354,10 +382,13 @@ impl App {
                 }
                 2 => {
                     // Sidebar width: ±10pt, clamped to [240, 360]. None → start at 280.
-                    let cur = self.settings.draft.window.sidebar_width.unwrap_or(280.0);
-                    let next = (cur + delta as f32 * 10.0).clamp(
+                    let next = adjust_finite_value(
+                        self.settings.draft.window.sidebar_width.unwrap_or(280.0),
+                        delta,
+                        10.0,
                         weft_core::config::SIDEBAR_MIN_WIDTH,
                         weft_core::config::SIDEBAR_MAX_WIDTH,
+                        280.0,
                     );
                     self.settings.draft.window.sidebar_width = Some(next);
                     self.settings.dirty = true;
@@ -367,6 +398,9 @@ impl App {
             SettingsTab::Advanced => {
                 // Placeholder rows — no real config backing yet.
             }
+        }
+        if self.settings.dirty {
+            self.refresh_settings_validation();
         }
     }
 
@@ -407,6 +441,7 @@ impl App {
                                 self.config_state.preferred_dark_theme = view.name.to_string();
                             }
                             self.settings.dirty = true;
+                            self.refresh_settings_validation();
                         }
                     }
                 }
@@ -520,207 +555,5 @@ impl App {
         // Sort by action label for stable display.
         views.sort_by(|a, b| a.action.cmp(&b.action));
         views
-    }
-}
-
-// ── F5: Pure helper functions ─────────────────────────────────────────
-
-/// F5: Detect keybinding conflicts — chords bound to more than one action.
-/// Returns the set of conflicting chord strings. A chord is a "conflict"
-/// when two different actions share the same chord string.
-///
-/// This is a pure function with no side effects, making it easy to unit-test.
-/// In normal operation the keybindings map deduplicates by (KeyCode, Modifiers),
-/// so conflicts only arise from UI editing or config aliasing. The function
-/// is infrastructure-ready for future keybinding editing.
-pub(crate) fn detect_keybinding_conflicts(
-    views: &[crate::overlay::SettingsKeybindingView],
-) -> HashSet<String> {
-    let mut chord_actions: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for v in views {
-        chord_actions
-            .entry(v.binding.as_str())
-            .or_default()
-            .insert(v.action.as_str());
-    }
-    chord_actions
-        .into_iter()
-        .filter(|(_, actions)| actions.len() > 1)
-        .map(|(chord, _)| chord.to_string())
-        .collect()
-}
-
-/// F5: Validate the settings draft before saving. Returns a list of
-/// (field_label, error_message) pairs. Empty vec = all valid.
-///
-/// This is a pure function with no side effects, making it easy to unit-test.
-pub(crate) fn validate_settings(config: &weft_core::config::Config) -> Vec<(String, String)> {
-    let mut errors = Vec::new();
-    if config.font.size < 8.0 || config.font.size > 24.0 {
-        errors.push((
-            "Font Size".to_string(),
-            format!("{} is out of range [8.0, 24.0]", config.font.size),
-        ));
-    }
-    if config.font.line_height < 1.0 || config.font.line_height > 1.5 {
-        errors.push((
-            "Line Height".to_string(),
-            format!("{} is out of range [1.0, 1.5]", config.font.line_height),
-        ));
-    }
-    if config.window.opacity < 0.5 || config.window.opacity > 1.0 {
-        errors.push((
-            "Window Opacity".to_string(),
-            format!("{} is out of range [0.5, 1.0]", config.window.opacity),
-        ));
-    }
-    if config.scrollback.lines < 1000 || config.scrollback.lines > 100_000 {
-        errors.push((
-            "Scrollback".to_string(),
-            format!("{} is out of range [1000, 100000]", config.scrollback.lines),
-        ));
-    }
-    if config.window.width < 400 {
-        errors.push((
-            "Window Width".to_string(),
-            format!("{} is below minimum 400", config.window.width),
-        ));
-    }
-    if config.window.height < 300 {
-        errors.push((
-            "Window Height".to_string(),
-            format!("{} is below minimum 300", config.window.height),
-        ));
-    }
-    errors
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::overlay::SettingsKeybindingView;
-
-    fn kb(action: &str, binding: &str) -> SettingsKeybindingView {
-        SettingsKeybindingView {
-            action: action.to_string(),
-            binding: binding.to_string(),
-            conflict: false,
-        }
-    }
-
-    #[test]
-    fn detect_conflicts_empty_list() {
-        let views: Vec<SettingsKeybindingView> = vec![];
-        let conflicts = detect_keybinding_conflicts(&views);
-        assert!(conflicts.is_empty());
-    }
-
-    #[test]
-    fn detect_conflicts_no_duplicates() {
-        let views = vec![
-            kb("Copy", "cmd+c"),
-            kb("Paste", "cmd+v"),
-            kb("Settings", "cmd+comma"),
-        ];
-        let conflicts = detect_keybinding_conflicts(&views);
-        assert!(conflicts.is_empty());
-    }
-
-    #[test]
-    fn detect_conflicts_same_chord_different_actions() {
-        // "cmd+x" bound to both Copy and Cut — that's a conflict.
-        let views = vec![
-            kb("Copy", "cmd+c"),
-            kb("Cut", "cmd+x"),
-            kb("Paste", "cmd+x"),
-        ];
-        let conflicts = detect_keybinding_conflicts(&views);
-        assert_eq!(conflicts.len(), 1);
-        assert!(conflicts.contains("cmd+x"));
-    }
-
-    #[test]
-    fn detect_conflicts_same_action_different_chords_is_not_conflict() {
-        // Paste bound to both cmd+v and cmd+shift+v — NOT a conflict
-        // (same action, different chords is fine).
-        let views = vec![kb("Paste", "cmd+v"), kb("Paste", "cmd+shift+v")];
-        let conflicts = detect_keybinding_conflicts(&views);
-        assert!(conflicts.is_empty());
-    }
-
-    #[test]
-    fn detect_conflicts_multiple_conflicting_chords() {
-        let views = vec![
-            kb("Copy", "cmd+c"),
-            kb("Cut", "cmd+c"),
-            kb("Paste", "cmd+v"),
-            kb("Close", "cmd+w"),
-            kb("New Tab", "cmd+w"),
-        ];
-        let conflicts = detect_keybinding_conflicts(&views);
-        assert_eq!(conflicts.len(), 2);
-        assert!(conflicts.contains("cmd+c"));
-        assert!(conflicts.contains("cmd+w"));
-    }
-
-    #[test]
-    fn validate_default_config_is_clean() {
-        let config = weft_core::config::Config::default();
-        let errors = validate_settings(&config);
-        assert!(errors.is_empty(), "default config should have no errors");
-    }
-
-    #[test]
-    fn validate_font_size_out_of_range() {
-        let mut config = weft_core::config::Config::default();
-        config.font.size = 30.0;
-        let errors = validate_settings(&config);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, "Font Size");
-        assert!(errors[0].1.contains("out of range"));
-    }
-
-    #[test]
-    fn validate_opacity_out_of_range() {
-        let mut config = weft_core::config::Config::default();
-        config.window.opacity = 0.1;
-        let errors = validate_settings(&config);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, "Window Opacity");
-    }
-
-    #[test]
-    fn validate_scrollback_out_of_range() {
-        let mut config = weft_core::config::Config::default();
-        config.scrollback.lines = 100;
-        let errors = validate_settings(&config);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].0, "Scrollback");
-    }
-
-    #[test]
-    fn validate_multiple_errors_collected() {
-        let mut config = weft_core::config::Config::default();
-        config.font.size = 1.0;
-        config.window.opacity = 0.0;
-        config.scrollback.lines = 10;
-        let errors = validate_settings(&config);
-        assert_eq!(errors.len(), 3);
-        let labels: Vec<&str> = errors.iter().map(|(l, _)| l.as_str()).collect();
-        assert!(labels.contains(&"Font Size"));
-        assert!(labels.contains(&"Window Opacity"));
-        assert!(labels.contains(&"Scrollback"));
-    }
-
-    #[test]
-    fn validate_window_dimensions_minimum() {
-        let mut config = weft_core::config::Config::default();
-        config.window.width = 200;
-        config.window.height = 100;
-        let errors = validate_settings(&config);
-        assert_eq!(errors.len(), 2);
-        let labels: Vec<&str> = errors.iter().map(|(l, _)| l.as_str()).collect();
-        assert!(labels.contains(&"Window Width"));
-        assert!(labels.contains(&"Window Height"));
     }
 }
