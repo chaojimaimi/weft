@@ -571,6 +571,35 @@ impl App {
         crate::panel_component::panel_target_at(&scene, x, y)
     }
 
+    pub(super) fn active_panel_scrollbar_layout(
+        &self,
+    ) -> Option<crate::panel_scrollbar::PanelScrollbarLayout> {
+        if !self.panel.open {
+            return None;
+        }
+        let renderer = self.renderer.as_ref()?;
+        let chrome_top = renderer.layout_ctx.map(|ctx| ctx.chrome_top).unwrap_or(0.0);
+        let layout = crate::layout::layout_panel(
+            chrome_top,
+            renderer.cell_width() as f32,
+            renderer.cell_height() as f32,
+            renderer.sidebar_width(),
+            renderer.viewport().1,
+        );
+        let visible = crate::paint::ui_helpers::visible_panel_rows(
+            renderer.viewport().1,
+            renderer.cell_height(),
+        );
+        crate::panel_scrollbar::panel_scrollbar_layout(
+            layout.panel_rect,
+            layout.list_top,
+            self.panel_total_filtered(),
+            visible,
+            self.panel.scroll_offset,
+            renderer.cell_height() as f32 * 0.8,
+        )
+    }
+
     /// Resolve a physical-pixel point in the settings panel to a target.
     /// Rebuilds the settings layout from renderer geometry + current settings
     /// state. Returns `None` when the panel is closed, the renderer is absent,

@@ -38,6 +38,7 @@ mod palette_controller;
 mod palette_state;
 mod panel_component;
 mod panel_controller;
+mod panel_scrollbar;
 mod performance_probe;
 mod redraw_controller;
 mod renderer;

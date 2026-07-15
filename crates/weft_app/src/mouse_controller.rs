@@ -40,6 +40,9 @@ impl App {
             self.request_redraw();
             return;
         }
+        if button == winit::event::MouseButton::Left && self.finish_panel_scrollbar_drag() {
+            return;
+        }
         // End popup border drag if active.
         if button == winit::event::MouseButton::Left
             && self.interaction.scrollbar_drag.take().is_some()
@@ -113,18 +116,10 @@ impl App {
     pub(super) fn handle_mouse_move(&mut self, x: f64, y: f64) {
         // F3-3: sidebar resize drag — update the renderer's sidebar width
         // from the pointer delta. The drag persists on release.
-        if let Some(drag) = self.interaction.sidebar_drag {
-            if let Some(renderer) = &mut self.renderer {
-                let scale = renderer.scale() as f32;
-                if scale > 0.0 {
-                    let dx_logical = ((x - drag.start_x) as f32 / scale).max(0.0);
-                    let new_width =
-                        crate::ui_tokens::clamp_sidebar_width(drag.start_width + dx_logical);
-                    renderer.set_sidebar_width(Some(new_width));
-                    self.recompute_layout();
-                    self.request_redraw();
-                }
-            }
+        if self.update_sidebar_drag(x) {
+            return;
+        }
+        if self.update_panel_scrollbar_drag(y as f32) {
             return;
         }
         if let Some(drag) = self.interaction.scrollbar_drag {

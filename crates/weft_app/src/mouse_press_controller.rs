@@ -216,6 +216,28 @@ impl App {
         if button == winit::event::MouseButton::Left && self.panel.open {
             let xf = x as f32;
             let yf = y as f32;
+            if let Some(layout) = self.active_panel_scrollbar_layout() {
+                if crate::panel_scrollbar::contains(layout.hit, xf, yf) {
+                    let thumb_height = layout.thumb[3] - layout.thumb[1];
+                    let grab_offset = crate::panel_scrollbar::thumb_grab_offset(&layout, xf, yf)
+                        .unwrap_or(thumb_height / 2.0);
+                    self.panel.scroll_offset =
+                        crate::panel_scrollbar::scroll_offset_for_pointer(&layout, yf, grab_offset);
+                    self.clamp_panel_scroll();
+                    self.clamp_panel_selection();
+                    self.interaction.panel_scrollbar_drag =
+                        Some(crate::panel_scrollbar::PanelScrollbarDragState {
+                            layout,
+                            grab_offset,
+                        });
+                    self.request_redraw();
+                    return;
+                }
+            }
+        }
+        if button == winit::event::MouseButton::Left && self.panel.open {
+            let xf = x as f32;
+            let yf = y as f32;
             match self.panel_target_at(xf, yf) {
                 Some(crate::panel_component::PanelTarget::Row(clicked)) => {
                     // Click on a history row: select it AND focus the
@@ -304,22 +326,15 @@ impl App {
             if let Some(renderer) = &self.renderer {
                 let xf = x as f32;
                 let yf = y as f32;
-                let hit = renderer.hit_regions.iter().find_map(|region| {
-                    if region.contains(xf, yf) {
-                        match region.target {
-                            crate::overlay::HitTarget::BlockActionCopy(bid) => {
-                                Some((bid, "copy_command"))
-                            }
-                            crate::overlay::HitTarget::BlockActionFold(bid) => {
-                                Some((bid, "toggle_fold"))
-                            }
-                            _ => None,
+                let hit =
+                    crate::block_component::block_header_action_at(&renderer.hit_regions, xf, yf);
+                if let Some(hit) = hit {
+                    let (block_id, action) = match hit {
+                        crate::block_component::BlockHeaderAction::Copy(id) => (id, "copy_command"),
+                        crate::block_component::BlockHeaderAction::ToggleFold(id) => {
+                            (id, "toggle_fold")
                         }
-                    } else {
-                        None
-                    }
-                });
-                if let Some((block_id, action)) = hit {
+                    };
                     self.run_context_action(Some(block_id), action);
                     self.request_redraw();
                     return;

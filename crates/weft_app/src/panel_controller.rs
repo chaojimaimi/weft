@@ -3,6 +3,48 @@
 use super::*;
 
 impl App {
+    pub(super) fn update_sidebar_drag(&mut self, pointer_x: f64) -> bool {
+        let Some(drag) = self.interaction.sidebar_drag else {
+            return false;
+        };
+        let Some(renderer) = &mut self.renderer else {
+            return true;
+        };
+        let width = crate::ui_tokens::sidebar_width_after_drag(
+            drag.start_width,
+            drag.start_x,
+            pointer_x,
+            renderer.scale() as f32,
+        );
+        renderer.set_sidebar_width(Some(width));
+        self.recompute_layout();
+        self.request_redraw();
+        true
+    }
+
+    pub(super) fn finish_panel_scrollbar_drag(&mut self) -> bool {
+        if self.interaction.panel_scrollbar_drag.take().is_none() {
+            return false;
+        }
+        self.request_redraw();
+        true
+    }
+
+    pub(super) fn update_panel_scrollbar_drag(&mut self, pointer_y: f32) -> bool {
+        let Some(drag) = self.interaction.panel_scrollbar_drag else {
+            return false;
+        };
+        self.panel.scroll_offset = crate::panel_scrollbar::scroll_offset_for_pointer(
+            &drag.layout,
+            pointer_y,
+            drag.grab_offset,
+        );
+        self.clamp_panel_scroll();
+        self.clamp_panel_selection();
+        self.request_redraw();
+        true
+    }
+
     /// F3-4: Maximum number of block rows that fit in the panel's visible list
     /// area, based on the renderer's actual viewport and cell height. Falls
     /// back to the grid row count when the renderer isn't available yet.

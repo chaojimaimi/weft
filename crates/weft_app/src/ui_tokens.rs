@@ -21,6 +21,19 @@ pub fn clamp_sidebar_width(width: f32) -> f32 {
     width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
 }
 
+/// Resolve a sidebar drag in physical pixels to a clamped logical width.
+/// The signed delta is intentional: dragging left must shrink the sidebar.
+pub fn sidebar_width_after_drag(start_width: f32, start_x: f64, current_x: f64, scale: f32) -> f32 {
+    if !scale.is_finite() || scale <= 0.0 {
+        return clamp_sidebar_width(start_width);
+    }
+    let delta = ((current_x - start_x) / f64::from(scale)) as f32;
+    if !delta.is_finite() {
+        return clamp_sidebar_width(start_width);
+    }
+    clamp_sidebar_width(start_width + delta)
+}
+
 /// F3-3: Pure hit-test for the sidebar's right-edge resize handle. Returns
 /// `true` when `x` is within `tolerance` px of `edge` and `y` is inside the
 /// viewport's vertical extent. Extracted from `App::sidebar_resize_hit` so
@@ -351,8 +364,8 @@ fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Colo
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, ResponsiveClass, SidebarMetrics,
-        UiColors, UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, sidebar_width_after_drag,
+        ResponsiveClass, SidebarMetrics, UiColors, UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     };
     use weft_core::config::Theme;
 
@@ -440,6 +453,25 @@ mod tests {
         // NaN must not slip through (clamp keeps NaN, so callers must guard
         // their inputs; document that contract here).
         assert!(clamp_sidebar_width(f32::NAN).is_nan());
+    }
+
+    #[test]
+    fn sidebar_drag_width_grows_and_shrinks_in_logical_points() {
+        assert_eq!(sidebar_width_after_drag(300.0, 300.0, 340.0, 1.0), 340.0);
+        assert_eq!(sidebar_width_after_drag(300.0, 300.0, 260.0, 1.0), 260.0);
+        assert_eq!(sidebar_width_after_drag(300.0, 600.0, 520.0, 2.0), 260.0);
+    }
+
+    #[test]
+    fn sidebar_drag_width_clamps_both_directions() {
+        assert_eq!(
+            sidebar_width_after_drag(300.0, 300.0, -100.0, 1.0),
+            SIDEBAR_MIN_WIDTH
+        );
+        assert_eq!(
+            sidebar_width_after_drag(300.0, 300.0, 900.0, 1.0),
+            SIDEBAR_MAX_WIDTH
+        );
     }
 
     #[test]

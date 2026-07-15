@@ -2,6 +2,55 @@
 
 use super::*;
 
+fn trimmed_block_output_lines(block: &weft_core::blocks::Block) -> usize {
+    if block.collapsed {
+        return 0;
+    }
+    let mut lines: Vec<&str> = block.output.lines().collect();
+    while lines.last().is_some_and(|line| {
+        let text = line.trim();
+        text.is_empty() || matches!(text, "%" | "$" | "#")
+    }) {
+        lines.pop();
+    }
+    lines.len()
+}
+
+fn block_find_scroll_target(
+    blocks: &[weft_core::blocks::Block],
+    hit: &weft_core::find::BlockMatch,
+    visible: usize,
+    max_scroll: usize,
+) -> Option<usize> {
+    let block_idx = blocks.iter().position(|block| block.id == hit.block_id)?;
+    let rows_below = blocks
+        .iter()
+        .skip(block_idx + 1)
+        .map(|block| 3 + trimmed_block_output_lines(block))
+        .sum::<usize>();
+    let output_lines = trimmed_block_output_lines(&blocks[block_idx]);
+    let row_in_block = if hit.is_command {
+        output_lines + 1
+    } else {
+        output_lines.saturating_sub(hit.line)
+    };
+    Some(
+        (rows_below + row_in_block)
+            .saturating_sub(visible * 2 / 3)
+            .min(max_scroll),
+    )
+}
+
+fn grid_find_scroll_target(scrollback_len: usize, viewport_rows: usize, match_row: usize) -> usize {
+    if match_row >= scrollback_len {
+        return 0;
+    }
+    let upper_middle_from_top = viewport_rows / 3;
+    (scrollback_len + upper_middle_from_top)
+        .saturating_sub(match_row)
+        .min(scrollback_len)
+}
+
 impl App {
     /// Handle keys while the FindInGrid bar is open. The bar consumes all
     /// non-modifier keystrokes into the query input; Esc closes, Enter /
@@ -328,57 +377,7 @@ impl App {
             let Some(term) = self.sessions.active_mut().terminal.as_ref() else {
                 return;
             };
-            // Find the block's index in session_blocks to compute its row
-            // offset from the bottom. Blocks are laid out bottom-to-top:
-            // the newest (highest index) is at the bottom. The row offset
-            // from the bottom = sum of rows of all blocks BELOW it + its
-            // own offset within. We approximate by scrolling to bring the
-            // block's command line to the middle of the viewport.
             let blocks = term.block_tracker().session_blocks();
-            let block_idx = blocks.iter().position(|b| b.id == bm.block_id);
-            let Some(block_idx) = block_idx else { return };
-            // Count rows from the bottom up to this block's matching line.
-            // Actual layout (bottom→top within a block):
-            //   Output[N-1] (last printed)  → row 1 from bottom
-            //   Output[N-2]                 → row 2
-            //   …
-            //   Output[0] (first printed)   → row N
-            //   Command                     → row N+1
-            //   Header                      → row N+2
-            //   Separator                   → row N+3
-            // where N = trimmed output line count. So for an output match at
-            // `bm.line`, the in-block offset from the bottom is `N - bm.line`.
-            // For a command match, it's `N + 1`.
-            // (The previous code used `bm.line + 3` which treated the layout
-            // as top-to-bottom — that was inverted, causing the viewport to
-            // jump to the wrong position and the highlight to land off-screen.)
-            let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
-                if b.collapsed {
-                    return 0;
-                }
-                let mut lines: Vec<&str> = b.output.lines().collect();
-                while lines.last().is_some_and(|l| {
-                    let t = l.trim();
-                    t.is_empty() || matches!(t, "%" | "$" | "#")
-                }) {
-                    lines.pop();
-                }
-                lines.len()
-            };
-            let mut rows_from_bottom = 0usize;
-            for (i, b) in blocks.iter().enumerate().rev() {
-                if i == block_idx {
-                    break;
-                }
-                rows_from_bottom += 3 + trim_output_lines(b);
-            }
-            let matching_output_lines = trim_output_lines(&blocks[block_idx]);
-            let line_in_block = if bm.is_command {
-                matching_output_lines + 1
-            } else {
-                matching_output_lines.saturating_sub(bm.line)
-            };
-            rows_from_bottom += line_in_block;
             // Bring it to roughly the upper-middle of the viewport so the
             // user sees context below and above the match.
             let Some(renderer) = self.renderer.as_ref() else {
@@ -395,9 +394,9 @@ impl App {
             let cols = term.grid().num_cols;
             let (total, _) = block_content_metrics(term, cols);
             let max_scroll = total.saturating_sub(visible);
-            let target = rows_from_bottom
-                .saturating_sub(visible * 2 / 3)
-                .min(max_scroll);
+            let Some(target) = block_find_scroll_target(blocks, &bm, visible, max_scroll) else {
+                return;
+            };
             self.sessions.active_mut().set_block_scroll(target);
             return;
         }
@@ -411,15 +410,66 @@ impl App {
         };
         let grid = term.grid_mut();
         let sb_len = grid.scrollback_len();
-        let mid = grid.num_rows * 2 / 3;
-        let target_offset = if m.row >= sb_len {
-            0
-        } else {
-            (sb_len + mid).saturating_sub(m.row).min(sb_len)
-        };
+        let target_offset = grid_find_scroll_target(sb_len, grid.num_rows, m.row);
         if grid.scroll_offset != target_offset {
             grid.scroll_offset = target_offset;
             term.clear_hyperlink_cell_map();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{block_find_scroll_target, grid_find_scroll_target};
+    use std::time::SystemTime;
+    use weft_core::blocks::{Block, BlockId};
+    use weft_core::find::BlockMatch;
+
+    fn block(id: u64, output: &str) -> Block {
+        Block {
+            id: BlockId(id),
+            command: format!("command-{id}"),
+            cwd: None,
+            output: output.into(),
+            exit_code: Some(0),
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: Some(SystemTime::UNIX_EPOCH),
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn block_find_scroll_places_old_output_in_upper_middle() {
+        let blocks = vec![block(1, "a\nb\nc\n"), block(2, "x\ny\n")];
+        let hit = BlockMatch {
+            block_id: BlockId(1),
+            is_command: false,
+            line: 0,
+            col: 0,
+            len: 1,
+        };
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 6, 100), Some(4));
+    }
+
+    #[test]
+    fn block_find_scroll_distinguishes_command_and_output_orientation() {
+        let blocks = vec![block(1, "a\nb\nc\n")];
+        let mut hit = BlockMatch {
+            block_id: BlockId(1),
+            is_command: false,
+            line: 2,
+            col: 0,
+            len: 1,
+        };
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 3, 100), Some(0));
+        hit.is_command = true;
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 3, 100), Some(2));
+    }
+
+    #[test]
+    fn grid_find_scroll_targets_upper_middle_or_live_viewport() {
+        assert_eq!(grid_find_scroll_target(100, 30, 90), 20);
+        assert_eq!(grid_find_scroll_target(100, 30, 20), 90);
+        assert_eq!(grid_find_scroll_target(100, 30, 100), 0);
     }
 }

@@ -1,7 +1,7 @@
 //! Pure presentation model for BlockView metadata.
 
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str};
-use weft_core::blocks::Block;
+use weft_core::blocks::{Block, BlockId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
@@ -20,6 +20,34 @@ pub(crate) enum BlockTone {
 pub(crate) struct BlockPresentation {
     pub(crate) label: String,
     pub(crate) tone: BlockTone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockHeaderAction {
+    Copy(BlockId),
+    ToggleFold(BlockId),
+}
+
+/// Resolve only the inline header actions. Half-open bounds ensure a point on
+/// an adjacent row belongs to exactly one block and cannot fall through to
+/// terminal text selection.
+pub(crate) fn block_header_action_at(
+    regions: &[crate::overlay::HitRegion],
+    x: f32,
+    y: f32,
+) -> Option<BlockHeaderAction> {
+    regions.iter().find_map(|region| {
+        if !region.contains_half_open(x, y) {
+            return None;
+        }
+        match region.target {
+            crate::overlay::HitTarget::BlockActionCopy(id) => Some(BlockHeaderAction::Copy(id)),
+            crate::overlay::HitTarget::BlockActionFold(id) => {
+                Some(BlockHeaderAction::ToggleFold(id))
+            }
+            _ => None,
+        }
+    })
 }
 
 pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPresentation {
@@ -142,5 +170,47 @@ mod tests {
             spinner_char_for_phase(last + 0.001, false),
             SPINNER_CHARS[last_idx]
         );
+    }
+
+    #[test]
+    fn block_header_actions_use_half_open_row_boundaries() {
+        use crate::overlay::{HitRegion, HitTarget};
+
+        let regions = vec![
+            HitRegion {
+                x0: 80.0,
+                y0: 0.0,
+                x1: 100.0,
+                y1: 10.0,
+                target: HitTarget::BlockActionCopy(BlockId(1)),
+            },
+            HitRegion {
+                x0: 80.0,
+                y0: 10.0,
+                x1: 100.0,
+                y1: 20.0,
+                target: HitTarget::BlockActionCopy(BlockId(2)),
+            },
+        ];
+
+        assert_eq!(
+            block_header_action_at(&regions, 90.0, 10.0),
+            Some(BlockHeaderAction::Copy(BlockId(2)))
+        );
+        assert_eq!(block_header_action_at(&regions, 100.0, 10.0), None);
+    }
+
+    #[test]
+    fn block_header_action_resolver_ignores_non_actions() {
+        use crate::overlay::{HitRegion, HitTarget};
+
+        let regions = vec![HitRegion {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 20.0,
+            y1: 20.0,
+            target: HitTarget::BlockFold(BlockId(1)),
+        }];
+        assert_eq!(block_header_action_at(&regions, 10.0, 10.0), None);
     }
 }

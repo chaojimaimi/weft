@@ -281,12 +281,18 @@ impl MetalRenderer {
         // F3-4: Scrollbar indicator on the right edge of the panel list area.
         // Only drawn when there are more filtered blocks than visible (i.e.
         // the list can scroll).
-        if total_filtered > max_rows {
-            let track_x = panel_x + width_px - 3.0;
-            let track_w = 2.0;
-            let track_y0 = panel_layout.list_top;
-            let track_y1 = vp_h;
-            let track_h = track_y1 - track_y0;
+        if let Some(scrollbar) = crate::panel_scrollbar::panel_scrollbar_layout(
+            panel_layout.panel_rect,
+            panel_layout.list_top,
+            total_filtered,
+            max_rows,
+            scroll_offset,
+            ch * 0.8,
+        ) {
+            let track_x = scrollbar.track[0];
+            let track_w = scrollbar.track[2] - scrollbar.track[0];
+            let track_y0 = scrollbar.track[1];
+            let track_y1 = scrollbar.track[3];
             // Track background (subtle).
             let track_bg = [
                 theme_bg[0] * 0.5 + fg[0] * 0.1,
@@ -301,20 +307,10 @@ impl MetalRenderer {
                 [0.0; 4],
                 track_bg,
             );
-            // Thumb: proportional height, positioned by scroll_offset.
-            let thumb_frac = max_rows as f32 / total_filtered as f32;
-            let thumb_h = (track_h * thumb_frac).max(ch * 0.8);
-            let pos_frac = if max_scroll > 0 {
-                scroll_offset as f32 / max_scroll as f32
-            } else {
-                0.0
-            };
-            let avail = (track_h - thumb_h).max(0.0);
-            let thumb_y0 = track_y0 + avail * pos_frac;
             let thumb_color = color_to_normalized(self.theme.accent);
             push_quad(
                 &mut vertices,
-                [track_x, thumb_y0, track_x + track_w, thumb_y0 + thumb_h],
+                scrollbar.thumb,
                 bg_uv,
                 [0.0; 4],
                 [thumb_color[0], thumb_color[1], thumb_color[2], 0.70],
