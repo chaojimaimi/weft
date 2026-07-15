@@ -65,7 +65,8 @@ pub use sections::{
 pub use theme::{SyntaxColors, Theme};
 
 use self::save::{
-    set_f32_if_diff, set_opt_string, set_string_if_diff, set_u32_if_diff, set_usize_if_diff,
+    parse_existing, set_f32_if_diff, set_opt_string, set_string_if_diff, set_u32_if_diff,
+    set_usize_if_diff,
 };
 
 // ── Config (deserialized from TOML) ────────────────────────────────────
@@ -133,14 +134,11 @@ impl Config {
     /// v1.0 S2: Save config to an explicit path. Used by [`save`] and by
     /// tests (which pass a tempdir path).
     pub fn save_to_path(&self, path: &std::path::Path) -> Result<(), ConfigSaveError> {
-        // Read the existing file as a toml_edit document (preserves comments
-        // and unknown fields). If the file doesn't exist or fails to parse,
-        // start from an empty document.
-        let existing = std::fs::read_to_string(path).ok();
-        let mut doc: toml_edit::DocumentMut = existing
-            .as_deref()
-            .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
-            .unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(path) {
+            Ok(existing) => parse_existing(&existing)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(error) => return Err(ConfigSaveError::Io(error)),
+        };
 
         // [font] section.
         let default_font = FontConfig::default();
@@ -284,7 +282,6 @@ impl Config {
             default_scrollback.lines,
         );
 
-        // [editor] section.
         if self.editor.submit_on_ctrl_enter {
             let editor_entry = doc.entry("editor").or_insert_with(toml_edit::table);
             if editor_entry.is_none() {
@@ -292,6 +289,8 @@ impl Config {
             }
             let editor = editor_entry.as_table_mut().expect("editor is a table");
             editor["submit_on_ctrl_enter"] = toml_edit::value(true);
+        } else if let Some(editor) = doc.get_mut("editor").and_then(|item| item.as_table_mut()) {
+            editor.remove("submit_on_ctrl_enter");
         }
 
         // [logo] section — write variant when non-default; clear it when
