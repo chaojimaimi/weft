@@ -79,6 +79,14 @@ pub(crate) fn role_exposes_text_value(role: &SemanticRole) -> bool {
     matches!(role, SemanticRole::TextArea | SemanticRole::TextField)
 }
 
+pub(crate) fn selected_state(selected: bool) -> String {
+    if selected {
+        "selected".into()
+    } else {
+        String::new()
+    }
+}
+
 /// Append a scene using business identities supplied by its owner.
 ///
 /// Neither array positions nor duplicate-label occurrence numbers are stable

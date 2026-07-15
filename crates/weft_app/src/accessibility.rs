@@ -25,7 +25,7 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::accessibility_model::{
-    append_keyed_semantics, role_exposes_text_value, role_is_pressable, stable_id,
+    append_keyed_semantics, role_exposes_text_value, role_is_pressable, selected_state, stable_id,
     structure_changed, tree_is_valid, AccessibilityAction, AccessibilityNode, BlockTextKey,
 };
 use crate::scene::{SemanticNode, SemanticRole};
@@ -772,17 +772,14 @@ impl App {
         );
         if theme_count > 0 {
             let themes = self.settings_theme_views();
-            for (index, (node, theme)) in scene
+            for (node, theme) in scene
                 .semantics
                 .iter_mut()
                 .filter(|node| node.role == SemanticRole::ListItem)
                 .zip(themes.iter())
-                .enumerate()
             {
                 node.label = theme.label.into();
-                if index == self.settings.selection {
-                    node.state = "selected".into();
-                }
+                node.state = selected_state(theme.name == self.settings.draft.theme.name);
             }
         }
         Some(scene)

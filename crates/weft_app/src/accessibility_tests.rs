@@ -1,6 +1,7 @@
 use super::{role_is_pressable, structure_changed, view_space_frame, AccessibilityNode};
 use crate::accessibility_model::{
-    append_keyed_semantics, role_exposes_text_value, tree_is_valid, AccessibilityAction,
+    append_keyed_semantics, role_exposes_text_value, selected_state, tree_is_valid,
+    AccessibilityAction,
 };
 use crate::scene::{FocusId, SemanticNode, SemanticRole};
 
@@ -53,6 +54,12 @@ fn text_field_state_is_available_as_current_value() {
     assert!(role_exposes_text_value(&node.role));
     assert!(role_exposes_text_value(&SemanticRole::TextArea));
     assert!(!role_exposes_text_value(&SemanticRole::Button));
+}
+
+#[test]
+fn selected_state_tracks_control_value_not_navigation_cursor() {
+    assert_eq!(selected_state(true), "selected");
+    assert_eq!(selected_state(false), "");
 }
 
 #[test]
