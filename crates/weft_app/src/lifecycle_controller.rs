@@ -181,10 +181,7 @@ impl App {
 
     pub(super) fn tab_strip_layout(&self) -> Option<crate::layout::TabStripLayout> {
         let renderer = self.renderer.as_ref()?;
-        let chrome_left = self
-            .terminal_layout()
-            .map(|layout| layout.chrome_left as f32)
-            .unwrap_or(0.0);
+        let chrome_left = self.tab_bar_chrome_left();
         Some(crate::layout::layout_tab_strip(
             crate::layout::TabStripInput {
                 viewport_width: renderer.viewport_width(),
@@ -197,6 +194,18 @@ impl App {
                 requested_scroll_offset: self.tab_bar.scroll_offset,
             },
         ))
+    }
+
+    pub(super) fn tab_bar_chrome_left(&self) -> f32 {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return 0.0;
+        };
+        crate::ui_tokens::sidebar_placement(
+            self.panel.open,
+            renderer.sidebar_width(),
+            renderer.sidebar_push_width(),
+        )
+        .tab_chrome_left
     }
 
     /// v1.2: Clamp `tab_scroll_offset` using the same layout product the
@@ -277,6 +286,7 @@ impl App {
             plus_hovered: self.tab_bar.plus_hovered,
             arrow_left_hovered: self.tab_bar.arrow_left_hovered,
             arrow_right_hovered: self.tab_bar.arrow_right_hovered,
+            chrome_left: self.tab_bar_chrome_left(),
         }
     }
 

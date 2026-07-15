@@ -29,6 +29,10 @@ pub struct TabBarDrawState {
     pub arrow_left_hovered: bool,
     /// v1.2: true when the mouse is over the right scroll arrow.
     pub arrow_right_hovered: bool,
+    /// Physical left edge reserved for a visible history panel. This differs
+    /// from terminal `chrome_left` in Compact mode, where the panel overlays
+    /// the PTY instead of resizing it.
+    pub chrome_left: f32,
 }
 
 impl MetalRenderer {
@@ -47,7 +51,7 @@ impl MetalRenderer {
         let bar_h = self.tab_bar_height();
         let vp_w = self.viewport.0;
         let pad_x = self.padding_x;
-        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+        let chrome_left = tab_bar.chrome_left;
 
         let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
         let bg = color_to_normalized(ui.canvas);

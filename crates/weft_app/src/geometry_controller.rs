@@ -448,16 +448,20 @@ impl App {
     /// or `None` when not on a block row.
     pub(super) fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
         let rows = self.compute_block_view_rows();
-        // Find the row whose y-range contains `y`. Prefer Command/LiveCommand
-        // rows; Output rows fall back to their owning block.
+        // Find the row whose y-range contains `y`. Header/Command/Output rows
+        // retain their owning finalized block; LiveCommand is in-flight.
         for row in &rows {
             if y >= row.y_top && y < row.y_bottom {
                 use weft_core::selection::BlockViewRowKind;
-                match row.kind {
-                    BlockViewRowKind::Command => return Some(row.block_id),
+                match &row.kind {
                     BlockViewRowKind::LiveCommand => return Some(None),
-                    BlockViewRowKind::Output => return Some(row.block_id),
-                    _ => {}
+                    _ => {
+                        return crate::block_component::hovered_block_for_row(
+                            &row.kind,
+                            row.block_id,
+                        )
+                        .map(Some)
+                    }
                 }
             }
         }
@@ -516,7 +520,7 @@ impl App {
         if y > renderer.tab_bar_height() {
             return None;
         }
-        let chrome_left = renderer.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+        let chrome_left = self.tab_bar_chrome_left();
         let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
             viewport_width: renderer.viewport().0,
             bar_height: renderer.tab_bar_height(),

@@ -408,11 +408,8 @@ impl MetalRenderer {
     /// F3-3: The effective logical sidebar width — user override if set,
     /// otherwise the responsive `SidebarMetrics` default.
     fn logical_sidebar_width(&self) -> f32 {
-        if let Some(w) = self.sidebar_width_override {
-            return w;
-        }
         let logical_viewport = self.viewport.0 / self.scale as f32;
-        crate::ui_tokens::SidebarMetrics::for_logical_width(logical_viewport).panel_width
+        crate::ui_tokens::sidebar_visual_width(logical_viewport, self.sidebar_width_override)
     }
 
     /// F3-3: Set the user sidebar width override (logical points). Clamped to
@@ -494,11 +491,12 @@ impl MetalRenderer {
             .layers
             .iter()
             .any(|l| l.kind == crate::overlay::OverlayKind::HistoryPanel);
-        let chrome_left = if panel_open {
-            self.sidebar_push_width()
-        } else {
-            0.0
-        };
+        let sidebar_placement = crate::ui_tokens::sidebar_placement(
+            panel_open,
+            self.sidebar_width(),
+            self.sidebar_push_width(),
+        );
+        let chrome_left = sidebar_placement.terminal_push_width;
 
         let terminal_layout = crate::terminal_geometry::terminal_layout_for_renderer(
             self,
@@ -821,12 +819,6 @@ impl MetalRenderer {
             Vec::new()
         };
 
-        // Overlay the history panel on top of the grid (drawn after, so it
-        // composites over terminal cells via the enabled alpha blend).
-        if let Some(p) = panel {
-            vertices.extend_from_slice(&self.build_panel_vertices(p));
-        }
-
         // v0.8 U6 scrollbar: dynamic thumb position + height proportional to
         // visible/total content. The thumb sits in a track spanning the block
         // region; its vertical position reflects block_scroll (scrolled up →
@@ -899,6 +891,11 @@ impl MetalRenderer {
                     );
                 }
             }
+        }
+
+        // Paint Compact drawer above terminal-local overlays; modals stay above it.
+        if let Some(p) = panel {
+            vertices.extend_from_slice(&self.build_panel_vertices(p));
         }
 
         // Command Palette overlay (v0.7) — centered floating window.

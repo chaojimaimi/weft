@@ -2,6 +2,7 @@
 
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str};
 use weft_core::blocks::{Block, BlockId};
+use weft_core::selection::BlockViewRowKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
@@ -26,6 +27,20 @@ pub(crate) struct BlockPresentation {
 pub(crate) enum BlockHeaderAction {
     Copy(BlockId),
     ToggleFold(BlockId),
+}
+
+/// Resolve the finalized block that owns a rendered row for hover purposes.
+/// Header rows must retain hover because that is where inline actions are
+/// painted; otherwise moving from the command text onto an action makes the
+/// action disappear before it can be clicked.
+pub(crate) fn hovered_block_for_row(
+    kind: &BlockViewRowKind,
+    block_id: Option<BlockId>,
+) -> Option<BlockId> {
+    match kind {
+        BlockViewRowKind::Header | BlockViewRowKind::Command | BlockViewRowKind::Output => block_id,
+        BlockViewRowKind::Separator | BlockViewRowKind::LiveCommand => None,
+    }
 }
 
 /// Resolve only the inline header actions. Half-open bounds ensure a point on
@@ -198,6 +213,31 @@ mod tests {
             Some(BlockHeaderAction::Copy(BlockId(2)))
         );
         assert_eq!(block_header_action_at(&regions, 100.0, 10.0), None);
+    }
+
+    #[test]
+    fn block_header_row_retains_hover_for_inline_actions() {
+        let id = BlockId(7);
+        assert_eq!(
+            hovered_block_for_row(&BlockViewRowKind::Header, Some(id)),
+            Some(id)
+        );
+        assert_eq!(
+            hovered_block_for_row(&BlockViewRowKind::Command, Some(id)),
+            Some(id)
+        );
+        assert_eq!(
+            hovered_block_for_row(&BlockViewRowKind::Output, Some(id)),
+            Some(id)
+        );
+        assert_eq!(
+            hovered_block_for_row(&BlockViewRowKind::Separator, Some(id)),
+            None
+        );
+        assert_eq!(
+            hovered_block_for_row(&BlockViewRowKind::LiveCommand, Some(id)),
+            None
+        );
     }
 
     #[test]

@@ -67,6 +67,46 @@ pub struct SidebarMetrics {
     pub push_width: f32,
 }
 
+/// Per-frame placement contract for the history sidebar. Compact windows use
+/// an overlay drawer: the terminal keeps its full PTY width, while top chrome
+/// still starts after the visible drawer and the drawer paints above terminal
+/// overlays such as the prompt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SidebarPlacement {
+    pub terminal_push_width: f32,
+    pub tab_chrome_left: f32,
+    pub overlay: bool,
+}
+
+pub fn sidebar_placement(open: bool, panel_width: f32, push_width: f32) -> SidebarPlacement {
+    if !open {
+        return SidebarPlacement {
+            terminal_push_width: 0.0,
+            tab_chrome_left: 0.0,
+            overlay: false,
+        };
+    }
+    SidebarPlacement {
+        terminal_push_width: push_width,
+        tab_chrome_left: panel_width,
+        overlay: push_width <= 0.0,
+    }
+}
+
+/// Resolve the visible sidebar width without letting a Regular/Wide drag
+/// override consume the entire Compact viewport. The override is retained by
+/// config and becomes effective again after returning to a wider class.
+pub fn sidebar_visual_width(logical_viewport_width: f32, override_width: Option<f32>) -> f32 {
+    let metrics = SidebarMetrics::for_logical_width(logical_viewport_width);
+    if ResponsiveClass::from_logical_width(logical_viewport_width) == ResponsiveClass::Compact {
+        metrics.panel_width
+    } else {
+        override_width
+            .map(clamp_sidebar_width)
+            .unwrap_or(metrics.panel_width)
+    }
+}
+
 impl SidebarMetrics {
     pub fn for_logical_width(width: f32) -> Self {
         let class = ResponsiveClass::from_logical_width(width);
@@ -364,8 +404,9 @@ fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Colo
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, sidebar_width_after_drag,
-        ResponsiveClass, SidebarMetrics, UiColors, UiMetrics, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, sidebar_placement,
+        sidebar_visual_width, sidebar_width_after_drag, ResponsiveClass, SidebarMetrics, UiColors,
+        UiMetrics, MIN_WINDOW_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
     };
     use weft_core::config::Theme;
 
@@ -402,6 +443,50 @@ mod tests {
         let wide = SidebarMetrics::for_logical_width(1600.0);
         assert_eq!(wide.panel_width, 360.0);
         assert_eq!(wide.push_width, wide.panel_width);
+    }
+
+    #[test]
+    fn compact_sidebar_preserves_pty_but_reserves_visible_tab_chrome() {
+        let compact = sidebar_placement(true, 480.0, 0.0);
+        assert_eq!(compact.terminal_push_width, 0.0);
+        assert_eq!(compact.tab_chrome_left, 480.0);
+        assert!(compact.overlay);
+
+        let regular = sidebar_placement(true, 480.0, 480.0);
+        assert_eq!(regular.terminal_push_width, 480.0);
+        assert_eq!(regular.tab_chrome_left, 480.0);
+        assert!(!regular.overlay);
+
+        let closed = sidebar_placement(false, 480.0, 0.0);
+        assert_eq!(closed.terminal_push_width, 0.0);
+        assert_eq!(closed.tab_chrome_left, 0.0);
+        assert!(!closed.overlay);
+    }
+
+    #[test]
+    fn compact_sidebar_ignores_wide_override_until_viewport_recovers() {
+        assert_eq!(sidebar_visual_width(360.0, Some(360.0)), 240.0);
+        assert_eq!(sidebar_visual_width(900.0, Some(360.0)), 360.0);
+
+        let viewport = MIN_WINDOW_WIDTH as f32;
+        let chrome_left = sidebar_visual_width(viewport, Some(360.0));
+        let layout = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
+            viewport_width: viewport,
+            bar_height: 28.0,
+            cell_width: 8.0,
+            padding_x: 10.0,
+            chrome_left,
+            traffic_lights_width: 72.0,
+            tab_count: 4,
+            requested_scroll_offset: 500.0,
+        });
+        assert!(layout.plus_rect[2] <= layout.bar_rect[2]);
+        for rect in [layout.left_arrow_rect, layout.right_arrow_rect]
+            .into_iter()
+            .flatten()
+        {
+            assert!(rect[2] <= layout.bar_rect[2]);
+        }
     }
 
     #[test]
