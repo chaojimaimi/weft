@@ -68,6 +68,29 @@ fn row_text_out_of_bounds_is_empty() {
 }
 
 #[test]
+fn displayed_row_text_follows_scrollback_window() {
+    let mut grid = Grid::new(2, 10);
+    for ch in "old".chars() {
+        grid.write_char(ch);
+    }
+    grid.newline();
+    grid.carriage_return();
+    for ch in "new".chars() {
+        grid.write_char(ch);
+    }
+    grid.newline();
+    grid.carriage_return();
+    for ch in "latest".chars() {
+        grid.write_char(ch);
+    }
+    assert_eq!(grid.row_text(0), "new");
+    grid.scroll_up_history(1);
+    assert_eq!(grid.displayed_row_text(0), "old");
+    assert_eq!(grid.displayed_row_text(1), "new");
+    assert_eq!(grid.displayed_row_text(99), "");
+}
+
+#[test]
 fn write_char_advances_cursor() {
     let mut grid = Grid::new(24, 80);
     grid.write_char('A');

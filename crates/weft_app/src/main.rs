@@ -8,6 +8,7 @@
 //! Features: scrollback, selection, clipboard, CJK, mouse, IME, shell integration
 #[cfg(test)]
 mod acceptance_snapshots;
+mod accessibility;
 mod app_state;
 mod block_component;
 mod completion_component;
@@ -104,6 +105,11 @@ pub(crate) enum AppEvent {
     /// v1.1: A native menu item was clicked — dispatch the action on the
     /// main thread (where `App` is borrowed during `user_event`).
     MenuAction(weft_core::config::Action),
+    /// AppKit accessibility element invoked its default Press action.
+    AccessibilityPress {
+        generation: u64,
+        node_id: u64,
+    },
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -142,6 +148,7 @@ struct App {
     // ── Settings panel (v1.0 S1, Cmd+,) ───────────────────────────────
     /// Whether the Settings overlay is open.
     settings: SettingsState,
+    accessibility: accessibility::AccessibilityBridge,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
@@ -203,6 +210,7 @@ impl App {
             palette: PaletteState::new(),
             find: FindState::new(),
             settings: SettingsState::new(),
+            accessibility: accessibility::AccessibilityBridge::default(),
             should_exit: false,
         }
     }
@@ -1170,6 +1178,14 @@ impl ApplicationHandler<AppEvent> for App {
                 // keybindings. execute_action redraws where needed.
                 self.execute_action(action);
             }
+            AppEvent::AccessibilityPress {
+                generation,
+                node_id,
+            } => {
+                if let Some((x, y)) = self.accessibility.resolve_press(generation, node_id) {
+                    self.handle_mouse_press(x, y, winit::event::MouseButton::Left);
+                }
+            }
         }
         if self.should_exit {
             event_loop.exit();
@@ -1234,6 +1250,7 @@ impl ApplicationHandler<AppEvent> for App {
         // the NSWindow via the raw-window-handle AppKit handle and sets the
         // style mask + transparency; tab-bar empty space starts native drag.
         configure_titlebar(&window);
+        accessibility::install_event_proxy(self.proxy.clone());
         // v1.1: Install the native macOS menu bar (Weft/File/Edit/View/Find/
         // Window). Runs on the main thread; replaces winit's default menu.
         // Must be after `create_window` (NSApplication is up by `resumed`).

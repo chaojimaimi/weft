@@ -121,6 +121,9 @@ pub(crate) enum SemanticRole {
     Tab,
     /// F6: A tab list container (the tab bar as a whole).
     TabList,
+    /// Visible terminal text exposed as one navigable text area rather than
+    /// thousands of per-cell accessibility elements.
+    TextArea,
 }
 
 /// F6: Accessibility state descriptor. Conveys status beyond color so screen

@@ -32,7 +32,7 @@ pub(crate) enum SettingsTarget {
 pub(crate) fn build_settings_scene(
     layout: &SettingsLayout,
     tabs: &[SettingsTab],
-    _active_tab: SettingsTab,
+    active_tab: SettingsTab,
     theme_count: usize,
     cell_h: f32,
 ) -> Scene<SettingsTarget> {
@@ -66,7 +66,11 @@ pub(crate) fn build_settings_scene(
                 label: tab.label().into(),
                 bounds: row_rect,
                 focus: Some(FocusId::Settings),
-                state: String::new(),
+                state: if *tab == active_tab {
+                    "selected".into()
+                } else {
+                    String::new()
+                },
             });
         }
     }
@@ -94,16 +98,37 @@ pub(crate) fn build_settings_scene(
         scene
             .hits
             .push(HitRegion::from_rect(apply, SettingsTarget::ApplyButton));
+        scene.semantics.push(SemanticNode {
+            role: SemanticRole::Button,
+            label: "Apply settings".into(),
+            bounds: apply,
+            focus: Some(FocusId::Settings),
+            state: String::new(),
+        });
     }
     if let Some(close) = layout.footer_buttons.close {
         scene
             .hits
             .push(HitRegion::from_rect(close, SettingsTarget::CloseButton));
+        scene.semantics.push(SemanticNode {
+            role: SemanticRole::Button,
+            label: "Close settings".into(),
+            bounds: close,
+            focus: Some(FocusId::Settings),
+            state: String::new(),
+        });
     }
     if let Some(save) = layout.footer_buttons.save {
         scene
             .hits
             .push(HitRegion::from_rect(save, SettingsTarget::SaveButton));
+        scene.semantics.push(SemanticNode {
+            role: SemanticRole::Button,
+            label: "Save settings".into(),
+            bounds: save,
+            focus: Some(FocusId::Settings),
+            state: String::new(),
+        });
     }
 
     // Suppress unused-variable warning for box_x0 (kept for clarity).
@@ -177,6 +202,31 @@ mod tests {
             settings_target_at(&scene, 300.0, 205.0),
             Some(SettingsTarget::SidebarCategory(SettingsTab::Keybindings)),
         );
+        assert_eq!(scene.semantics[4].state, "selected");
+    }
+
+    #[test]
+    fn footer_actions_have_accessibility_semantics_with_shared_bounds() {
+        let layout = sample_layout();
+        let scene = build_settings_scene(
+            &layout,
+            &SettingsTab::ALL,
+            SettingsTab::Appearance,
+            0,
+            CELL_H,
+        );
+        for (label, bounds) in [
+            ("Apply settings", layout.footer_buttons.apply.unwrap()),
+            ("Close settings", layout.footer_buttons.close.unwrap()),
+            ("Save settings", layout.footer_buttons.save.unwrap()),
+        ] {
+            let semantic = scene
+                .semantics
+                .iter()
+                .find(|node| node.label == label)
+                .expect("footer action must be exposed to accessibility");
+            assert_eq!(semantic.bounds, bounds);
+        }
     }
 
     #[test]

@@ -572,7 +572,7 @@
           }
         ],
         "primitive_count": 0,
-        "semantic_count": 12,
+        "semantic_count": 13,
         "semantics": [
           {
             "bounds": [
@@ -717,6 +717,18 @@
             "label": "Theme 11",
             "role": "ListItem",
             "state": ""
+          },
+          {
+            "bounds": [
+              169.0,
+              596.0,
+              227.0,
+              614.0
+            ],
+            "focus": "Settings",
+            "label": "Apply settings",
+            "role": "Button",
+            "state": ""
           }
         ]
       },
@@ -812,7 +824,7 @@
           }
         ],
         "primitive_count": 0,
-        "semantic_count": 7,
+        "semantic_count": 8,
         "semantics": [
           {
             "bounds": [
@@ -836,7 +848,7 @@
             "focus": "Settings",
             "label": "Appearance",
             "role": "Tab",
-            "state": ""
+            "state": "selected"
           },
           {
             "bounds": [
@@ -896,6 +908,18 @@
             "focus": "Settings",
             "label": "Advanced",
             "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              169.0,
+              596.0,
+              227.0,
+              614.0
+            ],
+            "focus": "Settings",
+            "label": "Apply settings",
+            "role": "Button",
             "state": ""
           }
         ]
@@ -1109,7 +1133,7 @@
           }
         ],
         "primitive_count": 0,
-        "semantic_count": 18,
+        "semantic_count": 21,
         "semantics": [
           {
             "bounds": [
@@ -1133,7 +1157,7 @@
             "focus": "Settings",
             "label": "Appearance",
             "role": "Tab",
-            "state": ""
+            "state": "selected"
           },
           {
             "bounds": [
@@ -1325,6 +1349,42 @@
             "focus": null,
             "label": "Theme 11",
             "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              581.904,
+              774.0,
+              639.904,
+              792.0
+            ],
+            "focus": "Settings",
+            "label": "Apply settings",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              814.404,
+              774.0,
+              870.404,
+              792.0
+            ],
+            "focus": "Settings",
+            "label": "Close settings",
+            "role": "Button",
+            "state": ""
+          },
+          {
+            "bounds": [
+              883.904,
+              774.0,
+              957.904,
+              792.0
+            ],
+            "focus": "Settings",
+            "label": "Save settings",
+            "role": "Button",
             "state": ""
           }
         ]

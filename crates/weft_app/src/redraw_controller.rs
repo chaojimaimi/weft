@@ -458,6 +458,7 @@ impl App {
             t.grid_mut().clear_all_dirty();
         }
         self.sessions.set_prev_drawn_tab(active);
+        self.update_accessibility_tree();
 
         // No busy-loop redraw here: the PTY reader thread and the
         // cursor-blink timer wake the loop via `AppEvent::Wake`

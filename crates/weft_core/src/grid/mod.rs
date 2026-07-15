@@ -1,11 +1,11 @@
 // arch-gate: allow-over-800
-// Grid struct + impl Grid (~1175 lines): the core terminal grid with
-// scrollback, resize, reflow, and cell manipulation. Already extracted
+// Grid struct + impl Grid (~1175 lines): scrollback, resize, reflow, and cell manipulation.
 // cell/row/cursor/scrollback to submodules; impl Grid is irreducible.
 //! Terminal grid: Cell, Row, Grid, Scrollback
 
 mod cell;
 mod cursor;
+mod display;
 mod row;
 mod scrollback;
 
