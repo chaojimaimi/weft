@@ -5,6 +5,31 @@ use std::hash::{Hash, Hasher};
 use crate::scene::{SemanticNode, SemanticRole};
 
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AccessibilityAction {
+    PressPoint { x: f64, y: f64 },
+    NewTab,
+    SwitchSession(u64),
+    ContextMenuItem { session_id: u64, index: usize },
+    PaletteEntry(String),
+    PaletteTheme(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BlockTextKey {
+    pub(crate) session_id: u64,
+    pub(crate) block_count: usize,
+    pub(crate) last_output_len: usize,
+    pub(crate) live_output_len: usize,
+    pub(crate) scroll: usize,
+    pub(crate) editor_hash: u64,
+    pub(crate) cwd_hash: u64,
+    pub(crate) git_branch_hash: u64,
+    pub(crate) fold_hash: u64,
+    pub(crate) width_bits: u32,
+    pub(crate) height_bits: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AccessibilityNode {
     pub(crate) id: String,
     pub(crate) parent: Option<String>,
@@ -12,7 +37,7 @@ pub(crate) struct AccessibilityNode {
     pub(crate) label: String,
     pub(crate) bounds: [f32; 4],
     pub(crate) state: String,
-    pub(crate) pressable: bool,
+    pub(crate) action: Option<AccessibilityAction>,
 }
 
 impl AccessibilityNode {
@@ -29,7 +54,10 @@ impl AccessibilityNode {
             label: node.label.clone(),
             bounds: node.bounds,
             state: node.state.clone(),
-            pressable,
+            action: pressable.then(|| AccessibilityAction::PressPoint {
+                x: f64::from((node.bounds[0] + node.bounds[2]) * 0.5),
+                y: f64::from((node.bounds[1] + node.bounds[3]) * 0.5),
+            }),
         }
     }
 }
@@ -45,6 +73,10 @@ pub(crate) fn role_is_pressable(role: &SemanticRole) -> bool {
         role,
         SemanticRole::Button | SemanticRole::ListItem | SemanticRole::MenuItem | SemanticRole::Tab
     )
+}
+
+pub(crate) fn role_exposes_text_value(role: &SemanticRole) -> bool {
+    matches!(role, SemanticRole::TextArea | SemanticRole::TextField)
 }
 
 /// Append a scene using business identities supplied by its owner.
@@ -82,8 +114,48 @@ pub(crate) fn structure_changed(
 ) -> bool {
     previous.len() != current.len()
         || previous.iter().zip(current).any(|(a, b)| {
-            a.id != b.id || a.parent != b.parent || a.role != b.role || a.pressable != b.pressable
+            a.id != b.id
+                || a.parent != b.parent
+                || a.role != b.role
+                || !same_action_identity(&a.action, &b.action)
         })
+}
+
+fn same_action_identity(
+    left: &Option<AccessibilityAction>,
+    right: &Option<AccessibilityAction>,
+) -> bool {
+    match (left, right) {
+        (None, None)
+        | (
+            Some(AccessibilityAction::PressPoint { .. }),
+            Some(AccessibilityAction::PressPoint { .. }),
+        )
+        | (Some(AccessibilityAction::NewTab), Some(AccessibilityAction::NewTab)) => true,
+        (
+            Some(AccessibilityAction::SwitchSession(left)),
+            Some(AccessibilityAction::SwitchSession(right)),
+        ) => left == right,
+        (
+            Some(AccessibilityAction::ContextMenuItem {
+                session_id: left_session,
+                index: left_index,
+            }),
+            Some(AccessibilityAction::ContextMenuItem {
+                session_id: right_session,
+                index: right_index,
+            }),
+        ) => left_session == right_session && left_index == right_index,
+        (
+            Some(AccessibilityAction::PaletteEntry(left)),
+            Some(AccessibilityAction::PaletteEntry(right)),
+        ) => left == right,
+        (
+            Some(AccessibilityAction::PaletteTheme(left)),
+            Some(AccessibilityAction::PaletteTheme(right)),
+        ) => left == right,
+        _ => false,
+    }
 }
 
 pub(crate) fn tree_is_valid(nodes: &[AccessibilityNode]) -> bool {

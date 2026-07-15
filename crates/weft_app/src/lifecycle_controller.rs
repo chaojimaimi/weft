@@ -495,10 +495,7 @@ impl App {
                 if let Some(name) = selected_name(self.palette.selection, &buffer) {
                     // Heuristic: classify as dark unless the name clearly
                     // indicates a light theme. Affects follow_system parity.
-                    let dark = !matches!(
-                        name.as_str(),
-                        "weft-light" | "solarized-light" | "gruvbox-light"
-                    );
+                    let dark = crate::palette_state::theme_name_is_dark(&name);
                     self.apply_theme_by_name(&name, dark);
                     self.palette.submode = PaletteSubMode::Search;
                     self.palette.query.clear();

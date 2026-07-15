@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod acceptance_snapshots;
 mod accessibility;
+mod accessibility_actions;
 mod accessibility_model;
 mod app_runtime;
 mod app_state;

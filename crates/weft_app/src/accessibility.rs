@@ -25,8 +25,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::accessibility_model::{
-    append_keyed_semantics, role_is_pressable, stable_id, structure_changed, tree_is_valid,
-    AccessibilityNode,
+    append_keyed_semantics, role_exposes_text_value, role_is_pressable, stable_id,
+    structure_changed, tree_is_valid, AccessibilityAction, AccessibilityNode, BlockTextKey,
 };
 use crate::scene::{SemanticNode, SemanticRole};
 use crate::{App, AppEvent, CONTEXT_MENU_ITEMS};
@@ -107,7 +107,7 @@ impl WeftAccessibilityElement {
         let this = Self::alloc().set_ivars(ElementIvars {
             generation: Cell::new(generation),
             node_id: stable_id(&node.id),
-            pressable: Cell::new(node.pressable),
+            pressable: Cell::new(node.action.is_some()),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -124,34 +124,20 @@ pub(crate) struct AccessibilityBridge {
     block_text: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BlockTextKey {
-    session_id: u64,
-    block_count: usize,
-    last_output_len: usize,
-    live_output_len: usize,
-    scroll: usize,
-    editor_hash: u64,
-    cwd_hash: u64,
-    git_branch_hash: u64,
-    fold_hash: u64,
-    width_bits: u32,
-    height_bits: u32,
-}
-
 impl AccessibilityBridge {
-    pub(crate) fn resolve_press(&self, generation: u64, node_id: u64) -> Option<(f64, f64)> {
+    pub(crate) fn resolve_press(
+        &self,
+        generation: u64,
+        node_id: u64,
+    ) -> Option<AccessibilityAction> {
         if generation != self.generation {
             return None;
         }
         let node = self
             .previous_nodes
             .iter()
-            .find(|node| stable_id(&node.id) == node_id && node.pressable)?;
-        Some((
-            f64::from((node.bounds[0] + node.bounds[2]) * 0.5),
-            f64::from((node.bounds[1] + node.bounds[3]) * 0.5),
-        ))
+            .find(|node| stable_id(&node.id) == node_id)?;
+        node.action.clone()
     }
 
     pub(crate) fn update(
@@ -189,7 +175,7 @@ impl AccessibilityBridge {
                         .remove(&node_id)
                         .unwrap_or_else(|| WeftAccessibilityElement::new(node, self.generation));
                     element.ivars().generation.set(self.generation);
-                    element.ivars().pressable.set(node.pressable);
+                    element.ivars().pressable.set(node.action.is_some());
                     self.elements.insert(node_id, element);
                 }
             }
@@ -219,7 +205,7 @@ impl AccessibilityBridge {
                     view_space_frame(node.bounds, scale),
                 ));
                 let state = NSString::from_str(&node.state);
-                if node.role == SemanticRole::TextArea {
+                if role_exposes_text_value(&node.role) {
                     let value: &AnyObject = &*((&*state as *const NSString).cast::<AnyObject>());
                     element.setAccessibilityValue(Some(value));
                     element.setAccessibilityValueDescription(None);
@@ -328,6 +314,11 @@ impl App {
         }
         if self.palette.open {
             if let Some(mut scene) = self.palette_scene() {
+                if let Some(query) = scene.semantics.get_mut(1) {
+                    if query.role == SemanticRole::TextField {
+                        query.state = self.palette.accessibility_query().to_owned();
+                    }
+                }
                 let selected_bounds = scene.hits.iter().find_map(|hit| {
                     (hit.target
                         == crate::palette_component::PaletteTarget::Item(self.palette.selection))
@@ -404,6 +395,21 @@ impl App {
                             item,
                             pressable,
                         );
+                        if pressable {
+                            if let Some(node) = semantics.last_mut() {
+                                node.action = match &self.palette.submode {
+                                    crate::palette_state::PaletteSubMode::Search => {
+                                        Some(AccessibilityAction::PaletteEntry(identity))
+                                    }
+                                    crate::palette_state::PaletteSubMode::SelectTheme {
+                                        ..
+                                    } => {
+                                        Some(AccessibilityAction::PaletteTheme(item.label.clone()))
+                                    }
+                                    _ => node.action.clone(),
+                                };
+                            }
+                        }
                     }
                 }
             }
@@ -425,6 +431,12 @@ impl App {
                 true,
                 |index, _node| format!("context-menu/action/{}", index - 1),
             );
+            for (index, node) in semantics.iter_mut().skip(1).enumerate() {
+                node.action = Some(AccessibilityAction::ContextMenuItem {
+                    session_id: menu.session_id,
+                    index,
+                });
+            }
             return semantics;
         }
 
@@ -492,6 +504,17 @@ impl App {
                 node,
                 role_is_pressable(&node.role),
             );
+            if let Some(accessibility_node) = semantics.last_mut() {
+                accessibility_node.action = if node.role == SemanticRole::Tab {
+                    self.sessions
+                        .tab(session_index.saturating_sub(1))
+                        .map(|tab| AccessibilityAction::SwitchSession(tab.session_id))
+                } else if node.label == "New tab" {
+                    Some(AccessibilityAction::NewTab)
+                } else {
+                    accessibility_node.action.clone()
+                };
+            }
         }
 
         if let Some(layout) = self.terminal_layout() {
@@ -609,6 +632,9 @@ impl App {
                 layout.row_height,
                 display.len(),
             );
+            if let Some(search) = scene.semantics.first_mut() {
+                search.state = self.panel.query.clone();
+            }
             for (node, block) in scene.semantics.iter_mut().skip(1).zip(&display) {
                 node.label = crate::paint::ui_helpers::strip_prompt_prefix(&block.command);
             }
@@ -644,8 +670,11 @@ impl App {
             } else {
                 self.find.matches.len()
             };
-            let scene =
+            let mut scene =
                 crate::find_component::build_find_scene(crate::layout::layout_find(&ctx, total));
+            if let Some(query) = scene.semantics.first_mut() {
+                query.state = self.find.query.clone();
+            }
             let dialog = SemanticNode {
                 role: SemanticRole::Dialog,
                 label: "Find".into(),

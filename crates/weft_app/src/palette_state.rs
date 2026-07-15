@@ -142,6 +142,26 @@ impl PaletteState {
         self.reset_search();
     }
 
+    pub(crate) fn accessibility_query(&self) -> &str {
+        match &self.submode {
+            PaletteSubMode::Search => &self.query,
+            PaletteSubMode::CreateWorkflow { buffer, .. }
+            | PaletteSubMode::EditWorkflow { buffer, .. }
+            | PaletteSubMode::SelectTheme { buffer, .. } => buffer,
+            PaletteSubMode::ConfirmDelete { .. } => "",
+        }
+    }
+
+    pub(crate) fn theme_picker_contains(&self, name: &str) -> bool {
+        match &self.submode {
+            PaletteSubMode::SelectTheme { buffer, themes } => themes.iter().any(|theme| {
+                theme == name
+                    && (buffer.is_empty() || theme.to_lowercase().contains(&buffer.to_lowercase()))
+            }),
+            _ => false,
+        }
+    }
+
     fn reset_search(&mut self) {
         self.query.clear();
         self.selection = 0;
@@ -150,6 +170,10 @@ impl PaletteState {
         self.form = None;
         self.submode = PaletteSubMode::Search;
     }
+}
+
+pub(crate) fn theme_name_is_dark(name: &str) -> bool {
+    !matches!(name, "weft-light" | "solarized-light" | "gruvbox-light")
 }
 
 #[cfg(test)]
@@ -218,5 +242,48 @@ mod tests {
         assert_eq!(workflow.accessibility_key(), "workflow/7");
         assert_eq!(builtin.accessibility_key(), "builtin/reload-config");
         assert_ne!(workflow.accessibility_key(), builtin.accessibility_key());
+    }
+
+    #[test]
+    fn accessibility_query_uses_theme_picker_buffer_in_that_submode() {
+        let mut state = PaletteState::new();
+        state.query = "normal".into();
+        assert_eq!(state.accessibility_query(), "normal");
+        state.submode = super::PaletteSubMode::SelectTheme {
+            buffer: "light".into(),
+            themes: vec!["weft-light".into()],
+        };
+        assert_eq!(state.accessibility_query(), "light");
+        assert!(state.theme_picker_contains("weft-light"));
+        assert!(!state.theme_picker_contains("weft-warm"));
+        assert!(!state.theme_picker_contains("missing-light"));
+
+        state.submode = super::PaletteSubMode::CreateWorkflow {
+            step: super::CreateStep::Name,
+            buffer: "deploy".into(),
+            name: String::new(),
+            command: String::new(),
+        };
+        assert_eq!(state.accessibility_query(), "deploy");
+        state.submode = super::PaletteSubMode::EditWorkflow {
+            id: 7,
+            name: "deploy".into(),
+            buffer: "edited command".into(),
+        };
+        assert_eq!(state.accessibility_query(), "edited command");
+        state.submode = super::PaletteSubMode::ConfirmDelete {
+            id: 7,
+            name: "deploy".into(),
+        };
+        assert_eq!(state.accessibility_query(), "");
+    }
+
+    #[test]
+    fn theme_dark_classification_matches_picker_apply_contract() {
+        assert!(!super::theme_name_is_dark("weft-light"));
+        assert!(!super::theme_name_is_dark("solarized-light"));
+        assert!(!super::theme_name_is_dark("gruvbox-light"));
+        assert!(super::theme_name_is_dark("weft-warm"));
+        assert!(super::theme_name_is_dark("nord"));
     }
 }

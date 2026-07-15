@@ -44,8 +44,8 @@ impl ApplicationHandler<AppEvent> for App {
                 generation,
                 node_id,
             } => {
-                if let Some((x, y)) = self.accessibility.resolve_press(generation, node_id) {
-                    self.handle_mouse_press(x, y, winit::event::MouseButton::Left);
+                if let Some(action) = self.accessibility.resolve_press(generation, node_id) {
+                    self.perform_accessibility_action(action);
                 }
             }
         }

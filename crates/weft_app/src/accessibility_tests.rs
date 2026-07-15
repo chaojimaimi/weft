@@ -1,5 +1,7 @@
 use super::{role_is_pressable, structure_changed, view_space_frame, AccessibilityNode};
-use crate::accessibility_model::{append_keyed_semantics, tree_is_valid};
+use crate::accessibility_model::{
+    append_keyed_semantics, role_exposes_text_value, tree_is_valid, AccessibilityAction,
+};
 use crate::scene::{FocusId, SemanticNode, SemanticRole};
 
 #[test]
@@ -33,7 +35,24 @@ fn bridge_snapshot_preserves_scene_label_bounds_and_state() {
     assert_eq!(node.label, "Build");
     assert_eq!(node.bounds, semantic.bounds);
     assert_eq!(node.state, "selected, running");
-    assert!(node.pressable);
+    assert!(node.action.is_some());
+}
+
+#[test]
+fn text_field_state_is_available_as_current_value() {
+    let semantic = SemanticNode {
+        role: SemanticRole::TextField,
+        label: "Find".into(),
+        bounds: [0.0, 0.0, 100.0, 20.0],
+        focus: Some(FocusId::FindQuery),
+        state: "needle".into(),
+    };
+    let node = AccessibilityNode::from_semantic("find/query", None, &semantic, false);
+    assert_eq!(node.state, "needle");
+    assert_eq!(node.role, SemanticRole::TextField);
+    assert!(role_exposes_text_value(&node.role));
+    assert!(role_exposes_text_value(&SemanticRole::TextArea));
+    assert!(!role_exposes_text_value(&SemanticRole::Button));
 }
 
 #[test]
@@ -73,12 +92,60 @@ fn stale_or_non_action_press_is_rejected_before_mouse_routing() {
         generation: 7,
         ..Default::default()
     };
-    assert_eq!(bridge.resolve_press(7, node_id), Some((20.0, 30.0)));
+    assert_eq!(
+        bridge.resolve_press(7, node_id),
+        Some(AccessibilityAction::PressPoint { x: 20.0, y: 30.0 })
+    );
     assert_eq!(bridge.resolve_press(6, node_id), None);
 
     let mut non_action = bridge;
-    non_action.previous_nodes[0].pressable = false;
+    non_action.previous_nodes[0].action = None;
     assert_eq!(non_action.resolve_press(7, node_id), None);
+}
+
+#[test]
+fn typed_actions_resolve_exact_business_target_and_reject_stale_generation() {
+    let semantic = SemanticNode {
+        role: SemanticRole::Tab,
+        label: "Build".into(),
+        bounds: [10.0, 20.0, 30.0, 40.0],
+        focus: Some(FocusId::Tab(0)),
+        state: "selected".into(),
+    };
+    let mut tab = AccessibilityNode::from_semantic("tabs/session/42", None, &semantic, true);
+    tab.action = Some(AccessibilityAction::SwitchSession(42));
+    let node_id = super::stable_id(&tab.id);
+    let bridge = super::AccessibilityBridge {
+        previous_nodes: vec![tab],
+        generation: 9,
+        ..Default::default()
+    };
+    assert_eq!(
+        bridge.resolve_press(9, node_id),
+        Some(AccessibilityAction::SwitchSession(42))
+    );
+    assert_eq!(bridge.resolve_press(8, node_id), None);
+}
+
+#[test]
+fn geometry_updates_reuse_point_action_but_business_target_changes_rebuild() {
+    let semantic = SemanticNode {
+        role: SemanticRole::Button,
+        label: "New tab".into(),
+        bounds: [0.0, 0.0, 20.0, 20.0],
+        focus: None,
+        state: String::new(),
+    };
+    let first = AccessibilityNode::from_semantic("new-tab", None, &semantic, true);
+    let mut moved = first.clone();
+    moved.action = Some(AccessibilityAction::PressPoint { x: 80.0, y: 20.0 });
+    assert!(!structure_changed(&[first], &[moved]));
+
+    let mut old_tab = AccessibilityNode::from_semantic("tab", None, &semantic, true);
+    old_tab.action = Some(AccessibilityAction::SwitchSession(41));
+    let mut new_tab = old_tab.clone();
+    new_tab.action = Some(AccessibilityAction::SwitchSession(42));
+    assert!(structure_changed(&[old_tab], &[new_tab]));
 }
 
 #[test]
