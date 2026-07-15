@@ -1,6 +1,6 @@
 //! Real PTY/TUI acceptance tests.
 //!
-//! These tests exercise the installed macOS Vim/less binaries through Weft's
+//! These tests exercise the installed macOS Vim/less/nano binaries through Weft's
 //! own PTY and VT parser. They complement deterministic unit tests: hardware
 //! trackpad feel still needs one manual check, while protocol, Grid, mouse
 //! mode, search prompt, CJK invariants, and exit behavior run automatically.
@@ -188,6 +188,121 @@ async fn vim_mouse_search_cjk_grid_and_exit_roundtrip() {
         session.wait_until(UPDATE_TIMEOUT, |s| s.exited).await,
         "Vim did not exit; status={:?}",
         session.exit_status
+    );
+    assert!(!session.terminal.is_alt_screen_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn nano_edit_search_save_resize_and_exit_roundtrip() {
+    const NANO: &str = "/usr/bin/nano";
+    if !require_command(NANO) {
+        return;
+    }
+
+    let dir = sandbox("nano");
+    let fixture = dir.join("notes.txt");
+    let content = (1..=120)
+        .map(|line| format!("nano 自动化行 {line:04} mixed content\n"))
+        .collect::<String>();
+    std::fs::write(&fixture, content).expect("write nano fixture");
+    let fixture_text = fixture.to_string_lossy().into_owned();
+
+    let mut session = TuiSession::spawn(NANO, &[&fixture_text], 24, 80, &dir);
+    assert!(
+        session
+            .wait_until(START_TIMEOUT, |s| s.terminal.is_alt_screen_active())
+            .await,
+        "nano did not enter alt screen; output={:?}",
+        String::from_utf8_lossy(&session.raw_output)
+    );
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                s.visible_text().contains("notes.txt")
+                    && s.visible_text().contains("Get Help")
+                    && s.bottom_line().contains("Exit")
+            })
+            .await,
+        "nano title and shortcut bar did not render; screen:\n{}",
+        session.visible_text()
+    );
+    session.assert_no_orphaned_wide_cells();
+
+    session.send(b"\x17nano "); // Ctrl-W: Where Is
+    session.send("自动化行 0075".as_bytes());
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                let lines = s.visible_lines();
+                lines
+                    .get(lines.len().saturating_sub(3))
+                    .is_some_and(|line| line.contains("Search: nano 自动化行 0075"))
+            })
+            .await,
+        "nano search prompt was not visible above the shortcut rows; screen:\n{}",
+        session.visible_text()
+    );
+    session.send(b"\r");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                s.visible_lines()
+                    .iter()
+                    .any(|line| line == "nano 自动化行 0075 mixed content")
+            })
+            .await,
+        "nano did not reveal the requested match; screen:\n{}",
+        session.visible_text()
+    );
+    session.assert_no_orphaned_wide_cells();
+
+    session.send(b"\x05 appended-by-weft"); // Ctrl-E, then edit the matched line.
+    session.send(b"\x0f"); // Ctrl-O: WriteOut
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                let lines = s.visible_lines();
+                lines
+                    .get(lines.len().saturating_sub(3))
+                    .is_some_and(|line| line.contains("File Name"))
+            })
+            .await,
+        "nano write-out prompt was not visible above the shortcut rows; screen:\n{}",
+        session.visible_text()
+    );
+    session.send(b"\r");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |_s| {
+                std::fs::read_to_string(&fixture)
+                    .is_ok_and(|text| text.contains("0075 mixed content appended-by-weft"))
+            })
+            .await,
+        "nano did not save the edited fixture; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.resize(18, 64);
+    session.send(b"\x0c");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| {
+                s.terminal.grid().num_rows == 18
+                    && s.terminal.grid().num_cols == 64
+                    && s.bottom_line().contains("Exit")
+            })
+            .await,
+        "nano shortcut bar was not on the bottom row after resize; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(b"\x18"); // Ctrl-X: Exit
+    assert!(
+        session.wait_until(UPDATE_TIMEOUT, |s| s.exited).await,
+        "nano did not exit; status={:?}, screen:\n{}",
+        session.exit_status,
+        session.visible_text()
     );
     assert!(!session.terminal.is_alt_screen_active());
     let _ = std::fs::remove_dir_all(dir);
