@@ -24,6 +24,71 @@ pub(crate) enum SettingsTarget {
     SaveButton,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SettingsFooterHint {
+    pub keys: &'static [&'static str],
+    pub description: &'static str,
+}
+
+pub(crate) const SETTINGS_FOOTER_HINTS: [SettingsFooterHint; 6] = [
+    SettingsFooterHint {
+        keys: &["↑", "↓"],
+        description: "navigate",
+    },
+    SettingsFooterHint {
+        keys: &["⏎"],
+        description: "apply",
+    },
+    SettingsFooterHint {
+        keys: &["⇥"],
+        description: "switch",
+    },
+    SettingsFooterHint {
+        keys: &["←", "→"],
+        description: "adjust",
+    },
+    SettingsFooterHint {
+        keys: &["esc"],
+        description: "close",
+    },
+    SettingsFooterHint {
+        keys: &["⌘", "⏎"],
+        description: "save",
+    },
+];
+
+pub(crate) const KEYCAP_PAD_X_CELLS: f32 = 0.35;
+pub(crate) const KEYCAP_GAP_CELLS: f32 = 0.30;
+pub(crate) const KEYCAP_DESCRIPTION_GAP_CELLS: f32 = 0.65;
+pub(crate) const FOOTER_HINT_GAP_CELLS: f32 = 1.25;
+
+pub(crate) fn settings_keycap_width(key: &str, cell_w: f32) -> f32 {
+    let columns = if matches!(key, "↑" | "↓" | "←" | "→") {
+        1.0
+    } else {
+        unicode_width::UnicodeWidthStr::width_cjk(key) as f32
+    };
+    cell_w * (columns + KEYCAP_PAD_X_CELLS * 2.0)
+}
+
+pub(crate) fn settings_key_group_width(keys: &[&str], cell_w: f32) -> f32 {
+    let key_width: f32 = keys
+        .iter()
+        .map(|key| settings_keycap_width(key, cell_w))
+        .sum();
+    key_width + cell_w * KEYCAP_GAP_CELLS * keys.len().saturating_sub(1) as f32
+}
+
+pub(crate) fn settings_footer_hint_width(hint: SettingsFooterHint, cell_w: f32) -> f32 {
+    let description_cols = unicode_width::UnicodeWidthStr::width_cjk(hint.description) as f32;
+    settings_key_group_width(hint.keys, cell_w)
+        + cell_w * (KEYCAP_DESCRIPTION_GAP_CELLS + description_cols)
+}
+
+pub(crate) fn settings_footer_widths(cell_w: f32) -> [f32; 6] {
+    SETTINGS_FOOTER_HINTS.map(|hint| settings_footer_hint_width(hint, cell_w))
+}
+
 pub(crate) fn settings_value_x(
     base_x: f32,
     content_x0: f32,
@@ -289,5 +354,20 @@ mod tests {
     fn settings_value_starts_after_long_label() {
         assert_eq!(settings_value_x(140.0, 10.0, 10.0, 20), 220.0);
         assert_eq!(settings_value_x(240.0, 10.0, 10.0, 5), 240.0);
+    }
+
+    #[test]
+    fn footer_keycaps_use_uniform_pair_spacing() {
+        let cell_w = 10.0;
+        assert_eq!(
+            settings_key_group_width(&["↑", "↓"], cell_w),
+            settings_key_group_width(&["←", "→"], cell_w)
+        );
+        assert_eq!(settings_footer_widths(cell_w).len(), 6);
+        assert_eq!(
+            settings_keycap_width("↑", cell_w),
+            settings_keycap_width("↓", cell_w)
+        );
+        assert!(settings_key_group_width(&["⌘", "⏎"], cell_w) > cell_w * 2.0);
     }
 }

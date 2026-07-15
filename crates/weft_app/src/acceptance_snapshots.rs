@@ -19,7 +19,7 @@ use crate::{
     paint::command_surface::{build_command_surface_shell, CommandSurfaceShell},
     panel_component::build_panel_scene,
     scene::Scene,
-    settings_component::build_settings_scene,
+    settings_component::{build_settings_scene, settings_footer_widths},
     tab_bar_component::build_tab_bar_scene,
     terminal_geometry::{GridGeometry, PhysicalRect, TerminalLayout},
     ui_tokens::{contrast_ratio, ResponsiveClass, SidebarMetrics, UiColors},
@@ -215,7 +215,7 @@ fn layout_scene_snapshot() -> Value {
         12,
     );
 
-    let footer_widths = [72.0, 58.0, 70.0, 64.0, 56.0, 74.0];
+    let footer_widths = settings_footer_widths(9.0);
     let wide_settings = layout_settings(
         1440.0,
         900.0,
@@ -228,6 +228,9 @@ fn layout_scene_snapshot() -> Value {
         false,
     )
     .expect("wide settings layout");
+    assert!(wide_settings.footer_buttons.apply.is_some());
+    assert!(wide_settings.footer_buttons.close.is_some());
+    assert!(wide_settings.footer_buttons.save.is_some());
     let narrow_sidebar = layout_settings(
         500.0,
         700.0,

@@ -86,58 +86,6 @@ impl MetalRenderer {
         }
     }
 
-    /// v1.0: Like `push_text` but renders each glyph quad scaled by `scale`
-    /// (1.0 == identical to push_text). Used for the Settings footer where
-    /// the hint pairs benefit from being slightly more prominent than the
-    /// body text. The glyph atlas is rasterized at the base cell size, so
-    /// scaling up samples with mild magnification (acceptable for ≤1.2x).
-    /// Column advance is scaled too so layout math stays consistent.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn push_text_scaled(
-        &self,
-        vertices: &mut Vec<f32>,
-        x: f32,
-        y: f32,
-        text: &str,
-        fg: [f32; 4],
-        max_cols: usize,
-        scale: f32,
-    ) {
-        let cw = self.cell_width() as f32 * scale;
-        let ch = self.cell_height() as f32 * scale;
-        // Vertically center the scaled glyph within the original cell row
-        // so the footer baseline stays aligned with the separator line.
-        let y_off = (self.cell_height() as f32 - ch) * 0.5;
-        let mut col = 0usize;
-        let mut px = x;
-        for c in text.chars() {
-            let w = Self::char_col_width(c);
-            if w == 0 {
-                continue;
-            }
-            if col + w > max_cols {
-                break;
-            }
-            let Some(g) = self.atlas.get(c) else {
-                col += w;
-                px += w as f32 * cw;
-                continue;
-            };
-            let (u, v) = g.uv_origin;
-            let (uw, vh) = g.uv_size;
-            let cell_w = w as f32 * cw;
-            push_quad(
-                vertices,
-                [px, y + y_off, px + cell_w, y + y_off + ch],
-                [u, v + vh, u + uw, v],
-                fg,
-                [0.0; 4],
-            );
-            col += w;
-            px += cell_w;
-        }
-    }
-
     /// Lay out a line left-to-right, coloring each shell token by its kind
     /// (syntax highlight). `default_fg` is used for Whitespace/Default tokens.
     /// Wide-character aware: CJK chars occupy 2 columns. Glyphs must already

@@ -707,22 +707,7 @@ impl App {
         let cw = renderer.cell_width() as f32;
         let ch = renderer.cell_height() as f32;
         let (vp_w, vp_h) = renderer.viewport();
-        let pairs = [
-            ("↑↓", "navigate"),
-            ("⏎", "apply"),
-            ("⇥", "switch"),
-            ("←→", "adjust"),
-            ("esc", "close"),
-            ("⌘⏎", "save"),
-        ];
-        let mut footer_pair_widths = [0.0; 6];
-        for (index, (key, description)) in pairs.iter().enumerate() {
-            footer_pair_widths[index] = cw
-                * (crate::renderer::MetalRenderer::text_col_width(key)
-                    + crate::renderer::MetalRenderer::text_col_width(description))
-                    as f32
-                + cw * 0.3;
-        }
+        let footer_pair_widths = crate::settings_component::settings_footer_widths(cw);
         let layout = crate::layout::layout_settings(
             vp_w,
             vp_h,

@@ -63,20 +63,7 @@ impl MetalRenderer {
             return verts;
         }
 
-        let pairs: [(&str, &str); 6] = [
-            ("↑↓", "navigate"),
-            ("⏎", "apply"),
-            ("⇥", "switch"),
-            ("←→", "adjust"),
-            ("esc", "close"),
-            ("⌘⏎", "save"),
-        ];
-        let inner = cw * 0.3;
-        let mut footer_pair_widths = [0.0; 6];
-        for (index, (key, desc)) in pairs.iter().enumerate() {
-            footer_pair_widths[index] =
-                cw * (Self::text_col_width(key) + Self::text_col_width(desc)) as f32 + inner;
-        }
+        let footer_pair_widths = crate::settings_component::settings_footer_widths(cw);
         let layout = crate::layout::layout_settings(
             vp_w,
             vp_h,
@@ -553,35 +540,23 @@ impl MetalRenderer {
             [0.0; 4],
             separator,
         );
-        let gap = cw * 1.5;
-        let scale = 1.0;
         let footer_start = if s.is_narrow {
             box_x0 + cw * 1.5
         } else {
             content_x0
         };
         let footer_end = box_x1 - cw * 1.5;
-        let footer_cols = (((footer_end - footer_start) / cw).max(1.0)) as usize;
-        let mut fx = footer_start;
-        for (key, desc) in &pairs {
-            let key_w = cw * scale * Self::text_col_width(key) as f32;
-            let desc_w = cw * scale * Self::text_col_width(desc) as f32;
-            let pair_w = key_w + inner + desc_w;
-            if fx + pair_w > footer_end {
-                break;
-            }
-            self.push_text_scaled(&mut verts, fx, footer_y, key, accent, footer_cols, scale);
-            self.push_text_scaled(
-                &mut verts,
-                fx + key_w + inner,
-                footer_y,
-                desc,
-                label_c,
-                footer_cols,
-                scale,
-            );
-            fx += pair_w + gap;
-        }
+        self.push_settings_footer_hints(
+            &mut verts,
+            footer_start,
+            footer_end,
+            footer_y,
+            cw,
+            ch,
+            bg_uv,
+            accent,
+            label_c,
+        );
 
         verts
     }

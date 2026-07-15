@@ -621,22 +621,7 @@ impl App {
         let ch = renderer.cell_height() as f32;
         let (vp_w, vp_h) = renderer.viewport();
 
-        // Footer pair widths: key_w + inner + desc_w for each of the 6 pairs.
-        let pairs: [(&str, &str); 6] = [
-            ("↑↓", "navigate"),
-            ("⏎", "apply"),
-            ("⇥", "switch"),
-            ("←→", "adjust"),
-            ("esc", "close"),
-            ("⌘⏎", "save"),
-        ];
-        let inner = cw * 0.3;
-        let mut footer_pair_widths = [0.0f32; 6];
-        for (i, (key, desc)) in pairs.iter().enumerate() {
-            let key_w = cw * crate::renderer::MetalRenderer::text_col_width(key) as f32;
-            let desc_w = cw * crate::renderer::MetalRenderer::text_col_width(desc) as f32;
-            footer_pair_widths[i] = key_w + inner + desc_w;
-        }
+        let footer_pair_widths = crate::settings_component::settings_footer_widths(cw);
 
         let layout = crate::layout::layout_settings(
             vp_w,

@@ -1139,7 +1139,7 @@ pub fn layout_settings(
     // `footer_pair_widths` already includes the per-pair `inner` gap (key↔desc)
     // measured by the caller via text_col_width — we only add the inter-pair
     // `gap` here.
-    let gap = cw * 1.5;
+    let gap = cw * crate::settings_component::FOOTER_HINT_GAP_CELLS;
     let footer_start = if is_narrow {
         box_x0 + pad_x
     } else {
