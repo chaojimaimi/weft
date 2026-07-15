@@ -213,11 +213,11 @@ impl App {
             tab_bar: TabBarState::default(),
             window_runtime: WindowRuntimeState::new(),
             interaction: InteractionState::new(),
+            find: FindState::new(proxy.clone()),
             proxy,
             config_state,
             panel: PanelState::default(),
             palette: PaletteState::new(),
-            find: FindState::new(),
             settings: SettingsState::new(),
             accessibility: accessibility::AccessibilityBridge::default(),
             performance_probe: performance_probe::PerformanceProbe::from_env(),
@@ -533,8 +533,7 @@ impl App {
             if key == KeyCode::Char('v') {
                 if let Some(text) = clipboard_paste() {
                     self.find.query.push_str(&text);
-                    self.find.last_key = Some(std::time::Instant::now());
-                    self.request_redraw();
+                    self.arm_find_refresh();
                 }
                 return;
             }

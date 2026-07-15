@@ -371,6 +371,7 @@ impl App {
                     regex_mode: self.find.regex_mode,
                     case_sensitive: self.find.case_sensitive,
                     regex_error: self.find.regex_error.clone(),
+                    worker_busy: self.find.worker_busy,
                 })
             } else {
                 None

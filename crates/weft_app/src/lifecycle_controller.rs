@@ -119,23 +119,7 @@ impl App {
         if !self.find.open || self.find.query.is_empty() {
             return;
         }
-        // Drop any results still queued from the old tab's scan. Without this
-        // drain, `poll_find_worker_results` would apply the stale `Partial`/
-        // `Complete` results to the new active tab on the next frame.
-        while self.find.worker.try_recv_result().is_some() {}
-        self.find.worker_busy = false;
-        // Clear stale matches so the FindUI count resets to 0 until the new
-        // search completes.
-        self.find.matches.clear();
-        self.find.truncated = false;
-        self.find.index = 0;
-        self.find.block_matches.clear();
-        self.find.block_truncated = false;
-        self.find.block_index = 0;
-        self.find.regex_error = None;
-        // Arm the debounce so `maybe_refresh_find_results` re-submits the
-        // query against the new active tab's snapshot on the next redraw.
-        self.find.last_key = Some(std::time::Instant::now());
+        self.arm_find_refresh();
     }
 
     /// Cmd+Shift+] — switch to the next tab (wraps around). Returns effects

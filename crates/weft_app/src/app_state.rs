@@ -472,10 +472,17 @@ pub struct FindState {
     pub worker: FindWorker,
     pub regex_error: Option<String>,
     pub worker_busy: bool,
+    pub worker_generation: u64,
 }
 
 impl FindState {
-    pub fn new() -> Self {
+    pub fn new(proxy: winit::event_loop::EventLoopProxy<crate::AppEvent>) -> Self {
+        Self::new_with_waker(Arc::new(move || {
+            let _ = proxy.send_event(crate::AppEvent::Wake);
+        }))
+    }
+
+    fn new_with_waker(waker: Arc<dyn Fn() + Send + Sync + 'static>) -> Self {
         Self {
             open: false,
             query: String::new(),
@@ -488,10 +495,16 @@ impl FindState {
             block_truncated: false,
             regex_mode: false,
             case_sensitive: false,
-            worker: FindWorker::spawn(),
+            worker: FindWorker::spawn_with_waker(waker),
             regex_error: None,
             worker_busy: false,
+            worker_generation: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self::new_with_waker(Arc::new(|| {}))
     }
 
     pub fn reset_query(&mut self) {
@@ -507,6 +520,20 @@ impl FindState {
         self.case_sensitive = false;
         self.regex_error = None;
         self.worker_busy = false;
+        self.worker_generation = self.worker.invalidate();
+    }
+
+    pub fn arm_refresh(&mut self, now: Instant) {
+        self.worker_generation = self.worker.invalidate();
+        self.worker_busy = !self.query.is_empty();
+        self.last_key = Some(now);
+        self.matches.clear();
+        self.index = 0;
+        self.truncated = false;
+        self.block_matches.clear();
+        self.block_index = 0;
+        self.block_truncated = false;
+        self.regex_error = None;
     }
 
     pub fn close(&mut self) {
@@ -570,8 +597,8 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigState, ContextMenu, FindState, InteractionState, PanelState, SessionManager,
-        SettingsState, TabBarState, WindowRuntimeState,
+        ConfigState, ContextMenu, InteractionState, PanelState, SessionManager, SettingsState,
+        TabBarState, WindowRuntimeState,
     };
     use crate::tab::Tab;
     use std::time::Instant;
@@ -613,24 +640,6 @@ mod tests {
         assert!(state.last_click.is_none());
         assert_eq!(state.query, "git");
         assert_eq!(state.selection, 3);
-    }
-
-    #[test]
-    fn find_close_clears_all_query_ownership() {
-        let mut state = FindState::new();
-        state.open = true;
-        state.query = "needle".into();
-        state.regex_mode = true;
-        state.case_sensitive = true;
-        state.worker_busy = true;
-        state.regex_error = Some("bad regex".into());
-        state.close();
-        assert!(!state.open);
-        assert!(state.query.is_empty());
-        assert!(!state.regex_mode);
-        assert!(!state.case_sensitive);
-        assert!(!state.worker_busy);
-        assert!(state.regex_error.is_none());
     }
 
     #[test]

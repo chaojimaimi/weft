@@ -394,19 +394,14 @@ impl App {
             if let Some(action) = self.find_button_at(x as f32, y as f32) {
                 match action {
                     FindButtonAction::ToggleRegex => {
-                        self.find.regex_mode = !self.find.regex_mode;
-                        // Force immediate re-search so toggle is reflected
-                        // (matches ToggleCase behavior — without this, typing
-                        // the regex first and then toggling .* won't apply
-                        // the regex mode to the existing query).
-                        self.find.last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
+                        self.find.regex_mode =
+                            crate::find_controller::toggled_find_option(self.find.regex_mode);
+                        self.arm_find_refresh();
                     }
                     FindButtonAction::ToggleCase => {
-                        self.find.case_sensitive = !self.find.case_sensitive;
-                        // Force immediate re-search so toggle is reflected.
-                        self.find.last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
+                        self.find.case_sensitive =
+                            crate::find_controller::toggled_find_option(self.find.case_sensitive);
+                        self.arm_find_refresh();
                     }
                     FindButtonAction::Next => self.find_cycle_next_prev(true),
                     FindButtonAction::Prev => self.find_cycle_next_prev(false),

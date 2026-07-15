@@ -46,6 +46,20 @@ pub struct FindDrawState {
     /// shows "invalid regex" in red instead of the match count. Cleared
     /// when the query compiles successfully or regex mode is toggled off.
     pub regex_error: Option<String>,
+    /// Async grid scan is still running. Drives the shared Loading state so
+    /// a large scrollback search never looks like a completed empty result.
+    pub worker_busy: bool,
+}
+
+impl FindDrawState {
+    fn surface_state(&self) -> crate::paint::command_surface::CommandSurfaceState {
+        crate::paint::command_surface::find_surface_state(
+            &self.query,
+            self.worker_busy,
+            self.total,
+            self.regex_error.as_deref(),
+        )
+    }
 }
 
 impl MetalRenderer {
@@ -150,9 +164,7 @@ impl MetalRenderer {
     /// renderer: text is sampled from the glyph atlas, card surfaces are
     /// bg-only quads sampling the space glyph (mask 0 → solid bg color).
     pub(crate) fn build_find_vertices(&self, find: &FindDrawState) -> Vec<f32> {
-        use crate::paint::command_surface::{
-            build_command_surface_shell, find_surface_state, CommandSurfaceShell,
-        };
+        use crate::paint::command_surface::{build_command_surface_shell, CommandSurfaceShell};
 
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
@@ -309,16 +321,13 @@ impl MetalRenderer {
         // kept (it has more nuance: truncated, block_matches, etc.), but the
         // error color now comes from the unified state so Find, Palette and
         // Completion all treat "invalid regex" as a formal Error state.
-        let surface_state = find_surface_state(
-            &find.query,
-            false, // worker_busy — not yet wired to FindDrawState
-            find.total,
-            find.regex_error.as_deref(),
-        );
+        let surface_state = find.surface_state();
         let (status, status_color) = if surface_state.is_error() {
             ("invalid regex  ".to_string(), accent)
         } else if find.query.is_empty() {
             (String::new(), accent_dim)
+        } else if find.worker_busy {
+            (format!("{}  ", surface_state.status_text()), accent_dim)
         } else if find.truncated {
             (format!("{}+  ", find.total), accent_dim)
         } else if find.total == 0 {
@@ -604,6 +613,22 @@ fn split_highlight_around_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paint::command_surface::CommandSurfaceState;
+
+    #[test]
+    fn find_draw_state_exposes_real_worker_loading_and_error_priority() {
+        let mut state = FindDrawState {
+            query: "needle".into(),
+            worker_busy: true,
+            ..Default::default()
+        };
+        assert_eq!(state.surface_state(), CommandSurfaceState::Loading);
+        state.regex_error = Some("invalid pattern".into());
+        assert_eq!(
+            state.surface_state(),
+            CommandSurfaceState::Error("invalid pattern".into())
+        );
+    }
 
     #[test]
     fn split_highlight_no_cursor_returns_whole_range() {

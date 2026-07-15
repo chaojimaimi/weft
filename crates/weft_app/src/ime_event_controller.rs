@@ -92,8 +92,7 @@ impl App {
                         }
                         event_replay::ImeCommitTarget::Find => {
                             self.find.query.push_str(&text);
-                            self.find.last_key = Some(std::time::Instant::now());
-                            self.request_redraw();
+                            self.arm_find_refresh();
                         }
                         event_replay::ImeCommitTarget::PanelSearch => {
                             self.panel.query.push_str(&text);

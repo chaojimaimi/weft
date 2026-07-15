@@ -19,65 +19,105 @@
 //!   between chunks. If a newer query is pending, it sends `Cancelled` and
 //!   starts the new query.
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use weft_core::find::{find_in_snapshot, FindMatch, FindSnapshot};
 
 /// A query + snapshot to be scanned by the worker.
 struct FindQuery {
+    generation: u64,
     query: String,
     case_sensitive: bool,
     is_regex: bool,
     snapshot: Arc<FindSnapshot>,
 }
 
+struct DebounceRequest {
+    generation: u64,
+    deadline: Instant,
+}
+
+pub(crate) type WakeCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
 /// Incremental or final result streamed back to the main thread.
 pub enum FindResult {
     /// Partial results (incremental — emitted every ~5000 rows).
     /// The UI can paint these immediately and refine as more arrive.
-    Partial { matches: Vec<FindMatch> },
+    Partial {
+        generation: u64,
+        matches: Vec<FindMatch>,
+    },
     /// Final result (full scan complete or MAX_MATCHES hit).
     Complete {
+        generation: u64,
         matches: Vec<FindMatch>,
         truncated: bool,
     },
     /// Worker hit a regex compile error (only when `is_regex` is true).
-    RegexInvalid(String),
+    RegexInvalid { generation: u64, message: String },
     /// Cancelled — a newer query arrived before this one finished. The main
     /// thread can ignore this (the newer query's results will arrive soon).
-    Cancelled,
+    Cancelled { generation: u64 },
 }
 
 /// Handle to the background find worker. Cheap to clone (just channel
 /// handles); the worker thread itself is shared.
 pub struct FindWorker {
     query_tx: Sender<FindQuery>,
+    query_rx: Receiver<FindQuery>,
+    debounce_tx: Sender<DebounceRequest>,
+    debounce_rx: Receiver<DebounceRequest>,
     result_rx: Receiver<FindResult>,
+    next_generation: Arc<AtomicU64>,
 }
 
 impl FindWorker {
     /// Spawn a new worker thread. The thread runs for the lifetime of the
     /// returned handle — when `FindWorker` is dropped, the query channel
     /// closes and the worker exits.
+    #[cfg(test)]
     pub fn spawn() -> Self {
+        Self::spawn_with_waker(Arc::new(|| {}))
+    }
+
+    /// Spawn a worker that wakes the application whenever a debounce deadline
+    /// expires or an async result becomes available.
+    pub(crate) fn spawn_with_waker(waker: WakeCallback) -> Self {
         let (query_tx, query_rx) = bounded::<FindQuery>(1);
         let (result_tx, result_rx) = bounded::<FindResult>(32);
+        let (debounce_tx, debounce_rx) = bounded::<DebounceRequest>(1);
+        let submit_query_rx = query_rx.clone();
+        let replace_debounce_rx = debounce_rx.clone();
+        let next_generation = Arc::new(AtomicU64::new(0));
+        let result_waker = waker.clone();
         thread::Builder::new()
             .name("weft-find-worker".to_string())
             .spawn(move || {
-                Self::run(query_rx, result_tx);
+                Self::run(query_rx, result_tx, result_waker);
             })
             .expect("spawn find worker");
+        let debounce_generation = next_generation.clone();
+        thread::Builder::new()
+            .name("weft-find-debounce".to_string())
+            .spawn(move || {
+                Self::run_debounce(debounce_rx, debounce_generation, waker);
+            })
+            .expect("spawn find debounce worker");
         FindWorker {
             query_tx,
+            query_rx: submit_query_rx,
+            debounce_tx,
+            debounce_rx: replace_debounce_rx,
             result_rx,
+            next_generation,
         }
     }
 
     /// Worker loop: read queries, scan snapshots, stream results.
-    fn run(query_rx: Receiver<FindQuery>, result_tx: Sender<FindResult>) {
+    fn run(query_rx: Receiver<FindQuery>, result_tx: Sender<FindResult>, waker: WakeCallback) {
         while let Ok(q) = query_rx.recv() {
             // Drain any newer queries that arrived while we were busy —
             // only the latest matters.
@@ -91,13 +131,21 @@ impl FindWorker {
             let is_regex = current.is_regex;
             let query = current.query.clone();
             let snapshot = current.snapshot.clone();
+            let generation = current.generation;
 
             // For regex mode, validate the query first. An invalid regex
             // short-circuits with a `RegexInvalid` message so the UI can
             // surface "invalid regex" instead of silently returning nothing.
             if is_regex {
                 if let Err(e) = regex::Regex::new(&query) {
-                    let _ = result_tx.send(FindResult::RegexInvalid(e.to_string()));
+                    Self::publish_result(
+                        &result_tx,
+                        &waker,
+                        FindResult::RegexInvalid {
+                            generation,
+                            message: e.to_string(),
+                        },
+                    );
                     continue;
                 }
             }
@@ -113,7 +161,7 @@ impl FindWorker {
             for chunk_start in (0..total).step_by(CHUNK_SIZE) {
                 // Cancellation check: if a newer query has arrived, bail.
                 if !query_rx.is_empty() {
-                    let _ = result_tx.send(FindResult::Cancelled);
+                    Self::publish_result(&result_tx, &waker, FindResult::Cancelled { generation });
                     cancelled = true;
                     break;
                 }
@@ -126,9 +174,14 @@ impl FindWorker {
                     break;
                 }
                 if chunk_end - last_yield >= YIELD_EVERY && chunk_end < total {
-                    let _ = result_tx.send(FindResult::Partial {
-                        matches: matches.clone(),
-                    });
+                    Self::publish_result(
+                        &result_tx,
+                        &waker,
+                        FindResult::Partial {
+                            generation,
+                            matches: matches.clone(),
+                        },
+                    );
                     // Yield to let the main thread redraw with partial
                     // results. A short sleep also reduces CPU pressure
                     // during very large scans.
@@ -142,7 +195,54 @@ impl FindWorker {
             }
 
             let truncated = matches.len() >= weft_core::find::MAX_MATCHES;
-            let _ = result_tx.send(FindResult::Complete { matches, truncated });
+            Self::publish_result(
+                &result_tx,
+                &waker,
+                FindResult::Complete {
+                    generation,
+                    matches,
+                    truncated,
+                },
+            );
+        }
+    }
+
+    fn publish_result(result_tx: &Sender<FindResult>, waker: &WakeCallback, result: FindResult) {
+        if result_tx.send(result).is_ok() {
+            waker();
+        }
+    }
+
+    fn run_debounce(
+        debounce_rx: Receiver<DebounceRequest>,
+        next_generation: Arc<AtomicU64>,
+        waker: WakeCallback,
+    ) {
+        while let Ok(mut request) = debounce_rx.recv() {
+            loop {
+                let wait = request.deadline.saturating_duration_since(Instant::now());
+                if wait.is_zero() {
+                    if next_generation.load(Ordering::Acquire) == request.generation {
+                        waker();
+                    }
+                    break;
+                }
+                match debounce_rx.recv_timeout(wait) {
+                    Ok(newer) => {
+                        request = newer;
+                        while let Ok(latest) = debounce_rx.try_recv() {
+                            request = latest;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        if next_generation.load(Ordering::Acquire) == request.generation {
+                            waker();
+                        }
+                        break;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+            }
         }
     }
 
@@ -155,16 +255,52 @@ impl FindWorker {
         case_sensitive: bool,
         is_regex: bool,
         snapshot: Arc<FindSnapshot>,
-    ) {
-        // try_send: don't block if the previous query hasn't been picked up
-        // yet — replace it with the newer one (the worker drains stale
-        // queries in `run`).
-        let _ = self.query_tx.try_send(FindQuery {
+    ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let pending = FindQuery {
+            generation,
             query,
             case_sensitive,
             is_regex,
             snapshot,
-        });
+        };
+        match self.query_tx.try_send(pending) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(pending)) => {
+                // Replace the single queued (not yet running) query. The UI
+                // is the only submitter, so one drain+retry is sufficient;
+                // the worker may concurrently take the stale query, which
+                // simply makes the retry succeed without a drain.
+                let _ = self.query_rx.try_recv();
+                let _ = self.query_tx.try_send(pending);
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+        }
+        generation
+    }
+
+    /// Invalidate every result issued before this lifecycle boundary without
+    /// submitting a new scan (Find close/reset and tab ownership changes).
+    pub fn invalidate(&self) -> u64 {
+        self.next_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Arrange one event-loop wake after the latest query's debounce period.
+    /// The bounded channel replaces pending deadlines, so rapid typing uses a
+    /// single persistent timer thread rather than one sleeping thread per key.
+    pub fn schedule_debounce(&self, generation: u64, delay: Duration) {
+        let pending = DebounceRequest {
+            generation,
+            deadline: Instant::now() + delay,
+        };
+        match self.debounce_tx.try_send(pending) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(pending)) => {
+                let _ = self.debounce_rx.try_recv();
+                let _ = self.debounce_tx.try_send(pending);
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+        }
     }
 
     /// Non-blocking result poll. The main thread calls this in the redraw
@@ -280,11 +416,17 @@ mod tests {
     fn find_worker_spawn_and_complete() {
         let worker = FindWorker::spawn();
         let s = snap(&["hello world", "foo"]);
-        worker.submit("world".to_string(), false, false, s);
+        let expected = worker.submit("world".to_string(), false, false, s);
         // Poll for up to ~2s waiting for Complete.
         let mut got_complete = false;
         for _ in 0..200 {
-            if let Some(FindResult::Complete { matches, .. }) = worker.try_recv_result() {
+            if let Some(FindResult::Complete {
+                generation,
+                matches,
+                ..
+            }) = worker.try_recv_result()
+            {
+                assert_eq!(generation, expected);
                 assert_eq!(matches.len(), 1);
                 assert_eq!(matches[0].row, 0);
                 got_complete = true;
@@ -299,16 +441,87 @@ mod tests {
     fn find_worker_regex_invalid() {
         let worker = FindWorker::spawn();
         let s = snap(&["hello"]);
-        worker.submit("(unclosed".to_string(), false, true, s);
+        let expected = worker.submit("(unclosed".to_string(), false, true, s);
         let mut got_err = false;
         for _ in 0..200 {
-            if let Some(FindResult::RegexInvalid(_)) = worker.try_recv_result() {
-                got_err = true;
-                break;
+            if let Some(FindResult::RegexInvalid { generation, .. }) = worker.try_recv_result() {
+                if generation == expected {
+                    got_err = true;
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(got_err, "worker should send RegexInvalid");
+    }
+
+    #[test]
+    fn rapid_queries_eventually_complete_with_latest_generation() {
+        let worker = FindWorker::spawn();
+        let rows = vec!["alpha beta"; 20_000];
+        let large = snap(&rows);
+        worker.submit("alpha".into(), false, false, large.clone());
+        worker.submit("beta".into(), false, false, large.clone());
+        let expected = worker.submit("needle".into(), false, false, snap(&["needle"]));
+
+        let mut latest = None;
+        for _ in 0..400 {
+            if let Some(FindResult::Complete {
+                generation,
+                matches,
+                ..
+            }) = worker.try_recv_result()
+            {
+                if generation == expected {
+                    latest = Some(matches);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let matches = latest.expect("latest queued query should complete");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].row, 0);
+    }
+
+    #[test]
+    fn complete_result_wakes_event_loop_without_external_timer() {
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let worker = FindWorker::spawn_with_waker(Arc::new(move || {
+            let _ = wake_tx.send(());
+        }));
+        let expected = worker.submit("needle".into(), false, false, snap(&["needle"]));
+
+        wake_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker completion should actively wake the event loop");
+        let result = worker
+            .try_recv_result()
+            .expect("result must be available before its wake is published");
+        assert!(matches!(
+            result,
+            FindResult::Complete { generation, .. } if generation == expected
+        ));
+    }
+
+    #[test]
+    fn debounce_scheduler_coalesces_rapid_deadlines() {
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let worker = FindWorker::spawn_with_waker(Arc::new(move || {
+            let _ = wake_tx.send(());
+        }));
+        for _ in 0..20 {
+            let generation = worker.invalidate();
+            worker.schedule_debounce(generation, Duration::from_millis(30));
+        }
+
+        wake_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("latest debounce deadline should wake once");
+        assert!(
+            wake_rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "superseded debounce deadlines must not create a wake burst"
+        );
     }
 
     // ── T3: additional scan_chunk coverage ─────────────────────────────

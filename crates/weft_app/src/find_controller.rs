@@ -2,6 +2,10 @@
 
 use super::*;
 
+pub(crate) fn toggled_find_option(current: bool) -> bool {
+    !current
+}
+
 fn trimmed_block_output_lines(block: &weft_core::blocks::Block) -> usize {
     if block.collapsed {
         return 0;
@@ -52,6 +56,15 @@ fn grid_find_scroll_target(scrollback_len: usize, viewport_rows: usize, match_ro
 }
 
 impl App {
+    pub(super) fn arm_find_refresh(&mut self) {
+        self.find.arm_refresh(std::time::Instant::now());
+        self.find.worker.schedule_debounce(
+            self.find.worker_generation,
+            std::time::Duration::from_millis(160),
+        );
+        self.request_redraw();
+    }
+
     /// Handle keys while the FindInGrid bar is open. The bar consumes all
     /// non-modifier keystrokes into the query input; Esc closes, Enter /
     /// Shift+Enter navigate next/prev match, Cmd+F toggles closed (handled
@@ -62,19 +75,16 @@ impl App {
         mods: Modifiers,
         text: Option<&str>,
     ) -> bool {
-        // Cmd+R: toggle regex mode (visual indicator only — actual regex
-        // search engine not yet wired, so this doesn't change results yet).
+        // Cmd+R: toggle regex mode and refresh the real async/block searches.
         if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('r') {
-            self.find.regex_mode = !self.find.regex_mode;
-            self.request_redraw();
+            self.find.regex_mode = toggled_find_option(self.find.regex_mode);
+            self.arm_find_refresh();
             return true;
         }
         // Cmd+I: toggle case-sensitive search.
         if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('i') {
-            self.find.case_sensitive = !self.find.case_sensitive;
-            // Re-run the search immediately so the toggle is reflected.
-            self.find.last_key = Some(std::time::Instant::now());
-            self.request_redraw();
+            self.find.case_sensitive = toggled_find_option(self.find.case_sensitive);
+            self.arm_find_refresh();
             return true;
         }
         if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
@@ -110,8 +120,7 @@ impl App {
             }
             KeyCode::Backspace => {
                 if self.find.query.pop().is_some() {
-                    self.find.last_key = Some(std::time::Instant::now());
-                    self.request_redraw();
+                    self.arm_find_refresh();
                 }
                 true
             }
@@ -124,16 +133,14 @@ impl App {
                     let resolved = resolve_text_char(text, c, mods.contains(Modifiers::SHIFT));
                     if !resolved.is_control() {
                         self.find.query.push(resolved);
-                        self.find.last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
+                        self.arm_find_refresh();
                         return true;
                     }
                 }
                 if let Some(t) = text {
                     if !t.is_empty() {
                         self.find.query.push_str(t);
-                        self.find.last_key = Some(std::time::Instant::now());
-                        self.request_redraw();
+                        self.arm_find_refresh();
                         return true;
                     }
                 }
@@ -234,7 +241,7 @@ impl App {
         // cost; the scan itself runs on the worker thread.
         if !self.find.query.is_empty() {
             let snapshot = std::sync::Arc::new(term.grid().find_snapshot());
-            self.find.worker.submit(
+            self.find.worker_generation = self.find.worker.submit(
                 self.find.query.clone(),
                 self.find.case_sensitive,
                 self.find.regex_mode,
@@ -313,8 +320,17 @@ impl App {
             return;
         }
         while let Some(result) = self.find.worker.try_recv_result() {
+            let generation = match &result {
+                find_worker::FindResult::Partial { generation, .. }
+                | find_worker::FindResult::Complete { generation, .. }
+                | find_worker::FindResult::RegexInvalid { generation, .. }
+                | find_worker::FindResult::Cancelled { generation } => *generation,
+            };
+            if generation != self.find.worker_generation {
+                continue;
+            }
             match result {
-                find_worker::FindResult::Partial { matches } => {
+                find_worker::FindResult::Partial { matches, .. } => {
                     // Incremental results — paint them so the user sees
                     // matches appear as the scan progresses.
                     // v0.9 fix: update find_matches regardless of block view —
@@ -332,7 +348,9 @@ impl App {
                     }
                     self.request_redraw();
                 }
-                find_worker::FindResult::Complete { matches, truncated } => {
+                find_worker::FindResult::Complete {
+                    matches, truncated, ..
+                } => {
                     if !matches.is_empty() {
                         self.find.index = self.find.index.min(matches.len() - 1);
                     } else {
@@ -348,8 +366,8 @@ impl App {
                     // Done — break out of the drain loop.
                     break;
                 }
-                find_worker::FindResult::RegexInvalid(msg) => {
-                    self.find.regex_error = Some(msg);
+                find_worker::FindResult::RegexInvalid { message, .. } => {
+                    self.find.regex_error = Some(message);
                     self.find.matches.clear();
                     self.find.truncated = false;
                     self.find.index = 0;
@@ -357,7 +375,7 @@ impl App {
                     self.request_redraw();
                     break;
                 }
-                find_worker::FindResult::Cancelled => {
+                find_worker::FindResult::Cancelled { .. } => {
                     // A newer query is in flight — keep `find_worker_busy`
                     // true; the newer query's results will arrive soon.
                 }
@@ -420,10 +438,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_find_scroll_target, grid_find_scroll_target};
-    use std::time::SystemTime;
+    use super::{block_find_scroll_target, grid_find_scroll_target, toggled_find_option};
+    use crate::app_state::FindState;
+    use std::time::{Instant, SystemTime};
     use weft_core::blocks::{Block, BlockId};
-    use weft_core::find::BlockMatch;
+    use weft_core::find::{BlockMatch, FindMatch};
 
     fn block(id: u64, output: &str) -> Block {
         Block {
@@ -471,5 +490,34 @@ mod tests {
         assert_eq!(grid_find_scroll_target(100, 30, 90), 20);
         assert_eq!(grid_find_scroll_target(100, 30, 20), 90);
         assert_eq!(grid_find_scroll_target(100, 30, 100), 0);
+    }
+
+    #[test]
+    fn keyboard_find_option_toggle_rearms_existing_query() {
+        assert!(toggled_find_option(false));
+        assert!(!toggled_find_option(true));
+    }
+
+    #[test]
+    fn query_change_invalidates_old_results_before_debounce() {
+        let mut state = FindState::new_for_test();
+        state.open = true;
+        state.query = "new query".into();
+        state.matches.push(FindMatch {
+            row: 1,
+            col: 2,
+            len: 3,
+        });
+        let old_generation = state.worker_generation;
+        state.arm_refresh(Instant::now());
+        assert!(state.worker_generation > old_generation);
+        assert!(state.worker_busy);
+        assert!(state.matches.is_empty());
+        assert!(state.last_key.is_some());
+
+        state.close();
+        assert!(!state.open);
+        assert!(state.query.is_empty());
+        assert!(!state.worker_busy);
     }
 }
