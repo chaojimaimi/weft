@@ -11,6 +11,7 @@ use metal::{
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 use weft_core::config::Theme;
 
@@ -122,7 +123,7 @@ fn flag_is_enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
 }
 
-fn render(device: &Device, case: &Case) -> image::RgbaImage {
+fn render(device: &Device, case: &Case) -> (image::RgbaImage, Duration) {
     let width = LOGICAL_WIDTH * case.scale;
     let height = LOGICAL_HEIGHT * case.scale;
     let queue = device.new_command_queue();
@@ -224,8 +225,10 @@ fn render(device: &Device, case: &Case) -> image::RgbaImage {
     let blit = command_buffer.new_blit_command_encoder();
     blit.synchronize_resource(&target);
     blit.end_encoding();
+    let submitted = Instant::now();
     command_buffer.commit();
     command_buffer.wait_until_completed();
+    let gpu_completion = submitted.elapsed();
 
     let mut bgra = vec![0_u8; width as usize * height as usize * 4];
     target.get_bytes(
@@ -244,7 +247,10 @@ fn render(device: &Device, case: &Case) -> image::RgbaImage {
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    image::RgbaImage::from_raw(width, height, bgra).expect("valid offscreen image dimensions")
+    (
+        image::RgbaImage::from_raw(width, height, bgra).expect("valid offscreen image dimensions"),
+        gpu_completion,
+    )
 }
 
 fn assert_matches_golden(actual: &image::RgbaImage, path: &Path) {
@@ -282,7 +288,7 @@ fn dark_and_light_1x_2x_match_offscreen_metal_goldens() {
         return;
     };
     for case in cases() {
-        let actual = render(&device, &case);
+        let (actual, _) = render(&device, &case);
         let path = snapshot_path(case.name);
         if update {
             actual
@@ -291,6 +297,28 @@ fn dark_and_light_1x_2x_match_offscreen_metal_goldens() {
         } else {
             assert_matches_golden(&actual, &path);
         }
+    }
+}
+
+#[test]
+#[ignore = "real Metal timing budget; run through scripts/performance_gate.sh"]
+fn perf_offscreen_metal_frame_budget() {
+    const SAMPLES: usize = 20;
+    const P95_BUDGET: Duration = Duration::from_millis(20);
+
+    let device = Device::system_default().expect("Metal device required for GPU frame gate");
+    for case in cases() {
+        let _ = render(&device, &case);
+        let mut samples: Vec<_> = (0..SAMPLES).map(|_| render(&device, &case).1).collect();
+        samples.sort();
+        let p95_index = ((SAMPLES as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        let p95 = samples[p95_index];
+        println!("{} Metal completion p95: {p95:?}", case.name);
+        assert!(
+            p95 <= P95_BUDGET,
+            "{} Metal completion p95 {p95:?} exceeds {P95_BUDGET:?}",
+            case.name
+        );
     }
 }
 

@@ -38,6 +38,7 @@ mod palette_controller;
 mod palette_state;
 mod panel_component;
 mod panel_controller;
+mod performance_probe;
 mod redraw_controller;
 mod renderer;
 mod scene;
@@ -110,6 +111,8 @@ pub(crate) enum AppEvent {
         generation: u64,
         node_id: u64,
     },
+    PerformanceProbeStart,
+    PerformanceProbeFinish,
 }
 
 // ── Application ──────────────────────────────────────────────────────
@@ -149,6 +152,7 @@ struct App {
     /// Whether the Settings overlay is open.
     settings: SettingsState,
     accessibility: accessibility::AccessibilityBridge,
+    performance_probe: performance_probe::PerformanceProbe,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
@@ -211,6 +215,7 @@ impl App {
             find: FindState::new(),
             settings: SettingsState::new(),
             accessibility: accessibility::AccessibilityBridge::default(),
+            performance_probe: performance_probe::PerformanceProbe::from_env(),
             should_exit: false,
         }
     }
@@ -1162,6 +1167,7 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::Wake => {
+                self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
                 self.request_redraw();
@@ -1172,6 +1178,13 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::TabsAutoSave => {
                 self.drain_effects(vec![Effect::PersistTabs]);
+            }
+            AppEvent::PerformanceProbeStart => self.performance_probe.start(),
+            AppEvent::PerformanceProbeFinish => {
+                if let Some(report) = self.performance_probe.finish() {
+                    println!("{}", report.line());
+                }
+                event_loop.exit();
             }
             AppEvent::MenuAction(action) => {
                 // v1.1: native menu click → reuse the same dispatch as
@@ -1489,6 +1502,21 @@ impl ApplicationHandler<AppEvent> for App {
                 break; // event loop exited
             }
         });
+
+        if self.performance_probe.enabled() {
+            let probe_proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(performance_probe::WARMUP);
+                if probe_proxy
+                    .send_event(AppEvent::PerformanceProbeStart)
+                    .is_err()
+                {
+                    return;
+                }
+                std::thread::sleep(performance_probe::SAMPLE);
+                let _ = probe_proxy.send_event(AppEvent::PerformanceProbeFinish);
+            });
+        }
 
         // Config file watcher: poll the config's mtime ~1/sec and reload live
         // on change (theme/font/keybindings/scrollback re-apply instantly).

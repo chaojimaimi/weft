@@ -80,7 +80,11 @@ impl App {
                     self.request_redraw();
                 }
             }
-            WindowEvent::RedrawRequested => self.handle_redraw_requested(),
+            WindowEvent::RedrawRequested => {
+                let started = std::time::Instant::now();
+                self.handle_redraw_requested();
+                self.performance_probe.record_redraw(started.elapsed());
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == winit::event::ElementState::Pressed {
                     if let PhysicalKey::Code(key_code) = event.physical_key {
