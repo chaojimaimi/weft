@@ -61,6 +61,14 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
 
     t.process(b"\rprogress\x1b[K");
     assert!(!t.show_block_view());
+    t.process(b"\x1b[?1049h");
+    assert!(t.is_alt_screen_active());
+    assert!(
+        !t.primary_screen_app_active(),
+        "alternate-screen ownership must supersede primary-screen evidence"
+    );
+    t.process(b"\x1b[?1049l");
+    assert!(t.primary_screen_app_active());
     t.block_tracker_mut().reset_to_prompt();
     assert!(!t.primary_screen_app_active());
     assert!(t.show_block_view());
@@ -73,7 +81,7 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
 }
 
 #[test]
-fn primary_screen_tui_resize_is_dimension_only_until_prompt_reset() {
+fn primary_screen_tui_resize_is_dimension_only_with_host_context_outside_grid() {
     let mut t = Terminal::new(4, 8);
     t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
     t.process(b"\x1b[2J\x1b[1;1H\x1b[1;1HABCDEFGH");
@@ -83,11 +91,46 @@ fn primary_screen_tui_resize_is_dimension_only_until_prompt_reset() {
     assert_eq!(t.grid().row_text(0), "ABCD");
     assert!(
         t.grid().row_text(1).is_empty(),
-        "TUI content must not reflow"
+        "absolute-positioned TUI rows must not reflow before SIGWINCH repaint"
     );
 
     t.block_tracker_mut().reset_to_prompt();
     assert!(!t.primary_screen_app_active());
+}
+
+#[test]
+fn claude_like_clear_and_repaint_keeps_command_context_across_resizes() {
+    fn repaint(terminal: &mut Terminal, rows: usize) {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"\x1b[H");
+        for _ in 0..rows {
+            frame.extend_from_slice(b"\x1b[2K\x1b[1B");
+        }
+        frame.extend_from_slice(
+            b"\x1b[H\x1b[2GClaude\x1b[9GCode\r\n\x1b[12Gglm-5.2\r\n\x1b[12G~/project",
+        );
+        terminal.process(&frame);
+    }
+
+    let mut terminal = Terminal::new(50, 160);
+    terminal.process(b"\x1b]7;file://localhost/Users/me/project\x07");
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    repaint(&mut terminal, 50);
+
+    for (rows, cols) in [(35, 100), (60, 180), (42, 120)] {
+        terminal.resize(rows, cols);
+        repaint(&mut terminal, rows);
+        assert!(terminal.primary_screen_app_active());
+        assert_eq!(terminal.cwd(), Some("/Users/me/project"));
+        assert_eq!(
+            terminal
+                .block_tracker()
+                .in_flight()
+                .map(|live| live.command),
+            Some("claude")
+        );
+        assert!(terminal.grid().row_text(0).contains("Claude"));
+    }
 }
 
 #[test]

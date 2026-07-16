@@ -173,12 +173,7 @@ impl App {
         // F2 P0-3: set cursor based on mouse reporting + scrollbar hover.
         // Default == arrow cursor; used when a TUI app (vim/less/htop) has
         // enabled mouse reporting so it owns the pointer.
-        let in_terminal_content = self.terminal_layout().is_some_and(|layout| {
-            x >= layout.content.left
-                && x <= layout.content.right
-                && y >= layout.content.top
-                && y <= layout.content.bottom
-        });
+        let in_terminal_content = self.terminal_content_contains(x, y);
         let over_panel = self.panel.open
             && self
                 .renderer
@@ -289,8 +284,10 @@ impl App {
         }
 
         // PTY mouse reporting always speaks grid coordinates.
-        let pos = self.pixel_to_grid(x, y);
-        self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+        if in_terminal_content {
+            let pos = self.pixel_to_grid(x, y);
+            self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+        }
     }
 
     /// Check if a click (x, y) lands on a popup border drag handle.
@@ -625,6 +622,9 @@ impl App {
 
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
+            if !self.terminal_content_contains(x, y) {
+                return;
+            }
             let pos = self.pixel_to_grid(x, y);
             let mut m = Modifiers::empty();
             if self.interaction.mods.state().shift_key() {
@@ -660,6 +660,9 @@ impl App {
         // back to ordinary local viewport scrolling (so normal commands do not
         // lose their first gesture during the two-second launch window).
         if tui_starting && !alt_screen_active {
+            if !self.terminal_content_contains(x, y) {
+                return;
+            }
             let pos = self.pixel_to_grid(x, y);
             let mut m = Modifiers::empty();
             if self.interaction.mods.state().shift_key() {

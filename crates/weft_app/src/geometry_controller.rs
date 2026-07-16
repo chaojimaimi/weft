@@ -104,11 +104,18 @@ impl App {
         } else {
             0.0
         };
-        Some(terminal_layout_for_renderer(
-            renderer,
-            window.inner_size(),
-            chrome_left,
-        ))
+        let layout = terminal_layout_for_renderer(renderer, window.inner_size(), chrome_left);
+        let primary_tui = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .is_some_and(Terminal::primary_screen_app_active);
+        Some(if primary_tui {
+            layout.reserve_top_rows(crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS)
+        } else {
+            layout
+        })
     }
 
     /// Compute grid (rows, cols) from the shared terminal layout. Returns
@@ -119,20 +126,31 @@ impl App {
             .unwrap_or((0, 0))
     }
 
+    pub(super) fn terminal_content_contains(&self, x: f64, y: f64) -> bool {
+        self.terminal_layout()
+            .is_some_and(|layout| layout.contains_content(x, y))
+    }
+
     /// Recompute grid rows/cols from the current window + cell dimensions and
     /// resize the terminal / queue a PTY SIGWINCH. Used after a font or padding
     /// change (cell size or usable area changes) and on window resize.
     pub(super) fn recompute_layout(&mut self) {
-        let (new_rows, new_cols) = self.grid_dims();
-        if new_cols == 0 || new_rows == 0 {
-            return;
-        }
         let Some(window) = &self.window else {
             return;
         };
         let size = window.inner_size();
-        if let Some(renderer) = &mut self.renderer {
-            renderer.resize(window, size);
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        renderer.resize(window, size);
+        let chrome_left = if self.panel.open {
+            renderer.sidebar_push_width() as f64
+        } else {
+            0.0
+        };
+        let base_layout = terminal_layout_for_renderer(renderer, size, chrome_left);
+        if base_layout.rows == 0 || base_layout.cols == 0 {
+            return;
         }
         // v0.9 W5: resize every tab's terminal so non-active tabs also pick
         // up the new chrome_left (sidebar open/close shifts the grid). Only
@@ -140,14 +158,16 @@ impl App {
         // their PTY resize on activation (refresh_grid_for_active_tab).
         let active = self.sessions.active_idx();
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
-            if let Some(terminal) = &mut tab.terminal {
-                terminal.resize(new_rows, new_cols);
-                if i == active {
+            if let Some(terminal) = &tab.terminal {
+                let layout = if terminal.primary_screen_app_active() {
+                    base_layout.reserve_top_rows(crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS)
+                } else {
+                    base_layout
+                };
+                let (new_rows, new_cols) = layout.dimensions();
+                if tab.resize_terminal_and_queue(new_rows, new_cols) && i == active {
                     info!(rows = new_rows, cols = new_cols, "terminal resized");
                 }
-            }
-            if i == active {
-                tab.pending_pty_resize = Some((new_rows, new_cols));
             }
         }
         self.window_runtime.last_resize_instant = std::time::Instant::now();
@@ -180,6 +200,9 @@ impl App {
         let terminal = self.sessions.active().terminal.as_ref()?;
         // Block view uses a separate scrollable layout — skip OSC 8 there.
         if self.block_view_active() {
+            return None;
+        }
+        if !self.terminal_content_contains(x, y) {
             return None;
         }
         let pos = self.pixel_to_grid(x, y);

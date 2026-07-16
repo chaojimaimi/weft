@@ -33,23 +33,33 @@ impl App {
                     } else {
                         0.0
                     };
-                    let (new_rows, new_cols) =
-                        dimensions_for_renderer(renderer, physical_size, chrome_left);
+                    let base_layout =
+                        terminal_layout_for_renderer(renderer, physical_size, chrome_left);
 
-                    if new_cols > 0 && new_rows > 0 {
+                    if base_layout.cols > 0 && base_layout.rows > 0 {
                         // Resize ALL tabs' grids immediately for smooth
                         // animation. The rewrap/dimension-only resize is fast
                         // (<1ms) so doing it on every intermediate event is
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
                         for tab in self.sessions.tabs_mut() {
-                            if let Some(terminal) = &mut tab.terminal {
-                                terminal.resize(new_rows, new_cols);
+                            if let Some(terminal) = &tab.terminal {
+                                let layout = if terminal.primary_screen_app_active() {
+                                    base_layout.reserve_top_rows(
+                                        crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS,
+                                    )
+                                } else {
+                                    base_layout
+                                };
+                                let (new_rows, new_cols) = layout.dimensions();
+                                tab.resize_terminal_and_queue(new_rows, new_cols);
                             }
-                            // Queue the PTY SIGWINCH for this tab.
-                            tab.pending_pty_resize = Some((new_rows, new_cols));
                         }
-                        info!(rows = new_rows, cols = new_cols, "all tabs resized (event)");
+                        info!(
+                            rows = base_layout.rows,
+                            cols = base_layout.cols,
+                            "all tabs resized (event)"
+                        );
                         self.window_runtime.last_resize_instant = std::time::Instant::now();
                         // v1.2-fix: re-clamp tab scroll offset after resize.
                         // The window may have grown/shrunk, changing max_scroll.
@@ -206,8 +216,10 @@ impl App {
                         .map(|(_, owner)| owner);
                     match crate::input_router::route_owned_pointer_move(active_session, owner) {
                         crate::input_router::OwnedPointerMoveRoute::TerminalOwner(_) => {
-                            let pos = self.pixel_to_grid(position.x, position.y);
-                            self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+                            if self.terminal_content_contains(position.x, position.y) {
+                                let pos = self.pixel_to_grid(position.x, position.y);
+                                self.send_mouse_event(MouseButton::Left, MouseAction::Move, pos);
+                            }
                         }
                         crate::input_router::OwnedPointerMoveRoute::Suppress => {}
                         crate::input_router::OwnedPointerMoveRoute::ActiveSession => {

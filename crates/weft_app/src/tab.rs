@@ -148,6 +148,19 @@ impl Tab {
         }
     }
 
+    /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
+    /// Overwriting (rather than preserving) an older pending size is required
+    /// when several window/font/sidebar changes coalesce before the throttle
+    /// flushes them, including for background tabs.
+    pub(crate) fn resize_terminal_and_queue(&mut self, rows: usize, cols: usize) -> bool {
+        let Some(terminal) = &mut self.terminal else {
+            return false;
+        };
+        terminal.resize(rows, cols);
+        self.pending_pty_resize = Some((rows, cols));
+        true
+    }
+
     /// Non-blocking drain of PTY events into channel. Capped per frame.
     pub fn pump_pty(&mut self) {
         let Some(pty) = &mut self.pty else { return };
@@ -678,18 +691,6 @@ mod tests {
             panic!("expected shifted arrow bytes");
         };
         assert_eq!(bytes, b"\x1b[1;2B");
-    }
-
-    #[test]
-    fn empty_tab_has_no_pending_resize() {
-        let t = Tab::empty();
-        assert!(t.pending_pty_resize.is_none());
-    }
-
-    #[test]
-    fn empty_tab_has_empty_ime_preedit() {
-        let t = Tab::empty();
-        assert!(t.ime_preedit.is_empty());
     }
 
     // ── v1.0 H4: TabsAutoSave snapshot roundtrip ─────────────────────

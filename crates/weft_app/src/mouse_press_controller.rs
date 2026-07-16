@@ -484,6 +484,13 @@ impl App {
         let selecting = !self.mouse_reporting_active();
         let block_view = self.block_view_active();
 
+        // The primary-screen TUI context band is host chrome, not a clamped
+        // alias for Grid row 0. Consume presses there before selection, paste,
+        // context-menu or PTY mouse routing. BlockView has its own row model.
+        if !block_view && !self.terminal_content_contains(x, y) {
+            return;
+        }
+
         match button {
             winit::event::MouseButton::Left => {
                 if selecting {

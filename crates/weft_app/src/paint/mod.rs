@@ -19,6 +19,7 @@ mod offscreen_snapshots;
 pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod panel;
+pub(crate) mod primary_tui;
 pub(crate) mod primitives;
 pub(crate) mod prompt;
 pub(crate) mod settings;

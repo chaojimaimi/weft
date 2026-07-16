@@ -9,7 +9,8 @@ impl Terminal {
     /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
     /// repeatedly use absolute cursor addressing to own the whole viewport.
     pub fn primary_screen_app_active(&self) -> bool {
-        self.block_tracker.phase() == ShellPhase::CommandExecuting
+        !self.alt_active
+            && self.block_tracker.phase() == ShellPhase::CommandExecuting
             && self.primary_screen_cursor_ops >= 2
     }
 

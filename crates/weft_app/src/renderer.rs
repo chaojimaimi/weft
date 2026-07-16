@@ -277,6 +277,13 @@ impl MetalRenderer {
             ),
             chrome_left as f64,
         );
+        let primary_tui_context_visible = terminal.primary_screen_app_active()
+            && terminal_layout.rows > crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS;
+        let terminal_layout = if primary_tui_context_visible {
+            terminal_layout.reserve_top_rows(crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS)
+        } else {
+            terminal_layout
+        };
         let chrome_top = terminal_layout.chrome_top as f32;
 
         // Build this frame's LayoutCtx: the single source of truth for
@@ -447,6 +454,11 @@ impl MetalRenderer {
                     }
                 }
             }
+            if let Some(context) = crate::paint::primary_tui::primary_tui_context(terminal) {
+                missing.extend(context.cwd.chars());
+                missing.extend("❯ ".chars());
+                missing.extend(context.command.chars());
+            }
             // Find bar (Cmd+F): warm up the query + status text + button
             // glyphs so CJK / other non-ASCII chars typed via IME render
             // instead of leaving blank cells (the atlas only auto-warms
@@ -602,6 +614,10 @@ impl MetalRenderer {
             );
             Vec::new()
         };
+
+        if primary_tui_context_visible {
+            vertices.extend_from_slice(&self.build_primary_tui_context_vertices(terminal));
+        }
 
         // v0.8 U6 scrollbar: dynamic thumb position + height proportional to
         // visible/total content. The thumb sits in a track spanning the block

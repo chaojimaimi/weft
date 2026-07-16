@@ -8,6 +8,24 @@ fn tab_with_terminal() -> Tab {
     tab
 }
 
+#[test]
+fn empty_tab_starts_without_transient_pending_state() {
+    let tab = Tab::empty();
+    assert!(tab.pending_pty_resize.is_none());
+    assert!(tab.ime_preedit.is_empty());
+}
+
+#[test]
+fn terminal_resize_replaces_stale_pending_size_for_background_convergence() {
+    let mut tab = tab_with_terminal();
+    tab.pending_pty_resize = Some((40, 120));
+
+    assert!(tab.resize_terminal_and_queue(22, 78));
+    assert_eq!(tab.pending_pty_resize, Some((22, 78)));
+    let grid = tab.terminal.as_ref().unwrap().grid();
+    assert_eq!((grid.num_rows, grid.num_cols), (22, 78));
+}
+
 fn snapshot(cwd: &str, editor: &EditorBuffer) -> TabSnapshot {
     TabSnapshot {
         position: 0,
