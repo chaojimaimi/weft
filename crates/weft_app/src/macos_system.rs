@@ -222,17 +222,20 @@ pub(super) fn load_window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
-/// Multi-resolution ICNS bytes used for runtime Dock variants. A single PNG
-/// is treated by Dock as an unscaled replacement and can remain magnified or
-/// overlap the running indicator; ICNS lets AppKit choose the native rep.
-fn logo_icns_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
+/// High-resolution PNG bytes used for runtime Dock variants.
+///
+/// Unlike the bundled icon, an image installed with
+/// `setApplicationIconImage` does not receive the bundle icon's automatic
+/// visual inset. These rasters therefore include a transparent 12.5% margin
+/// on every side so Dock magnification cannot overlap the running indicator.
+fn logo_image_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     use weft_core::config::LogoVariant;
     match variant {
-        LogoVariant::Cool => include_bytes!("../../../assets/logo/variants/cool.icns"),
-        LogoVariant::Warm => include_bytes!("../../../assets/logo/variants/warm.icns"),
-        LogoVariant::Light => include_bytes!("../../../assets/logo/variants/light.icns"),
+        LogoVariant::Cool => include_bytes!("../../../assets/logo/variants/png/cool-1024.png"),
+        LogoVariant::Warm => include_bytes!("../../../assets/logo/variants/png/warm-1024.png"),
+        LogoVariant::Light => include_bytes!("../../../assets/logo/variants/png/light-1024.png"),
         LogoVariant::Transparent => {
-            include_bytes!("../../../assets/logo/variants/transparent.icns")
+            include_bytes!("../../../assets/logo/variants/png/transparent-1024.png")
         }
     }
 }
@@ -287,7 +290,7 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
             tracing::info!("using bundled Dock icon");
             return;
         }
-        let icon_bytes = logo_icns_bytes(variant);
+        let icon_bytes = logo_image_bytes(variant);
         let ns_data = NSData::dataWithBytes_length(
             icon_bytes.as_ptr() as *mut std::ffi::c_void,
             icon_bytes.len(),
@@ -304,7 +307,7 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{logo_icns_bytes, should_use_bundle_dock_icon};
+    use super::{logo_image_bytes, should_use_bundle_dock_icon};
     use std::path::Path;
     use weft_core::config::LogoVariant;
 
@@ -320,11 +323,30 @@ mod tests {
     }
 
     #[test]
-    fn every_runtime_dock_variant_is_a_multiresolution_icns() {
+    fn every_runtime_dock_variant_has_a_high_resolution_safe_area() {
         for variant in LogoVariant::ALL {
-            let bytes = logo_icns_bytes(variant);
-            assert_eq!(&bytes[..4], b"icns");
-            assert!(bytes.len() > 200_000);
+            let rgba = image::load_from_memory(logo_image_bytes(variant))
+                .expect("embedded Dock icon must decode")
+                .to_rgba8();
+            assert_eq!(rgba.dimensions(), (1024, 1024));
+
+            let mut bounds = (1024, 1024, 0, 0);
+            for (x, y, pixel) in rgba.enumerate_pixels() {
+                if pixel.0[3] > 0 {
+                    bounds.0 = bounds.0.min(x);
+                    bounds.1 = bounds.1.min(y);
+                    bounds.2 = bounds.2.max(x);
+                    bounds.3 = bounds.3.max(y);
+                }
+            }
+            assert!(
+                bounds.0 <= bounds.2 && bounds.1 <= bounds.3,
+                "{variant:?} Dock icon must contain visible pixels"
+            );
+            assert!(
+                bounds.0 >= 120 && bounds.1 >= 120 && bounds.2 <= 903 && bounds.3 <= 903,
+                "{variant:?} alpha bounds {bounds:?} must preserve the Dock safe area"
+            );
         }
     }
 }

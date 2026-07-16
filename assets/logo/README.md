@@ -88,3 +88,15 @@ W 的青色剪影在深底上仍可辨认（强对比度光斑），但：
 - 内部暗色空心线消失
 
 作为 Dock / 任务栏图标可用；若追求 32px 极致清晰度，可考虑做一个无网格、单粗笔 W 的简化变体。
+
+## 运行时 Dock 安全区
+
+AppKit 的 `setApplicationIconImage` 不会像 bundle 图标那样自动应用 Dock tile 安全区。
+四套 variant SVG 因此使用扩展 viewBox，把实际图形缩放到约 75%，避免运行指示圆点与图标重叠。
+运行时加载带安全区的 1024px PNG；修改 SVG 后使用匹配 macOS SDK 的 Swift 工具链执行：
+
+```bash
+swift scripts/render_variants.swift
+```
+
+安装包默认 Cool 图标仍由 bundle ICNS 提供，Warm、Light、Transparent 以及开发构建使用上述运行时 PNG。

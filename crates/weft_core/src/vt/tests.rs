@@ -39,6 +39,58 @@ fn opentui_drawing_symbols_follow_single_cell_cursor_math() {
 }
 
 #[test]
+fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    assert!(t.show_block_view());
+
+    // Claude Code enables color-scheme reporting and then paints its primary
+    // screen with absolute cursor moves instead of entering DEC 1049.
+    t.process(b"\x1b[?2031h\x1b[6G");
+    assert!(
+        t.show_block_view(),
+        "one absolute move is not enough evidence"
+    );
+    t.process(b"\x1b[13G");
+    assert!(t.primary_screen_app_active());
+    assert!(!t.show_block_view());
+
+    t.process(b"\x1b[2;1HClaude Code\x1b[3;1Hglm-5.2\x1b[20;1H>\x1b[20;3G");
+    assert_eq!(t.grid().row_text(1), "Claude Code");
+    assert_eq!(t.grid().row_text(2), "glm-5.2");
+
+    t.process(b"\rprogress\x1b[K");
+    assert!(!t.show_block_view());
+    t.block_tracker_mut().reset_to_prompt();
+    assert!(!t.primary_screen_app_active());
+    assert!(t.show_block_view());
+
+    t.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[6G\x1b[13G");
+    assert!(t.primary_screen_app_active());
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(!t.primary_screen_app_active());
+    assert!(t.show_block_view());
+}
+
+#[test]
+fn primary_screen_tui_resize_is_dimension_only_until_prompt_reset() {
+    let mut t = Terminal::new(4, 8);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"\x1b[2J\x1b[1;1H\x1b[1;1HABCDEFGH");
+    assert!(t.primary_screen_app_active());
+
+    t.resize(4, 4);
+    assert_eq!(t.grid().row_text(0), "ABCD");
+    assert!(
+        t.grid().row_text(1).is_empty(),
+        "TUI content must not reflow"
+    );
+
+    t.block_tracker_mut().reset_to_prompt();
+    assert!(!t.primary_screen_app_active());
+}
+
+#[test]
 fn zero_width_scalars_do_not_consume_grid_cells() {
     let mut t = term();
     t.process("e\u{0301}X".as_bytes());

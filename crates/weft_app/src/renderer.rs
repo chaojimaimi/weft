@@ -417,6 +417,13 @@ impl MetalRenderer {
             // outputs, durations. Session blocks only — hydrated history stays
             // in the panel.
             if terminal.show_block_view() {
+                if let Some(cwd) = terminal.cwd() {
+                    missing.extend(cwd.chars());
+                }
+                if let Some(branch) = terminal.git_branch() {
+                    missing.extend(" git:()".chars());
+                    missing.extend(branch.chars());
+                }
                 for b in terminal
                     .block_tracker()
                     .session_blocks()
@@ -474,7 +481,7 @@ impl MetalRenderer {
             // v0.9 fix: warm up the tab bar close button "×" and separator
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
-            missing.extend(['×', '·', '…']);
+            missing.extend(['×', '·', '•', '…']);
             // Explicit one-scalar fallbacks for unsupported multi-scalar
             // graphemes; keep them resident before push_text uses them.
             missing.extend(['\u{fffd}', '\u{ff1f}']);
@@ -576,7 +583,7 @@ impl MetalRenderer {
             // the cache entirely and renders directly from the live grid,
             // eliminating the corruption. Cost: full redraw while in a TUI app
             // (acceptable — TUIs don't stream like shell output).
-            if terminal.is_alt_screen_active() {
+            if terminal.is_alt_screen_active() || terminal.primary_screen_app_active() {
                 self.force_full_grid_redraw();
             }
             let cursor_visible_this_frame = crate::terminal_geometry::grid_cursor_visible(

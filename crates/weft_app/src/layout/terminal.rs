@@ -139,10 +139,10 @@ pub fn block_visible_rows(ctx: &LayoutCtx, prompt_lines: usize, cwd_header_activ
     ((height / block.pitch).floor() as usize).max(1)
 }
 
-/// Keep the fixed CWD band visible whenever the shell has reported a cwd.
-/// This preserves location context while long-running commands own the prompt.
-pub fn block_cwd_header_active(_editor_mode: bool, cwd_present: bool) -> bool {
-    cwd_present
+/// The fixed CWD band belongs to the editor. While a command runs, its CWD is
+/// rendered as part of the in-flight block header instead of at window bottom.
+pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
+    editor_mode && cwd_present
 }
 
 // ── Block view (Warp-style history) ────────────────────────────────────

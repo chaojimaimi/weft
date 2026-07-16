@@ -11,12 +11,6 @@ pub(crate) enum BlockTone {
     Success,
     Error,
     Warning,
-    /// F3-2: A command is currently executing (in-flight block).
-    /// Never returned by `block_presentation` (finished blocks always have
-    /// an exit code); kept for the exhaustive color match in header rendering
-    /// and future use when live blocks gain headers.
-    #[allow(dead_code)]
-    Running,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +114,14 @@ pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
     }
 }
 
+pub(crate) fn live_context_label(cwd: Option<&str>, git_branch: Option<&str>) -> Option<String> {
+    let cwd = cwd.map(abbreviate_path).filter(|cwd| !cwd.is_empty())?;
+    Some(match git_branch {
+        Some(branch) if !branch.is_empty() => format!("{cwd} git:({branch})"),
+        _ => cwd,
+    })
+}
+
 /// Total/visible BlockView rows used by scrollbar and input geometry.
 pub(crate) fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
@@ -147,6 +149,7 @@ pub(crate) fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize,
                 .map(|line| wrapped_row_count(line, cols))
                 .sum::<usize>();
             total += 2; // command + gap
+            total += usize::from(live.cwd.or(terminal.cwd()).is_some());
         }
     }
     (total, terminal.grid().num_rows.max(1))
@@ -247,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn running_block_metrics_keep_fixed_cwd_out_of_scroll_rows() {
+    fn running_block_metrics_include_context_as_a_live_header() {
         fn running_terminal(cwd: bool) -> Terminal {
             let mut terminal = Terminal::new(24, 80);
             if cwd {
@@ -257,8 +260,15 @@ mod tests {
             terminal
         }
 
-        assert_eq!(block_content_metrics(&running_terminal(false), 80).0, 2);
-        assert_eq!(block_content_metrics(&running_terminal(true), 80).0, 2);
+        let mut late_cwd = running_terminal(false);
+        assert_eq!(block_content_metrics(&late_cwd, 80).0, 2);
+        late_cwd.process(b"\x1b]7;file://localhost/Users/me/.hermes\x07");
+        assert_eq!(block_content_metrics(&late_cwd, 80).0, 3);
+        assert_eq!(block_content_metrics(&running_terminal(true), 80).0, 3);
+        assert_eq!(
+            live_context_label(Some("/Users/me/.hermes"), Some("main")),
+            Some("/Users/me/.hermes git:(main)".into())
+        );
     }
 
     #[test]

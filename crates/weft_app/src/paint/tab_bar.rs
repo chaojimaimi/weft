@@ -11,8 +11,8 @@ pub(crate) struct TabTitle {
 }
 
 /// Build a dense tab title once, leaving final pixel truncation to the shared
-/// tab-strip layout. The compact separator deliberately consumes one column:
-/// `OpenCode·opencode` fits where the previous spaced form did not.
+/// tab-strip layout. Symmetric one-column spaces keep the separator visually
+/// balanced after ambiguous-width punctuation was standardized to one cell.
 pub(crate) fn tab_title(index: usize, cwd: Option<&str>, command: Option<&str>) -> TabTitle {
     let fallback = format!("Tab {}", index + 1);
     let full_cwd = cwd.unwrap_or(&fallback);
@@ -29,8 +29,8 @@ pub(crate) fn tab_title(index: usize, cwd: Option<&str>, command: Option<&str>) 
     let command = command.map(str::trim).filter(|command| !command.is_empty());
     match command {
         Some(command) => TabTitle {
-            compact: format!("{compact_cwd}·{command}"),
-            tooltip: format!("{full_cwd} · {command}"),
+            compact: format!("{compact_cwd} • {command}"),
+            tooltip: format!("{full_cwd} • {command}"),
         },
         None => TabTitle {
             compact: compact_cwd.to_string(),
@@ -466,16 +466,17 @@ mod tests {
     use super::tab_title;
 
     #[test]
-    fn running_title_uses_one_column_separator_without_early_command_truncation() {
+    fn running_title_uses_balanced_separator_without_early_command_truncation() {
         let title = tab_title(
             0,
             Some("/Users/andylee/McDull/OpenCode"),
             Some("opencode upgrade"),
         );
-        assert_eq!(title.compact, "OpenCode·opencode upgrade");
+        assert_eq!(title.compact, "OpenCode • opencode upgrade");
+        assert_eq!(weft_core::grid::terminal_char_width('•'), 1);
         assert_eq!(
             title.tooltip,
-            "/Users/andylee/McDull/OpenCode · opencode upgrade"
+            "/Users/andylee/McDull/OpenCode • opencode upgrade"
         );
     }
 
@@ -486,10 +487,10 @@ mod tests {
             Some("/Users/andylee/McDull/Claude/projects/weft"),
             Some("cargo test --workspace"),
         );
-        assert_eq!(title.compact, "weft·cargo test --workspace");
+        assert_eq!(title.compact, "weft • cargo test --workspace");
         assert!(title
             .tooltip
-            .starts_with("/Users/andylee/McDull/Claude/projects/weft · "));
+            .starts_with("/Users/andylee/McDull/Claude/projects/weft • "));
     }
 
     #[test]

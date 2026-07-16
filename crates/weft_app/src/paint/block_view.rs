@@ -10,7 +10,7 @@
 use std::rc::Rc;
 
 use crate::block_component::{
-    block_presentation, command_resume_hints, spinner_char_for_phase, BlockTone,
+    block_presentation, command_resume_hints, live_context_label, spinner_char_for_phase, BlockTone,
 };
 use crate::paint::block_view::actions::{push_block_header_actions, BlockHeaderActionPaint};
 use crate::paint::block_view_model::BlockViewPaintModel;
@@ -68,7 +68,7 @@ impl MetalRenderer {
         let bg_uv = [su, sv + svh, su + suw, sv];
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let cwd_header_active = cwd.is_some();
+        let cwd_header_active = cwd.is_some() && live.is_none();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
         let left = layout.left;
@@ -84,7 +84,8 @@ impl MetalRenderer {
             theme_bg,
         );
 
-        if let Some(cwd) = cwd {
+        if cwd_header_active {
+            let cwd = cwd.expect("active fixed CWD has text");
             let fixed_y = layout.fixed_cwd_y;
             push_quad(
                 &mut verts,
@@ -126,6 +127,9 @@ impl MetalRenderer {
             LiveCommand {
                 command: &'a str,
             },
+            LiveHeader {
+                text: String,
+            },
             Blank,
         }
 
@@ -158,6 +162,11 @@ impl MetalRenderer {
             row_data.push(LaidRow::LiveCommand {
                 command: live.command,
             });
+            if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch) {
+                cursor_dist += pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::LiveHeader { text });
+            }
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Separator);
@@ -294,6 +303,15 @@ impl MetalRenderer {
                         kind: weft_core::selection::BlockViewRowKind::Header,
                         text: text.clone(),
                         block_id: Some(*block_id),
+                        y_top: y,
+                        y_bottom: y + pitch,
+                    });
+                }
+                LaidRow::LiveHeader { text } => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::Header,
+                        text: text.clone(),
+                        block_id: None,
                         y_top: y,
                         y_bottom: y + pitch,
                     });
@@ -529,7 +547,6 @@ impl MetalRenderer {
                         BlockTone::Success => dim,
                         BlockTone::Error => color_to_normalized(ui.error),
                         BlockTone::Warning => color_to_normalized(ui.warning),
-                        BlockTone::Running => color_to_normalized(ui.focus),
                     };
                     self.push_text(&mut verts, left, y, text, color, cols);
 
@@ -548,6 +565,17 @@ impl MetalRenderer {
                             cell_height: ch,
                             foreground: fg,
                         },
+                    );
+                }
+                LaidRow::LiveHeader { text } => {
+                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                    self.push_text(
+                        &mut verts,
+                        left,
+                        y,
+                        text,
+                        color_to_normalized(ui.focus),
+                        cols,
                     );
                 }
                 LaidRow::Separator => {

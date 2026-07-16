@@ -614,9 +614,9 @@ fn block_visible_rows_use_clamped_prompt_height() {
 }
 
 #[test]
-fn cwd_header_remains_reserved_while_a_command_runs() {
+fn fixed_cwd_header_is_reserved_only_for_the_editor() {
     assert!(block_cwd_header_active(true, true));
-    assert!(block_cwd_header_active(false, true));
+    assert!(!block_cwd_header_active(false, true));
     assert!(!block_cwd_header_active(true, false));
     assert!(!block_cwd_header_active(false, false));
 }

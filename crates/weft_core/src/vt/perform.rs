@@ -5,6 +5,21 @@ use super::Terminal;
 use crate::blocks::ShellPhase;
 use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
+impl Terminal {
+    /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
+    /// repeatedly use absolute cursor addressing to own the whole viewport.
+    pub fn primary_screen_app_active(&self) -> bool {
+        self.block_tracker.phase() == ShellPhase::CommandExecuting
+            && self.primary_screen_cursor_ops >= 2
+    }
+
+    fn note_primary_screen_cursor_addressing(&mut self) {
+        if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
+            self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
+        }
+    }
+}
+
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
         // v1.0 perf: vte only calls print() in ground state, so mark it.
@@ -315,6 +330,9 @@ impl vte::Perform for Terminal {
         }
 
         // Diagnostic: trace cursor-moving CSIs to pin down TUI cursor desync.
+        if matches!(action, 'H' | 'f' | 'G' | 'd') {
+            self.note_primary_screen_cursor_addressing();
+        }
         if matches!(
             action,
             'A' | 'B' | 'C' | 'D' | 'E' | 'F' | 'H' | 'f' | 'G' | 'd'
@@ -629,6 +647,7 @@ impl vte::Perform for Terminal {
                 if params.len() > 1 {
                     match params[1] {
                         b"A" => {
+                            self.primary_screen_cursor_ops = 0;
                             self.shell_markers.push(ShellMarker::PromptStart);
                             self.block_tracker.on_prompt_start();
                             // Clear the git branch: the precmd hook re-emits
@@ -643,6 +662,7 @@ impl vte::Perform for Terminal {
                             self.command_from_editor = None;
                         }
                         b"B" => {
+                            self.primary_screen_cursor_ops = 0;
                             self.shell_markers.push(ShellMarker::CommandStart);
                             // 133;B (preexec): if the editor submitted the
                             // command, record that; otherwise snapshot the grid
@@ -661,6 +681,7 @@ impl vte::Perform for Terminal {
                             self.block_tracker.on_command_output_start();
                         }
                         b"D" => {
+                            self.primary_screen_cursor_ops = 0;
                             let exit_code = if params.len() > 2 {
                                 std::str::from_utf8(params[2])
                                     .ok()

@@ -2,12 +2,10 @@
 //!
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
-
 mod attrs;
 mod grapheme;
 mod osc;
 mod perform;
-
 pub use attrs::{Attrs, ShellMarker};
 
 use crate::blocks::{BlockTracker, ShellPhase};
@@ -66,6 +64,7 @@ pub struct Terminal {
     /// Gates the printable-ASCII fast path while vte is in ground state.
     parser_in_ground_state: bool,
     suppress_joined_scalar: bool,
+    primary_screen_cursor_ops: u8,
 }
 
 impl Terminal {
@@ -95,8 +94,7 @@ impl Terminal {
             synchronized_output_started: None,
             sgr_mouse: false,
             palette: Self::init_palette(),
-            // Alt screen has no scrollback: full-screen apps manage their own
-            // scrolling and history should not leak across invocations.
+            // Alt-screen apps manage their own scrolling and history.
             alt_grid: Grid::with_scrollback(rows, cols, 0),
             alt_active: false,
             saved_cursor: None,
@@ -105,6 +103,7 @@ impl Terminal {
             hyperlinks: HyperlinkRegistry::new(),
             parser_in_ground_state: true,
             suppress_joined_scalar: false,
+            primary_screen_cursor_ops: 0,
         }
     }
 
@@ -229,7 +228,9 @@ impl Terminal {
     /// CommandExecuting (blocks overlaid above the live grid) — the renderer
     /// distinguishes them via the prompt / shell phase.
     pub fn show_block_view(&self) -> bool {
-        self.block_tracker.bootstrap_ready() && !self.alt_active
+        self.block_tracker.bootstrap_ready()
+            && !self.alt_active
+            && !self.primary_screen_app_active()
     }
 
     /// Swap the primary and alternate screen buffers (DEC 1049/47).
@@ -538,11 +539,11 @@ impl Terminal {
     ///
     /// The **active** grid (whichever is currently displayed, i.e. `self.grid`
     /// after any alt-screen swap) is resized **dimension-only** when an
-    /// alt-screen TUI app is running, and **reflowed** otherwise. The
+    /// full-screen TUI app is running, and **reflowed** otherwise. The
     /// **inactive** grid is always reflowed so it is correct when swapped to.
     ///
-    /// Why dimension-only for the active alt-screen grid: apps like `less`,
-    /// `vim`, `man` paint with absolute cursor positioning at a fixed width and
+    /// Why dimension-only for the active TUI grid: apps like `less`, `vim`,
+    /// `man` and Claude paint with absolute cursor positioning at a fixed width and
     /// repaint themselves on SIGWINCH. Reflowing (rewrapping) their content
     /// mid-drag — while SIGWINCH is still debounced and undelivered — moves
     /// their characters to wrong cells, producing the "content squished into
@@ -550,8 +551,8 @@ impl Terminal {
     /// SIGWINCH finally fires and the app repaints). Alacritty/Warp apply the
     /// same rule: never reflow the active screen during a TUI app's lifetime.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        if self.alt_active {
-            // self.grid IS the alt grid (swapped in). Dimension-only so the
+        if self.alt_active || self.primary_screen_app_active() {
+            // self.grid is TUI-owned. Dimension-only so the
             // running TUI app owns its layout until it repaints on SIGWINCH.
             // self.alt_grid IS the hidden primary grid — reflow it so it is
             // correct when the app exits and swaps back.
