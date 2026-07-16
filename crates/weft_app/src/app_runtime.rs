@@ -225,10 +225,6 @@ impl ApplicationHandler<AppEvent> for App {
         // is needed — the initial tab already has the right cwd.
         if let Some(store) = self.sessions.block_store() {
             let snaps_result = store.load_tabs();
-            // Clear saved tabs now so the immutable borrow of self.sessions
-            // ends before the mutations below. The periodic auto-save will
-            // re-persist the live state.
-            let _ = store.clear_tabs();
             match snaps_result {
                 Ok(snaps) if !snaps.is_empty() => {
                     info!(count = snaps.len(), "restoring saved tab snapshots");
@@ -286,7 +282,8 @@ impl ApplicationHandler<AppEvent> for App {
                             self.sessions.push_tab(tab);
                         }
                     }
-                    self.sessions.set_active(0);
+                    let active = weft_core::persistence::TabSnapshot::restored_active_index(&snaps);
+                    self.sessions.set_active(active);
                     info!(restored = total, "tab snapshots restored");
                 }
                 Ok(_) => {

@@ -99,7 +99,7 @@ impl App {
             .tabs()
             .iter()
             .enumerate()
-            .filter_map(|(i, tab)| tab.to_snapshot(i))
+            .filter_map(|(i, tab)| tab.to_snapshot(i, i == self.sessions.active_idx()))
             .collect();
         if let Err(e) = store.save_tabs(&snaps) {
             tracing::warn!(error = %e, "failed to save tab snapshots");

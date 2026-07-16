@@ -48,6 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_blocks_started ON blocks(started_ms);\
 CREATE TABLE IF NOT EXISTS tabs (\
     id                  INTEGER PRIMARY KEY,\
     position            INTEGER NOT NULL,\
+    active              INTEGER NOT NULL DEFAULT 0,\
     cwd                 TEXT,\
     block_scroll_offset INTEGER NOT NULL DEFAULT 0,\
     editor_buffer       TEXT,\
@@ -65,6 +66,9 @@ CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);";
 pub struct TabSnapshot {
     /// Position in the tab bar (0-based).
     pub position: usize,
+    /// Whether this was the active tab when the snapshot was saved.
+    #[serde(default)]
+    pub active: bool,
     /// Working directory at save time (from shell integration).
     pub cwd: Option<String>,
     /// Block-view scroll offset.
@@ -77,6 +81,15 @@ pub struct TabSnapshot {
 }
 
 impl TabSnapshot {
+    /// Index to activate after ordered snapshots are restored. Legacy data
+    /// has no active marker and therefore safely falls back to the first tab.
+    pub fn restored_active_index(snapshots: &[Self]) -> usize {
+        snapshots
+            .iter()
+            .position(|snapshot| snapshot.active)
+            .unwrap_or(0)
+    }
+
     /// v1.0 H4: Serialize an [`EditorBuffer`](crate::editor::EditorBuffer)
     /// to a JSON string for storage. Returns `"{}"` on serialization
     /// failure (so a corrupt buffer doesn't block the save).
@@ -101,6 +114,22 @@ impl BlockStore {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // CREATE TABLE IF NOT EXISTS does not evolve databases created by an
+        // older Weft version, so migrate the D5 active-tab field explicitly.
+        let has_active = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tabs)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            columns
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "active")
+        };
+        if !has_active {
+            conn.execute(
+                "ALTER TABLE tabs ADD COLUMN active INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -165,10 +194,11 @@ impl BlockStore {
         tx.execute("DELETE FROM tabs", [])?;
         for snap in snapshots {
             tx.execute(
-                "INSERT INTO tabs (id, position, cwd, block_scroll_offset, editor_buffer, shell_phase) \
-                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase) \
+                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     snap.position as i64,
+                    snap.active as i64,
                     snap.cwd.as_deref().unwrap_or(""),
                     snap.block_scroll_offset as i64,
                     &snap.editor_buffer,
@@ -185,7 +215,7 @@ impl BlockStore {
     /// or after [`clear_tabs`]).
     pub fn load_tabs(&self) -> Result<Vec<TabSnapshot>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT position, cwd, block_scroll_offset, editor_buffer, shell_phase \
+            "SELECT position, active, cwd, block_scroll_offset, editor_buffer, shell_phase \
              FROM tabs ORDER BY position ASC",
         )?;
         let rows = stmt.query_map([], row_to_tab_snapshot)?;
@@ -201,9 +231,9 @@ impl BlockStore {
         Ok(out)
     }
 
-    /// v1.0 H4: Delete every saved tab snapshot. Used on startup after
-    /// restoring so a crash during the session doesn't re-restore stale
-    /// tabs on the next launch.
+    /// v1.0 H4: Delete every saved tab snapshot for an explicit session reset.
+    /// Normal startup deliberately retains the last atomic snapshot until the
+    /// next save replaces it, so an early crash cannot erase recovery data.
     pub fn clear_tabs(&self) -> Result<(), PersistenceError> {
         self.conn.execute("DELETE FROM tabs", [])?;
         Ok(())
@@ -234,12 +264,14 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
 /// v1.0 H4: Decode a stored row into a [`TabSnapshot`].
 fn row_to_tab_snapshot(row: &rusqlite::Row) -> rusqlite::Result<TabSnapshot> {
     let position: i64 = row.get(0)?;
-    let cwd: String = row.get(1)?;
-    let block_scroll_offset: i64 = row.get(2)?;
-    let editor_buffer: String = row.get(3)?;
-    let shell_phase: String = row.get(4)?;
+    let active: bool = row.get(1)?;
+    let cwd: String = row.get(2)?;
+    let block_scroll_offset: i64 = row.get(3)?;
+    let editor_buffer: String = row.get(4)?;
+    let shell_phase: String = row.get(5)?;
     Ok(TabSnapshot {
         position: position as usize,
+        active,
         cwd: Some(cwd),
         block_scroll_offset: block_scroll_offset as usize,
         editor_buffer,
@@ -423,6 +455,7 @@ mod tests {
     fn snapshot(position: usize, cwd: &str, scroll: usize, phase: &str) -> TabSnapshot {
         TabSnapshot {
             position,
+            active: position == 1,
             cwd: Some(cwd.to_string()),
             block_scroll_offset: scroll,
             editor_buffer: r#"{"lines":["ls -la"],"cursor":[0,7],"selection_anchor":null}"#
@@ -442,12 +475,26 @@ mod tests {
         let loaded = store.load_tabs().unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].position, 0);
+        assert!(!loaded[0].active);
         assert_eq!(loaded[0].cwd.as_deref(), Some("/home/user"));
         assert_eq!(loaded[0].block_scroll_offset, 3);
         assert_eq!(loaded[0].shell_phase, "AtPrompt");
         assert_eq!(loaded[1].position, 1);
+        assert!(loaded[1].active);
         assert_eq!(loaded[1].cwd.as_deref(), Some("/tmp"));
         assert_eq!(loaded[1].shell_phase, "CommandExecuting");
+    }
+
+    #[test]
+    fn restored_active_index_uses_marker_and_falls_back_for_legacy_data() {
+        let mut snaps = vec![
+            snapshot(0, "/a", 0, "AtPrompt"),
+            snapshot(1, "/b", 0, "AtPrompt"),
+        ];
+        assert_eq!(TabSnapshot::restored_active_index(&snaps), 1);
+        snaps[1].active = false;
+        assert_eq!(TabSnapshot::restored_active_index(&snaps), 0);
+        assert_eq!(TabSnapshot::restored_active_index(&[]), 0);
     }
 
     #[test]
@@ -530,6 +577,36 @@ mod tests {
     }
 
     #[test]
+    fn open_migrates_legacy_tabs_without_losing_snapshots() {
+        let path = std::env::temp_dir().join(format!(
+            "weft-tabs-legacy-{}-{}.db",
+            std::process::id(),
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tabs (\
+                    id INTEGER PRIMARY KEY, position INTEGER NOT NULL, cwd TEXT,\
+                    block_scroll_offset INTEGER NOT NULL DEFAULT 0,\
+                    editor_buffer TEXT, shell_phase TEXT\
+                 );\
+                 INSERT INTO tabs (position, cwd, block_scroll_offset, editor_buffer, shell_phase)\
+                 VALUES (0, '/legacy', 4, '{}', 'AtPrompt');",
+            )
+            .unwrap();
+        }
+        let store = BlockStore::open(&path).unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].cwd.as_deref(), Some("/legacy"));
+        assert_eq!(loaded[0].block_scroll_offset, 4);
+        assert!(!loaded[0].active, "legacy snapshots default to first tab");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn encode_decode_editor_buffer_roundtrip() {
         use crate::editor::EditorBuffer;
         let buf = EditorBuffer {
@@ -570,6 +647,7 @@ mod tests {
         };
         let snap = TabSnapshot {
             position: 0,
+            active: true,
             cwd: Some("/home/user".to_string()),
             block_scroll_offset: 2,
             editor_buffer: TabSnapshot::encode_editor_buffer(&buf),

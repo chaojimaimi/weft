@@ -416,7 +416,11 @@ impl Tab {
     /// The PTY itself is NOT serialized (impossible to revive). On
     /// restore, the tab shows the saved editor draft + block history;
     /// the user presses Enter to spawn a fresh shell in the saved cwd.
-    pub fn to_snapshot(&self, position: usize) -> Option<weft_core::persistence::TabSnapshot> {
+    pub fn to_snapshot(
+        &self,
+        position: usize,
+        active: bool,
+    ) -> Option<weft_core::persistence::TabSnapshot> {
         let terminal = self.terminal.as_ref()?;
         let cwd = terminal.cwd().map(|s| s.to_string());
         let editor_buffer =
@@ -428,6 +432,7 @@ impl Tab {
         };
         Some(weft_core::persistence::TabSnapshot {
             position,
+            active,
             cwd,
             block_scroll_offset: self.block_scroll(),
             editor_buffer,
@@ -681,7 +686,7 @@ mod tests {
     fn snapshot_is_none_when_no_terminal() {
         // Tab::empty has no terminal → to_snapshot returns None.
         let t = Tab::empty();
-        assert!(t.to_snapshot(0).is_none());
+        assert!(t.to_snapshot(0, false).is_none());
     }
 
     #[test]
@@ -695,8 +700,9 @@ mod tests {
             .buffer
             .set_text("echo hi");
 
-        let snap = t.to_snapshot(2).expect("snapshot with terminal");
+        let snap = t.to_snapshot(2, true).expect("snapshot with terminal");
         assert_eq!(snap.position, 2);
+        assert!(snap.active);
         assert_eq!(snap.block_scroll_offset, 7);
         assert!(!snap.editor_buffer.is_empty(), "editor buffer encoded");
 
@@ -712,7 +718,7 @@ mod tests {
     fn snapshot_default_shell_phase_is_not_integrated() {
         // A fresh Terminal has NotIntegrated phase → snapshot encodes that.
         let t = tab_with_terminal(1000);
-        let snap = t.to_snapshot(0).unwrap();
+        let snap = t.to_snapshot(0, false).unwrap();
         assert_eq!(snap.shell_phase, "NotIntegrated");
     }
 
@@ -720,7 +726,7 @@ mod tests {
     fn snapshot_cwd_none_when_unset() {
         // No OSC 7 received → cwd is None in the snapshot.
         let t = tab_with_terminal(1000);
-        let snap = t.to_snapshot(0).unwrap();
+        let snap = t.to_snapshot(0, false).unwrap();
         assert!(snap.cwd.is_none());
     }
 
@@ -730,6 +736,7 @@ mod tests {
         let mut t = tab_with_terminal(1000);
         let snap = weft_core::persistence::TabSnapshot {
             position: 0,
+            active: false,
             cwd: None,
             block_scroll_offset: 3,
             editor_buffer: "{not valid json".to_string(),
