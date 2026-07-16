@@ -375,7 +375,7 @@ impl App {
         renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
             blocks: terminal.block_tracker().session_blocks(),
             region_bottom_y,
-            cwd: editor_mode.then(|| terminal.cwd()).flatten(),
+            cwd: terminal.cwd(),
             git_branch: terminal.git_branch(),
             live: (!editor_mode)
                 .then(|| terminal.block_tracker().in_flight())

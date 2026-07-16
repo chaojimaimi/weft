@@ -2,8 +2,8 @@
 
 use crate::layout::{completion_window, layout_completion, CompletionLayout, LayoutCtx};
 use crate::scene::{FocusId, HitRegion, Scene, SemanticNode, SemanticRole};
-use unicode_width::UnicodeWidthStr;
 use weft_core::complete::Match;
+use weft_core::grid::terminal_text_width;
 
 const RESIZE_HOT_ZONE: f32 = 8.0;
 
@@ -39,7 +39,7 @@ pub(crate) fn derive_completion_layout(
     );
     let max_label_cols = matches[start..end]
         .iter()
-        .map(|candidate| UnicodeWidthStr::width_cjk(candidate.label.as_str()))
+        .map(|candidate| terminal_text_width(candidate.label.as_str()))
         .max()
         .unwrap_or(10);
     Some(layout_completion(

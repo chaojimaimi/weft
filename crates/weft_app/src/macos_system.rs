@@ -222,17 +222,17 @@ pub(super) fn load_window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba.into_raw(), w, h).ok()
 }
 
-/// v1.0 Logo: PNG bytes for each logo variant. Each variant ships its own
-/// 256×256 PNG (rendered from `assets/logo/variants/{variant}.svg`); the
-/// runtime switches Dock icon by loading the matching bytes via NSImage.
-fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
+/// Multi-resolution ICNS bytes used for runtime Dock variants. A single PNG
+/// is treated by Dock as an unscaled replacement and can remain magnified or
+/// overlap the running indicator; ICNS lets AppKit choose the native rep.
+fn logo_icns_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     use weft_core::config::LogoVariant;
     match variant {
-        LogoVariant::Cool => include_bytes!("../../../assets/logo/variants/png/cool-256.png"),
-        LogoVariant::Warm => include_bytes!("../../../assets/logo/variants/png/warm-256.png"),
-        LogoVariant::Light => include_bytes!("../../../assets/logo/variants/png/light-256.png"),
+        LogoVariant::Cool => include_bytes!("../../../assets/logo/variants/cool.icns"),
+        LogoVariant::Warm => include_bytes!("../../../assets/logo/variants/warm.icns"),
+        LogoVariant::Light => include_bytes!("../../../assets/logo/variants/light.icns"),
         LogoVariant::Transparent => {
-            include_bytes!("../../../assets/logo/variants/png/transparent-256.png")
+            include_bytes!("../../../assets/logo/variants/transparent.icns")
         }
     }
 }
@@ -287,10 +287,10 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
             tracing::info!("using bundled Dock icon");
             return;
         }
-        let png_bytes = logo_png_bytes(variant);
+        let icon_bytes = logo_icns_bytes(variant);
         let ns_data = NSData::dataWithBytes_length(
-            png_bytes.as_ptr() as *mut std::ffi::c_void,
-            png_bytes.len(),
+            icon_bytes.as_ptr() as *mut std::ffi::c_void,
+            icon_bytes.len(),
         );
         let ns_image = NSImage::initWithData(NSImage::alloc(), &ns_data);
         if let Some(image) = ns_image {
@@ -304,7 +304,7 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
 
 #[cfg(test)]
 mod tests {
-    use super::should_use_bundle_dock_icon;
+    use super::{logo_icns_bytes, should_use_bundle_dock_icon};
     use std::path::Path;
     use weft_core::config::LogoVariant;
 
@@ -317,5 +317,14 @@ mod tests {
             LogoVariant::Cool,
             Path::new("/tmp/target/release/weft")
         ));
+    }
+
+    #[test]
+    fn every_runtime_dock_variant_is_a_multiresolution_icns() {
+        for variant in LogoVariant::ALL {
+            let bytes = logo_icns_bytes(variant);
+            assert_eq!(&bytes[..4], b"icns");
+            assert!(bytes.len() > 200_000);
+        }
     }
 }

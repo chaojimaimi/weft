@@ -318,30 +318,22 @@ impl MetalRenderer {
             return;
         }
         let cw = self.cell_width() as f32;
-        let mut px = x_left;
-        let mut col = 0f32; // column units consumed
-        for (ci, c) in text.chars().enumerate() {
-            let w = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
-            if w == 0 {
-                continue;
-            }
-            if ci >= c_end {
-                break;
-            }
-            let cell_w = w as f32 * cw;
-            if ci >= c_start {
-                // This char is inside the highlight range.
-                push_quad(
-                    vertices,
-                    [px, y_top, px + cell_w, y_top + height],
-                    bg_uv,
-                    [0.0; 4], // fg mask: no text contribution (pure background)
-                    bg_color,
-                );
-            }
-            px += cell_w;
-            col += w as f32;
-            let _ = col; // (kept for symmetry with push_text's col accounting)
+        let prefix = text.chars().take(c_start).collect::<String>();
+        let selected = text
+            .chars()
+            .skip(c_start)
+            .take(c_end - c_start)
+            .collect::<String>();
+        let x_start = x_left + weft_core::grid::terminal_text_width(&prefix) as f32 * cw;
+        let cell_w = weft_core::grid::terminal_text_width(&selected) as f32 * cw;
+        if cell_w > 0.0 {
+            push_quad(
+                vertices,
+                [x_start, y_top, x_start + cell_w, y_top + height],
+                bg_uv,
+                [0.0; 4], // fg mask: no text contribution (pure background)
+                bg_color,
+            );
         }
     }
 }

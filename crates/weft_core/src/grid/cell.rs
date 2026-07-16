@@ -107,6 +107,36 @@ pub enum CellWidth {
     Full = 2,
 }
 
+/// Column width used by the terminal protocol. East Asian ambiguous symbols
+/// (box/block drawing, middle dot, ellipsis) stay one cell, matching xterm and
+/// the cursor math used by modern TUIs; CJK ideographs remain two cells.
+pub fn terminal_char_width(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+pub fn terminal_text_width(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// Atlas/grid fallback for a grapheme that cannot fit in the current
+/// one-scalar [`Cell`] representation. Never masquerade a partial base glyph
+/// as the whole cluster: unsupported narrow clusters use U+FFFD and wide
+/// clusters use a full-width question mark, preserving both visibility and
+/// terminal column width.
+pub fn terminal_grapheme_glyph(grapheme: &str) -> char {
+    let mut chars = grapheme.chars();
+    let Some(first) = chars.next() else {
+        return ' ';
+    };
+    if chars.next().is_none() {
+        first
+    } else if terminal_text_width(grapheme) > 1 {
+        '\u{ff1f}'
+    } else {
+        '\u{fffd}'
+    }
+}
+
 /// Terminal cell (~24 bytes).
 /// Design reference: Warp 24-byte Cell + Alacritty sparse extra.
 #[derive(Clone, Debug)]
@@ -132,7 +162,7 @@ impl Default for Cell {
 
 impl Cell {
     pub fn with_char(ch: char) -> Self {
-        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
+        let width = if terminal_char_width(ch) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -146,5 +176,24 @@ impl Cell {
 
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{terminal_char_width, terminal_grapheme_glyph, terminal_text_width};
+
+    #[test]
+    fn terminal_width_keeps_tui_drawing_symbols_single_cell() {
+        for ch in ['▀', '█', '▄', '┃', '·', '…'] {
+            assert_eq!(terminal_char_width(ch), 1, "{ch} must occupy one PTY cell");
+        }
+        assert_eq!(terminal_char_width('中'), 2);
+        assert_eq!(terminal_text_width("▀Big·Pickle中"), 13);
+        assert_eq!(terminal_text_width("👩‍🔬"), 2);
+        assert_eq!(terminal_text_width("*\u{fe0f}"), 2);
+        assert_eq!(terminal_grapheme_glyph("e\u{0301}"), '\u{fffd}');
+        assert_eq!(terminal_grapheme_glyph("👩‍🔬"), '\u{ff1f}');
+        assert_eq!(terminal_grapheme_glyph("*\u{fe0f}"), '\u{ff1f}');
     }
 }

@@ -8,14 +8,14 @@
 
 use crate::paint::primitives::{push_quad, syntax_color};
 use crate::renderer::MetalRenderer;
+use unicode_segmentation::UnicodeSegmentation;
 use weft_core::syntax;
 
 impl MetalRenderer {
     /// Column width of a character (0 for zero-width combining marks,
-    /// 1 for ASCII/narrow, 2 for CJK full-width including ambiguous-width
-    /// characters like ①②③ which are rendered full-width in CJK context).
+    /// 1 for ASCII and ambiguous terminal symbols, 2 for CJK full-width.
     pub(crate) fn char_col_width(c: char) -> usize {
-        unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0)
+        weft_core::grid::terminal_char_width(c)
     }
 
     /// Total column width of a string — sum of each char's display width.
@@ -23,9 +23,7 @@ impl MetalRenderer {
     /// calculation must match what `push_text` actually renders (CJK chars
     /// occupy 2 columns each, not 1).
     pub(crate) fn text_col_width(s: &str) -> usize {
-        s.chars()
-            .map(|c| unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0))
-            .sum()
+        weft_core::grid::terminal_text_width(s)
     }
 
     /// UV rect of the space glyph (background-only quads need mask 0).
@@ -58,15 +56,16 @@ impl MetalRenderer {
         let ch = self.cell_height() as f32;
         let mut col = 0usize;
         let mut px = x;
-        for c in text.chars() {
-            let w = Self::char_col_width(c);
+        for grapheme in text.graphemes(true) {
+            let w = weft_core::grid::terminal_text_width(grapheme);
             if w == 0 {
-                continue; // skip combining marks / zero-width
+                continue;
             }
             if col + w > max_cols {
                 break; // column budget exhausted
             }
-            let Some(g) = self.atlas.get(c) else {
+            let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
+            let Some(g) = self.atlas.get(glyph) else {
                 col += w;
                 px += w as f32 * cw;
                 continue;
@@ -106,15 +105,16 @@ impl MetalRenderer {
                 break;
             }
             let color = syntax_color(token.kind, &self.theme);
-            for c in token.text.chars() {
-                let w = Self::char_col_width(c);
+            for grapheme in token.text.graphemes(true) {
+                let w = weft_core::grid::terminal_text_width(grapheme);
                 if w == 0 {
                     continue;
                 }
                 if col + w > max_cols {
                     break;
                 }
-                if let Some(g) = self.atlas.get(c) {
+                let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
+                if let Some(g) = self.atlas.get(glyph) {
                     let (u, v) = g.uv_origin;
                     let (uw, vh) = g.uv_size;
                     let cell_w = w as f32 * cw;

@@ -15,6 +15,106 @@ fn synchronized_output_mode_tracks_open_tui_frame_boundaries() {
 }
 
 #[test]
+fn opentui_drawing_symbols_follow_single_cell_cursor_math() {
+    let mut t = Terminal::new(4, 80);
+    let line = "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀";
+    t.process(format!("\x1b[?2026h\x1b[2;5H{line}\x1b[?2026l").as_bytes());
+
+    assert_eq!(t.grid().cursor.col, 4 + line.chars().count());
+    for col in 4..t.grid().cursor.col {
+        let cell = t.grid().cell(1, col);
+        assert_eq!(
+            cell.width,
+            CellWidth::Half,
+            "{} at col {col}",
+            cell.character
+        );
+        assert!(!cell.flags.contains(CellFlags::WIDE_SPACER));
+    }
+
+    t.process("\x1b[3;5H█▄┃·…中".as_bytes());
+    assert_eq!(t.grid().cursor.col, 4 + 5 + 2);
+    assert_eq!(t.grid().cell(2, 9).character, '中');
+    assert_eq!(t.grid().cell(2, 9).width, CellWidth::Full);
+}
+
+#[test]
+fn zero_width_scalars_do_not_consume_grid_cells() {
+    let mut t = term();
+    t.process("e\u{0301}X".as_bytes());
+    assert_eq!(t.grid().row_text(0), "\u{fffd}X");
+    assert_eq!(t.grid().cell(0, 1).character, 'X');
+    assert_eq!(t.grid().cursor.col, 2);
+
+    let mut t = term();
+    t.process("👩‍🔬Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert_eq!(t.grid().cell(0, 2).character, 'Y');
+    assert_eq!(t.grid().cursor.col, 3);
+
+    let mut t = term();
+    t.process("*\u{fe0f}Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+    assert_eq!(t.grid().cell(0, 2).character, 'Y');
+    assert_eq!(t.grid().cursor.col, 3);
+
+    let mut t = term();
+    t.process("👩🏽Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().cell(0, 2).character, 'Y');
+    assert_eq!(t.grid().cursor.col, 3);
+
+    let mut t = term();
+    t.process("🇨🇳Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().cell(0, 2).character, 'Y');
+    assert_eq!(t.grid().cursor.col, 3);
+
+    let mut t = term();
+    t.process("A\u{200d}\nB".as_bytes());
+    assert_eq!(t.grid().cell(0, 0).character, '\u{fffd}');
+    assert_eq!(t.grid().cell(1, 0).character, 'B');
+
+    let mut t = term();
+    t.process("\u{200d}B".as_bytes());
+    assert_eq!(t.grid().cell(0, 0).character, 'B');
+
+    let mut t = term();
+    t.process("A\u{200d}\x1b[2CB".as_bytes());
+    assert_eq!(t.grid().cell(0, 0).character, '\u{fffd}');
+    assert_eq!(t.grid().cell(0, 3).character, 'B');
+
+    let mut t = Terminal::new(4, 2);
+    t.process("A*\u{fe0f}Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "A");
+    assert_eq!(t.grid().row_text(1), "\u{ff1f}");
+    assert_eq!(t.grid().row_text(2), "Y");
+
+    let mut t = Terminal::new(4, 2);
+    t.process("A🇨🇳Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "A");
+    assert_eq!(t.grid().row_text(1), "\u{ff1f}");
+    assert_eq!(t.grid().row_text(2), "Y");
+
+    let mut t = Terminal::new(4, 4);
+    t.process("ABC*\u{fe0f}Y".as_bytes());
+    assert_eq!(t.grid().row_text(0), "ABC");
+    assert_eq!(t.grid().row_text(1), "\u{ff1f}Y");
+    assert_eq!(t.grid().cell(1, 2).character, 'Y');
+
+    let mut t = Terminal::new(3, 2);
+    t.process(b"\x1b[2;1H\x1b]8;;https://weft.dev/stale\x1b\\X\x1b]8;;\x1b\\");
+    assert_eq!(t.hyperlinks().url_at(1, 0), Some("https://weft.dev/stale"));
+    t.process("\x1b[1;2H*\u{fe0f}".as_bytes());
+    assert_eq!(t.grid().cell(1, 0).character, '\u{ff1f}');
+    assert_eq!(t.hyperlinks().url_at(1, 0), None);
+    assert_eq!(t.hyperlinks().url_at(1, 1), None);
+}
+
+#[test]
 fn synchronized_output_watchdog_releases_a_missing_reset() {
     let mut t = term();
     let now = std::time::Instant::now();

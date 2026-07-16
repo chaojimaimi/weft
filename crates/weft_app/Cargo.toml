@@ -45,6 +45,7 @@ core-foundation.workspace = true
 font-kit.workspace = true
 pathfinder_geometry.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 crossbeam-channel.workspace = true

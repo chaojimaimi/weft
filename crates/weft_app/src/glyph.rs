@@ -436,7 +436,7 @@ impl GlyphAtlas {
         }
 
         // Determine which font to use
-        let is_wide = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1;
+        let is_wide = weft_core::grid::terminal_char_width(ch) > 1;
         let is_emoji = is_emoji_char(ch);
 
         let font = if is_emoji {
@@ -959,6 +959,40 @@ mod transform_probe {
             GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28, false, descent_px(&font, 28.0));
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
+    }
+
+    #[test]
+    fn unsupported_grapheme_fallbacks_rasterize_with_matching_cell_width() {
+        let cases = [
+            ("/System/Library/Fonts/Menlo.ttc", '\u{fffd}', false, 14),
+            (
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                '\u{ff1f}',
+                true,
+                28,
+            ),
+        ];
+        for (path, ch, is_wide, glyph_w) in cases {
+            let font = Font::from_path(path, 0).unwrap();
+            assert!(
+                font.glyph_for_char(ch).is_some(),
+                "{path} must contain {ch}"
+            );
+            let px = GlyphAtlas::rasterize_glyph(
+                &font,
+                ch,
+                28.0,
+                glyph_w,
+                28,
+                is_wide,
+                descent_px(&font, 28.0),
+            );
+            assert!(px.iter().any(|value| *value > 0), "{ch} must have ink");
+            assert_eq!(
+                weft_core::grid::terminal_char_width(ch),
+                if is_wide { 2 } else { 1 }
+            );
+        }
     }
 
     #[test]

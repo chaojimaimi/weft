@@ -383,19 +383,22 @@ impl MetalRenderer {
             (find.query.clone(), cx)
         } else {
             // Truncate from left: walk chars in reverse, keep the tail.
-            let mut kept: Vec<char> = Vec::new();
-            let mut w = 1usize; // reserve 1 for "…"
-            for c in find.query.chars().rev() {
-                let cw_char = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
-                if w + cw_char > query_budget {
+            use unicode_segmentation::UnicodeSegmentation;
+            let mut kept: Vec<&str> = Vec::new();
+            let mut w = weft_core::grid::terminal_text_width("…");
+            for grapheme in find.query.graphemes(true).rev() {
+                let width = weft_core::grid::terminal_text_width(grapheme);
+                if w + width > query_budget {
                     break;
                 }
-                kept.push(c);
-                w += cw_char;
+                kept.push(grapheme);
+                w += width;
             }
             kept.reverse();
             let mut s = String::from("…");
-            s.extend(kept.iter());
+            for grapheme in kept {
+                s.push_str(grapheme);
+            }
             let cx = query_start_x + w as f32 * cw;
             (s, cx)
         };

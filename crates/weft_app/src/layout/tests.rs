@@ -443,8 +443,8 @@ fn find_layout_preserves_popup_and_button_geometry() {
     assert_eq!(layout.line_y, 26.0);
     assert_eq!(layout.regex_rect, [943.0, 24.0, 965.0, 48.0]);
     assert_eq!(layout.case_rect, [916.0, 24.0, 938.0, 48.0]);
-    assert_eq!(layout.down_rect, Some([889.0, 24.0, 911.0, 48.0]));
-    assert_eq!(layout.up_rect, Some([862.0, 24.0, 884.0, 48.0]));
+    assert_eq!(layout.down_rect, Some([898.0, 24.0, 911.0, 48.0]));
+    assert_eq!(layout.up_rect, Some([880.0, 24.0, 893.0, 48.0]));
 }
 
 /// Click near right edge: menu clamps left so its right edge stays

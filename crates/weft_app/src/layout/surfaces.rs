@@ -342,7 +342,7 @@ pub fn layout_find(ctx: &LayoutCtx, total_matches: usize) -> FindLayout {
     let click_pad = 2.0;
     let gap_w = cw;
 
-    let text_width = |text: &str| unicode_width::UnicodeWidthStr::width_cjk(text) as f32 * cw;
+    let text_width = |text: &str| weft_core::grid::terminal_text_width(text) as f32 * cw;
     let regex_w = text_width(".*");
     let case_w = text_width("Aa");
     let down_w = text_width("↓");

@@ -1,8 +1,10 @@
 //! Pure presentation model for BlockView metadata.
 
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str};
+use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::{Block, BlockId};
 use weft_core::selection::BlockViewRowKind;
+use weft_core::vt::Terminal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
@@ -118,6 +120,58 @@ pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
     }
 }
 
+/// Total/visible BlockView rows used by scrollbar and input geometry.
+pub(crate) fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize, usize) {
+    use weft_core::blocks::ShellPhase;
+
+    let mut total = 0;
+    for block in terminal.block_tracker().session_blocks() {
+        if !block.collapsed {
+            total += command_resume_hints(block)
+                .iter()
+                .map(|hint| wrapped_row_count(hint, cols))
+                .sum::<usize>();
+            total += block
+                .output
+                .lines()
+                .map(|line| wrapped_row_count(line, cols))
+                .sum::<usize>();
+        }
+        total += 3; // command + header + gap
+    }
+    if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
+        if let Some(live) = terminal.block_tracker().in_flight() {
+            total += live
+                .output
+                .lines()
+                .map(|line| wrapped_row_count(line, cols))
+                .sum::<usize>();
+            total += 2; // command + gap
+        }
+    }
+    (total, terminal.grid().num_rows.max(1))
+}
+
+fn wrapped_row_count(text: &str, cols: usize) -> usize {
+    if cols == 0 {
+        return 1;
+    }
+    let mut rows = 1;
+    let mut col = 0;
+    for grapheme in text.graphemes(true) {
+        let width = weft_core::grid::terminal_text_width(grapheme);
+        if width == 0 {
+            continue;
+        }
+        if col + width > cols {
+            rows += 1;
+            col = 0;
+        }
+        col += width;
+    }
+    rows
+}
+
 /// F3-2: Braille spinner glyphs for the running-command activity indicator.
 /// Cycled left-to-right by `spinner_phase` (see `spinner_char_for_phase`).
 pub(crate) const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -190,6 +244,36 @@ mod tests {
         assert!(!command_resume_hints(&interrupted).is_empty());
         interrupted.exit_code = Some(0);
         assert!(command_resume_hints(&interrupted).is_empty());
+    }
+
+    #[test]
+    fn running_block_metrics_keep_fixed_cwd_out_of_scroll_rows() {
+        fn running_terminal(cwd: bool) -> Terminal {
+            let mut terminal = Terminal::new(24, 80);
+            if cwd {
+                terminal.process(b"\x1b]7;file://localhost/Users/me/.hermes\x07");
+            }
+            terminal.process(b"\x1b]133;A\x07hermes update\x1b]133;B\x07\x1b]133;C\x07");
+            terminal
+        }
+
+        assert_eq!(block_content_metrics(&running_terminal(false), 80).0, 2);
+        assert_eq!(block_content_metrics(&running_terminal(true), 80).0, 2);
+    }
+
+    #[test]
+    fn block_metrics_include_wrapped_resume_hint_rows() {
+        let mut terminal = Terminal::new(24, 80);
+        terminal.process(b"\x1b]133;A\x07opencode\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;130\x07");
+
+        assert_eq!(block_content_metrics(&terminal, 80).0, 5);
+        assert!(block_content_metrics(&terminal, 20).0 > 5);
+    }
+
+    #[test]
+    fn wrapped_rows_keep_emoji_graphemes_atomic() {
+        assert_eq!(wrapped_row_count("A👩‍🔬B", 4), 1);
+        assert_eq!(wrapped_row_count("A👩‍🔬B", 3), 2);
     }
 
     #[test]

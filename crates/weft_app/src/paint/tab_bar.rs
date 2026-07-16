@@ -494,14 +494,9 @@ mod tests {
 
     #[test]
     fn cjk_tooltip_is_truncated_by_display_columns() {
-        use unicode_width::UnicodeWidthChar;
-
         let title = tab_title(0, Some("/用户/项目目录"), Some("运行升级命令"));
         let display = crate::paint::ui_helpers::truncate_to_columns(&title.tooltip, 12);
-        let width: usize = display
-            .chars()
-            .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
-            .sum();
+        let width = weft_core::grid::terminal_text_width(&display);
         assert!(width <= 12);
         assert!(display.ends_with('…'));
     }

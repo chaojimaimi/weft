@@ -3,7 +3,7 @@ use super::osc::{parse_osc7_cwd, parse_x11_color};
 use super::param;
 use super::Terminal;
 use crate::blocks::ShellPhase;
-use crate::grid::{CellFlags, CellWidth, CursorStyle};
+use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
@@ -31,6 +31,43 @@ impl vte::Perform for Terminal {
             self.block_tracker.on_print(c);
         }
 
+        if self.suppress_joined_scalar && terminal_char_width(c) > 0 {
+            self.suppress_joined_scalar = false;
+            return;
+        }
+
+        let is_emoji_modifier = matches!(c, '\u{1f3fb}'..='\u{1f3ff}');
+        let is_regional_indicator = matches!(c, '\u{1f1e6}'..='\u{1f1ff}');
+        let follows_regional_indicator = is_regional_indicator
+            && self.previous_cell_position().is_some_and(|(row, col)| {
+                matches!(
+                    self.grid.viewport[row].cells[col].character,
+                    '\u{1f1e6}'..='\u{1f1ff}'
+                )
+            });
+        if is_emoji_modifier && self.replace_previous_grapheme(false) {
+            return;
+        }
+        if follows_regional_indicator && self.replace_previous_grapheme(true) {
+            return;
+        }
+
+        // Cell stores one base scalar. Combining marks, ZWJ and variation
+        // selectors therefore cannot be retained yet, but they must never
+        // consume a terminal column or trigger a deferred wrap.
+        let scalar_width = if c.is_ascii() {
+            1
+        } else {
+            terminal_char_width(c)
+        };
+        if scalar_width == 0 {
+            let replaced = self.replace_previous_grapheme(c == '\u{fe0f}');
+            if c == '\u{200d}' && replaced {
+                self.suppress_joined_scalar = true;
+            }
+            return;
+        }
+
         // Handle deferred wrap
         if self.grid.cursor.wrap_pending {
             self.grid.cursor.wrap_pending = false;
@@ -52,9 +89,7 @@ impl vte::Perform for Terminal {
         // This skips the unicode_width lookup for the common case (terminal
         // output is predominantly ASCII: digits, letters, punctuation).
         // For 58KB of `seq` output, this saves ~58000 lookup calls.
-        let width = if c.is_ascii() {
-            CellWidth::Half
-        } else if unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0) > 1 {
+        let width = if scalar_width > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -196,6 +231,7 @@ impl vte::Perform for Terminal {
     }
 
     fn execute(&mut self, byte: u8) {
+        self.suppress_joined_scalar = false;
         match byte {
             0x07 => { /* BEL — bell, ignored in v0.1 */ }
             0x08 => {
@@ -249,6 +285,7 @@ impl vte::Perform for Terminal {
         _ignore: bool,
         action: char,
     ) {
+        self.suppress_joined_scalar = false;
         // DECRQM private-mode query: CSI ? Ps $ p. OpenTUI probes mode 2026
         // before using synchronized updates. Report it as supported and
         // currently set/reset; unknown modes remain unsupported (0).
@@ -486,6 +523,7 @@ impl vte::Perform for Terminal {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.suppress_joined_scalar = false;
         match (intermediates, byte) {
             (&[], 0x37) => self.grid.save_cursor(),    // DECSC
             (&[], 0x38) => self.grid.restore_cursor(), // DECRC
@@ -519,6 +557,7 @@ impl vte::Perform for Terminal {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.suppress_joined_scalar = false;
         if params.is_empty() {
             return;
         }
@@ -645,14 +684,17 @@ impl vte::Perform for Terminal {
     }
 
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+        self.suppress_joined_scalar = false;
         tracing::trace!(action = ?action, "DCS hook (ignored in v0.1)");
     }
 
     fn put(&mut self, _byte: u8) {
+        self.suppress_joined_scalar = false;
         // DCS data — ignored in v0.1
     }
 
     fn unhook(&mut self) {
+        self.suppress_joined_scalar = false;
         // DCS end — ignored in v0.1
     }
 }

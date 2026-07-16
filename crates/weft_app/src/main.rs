@@ -59,6 +59,7 @@ use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
     SessionManager, SettingsState, TabBarState, WindowRuntimeState,
 };
+use block_component::block_content_metrics;
 use effect::Effect;
 use input_router::{OverlayInputContext, OverlayInputOwner};
 use macos_system::{
@@ -1000,67 +1001,6 @@ impl App {
 ///
 /// A marker is only recognized when followed by a space (so `$HOME` in a
 /// command is not mistaken for a `$` prompt).
-/// Estimate the total block-view content rows and the visible viewport rows
-/// for scroll clamping. This mirrors the row accounting in
-/// `build_block_view_vertices`: per block = output lines (wrapped at `cols`)
-/// + command line + header line + separator gap.
-fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize, usize) {
-    use weft_core::blocks::ShellPhase;
-
-    let blocks = terminal.block_tracker().session_blocks();
-    let mut total: usize = 0;
-    for b in blocks {
-        if !b.collapsed {
-            for line in b.output.lines() {
-                total += wrapped_row_count(line, cols);
-            }
-        }
-        total += 1; // command line
-        total += 1; // header line
-        total += 1; // separator gap
-    }
-    // Live block during CommandExecuting: output + command + gap.
-    if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
-        if let Some(live) = terminal.block_tracker().in_flight() {
-            for line in live.output.lines() {
-                total += wrapped_row_count(line, cols);
-            }
-            total += 2; // command + gap
-        }
-    } else {
-        // Editor mode: cwd header line.
-        total += 1;
-    }
-
-    // Visible rows: the block region height / cell height.
-    let renderer_cell_h = 1; // placeholder; computed from terminal grid rows
-    let grid_rows = terminal.grid().num_rows;
-    let visible = grid_rows.max(1);
-    let _ = renderer_cell_h;
-    (total, visible)
-}
-
-/// Count how many visual rows a text line occupies when wrapped at `cols`.
-fn wrapped_row_count(text: &str, cols: usize) -> usize {
-    if cols == 0 {
-        return 1;
-    }
-    let mut rows = 1;
-    let mut col = 0usize;
-    for c in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if w == 0 {
-            continue;
-        }
-        if col + w > cols {
-            rows += 1;
-            col = 0;
-        }
-        col += w;
-    }
-    rows.max(1)
-}
-
 fn strip_prompt_prefix(s: &str) -> String {
     // Patterns: "❯ ", "❮ ", "› ", "$ ", "% ", "# " — the marker + space.
     let markers = ["❯ ", "❮ ", "› ", "$ ", "% ", "# "];

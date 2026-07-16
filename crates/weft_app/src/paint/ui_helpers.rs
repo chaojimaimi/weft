@@ -143,34 +143,29 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     t
 }
 
-/// Truncate with the same CJK column model used by the text renderer.
+/// Truncate with the same terminal-column model used by the text renderer.
 pub(crate) fn truncate_to_columns(s: &str, max_cols: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
 
     if max_cols == 0 {
         return String::new();
     }
-    let display_width = |text: &str| {
-        text.chars()
-            .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
-            .sum::<usize>()
-    };
-    if display_width(s) <= max_cols {
+    if weft_core::grid::terminal_text_width(s) <= max_cols {
         return s.to_string();
     }
-    let ellipsis_width = UnicodeWidthChar::width_cjk('…').unwrap_or(0);
+    let ellipsis_width = weft_core::grid::terminal_char_width('…');
     if ellipsis_width > max_cols {
         return String::new();
     }
     let budget = max_cols - ellipsis_width;
     let mut used = 0;
     let mut output = String::new();
-    for ch in s.chars() {
-        let width = UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let width = weft_core::grid::terminal_text_width(grapheme);
         if used + width > budget {
             break;
         }
-        output.push(ch);
+        output.push_str(grapheme);
         used += width;
     }
     output.push('…');
@@ -214,19 +209,14 @@ mod tests {
 
     #[test]
     fn display_column_truncation_keeps_cjk_inside_budget() {
-        use unicode_width::UnicodeWidthChar;
-
-        let width = |text: &str| {
-            text.chars()
-                .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
-                .sum::<usize>()
-        };
+        let width = weft_core::grid::terminal_text_width;
 
         let text = truncate_to_columns("项目目录·运行命令", 8);
         assert_eq!(text, "项目目…");
         assert!(width(&text) <= 8);
-        assert_eq!(truncate_to_columns("abcdef", 4), "ab…");
+        assert_eq!(truncate_to_columns("abcdef", 4), "abc…");
         assert!(width(&truncate_to_columns("①·…", 4)) <= 4);
+        assert_eq!(truncate_to_columns("👩‍🔬abc", 3), "👩‍🔬…");
     }
     use weft_core::blocks::BlockId;
 

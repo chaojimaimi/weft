@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::Block;
 
 /// Iterator yielding wrapped row chunks of `text` at `cols` columns. Each
@@ -26,8 +27,8 @@ pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = 
     }
     let mut current = String::new();
     let mut col = 0usize;
-    for c in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
+    for grapheme in text.graphemes(true) {
+        let w = weft_core::grid::terminal_text_width(grapheme);
         if w == 0 {
             continue;
         }
@@ -35,7 +36,7 @@ pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = 
             chunks.push(std::mem::take(&mut current));
             col = 0;
         }
-        current.push(c);
+        current.push_str(grapheme);
         col += w;
     }
     chunks.push(current);
@@ -245,6 +246,12 @@ mod tests {
         );
         assert_eq!(layout.lines[0].chunks[0], "0123456789");
         assert_eq!(layout.lines[0].chunks[1], "abcdefghij");
+    }
+
+    #[test]
+    fn wrapping_keeps_emoji_grapheme_clusters_atomic() {
+        let chunks: Vec<_> = wrap_line_chunks("A👩‍🔬B", 3).collect();
+        assert_eq!(chunks, ["A👩‍🔬", "B"]);
     }
 
     #[test]

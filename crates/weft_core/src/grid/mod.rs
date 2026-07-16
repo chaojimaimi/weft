@@ -1,15 +1,15 @@
 // arch-gate: allow-over-800
-// Grid struct + impl Grid (~1175 lines): scrollback, resize, reflow, and cell manipulation.
-// cell/row/cursor/scrollback to submodules; impl Grid is irreducible.
 //! Terminal grid: Cell, Row, Grid, Scrollback
-
 mod cell;
 mod cursor;
 mod display;
 mod row;
 mod scrollback;
 
-pub use cell::{Cell, CellColor, CellFlags, CellWidth, Color};
+pub use cell::{
+    terminal_char_width, terminal_grapheme_glyph, terminal_text_width, Cell, CellColor, CellFlags,
+    CellWidth, Color,
+};
 pub use cursor::{Cursor, CursorStyle};
 pub use row::Row;
 pub use scrollback::Scrollback;
@@ -163,7 +163,7 @@ impl Grid {
             }
         }
 
-        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
+        let width = if terminal_char_width(ch) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half
@@ -223,7 +223,7 @@ impl Grid {
     /// Write a character at the cursor position and advance.
     /// Preserves existing fg/bg (for direct/test use).
     pub fn write_char(&mut self, ch: char) {
-        let width = if unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0) > 1 {
+        let width = if terminal_char_width(ch) > 1 {
             CellWidth::Full
         } else {
             CellWidth::Half

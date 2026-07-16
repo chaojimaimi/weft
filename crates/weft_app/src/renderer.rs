@@ -475,6 +475,9 @@ impl MetalRenderer {
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
             missing.extend(['×', '·', '…']);
+            // Explicit one-scalar fallbacks for unsupported multi-scalar
+            // graphemes; keep them resident before push_text uses them.
+            missing.extend(['\u{fffd}', '\u{ff1f}']);
             for text in tab_bar.labels.iter().chain(&tab_bar.tooltips) {
                 missing.extend(text.chars());
             }
@@ -545,7 +548,7 @@ impl MetalRenderer {
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
                         region_bottom_y: vp_h - pad_y,
-                        cwd: None,
+                        cwd: terminal.cwd(),
                         git_branch: terminal.git_branch(),
                         live: terminal.block_tracker().in_flight(),
                         block_scroll,

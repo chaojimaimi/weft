@@ -66,7 +66,7 @@ pub(crate) fn settings_keycap_width(key: &str, cell_w: f32) -> f32 {
     let columns = if matches!(key, "↑" | "↓" | "←" | "→") {
         1.0
     } else {
-        unicode_width::UnicodeWidthStr::width_cjk(key) as f32
+        weft_core::grid::terminal_text_width(key) as f32
     };
     cell_w * (columns + KEYCAP_PAD_X_CELLS * 2.0)
 }
@@ -80,7 +80,7 @@ pub(crate) fn settings_key_group_width(keys: &[&str], cell_w: f32) -> f32 {
 }
 
 pub(crate) fn settings_footer_hint_width(hint: SettingsFooterHint, cell_w: f32) -> f32 {
-    let description_cols = unicode_width::UnicodeWidthStr::width_cjk(hint.description) as f32;
+    let description_cols = weft_core::grid::terminal_text_width(hint.description) as f32;
     settings_key_group_width(hint.keys, cell_w)
         + cell_w * (KEYCAP_DESCRIPTION_GAP_CELLS + description_cols)
 }

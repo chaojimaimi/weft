@@ -4,6 +4,7 @@
 //! `vte::Perform` to translate escape sequences into Grid operations.
 
 mod attrs;
+mod grapheme;
 mod osc;
 mod perform;
 
@@ -62,12 +63,9 @@ pub struct Terminal {
     /// the `Cell` struct so Cell stays at 24 bytes (only the 1-bit HYPERLINK
     /// flag lives on the cell).
     hyperlinks: HyperlinkRegistry,
-    /// v1.0 perf: tracks whether vte's parser is in the ground state (not
-    /// inside an escape sequence). Set true in `print()` (vte only calls
-    /// print() in ground state), cleared on escape (0x1B) / C0 controls.
-    /// Used by `process()` to gate the ASCII fast path — only when in ground
-    /// state can a run of printable ASCII bypass the per-byte state machine.
+    /// Gates the printable-ASCII fast path while vte is in ground state.
     parser_in_ground_state: bool,
+    suppress_joined_scalar: bool,
 }
 
 impl Terminal {
@@ -106,6 +104,7 @@ impl Terminal {
             active_hyperlink_id: None,
             hyperlinks: HyperlinkRegistry::new(),
             parser_in_ground_state: true,
+            suppress_joined_scalar: false,
         }
     }
 
@@ -328,7 +327,7 @@ impl Terminal {
             // of printable ASCII (0x20..=0x7E) that doesn't start with an
             // escape/C0 control. These bytes map 1:1 to chars and are all
             // width-1, so they bypass vte entirely.
-            if self.parser_in_ground_state {
+            if self.parser_in_ground_state && !self.suppress_joined_scalar {
                 let run_start = i;
                 while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x7E {
                     i += 1;
