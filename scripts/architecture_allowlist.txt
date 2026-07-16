@@ -5,7 +5,7 @@
 # may not grow beyond its ceiling. New exceptions require an explicit review of
 # this file instead of a self-authorizing comment in the Rust source.
 crates/weft_app/src/glyph.rs|1271|CoreText rasterization, fallback, atlas cache, and transform probes remain coupled
-crates/weft_app/src/layout.rs|1862|Shared pure geometry and its colocated regression tests await domain splitting
+crates/weft_app/src/layout.rs|1191|Shared pure geometry remains above budget after its regression tests moved to layout/tests.rs
 crates/weft_app/src/main.rs|2437|Legacy App shell is reduced from 7316 lines but still awaits the second extraction pass
 crates/weft_app/src/mouse_controller.rs|811|Pointer routing and drag state are still coupled at the App controller boundary
 crates/weft_app/src/overlay.rs|888|Overlay models and compatibility draw parameters await final component ownership cleanup
