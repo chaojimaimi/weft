@@ -427,7 +427,7 @@ impl App {
                         clipboard_text = Some(if action == "copy_command" {
                             block.command.clone()
                         } else {
-                            block.output.clone()
+                            block.output.to_string()
                         });
                     }
                 }

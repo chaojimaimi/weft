@@ -169,7 +169,7 @@ mod tests {
             id: BlockId(id),
             command: command.to_string(),
             cwd: None,
-            output: output.to_string(),
+            output: output.into(),
             exit_code: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
             finished_at: None,

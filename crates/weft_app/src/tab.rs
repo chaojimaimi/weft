@@ -9,6 +9,7 @@
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use weft_core::input::InputHandler;
+use weft_core::persistence::TabSnapshot;
 use weft_core::pty::{Pty, PtyEvent};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
@@ -49,6 +50,11 @@ pub struct Tab {
     pub pending_pty_resize: Option<(usize, usize)>,
     /// M3.5: private — use the block-scroll API methods below instead.
     block_scroll_offset: usize,
+    /// Original persisted state retained while a restored shell is starting.
+    /// Until OSC 7 supplies an authoritative cwd, this prevents autosave from
+    /// replacing the saved cwd with a transient `None`. It also preserves the
+    /// complete tab when PTY creation fails and no live snapshot is possible.
+    restored_snapshot: Option<TabSnapshot>,
     /// Wheel rows received while a TUI command is starting but before its
     /// alternate-screen sequence has reached the parser. Replayed once the
     /// alt screen becomes active, so the first trackpad gesture is not lost.
@@ -113,6 +119,7 @@ impl Tab {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
+            restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -134,6 +141,7 @@ impl Tab {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
+            restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -410,19 +418,25 @@ impl Tab {
     }
 
     /// v1.0 H4: Serialize this tab's UI state to a [`TabSnapshot`] for
-    /// SQLite persistence. Returns `None` when the terminal is missing
-    /// (PTY spawn failed — nothing worth persisting).
+    /// SQLite persistence. A restored tab whose PTY failed keeps its loaded
+    /// snapshot; only a fresh empty tab with no recovery state returns `None`.
     ///
     /// The PTY itself is NOT serialized (impossible to revive). On
     /// restore, the tab shows the saved editor draft + block history;
     /// the user presses Enter to spawn a fresh shell in the saved cwd.
-    pub fn to_snapshot(
-        &self,
-        position: usize,
-        active: bool,
-    ) -> Option<weft_core::persistence::TabSnapshot> {
-        let terminal = self.terminal.as_ref()?;
-        let cwd = terminal.cwd().map(|s| s.to_string());
+    pub fn to_snapshot(&self, position: usize, active: bool) -> Option<TabSnapshot> {
+        let Some(terminal) = self.terminal.as_ref() else {
+            let mut snapshot = self.restored_snapshot.clone()?;
+            snapshot.position = position;
+            snapshot.active = active;
+            snapshot.block_scroll_offset = self.block_scroll();
+            return Some(snapshot);
+        };
+        let cwd = terminal.cwd().map(str::to_owned).or_else(|| {
+            self.restored_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.cwd.clone())
+        });
         let editor_buffer =
             weft_core::persistence::TabSnapshot::encode_editor_buffer(&terminal.editor().buffer);
         let shell_phase = match terminal.block_tracker().phase() {
@@ -430,7 +444,7 @@ impl Tab {
             weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
             weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
         };
-        Some(weft_core::persistence::TabSnapshot {
+        Some(TabSnapshot {
             position,
             active,
             cwd,
@@ -447,7 +461,8 @@ impl Tab {
     ///
     /// Returns `false` if the snapshot's editor buffer JSON was invalid
     /// (the tab stays usable with an empty editor — same as a fresh tab).
-    pub fn restore_from_snapshot(&mut self, snap: &weft_core::persistence::TabSnapshot) -> bool {
+    pub fn restore_from_snapshot(&mut self, snap: &TabSnapshot) -> bool {
+        self.restored_snapshot = Some(snap.clone());
         self.block_scroll_offset = snap.block_scroll_offset;
         let Some(terminal) = self.terminal.as_mut() else {
             return false;
@@ -670,6 +685,7 @@ mod tests {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             block_scroll_offset: 0,
+            restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -749,3 +765,7 @@ mod tests {
         assert!(editor_text.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "tab/snapshot_tests.rs"]
+mod snapshot_tests;

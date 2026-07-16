@@ -38,6 +38,10 @@ impl App {
     /// Cmd+T — open a new tab with a fresh shell session and switch to it.
     pub(super) fn new_tab(&mut self) {
         self.reset_ime_context("new tab");
+        let block_id_allocator = self
+            .sessions
+            .block_store()
+            .map(BlockStore::block_id_allocator);
         let (rows, cols) = self.current_size();
         // New tabs inherit the weft process's cwd (None = no chdir).
         let idx = self.sessions.open_tab(
@@ -47,6 +51,17 @@ impl App {
             &self.proxy,
             None,
         );
+        if let Some(block_id_allocator) = block_id_allocator {
+            if let Some(terminal) = self
+                .sessions
+                .tab_mut(idx)
+                .and_then(|tab| tab.terminal.as_mut())
+            {
+                terminal
+                    .block_tracker_mut()
+                    .use_shared_id_allocator(block_id_allocator);
+            }
+        }
         // Apply the current theme palette to the new terminal so it matches
         // the window's renderer theme (the atlas is shared per-window, not
         // per-tab — no atlas rebuild needed).
@@ -90,7 +105,7 @@ impl App {
     /// session layout (cwd + editor drafts) survives restarts. Best-effort:
     /// failures are logged but don't interrupt the caller. The PTY itself
     /// is NOT persisted (impossible to revive); only UI state is saved.
-    pub(super) fn save_all_tabs(&self) {
+    pub(super) fn save_all_tabs(&mut self) {
         let Some(store) = self.sessions.block_store() else {
             return;
         };
@@ -103,6 +118,21 @@ impl App {
             .collect();
         if let Err(e) = store.save_tabs(&snaps) {
             tracing::warn!(error = %e, "failed to save tab snapshots");
+        } else {
+            self.window_runtime.tab_snapshots.record_saved(snaps);
+        }
+    }
+
+    pub(super) fn save_changed_tabs(&mut self) {
+        let snapshots: Vec<_> = self
+            .sessions
+            .tabs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tab)| tab.to_snapshot(i, i == self.sessions.active_idx()))
+            .collect();
+        if self.window_runtime.tab_snapshots.should_save(&snapshots) {
+            self.save_all_tabs();
         }
     }
 

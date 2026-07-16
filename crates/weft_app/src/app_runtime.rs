@@ -2,6 +2,26 @@
 
 use super::*;
 
+fn hydrate_persisted_history(
+    terminal: &mut Terminal,
+    newest_first: &[weft_core::blocks::Block],
+    block_id_allocator: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    // SQLite returns newest→oldest. Both BlockTracker and Editor::load_history
+    // accept chronological input; the editor reverses it internally for Up.
+    let oldest_first: Vec<_> = newest_first.iter().rev().cloned().collect();
+    let commands = oldest_first
+        .iter()
+        .map(|block| strip_prompt_prefix(&block.command))
+        .filter(|command| !command.trim().is_empty())
+        .collect();
+    terminal.editor_mut().load_history(commands);
+    terminal.block_tracker_mut().load_blocks(oldest_first);
+    terminal
+        .block_tracker_mut()
+        .use_shared_id_allocator(block_id_allocator);
+}
+
 impl ApplicationHandler<AppEvent> for App {
     /// Cross-thread wake-up (PTY output or blink timer): pump + process
     /// immediately, then schedule a redraw for rendering.
@@ -26,7 +46,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
             AppEvent::TabsAutoSave => {
-                self.drain_effects(vec![Effect::PersistTabs]);
+                self.save_changed_tabs();
             }
             AppEvent::PerformanceProbeStart => self.performance_probe.start(),
             AppEvent::PerformanceProbeFinish => {
@@ -174,30 +194,14 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
+        let mut persisted_history = Vec::new();
         let block_store = weft_cache_dir().and_then(|cache| {
             let path = cache.join("blocks.db");
             match BlockStore::open(&path) {
                 Ok(store) => {
-                    if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
-                        match store.recent(1000) {
-                            Ok(history) => {
-                                // Hydrate editor history from persisted commands so
-                                // ↑/↓ navigation works immediately on startup.
-                                // Blocks are oldest→newest; load_history reverses
-                                // to newest-first. Skip empty commands and strip
-                                // prompt artifacts (cwd path + ❯ marker) that
-                                // snapshot_command_line may have captured for
-                                // passthrough / non-editor sessions.
-                                let cmds: Vec<String> = history
-                                    .iter()
-                                    .map(|b| strip_prompt_prefix(&b.command))
-                                    .filter(|c| !c.trim().is_empty())
-                                    .collect();
-                                terminal.editor_mut().load_history(cmds);
-                                terminal.block_tracker_mut().load_blocks(history);
-                            }
-                            Err(e) => warn!(error = %e, "failed to load block history"),
-                        }
+                    match store.recent(1000) {
+                        Ok(history) => persisted_history = history,
+                        Err(e) => warn!(error = %e, "failed to load block history"),
                     }
                     Some(store)
                 }
@@ -208,6 +212,10 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
         self.sessions.set_block_store(block_store);
+        let block_id_allocator = self
+            .sessions
+            .block_store()
+            .map(BlockStore::block_id_allocator);
 
         // v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
         // session layout survives restarts. The first tab (spawned above by
@@ -291,6 +299,21 @@ impl ApplicationHandler<AppEvent> for App {
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load tab snapshots; starting fresh");
+                }
+            }
+        }
+
+        // Restore history only after the tab topology is final. Hydrating the
+        // initial terminal before cwd-based replacement discarded the loaded
+        // history, and additional restored tabs never received it at all.
+        if let Some(block_id_allocator) = block_id_allocator {
+            for tab in self.sessions.tabs_mut() {
+                if let Some(terminal) = tab.terminal.as_mut() {
+                    hydrate_persisted_history(
+                        terminal,
+                        &persisted_history,
+                        block_id_allocator.clone(),
+                    );
                 }
             }
         }
@@ -384,14 +407,15 @@ impl ApplicationHandler<AppEvent> for App {
             });
         }
 
-        // v1.0 H4: periodic auto-save (every 30s) so a crash doesn't lose
-        // the tab layout + editor drafts. Best-effort — failures are logged
-        // inside `save_all_tabs`. Runs on a background thread, wakes the loop
+        // D5: compare complete snapshots once per second so unmarked cwd or
+        // scroll changes cannot bypass recovery, without writing unchanged
+        // state. Best-effort failures retry on the next tick.
+        // Runs on a background thread, wakes the loop
         // via AppEvent::TabsAutoSave (handled synchronously on the main
         // thread, which owns `&mut self`).
         let save_proxy = self.proxy.clone();
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            std::thread::sleep(std::time::Duration::from_secs(1));
             if save_proxy.send_event(AppEvent::TabsAutoSave).is_err() {
                 break; // event loop exited
             }
@@ -423,5 +447,49 @@ impl ApplicationHandler<AppEvent> for App {
         {
             self.request_redraw();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+    use weft_core::blocks::{Block, BlockId};
+
+    fn block(id: u64, command: &str) -> Block {
+        Block {
+            id: BlockId(id),
+            command: command.to_string(),
+            cwd: None,
+            output: String::new().into(),
+            exit_code: Some(0),
+            started_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+            finished_at: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id)),
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn restored_history_is_chronological_and_shares_output_across_tabs() {
+        let mut newest_first = vec![block(2, "❯ echo newest"), block(1, "❯ echo oldest")];
+        newest_first[0].output = "large persisted output".repeat(1024).into();
+        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let mut terminal = Terminal::new(24, 80);
+        let mut second_terminal = Terminal::new(24, 80);
+        hydrate_persisted_history(&mut terminal, &newest_first, allocator.clone());
+        hydrate_persisted_history(&mut second_terminal, &newest_first, allocator);
+
+        assert_eq!(terminal.editor().history(), ["echo newest", "echo oldest"]);
+        let ids: Vec<_> = terminal
+            .block_tracker()
+            .blocks()
+            .iter()
+            .map(|block| block.id.0)
+            .collect();
+        assert_eq!(ids, [1, 2]);
+        assert!(std::sync::Arc::ptr_eq(
+            &terminal.block_tracker().blocks()[1].output,
+            &second_terminal.block_tracker().blocks()[1].output,
+        ));
     }
 }

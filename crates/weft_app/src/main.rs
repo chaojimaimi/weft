@@ -49,6 +49,7 @@ mod scrollbar_component;
 mod settings_component;
 mod settings_controller;
 mod settings_validation;
+mod snapshot_persistence;
 mod tab;
 mod tab_bar_component;
 mod terminal_geometry;
@@ -108,7 +109,6 @@ pub(crate) enum AppEvent {
     Wake,
     /// Config file changed on disk — reload and re-apply live.
     ConfigReload,
-    /// v1.0 H4: Periodic 30s timer fired — persist tab snapshots.
     TabsAutoSave,
     /// v1.1: A native menu item was clicked — dispatch the action on the
     /// main thread (where `App` is borrowed during `user_event`).
@@ -265,14 +265,10 @@ impl App {
         let mut exit_requested = false;
         for i in 0..self.sessions.len() {
             let (alive, drained, need_redraw) = self.sessions.tabs_mut()[i].process_messages();
-            // A dying shell can complete its final block in the same batch as
-            // the exit event. Collect before branching so persistence never
-            // loses that last command.
+            // Collect final blocks before handling a shell exit.
             drained_blocks.extend(drained);
             if !alive {
-                // Shell exited on tab `i`. For now (Stage 2) we only exit
-                // the app when the LAST tab's shell exits. A closed tab
-                // via Cmd+W is handled by `close_tab`, not here.
+                // Exit the app only when the last shell exits; Cmd+W is separate.
                 let dead_session_id = self.sessions.tab(i).map(|tab| tab.session_id);
                 let menu_belongs_to_dead_session = dead_session_id.is_some_and(|session_id| {
                     self.interaction
@@ -373,10 +369,8 @@ impl App {
                     new_active,
                     is_last,
                 } => {
-                    // Synchronous mutation (close_active, IME reset, hover
-                    // clear, find refresh, tab-bar scroll) already ran in
-                    // `close_tab`. This arm is the declarative extension point
-                    // for future post-close consumers (e.g. analytics).
+                    // close_tab already applied the synchronous mutations;
+                    // retain this effect as the post-close extension point.
                     info!(removed_idx, new_active, is_last, "tab closed effect");
                 }
                 Effect::TabSwitched { new_idx, prev_idx } => {
@@ -432,10 +426,8 @@ impl App {
             .unwrap_or(weft_core::input::InputMode::Passthrough);
 
         if mode == weft_core::input::InputMode::Editor {
-            // Editor takeover: paste into the input box. Multi-line text is
-            // split on \n (insert_char rejects control chars including \n,
-            // so we must drive split_newline explicitly to preserve line
-            // breaks). \r is dropped to handle CRLF paste from external apps).
+            // Preserve pasted newlines explicitly because insert_char rejects
+            // controls; drop CR to normalize external CRLF text.
             if let Some(t) = self
                 .sessions
                 .tab_mut(tab)

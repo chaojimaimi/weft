@@ -13,6 +13,8 @@
 //! layer wires it to `<cache>/weft/blocks.db` (see `weft_cache_dir`).
 
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, Connection};
@@ -32,6 +34,7 @@ pub enum PersistenceError {
 /// SQLite-backed store of finished command blocks.
 pub struct BlockStore {
     conn: Connection,
+    block_id_allocator: Arc<AtomicU64>,
 }
 
 const SCHEMA: &str = "\
@@ -62,7 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);";
 /// SQLite so the tab layout survives restarts. The PTY itself is NOT
 /// restored (impossible); on restore, the tab shows the saved editor draft
 /// + block history, and the user presses Enter to spawn a fresh shell.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TabSnapshot {
     /// Position in the tab bar (0-based).
     pub position: usize,
@@ -130,7 +133,20 @@ impl BlockStore {
                 [],
             )?;
         }
-        Ok(Self { conn })
+        let next_block_id =
+            conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM blocks", [], |row| {
+                row.get::<_, u64>(0)
+            })?;
+        Ok(Self {
+            conn,
+            block_id_allocator: Arc::new(AtomicU64::new(next_block_id.max(1))),
+        })
+    }
+
+    /// Shared allocator used by every tab writing to this store, preventing
+    /// per-terminal BlockId sequences from replacing each other in SQLite.
+    pub fn block_id_allocator(&self) -> Arc<AtomicU64> {
+        self.block_id_allocator.clone()
     }
 
     /// Insert (or replace by id) a single block.
@@ -142,7 +158,7 @@ impl BlockStore {
             params![
                 block.id.0 as i64,
                 &block.command,
-                &block.output,
+                block.output.as_ref(),
                 block.exit_code,
                 system_time_to_millis(block.started_at),
                 block.finished_at.map(system_time_to_millis),
@@ -253,7 +269,7 @@ fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
         id: BlockId(id as u64),
         command,
         cwd: None,
-        output,
+        output: output.into(),
         exit_code,
         started_at: millis_to_system_time(started_ms),
         finished_at: finished_ms.map(millis_to_system_time),
@@ -345,7 +361,7 @@ mod tests {
         assert_eq!(recent[0].id, BlockId(2));
         assert_eq!(recent[1].id, BlockId(1));
         assert_eq!(recent[0].command, "pwd");
-        assert_eq!(recent[0].output, "/tmp");
+        assert_eq!(recent[0].output.as_ref(), "/tmp");
         assert_eq!(recent[0].exit_code, Some(0));
     }
 
@@ -573,6 +589,25 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].cwd.as_deref(), Some("/persisted"));
         assert_eq!(loaded[0].block_scroll_offset, 7);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopened_store_seeds_shared_block_ids_after_persisted_maximum() {
+        use std::sync::atomic::Ordering;
+
+        let path = std::env::temp_dir().join(format!(
+            "weft-block-id-reopen-{}-{}.db",
+            std::process::id(),
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = BlockStore::open(&path).unwrap();
+            store.insert(&block(7, "persisted", "", Some(0))).unwrap();
+        }
+        let store = BlockStore::open(&path).unwrap();
+        assert_eq!(store.block_id_allocator().load(Ordering::Relaxed), 8);
         let _ = std::fs::remove_file(&path);
     }
 

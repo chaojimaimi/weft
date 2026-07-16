@@ -279,6 +279,7 @@ pub struct WindowRuntimeState {
     /// state is perceivable without relying on subtle color differences.
     /// Polled alongside system appearance (1Hz).
     pub increase_contrast: bool,
+    pub tab_snapshots: crate::snapshot_persistence::SnapshotPersistenceState,
 }
 
 impl WindowRuntimeState {
@@ -297,6 +298,7 @@ impl WindowRuntimeState {
             spinner_time: Instant::now(),
             reduce_motion: false,
             increase_contrast: false,
+            tab_snapshots: crate::snapshot_persistence::SnapshotPersistenceState::default(),
         }
     }
 }

@@ -235,7 +235,8 @@ impl App {
         let rows = terminal.grid().num_rows;
         let cols = terminal.grid().num_cols;
         // Block view uses a dedicated scroll offset.
-        if terminal.show_block_view() {
+        let block_view = terminal.show_block_view();
+        if block_view {
             let (total, _) = block_content_metrics(terminal, cols);
             // Compute visible rows from the renderer's actual geometry.
             let prompt_lines = terminal.editor().buffer.lines.len();

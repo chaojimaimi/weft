@@ -549,7 +549,7 @@ fn osc133_lifecycle_produces_block() {
     assert_eq!(blocks.len(), 1);
     let b = &blocks[0];
     assert_eq!(b.command, "$ ls -la", "command = prompt row at 133;B");
-    assert_eq!(b.output, "file1\nfile2\n", "output captured B..D");
+    assert_eq!(b.output.as_ref(), "file1\nfile2\n", "output captured B..D");
     assert_eq!(b.exit_code, Some(0));
     assert_eq!(t.block_tracker().phase(), ShellPhase::AtPrompt);
 }

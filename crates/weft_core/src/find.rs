@@ -675,7 +675,7 @@ mod tests {
             id: BlockId(id),
             command: command.to_string(),
             cwd: None,
-            output: output.to_string(),
+            output: output.into(),
             exit_code: Some(0),
             started_at: std::time::SystemTime::now(),
             finished_at: Some(std::time::SystemTime::now()),

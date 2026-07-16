@@ -1,15 +1,11 @@
 // arch-gate: allow-over-800
-// Block + BlockTracker + BlockStore: command block metadata, shell
-// integration state machine, and SQLite persistence. Already a focused
-// module; BlockTracker state transitions share private helpers.
+// Block metadata and its cohesive shell-integration state machine.
 //! Command blocks — the metadata layer (v0.4 "Fabric", phase 1).
 //!
 //! A [`Block`] binds one shell command to its output, exit code, and timing.
-//! Blocks are driven by OSC 133 shell-integration markers (see
-//! [`crate::vt::ShellMarker`] and `crate::shell`): the shell emits `133;A`
+//! OSC 133 shell-integration markers drive blocks: the shell emits `133;A`
 //! (prompt start), `133;B` (command start / preexec), `133;C` (output start),
-//! and `133;D;<exit>` (command end). [`BlockTracker`] is the state machine
-//! that turns that marker stream into finished [`Block`]s.
+//! and `133;D;<exit>`; [`BlockTracker`] turns that stream into finished blocks.
 //!
 //! **Design: detached content.** A Block owns its `command` and `output` as
 //! plain `String`s — snapshotted at marker time, not anchored to live grid
@@ -25,6 +21,8 @@
 //! `BlockTracker` from its `osc_dispatch` / `print` paths.
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Hard cap on captured output to bound memory for commands like
@@ -58,7 +56,7 @@ pub struct Block {
     /// from older DB rows that predate the field.
     pub cwd: Option<String>,
     /// Output captured between `133;B` and `133;D` (detached snapshot).
-    pub output: String,
+    pub output: Arc<str>,
     /// Exit code from `133;D;<exit>`. `None` when the command was interrupted
     /// (shell re-prompted via `133;A` without a preceding `133;D`).
     pub exit_code: Option<i32>,
@@ -110,7 +108,7 @@ pub struct BlockTracker {
     /// Finished-but-not-yet-persisted blocks; drained by the app into SQLite.
     unpersisted: Vec<Block>,
     /// Next [`BlockId`] to assign.
-    next_id: u64,
+    ids: crate::block_id_sequence::BlockIdSequence,
     // ── in-flight command (between 133;B and 133;D) ──
     pending_command: Option<String>,
     pending_started: Option<SystemTime>,
@@ -143,7 +141,7 @@ impl BlockTracker {
             bootstrap_ready: false,
             blocks: Vec::new(),
             unpersisted: Vec::new(),
-            next_id: 1,
+            ids: crate::block_id_sequence::BlockIdSequence::new(),
             pending_command: None,
             pending_started: None,
             pending_cwd: None,
@@ -242,15 +240,18 @@ impl BlockTracker {
     /// `unpersisted`), and `next_id` is advanced past the highest loaded id.
     pub fn load_blocks(&mut self, blocks: Vec<Block>) {
         for b in &blocks {
-            if b.id.0 >= self.next_id {
-                self.next_id = b.id.0 + 1;
-            }
+            self.ids.observe(b.id.0);
             self.dirty_blocks.insert(b.id.0);
         }
         self.blocks.extend(blocks);
         // Everything loaded so far is pre-session history; session blocks
         // (appended after this) begin at the new length.
         self.session_start = self.blocks.len();
+    }
+
+    /// Share persisted IDs across tabs; isolated trackers remain local.
+    pub fn use_shared_id_allocator(&mut self, next_id: Arc<AtomicU64>) {
+        self.ids.share(next_id);
     }
 
     // ── Marker-driven state transitions ──────────────────────────────────
@@ -383,18 +384,17 @@ impl BlockTracker {
         // future AI context) never holds a credential. The live grid stays raw.
         output = crate::secrets::mask(&output);
 
-        let block_id = BlockId(self.next_id);
+        let block_id = BlockId(self.ids.allocate());
         let block = Block {
             id: block_id,
             command,
             cwd,
-            output,
+            output: output.into(),
             exit_code,
             started_at,
             finished_at: Some(SystemTime::now()),
             collapsed: false,
         };
-        self.next_id += 1;
         self.blocks.push(block.clone());
         self.unpersisted.push(block);
         self.dirty_blocks.insert(block_id.0);
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(block.command, "ls -la");
         // run_one splits on '\n' and appends a newline after each segment,
         // so "file_a\nfile_b" → "file_a\nfile_b\n".
-        assert_eq!(block.output, "file_a\nfile_b\n");
+        assert_eq!(block.output.as_ref(), "file_a\nfile_b\n");
         assert_eq!(block.exit_code, Some(0));
         assert!(block.finished_at.is_some());
         assert!(block.finished_at.unwrap() >= block.started_at);
@@ -499,7 +499,7 @@ mod tests {
         t.on_command_end(0);
 
         let block = t.blocks().last().unwrap();
-        assert_eq!(block.output, "hi");
+        assert_eq!(block.output.as_ref(), "hi");
     }
 
     #[test]
@@ -511,7 +511,7 @@ mod tests {
         t.on_newline();
         t.on_print('b');
         t.on_command_end(0);
-        assert_eq!(t.blocks().last().unwrap().output, "a\nb");
+        assert_eq!(t.blocks().last().unwrap().output.as_ref(), "a\nb");
     }
 
     #[test]
@@ -533,7 +533,7 @@ mod tests {
         assert_eq!(t.blocks().len(), 1);
         let block = &t.blocks()[0];
         assert_eq!(block.command, "sleep 100");
-        assert_eq!(block.output, "z");
+        assert_eq!(block.output.as_ref(), "z");
         assert_eq!(block.exit_code, None, "interrupted → no exit code");
         assert_eq!(t.phase(), ShellPhase::AtPrompt);
     }
@@ -582,7 +582,7 @@ mod tests {
                 id: BlockId(7),
                 command: "old".into(),
                 cwd: None,
-                output: String::new(),
+                output: String::new().into(),
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -592,7 +592,7 @@ mod tests {
                 id: BlockId(3),
                 command: "older".into(),
                 cwd: None,
-                output: String::new(),
+                output: String::new().into(),
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -615,7 +615,7 @@ mod tests {
             id: BlockId(1),
             command: "old".into(),
             cwd: None,
-            output: String::new(),
+            output: String::new().into(),
             exit_code: Some(0),
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -648,7 +648,7 @@ mod tests {
         t.on_command_output_start();
         t.on_print('x');
         t.on_command_end(0);
-        assert_eq!(t.blocks().last().unwrap().output, "x");
+        assert_eq!(t.blocks().last().unwrap().output.as_ref(), "x");
     }
 
     // ── v1.0 P0-b: dirty_blocks tests ──────────────────────────────────
@@ -712,7 +712,7 @@ mod tests {
             id: BlockId(5),
             command: "x".to_string(),
             cwd: None,
-            output: "y".to_string(),
+            output: "y".into(),
             exit_code: Some(0),
             started_at: SystemTime::now(),
             finished_at: Some(SystemTime::now()),
@@ -778,7 +778,7 @@ mod tests {
         let mut t = BlockTracker::new();
         let block = run_one(&mut t, "", "some output", 0);
         assert_eq!(block.command, "");
-        assert_eq!(block.output, "some output\n");
+        assert_eq!(block.output.as_ref(), "some output\n");
         assert_eq!(block.exit_code, Some(0));
         assert_eq!(t.blocks().len(), 1);
     }
@@ -819,7 +819,7 @@ mod tests {
         assert_eq!(t.blocks().len(), 1);
         let block = &t.blocks()[0];
         assert_eq!(block.command, "long-running");
-        assert_eq!(block.output, "xy");
+        assert_eq!(block.output.as_ref(), "xy");
         assert_eq!(
             block.exit_code, None,
             "reset_to_prompt finalizes with no exit code"
