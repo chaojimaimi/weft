@@ -614,10 +614,11 @@ fn block_visible_rows_use_clamped_prompt_height() {
 }
 
 #[test]
-fn cwd_header_is_reserved_only_in_editor_mode() {
+fn cwd_header_remains_reserved_while_a_command_runs() {
     assert!(block_cwd_header_active(true, true));
-    assert!(!block_cwd_header_active(false, true));
+    assert!(block_cwd_header_active(false, true));
     assert!(!block_cwd_header_active(true, false));
+    assert!(!block_cwd_header_active(false, false));
 }
 
 // ── Block view layout (stage 4 — U2) ────────────────────────────────
@@ -668,4 +669,16 @@ fn block_view_sticky_y_anchors_to_clip_top() {
     let layout = layout_block_view(&ctx, 1100.0, true);
     // The renderer's sticky header draws at y = layout.clip_top (= pad_y).
     assert_eq!(layout.clip_top, 16.0);
+}
+
+#[test]
+fn tab_tooltip_clamps_at_both_viewport_edges() {
+    let left = layout_tab_tooltip([0.0, 0.0, 120.0, 32.0], 600.0, 32.0, 8.0, 16.0, 40);
+    assert_eq!(left[0], 8.0);
+    assert!(left[2] <= 592.0);
+
+    let right = layout_tab_tooltip([520.0, 0.0, 600.0, 32.0], 600.0, 32.0, 8.0, 16.0, 40);
+    assert!(right[0] >= 8.0);
+    assert_eq!(right[2], 592.0);
+    assert!(right[1] >= 32.0);
 }

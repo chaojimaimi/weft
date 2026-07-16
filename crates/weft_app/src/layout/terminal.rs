@@ -139,10 +139,10 @@ pub fn block_visible_rows(ctx: &LayoutCtx, prompt_lines: usize, cwd_header_activ
     ((height / block.pitch).floor() as usize).max(1)
 }
 
-/// The fixed CWD band exists only while the owned editor prompt is visible.
-/// A running command retains Terminal.cwd but renders a live block instead.
-pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
-    editor_mode && cwd_present
+/// Keep the fixed CWD band visible whenever the shell has reported a cwd.
+/// This preserves location context while long-running commands own the prompt.
+pub fn block_cwd_header_active(_editor_mode: bool, cwd_present: bool) -> bool {
+    cwd_present
 }
 
 // ── Block view (Warp-style history) ────────────────────────────────────
@@ -180,7 +180,7 @@ pub struct BlockViewLayout {
 /// Compute the block view's frame layout. `region_bottom_y` is the bottom
 /// edge of the block region (top of the input box in Editor mode, or the
 /// screen bottom in CommandExecuting). `cwd_header_active` should be true
-/// when a CWD line will be rendered (Editor mode + no live block).
+/// whenever a CWD line will be rendered.
 pub fn layout_block_view(
     ctx: &LayoutCtx,
     region_bottom_y: f32,
@@ -201,12 +201,12 @@ pub fn layout_block_view(
     // this reduces to the old `ctx.padding_y`.
     let clip_top = ctx.top();
     let (content_bottom_y, fixed_cwd_y) = if cwd_header_active {
-        // Editor mode: CWD line + divider pinned to the bottom; scrollable
+        // CWD line + divider pinned to the bottom; scrollable
         // content sits ABOVE the CWD line (2 pitches up: one for CWD text,
         // one for the separator that the renderer draws above it).
         (region_bottom_y - 2.0 * pitch, region_bottom_y - pitch)
     } else {
-        // CommandExecuting (live block) or no CWD: scrollable content goes
+        // No CWD: scrollable content goes
         // all the way to region_bottom_y.
         (region_bottom_y, 0.0)
     };

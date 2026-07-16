@@ -2,6 +2,22 @@
 
 use super::*;
 
+fn schedule_synchronized_output_watchdog(
+    pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    delay: std::time::Duration,
+    wake: impl FnOnce() + Send + 'static,
+) -> bool {
+    if pending.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        pending.store(false, Ordering::Release);
+        wake();
+    });
+    true
+}
+
 fn hydrate_persisted_history(
     terminal: &mut Terminal,
     newest_first: &[weft_core::blocks::Block],
@@ -39,7 +55,26 @@ impl ApplicationHandler<AppEvent> for App {
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
-                self.request_redraw();
+                let synchronized = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .is_some_and(Terminal::synchronized_output);
+                if !synchronized {
+                    self.request_redraw();
+                } else {
+                    let proxy = self.proxy.clone();
+                    schedule_synchronized_output_watchdog(
+                        self.window_runtime
+                            .synchronized_output_watchdog_pending
+                            .clone(),
+                        weft_core::vt::SYNCHRONIZED_OUTPUT_TIMEOUT,
+                        move || {
+                            let _ = proxy.send_event(AppEvent::Wake);
+                        },
+                    );
+                }
             }
             AppEvent::ConfigReload => {
                 self.reload_config();
@@ -455,6 +490,25 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
     use weft_core::blocks::{Block, BlockId};
+
+    #[test]
+    fn synchronized_output_watchdog_wakes_without_another_pty_event() {
+        let pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(schedule_synchronized_output_watchdog(
+            pending.clone(),
+            std::time::Duration::from_millis(1),
+            move || tx.send(()).unwrap()
+        ));
+        assert!(!schedule_synchronized_output_watchdog(
+            pending.clone(),
+            std::time::Duration::from_millis(1),
+            || {}
+        ));
+        rx.recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        assert!(!pending.load(Ordering::Acquire));
+    }
 
     fn block(id: u64, command: &str) -> Block {
         Block {

@@ -1,4 +1,3 @@
-// arch-gate: allow-over-800
 // Block metadata and its cohesive shell-integration state machine.
 //! Command blocks — the metadata layer (v0.4 "Fabric", phase 1).
 //!
@@ -24,6 +23,10 @@ use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::SystemTime;
+
+mod output_capture;
+
+use output_capture::OutputCapture;
 
 /// Hard cap on captured output to bound memory for commands like
 /// `cat huge.log`. Beyond this the capture stops and the block is marked
@@ -116,8 +119,7 @@ pub struct BlockTracker {
     pending_cwd: Option<String>,
     /// Latest cwd from OSC 7; snapshotted into each new block.
     current_cwd: Option<String>,
-    output_buf: String,
-    output_truncated: bool,
+    output: OutputCapture,
     /// Index in `blocks` where the current session's blocks begin. Blocks
     /// before this were loaded from SQLite on startup (history search only —
     /// NOT shown in the main block view, which is session-scoped).
@@ -146,8 +148,7 @@ impl BlockTracker {
             pending_started: None,
             pending_cwd: None,
             current_cwd: None,
-            output_buf: String::new(),
-            output_truncated: false,
+            output: OutputCapture::default(),
             session_start: 0,
             dirty_blocks: HashSet::new(),
         }
@@ -231,7 +232,7 @@ impl BlockTracker {
         Some(InFlightBlock {
             command,
             cwd: self.pending_cwd.as_deref(),
-            output: self.output_buf.as_str(),
+            output: self.output.as_str(),
         })
     }
 
@@ -288,8 +289,7 @@ impl BlockTracker {
         self.pending_command = Some(command);
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
-        self.output_buf.clear();
-        self.output_truncated = false;
+        self.output.clear();
         self.phase = ShellPhase::CommandExecuting;
     }
 
@@ -311,7 +311,7 @@ impl BlockTracker {
     /// a command is executing.
     pub fn on_print(&mut self, c: char) {
         if self.is_capturing() {
-            self.push_capped(c);
+            self.output.print(c, MAX_OUTPUT_BYTES);
         }
     }
 
@@ -323,43 +323,33 @@ impl BlockTracker {
         if !self.is_capturing() || bytes.is_empty() {
             return;
         }
-        if self.output_truncated {
-            return;
-        }
-        // ASCII bytes are 1 byte each = 1 char each, so len check is direct.
-        if self.output_buf.len() + bytes.len() > MAX_OUTPUT_BYTES {
-            // Partial push up to the cap.
-            let remaining = MAX_OUTPUT_BYTES.saturating_sub(self.output_buf.len());
-            if remaining > 0 {
-                // Safety: bytes are printable ASCII (0x20..=0x7E), valid UTF-8.
-                self.output_buf
-                    .push_str(std::str::from_utf8(&bytes[..remaining]).unwrap_or(""));
-            }
-            self.output_truncated = true;
-            return;
-        }
-        // Safety: bytes are printable ASCII (0x20..=0x7E), valid UTF-8.
-        self.output_buf
-            .push_str(std::str::from_utf8(bytes).unwrap_or(""));
+        self.output.print_ascii(bytes, MAX_OUTPUT_BYTES);
     }
 
     /// Append a newline to the in-flight block's output. No-op unless a command
     /// is executing.
     pub fn on_newline(&mut self) {
         if self.is_capturing() {
-            self.push_capped('\n');
+            self.output.newline(MAX_OUTPUT_BYTES);
         }
     }
 
-    fn push_capped(&mut self, c: char) {
-        if self.output_truncated {
-            return;
+    pub fn on_carriage_return(&mut self) {
+        if self.is_capturing() {
+            self.output.carriage_return();
         }
-        if self.output_buf.len() + c.len_utf8() > MAX_OUTPUT_BYTES {
-            self.output_truncated = true;
-            return;
+    }
+
+    pub fn on_backspace(&mut self) {
+        if self.is_capturing() {
+            self.output.backspace();
         }
-        self.output_buf.push(c);
+    }
+
+    pub fn on_erase_line(&mut self, mode: u16) {
+        if self.is_capturing() {
+            self.output.erase_line(mode);
+        }
     }
 
     /// Finalize the in-flight command into a [`Block`], appending it to both
@@ -369,17 +359,12 @@ impl BlockTracker {
     fn finalize(&mut self, exit_code: Option<i32>) {
         let Some(command) = self.pending_command.take() else {
             self.pending_started = None;
-            self.output_buf.clear();
-            self.output_truncated = false;
+            self.output.clear();
             return;
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
         let cwd = self.pending_cwd.take();
-        let mut output = std::mem::take(&mut self.output_buf);
-        if self.output_truncated {
-            output.push_str("\n…(output truncated, >1 MiB)");
-        }
-        self.output_truncated = false;
+        let mut output = self.output.take();
         // Mask secrets capture-side so the stored block (history / search /
         // future AI context) never holds a credential. The live grid stays raw.
         output = crate::secrets::mask(&output);

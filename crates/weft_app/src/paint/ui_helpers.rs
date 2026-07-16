@@ -143,6 +143,40 @@ pub(crate) fn truncate_str(s: &str, max: usize) -> String {
     t
 }
 
+/// Truncate with the same CJK column model used by the text renderer.
+pub(crate) fn truncate_to_columns(s: &str, max_cols: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if max_cols == 0 {
+        return String::new();
+    }
+    let display_width = |text: &str| {
+        text.chars()
+            .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
+            .sum::<usize>()
+    };
+    if display_width(s) <= max_cols {
+        return s.to_string();
+    }
+    let ellipsis_width = UnicodeWidthChar::width_cjk('…').unwrap_or(0);
+    if ellipsis_width > max_cols {
+        return String::new();
+    }
+    let budget = max_cols - ellipsis_width;
+    let mut used = 0;
+    let mut output = String::new();
+    for ch in s.chars() {
+        let width = UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        if used + width > budget {
+            break;
+        }
+        output.push(ch);
+        used += width;
+    }
+    output.push('…');
+    output
+}
+
 /// v0.9 fix: strip a shell prompt prefix from a captured command line.
 ///
 /// `snapshot_command_line` grabs the whole prompt row when the command wasn't
@@ -177,6 +211,23 @@ pub(crate) fn strip_prompt_prefix(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_column_truncation_keeps_cjk_inside_budget() {
+        use unicode_width::UnicodeWidthChar;
+
+        let width = |text: &str| {
+            text.chars()
+                .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
+                .sum::<usize>()
+        };
+
+        let text = truncate_to_columns("项目目录·运行命令", 8);
+        assert_eq!(text, "项目目…");
+        assert!(width(&text) <= 8);
+        assert_eq!(truncate_to_columns("abcdef", 4), "ab…");
+        assert!(width(&truncate_to_columns("①·…", 4)) <= 4);
+    }
     use weft_core::blocks::BlockId;
 
     #[test]

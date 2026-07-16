@@ -5,6 +5,61 @@ fn term() -> Terminal {
     Terminal::new(24, 80)
 }
 
+#[test]
+fn synchronized_output_mode_tracks_open_tui_frame_boundaries() {
+    let mut t = term();
+    t.process(b"\x1b[?2026hpartial frame");
+    assert!(t.synchronized_output());
+    t.process(b"\x1b[?2026l");
+    assert!(!t.synchronized_output());
+}
+
+#[test]
+fn synchronized_output_watchdog_releases_a_missing_reset() {
+    let mut t = term();
+    let now = std::time::Instant::now();
+    t.synchronized_output_started = now.checked_sub(std::time::Duration::from_secs(1));
+    assert!(!t.synchronized_output_at(now));
+}
+
+#[test]
+fn repeated_synchronized_output_begin_does_not_extend_watchdog() {
+    let mut t = term();
+    t.process(b"\x1b[?2026h");
+    let started = t.synchronized_output_started.unwrap();
+    t.process(b"\x1b[?2026h");
+    assert_eq!(t.synchronized_output_started, Some(started));
+    assert!(!t.synchronized_output_at(started + SYNCHRONIZED_OUTPUT_TIMEOUT));
+}
+
+#[test]
+fn alt_screen_exit_releases_unclosed_synchronized_frame() {
+    let mut t = term();
+    t.process(b"\x1b[?1049h\x1b[?2026hpartial\x1b[?1049l");
+    assert!(!t.synchronized_output());
+    assert!(!t.is_alt_screen_active());
+}
+
+#[test]
+fn decrqm_reports_synchronized_output_support_and_state() {
+    let mut t = term();
+    t.process(b"\x1b[?2026$p");
+    assert_eq!(t.take_response(), b"\x1b[?2026;2$y");
+    t.process(b"\x1b[?2026h\x1b[?2026$p");
+    assert_eq!(t.take_response(), b"\x1b[?2026;1$y");
+}
+
+#[test]
+fn progress_rewrites_are_compacted_in_detached_block_output() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07upgrade\n\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"Upgrading.\rUpgrading..\x1b[K\rUpgrading...\x1b[K");
+    t.process(b"\nDone\n\x1b]133;D;0\x07");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.output.as_ref(), "Upgrading...\nDone\n");
+}
+
 fn assert_no_orphaned_wide_cells(t: &Terminal, row: usize) {
     for col in 0..t.grid().num_cols {
         let cell = t.grid().cell(row, col);

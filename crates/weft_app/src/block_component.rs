@@ -98,6 +98,26 @@ pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPre
     }
 }
 
+/// OpenCode 1.18.x clears its TUI but emits no session card on exit (verified
+/// from the raw PTY stream). Surface stable CLI recovery commands without
+/// inventing a session id or coupling Weft to OpenCode's private database.
+pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
+    const OPENCODE_HINTS: &[&str] = &[
+        "Continue last session: opencode -c",
+        "Choose a session: opencode session list; opencode -s <session-id>",
+    ];
+    let executable = block
+        .command
+        .split_whitespace()
+        .next()
+        .and_then(|part| part.rsplit('/').next());
+    if block.exit_code != Some(0) && executable == Some("opencode") {
+        OPENCODE_HINTS
+    } else {
+        &[]
+    }
+}
+
 /// F3-2: Braille spinner glyphs for the running-command activity indicator.
 /// Cycled left-to-right by `spinner_phase` (see `spinner_char_for_phase`).
 pub(crate) const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -152,6 +172,24 @@ mod tests {
         let presentation = block_presentation(&block(None, true), 1);
         assert_eq!(presentation.label, "1 line · 1.2s · interrupted");
         assert_eq!(presentation.tone, BlockTone::Warning);
+    }
+
+    #[test]
+    fn interrupted_opencode_block_surfaces_stable_resume_commands() {
+        let mut interrupted = block(None, false);
+        interrupted.command = "/Users/me/.opencode/bin/opencode".into();
+        assert_eq!(
+            command_resume_hints(&interrupted),
+            [
+                "Continue last session: opencode -c",
+                "Choose a session: opencode session list; opencode -s <session-id>",
+            ]
+        );
+
+        interrupted.exit_code = Some(130);
+        assert!(!command_resume_hints(&interrupted).is_empty());
+        interrupted.exit_code = Some(0);
+        assert!(command_resume_hints(&interrupted).is_empty());
     }
 
     #[test]

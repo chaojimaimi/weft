@@ -140,6 +140,26 @@ pub fn layout_tab_strip(input: TabStripInput) -> TabStripLayout {
     }
 }
 
+/// Position a one-line tab tooltip below the strip, centered on its tab and
+/// clamped inside the viewport. All inputs and output use physical pixels.
+pub fn layout_tab_tooltip(
+    tab_rect: Rect,
+    viewport_width: f32,
+    bar_height: f32,
+    cell_width: f32,
+    cell_height: f32,
+    text_cols: usize,
+) -> Rect {
+    let margin = cell_width.max(1.0);
+    let max_width = (viewport_width - 2.0 * margin).max(cell_width);
+    let width = ((text_cols as f32 + 1.5) * cell_width).min(max_width);
+    let center = (tab_rect[0] + tab_rect[2]) * 0.5;
+    let max_x0 = (viewport_width - margin - width).max(margin);
+    let x0 = (center - width * 0.5).clamp(margin, max_x0);
+    let y0 = bar_height + cell_height * 0.2;
+    [x0, y0, x0 + width, y0 + cell_height * 1.4]
+}
+
 // ── Panel (history sidebar) layout ──────────────────────────────────
 
 /// Layout product for the history sidebar. Shared between

@@ -198,7 +198,12 @@ impl vte::Perform for Terminal {
     fn execute(&mut self, byte: u8) {
         match byte {
             0x07 => { /* BEL — bell, ignored in v0.1 */ }
-            0x08 => self.grid.backspace(),
+            0x08 => {
+                self.grid.backspace();
+                if !self.alt_active {
+                    self.block_tracker.on_backspace();
+                }
+            }
             0x09 => {
                 // Tab is a C0 control, so the print path never sees it — but
                 // columnar tools (ls, etc.) separate fields with tabs. Mirror
@@ -227,7 +232,12 @@ impl vte::Perform for Terminal {
                     self.hyperlinks.clear_cell_map();
                 }
             }
-            0x0D => self.grid.carriage_return(),
+            0x0D => {
+                self.grid.carriage_return();
+                if !self.alt_active {
+                    self.block_tracker.on_carriage_return();
+                }
+            }
             _ => tracing::trace!(byte, "unhandled execute"),
         }
     }
@@ -239,6 +249,23 @@ impl vte::Perform for Terminal {
         _ignore: bool,
         action: char,
     ) {
+        // DECRQM private-mode query: CSI ? Ps $ p. OpenTUI probes mode 2026
+        // before using synchronized updates. Report it as supported and
+        // currently set/reset; unknown modes remain unsupported (0).
+        if action == 'p' && intermediates == [b'?', b'$'] {
+            for sub in params.iter() {
+                if let &[mode] = sub {
+                    let status = match mode {
+                        2026 if self.synchronized_output() => 1,
+                        2026 => 2,
+                        _ => 0,
+                    };
+                    self.respond(format!("\x1b[?{mode};{status}$y").as_bytes());
+                }
+            }
+            return;
+        }
+
         // DEC private mode: CSI ? <params> h/l
         if intermediates == [b'?'] {
             let set = action == 'h';
@@ -324,6 +351,9 @@ impl vte::Perform for Terminal {
                     1 => self.grid.clear_line_left(),
                     2 => self.grid.clear_line_all(),
                     _ => {}
+                }
+                if !self.alt_active {
+                    self.block_tracker.on_erase_line(mode);
                 }
             }
             'X' => {

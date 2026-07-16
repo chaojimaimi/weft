@@ -1,8 +1,43 @@
 //! Tab bar vertex builder extracted from renderer.rs (A5).
 
 use crate::paint::primitives::{color_to_normalized, push_line, push_quad};
-use crate::paint::ui_helpers::truncate_str;
+use crate::paint::ui_helpers::truncate_to_columns;
 use crate::renderer::MetalRenderer;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabTitle {
+    pub(crate) compact: String,
+    pub(crate) tooltip: String,
+}
+
+/// Build a dense tab title once, leaving final pixel truncation to the shared
+/// tab-strip layout. The compact separator deliberately consumes one column:
+/// `OpenCode·opencode` fits where the previous spaced form did not.
+pub(crate) fn tab_title(index: usize, cwd: Option<&str>, command: Option<&str>) -> TabTitle {
+    let fallback = format!("Tab {}", index + 1);
+    let full_cwd = cwd.unwrap_or(&fallback);
+    let compact_cwd = if full_cwd.chars().count() <= 20 {
+        full_cwd
+    } else {
+        full_cwd
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or("/")
+    };
+    let command = command.map(str::trim).filter(|command| !command.is_empty());
+    match command {
+        Some(command) => TabTitle {
+            compact: format!("{compact_cwd}·{command}"),
+            tooltip: format!("{full_cwd} · {command}"),
+        },
+        None => TabTitle {
+            compact: compact_cwd.to_string(),
+            tooltip: full_cwd.to_string(),
+        },
+    }
+}
 
 /// v0.9 H1: Tab bar state passed to the renderer each frame.
 #[derive(Clone, Default)]
@@ -13,6 +48,8 @@ pub struct TabBarDrawState {
     pub active_tab: usize,
     /// Tab labels (e.g., shell cwd basename or "Tab N").
     pub labels: Vec<String>,
+    /// Full cwd + running command shown below a hovered tab.
+    pub tooltips: Vec<String>,
     /// v0.9 W1+: index of the tab currently hovered by the mouse (0-based),
     /// or `None` when the cursor isn't over any tab. Used to show the close
     /// "×" button on hover (Warp-style) — active tab always shows "×".
@@ -168,7 +205,7 @@ impl MetalRenderer {
             if avail_text_w >= cw {
                 let max_cols = ((avail_text_w / cw) as usize).max(1);
                 let label = tab_bar.labels.get(i).map(|s| s.as_str()).unwrap_or("");
-                let display = truncate_str(label, max_cols.saturating_sub(1));
+                let display = truncate_to_columns(label, max_cols.saturating_sub(1));
                 let label_color = if is_active {
                     fg
                 } else if is_hovered {
@@ -226,6 +263,53 @@ impl MetalRenderer {
 
             // Hit rect: close_rect registered only when cx is in view.
             // Hit regions now live in the TabBar Scene (tab_bar_component.rs).
+        }
+
+        // Full cwd + command tooltip. The tab itself stays dense; hovering
+        // exposes the unabridged context even when the label is ellipsized.
+        if let Some(index) = tab_bar
+            .hovered_tab
+            .filter(|index| *index < tab_bar.tab_count)
+        {
+            if let Some(tooltip) = tab_bar.tooltips.get(index).filter(|text| !text.is_empty()) {
+                let viewport_cols = ((vp_w - 2.0 * cw).max(cw) / cw) as usize;
+                let display = truncate_to_columns(tooltip, viewport_cols.saturating_sub(2).max(1));
+                let text_cols = Self::text_col_width(&display).max(1);
+                let rect = crate::layout::layout_tab_tooltip(
+                    strip.tab_rect(index),
+                    vp_w,
+                    bar_h,
+                    cw,
+                    ch,
+                    text_cols,
+                );
+                let tooltip_bg = color_to_normalized(ui.raised);
+                let tooltip_border = color_to_normalized(ui.border_subtle);
+                let stroke = crate::ui_tokens::UiMetrics::for_scale(self.scale).stroke;
+                push_quad(&mut vertices, rect, [0.0; 4], [0.0; 4], tooltip_bg);
+                push_quad(
+                    &mut vertices,
+                    [rect[0], rect[1], rect[2], rect[1] + stroke],
+                    [0.0; 4],
+                    [0.0; 4],
+                    tooltip_border,
+                );
+                push_quad(
+                    &mut vertices,
+                    [rect[0], rect[3] - stroke, rect[2], rect[3]],
+                    [0.0; 4],
+                    [0.0; 4],
+                    tooltip_border,
+                );
+                self.push_text(
+                    &mut vertices,
+                    rect[0] + cw * 0.75,
+                    rect[1] + ch * 0.2,
+                    &display,
+                    fg,
+                    text_cols,
+                );
+            }
         }
 
         // v1.2: Scroll arrows — drawn when tabs overflow.
@@ -374,5 +458,51 @@ impl MetalRenderer {
             plus_color,
         );
         vertices
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_title;
+
+    #[test]
+    fn running_title_uses_one_column_separator_without_early_command_truncation() {
+        let title = tab_title(
+            0,
+            Some("/Users/andylee/McDull/OpenCode"),
+            Some("opencode upgrade"),
+        );
+        assert_eq!(title.compact, "OpenCode·opencode upgrade");
+        assert_eq!(
+            title.tooltip,
+            "/Users/andylee/McDull/OpenCode · opencode upgrade"
+        );
+    }
+
+    #[test]
+    fn long_cwd_uses_basename_in_tab_and_full_path_in_tooltip() {
+        let title = tab_title(
+            1,
+            Some("/Users/andylee/McDull/Claude/projects/weft"),
+            Some("cargo test --workspace"),
+        );
+        assert_eq!(title.compact, "weft·cargo test --workspace");
+        assert!(title
+            .tooltip
+            .starts_with("/Users/andylee/McDull/Claude/projects/weft · "));
+    }
+
+    #[test]
+    fn cjk_tooltip_is_truncated_by_display_columns() {
+        use unicode_width::UnicodeWidthChar;
+
+        let title = tab_title(0, Some("/用户/项目目录"), Some("运行升级命令"));
+        let display = crate::paint::ui_helpers::truncate_to_columns(&title.tooltip, 12);
+        let width: usize = display
+            .chars()
+            .map(|ch| UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
+            .sum();
+        assert!(width <= 12);
+        assert!(display.ends_with('…'));
     }
 }

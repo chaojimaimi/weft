@@ -185,6 +185,19 @@ impl Tab {
     /// `PtyExit` events are preserved — they signal shell exit and must not
     /// be lost.
     pub fn flush_pty_output(&mut self) {
+        // Full-screen TUIs own a bounded screen, so their queued output is
+        // repaint/teardown data rather than an unbounded shell-output flood.
+        // Keep it: the alt-screen exit and any trailing session/resume text
+        // must reach the parser after Ctrl+C. The flood-protection path below
+        // remains for primary-screen commands such as `seq 1 10000000`.
+        if self
+            .terminal
+            .as_ref()
+            .is_some_and(Terminal::is_alt_screen_active)
+        {
+            tracing::info!("preserving alt-screen PTY tail after interrupt");
+            return;
+        }
         // Flush kernel PTY read buffer + drain Pty's internal event channel.
         if let Some(pty) = &mut self.pty {
             pty.flush_input();
@@ -291,6 +304,9 @@ impl Tab {
         let mut drained = Vec::new();
         if let Some(terminal) = &mut self.terminal {
             drained = terminal.block_tracker_mut().drain_unpersisted();
+            if terminal.synchronized_output() {
+                need_redraw = false;
+            }
         }
 
         (true, drained, need_redraw)
@@ -415,6 +431,15 @@ impl Tab {
     #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.terminal.is_some() && self.pty.is_some()
+    }
+
+    /// Directory inherited by a newly-created sibling tab. Prefer live OSC 7
+    /// state, retaining a restored cwd until the shell reports one.
+    pub fn launch_cwd(&self) -> Option<&str> {
+        self.terminal
+            .as_ref()
+            .and_then(Terminal::cwd)
+            .or_else(|| self.restored_snapshot.as_ref()?.cwd.as_deref())
     }
 
     /// v1.0 H4: Serialize this tab's UI state to a [`TabSnapshot`] for

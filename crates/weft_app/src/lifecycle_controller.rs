@@ -43,13 +43,16 @@ impl App {
             .block_store()
             .map(BlockStore::block_id_allocator);
         let (rows, cols) = self.current_size();
-        // New tabs inherit the weft process's cwd (None = no chdir).
+        // Finder-launched apps commonly have `/` as their process cwd. A new
+        // terminal tab should instead inherit the active shell's live OSC 7
+        // cwd (or its restored fallback) so Cmd+T preserves user context.
+        let inherited_cwd = self.sessions.active().launch_cwd().map(str::to_owned);
         let idx = self.sessions.open_tab(
             rows,
             cols,
             self.config_state.config.scrollback.lines,
             &self.proxy,
-            None,
+            inherited_cwd.as_deref(),
         );
         if let Some(block_id_allocator) = block_id_allocator {
             if let Some(terminal) = self
@@ -242,59 +245,27 @@ impl App {
     /// Build the `TabBarDrawState` for the renderer from the current tab list.
     /// Tab labels are the cwd basename (or "Tab N" when no cwd is set).
     pub(super) fn tab_bar_state(&self) -> TabBarDrawState {
-        let labels: Vec<String> = self
+        let titles: Vec<_> = self
             .sessions
             .tabs()
             .iter()
             .enumerate()
             .map(|(i, tab)| {
-                // v1.0 fix: show full path when short (≤ 20 chars, e.g.
-                // "/tmp", "/usr/local"), otherwise show basename only to
-                // keep the tab label compact. Root "/" is kept as-is.
-                let cwd = tab.terminal.as_ref().and_then(|t| t.cwd()).map(|c| {
-                    if c.len() <= 20 {
-                        c.to_string()
-                    } else {
-                        let base = c.rsplit('/').next().unwrap_or("");
-                        if base.is_empty() {
-                            "/".to_string()
-                        } else {
-                            base.to_string()
-                        }
-                    }
-                });
-                // v0.9 W1: when a command is running, show "cwd · cmd". When
-                // idle, show only the cwd basename. (Previous version showed
-                // the last completed command, but that kept the label stuck
-                // on "cwd · cmd" forever after any command — e.g. "sleep 5"
-                // never reverted, and "cd /" showed "/ · cd /". The running
-                // indicator is enough; completed commands live in the history
-                // panel and block view.)
-                let cmd: Option<String> = tab
+                let command = tab
                     .terminal
                     .as_ref()
                     .and_then(|t| t.block_tracker().in_flight())
-                    .map(|f| f.command.to_string());
-                match (cwd, cmd) {
-                    (Some(cwd), Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(16).collect();
-                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
-                        format!("{} · {}{}", cwd, cmd_short, suffix)
-                    }
-                    (Some(cwd), None) => cwd,
-                    (None, Some(cmd)) => {
-                        let cmd_short: String = cmd.chars().take(16).collect();
-                        let suffix = if cmd.chars().count() > 16 { "…" } else { "" };
-                        format!("Tab {} · {}{}", i + 1, cmd_short, suffix)
-                    }
-                    (None, None) => format!("Tab {}", i + 1),
-                }
+                    .map(|flight| flight.command);
+                crate::paint::tab_bar::tab_title(i, tab.launch_cwd(), command)
             })
             .collect();
+        let labels = titles.iter().map(|title| title.compact.clone()).collect();
+        let tooltips = titles.into_iter().map(|title| title.tooltip).collect();
         TabBarDrawState {
             tab_count: self.sessions.len(),
             active_tab: self.sessions.active_idx(),
             labels,
+            tooltips,
             hovered_tab: self.tab_bar.hovered_tab,
             scroll_offset: self.tab_bar.scroll_offset,
             plus_hovered: self.tab_bar.plus_hovered,

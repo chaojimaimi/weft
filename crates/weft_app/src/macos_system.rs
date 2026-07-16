@@ -237,6 +237,16 @@ fn logo_png_bytes(variant: weft_core::config::LogoVariant) -> &'static [u8] {
     }
 }
 
+fn should_use_bundle_dock_icon(
+    variant: weft_core::config::LogoVariant,
+    executable: &std::path::Path,
+) -> bool {
+    variant == weft_core::config::LogoVariant::Cool
+        && executable
+            .to_string_lossy()
+            .contains(".app/Contents/MacOS/")
+}
+
 /// v1.0 Logo: set the macOS Dock app icon at runtime via
 /// `NSApp.setApplicationIconImage:`. Constructs an NSImage from PNG bytes
 /// using typed `objc2-app-kit` safe methods.
@@ -264,6 +274,19 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
     };
 
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let app = NSApplication::sharedApplication(mtm);
+        if std::env::current_exe()
+            .ok()
+            .is_some_and(|path| should_use_bundle_dock_icon(variant, &path))
+        {
+            // `None` restores CFBundleIconFile. The bundled ICNS contains
+            // macOS-native multi-resolution representations and lets Dock own
+            // magnification/inset geometry instead of treating a runtime
+            // 256px PNG as an unscaled replacement image.
+            app.setApplicationIconImage(None);
+            tracing::info!("using bundled Dock icon");
+            return;
+        }
         let png_bytes = logo_png_bytes(variant);
         let ns_data = NSData::dataWithBytes_length(
             png_bytes.as_ptr() as *mut std::ffi::c_void,
@@ -271,11 +294,28 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
         );
         let ns_image = NSImage::initWithData(NSImage::alloc(), &ns_data);
         if let Some(image) = ns_image {
-            let app = NSApplication::sharedApplication(mtm);
             app.setApplicationIconImage(Some(&image));
             tracing::info!(?variant, "dock icon updated");
         } else {
             tracing::warn!(?variant, "NSImage::initWithData returned nil");
         }
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_use_bundle_dock_icon;
+    use std::path::Path;
+    use weft_core::config::LogoVariant;
+
+    #[test]
+    fn cool_bundle_uses_icns_while_dev_and_custom_variants_override() {
+        let bundled = Path::new("/Applications/Weft.app/Contents/MacOS/weft");
+        assert!(should_use_bundle_dock_icon(LogoVariant::Cool, bundled));
+        assert!(!should_use_bundle_dock_icon(LogoVariant::Warm, bundled));
+        assert!(!should_use_bundle_dock_icon(
+            LogoVariant::Cool,
+            Path::new("/tmp/target/release/weft")
+        ));
+    }
 }

@@ -1,7 +1,3 @@
-// arch-gate: allow-over-800
-// Terminal struct + impl Terminal (~725 lines): VT100/VT520 state machine
-// + grid manipulation. Already extracted attrs/osc/perform/tests to
-// submodules; impl Terminal is the irreducible core.
 //! VT100/VT520 escape sequence parser.
 //!
 //! Wraps the `vte` crate with a `Terminal` struct that implements
@@ -18,6 +14,7 @@ use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
 use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
+pub const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The terminal: owns a Grid, vte::Parser, and current attributes.
 /// Implements `vte::Perform` to translate escape sequences into Grid mutations.
@@ -25,24 +22,17 @@ pub struct Terminal {
     grid: Grid,
     parser: vte::Parser,
     attrs: Attrs,
-    /// Window title (from OSC 0/2).
     title: String,
-    /// Shell integration markers collected during parsing.
     shell_markers: Vec<ShellMarker>,
-    /// Command-block state machine: consumes the OSC 133 marker stream and the
-    /// printed output to build finished [`Block`](crate::blocks::Block)s.
+    /// Command-block state machine driven by OSC 133 and printed output.
     block_tracker: BlockTracker,
     editor: Editor,
-    /// cwd reported by the shell via OSC 7.
     cwd: Option<String>,
-    /// Git branch reported by the shell hook via OSC 9;git=<branch>.
     git_branch: Option<String>,
-    /// Set on editor submit, consumed by `133;B`. While `Some`, input passes
-    /// through (Enter→preexec window) and the command source is the editor.
+    /// Editor command awaiting `133;B`; keeps the preexec window passthrough.
     command_from_editor: Option<String>,
     /// Application cursor key mode (DECCKM, CSI ?1h/l).
     pub app_cursor_keys: bool,
-    /// Bracketed paste mode (CSI ?2004h/l).
     pub bracketed_paste: bool,
     /// Origin mode (DECOM, CSI ?6h/l).
     origin_mode: bool,
@@ -52,33 +42,21 @@ pub struct Terminal {
     pub cursor_style: CursorStyle,
     /// Mouse protocol mode.
     pub mouse_protocol: MouseProtocol,
-    /// v1.0 fix: SGR-1006 mouse encoding flag (CSI ?1006h / l). When true,
-    /// mouse/scroll events are encoded in the SGR format `\x1b[<Pb;Px;Py M/m`
-    /// (handles coords > 95 cleanly). When false, the legacy format
-    /// `\x1b[MbbbxxxYYYXXX` (32-offset, char-encoded) is used instead. TUIs
-    /// that enable mouse reporting usually also enable 1006; if we send SGR
-    /// format while the app expects legacy, the app can't parse the sequence
-    /// and the leftover bytes leak as visible text (e.g. vim's `~@k`).
+    /// Start of a DEC 2026 atomic update; stale frames expire automatically.
+    synchronized_output_started: Option<std::time::Instant>,
+    /// SGR-1006 selects SGR vs legacy mouse report encoding.
     pub sgr_mouse: bool,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
-    /// Alternate screen buffer for full-screen apps (DEC 1049/47).
-    /// Swapped with `grid` on enter/exit; main content survives in `alt_grid`.
+    /// Alternate screen buffer, swapped with `grid` for DEC 1049/47.
     alt_grid: Grid,
     /// True while the alternate screen is active.
     alt_active: bool,
     /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
     saved_cursor: Option<Cursor>,
-    /// Bytes to write back to the PTY in response to terminal queries
-    /// (DA1/DA2 device attributes, DSR cursor-position report, text-area size
-    /// report). Modern TUIs probe these to detect capabilities and engage their
-    /// full UI; weft must answer or they degrade (claude falls back to a basic
-    /// line mode with an unconstrained, roaming cursor).
+    /// Bytes written back for DA/DSR/size and capability queries.
     pending_output: Vec<u8>,
-    /// Active OSC 8 hyperlink (None = no link). Set by `OSC 8;params;URI ST`,
-    /// cleared by `OSC 8;; ST`. All cells printed while this is `Some(id)`
-    /// are tagged with `CellFlags::HYPERLINK` and linked to `id` in the
-    /// registry's side-map.
+    /// Active OSC 8 hyperlink; printed cells are tagged in the side-map.
     active_hyperlink_id: Option<u32>,
     /// OSC 8 hyperlink registry — maps cell coords → id → URL. External to
     /// the `Cell` struct so Cell stays at 24 bytes (only the 1-bit HYPERLINK
@@ -96,7 +74,6 @@ impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Self {
         Self::with_scrollback(rows, cols, 10_000)
     }
-
     /// Construct with a configured scrollback capacity (lines). The alternate
     /// screen always has zero scrollback.
     pub fn with_scrollback(rows: usize, cols: usize, scrollback_lines: usize) -> Self {
@@ -117,6 +94,7 @@ impl Terminal {
             cursor_visible: true,
             cursor_style: CursorStyle::Block,
             mouse_protocol: MouseProtocol::Off,
+            synchronized_output_started: None,
             sgr_mouse: false,
             palette: Self::init_palette(),
             // Alt screen has no scrollback: full-screen apps manage their own
@@ -235,6 +213,16 @@ impl Terminal {
     /// Whether the alternate screen buffer is currently active.
     pub fn is_alt_screen_active(&self) -> bool {
         self.alt_active
+    }
+
+    /// Whether DEC synchronized-output mode (`CSI ?2026h`) is active.
+    pub fn synchronized_output(&self) -> bool {
+        self.synchronized_output_at(std::time::Instant::now())
+    }
+    fn synchronized_output_at(&self, now: std::time::Instant) -> bool {
+        self.synchronized_output_started.is_some_and(|started| {
+            now.saturating_duration_since(started) < SYNCHRONIZED_OUTPUT_TIMEOUT
+        })
     }
 
     /// True when the Warp-style block view should render (integrated shell, not
@@ -772,8 +760,20 @@ impl Terminal {
                 if set != self.alt_active {
                     self.swap_alt(mode == 1049);
                 }
+                if !set {
+                    self.synchronized_output_started = None;
+                }
             }
             2004 => self.bracketed_paste = set, // Bracketed paste
+            2026 => {
+                if set {
+                    self.synchronized_output_started
+                        .get_or_insert_with(std::time::Instant::now);
+                } else {
+                    self.synchronized_output_started = None;
+                }
+                tracing::debug!(set, "DEC synchronized output toggled");
+            }
             9 => {
                 self.mouse_protocol = if set {
                     MouseProtocol::X10

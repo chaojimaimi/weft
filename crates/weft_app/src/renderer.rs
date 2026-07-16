@@ -475,6 +475,9 @@ impl MetalRenderer {
             // chars so they render instead of being silently skipped by
             // push_text (which drops chars not in the atlas).
             missing.extend(['×', '·', '…']);
+            for text in tab_bar.labels.iter().chain(&tab_bar.tooltips) {
+                missing.extend(text.chars());
+            }
             // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
             missing.extend("\u{25be} passthrough running".chars());
             // F3-2: warm up the braille spinner glyphs (animated activity

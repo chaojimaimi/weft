@@ -9,7 +9,9 @@
 
 use std::rc::Rc;
 
-use crate::block_component::{block_presentation, spinner_char_for_phase, BlockTone};
+use crate::block_component::{
+    block_presentation, command_resume_hints, spinner_char_for_phase, BlockTone,
+};
 use crate::paint::block_view::actions::{push_block_header_actions, BlockHeaderActionPaint};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
@@ -66,7 +68,7 @@ impl MetalRenderer {
         let bg_uv = [su, sv + svh, su + suw, sv];
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
-        let cwd_header_active = cwd.is_some() && live.is_none();
+        let cwd_header_active = cwd.is_some();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
         let left = layout.left;
@@ -83,24 +85,22 @@ impl MetalRenderer {
         );
 
         if let Some(cwd) = cwd {
-            if live.is_none() {
-                let fixed_y = layout.fixed_cwd_y;
-                push_quad(
-                    &mut verts,
-                    [left, fixed_y, right, fixed_y + 1.5],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-                let display = abbreviate_path(cwd);
-                let display = if let Some(b) = git_branch {
-                    format!("{display} git:({b})")
-                } else {
-                    display
-                };
-                if !display.is_empty() {
-                    self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
-                }
+            let fixed_y = layout.fixed_cwd_y;
+            push_quad(
+                &mut verts,
+                [left, fixed_y, right, fixed_y + 1.5],
+                bg_uv,
+                [0.0; 4],
+                separator,
+            );
+            let display = abbreviate_path(cwd);
+            let display = if let Some(b) = git_branch {
+                format!("{display} git:({b})")
+            } else {
+                display
+            };
+            if !display.is_empty() {
+                self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
             }
         }
 
@@ -175,6 +175,18 @@ impl MetalRenderer {
             for b in blocks.iter().rev() {
                 let cached = cache.get(b.id.0);
                 if !b.collapsed {
+                    for hint in command_resume_hints(b).iter().rev() {
+                        let chunks: Rc<[String]> =
+                            Rc::from(wrap_line_chunks(hint, cols).collect::<Vec<_>>());
+                        cursor_dist += chunks.len() as f32 * pitch;
+                        rows.push(cursor_dist);
+                        row_data.push(LaidRow::Output {
+                            text: hint,
+                            chunks,
+                            block_id: Some(b.id),
+                            line: usize::MAX,
+                        });
+                    }
                     for line in cached.lines.iter().rev() {
                         let text = &b.output[line.byte_start..line.byte_end];
                         let vis_rows = line.chunks.len();

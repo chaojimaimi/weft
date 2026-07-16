@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use crate::block_component::block_presentation;
+use crate::block_component::{block_presentation, command_resume_hints};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
 use crate::renderer::MetalRenderer;
@@ -47,7 +47,7 @@ impl MetalRenderer {
             Some(c) => c,
             None => return Vec::new(),
         };
-        let cwd_header_active = cwd.is_some() && live.is_none();
+        let cwd_header_active = cwd.is_some();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
         let content_bottom_y = layout.clip_bottom;
@@ -118,6 +118,17 @@ impl MetalRenderer {
             for b in blocks.iter().rev() {
                 let cached = cache.get(b.id.0);
                 if !b.collapsed {
+                    for hint in command_resume_hints(b).iter().rev() {
+                        let chunks: Rc<[String]> =
+                            Rc::from(wrap_line_chunks(hint, cols).collect::<Vec<_>>());
+                        cursor_dist += chunks.len() as f32 * pitch;
+                        rows.push(cursor_dist);
+                        row_data.push(LaidRow::Output {
+                            text: hint,
+                            chunks,
+                            block_id: Some(b.id),
+                        });
+                    }
                     for line in cached.lines.iter().rev() {
                         let text = &b.output[line.byte_start..line.byte_end];
                         let vis_rows = line.chunks.len();

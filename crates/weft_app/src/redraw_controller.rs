@@ -6,6 +6,15 @@ impl App {
     pub(super) fn handle_redraw_requested(&mut self) {
         self.pump_pty();
         let had_output = self.process_messages();
+        if self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .is_some_and(Terminal::synchronized_output)
+        {
+            return;
+        }
         if crate::input_router::route_session_input(!self.sessions.is_empty())
             == crate::input_router::SessionInputRoute::Consume
         {

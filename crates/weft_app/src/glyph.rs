@@ -1,10 +1,4 @@
-// arch-gate: allow-over-800
-// GlyphAtlas: rasterization + LRU eviction + CJK wide-glyph handling +
-// Metal texture management. The atlas state is tightly coupled (a cache
-// miss triggers rasterize+pack+upload in one path); splitting would leak
-// Metal buffer ownership across modules.
 //! Glyph atlas: rasterize glyphs with font-kit, pack into a Metal texture.
-//!
 //! v0.2: Dynamic atlas with LRU eviction for CJK support.
 //! On-demand rasterization of any character, not just ASCII.
 
@@ -23,6 +17,8 @@ use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use tracing::{debug, info, warn};
 use weft_core::config::FontConfig;
+
+mod special;
 
 /// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
 /// CoreGraphics. font-kit's `rasterize_glyph` cannot handle color bitmap fonts
@@ -653,6 +649,10 @@ impl GlyphAtlas {
     ) -> Vec<u8> {
         let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
 
+        if let Some(pixels) = special::rasterize(ch, glyph_w, cell_h) {
+            return pixels;
+        }
+
         // Emoji (color bitmap glyphs like 📁📄) cannot be rasterized by font-kit
         // (it produces 0 pixels on A8). Use the CoreText/CG color path instead.
         if is_emoji_char(ch) {
@@ -758,88 +758,25 @@ impl GlyphAtlas {
         let dst_x = *next_x;
         let dst_y = *next_y;
 
-        // Rasterize glyph
-        if let Some(glyph_id) = font.glyph_for_char(ch) {
-            let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
-            let mut canvas = Canvas::new(glyph_size, Format::A8);
-
-            // font-kit rasterize_glyph:
-            //   point_size: scales font units → pixels (1 em = point_size pixels)
-            //   transform:   ADDITIONAL transform in PIXEL SPACE (applied AFTER point_size scaling)
-            //
-            // Core Text backend internals:
-            //   CTM = flip_Y(1,-1,0,height) * scale(point_size/units_per_em) * transform
-            //   CTFontDrawGlyphs draws at (0,0) in CTM space.
-            //
-            // Glyph space:  Y-up,  baseline at Y=0
-            // Canvas space:  Y-down, Y=0 = TOP of canvas  (font-kit flips for us)
-            //
-            // We want the glyph to land inside the canvas, vertically centered in the cell.
-            // After Y-flip:  glyph Y=0 (baseline) → canvas Y = ?
-            //                 glyph Y=ascent           → canvas Y = ascent_px - ascent = 0  (top)
-            // So:  y_canvas = ascent_px - y_glyph
-            // i.e. transform:  (x, y) → (x, ascent_px - y)
-            //
-            // font-kit's core_text backend rasterizes glyphs in a Y-up space; the
-            // canvas is Y-down, so a Y-flip is required to render them upright. The
-            // backend positions the baseline itself — do NOT add a translation, or the
-            // ascent gets double-counted and glyphs are pushed below the cell (clipping
-            // their tops → unreadable fragments). Verified via the transform_probe test:
-            // scale(1,-1) yields full-height upright glyphs (e.g. 'M' ink rows [0,20]).
-            // Shift down by the descent depth so descenders sit inside the cell; the
-            // CAMetalLayer flips vertically, so this lifts the glyph off the screen-cell
-            // bottom and stops the next row's opaque background from clipping descenders.
-            //
-            // CJK glyphs: no horizontal stretch — centered in the slot instead
-            // (see `glyph_transform`). Half-width: scale_x ≈ 1, unchanged.
-            // primary_descent_px anchors both scripts to one baseline.
-            let transform = Self::glyph_transform(
-                font,
-                glyph_id,
-                scaled_size,
-                glyph_w,
-                is_wide,
-                primary_descent_px,
-            );
-
-            let result = font.rasterize_glyph(
-                &mut canvas,
-                glyph_id,
-                scaled_size,
-                transform,
-                HintingOptions::None,
-                RasterizationOptions::GrayscaleAa,
-            );
-
-            if result.is_ok() {
-                let non_zero = canvas.pixels.iter().filter(|&&p| p > 0).count();
-                tracing::debug!(
-                    "Rasterized '{}': canvas {}x{}, stride={}, non-zero in canvas={}",
-                    ch,
-                    glyph_w,
-                    cell_h,
-                    canvas.stride,
-                    non_zero
-                );
-
-                // Blit glyph pixels into atlas buffer
-                let mut copied = 0;
-                for y in 0..cell_h {
-                    for x in 0..glyph_w {
-                        let src_idx = (y as usize * canvas.stride) + x as usize;
-                        let dst_idx =
-                            ((dst_y + y) as usize * atlas_w as usize) + (dst_x + x) as usize;
-                        if src_idx < canvas.pixels.len() && dst_idx < atlas_pixels.len() {
-                            atlas_pixels[dst_idx] = canvas.pixels[src_idx];
-                            if canvas.pixels[src_idx] > 0 {
-                                copied += 1;
-                            }
-                        }
-                    }
+        // Use the same rasterizer as draw-time cache misses. In particular,
+        // this keeps prewarmed box/block glyphs on the exact-cell path.
+        let pixels = Self::rasterize_glyph(
+            font,
+            ch,
+            scaled_size,
+            glyph_w,
+            cell_h,
+            is_wide,
+            primary_descent_px,
+        );
+        for y in 0..cell_h {
+            for x in 0..glyph_w {
+                let src_idx = (y * glyph_w + x) as usize;
+                let dst_idx = ((dst_y + y) * atlas_w + dst_x + x) as usize;
+                if let (Some(src), Some(dst)) = (pixels.get(src_idx), atlas_pixels.get_mut(dst_idx))
+                {
+                    *dst = *src;
                 }
-                tracing::debug!("Copied {} non-zero pixels for '{}'", copied, ch);
-            } else {
-                tracing::warn!("Failed to rasterize '{}': {:?}", ch, result);
             }
         }
 
@@ -949,6 +886,33 @@ mod transform_probe {
     fn descent_px(font: &Font, scaled_size: f32) -> f32 {
         let m = font.metrics();
         m.descent.abs() * (scaled_size / m.units_per_em as f32)
+    }
+
+    #[test]
+    fn prewarm_path_uses_edge_to_edge_procedural_box_line() {
+        let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
+        let (width, height) = (8, 16);
+        let mut atlas = vec![0; (width * height) as usize];
+        let (mut x, mut y, mut row_height) = (0, 0, 0);
+        GlyphAtlas::rasterize_and_place(
+            &font,
+            '─',
+            14.0,
+            width,
+            height,
+            false,
+            &mut atlas,
+            width,
+            height,
+            &mut x,
+            &mut y,
+            &mut row_height,
+            descent_px(&font, 14.0),
+        )
+        .unwrap();
+        assert!(atlas
+            .chunks_exact(width as usize)
+            .any(|row| row[0] == u8::MAX && row[width as usize - 1] == u8::MAX));
     }
 
     fn ink_bbox(c: &Canvas) -> (i32, i32, usize) {

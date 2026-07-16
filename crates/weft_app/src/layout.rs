@@ -214,7 +214,9 @@ mod terminal;
 // Keep the original `layout::*` result-type paths available even when a
 // result type is currently only named inside its owning submodule.
 #[allow(unused_imports)]
-pub use chrome::{layout_panel, layout_tab_strip, PanelLayout, TabStripInput, TabStripLayout};
+pub use chrome::{
+    layout_panel, layout_tab_strip, layout_tab_tooltip, PanelLayout, TabStripInput, TabStripLayout,
+};
 #[allow(unused_imports)]
 pub use settings::{layout_settings, FooterButtonRects, SettingsLayout, SETTINGS_NARROW_THRESHOLD};
 #[allow(unused_imports)]
