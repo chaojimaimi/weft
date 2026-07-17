@@ -197,10 +197,9 @@ impl Pty {
             ws_ypixel: 0,
         };
         // SAFETY: TIOCSWINSZ is a safe ioctl that only writes to the winsize struct.
-        unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize) };
-        // ioctl returns -1 on error, but the exact error check varies by platform.
-        // nix doesn't wrap TIOCSWINSZ directly, so we check errno manually.
-        Ok(())
+        let result =
+            unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize) };
+        resize_ioctl_result(result)
     }
 
     /// Write bytes to the PTY (keyboard input → shell).
@@ -329,6 +328,14 @@ impl Pty {
     /// Get the master file descriptor (raw).
     pub fn master_fd(&self) -> std::os::unix::io::RawFd {
         self.master.as_raw_fd()
+    }
+}
+
+fn resize_ioctl_result(result: nix::libc::c_int) -> Result<()> {
+    if result == -1 {
+        Err(PtyError::Resize(nix::errno::Errno::last()))
+    } else {
+        Ok(())
     }
 }
 
@@ -510,6 +517,12 @@ impl From<nix::sys::wait::WaitStatus> for ChildStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_ioctl_failure_is_propagated() {
+        assert!(matches!(resize_ioctl_result(-1), Err(PtyError::Resize(_))));
+        assert!(resize_ioctl_result(0).is_ok());
+    }
 
     /// Test that spawning a PTY with /bin/cat works and we can read/write.
     #[tokio::test]

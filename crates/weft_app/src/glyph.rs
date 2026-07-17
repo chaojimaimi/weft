@@ -20,6 +20,10 @@ use weft_core::config::FontConfig;
 
 mod special;
 
+fn nonzero_cell_dimension(dimension: u32) -> u32 {
+    dimension.max(1)
+}
+
 /// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
 /// CoreGraphics. font-kit's `rasterize_glyph` cannot handle color bitmap fonts
 /// (Apple Color Emoji produces 0 pixels on A8/RGBA32 canvases). This bypasses
@@ -249,9 +253,9 @@ impl GlyphAtlas {
         let font_size = font_config.size;
         let scaled_size = font_size * scale_factor as f32;
 
-        // Measure cell dimensions using a reference character
-        let cell_w = Self::measure_advance(&primary_font, 'M', scaled_size);
-        let cell_h = (scaled_size * font_config.line_height).ceil() as u32;
+        // Metal uploads require non-zero row bytes even for a bad transient metric.
+        let cell_w = nonzero_cell_dimension(Self::measure_advance(&primary_font, 'M', scaled_size));
+        let cell_h = nonzero_cell_dimension((scaled_size * font_config.line_height).ceil() as u32);
 
         // Vertical baseline anchor: the primary font's |descent| in pixels.
         // Computed once here and threaded into every rasterize call so all
@@ -282,10 +286,7 @@ impl GlyphAtlas {
         let mut next_y: u32 = 0;
         let mut row_height: u32 = 0;
 
-        // v1.0 P1.5-B3: Direct-indexed array mirroring ASCII cache entries.
-        // Filled alongside `cache` so the fast path in `get()` /
-        // `get_or_rasterize()` can skip the HashMap hash for the common case
-        // (terminal output is overwhelmingly printable ASCII).
+        // Direct-indexed ASCII cache avoids hashing the common path.
         let mut ascii: [Option<GlyphInfo>; 128] = [None; 128];
 
         // Pre-rasterize printable ASCII (32–126)
@@ -313,10 +314,7 @@ impl GlyphAtlas {
             }
         }
 
-        // Pre-rasterize the prompt marker and common UI glyphs with the primary
-        // font, at init (atlas empty, no draw-time upload). The ❯ (U+276F)
-        // prompt must be in the texture before the first draw — the warm-up
-        // path was leaving it blank in the running app.
+        // Pre-rasterize the prompt marker and common UI glyphs at init.
         for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─', '▸', '▾', '●', '○']
         {
             let placed = Self::rasterize_and_place(
@@ -857,10 +855,6 @@ impl GlyphAtlas {
     }
 }
 
-/// Check if a character is an emoji.
-///
-/// NOTE: Currently unused in v0.2. Will be used by get_or_rasterize when dynamic
-/// glyph rasterization is integrated into the rendering pipeline.
 #[allow(dead_code)]
 fn is_emoji_char(ch: char) -> bool {
     matches!(ch,
@@ -875,17 +869,21 @@ fn is_emoji_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod transform_probe {
-    //! Device-free diagnostic: rasterize glyphs under candidate transforms and
-    //! print exact ink bounding boxes, to calibrate the rasterize transform.
+    //! Device-free rasterization and transform probes.
     use super::*;
     use font_kit::canvas::{Format, RasterizationOptions};
     use font_kit::hinting::HintingOptions;
 
-    /// |descent| of `font` at `scaled_size` px, in pixels — the production
-    /// baseline-anchor value. Mirrors `GlyphAtlas::primary_descent_px`.
+    /// Production baseline anchor in pixels.
     fn descent_px(font: &Font, scaled_size: f32) -> f32 {
         let m = font.metrics();
         m.descent.abs() * (scaled_size / m.units_per_em as f32)
+    }
+
+    #[test]
+    fn atlas_cell_dimensions_never_reach_zero() {
+        assert_eq!(nonzero_cell_dimension(0), 1);
+        assert_eq!(nonzero_cell_dimension(17), 17);
     }
 
     #[test]

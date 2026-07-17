@@ -99,6 +99,40 @@ fn primary_screen_tui_resize_is_dimension_only_with_host_context_outside_grid() 
 }
 
 #[test]
+fn primary_screen_destructive_repaint_requires_a_synchronized_frame() {
+    let mut terminal = Terminal::new(6, 40);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[Hprogress\x1b[2;1Hmore");
+    assert!(terminal.primary_screen_app_active());
+    assert!(!terminal.primary_screen_repaint_capable());
+
+    terminal.process(b"\x1b[?2026hframe\x1b[?2026l");
+    assert!(!terminal.primary_screen_repaint_capable());
+    terminal.process(b"\x1b[?2026h\x1b[2Jframe\x1b[?2026l");
+    assert!(terminal.primary_screen_repaint_capable());
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(!terminal.primary_screen_repaint_capable());
+}
+
+#[test]
+fn contiguous_line_erases_covering_viewport_prove_full_frame_repaint() {
+    let mut terminal = Terminal::new(3, 20);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[H");
+    terminal.process(b"\x1b[?2026h\x1b[H\x1b[2K\x1b[1B\x1b[2K\x1b[1B\x1b[2K\x1b[?2026l");
+    assert!(terminal.primary_screen_repaint_capable());
+}
+
+#[test]
+fn unclosed_full_frame_evidence_cannot_cross_command_boundaries() {
+    let mut terminal = Terminal::new(4, 20);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[H");
+    terminal.process(b"\x1b[?2026h\x1b[2J");
+    terminal.process(b"\x1b]133;D;1\x07\x1b]133;A\x07");
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[H\x1b[?2026l");
+    assert!(terminal.primary_screen_app_active());
+    assert!(!terminal.primary_screen_repaint_capable());
+}
+
+#[test]
 fn claude_like_clear_and_repaint_keeps_command_context_across_resizes() {
     fn repaint(terminal: &mut Terminal, rows: usize) {
         let mut frame = Vec::new();

@@ -14,6 +14,43 @@ impl Terminal {
             && self.primary_screen_cursor_ops >= 2
     }
 
+    /// Whether this primary-screen owner has demonstrated atomic full-frame repainting.
+    pub fn primary_screen_repaint_capable(&self) -> bool {
+        self.primary_screen_app_active() && self.primary_screen_synchronized_frame_seen
+    }
+
+    pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
+        self.synchronized_frame_cleared_rows = 0;
+    }
+
+    pub(super) fn finish_primary_screen_synchronized_frame(&mut self) {
+        if self.synchronized_output_started.is_some() {
+            self.primary_screen_synchronized_frame_seen |= self.primary_screen_app_active()
+                && self.synchronized_frame_cleared_rows >= self.grid.num_rows;
+        }
+    }
+
+    fn reset_primary_screen_synchronized_frame(&mut self) {
+        self.synchronized_output_started = None;
+        self.synchronized_frame_cleared_rows = 0;
+        self.primary_screen_synchronized_frame_seen = false;
+    }
+
+    fn note_primary_screen_full_erase(&mut self) {
+        if self.synchronized_output_started.is_some() && !self.alt_active {
+            self.synchronized_frame_cleared_rows = self.grid.num_rows;
+        }
+    }
+
+    fn note_primary_screen_line_erase(&mut self) {
+        if self.synchronized_output_started.is_some()
+            && !self.alt_active
+            && self.grid.cursor.row == self.synchronized_frame_cleared_rows
+        {
+            self.synchronized_frame_cleared_rows += 1;
+        }
+    }
+
     fn note_primary_screen_cursor_addressing(&mut self) {
         if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
             self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
@@ -395,7 +432,10 @@ impl vte::Perform for Terminal {
                 match mode {
                     0 => self.grid.clear_screen_below(),
                     1 => self.grid.clear_screen_above(),
-                    2 => self.grid.clear_screen_all(),
+                    2 => {
+                        self.note_primary_screen_full_erase();
+                        self.grid.clear_screen_all();
+                    }
                     3 => self.grid.clear_scrollback(),
                     _ => {}
                 }
@@ -405,7 +445,10 @@ impl vte::Perform for Terminal {
                 match mode {
                     0 => self.grid.clear_line_right(),
                     1 => self.grid.clear_line_left(),
-                    2 => self.grid.clear_line_all(),
+                    2 => {
+                        self.note_primary_screen_line_erase();
+                        self.grid.clear_line_all();
+                    }
                     _ => {}
                 }
                 if !self.alt_active {
@@ -649,6 +692,7 @@ impl vte::Perform for Terminal {
                     match params[1] {
                         b"A" => {
                             self.primary_screen_cursor_ops = 0;
+                            self.reset_primary_screen_synchronized_frame();
                             self.shell_markers.push(ShellMarker::PromptStart);
                             self.block_tracker.on_prompt_start();
                             // Clear the git branch: the precmd hook re-emits
@@ -664,6 +708,7 @@ impl vte::Perform for Terminal {
                         }
                         b"B" => {
                             self.primary_screen_cursor_ops = 0;
+                            self.reset_primary_screen_synchronized_frame();
                             self.shell_markers.push(ShellMarker::CommandStart);
                             // 133;B (preexec): if the editor submitted the
                             // command, record that; otherwise snapshot the grid
@@ -683,6 +728,7 @@ impl vte::Perform for Terminal {
                         }
                         b"D" => {
                             self.primary_screen_cursor_ops = 0;
+                            self.reset_primary_screen_synchronized_frame();
                             let exit_code = if params.len() > 2 {
                                 std::str::from_utf8(params[2])
                                     .ok()

@@ -349,16 +349,7 @@ impl App {
                     }
                 }
                 Effect::ResizePty { tab, rows, cols } => {
-                    if let Some(session) = self.sessions.tab_mut(tab) {
-                        if let Some(pty) = &session.pty {
-                            if let Err(error) = pty.resize(rows as u16, cols as u16) {
-                                warn!(%error, tab, rows, cols, "failed to apply PTY resize effect");
-                            }
-                        }
-                        if session.pending_pty_resize == Some((rows, cols)) {
-                            session.pending_pty_resize = None;
-                        }
-                    }
+                    self.apply_pty_resize_effect(tab, rows, cols);
                 }
                 Effect::CopyClipboard { text } => clipboard_copy(&text),
                 Effect::PersistTabs => self.save_all_tabs(),
@@ -1343,7 +1334,7 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    app_runtime::install_runtime_diagnostics();
     info!("Starting Weft v1.0 \"Weave\"");
 
     // Create a tokio runtime for PTY async operations.

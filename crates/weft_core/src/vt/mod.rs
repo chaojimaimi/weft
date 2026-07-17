@@ -14,7 +14,6 @@ use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, G
 use crate::hyperlink::HyperlinkRegistry;
 use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
 pub const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
-
 /// The terminal: owns a Grid, vte::Parser, and current attributes.
 /// Implements `vte::Perform` to translate escape sequences into Grid mutations.
 pub struct Terminal {
@@ -39,18 +38,18 @@ pub struct Terminal {
     pub cursor_visible: bool,
     /// Cursor style (DECSCUSR, CSI <n> q).
     pub cursor_style: CursorStyle,
-    /// Mouse protocol mode.
-    pub mouse_protocol: MouseProtocol,
+    pub mouse_protocol: MouseProtocol, // active mouse reporting mode
     /// Start of a DEC 2026 atomic update; stale frames expire automatically.
     synchronized_output_started: Option<std::time::Instant>,
+    synchronized_frame_cleared_rows: usize,
+    primary_screen_synchronized_frame_seen: bool,
     /// SGR-1006 selects SGR vs legacy mouse report encoding.
     pub sgr_mouse: bool,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
     /// Alternate screen buffer, swapped with `grid` for DEC 1049/47.
     alt_grid: Grid,
-    /// True while the alternate screen is active.
-    alt_active: bool,
+    alt_active: bool, // true while the alternate screen is active
     /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
     saved_cursor: Option<Cursor>,
     /// Bytes written back for DA/DSR/size and capability queries.
@@ -61,8 +60,7 @@ pub struct Terminal {
     /// the `Cell` struct so Cell stays at 24 bytes (only the 1-bit HYPERLINK
     /// flag lives on the cell).
     hyperlinks: HyperlinkRegistry,
-    /// Gates the printable-ASCII fast path while vte is in ground state.
-    parser_in_ground_state: bool,
+    parser_in_ground_state: bool, // gates the printable-ASCII fast path
     suppress_joined_scalar: bool,
     primary_screen_cursor_ops: u8,
 }
@@ -92,6 +90,8 @@ impl Terminal {
             cursor_style: CursorStyle::Block,
             mouse_protocol: MouseProtocol::Off,
             synchronized_output_started: None,
+            synchronized_frame_cleared_rows: 0,
+            primary_screen_synchronized_frame_seen: false,
             sgr_mouse: false,
             palette: Self::init_palette(),
             // Alt-screen apps manage their own scrolling and history.
@@ -747,16 +747,14 @@ impl Terminal {
         match mode {
             1 => self.app_cursor_keys = set, // DECCKM
             6 => {
-                // DECOM (origin mode): CUP becomes relative to the scroll
-                // region. Full-screen TUIs (vim, claude) rely on this.
+                // DECOM: CUP is relative to the scroll region.
                 self.origin_mode = set;
                 tracing::debug!(set, "DECOM origin mode toggled");
             }
             7 => { /* DECAWM — auto wrap mode, always on */ }
             25 => self.cursor_visible = set, // DECTCEM — cursor show/hide
             47 | 1049 => {
-                // DEC alternate screen buffer: only swap on a real state
-                // change, matching Warp's idempotent enter/exit guards.
+                // Swap only on a real state change.
                 if set != self.alt_active {
                     self.swap_alt(mode == 1049);
                 }
@@ -767,9 +765,11 @@ impl Terminal {
             2004 => self.bracketed_paste = set, // Bracketed paste
             2026 => {
                 if set {
+                    self.begin_primary_screen_synchronized_frame();
                     self.synchronized_output_started
                         .get_or_insert_with(std::time::Instant::now);
                 } else {
+                    self.finish_primary_screen_synchronized_frame();
                     self.synchronized_output_started = None;
                 }
                 tracing::debug!(set, "DEC synchronized output toggled");

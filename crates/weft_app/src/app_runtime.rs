@@ -2,6 +2,52 @@
 
 use super::*;
 
+pub(crate) fn install_runtime_diagnostics() {
+    tracing_subscriber::fmt::init();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = panic_log_path(std::env::var_os("HOME").as_deref());
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                file,
+                "\n=== Weft panic pid={} at {:?} ===\n{}\n{}",
+                std::process::id(),
+                std::time::SystemTime::now(),
+                info,
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        default_hook(info);
+    }));
+}
+
+fn invalidate_primary_tui_frame(terminal: &mut Terminal) -> bool {
+    if !terminal.primary_screen_repaint_capable() {
+        return false;
+    }
+    terminal.grid_mut().clear();
+    true
+}
+
+fn should_clear_pending_resize(resize_failed: bool) -> bool {
+    !resize_failed
+}
+
+fn panic_log_path(home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    home.map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library/Logs/Weft/panic.log")
+}
+
 fn schedule_synchronized_output_watchdog(
     pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     delay: std::time::Duration,
@@ -485,9 +531,96 @@ impl ApplicationHandler<AppEvent> for App {
     }
 }
 
+impl App {
+    pub(super) fn apply_pty_resize_effect(&mut self, tab: usize, rows: usize, cols: usize) {
+        let Some(session) = self.sessions.tab_mut(tab) else {
+            return;
+        };
+        let resize_failed = session.pty.as_ref().is_some_and(|pty| {
+            pty.resize(rows as u16, cols as u16)
+                .map(|()| {
+                    if let Some(terminal) = &mut session.terminal {
+                        invalidate_primary_tui_frame(terminal);
+                    }
+                    false
+                })
+                .unwrap_or_else(|error| {
+                    warn!(%error, tab, rows, cols, "failed to apply PTY resize effect");
+                    true
+                })
+        });
+        if should_clear_pending_resize(resize_failed)
+            && session.pending_pty_resize == Some((rows, cols))
+        {
+            session.pending_pty_resize = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panic_log_uses_the_user_library_logs_directory() {
+        assert_eq!(
+            panic_log_path(Some(std::ffi::OsStr::new("/Users/test"))),
+            std::path::PathBuf::from("/Users/test/Library/Logs/Weft/panic.log")
+        );
+    }
+
+    #[test]
+    fn primary_tui_resize_invalidation_drops_stale_frame_but_keeps_host_context() {
+        let mut terminal = Terminal::new(8, 40);
+        terminal.process(b"\x1b]7;file://localhost/Users/me/Claude\x07");
+        terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+        terminal.process(b"\x1b[?2026h\x1b[2J\x1b[HOLD ICON\x1b[4;1HOLD HEADER\x1b[?2026l");
+
+        assert!(invalidate_primary_tui_frame(&mut terminal));
+        terminal.process(b"\x1b[HNEW ICON");
+
+        assert_eq!(terminal.grid().row_text(0), "NEW ICON");
+        assert!(terminal.grid().row_text(3).is_empty());
+        assert_eq!(terminal.cwd(), Some("/Users/me/Claude"));
+        assert_eq!(
+            terminal
+                .block_tracker()
+                .in_flight()
+                .map(|live| live.command),
+            Some("claude")
+        );
+    }
+
+    #[test]
+    fn resize_invalidation_does_not_clear_shell_or_alt_screen() {
+        let mut shell = Terminal::new(4, 20);
+        shell.process(b"shell output");
+        assert!(!invalidate_primary_tui_frame(&mut shell));
+        assert_eq!(shell.grid().row_text(0), "shell output");
+
+        shell.process(b"\x1b[?1049hALT");
+        assert!(!invalidate_primary_tui_frame(&mut shell));
+        assert_eq!(shell.grid().row_text(0), "ALT");
+    }
+
+    #[test]
+    fn cursor_addressing_without_synchronized_frames_is_not_destructively_cleared() {
+        let mut terminal = Terminal::new(4, 24);
+        terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07");
+        terminal.process(b"\x1b[Hprogress\x1b[2;1Hstill running");
+        assert!(terminal.primary_screen_app_active());
+
+        assert!(!invalidate_primary_tui_frame(&mut terminal));
+        assert_eq!(terminal.grid().row_text(0), "progress");
+        assert_eq!(terminal.grid().row_text(1), "still running");
+    }
+
+    #[test]
+    fn failed_pty_resize_keeps_latest_dimensions_for_retry() {
+        assert!(!should_clear_pending_resize(true));
+        assert!(should_clear_pending_resize(false));
+    }
+
     use std::time::SystemTime;
     use weft_core::blocks::{Block, BlockId};
 
