@@ -55,28 +55,18 @@ impl Terminal {
         if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
             self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
             if self.primary_screen_app_active() {
-                self.block_tracker.begin_screen_owned_output();
+                self.block_tracker
+                    .begin_screen_owned_output(self.grid.scrollback.position());
             }
         }
     }
 
     fn snapshot_primary_screen_output(&mut self) {
-        if !self.block_tracker.screen_owned_output() {
+        let Some(scrollback_start) = self.block_tracker.screen_scrollback_start() else {
             return;
-        }
-        let rows: Vec<String> = (0..self.grid.num_rows)
-            .map(|row| self.grid.row_text(row))
-            .collect();
-        let start = rows
-            .iter()
-            .position(|row| !row.is_empty())
-            .unwrap_or(rows.len());
-        let end = rows
-            .iter()
-            .rposition(|row| !row.is_empty())
-            .map_or(start, |index| index + 1);
-        self.block_tracker
-            .replace_screen_output(&rows[start..end].join("\n"));
+        };
+        let document = self.grid.document_text_from(scrollback_start);
+        self.block_tracker.replace_screen_output(&document);
     }
 }
 

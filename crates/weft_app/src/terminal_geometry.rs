@@ -9,11 +9,6 @@ use crate::renderer::MetalRenderer;
 use weft_core::grid::CursorStyle;
 use winit::dpi::PhysicalSize;
 
-/// CWD and command rows reserved above a primary-screen TUI. Unlike an
-/// alternate-screen app, these programs clear the primary grid on SIGWINCH;
-/// host context therefore has to live outside the rows advertised to the PTY.
-pub const PRIMARY_TUI_CONTEXT_ROWS: usize = 2;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PhysicalRect {
     pub left: f64,
@@ -55,33 +50,13 @@ impl TerminalLayout {
     }
 
     /// Whether a pointer is inside the PTY-owned cell rectangle. Chrome,
-    /// padding, sidebars and the primary-TUI context band are deliberately
-    /// excluded so their coordinates cannot clamp into Grid row/column zero.
+    /// padding and sidebars are excluded so their coordinates cannot clamp
+    /// into Grid row/column zero.
     pub fn contains_content(self, x: f64, y: f64) -> bool {
         x >= self.content.left
             && x < self.content.right
             && y >= self.content.top
             && y < self.content.bottom
-    }
-
-    /// Reserve whole cell rows at the top of the terminal content rectangle.
-    /// Rendering, PTY dimensions and pointer mapping all consume the returned
-    /// layout, so no caller can advertise rows underneath the host-owned band.
-    /// The reservation is atomic: if it would leave no PTY row, keep the base
-    /// layout instead of exposing a zero-row Grid to resize/render code.
-    pub fn reserve_top_rows(mut self, rows: usize) -> Self {
-        if rows == 0 || self.rows <= rows {
-            return self;
-        }
-        let reserve = rows as f64 * self.cell_height;
-        self.chrome_top += reserve;
-        self.content.top = (self.content.top + reserve).min(self.content.bottom);
-        self.rows = if self.cell_height <= 0.0 {
-            0
-        } else {
-            (self.content.height() / self.cell_height).floor() as usize
-        };
-        self
     }
 
     /// Map a physical pixel to a valid cell, clamped to the supplied live Grid
@@ -223,7 +198,7 @@ pub fn grid_cursor_visible(
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_cursor_visible, GridGeometry, PhysicalRect, PRIMARY_TUI_CONTEXT_ROWS};
+    use super::{grid_cursor_visible, GridGeometry, PhysicalRect};
     use weft_core::grid::CursorStyle;
 
     fn geometry() -> GridGeometry {
@@ -250,34 +225,6 @@ mod tests {
         let old_rows = ((800.0_f64 - 20.0) / 20.0).floor() as usize;
         assert_eq!(old_rows, 39);
         assert!(10.0 + 56.0 + old_rows as f64 * 20.0 > 790.0);
-    }
-
-    #[test]
-    fn primary_tui_context_rows_shift_grid_and_reduce_pty_height_together() {
-        let base = geometry().layout();
-        let reserved = base.reserve_top_rows(PRIMARY_TUI_CONTEXT_ROWS);
-        assert_eq!(reserved.rows, base.rows - PRIMARY_TUI_CONTEXT_ROWS);
-        assert_eq!(reserved.cols, base.cols);
-        assert_eq!(
-            reserved.content.top,
-            base.content.top + PRIMARY_TUI_CONTEXT_ROWS as f64 * base.cell_height
-        );
-        assert_eq!(reserved.grid_position(10.0, 106.0, 34, 98), (0, 0));
-        assert!(!reserved.contains_content(10.0, reserved.content.top - 1.0));
-        assert!(reserved.contains_content(10.0, reserved.content.top));
-        assert!(!reserved.contains_content(10.0, reserved.content.bottom));
-    }
-
-    #[test]
-    fn primary_tui_context_never_creates_a_zero_row_terminal() {
-        let mut tiny = geometry().layout();
-        tiny.rows = PRIMARY_TUI_CONTEXT_ROWS;
-        tiny.content.bottom = tiny.content.top + PRIMARY_TUI_CONTEXT_ROWS as f64 * tiny.cell_height;
-        assert_eq!(
-            tiny.reserve_top_rows(PRIMARY_TUI_CONTEXT_ROWS),
-            tiny,
-            "an undersized viewport must keep its usable PTY rows"
-        );
     }
 
     #[test]

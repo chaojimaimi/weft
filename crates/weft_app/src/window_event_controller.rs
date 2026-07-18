@@ -43,15 +43,8 @@ impl App {
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
                         for tab in self.sessions.tabs_mut() {
-                            if let Some(terminal) = &tab.terminal {
-                                let layout = if terminal.primary_screen_app_active() {
-                                    base_layout.reserve_top_rows(
-                                        crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS,
-                                    )
-                                } else {
-                                    base_layout
-                                };
-                                let (new_rows, new_cols) = layout.dimensions();
+                            if tab.terminal.is_some() {
+                                let (new_rows, new_cols) = base_layout.dimensions();
                                 tab.resize_terminal_and_queue(new_rows, new_cols);
                             }
                         }

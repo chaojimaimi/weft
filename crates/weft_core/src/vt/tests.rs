@@ -81,7 +81,7 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
 }
 
 #[test]
-fn primary_screen_tui_resize_is_dimension_only_with_host_context_outside_grid() {
+fn primary_screen_tui_resize_is_dimension_only() {
     let mut t = Terminal::new(4, 8);
     t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
     t.process(b"\x1b[2J\x1b[1;1H\x1b[1;1HABCDEFGH");
@@ -96,6 +96,38 @@ fn primary_screen_tui_resize_is_dimension_only_with_host_context_outside_grid() 
 
     t.block_tracker_mut().reset_to_prompt();
     assert!(!t.primary_screen_app_active());
+}
+
+#[test]
+fn primary_screen_exit_snapshot_keeps_scrollback_and_ctrl_c_resume_tail() {
+    let mut terminal = Terminal::new(4, 48);
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    terminal.process(
+        b"\x1b[2J\x1b[Hanswer line 1\r\nanswer line 2\r\nanswer line 3\r\nPress Ctrl-C again to exit\r\nResume this session with:\r\nclaude --resume session-id",
+    );
+    terminal.process(b"\x1b]133;D;130\x07\x1b]133;A\x07");
+
+    let block = terminal.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        "answer line 1\nanswer line 2\nanswer line 3\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume session-id"
+    );
+}
+
+#[test]
+fn primary_screen_snapshot_excludes_rows_scrolled_before_tui_detection() {
+    let mut terminal = Terminal::new(3, 40);
+    terminal.process(b"old shell row 1\r\nold shell row 2\r\nold shell row 3\r\n");
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07startup\r\n");
+    terminal.process(b"\x1b[H\x1b[2;1H");
+    assert!(terminal.primary_screen_app_active());
+    terminal.process(b"\x1b[2J\x1b[Hfinal answer\x1b]133;D;0\x07");
+
+    let block = terminal.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.output.as_ref(), "final answer");
 }
 
 #[test]

@@ -13,6 +13,8 @@ pub struct Scrollback {
     head: usize,
     /// Current number of occupied lines.
     len: usize,
+    /// Logical insertion position; advances beyond ring capacity.
+    position: u64,
 }
 
 impl Scrollback {
@@ -22,6 +24,7 @@ impl Scrollback {
             max_lines,
             head: 0,
             len: 0,
+            position: 0,
         }
     }
 
@@ -30,6 +33,7 @@ impl Scrollback {
         if self.max_lines == 0 {
             return;
         }
+        self.position = self.position.saturating_add(1);
         if self.len < self.max_lines {
             self.buffer.push(row);
             self.len += 1;
@@ -48,30 +52,6 @@ impl Scrollback {
         }
     }
 
-    /// Pop the most recent row from scrollback (LIFO for scroll-up undo).
-    pub fn pop(&mut self) -> Option<Row> {
-        if self.len == 0 {
-            return None;
-        }
-        self.len -= 1;
-        if self.len < self.buffer.len() {
-            // Still within the Vec, just pop
-            self.head = self.len % self.max_lines;
-            self.buffer.pop()
-        } else {
-            // Ring buffer wrap-around case
-            let idx = if self.head == 0 {
-                self.max_lines - 1
-            } else {
-                self.head - 1
-            };
-            self.head = idx;
-            // Swap out the row
-            let cols = self.buffer[idx].cells.len();
-            Some(std::mem::replace(&mut self.buffer[idx], Row::new(cols)))
-        }
-    }
-
     /// Number of lines in scrollback.
     pub fn len(&self) -> usize {
         self.len
@@ -79,6 +59,27 @@ impl Scrollback {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Clear retained rows without resetting the logical insertion position.
+    /// Screen-capture baselines remain valid across CSI 3J.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.head = 0;
+        self.len = 0;
+    }
+
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Index of the oldest retained row inserted at or after `position`.
+    pub fn index_since(&self, position: u64) -> usize {
+        if position > self.position {
+            return 0; // The buffer was cleared and recreated.
+        }
+        let oldest = self.position.saturating_sub(self.len as u64);
+        position.max(oldest).saturating_sub(oldest) as usize
     }
 
     /// Get a row from scrollback by index (0 = oldest, len-1 = newest).
@@ -104,7 +105,7 @@ impl Scrollback {
     }
 
     /// Resize the scrollback buffer.
-    pub fn resize(&mut self, new_max: usize, cols: usize) {
+    pub fn resize(&mut self, new_max: usize, _cols: usize) {
         if new_max == self.max_lines {
             return;
         }
@@ -116,16 +117,15 @@ impl Scrollback {
             return;
         }
 
-        // Collect rows in order (oldest first)
+        // Keep the newest rows when shrinking so logical positions remain a
+        // contiguous suffix ending at `position`.
         let mut rows: Vec<Row> = Vec::with_capacity(new_max);
-        for i in 0..self.len.min(new_max) {
+        let keep = self.len.min(new_max);
+        let start = self.len.saturating_sub(keep);
+        for i in start..self.len {
             if let Some(row) = self.get(i) {
                 rows.push(row.clone());
             }
-        }
-        // Pad with empty rows if needed
-        while rows.len() < new_max.min(self.len) {
-            rows.push(Row::new(cols));
         }
 
         self.buffer = rows;

@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_tui_resize_invalidation_drops_stale_frame_but_keeps_host_context() {
+    fn primary_tui_resize_invalidation_drops_stale_frame_but_keeps_shell_state() {
         let mut terminal = Terminal::new(8, 40);
         terminal.process(b"\x1b]7;file://localhost/Users/me/Claude\x07");
         terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");

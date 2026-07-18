@@ -48,10 +48,7 @@ impl App {
 
         // If the grid row count drifted from what the terminal holds
         // (font/padding/window-size change, the one-time convergence from the
-        // spawn size to the padded size, or entering/leaving a primary-screen
-        // TUI's host-owned context band) — recompute. The dimension mismatch
-        // is also what delivers the first SIGWINCH after TUI ownership is
-        // detected from its cursor-addressing output.
+        // spawn size to the padded size) — recompute.
         let desired = self.grid_dims();
         let current = self
             .sessions

@@ -5,7 +5,7 @@ mod cursor;
 mod display;
 mod row;
 mod scrollback;
-
+mod snapshot;
 pub use cell::{
     terminal_char_width, terminal_grapheme_glyph, terminal_text_width, Cell, CellColor, CellFlags,
     CellWidth, Color,
@@ -463,9 +463,7 @@ impl Grid {
 
     /// Clear scrollback buffer (CSI 3 J).
     pub fn clear_scrollback(&mut self) {
-        // Preserve the configured capacity (don't reset to a hardcoded default).
-        let max_lines = self.scrollback.max_lines;
-        self.scrollback = Scrollback::new(max_lines);
+        self.scrollback.clear();
         self.scroll_offset = 0;
     }
 

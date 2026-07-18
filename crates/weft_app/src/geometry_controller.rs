@@ -105,17 +105,7 @@ impl App {
             0.0
         };
         let layout = terminal_layout_for_renderer(renderer, window.inner_size(), chrome_left);
-        let primary_tui = self
-            .sessions
-            .active()
-            .terminal
-            .as_ref()
-            .is_some_and(Terminal::primary_screen_app_active);
-        Some(if primary_tui {
-            layout.reserve_top_rows(crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS)
-        } else {
-            layout
-        })
+        Some(layout)
     }
 
     /// Compute grid (rows, cols) from the shared terminal layout. Returns
@@ -158,13 +148,8 @@ impl App {
         // their PTY resize on activation (refresh_grid_for_active_tab).
         let active = self.sessions.active_idx();
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
-            if let Some(terminal) = &tab.terminal {
-                let layout = if terminal.primary_screen_app_active() {
-                    base_layout.reserve_top_rows(crate::terminal_geometry::PRIMARY_TUI_CONTEXT_ROWS)
-                } else {
-                    base_layout
-                };
-                let (new_rows, new_cols) = layout.dimensions();
+            if tab.terminal.is_some() {
+                let (new_rows, new_cols) = base_layout.dimensions();
                 if tab.resize_terminal_and_queue(new_rows, new_cols) && i == active {
                     info!(rows = new_rows, cols = new_cols, "terminal resized");
                 }

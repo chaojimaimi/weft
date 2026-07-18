@@ -9,6 +9,10 @@ const LEFT: u8 = 1;
 const RIGHT: u8 = 2;
 const UP: u8 = 4;
 const DOWN: u8 = 8;
+const QUAD_UPPER_LEFT: u8 = 1;
+const QUAD_UPPER_RIGHT: u8 = 2;
+const QUAD_LOWER_LEFT: u8 = 4;
+const QUAD_LOWER_RIGHT: u8 = 8;
 
 pub(super) fn rasterize(ch: char, width: u32, height: u32) -> Option<Vec<u8>> {
     if width == 0 || height == 0 {
@@ -22,6 +26,58 @@ pub(super) fn rasterize(ch: char, width: u32, height: u32) -> Option<Vec<u8>> {
         '▄' => Some(fill_rect(width, height, 0, 0, width, height.div_ceil(2))),
         '▌' => Some(fill_rect(width, height, 0, 0, width.div_ceil(2), height)),
         '▐' => Some(fill_rect(width, height, width / 2, 0, width, height)),
+        '▁'..='▇' => Some(fill_lower_eighths(ch, width, height)),
+        '▉'..='▏' => Some(fill_left_eighths(ch, width, height)),
+        '▔' => Some(fill_rect(
+            width,
+            height,
+            0,
+            height.saturating_sub(height.div_ceil(8)),
+            width,
+            height,
+        )),
+        '▕' => Some(fill_rect(
+            width,
+            height,
+            width.saturating_sub(width.div_ceil(8)),
+            0,
+            width,
+            height,
+        )),
+        '▖' => Some(draw_quadrants(width, height, QUAD_LOWER_LEFT)),
+        '▗' => Some(draw_quadrants(width, height, QUAD_LOWER_RIGHT)),
+        '▘' => Some(draw_quadrants(width, height, QUAD_UPPER_LEFT)),
+        '▙' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_LEFT | QUAD_LOWER_LEFT | QUAD_LOWER_RIGHT,
+        )),
+        '▚' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_LEFT | QUAD_LOWER_RIGHT,
+        )),
+        '▛' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_LEFT | QUAD_UPPER_RIGHT | QUAD_LOWER_LEFT,
+        )),
+        '▜' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_LEFT | QUAD_UPPER_RIGHT | QUAD_LOWER_RIGHT,
+        )),
+        '▝' => Some(draw_quadrants(width, height, QUAD_UPPER_RIGHT)),
+        '▞' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_RIGHT | QUAD_LOWER_LEFT,
+        )),
+        '▟' => Some(draw_quadrants(
+            width,
+            height,
+            QUAD_UPPER_RIGHT | QUAD_LOWER_LEFT | QUAD_LOWER_RIGHT,
+        )),
         '─' => Some(draw_box(width, height, LEFT | RIGHT, false)),
         '━' => Some(draw_box(width, height, LEFT | RIGHT, true)),
         '│' => Some(draw_box(width, height, UP | DOWN, false)),
@@ -37,6 +93,37 @@ pub(super) fn rasterize(ch: char, width: u32, height: u32) -> Option<Vec<u8>> {
         '┼' => Some(draw_box(width, height, LEFT | RIGHT | UP | DOWN, false)),
         _ => None,
     }
+}
+
+fn fill_lower_eighths(ch: char, width: u32, height: u32) -> Vec<u8> {
+    let eighths = ch as u32 - '▁' as u32 + 1;
+    let filled = (height * eighths).div_ceil(8);
+    fill_rect(width, height, 0, 0, width, filled)
+}
+
+fn fill_left_eighths(ch: char, width: u32, height: u32) -> Vec<u8> {
+    let eighths = 8 - (ch as u32 - '▉' as u32 + 1);
+    let filled = (width * eighths).div_ceil(8);
+    fill_rect(width, height, 0, 0, filled, height)
+}
+
+fn draw_quadrants(width: u32, height: u32, quadrants: u8) -> Vec<u8> {
+    let mut pixels = vec![0; width as usize * height as usize];
+    let x_mid = width.div_ceil(2);
+    let y_mid = height.div_ceil(2);
+    if quadrants & QUAD_UPPER_LEFT != 0 {
+        paint(&mut pixels, width, 0, height / 2, x_mid, height);
+    }
+    if quadrants & QUAD_UPPER_RIGHT != 0 {
+        paint(&mut pixels, width, width / 2, height / 2, width, height);
+    }
+    if quadrants & QUAD_LOWER_LEFT != 0 {
+        paint(&mut pixels, width, 0, 0, x_mid, y_mid);
+    }
+    if quadrants & QUAD_LOWER_RIGHT != 0 {
+        paint(&mut pixels, width, width / 2, 0, width, y_mid);
+    }
+    pixels
 }
 
 fn fill_rect(width: u32, height: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<u8> {
@@ -109,5 +196,34 @@ mod tests {
         let right = rasterize('┐', 8, 16).unwrap();
         assert!(left.chunks_exact(8).any(|row| row[7] == u8::MAX));
         assert!(right.chunks_exact(8).any(|row| row[0] == u8::MAX));
+    }
+
+    #[test]
+    fn claude_logo_quadrants_have_no_font_bearing_gaps() {
+        let width = 8;
+        let height = 16;
+        let upper = rasterize('▛', width, height).unwrap();
+        let upper_right = rasterize('▝', width, height).unwrap();
+        let upper_left = rasterize('▘', width, height).unwrap();
+
+        for row in upper.chunks_exact(width as usize).skip(height as usize / 2) {
+            assert!(row.iter().all(|pixel| *pixel == u8::MAX));
+        }
+        assert_eq!(upper_right[(height as usize - 1) * width as usize], 0);
+        assert_eq!(upper_right[height as usize * width as usize - 1], u8::MAX);
+        assert_eq!(upper_left[(height as usize - 1) * width as usize], u8::MAX);
+        assert_eq!(upper_left[height as usize * width as usize - 1], 0);
+    }
+
+    #[test]
+    fn all_solid_block_elements_use_procedural_rasterization() {
+        for ch in '▁'..='▟' {
+            if !matches!(ch, '░' | '▒' | '▓') {
+                assert!(
+                    rasterize(ch, 8, 16).is_some(),
+                    "missing rasterizer for {ch}"
+                );
+            }
+        }
     }
 }

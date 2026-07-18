@@ -30,7 +30,7 @@ fn screen_owned_command_uses_final_snapshot_not_repaint_stream() {
     tracker.on_prompt_start();
     tracker.on_command_start("screen-app".to_string());
     tracker.on_print_ascii_run(b"partial repaint");
-    tracker.begin_screen_owned_output();
+    tracker.begin_screen_owned_output(7);
     tracker.on_print_ascii_run(b"ignored cursor frame");
     tracker.replace_screen_output("final screen\nresume command");
     tracker.on_command_end(130);
