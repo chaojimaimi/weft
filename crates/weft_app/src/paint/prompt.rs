@@ -277,12 +277,7 @@ impl MetalRenderer {
         // box. Shows the Enter / Shift+Enter (or Ctrl+Enter / Enter) key
         // semantics. Dim color, more prominent when multi-line input is active.
         let hint_y = layout.box_rect[3] - ch;
-        if hint_y >= text_y0 {
-            let hint_text = if p.submit_on_ctrl_enter {
-                "⌃⏎ Run · ⏎ Newline"
-            } else {
-                "⏎ Run · ⇧⏎ Newline"
-            };
+        if let Some(hint_text) = prompt_hint_text(p.submit_on_ctrl_enter, p.lines.len()) {
             let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
             let dim_c = color_to_normalized(ui.text_secondary);
             // Multi-line input makes the hint slightly more visible (0.70
@@ -370,6 +365,16 @@ pub struct PromptDrawParams<'a> {
     pub submit_on_ctrl_enter: bool,
 }
 
+fn prompt_hint_text(submit_on_ctrl_enter: bool, line_count: usize) -> Option<&'static str> {
+    if submit_on_ctrl_enter {
+        Some("⌃⏎ Run · ⏎ New line")
+    } else if line_count > 1 {
+        Some("⏎ Run · ⇧⏎ New line")
+    } else {
+        None
+    }
+}
+
 fn normalize_preedit_range(text: &str, start: usize, end: usize) -> (usize, usize) {
     fn floor_boundary(text: &str, offset: usize) -> usize {
         let mut offset = offset.min(text.len());
@@ -393,5 +398,12 @@ mod tests {
         assert_eq!(normalize_preedit_range("啊b", 1, 2), (0, 0));
         assert_eq!(normalize_preedit_range("啊b", 3, 4), (3, 4));
         assert_eq!(normalize_preedit_range("啊b", 99, 99), (4, 4));
+    }
+
+    #[test]
+    fn default_single_line_prompt_hides_redundant_key_hint() {
+        assert_eq!(prompt_hint_text(false, 1), None);
+        assert_eq!(prompt_hint_text(false, 2), Some("⏎ Run · ⇧⏎ New line"));
+        assert_eq!(prompt_hint_text(true, 1), Some("⌃⏎ Run · ⏎ New line"));
     }
 }

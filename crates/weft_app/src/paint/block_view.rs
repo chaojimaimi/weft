@@ -240,8 +240,6 @@ impl MetalRenderer {
         let clip_top = layout.clip_top;
         let clip_bottom = content_bottom_y;
 
-        let mut topmost_block_info: Option<(String, String)> = None;
-
         let selection_bg = {
             let accent = color_to_normalized(self.theme.accent);
             let bg = color_to_normalized(self.theme.background);
@@ -638,26 +636,20 @@ impl MetalRenderer {
                 }
                 LaidRow::Blank => {}
             }
-
-            if block_scroll > 0 && row_top_y <= clip_top + pitch {
-                if let LaidRow::Command { command, .. } = &row_data[i] {
-                    let cmd_str: &str = command;
-                    for b in blocks.iter().rev() {
-                        if b.command == cmd_str {
-                            topmost_block_info = Some((
-                                cmd_str.to_string(),
-                                b.cwd.as_deref().map(abbreviate_path).unwrap_or_default(),
-                            ));
-                            break;
-                        }
-                    }
-                }
-            }
         }
 
+        let sticky_block = rows::sticky_block_id(&bv_rows, clip_top, clip_bottom);
         if block_scroll > 0 {
-            if let Some((cmd, block_cwd)) = &topmost_block_info {
+            if let Some(block) = sticky_block.and_then(|id| blocks.iter().find(|b| b.id == id)) {
+                let cmd = &block.command;
+                let block_cwd = block
+                    .cwd
+                    .as_deref()
+                    .map(abbreviate_path)
+                    .unwrap_or_default();
                 let sticky_y = layout.clip_top;
+                let header_rows = rows::sticky_header_rows(!block_cwd.is_empty());
+                let sticky_bottom = sticky_y + header_rows as f32 * pitch;
                 let sticky_bg = [
                     theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
                     theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
@@ -666,28 +658,28 @@ impl MetalRenderer {
                 ];
                 push_quad(
                     &mut verts,
-                    [0.0, sticky_y, vp_w, sticky_y + pitch],
+                    [0.0, sticky_y, vp_w, sticky_bottom],
                     bg_uv,
                     [0.0; 4],
                     sticky_bg,
                 );
                 push_quad(
                     &mut verts,
-                    [0.0, sticky_y + pitch, vp_w, sticky_y + pitch + 1.0],
+                    [0.0, sticky_bottom, vp_w, sticky_bottom + 1.0],
                     bg_uv,
                     [0.0; 4],
                     separator,
                 );
-                self.push_text(&mut verts, left, sticky_y, "❯ ", prompt_c, cols);
+                let command_y = if block_cwd.is_empty() {
+                    sticky_y
+                } else {
+                    self.push_text(&mut verts, left, sticky_y, &block_cwd, dim, cols);
+                    sticky_y + pitch
+                };
+                self.push_text(&mut verts, left, command_y, "❯ ", prompt_c, cols);
                 let cmd_x = left + 2.0 * cw;
                 let avail = cols.saturating_sub(2).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, sticky_y, cmd, avail);
-                if !block_cwd.is_empty() {
-                    let cmd_cols = Self::text_col_width(cmd);
-                    let cwd_x = cmd_x + (cmd_cols + 2) as f32 * cw;
-                    let cwd_avail = cols.saturating_sub(2 + cmd_cols + 2).max(1);
-                    self.push_text(&mut verts, cwd_x, sticky_y, block_cwd, dim, cwd_avail);
-                }
+                self.push_line_tokenized(&mut verts, cmd_x, command_y, cmd, avail);
             }
         }
 

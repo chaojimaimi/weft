@@ -7,6 +7,33 @@ use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
+use weft_core::selection::{BlockViewRow, BlockViewRowKind};
+
+/// Return the block whose output is clipped by the top edge while its command
+/// row is already offscreen. That block owns the sticky CWD/command header.
+pub(super) fn sticky_block_id(
+    rows: &[BlockViewRow],
+    clip_top: f32,
+    clip_bottom: f32,
+) -> Option<BlockId> {
+    let top = rows
+        .iter()
+        .filter(|row| row.block_id.is_some() && row.y_bottom > clip_top && row.y_top < clip_bottom)
+        .min_by(|a, b| a.y_top.total_cmp(&b.y_top))?;
+    let block_id = top.block_id?;
+    let command = rows
+        .iter()
+        .find(|row| row.block_id == Some(block_id) && row.kind == BlockViewRowKind::Command)?;
+    (command.y_top < clip_top).then_some(block_id)
+}
+
+pub(super) fn sticky_header_rows(has_cwd: bool) -> usize {
+    if has_cwd {
+        2
+    } else {
+        1
+    }
+}
 
 impl MetalRenderer {
     /// Compute block-view rows for hit-testing WITHOUT building vertices.
@@ -22,8 +49,6 @@ impl MetalRenderer {
         &self,
         model: BlockViewPaintModel<'_>,
     ) -> Vec<weft_core::selection::BlockViewRow> {
-        use weft_core::selection::{BlockViewRow, BlockViewRowKind};
-
         let BlockViewPaintModel {
             blocks,
             region_bottom_y,
@@ -257,5 +282,45 @@ impl MetalRenderer {
         }
 
         bv_rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(kind: BlockViewRowKind, id: u64, y_top: f32, y_bottom: f32) -> BlockViewRow {
+        BlockViewRow {
+            kind,
+            text: String::new(),
+            block_id: Some(BlockId(id)),
+            y_top,
+            y_bottom,
+        }
+    }
+
+    #[test]
+    fn sticky_header_tracks_output_whose_command_scrolled_above_viewport() {
+        let rows = [
+            row(BlockViewRowKind::Command, 7, -20.0, 0.0),
+            row(BlockViewRowKind::Output, 7, -2.0, 18.0),
+            row(BlockViewRowKind::Output, 7, 18.0, 38.0),
+        ];
+        assert_eq!(sticky_block_id(&rows, 0.0, 100.0), Some(BlockId(7)));
+    }
+
+    #[test]
+    fn sticky_header_stays_hidden_while_command_is_visible() {
+        let rows = [
+            row(BlockViewRowKind::Command, 9, 4.0, 24.0),
+            row(BlockViewRowKind::Output, 9, 24.0, 44.0),
+        ];
+        assert_eq!(sticky_block_id(&rows, 0.0, 100.0), None);
+    }
+
+    #[test]
+    fn sticky_header_uses_a_separate_context_row_when_cwd_is_known() {
+        assert_eq!(sticky_header_rows(true), 2);
+        assert_eq!(sticky_header_rows(false), 1);
     }
 }

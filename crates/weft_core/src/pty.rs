@@ -357,6 +357,7 @@ fn build_child_env(overrides: &[(&str, &str)]) -> Vec<std::ffi::CString> {
     }
     use std::collections::HashMap;
     let mut env: HashMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
+    strip_launcher_presentation_env(&mut env);
     for (k, v) in overrides {
         env.insert(std::ffi::OsString::from(k), std::ffi::OsString::from(v));
     }
@@ -371,6 +372,15 @@ fn build_child_env(overrides: &[(&str, &str)]) -> Vec<std::ffi::CString> {
             std::ffi::CString::new(bytes).expect("env entry must not contain NUL")
         })
         .collect()
+}
+
+/// Do not leak a GUI launcher's presentation policy into terminal sessions.
+/// Users can still export `NO_COLOR` from their shell startup files when they
+/// intentionally want monochrome command output.
+fn strip_launcher_presentation_env(
+    env: &mut std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+) {
+    env.remove(std::ffi::OsStr::new("NO_COLOR"));
 }
 
 /// Async read loop: reads from the PTY master fd and sends output events.
@@ -522,6 +532,17 @@ mod tests {
     fn resize_ioctl_failure_is_propagated() {
         assert!(matches!(resize_ioctl_result(-1), Err(PtyError::Resize(_))));
         assert!(resize_ioctl_result(0).is_ok());
+    }
+
+    #[test]
+    fn child_env_drops_inherited_no_color_policy() {
+        let mut env = std::collections::HashMap::from([
+            ("NO_COLOR".into(), "1".into()),
+            ("TERM".into(), "dumb".into()),
+        ]);
+        strip_launcher_presentation_env(&mut env);
+        assert!(!env.contains_key(std::ffi::OsStr::new("NO_COLOR")));
+        assert_eq!(env.get(std::ffi::OsStr::new("TERM")), Some(&"dumb".into()));
     }
 
     /// Test that spawning a PTY with /bin/cat works and we can read/write.
