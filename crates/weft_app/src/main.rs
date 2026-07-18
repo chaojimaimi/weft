@@ -145,6 +145,7 @@ struct App {
     /// Proxy used by background threads (PTY reader, blink timer) to wake the
     /// event loop without a vsync busy-loop.
     proxy: EventLoopProxy<AppEvent>,
+    screen_exit_watchdog_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     config_state: ConfigState,
     /// Whether the command-history sidebar panel is shown.
     panel: PanelState,
@@ -218,6 +219,9 @@ impl App {
             interaction: InteractionState::new(),
             find: FindState::new(proxy.clone()),
             proxy,
+            screen_exit_watchdog_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             config_state,
             panel: PanelState::default(),
             palette: PaletteState::new(),

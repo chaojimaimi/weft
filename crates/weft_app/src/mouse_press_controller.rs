@@ -134,10 +134,20 @@ impl App {
                                 self.drain_effects(effects);
                             } else {
                                 // Close a background tab — remove and adjust index.
+                                let blocks = self
+                                    .sessions
+                                    .tab_mut(idx)
+                                    .map(crate::tab::Tab::finish_pending_blocks)
+                                    .unwrap_or_default();
                                 self.sessions.close_background(idx);
                                 self.tab_bar.hovered_tab = None;
                                 self.request_redraw();
-                                self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
+                                let mut effects = Vec::new();
+                                if !blocks.is_empty() {
+                                    effects.push(crate::effect::Effect::PersistBlocks { blocks });
+                                }
+                                effects.push(crate::effect::Effect::PersistTabs);
+                                self.drain_effects(effects);
                             }
                             return;
                         }

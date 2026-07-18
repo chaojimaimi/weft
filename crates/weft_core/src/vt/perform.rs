@@ -60,14 +60,6 @@ impl Terminal {
             }
         }
     }
-
-    fn snapshot_primary_screen_output(&mut self) {
-        let Some(scrollback_start) = self.block_tracker.screen_scrollback_start() else {
-            return;
-        };
-        let document = self.grid.document_text_from(scrollback_start);
-        self.block_tracker.replace_screen_output(&document);
-    }
 }
 
 impl vte::Perform for Terminal {
@@ -704,11 +696,18 @@ impl vte::Perform for Terminal {
                     match params[1] {
                         b"A" => {
                             self.snapshot_primary_screen_output();
+                            let defer_screen_exit =
+                                self.block_tracker.screen_scrollback_start().is_some()
+                                    && self.block_tracker.phase() == ShellPhase::CommandExecuting;
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             self.shell_markers.push(ShellMarker::PromptStart);
-                            self.block_tracker.on_prompt_start();
+                            if defer_screen_exit {
+                                self.defer_primary_screen_exit(None);
+                            } else {
+                                self.block_tracker.on_prompt_start();
+                            }
                             // Clear the git branch: the precmd hook re-emits
                             // OSC 9;git= if (and only if) the cwd is still a git
                             // repo. Without this, leaving a repo keeps the stale
@@ -721,6 +720,8 @@ impl vte::Perform for Terminal {
                             self.command_from_editor = None;
                         }
                         b"B" => {
+                            self.settle_primary_screen_exit();
+                            self.primary_history_view = false;
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
                             self.shell_markers.push(ShellMarker::CommandStart);
@@ -741,6 +742,8 @@ impl vte::Perform for Terminal {
                             self.block_tracker.on_command_output_start();
                         }
                         b"D" => {
+                            let defer_screen_exit =
+                                self.block_tracker.screen_scrollback_start().is_some();
                             self.snapshot_primary_screen_output();
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
@@ -755,7 +758,11 @@ impl vte::Perform for Terminal {
                             };
                             self.shell_markers
                                 .push(ShellMarker::CommandEnd { exit_code });
-                            self.block_tracker.on_command_end(exit_code);
+                            if defer_screen_exit {
+                                self.defer_primary_screen_exit(Some(exit_code));
+                            } else {
+                                self.block_tracker.on_command_end(exit_code);
+                            }
                         }
                         _ => {}
                     }

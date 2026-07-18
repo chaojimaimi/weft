@@ -6,7 +6,9 @@ mod attrs;
 mod grapheme;
 mod osc;
 mod perform;
+mod screen_exit;
 pub use attrs::{Attrs, ShellMarker};
+pub use screen_exit::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
 
 use crate::blocks::{BlockTracker, ShellPhase};
 use crate::editor::Editor;
@@ -63,6 +65,8 @@ pub struct Terminal {
     parser_in_ground_state: bool, // gates the printable-ASCII fast path
     suppress_joined_scalar: bool,
     primary_screen_cursor_ops: u8,
+    primary_screen_exit: Option<screen_exit::PendingPrimaryScreenExit>,
+    primary_history_view: bool,
 }
 
 impl Terminal {
@@ -104,6 +108,8 @@ impl Terminal {
             parser_in_ground_state: true,
             suppress_joined_scalar: false,
             primary_screen_cursor_ops: 0,
+            primary_screen_exit: None,
+            primary_history_view: false,
         }
     }
 
@@ -221,16 +227,6 @@ impl Terminal {
         self.synchronized_output_started.is_some_and(|started| {
             now.saturating_duration_since(started) < SYNCHRONIZED_OUTPUT_TIMEOUT
         })
-    }
-
-    /// True when the Warp-style block view should render (integrated shell, not
-    /// in an alt-screen app). Covers both AtPrompt (editor + input box) and
-    /// CommandExecuting (blocks overlaid above the live grid) — the renderer
-    /// distinguishes them via the prompt / shell phase.
-    pub fn show_block_view(&self) -> bool {
-        self.block_tracker.bootstrap_ready()
-            && !self.alt_active
-            && !self.primary_screen_app_active()
     }
 
     /// Swap the primary and alternate screen buffers (DEC 1049/47).
@@ -361,6 +357,7 @@ impl Terminal {
             }
         }
         self.parser = parser;
+        self.note_primary_screen_exit_activity();
     }
 
     /// v1.0 perf: Bulk-write a run of printable ASCII bytes (0x20..=0x7E)

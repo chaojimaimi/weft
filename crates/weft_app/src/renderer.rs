@@ -542,6 +542,7 @@ impl MetalRenderer {
                         block_scroll,
                         block_hovered: self.block_hovered,
                         spinner_phase: self.spinner_phase,
+                        palette: terminal.palette(),
                     },
                     selection,
                 )
@@ -561,6 +562,7 @@ impl MetalRenderer {
                         block_scroll,
                         block_hovered: self.block_hovered,
                         spinner_phase: self.spinner_phase,
+                        palette: terminal.palette(),
                     },
                     selection,
                 )

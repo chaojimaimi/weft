@@ -83,14 +83,21 @@ impl App {
     /// application shell must drain. Closing the last tab requests exit;
     /// otherwise the previous tab becomes active and a redraw is requested.
     pub(super) fn close_tab(&mut self) -> Vec<Effect> {
+        let removed_idx = self.sessions.active_idx();
+        let blocks = self
+            .sessions
+            .tab_mut(removed_idx)
+            .map(crate::tab::Tab::finish_pending_blocks)
+            .unwrap_or_default();
         if self.sessions.len() <= 1 {
             info!("closing last tab, exiting app");
-            let removed_idx = self.sessions.active_idx();
-            // new_active is irrelevant when exiting; pass 0 as a sentinel.
-            return effect::close_tab_effects(removed_idx, 0, true);
+            let mut effects = effect::close_tab_effects(removed_idx, 0, true);
+            if !blocks.is_empty() {
+                effects.insert(0, Effect::PersistBlocks { blocks });
+            }
+            return effects;
         }
         self.reset_ime_context("tab closed");
-        let removed_idx = self.sessions.active_idx();
         let _is_last = self.sessions.close_active();
         let new_active = self.sessions.active_idx();
         // v0.9 W1+: clear hover state — tab indices shift after removal, so
@@ -101,7 +108,19 @@ impl App {
         self.clamp_tab_scroll();
         self.scroll_active_tab_into_view();
         self.refresh_find_for_active_tab();
-        effect::close_tab_effects(removed_idx, new_active, false)
+        let mut effects = effect::close_tab_effects(removed_idx, new_active, false);
+        if !blocks.is_empty() {
+            effects.insert(0, Effect::PersistBlocks { blocks });
+        }
+        effects
+    }
+
+    pub(super) fn finish_all_pending_blocks(&mut self) -> Vec<weft_core::blocks::Block> {
+        self.sessions
+            .tabs_mut()
+            .iter_mut()
+            .flat_map(crate::tab::Tab::finish_pending_blocks)
+            .collect()
     }
 
     /// v1.0 H4: Serialize all live tabs to the SQLite `tabs` table so the

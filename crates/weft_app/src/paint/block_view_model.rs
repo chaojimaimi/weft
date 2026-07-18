@@ -1,6 +1,7 @@
 //! Immutable per-frame inputs for BlockView painting.
 
 use weft_core::blocks::{Block, BlockId, InFlightBlock};
+use weft_core::grid::Color;
 
 pub(crate) struct BlockViewPaintModel<'a> {
     pub(crate) blocks: &'a [Block],
@@ -16,4 +17,5 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// Advances ~once per 80ms; the renderer maps it to a braille spinner
     /// glyph. `-1.0` disables the spinner (reduce-motion or not running).
     pub(crate) spinner_phase: f32,
+    pub(crate) palette: &'a [Color; 256],
 }

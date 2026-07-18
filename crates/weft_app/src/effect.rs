@@ -305,6 +305,7 @@ mod tests {
             command: "exit".into(),
             cwd: None,
             output: "done".into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),

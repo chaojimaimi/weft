@@ -54,6 +54,13 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
     t.process(b"\x1b[13G");
     assert!(t.primary_screen_app_active());
     assert!(!t.show_block_view());
+    t.set_primary_history_view(true);
+    assert!(
+        t.show_block_view(),
+        "history browsing uses structured blocks"
+    );
+    t.set_primary_history_view(false);
+    assert!(!t.show_block_view());
 
     t.process(b"\x1b[2;1HClaude Code\x1b[3;1Hglm-5.2\x1b[20;1H>\x1b[20;3G");
     assert_eq!(t.grid().row_text(1), "Claude Code");
@@ -77,6 +84,9 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
     assert!(t.primary_screen_app_active());
     t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
     assert!(!t.primary_screen_app_active());
+    assert!(t.primary_screen_exit_pending());
+    assert!(!t.show_block_view());
+    t.settle_primary_screen_exit();
     assert!(t.show_block_view());
 }
 
@@ -109,12 +119,47 @@ fn primary_screen_exit_snapshot_keeps_scrollback_and_ctrl_c_resume_tail() {
         b"\x1b[2J\x1b[Hanswer line 1\r\nanswer line 2\r\nanswer line 3\r\nPress Ctrl-C again to exit\r\nResume this session with:\r\nclaude --resume session-id",
     );
     terminal.process(b"\x1b]133;D;130\x07\x1b]133;A\x07");
+    terminal.settle_primary_screen_exit();
 
     let block = terminal.block_tracker().blocks().last().unwrap();
     assert_eq!(
         block.output.as_ref(),
         "answer line 1\nanswer line 2\nanswer line 3\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume session-id"
     );
+}
+
+#[test]
+fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
+    let mut terminal = Terminal::new(6, 64);
+    terminal.process(b"\x1b]7;file://localhost/Users/me/project\x07");
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    terminal.process(b"\x1b[2J\x1b[H\x1b[38;2;222;120;80manswer\x1b[0m");
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(terminal.primary_screen_exit_pending());
+    assert!(terminal.block_tracker().blocks().is_empty());
+    assert!(!terminal.show_block_view());
+
+    terminal.process(
+        b"\x1b[3;1HPress Ctrl-C again to exit\x1b[4;1HResume this session with:\x1b[5;1Hclaude --resume late-id",
+    );
+    terminal.settle_primary_screen_exit();
+
+    let block = terminal.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.cwd.as_deref(), Some("/Users/me/project"));
+    assert!(block.output.contains("answer"));
+    assert!(block.output.contains("Press Ctrl-C again to exit"));
+    assert!(block.output.contains("claude --resume late-id"));
+    let styled = block
+        .styled_output
+        .as_ref()
+        .expect("screen snapshot styles");
+    assert!(styled
+        .line(0)
+        .and_then(|line| line.foreground_at(0))
+        .is_some_and(|color| matches!(color, crate::grid::CellColor::Rgb(_))));
 }
 
 #[test]
@@ -125,6 +170,7 @@ fn primary_screen_snapshot_excludes_rows_scrolled_before_tui_detection() {
     terminal.process(b"\x1b[H\x1b[2;1H");
     assert!(terminal.primary_screen_app_active());
     terminal.process(b"\x1b[2J\x1b[Hfinal answer\x1b]133;D;0\x07");
+    terminal.settle_primary_screen_exit();
 
     let block = terminal.block_tracker().blocks().last().unwrap();
     assert_eq!(block.output.as_ref(), "final answer");

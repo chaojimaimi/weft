@@ -458,6 +458,7 @@ mod tests {
             command: format!("command-{id}"),
             cwd: None,
             output: output.into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),

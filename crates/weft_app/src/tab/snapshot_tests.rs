@@ -12,6 +12,7 @@ fn tab_with_terminal() -> Tab {
 fn empty_tab_starts_without_transient_pending_state() {
     let tab = Tab::empty();
     assert!(tab.pending_pty_resize.is_none());
+    assert!(tab.pending_pty_output.is_none());
     assert!(tab.ime_preedit.is_empty());
 }
 
@@ -145,6 +146,13 @@ fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
     let (_, blocks, need_redraw) = tab.process_messages();
 
     assert!(need_redraw);
+    assert!(
+        blocks.is_empty(),
+        "the screen tail must settle before freezing"
+    );
+    assert!(tab.terminal.as_ref().unwrap().primary_screen_exit_pending());
+    tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
+    let (_, blocks, _) = tab.process_messages();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].command, "screen-app");
     assert_eq!(
@@ -152,6 +160,111 @@ fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
         "Resume this session with:\nscreen-app --resume abc"
     );
     assert!(!blocks[0].output.contains("old linear output"));
+}
+
+#[test]
+fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    tab.msg_tx
+        .send(AppMsg::PtyOutput(
+            b"\x1b]133;D;130\x07\x1b]133;A\x07\x1b[2J\x1b[HPress Ctrl-C again to exit\x1b[2;1HResume this session with:\x1b[3;1Hscreen-app --resume late"
+                .to_vec(),
+        ))
+        .unwrap();
+    tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
+
+    let (alive, blocks, need_redraw) = tab.process_messages();
+
+    assert!(!alive);
+    assert!(need_redraw);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].command, "screen-app");
+    assert_eq!(
+        blocks[0].output.as_ref(),
+        "Press Ctrl-C again to exit\nResume this session with:\nscreen-app --resume late"
+    );
+}
+
+#[test]
+fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
+
+    let mut output = vec![b'x'; 256 * 1024 + 1];
+    output.extend_from_slice(
+        b"\x1b]133;D;130\x07\x1b]133;A\x07\x1b[2J\x1b[HResume this session with:\x1b[2;1Hscreen-app --resume ordered",
+    );
+    tab.msg_tx.send(AppMsg::PtyOutput(output)).unwrap();
+    tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
+
+    let (alive, blocks, _) = tab.process_messages();
+    assert!(alive);
+    assert!(blocks.is_empty());
+    assert!(tab.pending_pty_output.is_some());
+
+    let (alive, blocks, _) = tab.process_messages();
+    assert!(!alive);
+    assert_eq!(blocks.len(), 1);
+    assert!(blocks[0]
+        .output
+        .ends_with("Resume this session with:\nscreen-app --resume ordered"));
+}
+
+#[test]
+fn closing_a_tab_force_settles_its_pending_primary_tui_block() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal
+        .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(terminal.primary_screen_exit_pending());
+    tab.msg_tx
+        .send(AppMsg::PtyOutput(b"\x1b[2J\x1b[Hlate close tail".to_vec()))
+        .unwrap();
+
+    let blocks = tab.finish_pending_blocks();
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].command, "screen-app");
+    assert_eq!(blocks[0].output.as_ref(), "late close tail");
+    assert!(!tab.terminal.as_ref().unwrap().primary_screen_exit_pending());
+}
+
+#[test]
+fn closing_a_primary_tui_does_not_chase_an_unbounded_output_producer() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal
+        .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(terminal.primary_screen_exit_pending());
+    for _ in 0..=super::lifecycle::MAX_CLOSE_TAIL_EVENTS {
+        tab.msg_tx.send(AppMsg::PtyOutput(b"x".to_vec())).unwrap();
+    }
+
+    let blocks = tab.finish_pending_blocks();
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        tab.msg_rx.len(),
+        1,
+        "close must process a fixed queue snapshot"
+    );
 }
 
 #[test]

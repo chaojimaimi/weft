@@ -16,6 +16,9 @@ use weft_core::vt::Terminal;
 
 use crate::{AppEvent, AppMsg};
 
+mod lifecycle;
+mod scroll;
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
@@ -48,6 +51,7 @@ pub struct Tab {
     /// position the caret at.
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
+    pending_pty_output: Option<Vec<u8>>,
     /// M3.5: private — use the block-scroll API methods below instead.
     block_scroll_offset: usize,
     /// Original persisted state retained while a restored shell is starting.
@@ -118,6 +122,7 @@ impl Tab {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            pending_pty_output: None,
             block_scroll_offset: 0,
             restored_snapshot: None,
             pending_tui_scroll: None,
@@ -140,6 +145,7 @@ impl Tab {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            pending_pty_output: None,
             block_scroll_offset: 0,
             restored_snapshot: None,
             pending_tui_scroll: None,
@@ -213,6 +219,7 @@ impl Tab {
         if let Some(pty) = &mut self.pty {
             pty.flush_input();
         }
+        self.pending_pty_output = None;
         // Drain queued AppMsg::PtyOutput messages from msg_rx.
         // PtyExit is re-queued — must not be lost.
         while let Ok(msg) = self.msg_rx.try_recv() {
@@ -230,13 +237,7 @@ impl Tab {
         }
     }
 
-    /// Process queued messages into the terminal. Returns
-    /// `(alive, drained_blocks, need_redraw)`.
-    /// `alive=false` when the shell exited. `drained_blocks` are finished
-    /// command blocks ready for persistence (the caller inserts them into
-    /// the shared BlockStore). `need_redraw` is true when any output was
-    /// processed (so the caller can call `request_redraw`).
-    ///
+    /// Process queued messages into the terminal and drain finished blocks.
     /// v1.0 P1.5-C3: Time-bounded processing. The loop drains messages until
     /// either the channel is empty OR a ~8ms wall-clock budget is exhausted.
     /// This keeps the render thread responsive during huge PTY bursts (e.g.
@@ -257,45 +258,30 @@ impl Tab {
         const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
         let frame_start = std::time::Instant::now();
         let mut bytes_since_check = 0usize;
+        let mut alive = true;
 
-        while let Ok(msg) = self.msg_rx.try_recv() {
+        let mut carried = self.pending_pty_output.take().map(AppMsg::PtyOutput);
+        loop {
+            let msg = match carried.take() {
+                Some(msg) => msg,
+                None => match self.msg_rx.try_recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                },
+            };
             match msg {
-                AppMsg::PtyOutput(data) => {
+                AppMsg::PtyOutput(mut data) => {
                     if data.len() > MAX_BYTES_PER_MESSAGE {
-                        // Oversized message: process the head, re-queue the
-                        // tail, then yield to the renderer this frame.
-                        let head = data[..MAX_BYTES_PER_MESSAGE].to_vec();
-                        let tail = data[MAX_BYTES_PER_MESSAGE..].to_vec();
-                        let _ = self.msg_tx.send(AppMsg::PtyOutput(tail));
-                        let mut response = Vec::new();
-                        if let Some(terminal) = &mut self.terminal {
-                            terminal.process(&head);
-                            response = terminal.take_response();
-                            need_redraw = true;
-                        }
-                        if !response.is_empty() {
-                            if let Some(pty) = &self.pty {
-                                if let Err(e) = pty.write_sync(&response) {
-                                    tracing::warn!(error = %e, "failed to write terminal response");
-                                }
-                            }
-                        }
+                        // Keep the remainder ahead of every later AppMsg,
+                        // especially PtyExit. Re-queueing it at the channel
+                        // tail would invert the original PTY byte order.
+                        let tail = data.split_off(MAX_BYTES_PER_MESSAGE);
+                        self.pending_pty_output = Some(tail);
+                        need_redraw |= self.process_pty_output(&data);
                         break;
                     }
                     bytes_since_check += data.len();
-                    let mut response = Vec::new();
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.process(&data);
-                        response = terminal.take_response();
-                        need_redraw = true;
-                    }
-                    if !response.is_empty() {
-                        if let Some(pty) = &self.pty {
-                            if let Err(e) = pty.write_sync(&response) {
-                                tracing::warn!(error = %e, "failed to write terminal response");
-                            }
-                        }
-                    }
+                    need_redraw |= self.process_pty_output(&data);
                     // Cooperative yield: if we've spent the frame's time
                     // budget, stop draining and let the renderer draw. The
                     // remaining messages stay queued for next frame.
@@ -307,20 +293,34 @@ impl Tab {
                 }
                 AppMsg::PtyExit(code) => {
                     tracing::info!("Shell exited: {:?}", code);
-                    return (false, Vec::new(), need_redraw);
+                    alive = false;
+                    break;
                 }
             }
         }
 
         let mut drained = Vec::new();
+        let mut reset_scroll = false;
         if let Some(terminal) = &mut self.terminal {
+            let settled = if alive {
+                terminal.settle_primary_screen_exit_if_idle(std::time::Instant::now())
+            } else {
+                terminal.settle_primary_screen_exit()
+            };
+            if settled {
+                need_redraw = true;
+            }
             drained = terminal.block_tracker_mut().drain_unpersisted();
+            reset_scroll = !drained.is_empty() && !terminal.primary_history_view();
             if terminal.synchronized_output() {
                 need_redraw = false;
             }
         }
+        if reset_scroll {
+            self.snap_to_bottom();
+        }
 
-        (true, drained, need_redraw)
+        (alive, drained, need_redraw)
     }
 
     /// Open a bounded window in which an early wheel gesture may belong to a
@@ -499,7 +499,7 @@ impl Tab {
     /// (the tab stays usable with an empty editor — same as a fresh tab).
     pub fn restore_from_snapshot(&mut self, snap: &TabSnapshot) -> bool {
         self.restored_snapshot = Some(snap.clone());
-        self.block_scroll_offset = snap.block_scroll_offset;
+        self.set_block_scroll(snap.block_scroll_offset);
         let Some(terminal) = self.terminal.as_mut() else {
             return false;
         };
@@ -512,43 +512,6 @@ impl Tab {
                 tracing::warn!("failed to deserialize editor buffer; using empty");
                 false
             }
-        }
-    }
-
-    // ── Block-scroll API (M3.5) ──────────────────────────────────────
-    // Encapsulates block_scroll_offset writes so controllers don't set
-    // the field directly. Each method encodes one intent.
-
-    /// Current block-scroll offset (0 = bottom / most recent).
-    pub fn block_scroll(&self) -> usize {
-        self.block_scroll_offset
-    }
-
-    /// Set the block-scroll offset to an exact value (clamped to 0).
-    pub fn set_block_scroll(&mut self, offset: usize) {
-        self.block_scroll_offset = offset;
-    }
-
-    /// Scroll to bottom (offset = 0, the most recent content).
-    pub fn snap_to_bottom(&mut self) {
-        self.block_scroll_offset = 0;
-    }
-
-    /// Scroll up by `rows` (away from bottom, offset increases).
-    pub fn scroll_up_by(&mut self, rows: usize) {
-        self.block_scroll_offset = self.block_scroll_offset.saturating_add(rows);
-    }
-
-    /// Scroll down by `rows` (toward bottom, offset decreases).
-    pub fn scroll_down_by(&mut self, rows: usize) {
-        self.block_scroll_offset = self.block_scroll_offset.saturating_sub(rows);
-    }
-
-    /// Clamp the offset to `max_scroll` (called after the terminal updates
-    /// its block count so offset can't point past the last block).
-    pub fn clamp_block_scroll(&mut self, max_scroll: usize) {
-        if self.block_scroll_offset > max_scroll {
-            self.block_scroll_offset = max_scroll;
         }
     }
 }
@@ -590,6 +553,23 @@ mod tests {
     fn empty_tab_has_zero_block_scroll() {
         let t = Tab::empty();
         assert_eq!(t.block_scroll(), 0);
+    }
+
+    #[test]
+    fn primary_tui_history_scroll_switches_between_blocks_and_live_grid() {
+        let mut tab = tab_with_terminal(100);
+        let terminal = tab.terminal.as_mut().unwrap();
+        terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b[6G\x1b[13G");
+        assert!(terminal.primary_screen_app_active());
+        assert!(!terminal.show_block_view());
+
+        tab.scroll_up_by(1);
+        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(tab.terminal.as_ref().unwrap().show_block_view());
+
+        tab.snap_to_bottom();
+        assert!(!tab.terminal.as_ref().unwrap().primary_history_view());
+        assert!(!tab.terminal.as_ref().unwrap().show_block_view());
     }
 
     #[test]
@@ -708,6 +688,7 @@ mod tests {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            pending_pty_output: None,
             block_scroll_offset: 0,
             restored_snapshot: None,
             pending_tui_scroll: None,

@@ -21,6 +21,8 @@ use rusqlite::{params, Connection};
 
 use crate::blocks::{Block, BlockId};
 
+const MAX_STYLED_OUTPUT_JSON_BYTES: usize = 256 * 1024;
+
 /// Errors from the block store: filesystem (opening/creating the DB file) or
 /// SQLite (query/prepare).
 #[derive(Debug, thiserror::Error)]
@@ -41,7 +43,9 @@ const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS blocks (\
     id           INTEGER PRIMARY KEY,\
     command      TEXT    NOT NULL,\
+    cwd          TEXT,\
     output       TEXT    NOT NULL,\
+    styled_output TEXT,\
     exit_code    INTEGER,\
     started_ms   INTEGER NOT NULL,\
     finished_ms  INTEGER,\
@@ -58,6 +62,27 @@ CREATE TABLE IF NOT EXISTS tabs (\
     shell_phase         TEXT\
 );\
 CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);";
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    if !names
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column)
+    {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 // ── Tab snapshots (v1.0 H4) ───────────────────────────────────────────
 
@@ -133,6 +158,8 @@ impl BlockStore {
                 [],
             )?;
         }
+        ensure_column(&conn, "blocks", "cwd", "TEXT")?;
+        ensure_column(&conn, "blocks", "styled_output", "TEXT")?;
         let next_block_id =
             conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM blocks", [], |row| {
                 row.get::<_, u64>(0)
@@ -151,14 +178,21 @@ impl BlockStore {
 
     /// Insert (or replace by id) a single block.
     pub fn insert(&self, block: &Block) -> Result<(), PersistenceError> {
+        let styled_output = block
+            .styled_output
+            .as_deref()
+            .and_then(|styled| serde_json::to_string(styled).ok())
+            .filter(|json| json.len() <= MAX_STYLED_OUTPUT_JSON_BYTES);
         self.conn.execute(
             "INSERT OR REPLACE INTO blocks \
-             (id, command, output, exit_code, started_ms, finished_ms, collapsed) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, command, cwd, output, styled_output, exit_code, started_ms, finished_ms, collapsed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 block.id.0 as i64,
                 &block.command,
+                block.cwd.as_deref(),
                 block.output.as_ref(),
+                styled_output,
                 block.exit_code,
                 system_time_to_millis(block.started_at),
                 block.finished_at.map(system_time_to_millis),
@@ -171,19 +205,22 @@ impl BlockStore {
     /// The most recent `limit` blocks, newest first (by start time, then id).
     pub fn recent(&self, limit: usize) -> Result<Vec<Block>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, command, output, exit_code, started_ms, finished_ms, collapsed \
+            "SELECT id, command, cwd, output, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    exit_code, started_ms, finished_ms, collapsed \
              FROM blocks ORDER BY started_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_block)?;
         rows.map(|r| r.map_err(PersistenceError::from)).collect()
     }
-
     /// Blocks whose command or output contains `query` (case-insensitive),
     /// newest first. Plain substring match via `INSTR` — no FTS overhead for
     /// v0.4; can upgrade to FTS5 if the history grows large.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Block>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, command, output, exit_code, started_ms, finished_ms, collapsed \
+            "SELECT id, command, cwd, output, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    exit_code, started_ms, finished_ms, collapsed \
              FROM blocks \
              WHERE INSTR(LOWER(command), LOWER(?1)) > 0 \
                 OR INSTR(LOWER(output), LOWER(?1)) > 0 \
@@ -260,16 +297,22 @@ impl BlockStore {
 fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
     let id: i64 = row.get(0)?;
     let command: String = row.get(1)?;
-    let output: String = row.get(2)?;
-    let exit_code: Option<i32> = row.get(3)?;
-    let started_ms: i64 = row.get(4)?;
-    let finished_ms: Option<i64> = row.get(5)?;
-    let collapsed: i64 = row.get(6)?;
+    let cwd: Option<String> = row.get(2)?;
+    let output: String = row.get(3)?;
+    let styled_json: Option<String> = row.get(4)?;
+    let exit_code: Option<i32> = row.get(5)?;
+    let started_ms: i64 = row.get(6)?;
+    let finished_ms: Option<i64> = row.get(7)?;
+    let collapsed: i64 = row.get(8)?;
     Ok(Block {
         id: BlockId(id as u64),
         command,
-        cwd: None,
+        cwd,
         output: output.into(),
+        styled_output: styled_json
+            .filter(|json| json.len() <= MAX_STYLED_OUTPUT_JSON_BYTES)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .map(Arc::new),
         exit_code,
         started_at: millis_to_system_time(started_ms),
         finished_at: finished_ms.map(millis_to_system_time),
@@ -342,6 +385,7 @@ mod tests {
             command: command.into(),
             cwd: None,
             output: output.into(),
+            styled_output: None,
             exit_code: exit,
             started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(id * 1000),
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(id * 1000 + 5)),
@@ -368,13 +412,26 @@ mod tests {
     #[test]
     fn roundtrip_preserves_all_fields() {
         let store = temp_store();
-        let original = block(7, "echo $X", "hello world\n", Some(3));
+        let mut original = block(7, "echo $X", "hello world", Some(3));
+        original.cwd = Some("/Users/me/project".into());
+        original.styled_output = Some(Arc::new(crate::blocks::StyledOutput {
+            lines: vec![crate::blocks::StyledLine {
+                line: 0,
+                foregrounds: vec![crate::blocks::ForegroundSpan {
+                    start: 0,
+                    end: 11,
+                    color: crate::grid::CellColor::Palette(2),
+                }],
+            }],
+        }));
         store.insert(&original).unwrap();
         let loaded = store.recent(1).unwrap().pop().unwrap();
 
         assert_eq!(loaded.id, original.id);
         assert_eq!(loaded.command, original.command);
         assert_eq!(loaded.output, original.output);
+        assert_eq!(loaded.cwd, original.cwd);
+        assert_eq!(loaded.styled_output, original.styled_output);
         assert_eq!(loaded.exit_code, original.exit_code);
         assert_eq!(
             loaded.started_at, original.started_at,
@@ -382,6 +439,51 @@ mod tests {
         );
         assert_eq!(loaded.finished_at, original.finished_at);
         assert_eq!(loaded.collapsed, original.collapsed);
+    }
+
+    #[test]
+    fn open_migrates_legacy_blocks_and_preserves_new_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "weft-blocks-legacy-{}-{}.db",
+            std::process::id(),
+            TEMP_STORE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        let legacy = Connection::open(&path).expect("open legacy block DB");
+        legacy
+            .execute_batch(
+                "CREATE TABLE blocks (\
+                    id INTEGER PRIMARY KEY, command TEXT NOT NULL, output TEXT NOT NULL,\
+                    exit_code INTEGER, started_ms INTEGER NOT NULL, finished_ms INTEGER,\
+                    collapsed INTEGER NOT NULL DEFAULT 0\
+                 );\
+                 INSERT INTO blocks VALUES (1, 'old', 'plain', 0, 1000, 1001, 0);",
+            )
+            .expect("seed legacy block DB");
+        drop(legacy);
+
+        let store = BlockStore::open(&path).expect("migrate legacy block DB");
+        let old = store.recent(1).unwrap().pop().unwrap();
+        assert_eq!(old.command, "old");
+        assert_eq!(old.cwd, None);
+        assert_eq!(old.styled_output, None);
+
+        let mut new = block(2, "new", "color", Some(0));
+        new.cwd = Some("/tmp/project".into());
+        new.styled_output = Some(Arc::new(crate::blocks::StyledOutput {
+            lines: vec![crate::blocks::StyledLine {
+                line: 0,
+                foregrounds: vec![crate::blocks::ForegroundSpan {
+                    start: 0,
+                    end: 5,
+                    color: crate::grid::CellColor::Palette(4),
+                }],
+            }],
+        }));
+        store.insert(&new).unwrap();
+        let loaded = store.recent(1).unwrap().pop().unwrap();
+        assert_eq!(loaded.cwd, new.cwd);
+        assert_eq!(loaded.styled_output, new.styled_output);
     }
 
     #[test]

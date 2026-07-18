@@ -21,7 +21,7 @@ bitflags! {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -91,7 +91,7 @@ impl Color {
 /// Where a cell's color comes from. Stored on the cell so a theme/palette
 /// change can recolor the whole screen instantly: cells remember their origin
 /// (default / palette index / explicit RGB) rather than a pre-resolved color.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum CellColor {
     /// Use the theme default (foreground or background depending on slot).
     Default,

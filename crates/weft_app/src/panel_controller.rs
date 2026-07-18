@@ -229,6 +229,12 @@ impl App {
     /// Local scrollback navigation (page up/down, top, bottom).
     pub(super) fn scroll_action(&mut self, action: Action) {
         let tab = self.sessions.active_mut();
+        if matches!(
+            action,
+            Action::ScrollPageUp | Action::ScrollLineUp | Action::ScrollToTop
+        ) {
+            tab.enter_primary_history_if_active();
+        }
         let Some(terminal) = &mut tab.terminal else {
             return;
         };

@@ -171,6 +171,7 @@ mod tests {
             command: command.to_string(),
             cwd: None,
             output: output.into(),
+            styled_output: None,
             exit_code: None,
             started_at: std::time::SystemTime::UNIX_EPOCH,
             finished_at: None,

@@ -27,8 +27,10 @@ use std::time::SystemTime;
 mod output_capture;
 #[cfg(test)]
 mod screen_capture_tests;
+mod style;
 
 use output_capture::OutputCapture;
+pub use style::{ForegroundSpan, StyledLine, StyledOutput};
 
 /// Hard cap on captured output to bound memory for commands like
 /// `cat huge.log`. Beyond this the capture stops and the block is marked
@@ -41,7 +43,7 @@ use output_capture::OutputCapture;
 /// acceptable for a desktop terminal). Block view layout is independently
 /// capped at 2000 visible lines per block in the renderer, so raising this
 /// doesn't affect rendering perf.
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Monotonically-increasing block identifier. Assigned by [`BlockTracker`],
 /// reused as the SQLite primary key (phase 3).
@@ -62,6 +64,7 @@ pub struct Block {
     pub cwd: Option<String>,
     /// Output captured between `133;B` and `133;D` (detached snapshot).
     pub output: Arc<str>,
+    pub styled_output: Option<Arc<StyledOutput>>,
     /// Exit code from `133;D;<exit>`. `None` when the command was interrupted
     /// (shell re-prompted via `133;A` without a preceding `133;D`).
     pub exit_code: Option<i32>,
@@ -122,6 +125,7 @@ pub struct BlockTracker {
     /// Latest cwd from OSC 7; snapshotted into each new block.
     current_cwd: Option<String>,
     output: OutputCapture,
+    styled_output: Option<Arc<StyledOutput>>,
     /// Scrollback baseline for a primary-screen TUI whose coordinate repaint
     /// stream must be snapshotted as a document instead of captured linearly.
     screen_scrollback_start: Option<u64>,
@@ -154,6 +158,7 @@ impl BlockTracker {
             pending_cwd: None,
             current_cwd: None,
             output: OutputCapture::default(),
+            styled_output: None,
             screen_scrollback_start: None,
             session_start: 0,
             dirty_blocks: HashSet::new(),
@@ -191,12 +196,6 @@ impl BlockTracker {
 
     pub fn screen_scrollback_start(&self) -> Option<u64> {
         self.screen_scrollback_start
-    }
-
-    pub fn replace_screen_output(&mut self, snapshot: &str) {
-        if self.screen_scrollback_start.is_some() {
-            self.output.replace(snapshot, MAX_OUTPUT_BYTES);
-        }
     }
 
     /// All finished blocks (newest last). The history panel / search read this
@@ -313,6 +312,7 @@ impl BlockTracker {
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
         self.output.clear();
+        self.styled_output = None;
         self.screen_scrollback_start = None;
         self.phase = ShellPhase::CommandExecuting;
     }
@@ -384,16 +384,23 @@ impl BlockTracker {
         let Some(command) = self.pending_command.take() else {
             self.pending_started = None;
             self.output.clear();
+            self.styled_output = None;
             self.screen_scrollback_start = None;
             return;
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
         let cwd = self.pending_cwd.take();
-        let mut output = self.output.take();
+        let raw_output = self.output.take();
         self.screen_scrollback_start = None;
         // Mask secrets capture-side so the stored block (history / search /
         // future AI context) never holds a credential. The live grid stays raw.
-        output = crate::secrets::mask(&output);
+        let output = crate::secrets::mask(&raw_output);
+        let styled_output = if output == raw_output {
+            self.styled_output.take()
+        } else {
+            self.styled_output = None;
+            None
+        };
 
         let block_id = BlockId(self.ids.allocate());
         let block = Block {
@@ -401,6 +408,7 @@ impl BlockTracker {
             command,
             cwd,
             output: output.into(),
+            styled_output,
             exit_code,
             started_at,
             finished_at: Some(SystemTime::now()),
@@ -594,6 +602,7 @@ mod tests {
                 command: "old".into(),
                 cwd: None,
                 output: String::new().into(),
+                styled_output: None,
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -604,6 +613,7 @@ mod tests {
                 command: "older".into(),
                 cwd: None,
                 output: String::new().into(),
+                styled_output: None,
                 exit_code: Some(0),
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -627,6 +637,7 @@ mod tests {
             command: "old".into(),
             cwd: None,
             output: String::new().into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),
@@ -724,6 +735,7 @@ mod tests {
             command: "x".to_string(),
             cwd: None,
             output: "y".into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: SystemTime::now(),
             finished_at: Some(SystemTime::now()),

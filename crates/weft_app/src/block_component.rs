@@ -203,6 +203,7 @@ mod tests {
             command: "cargo test".into(),
             cwd: Some("/tmp/weft".into()),
             output: "one\ntwo\nthree\n".into(),
+            styled_output: None,
             exit_code,
             started_at,
             finished_at: Some(started_at + Duration::from_millis(1200)),

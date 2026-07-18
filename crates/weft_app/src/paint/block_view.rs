@@ -18,10 +18,12 @@ use crate::paint::grid_cache::wrap_line_chunks;
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
-use weft_core::blocks::BlockId;
+use weft_core::blocks::{BlockId, StyledLine};
 
 mod actions;
 mod rows;
+mod style;
+use style::BlockOutputTextPaint;
 
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
@@ -42,6 +44,7 @@ impl MetalRenderer {
             block_scroll,
             block_hovered,
             spinner_phase,
+            palette,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -111,6 +114,7 @@ impl MetalRenderer {
                 chunks: Rc<[String]>,
                 block_id: Option<BlockId>,
                 line: usize,
+                style: Option<&'a StyledLine>,
             },
             Command {
                 command: &'a str,
@@ -155,6 +159,7 @@ impl MetalRenderer {
                     chunks,
                     block_id: None,
                     line: line_idx,
+                    style: None,
                 });
             }
             cursor_dist += pitch;
@@ -194,6 +199,7 @@ impl MetalRenderer {
                             chunks,
                             block_id: Some(b.id),
                             line: usize::MAX,
+                            style: None,
                         });
                     }
                     for line in cached.lines.iter().rev() {
@@ -206,6 +212,10 @@ impl MetalRenderer {
                             chunks: Rc::clone(&line.chunks),
                             block_id: Some(b.id),
                             line: line.idx,
+                            style: b
+                                .styled_output
+                                .as_deref()
+                                .and_then(|styled| styled.line(line.idx)),
                         });
                     }
                 }
@@ -263,6 +273,7 @@ impl MetalRenderer {
                     chunks,
                     block_id,
                     line: _,
+                    style: _,
                 } => {
                     if chunks.len() <= 1 {
                         bv_rows.push(weft_core::selection::BlockViewRow {
@@ -405,6 +416,7 @@ impl MetalRenderer {
                     chunks,
                     block_id,
                     line,
+                    style,
                 } => {
                     if chunks.len() <= 1 {
                         if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
@@ -435,8 +447,21 @@ impl MetalRenderer {
                                 );
                             }
                         }
-                        self.push_text(&mut verts, left, y, text, fg, cols);
+                        self.push_block_output_text(
+                            &mut verts,
+                            BlockOutputTextPaint {
+                                x: left,
+                                y,
+                                text,
+                                style: *style,
+                                char_offset: 0,
+                                fallback: fg,
+                                max_cols: cols,
+                                palette,
+                            },
+                        );
                     } else {
+                        let mut char_offset = 0;
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             if cy + ch > clip_top && cy < clip_bottom {
@@ -472,8 +497,21 @@ impl MetalRenderer {
                                         }
                                     }
                                 }
-                                self.push_text(&mut verts, left, cy, chunk, fg, cols);
+                                self.push_block_output_text(
+                                    &mut verts,
+                                    BlockOutputTextPaint {
+                                        x: left,
+                                        y: cy,
+                                        text: chunk,
+                                        style: *style,
+                                        char_offset,
+                                        fallback: fg,
+                                        max_cols: cols,
+                                        palette,
+                                    },
+                                );
                             }
+                            char_offset += chunk.chars().count();
                         }
                     }
                 }

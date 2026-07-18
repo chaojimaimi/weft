@@ -113,6 +113,20 @@ impl ApplicationHandler<AppEvent> for App {
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
+                if self.sessions.tabs().iter().any(|tab| {
+                    tab.terminal
+                        .as_ref()
+                        .is_some_and(Terminal::primary_screen_exit_pending)
+                }) {
+                    let proxy = self.proxy.clone();
+                    schedule_synchronized_output_watchdog(
+                        self.screen_exit_watchdog_pending.clone(),
+                        weft_core::vt::PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
+                        move || {
+                            let _ = proxy.send_event(AppEvent::Wake);
+                        },
+                    );
+                }
                 let synchronized = self
                     .sessions
                     .active()
@@ -694,6 +708,7 @@ mod tests {
             command: command.to_string(),
             cwd: None,
             output: String::new().into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
             finished_at: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id)),

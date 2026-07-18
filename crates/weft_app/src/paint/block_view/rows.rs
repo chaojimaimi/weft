@@ -58,6 +58,7 @@ impl MetalRenderer {
             block_scroll,
             block_hovered: _,
             spinner_phase: _,
+            palette: _,
         } = model;
 
         let cw = self.cell_width() as f32;

@@ -314,6 +314,12 @@ impl Pty {
         })
     }
 
+    /// Number of events queued at this instant. Close-time draining snapshots
+    /// this value so a producer cannot keep the UI thread chasing new output.
+    pub fn queued_event_count(&self) -> usize {
+        self.event_rx.len()
+    }
+
     /// Check if the child process is still alive.
     pub fn is_alive(&self) -> bool {
         // Send signal 0 to check if process exists.

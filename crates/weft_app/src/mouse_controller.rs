@@ -724,24 +724,18 @@ impl App {
         }
         let up = rows > 0;
         let lines = rows.unsigned_abs() as usize;
+        if up {
+            self.sessions.active_mut().enter_primary_history_if_active();
+        }
         let block_view = self
             .sessions
-            .active_mut()
+            .active()
             .terminal
             .as_ref()
             .is_some_and(Terminal::show_block_view);
 
-        // Block view uses a dedicated scroll offset (not grid.scroll_offset,
-        // which is clamped to grid scrollback — the wrong proxy for block
-        // content like headers/commands/separators).
         if block_view {
-            // Cap scroll speed at 1 row per wheel notch in the block view.
-            // macOS trackpad inertia can send 3-4 lines per tick, which skips
-            // past content too fast for comfortable reading.
             let scroll_lines = lines.min(1);
-            // Compute metrics via a short-lived immutable borrow of `terminal`
-            // so we can later mutate `block_scroll_offset` (same Tab, but a
-            // disjoint field — allowed once the immutable borrow ends).
             let (total, prompt_lines) = {
                 let Some(t) = self.sessions.active().terminal.as_ref() else {
                     return;
@@ -750,11 +744,6 @@ impl App {
                 let (total, _) = block_content_metrics(t, cols);
                 (total, t.editor().buffer.lines.len())
             };
-            // Compute visible rows from the renderer's actual geometry
-            // (pitch = ch * 1.1, region = viewport minus prompt box).
-            // The old code used grid().num_rows which overcounts because
-            // the block view uses a 10% taller line pitch and doesn't
-            // occupy the full viewport (prompt box eats space).
             let visible = self
                 .renderer
                 .as_ref()

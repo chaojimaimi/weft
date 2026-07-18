@@ -11,10 +11,16 @@ impl App {
         match event {
             WindowEvent::CloseRequested => {
                 info!("Window closed");
+                let blocks = self.finish_all_pending_blocks();
                 // v1.0 H4: persist tab state so the session restores on
                 // next launch. Goes through drain_effects so all persist
                 // paths share the Effect::PersistTabs entry point.
-                self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
+                let mut effects = Vec::new();
+                if !blocks.is_empty() {
+                    effects.push(crate::effect::Effect::PersistBlocks { blocks });
+                }
+                effects.push(crate::effect::Effect::PersistTabs);
+                self.drain_effects(effects);
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {

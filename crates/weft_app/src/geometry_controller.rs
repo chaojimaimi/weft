@@ -391,6 +391,7 @@ impl App {
             block_scroll: self.sessions.active().block_scroll(),
             block_hovered: self.interaction.block_hovered,
             spinner_phase: -1.0,
+            palette: terminal.palette(),
         })
     }
 

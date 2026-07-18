@@ -676,13 +676,13 @@ mod tests {
             command: command.to_string(),
             cwd: None,
             output: output.into(),
+            styled_output: None,
             exit_code: Some(0),
             started_at: std::time::SystemTime::now(),
             finished_at: Some(std::time::SystemTime::now()),
             collapsed: false,
         }
     }
-
     #[test]
     fn empty_query_returns_empty() {
         let mut g = Grid::new(5, 20);
