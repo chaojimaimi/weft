@@ -1249,27 +1249,10 @@ fn first_run_welcome() -> Option<String> {
 /// - **bash:** ships a snippet at `<cache>/bash-integration.sh`; the user opts
 ///   in with one `source` line in `~/.bashrc` (no clean interactive redirect).
 ///
-/// Returns `KEY=VALUE` overrides to pass to the PTY. On any setup failure it
-/// logs a warning and returns empty — the shell still launches, just without
-/// integration.
+/// Returns `KEY=VALUE` overrides to pass to the PTY. Terminal capabilities and
+/// locale survive shell-integration setup failures.
 pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
-    let plan = Integration::from_shell(shell);
-    if !plan.is_supported() {
-        return Vec::new();
-    }
-
-    let Some(cache_root) = weft_cache_dir() else {
-        warn!("HOME/XDG_CACHE_HOME unset — shell integration disabled");
-        return Vec::new();
-    };
-
-    // Base env: integration flag (+ forwarded original ZDOTDIR for zsh restore).
-    let orig_zdotdir = std::env::var("ZDOTDIR").ok();
-    let mut env: Vec<(String, String)> = plan
-        .child_env(orig_zdotdir.as_deref())
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect();
+    let mut env = app_runtime::terminal_capability_env();
 
     // v1.0 fix: ensure UTF-8 locale for the child shell. When weft is launched
     // from Finder (.app bundle), the GUI environment typically lacks LANG /
@@ -1284,22 +1267,21 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
         env.push(("LANG".to_string(), "en_US.UTF-8".to_string()));
     }
 
-    // v1.0 fix: set TERM / COLORTERM / TERM_PROGRAM for the child shell.
-    // When launched from Finder, GUI apps have no TERM set, so `less`,
-    // `vim`, `top`, etc. can't query terminfo and degrade ("terminal is
-    // not fully functional"). Weft implements xterm-256color semantics
-    // (256-color SGR, cursor movement, alternate screen), so advertise
-    // that capability. Don't override an existing TERM — the user may have
-    // set a specialized one (e.g. tmux).
-    if std::env::var("TERM").is_err() {
-        env.push(("TERM".to_string(), "xterm-256color".to_string()));
+    let plan = Integration::from_shell(shell);
+    if !plan.is_supported() {
+        return env;
     }
-    env.push(("COLORTERM".to_string(), "truecolor".to_string()));
-    env.push(("TERM_PROGRAM".to_string(), "Weft".to_string()));
-    env.push((
-        "TERM_PROGRAM_VERSION".to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
-    ));
+    let Some(cache_root) = weft_cache_dir() else {
+        warn!("HOME/XDG_CACHE_HOME unset — shell integration disabled");
+        return env;
+    };
+    let base_len = env.len();
+    let orig_zdotdir = std::env::var("ZDOTDIR").ok();
+    env.extend(
+        plan.child_env(orig_zdotdir.as_deref())
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
 
     // zsh: write the generated .zshenv and redirect ZDOTDIR at its directory.
     if let Some((redirect_var, file)) = plan.rc_redirect() {
@@ -1308,7 +1290,8 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
             .and_then(|_| std::fs::write(dir.join(file.filename), file.body))
         {
             warn!(error = %e, "failed to write zsh integration .zshenv; integration disabled");
-            return Vec::new();
+            env.truncate(base_len);
+            return env;
         }
         env.push((redirect_var.to_string(), dir.to_string_lossy().into_owned()));
     }

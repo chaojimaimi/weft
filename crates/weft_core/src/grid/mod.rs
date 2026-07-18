@@ -935,13 +935,13 @@ impl Grid {
         if new_cols != old_cols {
             for row in &mut self.viewport {
                 resize_row_cells(&mut row.cells, new_cols);
-                // Truncation may have dropped the rightmost dirty cell; mark
-                // the whole row dirty so the renderer repaints it fully.
+                row.repair_wide_pairs();
+                // Repaint the whole row after truncation or padding.
                 row.mark_dirty(new_cols.saturating_sub(1));
             }
+            self.scrollback.resize_cols(new_cols);
         }
 
-        // Grow or truncate the viewport to the new row count.
         if new_rows > self.num_rows {
             let extra = new_rows - self.num_rows;
             // Add blank rows at the BOTTOM (common convention: TUI apps clear

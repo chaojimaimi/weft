@@ -664,6 +664,44 @@ fn resize_dims_does_not_reflow() {
 }
 
 #[test]
+fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
+    let mut grid = Grid::with_scrollback(2, 4, 10);
+    for (col, ch) in "ABCD".chars().enumerate() {
+        grid.viewport[0].cells[col].character = ch;
+    }
+    grid.scroll_up(1);
+
+    grid.resize_dims(2, 5);
+    grid.scroll_to_top();
+    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 5);
+    assert_eq!(grid.cell(0, 3).character, 'D');
+    assert_eq!(grid.cell(0, 4).character, ' ');
+
+    grid.resize_dims(2, 3);
+    grid.scroll_to_top();
+    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 3);
+    assert_eq!(grid.cell(0, 2).character, 'C');
+}
+
+#[test]
+fn resize_dims_repairs_wide_glyphs_cut_at_the_right_edge() {
+    let mut grid = Grid::with_scrollback(2, 4, 10);
+    for row in &mut grid.viewport {
+        row.cells[2].character = '中';
+        row.cells[2].width = CellWidth::Full;
+        row.cells[3].flags.insert(CellFlags::WIDE_SPACER);
+    }
+    grid.scroll_up(1);
+
+    grid.resize_dims(2, 3);
+    assert_eq!(grid.viewport[0].cells[2].character, ' ');
+    assert_eq!(grid.viewport[0].cells[2].width, CellWidth::Half);
+    grid.scroll_to_top();
+    assert_eq!(grid.cell(0, 2).character, ' ');
+    assert_eq!(grid.cell(0, 2).width, CellWidth::Half);
+}
+
+#[test]
 fn resize_dims_grows_and_shrinks_rows() {
     let mut grid = Grid::new(3, 4);
     grid.viewport[0].cells[0].character = 'A';

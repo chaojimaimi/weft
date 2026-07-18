@@ -2,7 +2,7 @@
 //!
 //! Stores rows that have scrolled off the top of the viewport.
 
-use super::row::Row;
+use super::{resize_row_cells, row::Row};
 
 pub struct Scrollback {
     /// Ring buffer of rows.
@@ -93,6 +93,14 @@ impl Scrollback {
         };
         let actual = (start + index) % self.max_lines.min(self.buffer.len());
         self.buffer.get(actual)
+    }
+
+    /// Keep historical rows compatible with dimension-only viewport rendering.
+    pub(super) fn resize_cols(&mut self, new_cols: usize) {
+        for row in &mut self.buffer {
+            resize_row_cells(&mut row.cells, new_cols);
+            row.repair_wide_pairs();
+        }
     }
 
     /// Resize the scrollback buffer.

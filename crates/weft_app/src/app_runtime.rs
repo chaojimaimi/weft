@@ -34,12 +34,24 @@ fn invalidate_primary_tui_frame(terminal: &mut Terminal) -> bool {
     if !terminal.primary_screen_repaint_capable() {
         return false;
     }
-    terminal.grid_mut().clear();
+    terminal.grid_mut().clear_screen_all();
     true
 }
 
 fn should_clear_pending_resize(resize_failed: bool) -> bool {
     !resize_failed
+}
+
+pub(super) fn terminal_capability_env() -> Vec<(String, String)> {
+    vec![
+        ("TERM".into(), "xterm-256color".into()),
+        ("COLORTERM".into(), "truecolor".into()),
+        ("TERM_PROGRAM".into(), "Weft".into()),
+        (
+            "TERM_PROGRAM_VERSION".into(),
+            env!("CARGO_PKG_VERSION").into(),
+        ),
+    ]
 }
 
 fn panic_log_path(home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
@@ -575,8 +587,21 @@ mod tests {
         terminal.process(b"\x1b]7;file://localhost/Users/me/Claude\x07");
         terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
         terminal.process(b"\x1b[?2026h\x1b[2J\x1b[HOLD ICON\x1b[4;1HOLD HEADER\x1b[?2026l");
+        let cursor_before = (
+            terminal.grid().cursor.row,
+            terminal.grid().cursor.col,
+            terminal.grid().cursor.wrap_pending,
+        );
 
         assert!(invalidate_primary_tui_frame(&mut terminal));
+        assert_eq!(
+            (
+                terminal.grid().cursor.row,
+                terminal.grid().cursor.col,
+                terminal.grid().cursor.wrap_pending,
+            ),
+            cursor_before
+        );
         terminal.process(b"\x1b[HNEW ICON");
 
         assert_eq!(terminal.grid().row_text(0), "NEW ICON");
@@ -619,6 +644,26 @@ mod tests {
     fn failed_pty_resize_keeps_latest_dimensions_for_retry() {
         assert!(!should_clear_pending_resize(true));
         assert!(should_clear_pending_resize(false));
+    }
+
+    #[test]
+    fn terminal_capabilities_override_a_bad_launcher_environment() {
+        let env = terminal_capability_env();
+        let value = |key: &str| env.iter().find(|(name, _)| name == key).map(|(_, v)| v);
+        assert_eq!(value("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(value("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert_eq!(value("TERM_PROGRAM").map(String::as_str), Some("Weft"));
+    }
+
+    #[test]
+    fn unsupported_shell_still_receives_terminal_capabilities() {
+        let env = crate::shell_integration_env("/usr/local/bin/fish");
+        assert!(env
+            .iter()
+            .any(|pair| pair == &("TERM".into(), "xterm-256color".into())));
+        assert!(env
+            .iter()
+            .any(|pair| pair == &("COLORTERM".into(), "truecolor".into())));
     }
 
     use std::time::SystemTime;
