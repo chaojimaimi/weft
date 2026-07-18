@@ -125,6 +125,36 @@ fn interrupt_cleanup_preserves_alt_screen_teardown_output() {
 }
 
 #[test]
+fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07old linear output\x1b[2;1H\x1b[3;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    tab.msg_tx
+        .send(AppMsg::PtyOutput(
+            b"\x1b[2J\x1b[HResume this session with:\x1b[2;1Hscreen-app --resume abc\x1b]133;D;130\x07\x1b]133;A\x07"
+                .to_vec(),
+        ))
+        .unwrap();
+
+    tab.flush_pty_output();
+    let (_, blocks, need_redraw) = tab.process_messages();
+
+    assert!(need_redraw);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].command, "screen-app");
+    assert_eq!(
+        blocks[0].output.as_ref(),
+        "Resume this session with:\nscreen-app --resume abc"
+    );
+    assert!(!blocks[0].output.contains("old linear output"));
+}
+
+#[test]
 fn synchronized_output_suppresses_partial_frame_until_commit() {
     let mut tab = tab_with_terminal();
     tab.msg_tx

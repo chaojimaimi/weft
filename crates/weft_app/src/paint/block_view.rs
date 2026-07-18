@@ -639,48 +639,46 @@ impl MetalRenderer {
         }
 
         let sticky_block = rows::sticky_block_id(&bv_rows, clip_top, clip_bottom);
-        if block_scroll > 0 {
-            if let Some(block) = sticky_block.and_then(|id| blocks.iter().find(|b| b.id == id)) {
-                let cmd = &block.command;
-                let block_cwd = block
-                    .cwd
-                    .as_deref()
-                    .map(abbreviate_path)
-                    .unwrap_or_default();
-                let sticky_y = layout.clip_top;
-                let header_rows = rows::sticky_header_rows(!block_cwd.is_empty());
-                let sticky_bottom = sticky_y + header_rows as f32 * pitch;
-                let sticky_bg = [
-                    theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-                    theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-                    theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-                    1.0,
-                ];
-                push_quad(
-                    &mut verts,
-                    [0.0, sticky_y, vp_w, sticky_bottom],
-                    bg_uv,
-                    [0.0; 4],
-                    sticky_bg,
-                );
-                push_quad(
-                    &mut verts,
-                    [0.0, sticky_bottom, vp_w, sticky_bottom + 1.0],
-                    bg_uv,
-                    [0.0; 4],
-                    separator,
-                );
-                let command_y = if block_cwd.is_empty() {
-                    sticky_y
-                } else {
-                    self.push_text(&mut verts, left, sticky_y, &block_cwd, dim, cols);
-                    sticky_y + pitch
-                };
-                self.push_text(&mut verts, left, command_y, "❯ ", prompt_c, cols);
-                let cmd_x = left + 2.0 * cw;
-                let avail = cols.saturating_sub(2).max(1);
-                self.push_line_tokenized(&mut verts, cmd_x, command_y, cmd, avail);
-            }
+        if let Some(block) = sticky_block.and_then(|id| blocks.iter().find(|b| b.id == id)) {
+            let cmd = &block.command;
+            let block_cwd = block
+                .cwd
+                .as_deref()
+                .map(abbreviate_path)
+                .unwrap_or_default();
+            let sticky_y = layout.clip_top;
+            let header_rows = rows::sticky_header_rows(!block_cwd.is_empty());
+            let sticky_bottom = sticky_y + header_rows as f32 * pitch;
+            let sticky_bg = [
+                theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
+                theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
+                theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
+                1.0,
+            ];
+            push_quad(
+                &mut verts,
+                [0.0, sticky_y, vp_w, sticky_bottom],
+                bg_uv,
+                [0.0; 4],
+                sticky_bg,
+            );
+            push_quad(
+                &mut verts,
+                [0.0, sticky_bottom, vp_w, sticky_bottom + 1.0],
+                bg_uv,
+                [0.0; 4],
+                separator,
+            );
+            let command_y = if block_cwd.is_empty() {
+                sticky_y
+            } else {
+                self.push_text(&mut verts, left, sticky_y, &block_cwd, dim, cols);
+                sticky_y + pitch
+            };
+            self.push_text(&mut verts, left, command_y, "❯ ", prompt_c, cols);
+            let cmd_x = left + 2.0 * cw;
+            let avail = cols.saturating_sub(2).max(1);
+            self.push_line_tokenized(&mut verts, cmd_x, command_y, cmd, avail);
         }
 
         if let Some(hl_id) = self.panel_highlight {

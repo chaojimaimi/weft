@@ -54,7 +54,29 @@ impl Terminal {
     fn note_primary_screen_cursor_addressing(&mut self) {
         if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
             self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
+            if self.primary_screen_app_active() {
+                self.block_tracker.begin_screen_owned_output();
+            }
         }
+    }
+
+    fn snapshot_primary_screen_output(&mut self) {
+        if !self.block_tracker.screen_owned_output() {
+            return;
+        }
+        let rows: Vec<String> = (0..self.grid.num_rows)
+            .map(|row| self.grid.row_text(row))
+            .collect();
+        let start = rows
+            .iter()
+            .position(|row| !row.is_empty())
+            .unwrap_or(rows.len());
+        let end = rows
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .map_or(start, |index| index + 1);
+        self.block_tracker
+            .replace_screen_output(&rows[start..end].join("\n"));
     }
 }
 
@@ -691,8 +713,10 @@ impl vte::Perform for Terminal {
                 if params.len() > 1 {
                     match params[1] {
                         b"A" => {
+                            self.snapshot_primary_screen_output();
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
+                            self.attrs = Default::default();
                             self.shell_markers.push(ShellMarker::PromptStart);
                             self.block_tracker.on_prompt_start();
                             // Clear the git branch: the precmd hook re-emits
@@ -727,8 +751,10 @@ impl vte::Perform for Terminal {
                             self.block_tracker.on_command_output_start();
                         }
                         b"D" => {
+                            self.snapshot_primary_screen_output();
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
+                            self.attrs = Default::default();
                             let exit_code = if params.len() > 2 {
                                 std::str::from_utf8(params[2])
                                     .ok()

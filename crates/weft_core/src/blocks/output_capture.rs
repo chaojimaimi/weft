@@ -18,6 +18,17 @@ impl OutputCapture {
         self.truncated = false;
     }
 
+    pub(super) fn replace(&mut self, text: &str, max_bytes: usize) {
+        self.clear();
+        let mut end = text.len().min(max_bytes);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.text.push_str(&text[..end]);
+        self.cursor = self.text.len();
+        self.truncated = end < text.len();
+    }
+
     pub(super) fn print(&mut self, c: char, max_bytes: usize) {
         if self.truncated {
             return;

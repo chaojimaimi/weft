@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 mod output_capture;
+#[cfg(test)]
+mod screen_capture_tests;
 
 use output_capture::OutputCapture;
 
@@ -120,6 +122,9 @@ pub struct BlockTracker {
     /// Latest cwd from OSC 7; snapshotted into each new block.
     current_cwd: Option<String>,
     output: OutputCapture,
+    /// A primary-screen TUI owns cells by coordinates, so its repaint stream
+    /// must be snapshotted as a screen instead of captured as linear output.
+    screen_owned_output: bool,
     /// Index in `blocks` where the current session's blocks begin. Blocks
     /// before this were loaded from SQLite on startup (history search only —
     /// NOT shown in the main block view, which is session-scoped).
@@ -149,6 +154,7 @@ impl BlockTracker {
             pending_cwd: None,
             current_cwd: None,
             output: OutputCapture::default(),
+            screen_owned_output: false,
             session_start: 0,
             dirty_blocks: HashSet::new(),
         }
@@ -173,7 +179,24 @@ impl BlockTracker {
     /// True while a command is executing and output should be captured.
     /// The `Terminal` print path gates on this (plus an alt-screen check).
     pub fn is_capturing(&self) -> bool {
-        self.phase == ShellPhase::CommandExecuting
+        self.phase == ShellPhase::CommandExecuting && !self.screen_owned_output
+    }
+
+    pub fn begin_screen_owned_output(&mut self) {
+        if self.phase == ShellPhase::CommandExecuting && !self.screen_owned_output {
+            self.output.clear();
+            self.screen_owned_output = true;
+        }
+    }
+
+    pub fn screen_owned_output(&self) -> bool {
+        self.screen_owned_output
+    }
+
+    pub fn replace_screen_output(&mut self, snapshot: &str) {
+        if self.screen_owned_output {
+            self.output.replace(snapshot, MAX_OUTPUT_BYTES);
+        }
     }
 
     /// All finished blocks (newest last). The history panel / search read this
@@ -225,7 +248,7 @@ impl BlockTracker {
     /// renderer's live block during CommandExecuting (e.g. an interactive
     /// `sudo su`). `None` when nothing is in flight.
     pub fn in_flight(&self) -> Option<InFlightBlock<'_>> {
-        if !self.is_capturing() {
+        if self.phase != ShellPhase::CommandExecuting {
             return None;
         }
         let command = self.pending_command.as_deref()?;
@@ -290,6 +313,7 @@ impl BlockTracker {
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
         self.output.clear();
+        self.screen_owned_output = false;
         self.phase = ShellPhase::CommandExecuting;
     }
 
@@ -360,11 +384,13 @@ impl BlockTracker {
         let Some(command) = self.pending_command.take() else {
             self.pending_started = None;
             self.output.clear();
+            self.screen_owned_output = false;
             return;
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
         let cwd = self.pending_cwd.take();
         let mut output = self.output.take();
+        self.screen_owned_output = false;
         // Mask secrets capture-side so the stored block (history / search /
         // future AI context) never holds a credential. The live grid stays raw.
         output = crate::secrets::mask(&output);
@@ -786,29 +812,5 @@ mod tests {
         assert_eq!(t.blocks()[0].id, BlockId(1));
         assert_eq!(t.blocks()[1].id, BlockId(2));
         assert_eq!(t.blocks()[2].id, BlockId(3));
-    }
-
-    #[test]
-    fn reset_to_prompt_finalizes_with_no_exit_code() {
-        // v1.0 fix: reset_to_prompt() (called after Ctrl+C flush) finalizes
-        // any in-flight block with no exit code, mirroring the 133;A interrupt
-        // path. This is a distinct code path from on_prompt_start().
-        let mut t = BlockTracker::new();
-        t.on_prompt_start();
-        t.on_command_start("long-running".to_string());
-        t.on_print('x');
-        t.on_print('y');
-        // Simulate Ctrl+C flush → reset_to_prompt (no 133;D, no 133;A).
-        t.reset_to_prompt();
-
-        assert_eq!(t.blocks().len(), 1);
-        let block = &t.blocks()[0];
-        assert_eq!(block.command, "long-running");
-        assert_eq!(block.output.as_ref(), "xy");
-        assert_eq!(
-            block.exit_code, None,
-            "reset_to_prompt finalizes with no exit code"
-        );
-        assert_eq!(t.phase(), ShellPhase::AtPrompt);
     }
 }

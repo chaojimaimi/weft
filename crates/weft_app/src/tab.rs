@@ -203,12 +203,10 @@ impl Tab {
         // Keep it: the alt-screen exit and any trailing session/resume text
         // must reach the parser after Ctrl+C. The flood-protection path below
         // remains for primary-screen commands such as `seq 1 10000000`.
-        if self
-            .terminal
-            .as_ref()
-            .is_some_and(Terminal::is_alt_screen_active)
-        {
-            tracing::info!("preserving alt-screen PTY tail after interrupt");
+        if self.terminal.as_ref().is_some_and(|terminal| {
+            terminal.is_alt_screen_active() || terminal.primary_screen_app_active()
+        }) {
+            tracing::info!("preserving full-screen PTY tail after interrupt");
             return;
         }
         // Flush kernel PTY read buffer + drain Pty's internal event channel.
