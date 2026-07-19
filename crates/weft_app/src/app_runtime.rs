@@ -76,6 +76,22 @@ fn schedule_synchronized_output_watchdog(
     true
 }
 
+fn schedule_primary_history_refresh_wakes(
+    tabs: &mut [Tab],
+    proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
+) {
+    for delay in tabs
+        .iter_mut()
+        .filter_map(Tab::take_primary_history_refresh_wake_delay)
+    {
+        let proxy = proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            let _ = proxy.send_event(AppEvent::Wake);
+        });
+    }
+}
+
 fn hydrate_persisted_history(
     terminal: &mut Terminal,
     newest_first: &[weft_core::blocks::Block],
@@ -113,6 +129,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
+                schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
                 if self.sessions.tabs().iter().any(|tab| {
                     tab.terminal
                         .as_ref()

@@ -12,7 +12,10 @@ use std::rc::Rc;
 use crate::block_component::{
     block_presentation, command_resume_hints, live_context_label, spinner_char_for_phase, BlockTone,
 };
-use crate::paint::block_view::actions::{push_block_header_actions, BlockHeaderActionPaint};
+use crate::paint::block_view::actions::{
+    block_header_band_height, block_header_text_cols, push_block_header_actions,
+    BlockHeaderActionPaint,
+};
 use crate::paint::block_view_model::BlockViewPaintModel;
 use crate::paint::grid_cache::wrap_line_chunks;
 use crate::paint::primitives::{color_to_normalized, push_quad};
@@ -74,6 +77,7 @@ impl MetalRenderer {
         let cwd_header_active = cwd.is_some() && live.is_none();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
+        let header_height = block_header_band_height(pitch, self.scale);
         let left = layout.left;
         let right = layout.right;
         let cols = layout.cols;
@@ -159,7 +163,7 @@ impl MetalRenderer {
                     chunks,
                     block_id: None,
                     line: line_idx,
-                    style: None,
+                    style: live.styled_output.and_then(|styled| styled.line(line_idx)),
                 });
             }
             cursor_dist += pitch;
@@ -228,7 +232,7 @@ impl MetalRenderer {
                     block_id: b.id,
                 });
                 let presentation = block_presentation(b, cached.lines.len());
-                cursor_dist += pitch;
+                cursor_dist += header_height;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Header {
                     text: presentation.label,
@@ -264,8 +268,6 @@ impl MetalRenderer {
         };
         for (i, &dist) in rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
-            let row_bottom_y = row_top_y + pitch;
-            let _ = row_bottom_y; // unused (no clip in pre-pass)
             let y = row_top_y;
             match &row_data[i] {
                 LaidRow::Output {
@@ -313,7 +315,7 @@ impl MetalRenderer {
                         text: text.clone(),
                         block_id: Some(*block_id),
                         y_top: y,
-                        y_bottom: y + pitch,
+                        y_bottom: y + header_height,
                     });
                 }
                 LaidRow::LiveHeader { text } => {
@@ -402,7 +404,12 @@ impl MetalRenderer {
 
         for (i, &dist) in rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
-            let row_bottom_y = row_top_y + pitch;
+            let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
+                header_height
+            } else {
+                pitch
+            };
+            let row_bottom_y = row_top_y + row_height;
 
             if row_bottom_y < clip_top || row_top_y > clip_bottom {
                 continue;
@@ -569,10 +576,10 @@ impl MetalRenderer {
                     tone,
                     block_id,
                 } => {
-                    if row_in_selection(y + pitch * 0.5) {
+                    if row_in_selection(y + header_height * 0.5) {
                         push_quad(
                             &mut verts,
-                            [left, y, right, y + pitch],
+                            [left, y, right, y + header_height],
                             bg_uv,
                             [0.0; 4],
                             selection_bg,
@@ -584,7 +591,9 @@ impl MetalRenderer {
                         BlockTone::Error => color_to_normalized(ui.error),
                         BlockTone::Warning => color_to_normalized(ui.warning),
                     };
-                    self.push_text(&mut verts, left, y, text, color, cols);
+                    let text_y = y + (header_height - pitch) * 0.5;
+                    let text_cols = block_header_text_cols(left, right, cw, self.scale).min(cols);
+                    self.push_text(&mut verts, left, text_y, text, color, text_cols);
 
                     push_block_header_actions(
                         self,

@@ -1,6 +1,7 @@
 //! Find overlay controller extracted from the application shell.
 
 use super::*;
+use crate::block_component::completed_block_row_count;
 
 pub(crate) fn toggled_find_option(current: bool) -> bool {
     !current
@@ -23,6 +24,7 @@ fn trimmed_block_output_lines(block: &weft_core::blocks::Block) -> usize {
 fn block_find_scroll_target(
     blocks: &[weft_core::blocks::Block],
     hit: &weft_core::find::BlockMatch,
+    header_rows: usize,
     visible: usize,
     max_scroll: usize,
 ) -> Option<usize> {
@@ -30,7 +32,7 @@ fn block_find_scroll_target(
     let rows_below = blocks
         .iter()
         .skip(block_idx + 1)
-        .map(|block| 3 + trimmed_block_output_lines(block))
+        .map(|block| completed_block_row_count(trimmed_block_output_lines(block), header_rows))
         .sum::<usize>();
     let output_lines = trimmed_block_output_lines(&blocks[block_idx]);
     let row_in_block = if hit.is_command {
@@ -418,9 +420,15 @@ impl App {
             // viewport (upper-middle). block_scroll_offset is "rows scrolled
             // up from the bottom", so target = rows_from_bottom - visible*2/3.
             let cols = term.grid().num_cols;
-            let (total, _) = block_content_metrics(term, cols);
+            let (total, _) = block_content_metrics(term, cols, renderer.block_header_rows());
             let max_scroll = total.saturating_sub(visible);
-            let Some(target) = block_find_scroll_target(blocks, &bm, visible, max_scroll) else {
+            let Some(target) = block_find_scroll_target(
+                blocks,
+                &bm,
+                renderer.block_header_rows(),
+                visible,
+                max_scroll,
+            ) else {
                 return;
             };
             self.sessions.active_mut().set_block_scroll(target);
@@ -476,7 +484,8 @@ mod tests {
             col: 0,
             len: 1,
         };
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 6, 100), Some(4));
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 1, 6, 100), Some(4));
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 6, 100), Some(5));
     }
 
     #[test]
@@ -489,9 +498,9 @@ mod tests {
             col: 0,
             len: 1,
         };
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 3, 100), Some(0));
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 3, 100), Some(0));
         hit.is_command = true;
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 3, 100), Some(2));
+        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 3, 100), Some(2));
     }
 
     #[test]

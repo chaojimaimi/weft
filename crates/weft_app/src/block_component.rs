@@ -123,7 +123,15 @@ pub(crate) fn live_context_label(cwd: Option<&str>, git_branch: Option<&str>) ->
 }
 
 /// Total/visible BlockView rows used by scrollbar and input geometry.
-pub(crate) fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize, usize) {
+pub(crate) fn completed_block_row_count(output_lines: usize, header_rows: usize) -> usize {
+    output_lines + header_rows.max(1) + 2 // command + accessible header band + gap
+}
+
+pub(crate) fn block_content_metrics(
+    terminal: &Terminal,
+    cols: usize,
+    header_rows: usize,
+) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
     let mut total = 0;
@@ -139,7 +147,7 @@ pub(crate) fn block_content_metrics(terminal: &Terminal, cols: usize) -> (usize,
                 .map(|line| wrapped_row_count(line, cols))
                 .sum::<usize>();
         }
-        total += 3; // command + header + gap
+        total += completed_block_row_count(0, header_rows);
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
         if let Some(live) = terminal.block_tracker().in_flight() {
@@ -262,10 +270,10 @@ mod tests {
         }
 
         let mut late_cwd = running_terminal(false);
-        assert_eq!(block_content_metrics(&late_cwd, 80).0, 2);
+        assert_eq!(block_content_metrics(&late_cwd, 80, 1).0, 2);
         late_cwd.process(b"\x1b]7;file://localhost/Users/me/.hermes\x07");
-        assert_eq!(block_content_metrics(&late_cwd, 80).0, 3);
-        assert_eq!(block_content_metrics(&running_terminal(true), 80).0, 3);
+        assert_eq!(block_content_metrics(&late_cwd, 80, 1).0, 3);
+        assert_eq!(block_content_metrics(&running_terminal(true), 80, 1).0, 3);
         assert_eq!(
             live_context_label(Some("/Users/me/.hermes"), Some("main")),
             Some("/Users/me/.hermes git:(main)".into())
@@ -273,12 +281,28 @@ mod tests {
     }
 
     #[test]
+    fn primary_tui_document_exposes_positive_local_scroll_range() {
+        let mut terminal = Terminal::new(4, 32);
+        terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+        terminal.process(b"\x1b[H\x1b[2;1H\x1b[2J\x1b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+        terminal.set_primary_history_view(true);
+
+        let total = block_content_metrics(&terminal, 32, 2).0;
+        assert!(total > terminal.grid().num_rows);
+        assert!(total.saturating_sub(terminal.grid().num_rows) > 0);
+    }
+
+    #[test]
     fn block_metrics_include_wrapped_resume_hint_rows() {
         let mut terminal = Terminal::new(24, 80);
         terminal.process(b"\x1b]133;A\x07opencode\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;130\x07");
 
-        assert_eq!(block_content_metrics(&terminal, 80).0, 5);
-        assert!(block_content_metrics(&terminal, 20).0 > 5);
+        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 5);
+        assert!(block_content_metrics(&terminal, 20, 1).0 > 5);
+        assert_eq!(
+            block_content_metrics(&terminal, 80, 2).0,
+            block_content_metrics(&terminal, 80, 1).0 + 1
+        );
     }
 
     #[test]

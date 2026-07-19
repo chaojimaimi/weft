@@ -251,43 +251,42 @@ impl Pty {
         }
     }
 
-    /// v1.0 fix: Send SIGINT to the foreground process group of the PTY.
+    /// Deliver one Ctrl+C interrupt to the foreground process.
     ///
-    /// This is the reliable fallback for Ctrl+C when the PTY write buffer is
-    /// full (e.g. a command like `seq 1 1000000` is producing output faster
-    /// than weft can drain it). Writing 0x03 to the PTY master would block
-    /// or fail with EAGAIN, so we bypass the PTY entirely and ask the kernel
-    /// to signal the foreground process group directly via TIOCGPGRP +
-    /// killpg(SIGINT).
+    /// Write ETX (`0x03`) through the PTY so line discipline, remote sessions
+    /// and raw interactive programs observe exactly the same event as a native
+    /// terminal. We deliberately do not replace this with a direct SIGINT:
+    /// doing so would interrupt a local `ssh` transport instead of forwarding
+    /// Ctrl+C to its remote foreground process.
     ///
-    /// Returns true if the signal was sent successfully.
+    /// Returns true if the interrupt was delivered successfully.
     pub fn send_interrupt(&self) -> bool {
-        // Get the foreground process group of the PTY.
-        let mut pgrp: nix::libc::pid_t = 0;
-        // SAFETY: TIOCGPGRP writes a pid_t into the provided pointer.
-        let ret =
-            unsafe { nix::libc::ioctl(self.master.as_raw_fd(), nix::libc::TIOCGPGRP, &mut pgrp) };
-        if ret < 0 || pgrp <= 0 {
-            tracing::warn!("TIOCGPGRP failed — cannot send SIGINT");
-            return false;
+        match nix::unistd::write(&self.master, &[0x03]) {
+            Ok(1) => {
+                tracing::debug!(delivery = "pty-etx", "Ctrl+C delivered once");
+                true
+            }
+            Ok(_) => {
+                tracing::warn!("short Ctrl+C PTY write; interrupt not delivered");
+                false
+            }
+            Err(nix::errno::Errno::EAGAIN) => {
+                tracing::warn!("Ctrl+C PTY write would block; interrupt not delivered");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Ctrl+C PTY write failed; interrupt not delivered");
+                false
+            }
         }
-        // SAFETY: killpg sends a signal to a process group. SIGINT is safe.
-        let ret = unsafe { nix::libc::killpg(pgrp, nix::libc::SIGINT) };
-        if ret != 0 {
-            tracing::warn!("killpg failed — cannot send SIGINT");
-            return false;
-        }
-        tracing::info!(pgrp, "sent SIGINT to foreground process group");
-        true
     }
 
     /// v1.0 fix: Flush the PTY's kernel-side read buffer and drain queued
     /// output events from the internal channel.
     ///
-    /// Called after Ctrl+C to discard stale output from the interrupted
-    /// command. Without this, weft would continue processing the remaining
-    /// ~7MB of seq output in the buffer for many frames, making the UI
-    /// appear frozen even though the command was already interrupted.
+    /// Reserved for explicit flood-recovery actions. Ctrl+C itself must never
+    /// call this after writing ETX: `tcflush(TCIFLUSH)` can discard the ETX
+    /// before the slave line discipline consumes it.
     pub fn flush_input(&mut self) {
         // Flush kernel PTY read buffer (slave→master direction).
         // SAFETY: tcflush is a safe ioctl that discards pending data.
@@ -631,6 +630,65 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         pty.write_sync(b"test\n").expect("sync write failed");
         assert!(pty.is_alive());
+    }
+
+    /// Ctrl+C must remain a PTY byte for raw-mode consumers such as SSH and
+    /// terminal REPLs. With ISIG disabled the child can observe the literal
+    /// ETX value; a direct SIGINT implementation would never produce BYTE:3.
+    #[tokio::test]
+    async fn interrupt_delivers_exactly_one_etx_to_raw_mode() {
+        let script = concat!(
+            "stty -isig -icanon -echo; ",
+            "printf 'READY\\r\\n'; ",
+            "byte=$(/bin/dd bs=1 count=1 2>/dev/null | /usr/bin/od -An -tu1); ",
+            "printf 'BYTE:%s\\r\\n' \"$byte\""
+        );
+        let mut pty = Pty::spawn_with_args("/bin/sh", &["-c", script], (24, 80), &[], None, || {})
+            .expect("failed to spawn raw-mode PTY fixture");
+
+        let mut output = String::new();
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !output.contains("READY") && tokio::time::Instant::now() < ready_deadline {
+            if let Ok(Some(PtyEvent::Output(bytes))) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await
+            {
+                output.push_str(&String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert!(
+            output.contains("READY"),
+            "raw fixture did not become ready: {output:?}"
+        );
+        assert!(pty.send_interrupt(), "ETX write should succeed");
+
+        let exit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < exit_deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
+                Ok(Some(PtyEvent::Output(bytes))) => {
+                    output.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                Ok(Some(PtyEvent::Exit(result))) => {
+                    assert_eq!(result, Ok(0));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+        let byte = output
+            .split("BYTE:")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next());
+        assert_eq!(
+            byte,
+            Some("3"),
+            "raw child must receive one literal ETX byte: {output:?}"
+        );
+        assert_eq!(
+            output.matches("BYTE:").count(),
+            1,
+            "one key must deliver once"
+        );
     }
 
     /// Test that `extra_env` overrides reach the child via the `execve` path.

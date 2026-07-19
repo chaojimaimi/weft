@@ -11,10 +11,15 @@ impl Tab {
             .as_ref()
             .is_some_and(weft_core::vt::Terminal::primary_screen_app_active);
         if active {
-            self.terminal
+            let terminal = self
+                .terminal
                 .as_mut()
-                .expect("active primary screen has a terminal")
-                .set_primary_history_view(true);
+                .expect("active primary screen has a terminal");
+            let entering = !terminal.primary_history_view();
+            terminal.set_primary_history_view(true);
+            if entering {
+                self.reset_primary_history_refresh();
+            }
         }
         active
     }
@@ -41,9 +46,16 @@ impl Tab {
     }
 
     fn sync_primary_history_view(&mut self) {
-        if let Some(terminal) = &mut self.terminal {
+        let changed = if let Some(terminal) = &mut self.terminal {
             let browsing = self.block_scroll_offset > 0 && terminal.primary_screen_app_active();
+            let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
+            changed
+        } else {
+            false
+        };
+        if changed {
+            self.reset_primary_history_refresh();
         }
     }
 }

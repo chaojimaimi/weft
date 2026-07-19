@@ -8,7 +8,7 @@ mod osc;
 mod perform;
 mod screen_exit;
 pub use attrs::{Attrs, ShellMarker};
-pub use screen_exit::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
+pub use screen_exit::{PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY};
 
 use crate::blocks::{BlockTracker, ShellPhase};
 use crate::editor::Editor;
@@ -67,6 +67,7 @@ pub struct Terminal {
     primary_screen_cursor_ops: u8,
     primary_screen_exit: Option<screen_exit::PendingPrimaryScreenExit>,
     primary_history_view: bool,
+    primary_history_snapshot_at: Option<std::time::Instant>,
 }
 
 impl Terminal {
@@ -110,6 +111,7 @@ impl Terminal {
             primary_screen_cursor_ops: 0,
             primary_screen_exit: None,
             primary_history_view: false,
+            primary_history_snapshot_at: None,
         }
     }
 

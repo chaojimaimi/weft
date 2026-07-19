@@ -2,6 +2,7 @@ use super::Terminal;
 use std::time::{Duration, Instant};
 
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
+pub const PRIMARY_HISTORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(super) struct PendingPrimaryScreenExit {
     exit_code: Option<i32>,
@@ -25,10 +26,45 @@ impl Terminal {
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
+        let entering = active && !self.primary_history_view;
         self.primary_history_view = active;
         if active {
             self.grid.scroll_offset = 0;
+        } else {
+            self.primary_history_snapshot_at = None;
         }
+        if entering && self.primary_screen_app_active() {
+            self.snapshot_primary_screen_output();
+            self.primary_history_snapshot_at = Some(Instant::now());
+            tracing::debug!(
+                bytes = self
+                    .block_tracker
+                    .in_flight()
+                    .map_or(0, |live| live.output.len()),
+                "snapshotted primary-screen TUI for history browsing"
+            );
+        }
+    }
+
+    /// Coalesced by the app after it drains the current frame's PTY batches,
+    /// then rate-limited here so a high-frequency TUI cannot rescan the capped
+    /// document on every display frame.
+    pub fn refresh_primary_history_snapshot(&mut self) -> bool {
+        self.refresh_primary_history_snapshot_at(Instant::now())
+    }
+
+    pub(super) fn refresh_primary_history_snapshot_at(&mut self, now: Instant) -> bool {
+        if !self.primary_history_view || !self.primary_screen_app_active() {
+            return false;
+        }
+        if self.primary_history_snapshot_at.is_some_and(|previous| {
+            now.saturating_duration_since(previous) < PRIMARY_HISTORY_SNAPSHOT_INTERVAL
+        }) {
+            return false;
+        }
+        self.snapshot_primary_screen_output();
+        self.primary_history_snapshot_at = Some(now);
+        true
     }
 
     pub(super) fn snapshot_primary_screen_output(&mut self) {

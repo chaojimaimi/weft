@@ -143,6 +143,18 @@ impl UiMetrics {
     }
 }
 
+/// Number of ordinary text rows reserved for an accessible compact control.
+/// Keeping this integral lets BlockView scrolling, painting and hit-testing
+/// share the same half-open vertical bands without stealing adjacent rows.
+pub fn compact_control_row_span(row_pitch: f32, scale: f64) -> usize {
+    if !row_pitch.is_finite() || row_pitch <= 0.0 {
+        return 1;
+    }
+    (UiMetrics::for_scale(scale).control_compact / row_pitch)
+        .ceil()
+        .max(1.0) as usize
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiColors {
     pub canvas: Color,
@@ -404,9 +416,10 @@ fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Colo
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_sidebar_width, contrast_ratio, sidebar_edge_hit, sidebar_placement,
-        sidebar_visual_width, sidebar_width_after_drag, ResponsiveClass, SidebarMetrics, UiColors,
-        UiMetrics, MIN_WINDOW_WIDTH, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+        clamp_sidebar_width, compact_control_row_span, contrast_ratio, sidebar_edge_hit,
+        sidebar_placement, sidebar_visual_width, sidebar_width_after_drag, ResponsiveClass,
+        SidebarMetrics, UiColors, UiMetrics, MIN_WINDOW_WIDTH, SIDEBAR_MAX_WIDTH,
+        SIDEBAR_MIN_WIDTH,
     };
     use weft_core::config::Theme;
 
@@ -495,6 +508,14 @@ mod tests {
         let two = UiMetrics::for_scale(2.0);
         assert_eq!(two.stroke, one.stroke * 2.0);
         assert_eq!(two.control_compact, one.control_compact * 2.0);
+    }
+
+    #[test]
+    fn compact_control_span_reserves_whole_non_overlapping_rows() {
+        assert_eq!(compact_control_row_span(20.0, 1.0), 2);
+        assert_eq!(compact_control_row_span(40.0, 2.0), 2);
+        assert_eq!(compact_control_row_span(64.0, 2.0), 1);
+        assert_eq!(compact_control_row_span(0.0, 2.0), 1);
     }
 
     #[test]

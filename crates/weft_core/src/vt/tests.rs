@@ -1,5 +1,6 @@
 use super::*;
 use crate::blocks::ShellPhase;
+use std::time::Instant;
 
 fn term() -> Terminal {
     Terminal::new(24, 80)
@@ -88,6 +89,77 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
     assert!(!t.show_block_view());
     t.settle_primary_screen_exit();
     assert!(t.show_block_view());
+}
+
+#[test]
+fn primary_screen_history_view_snapshot_refresh_is_explicitly_coalesced() {
+    let mut terminal = Terminal::new(5, 48);
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H\x1b[2J\x1b[Hfirst answer\x1b[2;1Hsecond answer");
+    assert!(terminal.primary_screen_app_active());
+    assert!(terminal
+        .block_tracker()
+        .in_flight()
+        .is_some_and(|live| live.output.is_empty()));
+
+    terminal.set_primary_history_view(true);
+    let snapshot = terminal.block_tracker().in_flight().unwrap();
+    assert_eq!(snapshot.output, "first answer\nsecond answer");
+
+    terminal.process(b"\x1b[3;1Hthird answer");
+    let unchanged = terminal.block_tracker().in_flight().unwrap();
+    assert_eq!(unchanged.output, "first answer\nsecond answer");
+
+    let refreshed_at = Instant::now() + super::screen_exit::PRIMARY_HISTORY_SNAPSHOT_INTERVAL;
+    assert!(terminal.refresh_primary_history_snapshot_at(refreshed_at));
+    let refreshed = terminal.block_tracker().in_flight().unwrap();
+    assert_eq!(
+        refreshed.output,
+        "first answer\nsecond answer\nthird answer"
+    );
+}
+
+#[test]
+fn primary_screen_history_snapshot_refresh_is_rate_limited() {
+    let mut terminal = Terminal::new(5, 48);
+    terminal.process(
+        b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H\x1b[2J\x1b[Hfirst",
+    );
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+    terminal.process(b"\x1b[2;1Hsecond");
+
+    assert!(!terminal.refresh_primary_history_snapshot_at(Instant::now()));
+    assert_eq!(
+        terminal.block_tracker().in_flight().unwrap().output,
+        "first"
+    );
+
+    let due = Instant::now() + super::screen_exit::PRIMARY_HISTORY_SNAPSHOT_INTERVAL;
+    assert!(terminal.refresh_primary_history_snapshot_at(due));
+    assert_eq!(
+        terminal.block_tracker().in_flight().unwrap().output,
+        "first\nsecond"
+    );
+}
+
+#[test]
+fn primary_screen_history_view_includes_rows_scrolled_off_the_live_viewport() {
+    let mut terminal = Terminal::new(4, 32);
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H\x1b[2J\x1b[Hone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix");
+    assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.grid().num_rows, 4);
+
+    terminal.set_primary_history_view(true);
+    let snapshot = terminal.block_tracker().in_flight().unwrap();
+    assert!(
+        snapshot.output.starts_with("one\ntwo"),
+        "history capture must retain primary-screen rows above the live viewport: {:?}",
+        snapshot.output
+    );
+    assert!(snapshot.output.ends_with("five\nsix"));
+    assert!(snapshot.output.lines().count() > terminal.grid().num_rows);
 }
 
 #[test]

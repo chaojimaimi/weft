@@ -17,7 +17,10 @@ use weft_core::vt::Terminal;
 use crate::{AppEvent, AppMsg};
 
 mod lifecycle;
+mod primary_history;
 mod scroll;
+
+use primary_history::PrimaryHistoryRefresh;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -67,6 +70,7 @@ pub struct Tab {
     /// interval before a TUI's alternate-screen modes reach the parser.
     tui_scroll_deadline: Option<std::time::Instant>,
     tui_scroll_wake_scheduled: bool,
+    primary_history_refresh: PrimaryHistoryRefresh,
 }
 
 impl Tab {
@@ -128,6 +132,7 @@ impl Tab {
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
+            primary_history_refresh: PrimaryHistoryRefresh::default(),
         }
     }
 
@@ -151,6 +156,7 @@ impl Tab {
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
+            primary_history_refresh: PrimaryHistoryRefresh::default(),
         }
     }
 
@@ -193,48 +199,15 @@ impl Tab {
         }
     }
 
-    /// v1.0 fix: Flush all stale PTY output after Ctrl+C.
+    /// Deliver one PTY-native interrupt without discarding command output.
     ///
-    /// Discards pending output in both the kernel PTY buffer and the
-    /// internal message channel. Called after `send_interrupt()` so the UI
-    /// can respond immediately instead of spending many frames processing
-    /// the interrupted command's remaining output (e.g. ~7MB from
-    /// `seq 1 10000000`).
-    ///
-    /// `PtyExit` events are preserved — they signal shell exit and must not
-    /// be lost.
-    pub fn flush_pty_output(&mut self) {
-        // Full-screen TUIs own a bounded screen, so their queued output is
-        // repaint/teardown data rather than an unbounded shell-output flood.
-        // Keep it: the alt-screen exit and any trailing session/resume text
-        // must reach the parser after Ctrl+C. The flood-protection path below
-        // remains for primary-screen commands such as `seq 1 10000000`.
-        if self.terminal.as_ref().is_some_and(|terminal| {
-            terminal.is_alt_screen_active() || terminal.primary_screen_app_active()
-        }) {
-            tracing::info!("preserving full-screen PTY tail after interrupt");
-            return;
-        }
-        // Flush kernel PTY read buffer + drain Pty's internal event channel.
-        if let Some(pty) = &mut self.pty {
-            pty.flush_input();
-        }
-        self.pending_pty_output = None;
-        // Drain queued AppMsg::PtyOutput messages from msg_rx.
-        // PtyExit is re-queued — must not be lost.
-        while let Ok(msg) = self.msg_rx.try_recv() {
-            if let AppMsg::PtyExit(code) = msg {
-                let _ = self.msg_tx.send(AppMsg::PtyExit(code));
-            }
-            // PtyOutput → discard (stale output from interrupted command)
-        }
-        // v1.0 fix: Reset shell phase to AtPrompt — the flush may have
-        // discarded the OSC 133;A marker the shell emits after interruption.
-        // Without this, phase stays CommandExecuting and the prompt/editor
-        // never reappears (user must press Enter to recover).
-        if let Some(terminal) = &mut self.terminal {
-            terminal.block_tracker_mut().reset_to_prompt();
-        }
+    /// Ctrl+C is always one ETX byte, regardless of whether the foreground app
+    /// uses the alternate screen, primary-screen cursor addressing, raw mode,
+    /// SSH, or a conventional shell command. Output is intentionally retained:
+    /// interactive tools write confirmation/resume tails after the first or
+    /// second Ctrl+C, and a post-write `tcflush` can race away the ETX itself.
+    pub fn interrupt_pty(&mut self) -> bool {
+        self.pty.as_ref().is_some_and(Pty::send_interrupt)
     }
 
     /// Process queued messages into the terminal and drain finished blocks.
@@ -258,6 +231,7 @@ impl Tab {
         const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
         let frame_start = std::time::Instant::now();
         let mut bytes_since_check = 0usize;
+        let mut processed_pty_output = false;
         let mut alive = true;
 
         let mut carried = self.pending_pty_output.take().map(AppMsg::PtyOutput);
@@ -278,10 +252,12 @@ impl Tab {
                         let tail = data.split_off(MAX_BYTES_PER_MESSAGE);
                         self.pending_pty_output = Some(tail);
                         need_redraw |= self.process_pty_output(&data);
+                        processed_pty_output = true;
                         break;
                     }
                     bytes_since_check += data.len();
                     need_redraw |= self.process_pty_output(&data);
+                    processed_pty_output = true;
                     // Cooperative yield: if we've spent the frame's time
                     // budget, stop draining and let the renderer draw. The
                     // remaining messages stay queued for next frame.
@@ -299,6 +275,7 @@ impl Tab {
             }
         }
 
+        need_redraw |= self.refresh_primary_history_snapshot(processed_pty_output);
         let mut drained = Vec::new();
         let mut reset_scroll = false;
         if let Some(terminal) = &mut self.terminal {
@@ -556,23 +533,6 @@ mod tests {
     }
 
     #[test]
-    fn primary_tui_history_scroll_switches_between_blocks_and_live_grid() {
-        let mut tab = tab_with_terminal(100);
-        let terminal = tab.terminal.as_mut().unwrap();
-        terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b[6G\x1b[13G");
-        assert!(terminal.primary_screen_app_active());
-        assert!(!terminal.show_block_view());
-
-        tab.scroll_up_by(1);
-        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
-        assert!(tab.terminal.as_ref().unwrap().show_block_view());
-
-        tab.snap_to_bottom();
-        assert!(!tab.terminal.as_ref().unwrap().primary_history_view());
-        assert!(!tab.terminal.as_ref().unwrap().show_block_view());
-    }
-
-    #[test]
     fn queued_scroll_replays_after_alt_screen_entry() {
         let mut t = tab_with_terminal(100);
         t.arm_tui_scroll_window();
@@ -694,6 +654,7 @@ mod tests {
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
+            primary_history_refresh: PrimaryHistoryRefresh::default(),
         }
     }
 

@@ -343,13 +343,15 @@ impl App {
                     }
                 }
                 Effect::InterruptPty { tab } => {
-                    if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
-                        pty.send_interrupt();
-                    }
-                }
-                Effect::FlushPtyOutput { tab } => {
-                    if let Some(tab) = self.sessions.tab_mut(tab) {
-                        tab.flush_pty_output();
+                    let delivered = self
+                        .sessions
+                        .tab_mut(tab)
+                        .is_some_and(crate::tab::Tab::interrupt_pty);
+                    if !delivered {
+                        warn!(
+                            tab,
+                            "interrupt delivery failed; preserving PTY output and phase"
+                        );
                     }
                 }
                 Effect::ResizePty { tab, rows, cols } => {

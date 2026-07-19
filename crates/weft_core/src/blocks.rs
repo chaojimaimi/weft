@@ -83,10 +83,10 @@ pub struct InFlightBlock<'a> {
     pub command: &'a str,
     pub cwd: Option<&'a str>,
     pub output: &'a str,
+    pub styled_output: Option<&'a StyledOutput>,
 }
 
-/// Shell-phase state machine, driven by OSC 133. See
-/// `docs/DECISION-input-architecture.md` (§123-204). v0.4 uses it only to
+/// Shell-phase state machine driven by OSC 133. v0.4 uses it only to
 /// gate output capture and mark integration readiness; the derived
 /// `InputMode` (AtPrompt → editor) is a v0.5 concern.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
@@ -255,6 +255,7 @@ impl BlockTracker {
             command,
             cwd: self.pending_cwd.as_deref(),
             output: self.output.as_str(),
+            styled_output: self.styled_output.as_deref(),
         })
     }
 

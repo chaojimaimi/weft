@@ -741,7 +741,8 @@ impl App {
                     return;
                 };
                 let cols = t.grid().num_cols;
-                let (total, _) = block_content_metrics(t, cols);
+                let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
+                let (total, _) = block_content_metrics(t, cols, header_rows);
                 (total, t.editor().buffer.lines.len())
             };
             let visible = self

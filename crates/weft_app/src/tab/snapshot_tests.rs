@@ -104,14 +104,13 @@ fn new_tab_launch_cwd_prefers_live_then_restored_state() {
 }
 
 #[test]
-fn interrupt_cleanup_preserves_alt_screen_teardown_output() {
+fn queued_alt_screen_teardown_output_is_preserved() {
     let mut tab = tab_with_terminal();
     tab.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
     tab.msg_tx
         .send(AppMsg::PtyOutput(b"\x1b[?1049lresume hint".to_vec()))
         .unwrap();
 
-    tab.flush_pty_output();
     let (_, _, need_redraw) = tab.process_messages();
 
     assert!(need_redraw);
@@ -126,7 +125,7 @@ fn interrupt_cleanup_preserves_alt_screen_teardown_output() {
 }
 
 #[test]
-fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
+fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
     let mut tab = tab_with_terminal();
     let terminal = tab.terminal.as_mut().unwrap();
     terminal.process(b"\x1b]133;A\x07");
@@ -142,7 +141,6 @@ fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
         ))
         .unwrap();
 
-    tab.flush_pty_output();
     let (_, blocks, need_redraw) = tab.process_messages();
 
     assert!(need_redraw);
@@ -160,6 +158,39 @@ fn interrupt_cleanup_preserves_primary_tui_teardown_as_a_screen_snapshot() {
         "Resume this session with:\nscreen-app --resume abc"
     );
     assert!(!blocks[0].output.contains("old linear output"));
+}
+
+#[test]
+fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    assert_eq!(
+        terminal.block_tracker().phase(),
+        weft_core::blocks::ShellPhase::CommandExecuting
+    );
+    tab.msg_tx
+        .send(AppMsg::PtyOutput(b"still-running-tail".to_vec()))
+        .unwrap();
+
+    assert!(
+        !tab.interrupt_pty(),
+        "a tab without a PTY cannot deliver ETX"
+    );
+    let (_, _, need_redraw) = tab.process_messages();
+
+    assert!(need_redraw);
+    assert_eq!(
+        tab.terminal.as_ref().unwrap().block_tracker().phase(),
+        weft_core::blocks::ShellPhase::CommandExecuting
+    );
+    assert!(tab
+        .terminal
+        .as_ref()
+        .unwrap()
+        .block_tracker()
+        .in_flight()
+        .is_some_and(|live| live.output.contains("still-running-tail")));
 }
 
 #[test]

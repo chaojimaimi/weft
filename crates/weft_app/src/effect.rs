@@ -12,9 +12,6 @@ pub(crate) enum Effect {
     InterruptPty {
         tab: usize,
     },
-    FlushPtyOutput {
-        tab: usize,
-    },
     ResizePty {
         tab: usize,
         rows: usize,
@@ -101,15 +98,16 @@ pub(crate) fn passthrough_key_effects(tab: usize, bytes: Vec<u8>) -> Vec<Effect>
         return Vec::new();
     }
     let is_ctrl_c = bytes.as_slice() == [0x03];
-    let mut effects = vec![Effect::WritePty { tab, bytes }];
     if is_ctrl_c {
-        effects.extend([
-            Effect::InterruptPty { tab },
-            Effect::FlushPtyOutput { tab },
-            Effect::RequestRedraw,
-        ]);
+        // InterruptPty performs one atomic delivery by writing ETX to the PTY.
+        // A failed write remains a failure; signal fallback would bypass raw
+        // mode and remote-session semantics.
+        // Emitting WritePty as well would deliver two interrupts and makes
+        // double-Ctrl+C TUIs (Claude Code, OpenCode) exit on the first press.
+        vec![Effect::InterruptPty { tab }, Effect::RequestRedraw]
+    } else {
+        vec![Effect::WritePty { tab, bytes }]
     }
-    effects
 }
 
 pub(crate) fn ime_commit_effects(tab: usize, text: &str) -> Vec<Effect> {
@@ -193,18 +191,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_preserves_interrupt_flush_and_redraw_order() {
+    fn ctrl_c_uses_one_atomic_interrupt_before_redraw() {
         assert_eq!(
             passthrough_key_effects(0, vec![0x03]),
-            [
-                Effect::WritePty {
-                    tab: 0,
-                    bytes: vec![0x03],
-                },
-                Effect::InterruptPty { tab: 0 },
-                Effect::FlushPtyOutput { tab: 0 },
-                Effect::RequestRedraw,
-            ]
+            [Effect::InterruptPty { tab: 0 }, Effect::RequestRedraw,]
         );
     }
 

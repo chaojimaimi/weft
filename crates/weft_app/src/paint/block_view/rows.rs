@@ -9,6 +9,8 @@ use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
 use weft_core::selection::{BlockViewRow, BlockViewRowKind};
 
+use super::actions::block_header_band_height;
+
 /// Return the block whose output is clipped by the top edge while its command
 /// row is already offscreen. That block owns the sticky CWD/command header.
 pub(super) fn sticky_block_id(
@@ -76,6 +78,7 @@ impl MetalRenderer {
         let cwd_header_active = cwd.is_some() && live.is_none();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
         let pitch = layout.pitch;
+        let header_height = block_header_band_height(pitch, self.scale);
         let content_bottom_y = layout.clip_bottom;
         let cols = layout.cols;
 
@@ -181,7 +184,7 @@ impl MetalRenderer {
                     command: &b.command,
                     block_id: b.id,
                 });
-                cursor_dist += pitch;
+                cursor_dist += header_height;
                 rows.push(cursor_dist);
                 let presentation = block_presentation(b, cached.lines.len());
                 row_data.push(LaidRow::Header {
@@ -248,7 +251,7 @@ impl MetalRenderer {
                         text: text.clone(),
                         block_id: Some(*block_id),
                         y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
+                        y_bottom: row_top_y + header_height,
                     });
                 }
                 LaidRow::LiveHeader { text } => {

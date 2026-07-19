@@ -161,6 +161,11 @@ impl MetalRenderer {
             .unwrap_or(1)
     }
 
+    pub fn block_header_rows(&self) -> usize {
+        let pitch = self.cell_height() as f32 * 1.1;
+        crate::ui_tokens::compact_control_row_span(pitch, self.scale)
+    }
+
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
     /// live config reload when font family/size/line-height changes. Returns
     /// the new cell dimensions so the caller can recompute grid rows/cols and

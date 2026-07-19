@@ -1,6 +1,7 @@
 //! History panel controller extracted from the application shell.
 
 use super::*;
+use crate::block_component::completed_block_row_count;
 
 impl App {
     pub(super) fn update_sidebar_drag(&mut self, pointer_x: f64) -> bool {
@@ -187,9 +188,10 @@ impl App {
 
         // Count rows from the bottom up to the target block's command line.
         // Layout (bottom→top): Output[N-1] at row 0, …, Output[0] at row
-        // N-1, Command at row N, Header at row N+1, Separator at row N+2.
+        // N-1, Command at row N, then the accessible Header band and gap.
         // For each block BELOW the target (i.e. with higher index), add its
-        // full height (3 + output_lines).
+        // full height using the renderer's current Header row span.
+        let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
         let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
             if b.collapsed {
                 return 0;
@@ -208,7 +210,7 @@ impl App {
             if i == block_idx {
                 break;
             }
-            rows_from_bottom += 3 + trim_output_lines(b);
+            rows_from_bottom += completed_block_row_count(trim_output_lines(b), header_rows);
         }
         // Position the block's command line at ~1/3 from the bottom of the
         // viewport so the user sees the command + most of its output above.
@@ -228,6 +230,7 @@ impl App {
 
     /// Local scrollback navigation (page up/down, top, bottom).
     pub(super) fn scroll_action(&mut self, action: Action) {
+        let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
         let tab = self.sessions.active_mut();
         if matches!(
             action,
@@ -243,7 +246,7 @@ impl App {
         // Block view uses a dedicated scroll offset.
         let block_view = terminal.show_block_view();
         if block_view {
-            let (total, _) = block_content_metrics(terminal, cols);
+            let (total, _) = block_content_metrics(terminal, cols, header_rows);
             // Compute visible rows from the renderer's actual geometry.
             let prompt_lines = terminal.editor().buffer.lines.len();
             let visible = self
