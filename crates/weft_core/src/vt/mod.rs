@@ -65,6 +65,7 @@ pub struct Terminal {
     parser_in_ground_state: bool, // gates the printable-ASCII fast path
     suppress_joined_scalar: bool,
     primary_screen_cursor_ops: u8,
+    primary_screen_document_candidate: u64,
     primary_screen_exit: Option<screen_exit::PendingPrimaryScreenExit>,
     primary_history_view: bool,
     primary_history_snapshot_at: Option<std::time::Instant>,
@@ -109,6 +110,7 @@ impl Terminal {
             parser_in_ground_state: true,
             suppress_joined_scalar: false,
             primary_screen_cursor_ops: 0,
+            primary_screen_document_candidate: 0,
             primary_screen_exit: None,
             primary_history_view: false,
             primary_history_snapshot_at: None,
@@ -157,37 +159,6 @@ impl Terminal {
     /// the side-map is viewport-relative, so any scroll invalidates it.
     pub fn clear_hyperlink_cell_map(&mut self) {
         self.hyperlinks.clear_cell_map();
-    }
-
-    /// Scroll the grid up by `n` rows and invalidate the OSC 8 cell_map.
-    /// Required because the side-map keys are viewport-relative `(row, col)`
-    /// and shift on every scroll — leaving stale keys would make clicks
-    /// resolve to the wrong URL.
-    fn scroll_grid_up(&mut self, n: usize) {
-        self.grid.scroll_up(n);
-        // v1.0 fix: alt-screen TUIs (vim/less/man) repaint their whole screen
-        // after scrolling, so the renderer's scroll-blit/cache-shift
-        // optimization (built for shell streaming) corrupts their redraw.
-        // Discard the pending scroll delta and force a full rebuild instead.
-        if self.alt_active {
-            self.grid.discard_scroll_and_dirty_all();
-        }
-        // v1.0 P1.5-C2: skip the HashMap clear when no hyperlinks are active
-        // (the common case — terminal output rarely has OSC 8 links).
-        if !self.hyperlinks.cell_map_is_empty() {
-            self.hyperlinks.clear_cell_map();
-        }
-    }
-
-    /// Same as [`scroll_grid_up`](Self::scroll_grid_up) for scroll-down.
-    fn scroll_grid_down(&mut self, n: usize) {
-        self.grid.scroll_down(n);
-        if self.alt_active {
-            self.grid.discard_scroll_and_dirty_all();
-        }
-        if !self.hyperlinks.cell_map_is_empty() {
-            self.hyperlinks.clear_cell_map();
-        }
     }
 
     pub fn cwd(&self) -> Option<&str> {
@@ -439,6 +410,7 @@ impl Terminal {
             };
             // Read row AFTER the col adjustment (cursor.row may have changed).
             let row = self.grid.cursor.row;
+            self.include_primary_screen_viewport_row(row);
 
             // How many bytes fit in the current row? No per-char bounds check.
             let remaining_in_row = num_cols - col;
@@ -538,8 +510,11 @@ impl Terminal {
     ///
     /// The **active** grid (whichever is currently displayed, i.e. `self.grid`
     /// after any alt-screen swap) is resized **dimension-only** when an
-    /// full-screen TUI app is running, and **reflowed** otherwise. The
-    /// **inactive** grid is always reflowed so it is correct when swapped to.
+    /// full-screen TUI app is running or a deferred screen transcript is still
+    /// live. Before TUI ownership is confirmed, ordinary command output still
+    /// reflows and its frozen candidate boundary is mapped through that reflow.
+    /// A hidden owned primary grid is also kept dimension-only while an
+    /// alternate screen is visible.
     ///
     /// Why dimension-only for the active TUI grid: apps like `less`, `vim`,
     /// `man` and Claude paint with absolute cursor positioning at a fixed width and
@@ -550,12 +525,32 @@ impl Terminal {
     /// SIGWINCH finally fires and the app repaints). Alacritty/Warp apply the
     /// same rule: never reflow the active screen during a TUI app's lifetime.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        if self.alt_active || self.primary_screen_app_active() {
-            // self.grid is TUI-owned. Dimension-only so the
-            // running TUI app owns its layout until it repaints on SIGWINCH.
-            // self.alt_grid IS the hidden primary grid — reflow it so it is
-            // correct when the app exits and swaps back.
+        let primary_screen_layout_owned = self.primary_screen_cursor_ops > 0
+            || self.block_tracker.screen_document_start().is_some();
+        let primary_screen_candidate_pending =
+            self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting;
+        if self.alt_active {
+            // self.grid is the visible alternate screen and is always
+            // TUI-owned. The hidden primary grid must also stay
+            // dimension-only once primary-screen ownership evidence exists;
+            // otherwise reflow resets its logical document positions while
+            // the capture boundary still points into that document.
             self.grid.resize_dims(rows, cols);
+            if primary_screen_layout_owned {
+                self.alt_grid.resize_dims(rows, cols);
+            } else if primary_screen_candidate_pending {
+                self.reflow_primary_screen_candidate(rows, cols, true);
+            } else {
+                self.alt_grid.resize(rows, cols);
+            }
+        } else if primary_screen_layout_owned {
+            // The visible primary grid is cursor-addressed or still owns a
+            // deferred exit transcript. Preserve its row coordinates until
+            // the app repaints or the snapshot settles.
+            self.grid.resize_dims(rows, cols);
+            self.alt_grid.resize(rows, cols);
+        } else if primary_screen_candidate_pending {
+            self.reflow_primary_screen_candidate(rows, cols, false);
             self.alt_grid.resize(rows, cols);
         } else {
             // self.grid IS the primary grid at a shell prompt — reflow so

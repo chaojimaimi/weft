@@ -186,6 +186,7 @@ fn primary_screen_exit_snapshot_keeps_scrollback_and_ctrl_c_resume_tail() {
     terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
     terminal.process(b"\x1b[H\x1b[2;1H");
     assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.block_tracker().screen_document_start(), Some(0));
 
     terminal.process(
         b"\x1b[2J\x1b[Hanswer line 1\r\nanswer line 2\r\nanswer line 3\r\nPress Ctrl-C again to exit\r\nResume this session with:\r\nclaude --resume session-id",
@@ -196,7 +197,157 @@ fn primary_screen_exit_snapshot_keeps_scrollback_and_ctrl_c_resume_tail() {
     let block = terminal.block_tracker().blocks().last().unwrap();
     assert_eq!(
         block.output.as_ref(),
-        "answer line 1\nanswer line 2\nanswer line 3\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume session-id"
+        "answer line 1\nanswer line 2\nanswer line 3\n\nPress Ctrl-C again to exit\n\nResume this session with:\nclaude --resume session-id"
+    );
+}
+
+#[test]
+fn primary_screen_snapshot_excludes_previous_command_rows_left_in_viewport() {
+    let mut terminal = Terminal::new(10, 64);
+    terminal.process(b"\x1b]133;A\x07\x1b[Hpwd\x1b[2;1H/Users/me/project");
+    for ch in "claude".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    terminal.process(b"\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07");
+
+    // The TUI starts below the shell's retained rows without clearing them.
+    // They remain valid Grid content, but are not part of this command's
+    // detached transcript because the command already has its own Block.
+    terminal.process(b"\x1b[4;1H\x1b[5;1HClaude Code\x1b[6;1Hglm-5.2");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(
+        !output.contains("pwd"),
+        "previous command leaked: {output:?}"
+    );
+    assert!(
+        !output.contains("/Users/me/project"),
+        "previous output leaked: {output:?}"
+    );
+    assert!(
+        !output.starts_with("claude\n"),
+        "command echo leaked: {output:?}"
+    );
+    assert!(output.contains("Claude Code"));
+    assert!(output.contains("glm-5.2"));
+}
+
+#[test]
+fn primary_screen_boundary_is_frozen_before_tui_repeats_the_command_name() {
+    let mut terminal = Terminal::new(10, 64);
+    terminal.process(b"\x1b]133;A\x07\x1b[Hpwd\x1b[2;1H/Users/me/project");
+    for ch in "claude".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    terminal.process(b"\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07");
+
+    // The first addressed TUI row itself repeats the command name. Waiting
+    // until the second cursor op to scan would mistake this for the shell echo.
+    terminal.process(b"\x1b[5;1Hclaude\x1b[6;1HClaude Code");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("pwd"));
+    assert!(!output.contains("/Users/me/project"));
+    assert!(
+        output.contains("claude"),
+        "TUI title was cropped: {output:?}"
+    );
+    assert!(output.contains("Claude Code"));
+}
+
+#[test]
+fn primary_screen_ascii_fast_path_expands_capture_above_initial_boundary() {
+    let mut terminal = Terminal::new(8, 64);
+    terminal
+        .process(b"\x1b]133;A\x07\x1b[Hold shell row\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[5;1H\x1b[6;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    // Printable ASCII bypasses vte::Perform::print(), so it must update the
+    // screen-document boundary inside print_ascii_run itself.
+    terminal.process(b"\x1b[2;1HTUI HEADER");
+    terminal.set_primary_history_view(true);
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("old shell row"));
+    assert!(
+        output.contains("TUI HEADER"),
+        "ASCII row was cropped: {output:?}"
+    );
+}
+
+#[test]
+fn primary_screen_absolute_boundary_survives_forward_and_reverse_scrolls() {
+    let mut terminal = Terminal::new(7, 32);
+    terminal
+        .process(b"\x1b]133;A\x07\x1b[Hold\x1b[2;1Holder\x1b[3;1Happ\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[4;1Hanswer one\x1b[5;1Hanswer two\x1b[6;1H");
+    assert!(terminal.primary_screen_app_active());
+
+    terminal.process(b"\x1b[1S");
+    terminal.set_primary_history_view(true);
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.lines().any(|line| line == "old"));
+    assert!(!output.contains("older"));
+    assert!(output.contains("answer one"));
+    assert!(output.contains("answer two"));
+
+    terminal.set_primary_history_view(false);
+    terminal.process(b"\x1b[1T");
+    terminal.set_primary_history_view(true);
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.lines().any(|line| line == "old"));
+    assert!(!output.contains("older"));
+    assert!(output.contains("answer one"));
+    assert!(output.contains("answer two"));
+}
+
+#[test]
+fn alternate_screen_mutations_do_not_corrupt_later_primary_tail_boundary() {
+    let mut terminal = Terminal::new(8, 64);
+    terminal
+        .process(b"\x1b]133;A\x07\x1b[Hold shell row\x1b[3;1Hhybrid\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[?1049hALT SCREEN\r\nline 2\r\nline 3\x1b[2S\x1b[?1049l");
+
+    terminal.process(b"\x1b[4;1Hprimary teardown\x1b[5;1H");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("old shell row"));
+    assert!(!output.contains("ALT SCREEN"));
+    assert!(
+        output.contains("primary teardown"),
+        "primary tail was cropped: {output:?}"
+    );
+}
+
+#[test]
+fn hidden_primary_boundary_survives_alt_screen_resize_transition() {
+    let mut terminal = Terminal::new(8, 24);
+    terminal.process(
+        b"\x1b]133;A\x07\x1b[1;1Hold shell row\x1b[3;1Hhybrid\x1b]133;B\x07\x1b]133;C\x07",
+    );
+    terminal.process(b"\x1b[5;1Hprimary first");
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.process(b"\x1b[?1049hALT SCREEN");
+    terminal.resize(8, 10);
+    terminal.process(b"\x1b[?1049l\x1b[5;1Htail");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("old shell row"));
+    assert!(!output.contains("ALT SCREEN"));
+    assert!(!output.contains("hybrid"));
+    assert!(
+        output.contains("tail"),
+        "primary tail was cropped after alt resize: {output:?}"
     );
 }
 
@@ -207,8 +358,10 @@ fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
     terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
     terminal.process(b"\x1b[H\x1b[2;1H");
     assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.block_tracker().screen_document_start(), Some(1));
 
     terminal.process(b"\x1b[2J\x1b[H\x1b[38;2;222;120;80manswer\x1b[0m");
+    assert_eq!(terminal.block_tracker().screen_document_start(), Some(0));
     terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
     assert!(terminal.primary_screen_exit_pending());
     assert!(terminal.block_tracker().blocks().is_empty());
@@ -221,7 +374,11 @@ fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
 
     let block = terminal.block_tracker().blocks().last().unwrap();
     assert_eq!(block.cwd.as_deref(), Some("/Users/me/project"));
-    assert!(block.output.contains("answer"));
+    assert!(
+        block.output.contains("answer"),
+        "late-tail snapshot lost answer: {:?}",
+        block.output
+    );
     assert!(block.output.contains("Press Ctrl-C again to exit"));
     assert!(block.output.contains("claude --resume late-id"));
     let styled = block
@@ -232,6 +389,91 @@ fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
         .line(0)
         .and_then(|line| line.foreground_at(0))
         .is_some_and(|color| matches!(color, crate::grid::CellColor::Rgb(_))));
+}
+
+#[test]
+fn deferred_primary_screen_tail_can_expand_a_nonzero_document_boundary() {
+    let mut terminal = Terminal::new(8, 64);
+    terminal.process(
+        b"\x1b]133;A\x07\x1b[1;1Hold shell row\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07",
+    );
+    terminal.process(b"\x1b[4;1Hanswer\x1b[5;1H");
+    assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.block_tracker().screen_document_start(), Some(3));
+
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(terminal.primary_screen_exit_pending());
+    terminal.process(
+        b"\x1b[2;1HPress Ctrl-C again to exit\x1b[3;1HResume this session with:\x1b[4;1Hclaude --resume deferred-id",
+    );
+    assert_eq!(terminal.block_tracker().screen_document_start(), Some(1));
+    terminal.settle_primary_screen_exit();
+
+    let block = terminal.block_tracker().blocks().last().unwrap();
+    assert!(!block.output.contains("old shell row"));
+    assert!(block.output.contains("Press Ctrl-C again to exit"));
+    assert!(block.output.contains("claude --resume deferred-id"));
+}
+
+#[test]
+fn primary_screen_candidate_survives_resize_after_first_cursor_address() {
+    let mut terminal = Terminal::new(8, 24);
+    terminal.process(
+        b"\x1b]133;A\x07\x1b[1;1Hold shell row\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07",
+    );
+    terminal.process(b"\x1b[5;1Hfirst frame");
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.resize(8, 10);
+    terminal.process(b"\x1b[5;1Hsecond");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("old shell row"));
+    assert!(!output.contains("claude"));
+    assert!(
+        output.contains("second"),
+        "resized frame was cropped: {output:?}"
+    );
+}
+
+#[test]
+fn frozen_primary_screen_candidate_survives_resize_before_any_cursor_address() {
+    let mut terminal = Terminal::new(8, 24);
+    terminal.process(
+        b"\x1b]133;A\x07\x1b[1;1Hold shell row\x1b[3;1Hclaude\x1b]133;B\x07\x1b]133;C\x07",
+    );
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.resize(8, 10);
+    terminal.process(b"\x1b[5;1Hfirst\x1b[6;1Hsecond");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(!output.contains("old shell row"));
+    assert!(!output.contains("claude"));
+    assert!(output.contains("first"));
+    assert!(output.contains("second"));
+}
+
+#[test]
+fn ordinary_running_command_still_reflows_while_candidate_is_pending() {
+    let mut terminal = Terminal::new(5, 12);
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07abcdefghijklmnop");
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.resize(5, 6);
+    let text = (0..terminal.grid().num_rows)
+        .map(|row| terminal.grid().row_text(row))
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(
+        text.contains("abcdefghijklmnop"),
+        "reflow truncated output: {text:?}"
+    );
 }
 
 #[test]

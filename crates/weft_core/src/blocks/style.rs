@@ -48,15 +48,28 @@ pub struct ForegroundSpan {
 }
 
 impl BlockTracker {
+    /// Expand a screen-owned document toward an earlier logical row.
+    pub fn include_screen_document_position(&mut self, position: u64) {
+        if let Some(document_start) = &mut self.screen_document_start {
+            *document_start = (*document_start).min(position);
+        }
+    }
+
+    pub fn set_screen_document_start(&mut self, position: u64) {
+        if let Some(document_start) = &mut self.screen_document_start {
+            *document_start = position;
+        }
+    }
+
     pub fn replace_screen_output(&mut self, snapshot: &str) {
-        if self.screen_scrollback_start.is_some() {
+        if self.screen_document_start.is_some() {
             self.output.replace(snapshot, MAX_OUTPUT_BYTES);
             self.styled_output = None;
         }
     }
 
     pub fn replace_screen_snapshot(&mut self, text: &str, styled: StyledOutput) {
-        if self.screen_scrollback_start.is_none() {
+        if self.screen_document_start.is_none() {
             return;
         }
         self.output.replace(text, MAX_OUTPUT_BYTES);

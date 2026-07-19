@@ -219,7 +219,7 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     assert_eq!(blocks[0].command, "screen-app");
     assert_eq!(
         blocks[0].output.as_ref(),
-        "Press Ctrl-C again to exit\nResume this session with:\nscreen-app --resume late"
+        "Press Ctrl-C again to exit\n\nResume this session with:\nscreen-app --resume late"
     );
 }
 

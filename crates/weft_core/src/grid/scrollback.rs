@@ -96,6 +96,19 @@ impl Scrollback {
         self.buffer.get(actual)
     }
 
+    pub(super) fn get_mut(&mut self, index: usize) -> Option<&mut Row> {
+        if index >= self.len {
+            return None;
+        }
+        let start = if self.len < self.max_lines {
+            0
+        } else {
+            self.head
+        };
+        let actual = (start + index) % self.max_lines.min(self.buffer.len());
+        self.buffer.get_mut(actual)
+    }
+
     /// Keep historical rows compatible with dimension-only viewport rendering.
     pub(super) fn resize_cols(&mut self, new_cols: usize) {
         for row in &mut self.buffer {

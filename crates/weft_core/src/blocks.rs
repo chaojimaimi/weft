@@ -126,9 +126,8 @@ pub struct BlockTracker {
     current_cwd: Option<String>,
     output: OutputCapture,
     styled_output: Option<Arc<StyledOutput>>,
-    /// Scrollback baseline for a primary-screen TUI whose coordinate repaint
-    /// stream must be snapshotted as a document instead of captured linearly.
-    screen_scrollback_start: Option<u64>,
+    /// Absolute document position where primary-screen output begins.
+    screen_document_start: Option<u64>,
     /// Index in `blocks` where the current session's blocks begin. Blocks
     /// before this were loaded from SQLite on startup (history search only —
     /// NOT shown in the main block view, which is session-scoped).
@@ -159,7 +158,7 @@ impl BlockTracker {
             current_cwd: None,
             output: OutputCapture::default(),
             styled_output: None,
-            screen_scrollback_start: None,
+            screen_document_start: None,
             session_start: 0,
             dirty_blocks: HashSet::new(),
         }
@@ -184,18 +183,18 @@ impl BlockTracker {
     /// True while a command is executing and output should be captured.
     /// The `Terminal` print path gates on this (plus an alt-screen check).
     pub fn is_capturing(&self) -> bool {
-        self.phase == ShellPhase::CommandExecuting && self.screen_scrollback_start.is_none()
+        self.phase == ShellPhase::CommandExecuting && self.screen_document_start.is_none()
     }
 
-    pub fn begin_screen_owned_output(&mut self, scrollback_start: u64) {
-        if self.phase == ShellPhase::CommandExecuting && self.screen_scrollback_start.is_none() {
+    pub fn begin_screen_owned_output(&mut self, document_start: u64) {
+        if self.phase == ShellPhase::CommandExecuting && self.screen_document_start.is_none() {
             self.output.clear();
-            self.screen_scrollback_start = Some(scrollback_start);
+            self.screen_document_start = Some(document_start);
         }
     }
 
-    pub fn screen_scrollback_start(&self) -> Option<u64> {
-        self.screen_scrollback_start
+    pub fn screen_document_start(&self) -> Option<u64> {
+        self.screen_document_start
     }
 
     /// All finished blocks (newest last). The history panel / search read this
@@ -314,7 +313,7 @@ impl BlockTracker {
         self.pending_cwd = self.current_cwd.clone();
         self.output.clear();
         self.styled_output = None;
-        self.screen_scrollback_start = None;
+        self.screen_document_start = None;
         self.phase = ShellPhase::CommandExecuting;
     }
 
@@ -386,13 +385,13 @@ impl BlockTracker {
             self.pending_started = None;
             self.output.clear();
             self.styled_output = None;
-            self.screen_scrollback_start = None;
+            self.screen_document_start = None;
             return;
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
         let cwd = self.pending_cwd.take();
         let raw_output = self.output.take();
-        self.screen_scrollback_start = None;
+        self.screen_document_start = None;
         // Mask secrets capture-side so the stored block (history / search /
         // future AI context) never holds a credential. The live grid stays raw.
         let output = crate::secrets::mask(&raw_output);

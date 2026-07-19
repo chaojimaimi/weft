@@ -1,9 +1,119 @@
-use super::{CellFlags, Grid, Row};
+use super::{CellColor, CellFlags, Color, Grid, Row};
 use crate::blocks::{ForegroundSpan, StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
 
 const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
 
+fn retained_row(grid: &Grid, index: usize) -> Option<&Row> {
+    if index < grid.scrollback.len() {
+        grid.scrollback.get(index)
+    } else {
+        grid.viewport
+            .get(index.saturating_sub(grid.scrollback.len()))
+    }
+}
+
+fn row_content_end(row: &Row) -> usize {
+    row.cells
+        .iter()
+        .rposition(|cell| cell.character != ' ' || !cell.flags.is_empty())
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
 impl Grid {
+    /// Reflow once while mapping an absolute row boundary to the rebuilt
+    /// document. A temporary cell marker preserves a boundary that points at
+    /// a blank row or into a wrapped logical line.
+    pub(crate) fn resize_preserving_document_position(
+        &mut self,
+        document_start: u64,
+        new_rows: usize,
+        new_cols: usize,
+    ) -> u64 {
+        if new_rows == self.num_rows && new_cols == self.num_cols {
+            return document_start;
+        }
+        let retained_start = self
+            .scrollback
+            .position()
+            .saturating_sub(self.scrollback.len() as u64);
+        let retained_index = document_start.saturating_sub(retained_start) as usize;
+        let scrollback_len = self.scrollback.len();
+        let retained_len = scrollback_len.saturating_add(self.num_rows);
+        let direct_column = retained_row(self, retained_index).and_then(|row| {
+            let end = row_content_end(row);
+            row.cells[..end]
+                .iter()
+                .position(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
+        });
+        let (marker_row, marker_column, after_line) = if let Some(column) = direct_column {
+            (retained_index, column, false)
+        } else {
+            let previous = (0..retained_index.min(retained_len))
+                .rev()
+                .find_map(|index| {
+                    let row = retained_row(self, index)?;
+                    let end = row_content_end(row);
+                    row.cells[..end]
+                        .iter()
+                        .rposition(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
+                        .map(|column| (index, column))
+                });
+            let Some((row, column)) = previous else {
+                self.resize(new_rows, new_cols);
+                return 0;
+            };
+            (row, column, true)
+        };
+        let row = if marker_row < scrollback_len {
+            self.scrollback.get_mut(marker_row)
+        } else {
+            self.viewport
+                .get_mut(marker_row.saturating_sub(scrollback_len))
+        };
+        let Some(cell) = row.and_then(|row| row.cells.get_mut(marker_column)) else {
+            self.resize(new_rows, new_cols);
+            return document_start;
+        };
+        const MARKER: CellColor = CellColor::Rgb(Color {
+            r: 17,
+            g: 29,
+            b: 43,
+            a: 0,
+        });
+        let original_bg = cell.bg;
+        cell.bg = MARKER;
+        self.resize(new_rows, new_cols);
+
+        let marker = (0..self.scrollback.len().saturating_add(self.num_rows)).find_map(|index| {
+            retained_row(self, index)
+                .and_then(|row| row.cells.iter().position(|cell| cell.bg == MARKER))
+                .map(|column| (index, column))
+        });
+        let Some((marker_row, marker_column)) = marker else {
+            return document_start;
+        };
+        if marker_row < self.scrollback.len() {
+            self.scrollback.get_mut(marker_row).unwrap().cells[marker_column].bg = original_bg;
+        } else {
+            self.viewport[marker_row - self.scrollback.len()].cells[marker_column].bg = original_bg;
+        }
+        let mut boundary_row = marker_row;
+        if after_line {
+            loop {
+                let wrapped = retained_row(self, boundary_row).is_some_and(|row| row.wrapped);
+                boundary_row = boundary_row.saturating_add(1);
+                if !wrapped {
+                    break;
+                }
+            }
+        }
+        self.scrollback
+            .position()
+            .saturating_sub(self.scrollback.len() as u64)
+            .saturating_add(boundary_row as u64)
+    }
+
     /// Snapshot the rows produced since `scrollback_start`, followed by the
     /// live viewport. Primary-screen TUIs use this as their detached command
     /// transcript because their coordinate repaint stream is not linear text.
@@ -12,9 +122,34 @@ impl Grid {
     }
 
     pub fn document_snapshot_from(&self, scrollback_start: u64) -> (String, StyledOutput) {
-        let start = self.scrollback.index_since(scrollback_start);
-        let scrollback = (start..self.scrollback.len()).filter_map(|i| self.scrollback.get(i));
-        let viewport = self.viewport.iter().take(self.num_rows);
+        self.document_snapshot_from_indices(self.scrollback.index_since(scrollback_start), 0)
+    }
+
+    pub fn document_snapshot_from_position(&self, document_start: u64) -> (String, StyledOutput) {
+        let viewport_origin = self.scrollback.position();
+        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
+            (self.scrollback.index_since(document_start), 0)
+        } else {
+            (
+                self.scrollback.len(),
+                document_start.saturating_sub(viewport_origin) as usize,
+            )
+        };
+        self.document_snapshot_from_indices(scrollback_start, viewport_start)
+    }
+
+    fn document_snapshot_from_indices(
+        &self,
+        scrollback_start: usize,
+        viewport_start: usize,
+    ) -> (String, StyledOutput) {
+        let scrollback =
+            (scrollback_start..self.scrollback.len()).filter_map(|i| self.scrollback.get(i));
+        let viewport = self
+            .viewport
+            .iter()
+            .take(self.num_rows)
+            .skip(viewport_start.min(self.num_rows));
         let mut text = String::new();
         let mut lines = Vec::new();
         let mut span_count = 0_usize;
@@ -238,6 +373,54 @@ mod tests {
             grid.document_text_from(command_start),
             "new 0\nnew 1\nnew 2\nnew 3\nnew 4\nnew 5\nnew 6\nresume"
         );
+    }
+
+    #[test]
+    fn absolute_viewport_boundary_survives_scroll_ring_overflow_and_csi3j_clear() {
+        let mut grid = Grid::with_scrollback(4, 24, 2);
+        grid.viewport[0] = row("old shell", 24);
+        grid.viewport[1] = row("command", 24);
+        grid.viewport[2] = row("answer one", 24);
+        grid.viewport[3] = row("answer two", 24);
+        let document_start = grid.scrollback.position() + 2;
+
+        grid.scroll_up(3);
+        assert_eq!(
+            grid.document_snapshot_from_position(document_start).0,
+            "answer one\nanswer two"
+        );
+        grid.clear_scrollback();
+        assert_eq!(
+            grid.document_snapshot_from_position(document_start).0,
+            "answer two"
+        );
+        for index in 0..4 {
+            grid.scrollback.push(row(&format!("new {index}"), 24));
+        }
+        assert_eq!(
+            grid.document_snapshot_from_position(document_start).0,
+            "new 2\nnew 3\nanswer two"
+        );
+    }
+
+    #[test]
+    fn reflow_maps_a_blank_boundary_after_wrapped_shell_rows() {
+        let mut grid = Grid::with_scrollback(5, 12, 16);
+        grid.viewport[0] = row("old shell", 12);
+        grid.viewport[0].wrapped = true;
+        grid.viewport[1] = row("history", 12);
+        grid.viewport[2] = row("claude", 12);
+        grid.viewport[4] = row("startup", 12);
+        grid.cursor.row = 4;
+        let document_start = grid.scrollback.position() + 3;
+
+        let mapped = grid.resize_preserving_document_position(document_start, 6, 6);
+        let snapshot = grid.document_snapshot_from_position(mapped).0;
+
+        assert!(!snapshot.contains("old shell"));
+        assert!(!snapshot.contains("history"));
+        assert!(!snapshot.contains("claude"));
+        assert_eq!(snapshot.replace('\n', ""), "startup");
     }
 
     #[test]

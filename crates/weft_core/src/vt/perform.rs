@@ -37,12 +37,18 @@ impl Terminal {
     }
 
     fn note_primary_screen_full_erase(&mut self) {
+        if !self.alt_active {
+            self.include_primary_screen_viewport_row(0);
+        }
         if self.synchronized_output_started.is_some() && !self.alt_active {
             self.synchronized_frame_cleared_rows = self.grid.num_rows;
         }
     }
 
     fn note_primary_screen_line_erase(&mut self) {
+        if !self.alt_active {
+            self.include_primary_screen_viewport_row(self.grid.cursor.row);
+        }
         if self.synchronized_output_started.is_some()
             && !self.alt_active
             && self.grid.cursor.row == self.synchronized_frame_cleared_rows
@@ -55,8 +61,7 @@ impl Terminal {
         if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
             self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
             if self.primary_screen_app_active() {
-                self.block_tracker
-                    .begin_screen_owned_output(self.grid.scrollback.position());
+                self.begin_primary_screen_output_capture();
             }
         }
     }
@@ -173,6 +178,7 @@ impl vte::Perform for Terminal {
             // Write on new line
             let new_row = self.grid.cursor.row;
             let new_col = self.grid.cursor.col;
+            self.include_primary_screen_viewport_row(new_row);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
             let cells = &mut self.grid.viewport[new_row].cells;
@@ -233,6 +239,8 @@ impl vte::Perform for Terminal {
                 self.grid.viewport[row - 1].wrapped = true;
             }
         }
+
+        self.include_primary_screen_viewport_row(row);
 
         {
             self.grid.viewport[row].clear_wide_pair_at(col);
@@ -321,7 +329,7 @@ impl vte::Perform for Terminal {
                     self.block_tracker.on_newline();
                 }
                 self.grid.carriage_return();
-                if self.grid.index() {
+                if self.index_primary_screen() {
                     self.hyperlinks.clear_cell_map();
                 }
             }
@@ -549,8 +557,8 @@ impl vte::Perform for Terminal {
             // Insert/delete
             '@' => self.grid.insert_blank(param(params, 0, 1) as usize),
             'P' => self.grid.delete_chars(param(params, 0, 1) as usize),
-            'L' => self.grid.insert_blank_lines(param(params, 0, 1) as usize),
-            'M' => self.grid.delete_lines(param(params, 0, 1) as usize),
+            'L' => self.insert_primary_screen_lines(param(params, 0, 1) as usize),
+            'M' => self.delete_primary_screen_lines(param(params, 0, 1) as usize),
 
             // Tab stops
             'I' => self.grid.advance_tab(param(params, 0, 1) as usize),
@@ -596,19 +604,19 @@ impl vte::Perform for Terminal {
             (&[], 0x44) => {
                 // IND — index. May scroll the region; if so, OSC 8 cell_map
                 // entries (viewport-relative) go stale.
-                if self.grid.index() {
+                if self.index_primary_screen() {
                     self.hyperlinks.clear_cell_map();
                 }
             }
             (&[], 0x4D) => {
                 // RI — reverse index. Same scroll invalidation as IND.
-                if self.grid.reverse_index() {
+                if self.reverse_index_primary_screen() {
                     self.hyperlinks.clear_cell_map();
                 }
             }
             (&[], 0x45) => {
                 // NEL — next line. Same as CR+IND.
-                if self.grid.index() {
+                if self.index_primary_screen() {
                     self.hyperlinks.clear_cell_map();
                 }
                 self.grid.carriage_return();
@@ -697,7 +705,7 @@ impl vte::Perform for Terminal {
                         b"A" => {
                             self.snapshot_primary_screen_output();
                             let defer_screen_exit =
-                                self.block_tracker.screen_scrollback_start().is_some()
+                                self.block_tracker.screen_document_start().is_some()
                                     && self.block_tracker.phase() == ShellPhase::CommandExecuting;
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
@@ -735,6 +743,7 @@ impl vte::Perform for Terminal {
                             } else {
                                 self.snapshot_command_line()
                             };
+                            self.freeze_primary_screen_document_candidate();
                             self.block_tracker.on_command_start(command);
                         }
                         b"C" => {
@@ -743,7 +752,7 @@ impl vte::Perform for Terminal {
                         }
                         b"D" => {
                             let defer_screen_exit =
-                                self.block_tracker.screen_scrollback_start().is_some();
+                                self.block_tracker.screen_document_start().is_some();
                             self.snapshot_primary_screen_output();
                             self.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();

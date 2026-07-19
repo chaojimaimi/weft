@@ -1,4 +1,5 @@
 use super::Terminal;
+use crate::blocks::StyledOutput;
 use std::time::{Duration, Instant};
 
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
@@ -10,6 +11,174 @@ pub(super) struct PendingPrimaryScreenExit {
 }
 
 impl Terminal {
+    /// Scroll the grid and keep screen-document and viewport-relative side
+    /// state synchronized with the same row rotation.
+    pub(super) fn scroll_grid_up(&mut self, count: usize) {
+        self.scroll_grid_rows(count, false);
+    }
+
+    pub(super) fn scroll_grid_down(&mut self, count: usize) {
+        self.scroll_grid_rows(count, true);
+    }
+
+    fn scroll_grid_rows(&mut self, count: usize, down: bool) {
+        let origin_before = self.grid.scrollback.position();
+        let (top, bottom) = self.grid.scroll_region();
+        if down {
+            self.grid.scroll_down(count);
+        } else {
+            self.grid.scroll_up(count);
+        }
+        self.transform_primary_screen_rows(
+            origin_before,
+            self.grid.scrollback.position(),
+            top,
+            bottom,
+            count,
+            down,
+        );
+        if self.alt_active {
+            self.grid.discard_scroll_and_dirty_all();
+        }
+        if !self.hyperlinks.cell_map_is_empty() {
+            self.hyperlinks.clear_cell_map();
+        }
+    }
+
+    pub(super) fn begin_primary_screen_output_capture(&mut self) {
+        self.block_tracker
+            .begin_screen_owned_output(self.primary_screen_document_candidate);
+    }
+
+    pub(super) fn reflow_primary_screen_candidate(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        hidden: bool,
+    ) {
+        let grid = if hidden {
+            &mut self.alt_grid
+        } else {
+            &mut self.grid
+        };
+        self.primary_screen_document_candidate = grid.resize_preserving_document_position(
+            self.primary_screen_document_candidate,
+            rows,
+            cols,
+        );
+    }
+
+    /// Freeze the shell/TUI boundary at OSC 133;B, before the launched
+    /// program can paint text that happens to equal its command name.
+    pub(super) fn freeze_primary_screen_document_candidate(&mut self) {
+        let viewport_start = (0..self.grid.num_rows)
+            .rev()
+            .find(|&row| !self.grid.row_text(row).trim().is_empty())
+            .map_or(0, |row| row.saturating_add(1));
+        self.primary_screen_document_candidate = self
+            .grid
+            .scrollback
+            .position()
+            .saturating_add(viewport_start as u64);
+        tracing::debug!(
+            viewport_start,
+            document_start = self.primary_screen_document_candidate,
+            "primary-screen document boundary"
+        );
+    }
+
+    pub(super) fn include_primary_screen_viewport_row(&mut self, row: usize) {
+        if self.alt_active {
+            return;
+        }
+        let position = self.grid.scrollback.position().saturating_add(row as u64);
+        if self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting {
+            self.primary_screen_document_candidate =
+                self.primary_screen_document_candidate.min(position);
+        }
+        self.block_tracker
+            .include_screen_document_position(position);
+    }
+
+    pub(super) fn transform_primary_screen_rows(
+        &mut self,
+        origin_before: u64,
+        origin_after: u64,
+        top: usize,
+        bottom: usize,
+        count: usize,
+        down: bool,
+    ) {
+        if self.alt_active {
+            return;
+        }
+        let transform = |start| {
+            transform_document_start(start, origin_before, origin_after, top, bottom, count, down)
+        };
+        if self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting {
+            self.primary_screen_document_candidate =
+                transform(self.primary_screen_document_candidate);
+        }
+        if let Some(start) = self.block_tracker.screen_document_start() {
+            self.block_tracker
+                .set_screen_document_start(transform(start));
+        }
+    }
+
+    pub(super) fn index_primary_screen(&mut self) -> bool {
+        let origin = self.grid.scrollback.position();
+        let (top, bottom) = self.grid.scroll_region();
+        let scrolled = self.grid.index();
+        if scrolled {
+            self.transform_primary_screen_rows(
+                origin,
+                self.grid.scrollback.position(),
+                top,
+                bottom,
+                1,
+                false,
+            );
+        }
+        scrolled
+    }
+
+    pub(super) fn reverse_index_primary_screen(&mut self) -> bool {
+        let origin = self.grid.scrollback.position();
+        let (top, bottom) = self.grid.scroll_region();
+        let scrolled = self.grid.reverse_index();
+        if scrolled {
+            self.transform_primary_screen_rows(
+                origin,
+                self.grid.scrollback.position(),
+                top,
+                bottom,
+                1,
+                true,
+            );
+        }
+        scrolled
+    }
+
+    pub(super) fn insert_primary_screen_lines(&mut self, count: usize) {
+        let origin = self.grid.scrollback.position();
+        let row = self.grid.cursor.row;
+        let (top, bottom) = self.grid.scroll_region();
+        self.grid.insert_blank_lines(count);
+        if (top..=bottom).contains(&row) {
+            self.transform_primary_screen_rows(origin, origin, row, bottom, count, true);
+        }
+    }
+
+    pub(super) fn delete_primary_screen_lines(&mut self, count: usize) {
+        let origin = self.grid.scrollback.position();
+        let row = self.grid.cursor.row;
+        let (top, bottom) = self.grid.scroll_region();
+        self.grid.delete_lines(count);
+        if (top..=bottom).contains(&row) {
+            self.transform_primary_screen_rows(origin, origin, row, bottom, count, false);
+        }
+    }
+
     pub fn show_block_view(&self) -> bool {
         self.block_tracker.bootstrap_ready()
             && !self.alt_active
@@ -68,10 +237,11 @@ impl Terminal {
     }
 
     pub(super) fn snapshot_primary_screen_output(&mut self) {
-        let Some(start) = self.block_tracker.screen_scrollback_start() else {
+        let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
-        let (text, styled) = self.grid.document_snapshot_from(start);
+        let (text, styled) = self.grid.document_snapshot_from_position(document_start);
+        let (text, styled) = space_primary_screen_exit_tail(text, styled);
         self.block_tracker.replace_screen_snapshot(&text, styled);
     }
 
@@ -113,5 +283,118 @@ impl Terminal {
             "settled primary-screen command finalization"
         );
         true
+    }
+}
+
+fn transform_document_start(
+    start: u64,
+    origin_before: u64,
+    origin_after: u64,
+    top: usize,
+    bottom: usize,
+    count: usize,
+    down: bool,
+) -> u64 {
+    if start < origin_before || top > bottom {
+        return start;
+    }
+    let row = start.saturating_sub(origin_before) as usize;
+    let count = count.min(bottom - top + 1);
+    if down {
+        if (top..=bottom).contains(&row) {
+            origin_after.saturating_add(row.saturating_add(count).min(bottom + 1) as u64)
+        } else {
+            start.saturating_add(origin_after.saturating_sub(origin_before))
+        }
+    } else if top == 0 {
+        if row <= bottom + 1 {
+            start
+        } else {
+            start.saturating_add(origin_after.saturating_sub(origin_before))
+        }
+    } else if (top + 1..=bottom).contains(&row) {
+        origin_after.saturating_add(row.saturating_sub(count).max(top) as u64)
+    } else {
+        start.saturating_add(origin_after.saturating_sub(origin_before))
+    }
+}
+
+fn space_primary_screen_exit_tail(
+    text: String,
+    mut styled: StyledOutput,
+) -> (String, StyledOutput) {
+    if !text.contains("Press Ctrl-C again to exit") && !text.contains("Resume this session with:") {
+        return (text, styled);
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let insert_before: Vec<usize> = (1..lines.len())
+        .filter(|&index| {
+            let line = lines[index].trim();
+            let semantic_tail =
+                line == "Press Ctrl-C again to exit" || line == "Resume this session with:";
+            semantic_tail && !lines[index - 1].trim().is_empty()
+        })
+        .collect();
+    if insert_before.is_empty() {
+        drop(lines);
+        return (text, styled);
+    }
+
+    let mut spaced = Vec::with_capacity(lines.len() + insert_before.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if insert_before.binary_search(&index).is_ok() {
+            spaced.push("");
+        }
+        spaced.push(line);
+    }
+    for line in &mut styled.lines {
+        let original = line.line as usize;
+        let shift = insert_before.partition_point(|&index| index <= original);
+        line.line = line.line.saturating_add(shift as u32);
+    }
+    (spaced.join("\n"), styled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocks::StyledLine;
+
+    #[test]
+    fn exit_tail_spacing_shifts_parallel_style_line_indices() {
+        let styled = StyledOutput {
+            lines: (0..4)
+                .map(|line| StyledLine {
+                    line,
+                    foregrounds: Vec::new(),
+                })
+                .collect(),
+        };
+        let (text, styled) = space_primary_screen_exit_tail(
+            "answer\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume id"
+                .to_string(),
+            styled,
+        );
+
+        assert_eq!(
+            text,
+            "answer\n\nPress Ctrl-C again to exit\n\nResume this session with:\nclaude --resume id"
+        );
+        assert_eq!(
+            styled
+                .lines
+                .iter()
+                .map(|line| line.line)
+                .collect::<Vec<_>>(),
+            [0, 2, 4, 5]
+        );
+    }
+
+    #[test]
+    fn absolute_document_start_tracks_viewport_row_rotations() {
+        assert_eq!(transform_document_start(3, 0, 1, 0, 5, 1, false), 3);
+        assert_eq!(transform_document_start(3, 0, 0, 0, 5, 1, true), 4);
+        assert_eq!(transform_document_start(3, 0, 0, 1, 5, 1, false), 2);
+        assert_eq!(transform_document_start(3, 0, 0, 1, 5, 1, true), 4);
     }
 }
