@@ -210,6 +210,7 @@ impl MetalRenderer {
             prev_show_cursor: Cell::new(true),
             instances_unchanged: Cell::new(false),
             prev_show_blocks: Cell::new(false),
+            prev_primary_screen_row_start: Cell::new(None),
             grid_cache_dims: Cell::new((0, 0)),
             prev_scroll_offset: Cell::new(0),
             offscreen_texture: RefCell::new(None),

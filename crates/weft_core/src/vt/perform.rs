@@ -175,9 +175,9 @@ impl vte::Perform for Terminal {
             if self.grid.cursor.row > 0 {
                 self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
             }
-            // Write on new line
             let new_row = self.grid.cursor.row;
             let new_col = self.grid.cursor.col;
+            self.prepare_primary_screen_exit_row_overwrite();
             self.include_primary_screen_viewport_row(new_row);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
@@ -239,7 +239,7 @@ impl vte::Perform for Terminal {
                 self.grid.viewport[row - 1].wrapped = true;
             }
         }
-
+        self.prepare_primary_screen_exit_row_overwrite();
         self.include_primary_screen_viewport_row(row);
 
         {

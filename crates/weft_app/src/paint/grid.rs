@@ -9,6 +9,20 @@ use crate::renderer::MetalRenderer;
 use weft_core::grid::{CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 
+fn primary_screen_row_hidden(row: usize, hidden_before_row: Option<usize>) -> bool {
+    hidden_before_row.is_some_and(|start| row < start)
+}
+
+fn primary_screen_mask_changed(previous: Option<usize>, current: Option<usize>) -> bool {
+    previous != current
+}
+
+pub(crate) struct GridViewPolicy {
+    pub(crate) show_cursor: bool,
+    pub(crate) cursor_style: CursorStyle,
+    pub(crate) hidden_before_row: Option<usize>,
+}
+
 impl MetalRenderer {
     /// v1.0 P1.5-B1: Build per-cell instance data for the grid. Each cell
     /// becomes a single 64-byte instance (origin/size/uv_rect/fg/bg) drawn
@@ -22,8 +36,7 @@ impl MetalRenderer {
         palette: &[Color; 256],
         cursor: &weft_core::grid::Cursor,
         selection: &SelectionHandler,
-        show_cursor: bool,
-        cursor_style: CursorStyle,
+        policy: GridViewPolicy,
     ) -> Vec<f32> {
         // Render at the atlas's native cell size — do NOT stretch cells to
         // fill the viewport (cw = viewport / num_cols). Stretching distorts
@@ -73,6 +86,10 @@ impl MetalRenderer {
         let force_full = self.force_full_grid.get()
             || grid.scroll_offset != self.prev_scroll_offset.get()
             || self.grid_cache_dims.get() != (num_rows, num_cols)
+            || primary_screen_mask_changed(
+                self.prev_primary_screen_row_start.get(),
+                policy.hidden_before_row,
+            )
             // Selection overlay changes cell colors — rebuild all rows while
             // a selection is active or being dragged.
             || selection.selection.is_some()
@@ -139,7 +156,7 @@ impl MetalRenderer {
         // stable `show_cursor` + stable position means the cached cursor
         // cell is still correct.
         let cursor_changed = force_full
-            || self.prev_show_cursor.get() != show_cursor
+            || self.prev_show_cursor.get() != policy.show_cursor
             || self.prev_cursor_row.get() != Some(cursor.row)
             || self.prev_cursor_col.get() != Some(cursor.col);
         let mut rows_to_rebuild: Vec<usize> = if force_full {
@@ -166,8 +183,10 @@ impl MetalRenderer {
         self.force_full_grid.set(false);
         self.prev_cursor_row.set(Some(cursor.row));
         self.prev_cursor_col.set(Some(cursor.col));
-        self.prev_show_cursor.set(show_cursor);
+        self.prev_show_cursor.set(policy.show_cursor);
         self.prev_scroll_offset.set(grid.scroll_offset);
+        self.prev_primary_screen_row_start
+            .set(policy.hidden_before_row);
         self.grid_cache_dims.set((num_rows, num_cols));
 
         // Build vertices for dirty rows only. We build into a local Vec
@@ -202,6 +221,10 @@ impl MetalRenderer {
         self.instances_unchanged.set(false);
 
         for &row in &rows_to_rebuild {
+            if primary_screen_row_hidden(row, policy.hidden_before_row) {
+                cache[row].clear();
+                continue;
+            }
             // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
             // for cursor bar/underline + hyperlink underline decorations.
             let mut instances = Vec::with_capacity(num_cols * 16 + 48);
@@ -245,7 +268,7 @@ impl MetalRenderer {
                 bg[3] *= self.opacity;
 
                 // Check if this is the cursor position
-                let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
+                let is_cursor = policy.show_cursor && row == cursor.row && col == cursor.col;
 
                 // Check if this cell is in the selection
                 let is_selected = selection
@@ -281,7 +304,7 @@ impl MetalRenderer {
 
                 // Override colors for cursor
                 let final_fg = if is_cursor {
-                    if cursor_style.is_block() {
+                    if policy.cursor_style.is_block() {
                         [0.0, 0.0, 0.0, 1.0] // Black text on cursor block
                     } else {
                         cursor_color
@@ -290,11 +313,11 @@ impl MetalRenderer {
                     fg
                 };
 
-                let final_bg = if is_cursor && cursor_style.is_block() {
+                let final_bg = if is_cursor && policy.cursor_style.is_block() {
                     cursor_color
                 } else if is_selected {
                     selection_bg
-                } else if is_cursor && cursor_style.is_bar() {
+                } else if is_cursor && policy.cursor_style.is_bar() {
                     // Bar cursor: only highlight the left 2 pixels
                     // We'll draw the full cell with normal bg, then overlay bar later
                     bg
@@ -329,8 +352,8 @@ impl MetalRenderer {
                 );
 
                 // Draw bar/underline cursor overlay
-                if is_cursor && show_cursor {
-                    if cursor_style.is_bar() {
+                if is_cursor && policy.show_cursor {
+                    if policy.cursor_style.is_bar() {
                         let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
                         let bar_w = bar_w.max(1.0).min(cw * 0.15);
                         // v1.0 P1.5-B1: decoration instance. UV rect
@@ -343,7 +366,7 @@ impl MetalRenderer {
                             [0.0; 4],
                             cursor_color,
                         );
-                    } else if cursor_style.is_underline() {
+                    } else if policy.cursor_style.is_underline() {
                         let line_h = 2.0;
                         push_cell_instance(
                             &mut instances,
@@ -382,5 +405,28 @@ impl MetalRenderer {
             out.extend_from_slice(rv);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{primary_screen_mask_changed, primary_screen_row_hidden};
+
+    #[test]
+    fn primary_screen_mask_hides_only_rows_before_the_owned_boundary() {
+        assert!(primary_screen_row_hidden(0, Some(3)));
+        assert!(primary_screen_row_hidden(2, Some(3)));
+        assert!(!primary_screen_row_hidden(3, Some(3)));
+        assert!(!primary_screen_row_hidden(8, Some(3)));
+        assert!(!primary_screen_row_hidden(0, None));
+    }
+
+    #[test]
+    fn moving_or_removing_the_primary_screen_mask_invalidates_cached_rows() {
+        assert!(primary_screen_mask_changed(Some(5), Some(2)));
+        assert!(primary_screen_mask_changed(Some(5), None));
+        assert!(primary_screen_mask_changed(None, Some(5)));
+        assert!(!primary_screen_mask_changed(Some(5), Some(5)));
+        assert!(!primary_screen_mask_changed(None, None));
     }
 }

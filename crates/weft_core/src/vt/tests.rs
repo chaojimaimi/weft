@@ -236,6 +236,29 @@ fn primary_screen_snapshot_excludes_previous_command_rows_left_in_viewport() {
 }
 
 #[test]
+fn primary_screen_live_view_starts_at_the_owned_document_boundary() {
+    let mut terminal = Terminal::new(10, 64);
+    terminal.process(
+        b"\x1b]133;A\x07\x1b[1;1Hpwdd\x1b[2;1Hzsh: command not found: pwdd\x1b[3;1Hpwd\x1b[4;1H/Users/me/project",
+    );
+    for ch in "claude".chars() {
+        terminal.editor_mut().buffer.insert_char(ch);
+    }
+    terminal.submit_command();
+    terminal.process(b"\x1b[5;1Hclaude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[6;1H\x1b[7;1HClaude Code");
+
+    assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.primary_screen_visible_row_start(), Some(5));
+    assert_eq!(terminal.grid().row_text(0), "pwdd");
+    assert_eq!(terminal.grid().row_text(5), "");
+    assert_eq!(terminal.grid().row_text(6), "Claude Code");
+
+    terminal.grid_mut().scroll_offset = 1;
+    assert_eq!(terminal.primary_screen_visible_row_start(), None);
+}
+
+#[test]
 fn primary_screen_boundary_is_frozen_before_tui_repeats_the_command_name() {
     let mut terminal = Terminal::new(10, 64);
     terminal.process(b"\x1b]133;A\x07\x1b[Hpwd\x1b[2;1H/Users/me/project");
@@ -389,6 +412,46 @@ fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
         .line(0)
         .and_then(|line| line.foreground_at(0))
         .is_some_and(|color| matches!(color, crate::grid::CellColor::Rgb(_))));
+}
+
+#[test]
+fn deferred_primary_screen_exit_replaces_stale_row_suffixes() {
+    let mut terminal = Terminal::new(7, 72);
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H");
+    assert!(terminal.primary_screen_app_active());
+    terminal.process(b"\x1b[2J\x1b[Hanswer\x1b[4;1HResume this session with: stale answer suffix");
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(terminal.primary_screen_exit_pending());
+
+    terminal.process(b"\x1b[4;1HResume this session with:\x1b[5;1Hclaude --resume clean-id");
+    assert_eq!(terminal.grid().row_text(3), "Resume this session with:");
+    terminal.settle_primary_screen_exit();
+
+    let block = terminal.block_tracker().blocks().last().unwrap();
+    assert!(!block.output.contains("stale answer suffix"));
+    assert!(block.output.contains("claude --resume clean-id"));
+}
+
+#[test]
+fn deferred_primary_screen_exit_clears_replaced_row_hyperlinks() {
+    let mut terminal = Terminal::new(7, 72);
+    terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"\x1b[H\x1b[2;1H");
+    assert!(terminal.primary_screen_app_active());
+    terminal.process(
+        b"\x1b[4;1H\x1b]8;;https://weft.dev/stale\x07stale linked suffix that extends far beyond replacement\x1b]8;;\x07",
+    );
+    assert_eq!(
+        terminal.hyperlinks().url_at(3, 40),
+        Some("https://weft.dev/stale")
+    );
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+
+    terminal.process(b"\x1b[4;1HResume this session with:");
+
+    assert_eq!(terminal.grid().row_text(3), "Resume this session with:");
+    assert_eq!(terminal.hyperlinks().url_at(3, 40), None);
 }
 
 #[test]

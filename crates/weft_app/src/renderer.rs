@@ -129,6 +129,10 @@ pub struct MetalRenderer {
     /// switches between block view and grid view (alt screen enter/exit), the
     /// grid_row_cache and offscreen content are stale — force a full rebuild.
     pub(crate) prev_show_blocks: Cell<bool>,
+    /// Previous primary-screen ownership boundary. A changed boundary can
+    /// expose rows whose cached instances were intentionally empty, so it
+    /// participates in full-grid cache invalidation.
+    pub(crate) prev_primary_screen_row_start: Cell<Option<usize>>,
     /// v1.0 P0-b: Cached grid dimensions (rows × cols) for cache invalidation
     /// on resize.
     pub(crate) grid_cache_dims: Cell<(usize, usize)>,
@@ -599,8 +603,11 @@ impl MetalRenderer {
                 terminal.palette(),
                 cursor,
                 selection,
-                cursor_visible_this_frame,
-                terminal.cursor_style,
+                crate::paint::grid::GridViewPolicy {
+                    show_cursor: cursor_visible_this_frame,
+                    cursor_style: terminal.cursor_style,
+                    hidden_before_row: terminal.primary_screen_visible_row_start(),
+                },
             );
             Vec::new()
         };

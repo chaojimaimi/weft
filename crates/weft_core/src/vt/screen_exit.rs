@@ -190,6 +190,26 @@ impl Terminal {
         self.primary_screen_exit.is_some()
     }
 
+    /// First viewport row owned by the active primary-screen application.
+    ///
+    /// Shell rows can remain physically present above a TUI that paints below
+    /// the current cursor. They stay in the Grid for terminal correctness and
+    /// detached history, but the live renderer must not expose them as part of
+    /// the application's frame.
+    pub fn primary_screen_visible_row_start(&self) -> Option<usize> {
+        let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
+        if self.alt_active || !owns_live_view || self.grid.scroll_offset > 0 {
+            return None;
+        }
+        self.block_tracker.screen_document_start().map(|start| {
+            viewport_row_for_document_start(
+                start,
+                self.grid.scrollback.position(),
+                self.grid.num_rows,
+            )
+        })
+    }
+
     pub fn primary_history_view(&self) -> bool {
         self.primary_history_view
     }
@@ -264,6 +284,17 @@ impl Terminal {
         }
     }
 
+    /// A late primary-screen exit tail commonly rewrites rows from column 0
+    /// without first issuing EL. Clear the old row before that first scalar so
+    /// shorter status/resume lines cannot retain stale suffix cells.
+    pub(super) fn prepare_primary_screen_exit_row_overwrite(&mut self) {
+        if self.primary_screen_exit.is_some() && !self.alt_active && self.grid.cursor.col == 0 {
+            let row = self.grid.cursor.row;
+            self.grid.clear_line_all();
+            self.hyperlinks.unlink_row(row);
+        }
+    }
+
     pub fn settle_primary_screen_exit_if_idle(&mut self, now: Instant) -> bool {
         let ready = self.primary_screen_exit.as_ref().is_some_and(|pending| {
             now.saturating_duration_since(pending.last_activity) >= PRIMARY_SCREEN_EXIT_SETTLE_DELAY
@@ -317,6 +348,10 @@ fn transform_document_start(
     } else {
         start.saturating_add(origin_after.saturating_sub(origin_before))
     }
+}
+
+fn viewport_row_for_document_start(start: u64, viewport_origin: u64, rows: usize) -> usize {
+    start.saturating_sub(viewport_origin).min(rows as u64) as usize
 }
 
 fn space_primary_screen_exit_tail(
@@ -396,5 +431,12 @@ mod tests {
         assert_eq!(transform_document_start(3, 0, 0, 0, 5, 1, true), 4);
         assert_eq!(transform_document_start(3, 0, 0, 1, 5, 1, false), 2);
         assert_eq!(transform_document_start(3, 0, 0, 1, 5, 1, true), 4);
+    }
+
+    #[test]
+    fn document_start_maps_to_a_clamped_viewport_row() {
+        assert_eq!(viewport_row_for_document_start(12, 10, 8), 2);
+        assert_eq!(viewport_row_for_document_start(8, 10, 8), 0);
+        assert_eq!(viewport_row_for_document_start(30, 10, 8), 8);
     }
 }

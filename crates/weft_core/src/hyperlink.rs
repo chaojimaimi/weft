@@ -65,6 +65,12 @@ impl HyperlinkRegistry {
         self.cell_map.remove(&(row, col));
     }
 
+    /// Remove every viewport-relative hyperlink mapping on one row.
+    pub fn unlink_row(&mut self, row: usize) {
+        self.cell_map
+            .retain(|&(mapped_row, _), _| mapped_row != row);
+    }
+
     /// Resolve the URL for cell `(row, col)`, if any.
     pub fn url_at(&self, row: usize, col: usize) -> Option<&str> {
         let id = self.cell_map.get(&(row, col))?;
@@ -125,6 +131,21 @@ mod tests {
         r.unlink_cell(0, 0);
         assert_eq!(r.tagged_cell_count(), 0);
         assert_eq!(r.url_at(0, 0), None);
+    }
+
+    #[test]
+    fn unlink_row_preserves_links_on_other_rows() {
+        let mut r = HyperlinkRegistry::new();
+        let id = r.register("u".into());
+        r.link_cell(1, 0, id);
+        r.link_cell(1, 1, id);
+        r.link_cell(2, 0, id);
+
+        r.unlink_row(1);
+
+        assert_eq!(r.url_at(1, 0), None);
+        assert_eq!(r.url_at(1, 1), None);
+        assert_eq!(r.url_at(2, 0), Some("u"));
     }
 
     #[test]

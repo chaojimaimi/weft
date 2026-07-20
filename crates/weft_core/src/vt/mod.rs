@@ -410,6 +410,7 @@ impl Terminal {
             };
             // Read row AFTER the col adjustment (cursor.row may have changed).
             let row = self.grid.cursor.row;
+            self.prepare_primary_screen_exit_row_overwrite();
             self.include_primary_screen_viewport_row(row);
 
             // How many bytes fit in the current row? No per-char bounds check.
