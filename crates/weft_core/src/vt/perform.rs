@@ -5,68 +5,6 @@ use super::Terminal;
 use crate::blocks::ShellPhase;
 use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
-impl Terminal {
-    /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
-    /// repeatedly use absolute cursor addressing to own the whole viewport.
-    pub fn primary_screen_app_active(&self) -> bool {
-        !self.alt_active
-            && self.block_tracker.phase() == ShellPhase::CommandExecuting
-            && self.primary_screen_cursor_ops >= 2
-    }
-
-    /// Whether this primary-screen owner has demonstrated atomic full-frame repainting.
-    pub fn primary_screen_repaint_capable(&self) -> bool {
-        self.primary_screen_app_active() && self.primary_screen_synchronized_frame_seen
-    }
-
-    pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
-        self.synchronized_frame_cleared_rows = 0;
-    }
-
-    pub(super) fn finish_primary_screen_synchronized_frame(&mut self) {
-        if self.synchronized_output_started.is_some() {
-            self.primary_screen_synchronized_frame_seen |= self.primary_screen_app_active()
-                && self.synchronized_frame_cleared_rows >= self.grid.num_rows;
-        }
-    }
-
-    fn reset_primary_screen_synchronized_frame(&mut self) {
-        self.synchronized_output_started = None;
-        self.synchronized_frame_cleared_rows = 0;
-        self.primary_screen_synchronized_frame_seen = false;
-    }
-
-    fn note_primary_screen_full_erase(&mut self) {
-        if !self.alt_active {
-            self.include_primary_screen_viewport_row(0);
-        }
-        if self.synchronized_output_started.is_some() && !self.alt_active {
-            self.synchronized_frame_cleared_rows = self.grid.num_rows;
-        }
-    }
-
-    fn note_primary_screen_line_erase(&mut self) {
-        if !self.alt_active {
-            self.include_primary_screen_viewport_row(self.grid.cursor.row);
-        }
-        if self.synchronized_output_started.is_some()
-            && !self.alt_active
-            && self.grid.cursor.row == self.synchronized_frame_cleared_rows
-        {
-            self.synchronized_frame_cleared_rows += 1;
-        }
-    }
-
-    fn note_primary_screen_cursor_addressing(&mut self) {
-        if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
-            self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
-            if self.primary_screen_app_active() {
-                self.begin_primary_screen_output_capture();
-            }
-        }
-    }
-}
-
 impl vte::Perform for Terminal {
     fn print(&mut self, c: char) {
         // v1.0 perf: vte only calls print() in ground state, so mark it.
@@ -92,6 +30,7 @@ impl vte::Perform for Terminal {
         if !self.alt_active && phase == ShellPhase::CommandExecuting {
             self.block_tracker.on_print(c);
         }
+        self.capture_primary_screen_interrupt_print(c);
 
         if self.suppress_joined_scalar && terminal_char_width(c) > 0 {
             self.suppress_joined_scalar = false;
@@ -304,6 +243,7 @@ impl vte::Perform for Terminal {
                 if !self.alt_active {
                     self.block_tracker.on_backspace();
                 }
+                self.capture_primary_screen_interrupt_backspace();
             }
             0x09 => {
                 // Tab is a C0 control, so the print path never sees it — but
@@ -319,6 +259,9 @@ impl vte::Perform for Terminal {
                         self.block_tracker.on_print(' ');
                     }
                 }
+                for _ in 0..self.grid.cursor.col.saturating_sub(prev_col) {
+                    self.capture_primary_screen_interrupt_print(' ');
+                }
             }
             0x0A..=0x0C => {
                 // LF, VT, FF → move to next line (CR+LF on Unix terminals).
@@ -328,6 +271,7 @@ impl vte::Perform for Terminal {
                 if !self.alt_active && self.block_tracker.is_capturing() {
                     self.block_tracker.on_newline();
                 }
+                self.capture_primary_screen_interrupt_newline();
                 self.grid.carriage_return();
                 if self.index_primary_screen() {
                     self.hyperlinks.clear_cell_map();
@@ -338,6 +282,7 @@ impl vte::Perform for Terminal {
                 if !self.alt_active {
                     self.block_tracker.on_carriage_return();
                 }
+                self.capture_primary_screen_interrupt_carriage_return();
             }
             _ => tracing::trace!(byte, "unhandled execute"),
         }
@@ -400,19 +345,33 @@ impl vte::Perform for Terminal {
 
         match action {
             // Cursor movement
-            'A' => self.grid.move_up(param(params, 0, 1) as usize),
-            'B' => self.grid.move_down(param(params, 0, 1) as usize),
-            'C' => self.grid.move_forward(param(params, 0, 1) as usize),
-            'D' => self.grid.move_backward(param(params, 0, 1) as usize),
+            'A' => {
+                self.grid.move_up(param(params, 0, 1) as usize);
+                self.capture_primary_screen_interrupt_cursor_position(false);
+            }
+            'B' => {
+                self.grid.move_down(param(params, 0, 1) as usize);
+                self.capture_primary_screen_interrupt_cursor_position(false);
+            }
+            'C' => {
+                self.grid.move_forward(param(params, 0, 1) as usize);
+                self.capture_primary_screen_interrupt_cursor_position(false);
+            }
+            'D' => {
+                self.grid.move_backward(param(params, 0, 1) as usize);
+                self.capture_primary_screen_interrupt_cursor_position(false);
+            }
             'E' => {
                 let n = param(params, 0, 1) as usize;
                 self.grid.move_down(n);
                 self.grid.carriage_return();
+                self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'F' => {
                 let n = param(params, 0, 1) as usize;
                 self.grid.move_up(n);
                 self.grid.carriage_return();
+                self.capture_primary_screen_interrupt_cursor_position(false);
             }
 
             // Cursor position
@@ -420,6 +379,7 @@ impl vte::Perform for Terminal {
                 let row = param(params, 0, 1) as usize;
                 let col = param(params, 1, 1) as usize;
                 self.grid.goto(row, col, self.origin_mode);
+                self.capture_primary_screen_interrupt_cursor_position(true);
                 tracing::debug!(
                     req_row = row,
                     req_col = col,
@@ -432,10 +392,12 @@ impl vte::Perform for Terminal {
             'G' => {
                 let col = param(params, 0, 1) as usize;
                 self.grid.set_cursor_col(col.saturating_sub(1));
+                self.capture_primary_screen_interrupt_cursor_position(col == 1);
             }
             'd' => {
                 let row = param(params, 0, 1) as usize;
                 self.grid.set_cursor_row(row.saturating_sub(1));
+                self.capture_primary_screen_interrupt_cursor_position(false);
             }
 
             // Erase
@@ -466,6 +428,7 @@ impl vte::Perform for Terminal {
                 if !self.alt_active {
                     self.block_tracker.on_erase_line(mode);
                 }
+                self.capture_primary_screen_interrupt_erase_line(mode);
             }
             'X' => {
                 let count = param(params, 0, 1) as usize;

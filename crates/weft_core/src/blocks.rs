@@ -29,7 +29,7 @@ mod output_capture;
 mod screen_capture_tests;
 mod style;
 
-use output_capture::OutputCapture;
+pub(crate) use output_capture::OutputCapture;
 pub use style::{ForegroundSpan, StyledLine, StyledOutput};
 
 /// Hard cap on captured output to bound memory for commands like

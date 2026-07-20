@@ -1,24 +1,24 @@
 //! Terminal-like single-line rewrite handling for detached block output.
 
-#[derive(Debug, Default)]
-pub(super) struct OutputCapture {
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputCapture {
     text: String,
     cursor: usize,
     truncated: bool,
 }
 
 impl OutputCapture {
-    pub(super) fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.text
     }
 
-    pub(super) fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
         self.truncated = false;
     }
 
-    pub(super) fn replace(&mut self, text: &str, max_bytes: usize) {
+    pub(crate) fn replace(&mut self, text: &str, max_bytes: usize) {
         self.clear();
         let mut end = text.len().min(max_bytes);
         while end > 0 && !text.is_char_boundary(end) {
@@ -29,7 +29,7 @@ impl OutputCapture {
         self.truncated = end < text.len();
     }
 
-    pub(super) fn print(&mut self, c: char, max_bytes: usize) {
+    pub(crate) fn print(&mut self, c: char, max_bytes: usize) {
         if self.truncated {
             return;
         }
@@ -57,7 +57,7 @@ impl OutputCapture {
         self.cursor += c.len_utf8();
     }
 
-    pub(super) fn print_ascii(&mut self, bytes: &[u8], max_bytes: usize) {
+    pub(crate) fn print_ascii(&mut self, bytes: &[u8], max_bytes: usize) {
         if bytes.is_empty() || self.truncated {
             return;
         }
@@ -83,7 +83,7 @@ impl OutputCapture {
         }
     }
 
-    pub(super) fn newline(&mut self, max_bytes: usize) {
+    pub(crate) fn newline(&mut self, max_bytes: usize) {
         if self.truncated {
             return;
         }
@@ -100,11 +100,11 @@ impl OutputCapture {
         }
     }
 
-    pub(super) fn carriage_return(&mut self) {
+    pub(crate) fn carriage_return(&mut self) {
         self.cursor = self.line_start();
     }
 
-    pub(super) fn backspace(&mut self) {
+    pub(crate) fn backspace(&mut self) {
         let start = self.line_start();
         if self.cursor > start {
             self.cursor -= 1;
@@ -114,7 +114,7 @@ impl OutputCapture {
         }
     }
 
-    pub(super) fn erase_line(&mut self, mode: u16) {
+    pub(crate) fn erase_line(&mut self, mode: u16) {
         let start = self.line_start();
         let end = self.line_end();
         match mode {
@@ -132,7 +132,53 @@ impl OutputCapture {
         }
     }
 
-    pub(super) fn take(&mut self) -> String {
+    /// Move the capture cursor to a zero-based terminal row/column.
+    /// Missing rows and columns are materialized as newlines/spaces so
+    /// cursor-addressed primary-screen exit tails retain their visual line
+    /// structure instead of concatenating text from separate rows.
+    pub(crate) fn goto(&mut self, row: usize, col: usize, max_bytes: usize) {
+        if self.truncated {
+            return;
+        }
+        let existing_rows = self.text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        for _ in existing_rows..=row {
+            if self.text.len() >= max_bytes {
+                self.truncated = true;
+                return;
+            }
+            self.text.push('\n');
+        }
+
+        let line_start = if row == 0 {
+            0
+        } else {
+            self.text
+                .match_indices('\n')
+                .nth(row - 1)
+                .map_or(self.text.len(), |(index, _)| index + 1)
+        };
+        let line_end = self.text[line_start..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| line_start + offset);
+        let mut cursor = line_start;
+        for _ in 0..col {
+            if cursor < line_end {
+                cursor += self.text[cursor..line_end]
+                    .chars()
+                    .next()
+                    .map_or(0, char::len_utf8);
+            } else if self.text.len() < max_bytes {
+                self.text.insert(cursor, ' ');
+                cursor += 1;
+            } else {
+                self.truncated = true;
+                return;
+            }
+        }
+        self.cursor = cursor;
+    }
+
+    pub(crate) fn take(&mut self) -> String {
         let mut text = std::mem::take(&mut self.text);
         if self.truncated {
             text.push_str("\n…(output truncated, >1 MiB)");
@@ -193,5 +239,18 @@ mod tests {
         output.print('中', 1024);
         output.print('文', 1024);
         assert_eq!(output.as_str(), "中文c");
+    }
+
+    #[test]
+    fn absolute_cursor_rows_preserve_line_structure() {
+        let mut output = OutputCapture::default();
+        output.goto(0, 0, 1024);
+        output.print_ascii(b"first", 1024);
+        output.goto(2, 3, 1024);
+        output.print_ascii(b"third", 1024);
+        output.goto(1, 1, 1024);
+        output.print_ascii(b"second", 1024);
+
+        assert_eq!(output.as_str(), "first\n second\n   third");
     }
 }

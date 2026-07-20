@@ -52,8 +52,27 @@ impl MetalRenderer {
         fg: [f32; 4],
         max_cols: usize,
     ) {
+        self.push_text_with_height(
+            vertices,
+            [x, y],
+            text,
+            fg,
+            max_cols,
+            self.cell_height() as f32,
+        );
+    }
+
+    pub(crate) fn push_text_with_height(
+        &self,
+        vertices: &mut Vec<f32>,
+        origin: [f32; 2],
+        text: &str,
+        fg: [f32; 4],
+        max_cols: usize,
+        glyph_height: f32,
+    ) {
         let cw = self.cell_width() as f32;
-        let ch = self.cell_height() as f32;
+        let [x, y] = origin;
         let mut col = 0usize;
         let mut px = x;
         for grapheme in text.graphemes(true) {
@@ -75,7 +94,7 @@ impl MetalRenderer {
             let cell_w = w as f32 * cw;
             push_quad(
                 vertices,
-                [px, y, px + cell_w, y + ch],
+                [px, y, px + cell_w, y + glyph_height],
                 [u, v + vh, u + uw, v],
                 fg,
                 [0.0; 4],

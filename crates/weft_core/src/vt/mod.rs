@@ -67,6 +67,7 @@ pub struct Terminal {
     primary_screen_cursor_ops: u8,
     primary_screen_document_candidate: u64,
     primary_screen_exit: Option<screen_exit::PendingPrimaryScreenExit>,
+    primary_screen_interrupt_capture: Option<screen_exit::PrimaryScreenInterruptCapture>,
     primary_history_view: bool,
     primary_history_snapshot_at: Option<std::time::Instant>,
 }
@@ -112,6 +113,7 @@ impl Terminal {
             primary_screen_cursor_ops: 0,
             primary_screen_document_candidate: 0,
             primary_screen_exit: None,
+            primary_screen_interrupt_capture: None,
             primary_history_view: false,
             primary_history_snapshot_at: None,
         }
@@ -423,6 +425,7 @@ impl Terminal {
             if capturing {
                 self.block_tracker.on_print_ascii_run(chunk);
             }
+            self.capture_primary_screen_interrupt_ascii(chunk);
 
             // The contiguous ASCII overwrite can only split a pre-existing
             // wide glyph at its two boundaries. Pairs fully inside the range

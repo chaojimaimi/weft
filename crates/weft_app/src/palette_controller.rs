@@ -613,10 +613,8 @@ impl App {
                         // Set the command text and submit via the editor path.
                         terminal.editor_mut().buffer.set_text(cmd);
                         let bytes = terminal.submit_command();
-                        if !bytes.is_empty() {
-                            if let Some(pty) = &tab.pty {
-                                let _ = pty.write_sync(&bytes);
-                            }
+                        if !bytes.is_empty() && tab.write_user_input(&bytes).is_err() {
+                            warn!("failed to write workflow command to PTY");
                         }
                     }
                 }

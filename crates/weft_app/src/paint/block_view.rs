@@ -465,6 +465,7 @@ impl MetalRenderer {
                                 fallback: fg,
                                 max_cols: cols,
                                 palette,
+                                row_pitch: pitch,
                             },
                         );
                     } else {
@@ -515,6 +516,7 @@ impl MetalRenderer {
                                         fallback: fg,
                                         max_cols: cols,
                                         palette,
+                                        row_pitch: pitch,
                                     },
                                 );
                             }

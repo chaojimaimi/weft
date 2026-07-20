@@ -194,6 +194,30 @@ fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
 }
 
 #[test]
+fn failed_interrupt_rolls_back_primary_screen_freeze() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    terminal.process(b"old frame before failed interrupt");
+
+    assert!(!tab.interrupt_pty(), "tab intentionally has no PTY");
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew frame after failed interrupt\x1b[?2026l");
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    terminal.settle_primary_screen_exit();
+
+    let output = terminal
+        .block_tracker()
+        .blocks()
+        .last()
+        .unwrap()
+        .output
+        .as_ref();
+    assert!(output.contains("new frame after failed interrupt"));
+    assert!(!output.contains("old frame before failed interrupt"));
+}
+
+#[test]
 fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     let mut tab = tab_with_terminal();
     let terminal = tab.terminal.as_mut().unwrap();

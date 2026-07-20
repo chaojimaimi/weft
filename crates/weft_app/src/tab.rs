@@ -10,7 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
 use weft_core::input::InputHandler;
 use weft_core::persistence::TabSnapshot;
-use weft_core::pty::{Pty, PtyEvent};
+use weft_core::pty::{Pty, PtyError, PtyEvent};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
@@ -207,7 +207,40 @@ impl Tab {
     /// interactive tools write confirmation/resume tails after the first or
     /// second Ctrl+C, and a post-write `tcflush` can race away the ETX itself.
     pub fn interrupt_pty(&mut self) -> bool {
-        self.pty.as_ref().is_some_and(Pty::send_interrupt)
+        if let Some(terminal) = &mut self.terminal {
+            terminal.begin_primary_screen_interrupt_capture();
+        }
+        let delivered = self.pty.as_ref().is_some_and(Pty::send_interrupt);
+        if !delivered {
+            if let Some(terminal) = &mut self.terminal {
+                terminal.cancel_primary_screen_interrupt_capture();
+            }
+        }
+        delivered
+    }
+
+    /// Write input initiated by the user to this tab's PTY.
+    ///
+    /// A first Ctrl+C may freeze the current primary-screen transcript while
+    /// an interactive program decides whether to exit. Any later user input
+    /// means the program continued, so that frozen transcript is stale and
+    /// must not be reused by a future interrupt. Keeping this cancellation at
+    /// the PTY boundary covers keyboard, paste, mouse, wheel, workflow, and
+    /// delayed TUI-scroll input uniformly.
+    pub fn write_user_input(&mut self, data: &[u8]) -> weft_core::pty::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if let Some(terminal) = &mut self.terminal {
+            terminal.cancel_primary_screen_interrupt_capture();
+        }
+        let pty = self.pty.as_ref().ok_or_else(|| {
+            PtyError::Write(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "tab has no PTY",
+            ))
+        })?;
+        pty.write_sync(data)
     }
 
     /// Process queued messages into the terminal and drain finished blocks.

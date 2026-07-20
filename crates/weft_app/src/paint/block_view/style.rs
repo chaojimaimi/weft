@@ -12,6 +12,11 @@ pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) fallback: [f32; 4],
     pub(super) max_cols: usize,
     pub(super) palette: &'a [Color; 256],
+    pub(super) row_pitch: f32,
+}
+
+fn fills_terminal_cell_edges(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{259f}')
 }
 
 impl MetalRenderer {
@@ -37,16 +42,36 @@ impl MetalRenderer {
                 .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
                 .unwrap_or(paint.fallback);
             let mut encoded = [0; 4];
-            self.push_text(
+            let glyph_height = if fills_terminal_cell_edges(ch) {
+                paint.row_pitch
+            } else {
+                self.cell_height() as f32
+            };
+            self.push_text_with_height(
                 vertices,
-                x,
-                paint.y,
+                [x, paint.y],
                 ch.encode_utf8(&mut encoded),
                 color,
                 width,
+                glyph_height,
             );
             col += width;
             x += width as f32 * cw;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fills_terminal_cell_edges;
+
+    #[test]
+    fn block_and_box_glyphs_bridge_block_view_row_leading() {
+        for glyph in ['█', '▀', '▄', '▌', '┌', '─', '│', '┘'] {
+            assert!(fills_terminal_cell_edges(glyph), "glyph={glyph}");
+        }
+        for glyph in ['A', '中', '●'] {
+            assert!(!fills_terminal_cell_edges(glyph), "glyph={glyph}");
         }
     }
 }

@@ -299,8 +299,8 @@ impl App {
             if let Some(resolution) = self.sessions.tabs_mut()[i].resolve_pending_tui_scroll() {
                 match resolution {
                     TuiScrollResolution::PtyBytes(bytes) => {
-                        if let Some(pty) = self.sessions.tab(i).and_then(|t| t.pty.as_ref()) {
-                            if let Err(e) = pty.write_sync(&bytes) {
+                        if let Some(tab) = self.sessions.tab_mut(i) {
+                            if let Err(e) = tab.write_user_input(&bytes) {
                                 warn!(error = %e, tab = i, "failed to replay queued TUI scroll");
                             }
                         }
@@ -336,8 +336,8 @@ impl App {
         for effect in effects {
             match effect {
                 Effect::WritePty { tab, bytes } => {
-                    if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
-                        if let Err(error) = pty.write_sync(&bytes) {
+                    if let Some(session) = self.sessions.tab_mut(tab) {
+                        if let Err(error) = session.write_user_input(&bytes) {
                             warn!(%error, tab, "failed to apply PTY write effect");
                         }
                     }
@@ -450,8 +450,8 @@ impl App {
                 .map(|t| t.bracketed_paste)
                 .unwrap_or(false);
             let bytes = encode_paste(text, bracketed);
-            if let Some(pty) = self.sessions.tab(tab).and_then(|t| t.pty.as_ref()) {
-                if let Err(e) = pty.write_sync(&bytes) {
+            if let Some(session) = self.sessions.tab_mut(tab) {
+                if let Err(e) = session.write_user_input(&bytes) {
                     warn!(error = %e, tab, "failed to paste to PTY");
                 }
             }

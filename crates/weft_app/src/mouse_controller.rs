@@ -642,13 +642,11 @@ impl App {
                 .input_handler
                 .encode_scroll(up, pos.col, pos.row, m)
             {
-                if let Some(pty) = &self.sessions.active_mut().pty {
-                    let mut batch = Vec::with_capacity(bytes.len() * lines);
-                    for _ in 0..lines {
-                        batch.extend_from_slice(&bytes);
-                    }
-                    let _ = pty.write_sync(&batch);
+                let mut batch = Vec::with_capacity(bytes.len() * lines);
+                for _ in 0..lines {
+                    batch.extend_from_slice(&bytes);
                 }
+                let _ = self.sessions.active_mut().write_user_input(&batch);
             }
             return;
         }
@@ -705,9 +703,7 @@ impl App {
                 for _ in 0..lines {
                     batch.extend_from_slice(&single);
                 }
-                if let Some(pty) = &self.sessions.active_mut().pty {
-                    let _ = pty.write_sync(&batch);
-                }
+                let _ = self.sessions.active_mut().write_user_input(&batch);
             }
             return;
         }

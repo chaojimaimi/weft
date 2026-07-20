@@ -58,7 +58,7 @@ impl App {
     }
 
     pub(super) fn send_mouse_event_to_session(
-        &self,
+        &mut self,
         tab: usize,
         button: MouseButton,
         action: MouseAction,
@@ -87,9 +87,10 @@ impl App {
             .input_handler
             .encode_mouse(button, action, pos.col, pos.row, m);
         if let Some(bytes) = bytes {
-            if let Some(pty) = &session.pty {
-                return pty.write_sync(&bytes).is_ok();
-            }
+            return self
+                .sessions
+                .tab_mut(tab)
+                .is_some_and(|session| session.write_user_input(&bytes).is_ok());
         }
         false
     }

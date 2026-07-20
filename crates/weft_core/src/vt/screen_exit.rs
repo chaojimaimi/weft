@@ -1,5 +1,5 @@
 use super::Terminal;
-use crate::blocks::StyledOutput;
+use crate::blocks::{OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
 use std::time::{Duration, Instant};
 
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
@@ -10,7 +10,161 @@ pub(super) struct PendingPrimaryScreenExit {
     last_activity: Instant,
 }
 
+pub(super) struct PrimaryScreenInterruptCapture {
+    frozen_text: String,
+    frozen_styled: StyledOutput,
+    tail: OutputCapture,
+    origin_row: Option<usize>,
+}
+
 impl Terminal {
+    /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
+    /// repeatedly use absolute cursor addressing to own the whole viewport.
+    pub fn primary_screen_app_active(&self) -> bool {
+        !self.alt_active
+            && self.block_tracker.phase() == ShellPhase::CommandExecuting
+            && self.primary_screen_cursor_ops >= 2
+    }
+
+    /// Whether this primary-screen owner has demonstrated atomic full-frame repainting.
+    pub fn primary_screen_repaint_capable(&self) -> bool {
+        self.primary_screen_app_active() && self.primary_screen_synchronized_frame_seen
+    }
+
+    pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
+        self.synchronized_frame_cleared_rows = 0;
+    }
+
+    pub(super) fn finish_primary_screen_synchronized_frame(&mut self) {
+        if self.synchronized_output_started.is_some() {
+            let complete_primary_frame = self.primary_screen_app_active()
+                && self.synchronized_frame_cleared_rows >= self.grid.num_rows;
+            if complete_primary_frame {
+                self.discard_superseded_primary_screen_frame();
+            }
+            self.primary_screen_synchronized_frame_seen |= complete_primary_frame;
+        }
+    }
+
+    pub(super) fn reset_primary_screen_synchronized_frame(&mut self) {
+        self.synchronized_output_started = None;
+        self.synchronized_frame_cleared_rows = 0;
+        self.primary_screen_synchronized_frame_seen = false;
+    }
+
+    pub(super) fn note_primary_screen_full_erase(&mut self) {
+        if !self.alt_active {
+            self.include_primary_screen_viewport_row(0);
+        }
+        if self.synchronized_output_started.is_some() && !self.alt_active {
+            self.synchronized_frame_cleared_rows = self.grid.num_rows;
+            if self.primary_screen_app_active() {
+                self.discard_superseded_primary_screen_frame();
+            }
+        }
+    }
+
+    pub(super) fn note_primary_screen_line_erase(&mut self) {
+        if !self.alt_active {
+            self.include_primary_screen_viewport_row(self.grid.cursor.row);
+        }
+        if self.synchronized_output_started.is_some()
+            && !self.alt_active
+            && self.grid.cursor.row == self.synchronized_frame_cleared_rows
+        {
+            self.synchronized_frame_cleared_rows += 1;
+        }
+    }
+
+    pub(super) fn note_primary_screen_cursor_addressing(&mut self) {
+        if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
+            self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
+            if self.primary_screen_app_active() {
+                self.begin_primary_screen_output_capture();
+            }
+        }
+    }
+
+    pub fn begin_primary_screen_interrupt_capture(&mut self) {
+        if !self.primary_screen_app_active() || self.primary_screen_interrupt_capture.is_some() {
+            return;
+        }
+        let Some(document_start) = self.block_tracker.screen_document_start() else {
+            return;
+        };
+        let (frozen_text, frozen_styled) =
+            self.grid.document_snapshot_from_position(document_start);
+        self.primary_screen_interrupt_capture = Some(PrimaryScreenInterruptCapture {
+            frozen_text,
+            frozen_styled,
+            tail: OutputCapture::default(),
+            origin_row: None,
+        });
+        tracing::info!("froze primary-screen transcript before interrupt");
+    }
+
+    pub fn cancel_primary_screen_interrupt_capture(&mut self) {
+        self.primary_screen_interrupt_capture = None;
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_print(&mut self, c: char) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.print(c, MAX_OUTPUT_BYTES);
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_ascii(&mut self, bytes: &[u8]) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.print_ascii(bytes, MAX_OUTPUT_BYTES);
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_newline(&mut self) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.newline(MAX_OUTPUT_BYTES);
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_carriage_return(&mut self) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.carriage_return();
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_backspace(&mut self) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.backspace();
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_erase_line(&mut self, mode: u16) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            capture.tail.erase_line(mode);
+        }
+    }
+
+    pub(super) fn capture_primary_screen_interrupt_cursor_position(&mut self, clear_line: bool) {
+        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+            let origin_row = *capture.origin_row.get_or_insert(self.grid.cursor.row);
+            let row = self.grid.cursor.row.saturating_sub(origin_row);
+            let col = self.grid.cursor.col;
+            capture.tail.goto(row, col, MAX_OUTPUT_BYTES);
+            if clear_line && col == 0 {
+                capture.tail.erase_line(2);
+                capture.tail.goto(row, col, MAX_OUTPUT_BYTES);
+            }
+        }
+    }
+
+    pub(super) fn discard_superseded_primary_screen_frame(&mut self) {
+        self.grid.clear_scrollback();
+        let origin = self.grid.scrollback.position();
+        self.primary_screen_document_candidate = origin;
+        if self.block_tracker.screen_document_start().is_some() {
+            self.block_tracker.set_screen_document_start(origin);
+        }
+        tracing::debug!(origin, "discarded superseded atomic primary-screen frame");
+    }
     /// Scroll the grid and keep screen-document and viewport-relative side
     /// state synchronized with the same row rotation.
     pub(super) fn scroll_grid_up(&mut self, count: usize) {
@@ -257,6 +411,15 @@ impl Terminal {
     }
 
     pub(super) fn snapshot_primary_screen_output(&mut self) {
+        if let Some(capture) = &self.primary_screen_interrupt_capture {
+            let (text, styled) = merge_primary_screen_interrupt_tail(
+                capture.frozen_text.clone(),
+                capture.frozen_styled.clone(),
+                capture.tail.as_str(),
+            );
+            self.block_tracker.replace_screen_snapshot(&text, styled);
+            return;
+        }
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
@@ -309,12 +472,55 @@ impl Terminal {
         self.snapshot_primary_screen_output();
         self.block_tracker
             .finish_deferred_screen_command(pending.exit_code);
+        self.primary_screen_interrupt_capture = None;
         tracing::info!(
             exit_code = ?pending.exit_code,
             "settled primary-screen command finalization"
         );
         true
     }
+}
+
+fn merge_primary_screen_interrupt_tail(
+    frozen_text: String,
+    frozen_styled: StyledOutput,
+    tail: &str,
+) -> (String, StyledOutput) {
+    let tail = semantic_exit_tail(tail).trim_matches('\n');
+    if tail.is_empty() {
+        return (frozen_text, frozen_styled);
+    }
+    let merged = format!("{}\n\n{}", frozen_text.trim_end_matches('\n'), tail);
+    space_primary_screen_exit_tail(merged, frozen_styled)
+}
+
+fn semantic_exit_tail(tail: &str) -> &str {
+    let explicit = ["Press Ctrl-C again to exit", "Resume this session with:"]
+        .into_iter()
+        .filter_map(|marker| line_marker_start(tail, marker))
+        .min();
+    let session_card = tail
+        .match_indices("Session")
+        .filter(|(start, _)| *start == 0 || tail.as_bytes().get(start - 1) == Some(&b'\n'))
+        .find_map(|(start, _)| {
+            tail[start..]
+                .lines()
+                .skip(1)
+                .take(3)
+                .any(|line| line.trim_start().starts_with("Continue"))
+                .then_some(start)
+        });
+    explicit
+        .into_iter()
+        .chain(session_card)
+        .min()
+        .map_or(tail, |start| &tail[start..])
+}
+
+fn line_marker_start(text: &str, marker: &str) -> Option<usize> {
+    text.match_indices(marker)
+        .map(|(start, _)| start)
+        .find(|&start| start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n'))
 }
 
 fn transform_document_start(
@@ -422,6 +628,18 @@ mod tests {
                 .map(|line| line.line)
                 .collect::<Vec<_>>(),
             [0, 2, 4, 5]
+        );
+    }
+
+    #[test]
+    fn semantic_tail_discards_repainted_banners_for_claude_and_opencode() {
+        assert_eq!(
+            semantic_exit_tail("repainted answer\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume id"),
+            "Press Ctrl-C again to exit\nResume this session with:\nclaude --resume id"
+        );
+        assert_eq!(
+            semantic_exit_tail("opencode banner\nSession   project\nContinue  opencode -s id"),
+            "Session   project\nContinue  opencode -s id"
         );
     }
 

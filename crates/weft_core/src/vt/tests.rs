@@ -569,6 +569,75 @@ fn primary_screen_destructive_repaint_requires_a_synchronized_frame() {
 }
 
 #[test]
+fn synchronized_full_repaint_discards_superseded_primary_screen_scrollback() {
+    let mut terminal = Terminal::new(4, 32);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    terminal.process(b"old banner\r\nold answer 1\r\nold answer 2\r\nold answer 3\r\nold answer 4");
+    assert!(terminal.grid().scrollback_len() > 0);
+
+    terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew banner\r\nnew answer\x1b[?2026l");
+    terminal.set_primary_history_view(true);
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(
+        !output.contains("old banner"),
+        "superseded frame leaked: {output:?}"
+    );
+    assert!(output.contains("new banner"));
+}
+
+#[test]
+fn interrupt_snapshot_preserves_answer_when_resume_tail_reuses_screen_rows() {
+    let mut terminal = Terminal::new(6, 64);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    terminal.process(b"answer row one\x1b[2;1Hanswer row two\x1b[3;1Htable final row");
+    terminal.begin_primary_screen_interrupt_capture();
+    terminal.process(b"stale repaint suffix");
+    terminal.process(
+        b"\x1b[3;1HPress Ctrl-C again to exit\x1b[4;1HResume this session with:\x1b[5;1Hclaude --resume preserved-id",
+    );
+    terminal.process(b"\x1b]133;D;130\x07\x1b]133;A\x07");
+    terminal.settle_primary_screen_exit();
+
+    let output = terminal
+        .block_tracker()
+        .blocks()
+        .last()
+        .unwrap()
+        .output
+        .as_ref();
+    assert_eq!(
+        output,
+        "answer row two\ntable final row\n\nPress Ctrl-C again to exit\n\nResume this session with:\nclaude --resume preserved-id"
+    );
+}
+
+#[test]
+fn continued_user_input_discards_stale_interrupt_snapshot() {
+    let mut terminal = Terminal::new(5, 48);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    terminal.process(b"old answer before first interrupt");
+    terminal.begin_primary_screen_interrupt_capture();
+
+    terminal.cancel_primary_screen_interrupt_capture();
+    terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew answer after continuing\x1b[?2026l");
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    terminal.settle_primary_screen_exit();
+
+    let output = terminal
+        .block_tracker()
+        .blocks()
+        .last()
+        .unwrap()
+        .output
+        .as_ref();
+    assert!(output.contains("new answer after continuing"));
+    assert!(
+        !output.contains("old answer before first interrupt"),
+        "stale frozen transcript leaked after continued input: {output:?}"
+    );
+}
+
+#[test]
 fn contiguous_line_erases_covering_viewport_prove_full_frame_repaint() {
     let mut terminal = Terminal::new(3, 20);
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[H");

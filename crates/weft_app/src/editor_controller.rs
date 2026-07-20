@@ -432,8 +432,8 @@ impl App {
             .map(|t| t.submit_command())
             .unwrap_or_default();
         if !bytes.is_empty() {
-            if let Some(pty) = &self.sessions.active_mut().pty {
-                let _ = pty.write_sync(&bytes);
+            if let Err(error) = self.sessions.active_mut().write_user_input(&bytes) {
+                warn!(%error, "failed to submit editor command to PTY");
             }
         }
         let resp = self
