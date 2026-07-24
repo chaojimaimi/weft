@@ -195,9 +195,53 @@ impl MetalRenderer {
 
         {
             let cache = self.block_layout_cache.borrow();
+            // Step 2: visibility culling. Compute scroll_px and clip bounds
+            // once, then for each block decide whether to expand its internal
+            // lines. Blocks fully offscreen (y_bottom < clip_top OR y_top >
+            // clip_bottom) only accumulate cursor_dist without pushing rows,
+            // reducing layout pass from O(n*m) to O(n + k*m) where k = visible
+            // block count. A 1-block overscan on each side covers partial
+            // blocks and the sticky header.
+            let scroll_px = (block_scroll as f32) * pitch;
+            let clip_top = layout.clip_top;
+            let clip_bottom = content_bottom_y;
+            // Overscan: expand the visible range by 1 block height on each
+            // side to cover partially-visible blocks and the sticky header
+            // (which pulls a block from elsewhere into the viewport).
+            let overscan = header_height + pitch * 2.0;
             for b in blocks.iter().rev() {
                 let cached = cache.get(b.id.0);
-                if !b.collapsed {
+
+                // Compute this block's total height without expanding internal
+                // lines. Uses cached.output_rows (O(1)) for the output portion.
+                let hint_rows: usize = if b.collapsed {
+                    0
+                } else {
+                    command_resume_hints(b)
+                        .iter()
+                        .map(|hint| block_line_chunks(hint, cols).count())
+                        .sum()
+                };
+                let output_rows = if b.collapsed { 0 } else { cached.output_rows };
+                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
+                let block_total_height = (hint_rows + output_rows) as f32 * pitch
+                    + pitch // command
+                    + header_height
+                    + pitch // separator
+                    + clear_rows as f32 * pitch;
+
+                // Block y-range (before scroll adjustment: dist increases
+                // upward from content_bottom_y).
+                let block_dist_before = cursor_dist;
+                let block_dist_after = cursor_dist + block_total_height;
+                let block_y_top = content_bottom_y - block_dist_after + scroll_px;
+                let block_y_bottom = content_bottom_y - block_dist_before + scroll_px;
+
+                // Cull blocks fully outside the visible range + overscan.
+                let is_visible =
+                    block_y_bottom >= clip_top - overscan && block_y_top <= clip_bottom + overscan;
+
+                if is_visible && !b.collapsed {
                     for hint in command_resume_hints(b).iter().rev() {
                         let chunks: Rc<[String]> =
                             Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
@@ -227,6 +271,10 @@ impl MetalRenderer {
                                 .and_then(|styled| styled.line(line.idx)),
                         });
                     }
+                } else {
+                    // Culled: skip expanding internal lines, just advance
+                    // cursor_dist by the output+hint height.
+                    cursor_dist += (hint_rows + output_rows) as f32 * pitch;
                 }
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
@@ -247,7 +295,6 @@ impl MetalRenderer {
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
-                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
                 if clear_rows > 0 {
                     cursor_dist += clear_rows as f32 * pitch;
                     rows.push(cursor_dist);

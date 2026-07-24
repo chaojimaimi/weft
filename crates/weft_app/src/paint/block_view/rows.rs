@@ -154,9 +154,42 @@ impl MetalRenderer {
         }
         {
             let cache = self.block_layout_cache.borrow();
+            // Step 2: visibility culling — mirrors build_block_view_vertices.
+            // Blocks fully offscreen only accumulate cursor_dist without
+            // expanding internal lines. O(n + k*m) instead of O(n*m).
+            let scroll_px = (block_scroll as f32) * pitch;
+            let clip_top = layout.clip_top;
+            let clip_bottom = content_bottom_y;
+            let overscan = header_height + pitch * 2.0;
             for b in blocks.iter().rev() {
                 let cached = cache.get(b.id.0);
-                if !b.collapsed {
+
+                // Compute block total height without expanding internal lines.
+                let hint_rows: usize = if b.collapsed {
+                    0
+                } else {
+                    command_resume_hints(b)
+                        .iter()
+                        .map(|hint| block_line_chunks(hint, cols).count())
+                        .sum()
+                };
+                let output_rows = if b.collapsed { 0 } else { cached.output_rows };
+                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
+                let block_total_height = (hint_rows + output_rows) as f32 * pitch
+                    + pitch
+                    + header_height
+                    + pitch
+                    + clear_rows as f32 * pitch;
+
+                let block_dist_before = cursor_dist;
+                let block_dist_after = cursor_dist + block_total_height;
+                let block_y_top = content_bottom_y - block_dist_after + scroll_px;
+                let block_y_bottom = content_bottom_y - block_dist_before + scroll_px;
+
+                let is_visible =
+                    block_y_bottom >= clip_top - overscan && block_y_top <= clip_bottom + overscan;
+
+                if is_visible && !b.collapsed {
                     for hint in command_resume_hints(b).iter().rev() {
                         let chunks: Rc<[String]> =
                             Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
@@ -179,6 +212,8 @@ impl MetalRenderer {
                             block_id: Some(b.id),
                         });
                     }
+                } else {
+                    cursor_dist += (hint_rows + output_rows) as f32 * pitch;
                 }
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
@@ -196,7 +231,6 @@ impl MetalRenderer {
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
-                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
                 if clear_rows > 0 {
                     cursor_dist += clear_rows as f32 * pitch;
                     rows.push(cursor_dist);

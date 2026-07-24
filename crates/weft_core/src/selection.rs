@@ -735,7 +735,7 @@ mod tests {
             rows: old_rows,
         };
         let new_rows = vec![
-            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0),  // new idx 0
+            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0), // new idx 0
             bv_row(BlockViewRowKind::Output, "hello", 20.0, 40.0), // new idx 1
             bv_row(BlockViewRowKind::Command, "echo hi", 60.0, 80.0), // new idx 2
         ];
