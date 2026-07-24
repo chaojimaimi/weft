@@ -636,4 +636,109 @@ mod tests {
         }];
         assert_eq!(block_header_action_at(&regions, 10.0, 10.0), None);
     }
+
+    // ---- R2-2 assumption falsification tests ----
+    // These tests validate the 5 assumptions listed in BATCH3_IMPLEMENTATION_PLAN.md
+    // before any prefix-sum optimization is applied. They pin the current behavior
+    // so the optimization can be verified against them.
+
+    fn r22_block(command: &str, output: &str) -> Block {
+        Block {
+            id: BlockId(1),
+            command: command.into(),
+            cwd: Some("/tmp/weft".into()),
+            output: output.into(),
+            styled_output: None,
+            exit_code: Some(0),
+            started_at: SystemTime::UNIX_EPOCH,
+            finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(100)),
+            collapsed: false,
+        }
+    }
+
+    /// Assumption 1 (CONFIRMED): block height depends on viewport_rows when
+    /// the command is `clear` — `clear_block_spacer_rows` returns
+    /// `viewport_rows` for clear, 0 otherwise. R2-2 must either include
+    /// viewport_rows in the cache key or extract the spacer as a separate
+    /// O(1) term.
+    #[test]
+    fn r22_clear_command_height_depends_on_viewport_rows() {
+        let b = r22_block("clear", "");
+        let cols = 80;
+        let header_rows = 2;
+
+        let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30);
+        let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50);
+
+        // clear command produces a viewport-sized spacer → height must differ.
+        assert_ne!(
+            h_30, h_50,
+            "clear command height must depend on viewport_rows"
+        );
+        // The spacer equals viewport_rows; the rest (header + gap) is fixed.
+        assert_eq!(h_50 - h_30, 20, "delta must equal viewport_rows delta");
+    }
+
+    /// Assumption 1 (negative case): non-clear commands do NOT depend on
+    /// viewport_rows. This confirms the dependency is isolated to clear.
+    #[test]
+    fn r22_non_clear_command_height_independent_of_viewport_rows() {
+        let b = r22_block("ls -la", "file1\nfile2\nfile3\n");
+        let cols = 80;
+        let header_rows = 2;
+
+        let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30);
+        let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50);
+
+        assert_eq!(
+            h_30, h_50,
+            "non-clear command height must not depend on viewport_rows"
+        );
+    }
+
+    /// Assumption 3: `block_content_metrics` is the single total source.
+    /// This test pins its contract: returns (total, visible) where visible
+    /// = grid num_rows. It does NOT test all 6 call sites (see grep in the
+    /// batch 3 research), but pins the function signature/return shape.
+    #[test]
+    fn r22_block_content_metrics_returns_total_and_visible() {
+        use weft_core::vt::Terminal;
+        let mut terminal = Terminal::new(30, 80);
+        // No blocks → total = 0, visible = num_rows.
+        let (total, visible) = block_content_metrics(&terminal, 80, 2);
+        assert_eq!(total, 0);
+        assert_eq!(visible, 30);
+        // block_content_metrics reads terminal.grid().num_rows as viewport_rows.
+        // Resizing the terminal changes visible (and would change total if any
+        // block had a clear command).
+        terminal.resize(50, 80);
+        let (total2, visible2) = block_content_metrics(&terminal, 80, 2);
+        assert_eq!(total2, 0);
+        assert_eq!(visible2, 50);
+    }
+
+    /// Assumption 5: `CachedBlockLayout.lines` already stores wrapped chunks,
+    /// but `completed_block_output_rows` re-wraps via `block_line_chunks`.
+    /// This test confirms the re-wrap is redundant (same result), validating
+    /// that R2-2 can safely route through the cache.
+    #[test]
+    fn r22_cached_chunks_match_completed_block_output_rows() {
+        use crate::paint::grid_cache::BlockLayoutCache;
+        let b = r22_block("echo hi", "short line\na much longer line that surely wraps past eighty columns when rendered at eighty cols\n");
+        let cols = 80;
+
+        // Cache path: ensure_cached + sum chunks per line.
+        let mut cache = BlockLayoutCache::default();
+        cache.ensure_cached(&b, cols);
+        let cached = cache.get(b.id.0);
+        let cached_rows: usize = cached.lines.iter().map(|l| l.chunks.len()).sum();
+
+        // Direct path: completed_block_output_rows re-wraps.
+        let direct_rows = completed_block_output_rows(&b, cols);
+
+        assert_eq!(
+            cached_rows, direct_rows,
+            "cache chunks must match direct wrap count"
+        );
+    }
 }
