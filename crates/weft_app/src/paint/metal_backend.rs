@@ -291,9 +291,12 @@ impl MetalRenderer {
             let has_offscreen = unchanged && self.ensure_offscreen_texture();
             let command_buffer = self.queue.new_command_buffer();
             // R3 task 6: stamp frame id + mark ENCODE end on the idle path too.
-            if self.frame_id.get() != 0 {
-                command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
-            }
+            // Always set_label (even when frame_id == 0): metal 0.29's
+            // CommandBufferRef::label() calls nsstring_as_str which panics on
+            // a null NSString via slice::from_raw_parts precondition. Without
+            // set_label the label is null, and register_gpu_completion_handler
+            // below reads .label() to parse the frame id.
+            command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
             self.frame_trace.borrow_mut().encode_end();
             if has_offscreen {
                 let blit = command_buffer.new_blit_command_encoder();
@@ -488,10 +491,12 @@ impl MetalRenderer {
 
         let command_buffer = self.queue.new_command_buffer();
         // R3 task 6: stamp the frame id on the command buffer label so the
-        // async add_completed_handler can correlate GPU completion.
-        if self.frame_id.get() != 0 {
-            command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
-        }
+        // async add_completed_handler can correlate GPU completion. Always
+        // set_label (even when frame_id == 0): metal 0.29's label() panics on
+        // null NSString via slice::from_raw_parts precondition, and
+        // register_gpu_completion_handler below reads .label() unconditionally
+        // when the gpu probe is installed (main.rs installs it at startup).
+        command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
 
         // v1.0 P0-c: If scrolling and not force_full, blit the unchanged
         // region within the offscreen texture (src_y=Δ → dst_y=0) before
