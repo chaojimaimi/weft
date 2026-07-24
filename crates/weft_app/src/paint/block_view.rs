@@ -128,6 +128,9 @@ impl MetalRenderer {
                 cache.ensure_cached(b, cols);
             }
         }
+        // Batch 6 Step 1: reset styled lookup counter before the pass; the
+        // pass bumps it via styled_lookup_counter for each styled.line() call.
+        self.styled_lookup_counter.set(0);
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
             compute_block_layout_pass(
@@ -145,11 +148,18 @@ impl MetalRenderer {
                     clip_top: layout.clip_top,
                     clip_bottom: content_bottom_y,
                     resolve_styles: true,
+                    styled_lookup_counter: Some(&self.styled_lookup_counter),
                 },
                 &cache,
             )
         };
-        let LayoutPassOutput { rows, row_data } = layout_out;
+        let LayoutPassOutput {
+            rows,
+            row_data,
+            expanded_block_count,
+        } = layout_out;
+        // Batch 6 Step 1: stash for frame_trace visible_block_count.
+        self.last_expanded_block_count.set(expanded_block_count);
 
         let scroll_px = (block_scroll as f32) * pitch;
         let clip_top = layout.clip_top;

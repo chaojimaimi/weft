@@ -105,6 +105,7 @@ impl MetalRenderer {
                     clip_top: layout.clip_top,
                     clip_bottom: content_bottom_y,
                     resolve_styles: false,
+                    styled_lookup_counter: None,
                 },
                 &cache,
             )

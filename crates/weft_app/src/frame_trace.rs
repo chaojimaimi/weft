@@ -69,19 +69,25 @@ pub(crate) struct FrameCounters {
     /// - `session_block_count`: total finished blocks in the session
     ///   (`terminal.block_tracker().session_blocks().len()`)
     /// - `visible_block_count`: blocks whose rows were actually expanded
-    ///   into `bv_rows` (after clipping). Equals session_block_count until
-    ///   Step 2 visibility culling lands; thereafter should be << total.
+    ///   into `bv_rows` (after clipping). Batch 6 Step 1: now reflects the
+    ///   actual expanded count from `compute_block_layout_pass`, not the
+    ///   total. When << `session_block_count`, visibility culling is working.
     /// - `bv_rows_count`: total rows in the returned `bv_rows` Vec — the
     ///   rows the hit-tester / selection syncer / find highlighter will see.
     /// - `block_layout_cache_hits` / `_misses`: increments since last frame
     ///   from `BlockLayoutCache::ensure_cached`. A "miss" is a rebuild
     ///   (cache entry absent or stale); a "hit" is a no-op ensure_cached.
     ///   Steady-state should be hits >> misses.
+    /// - `styled_line_lookups`: Batch 6 Step 1. Number of `styled.line()`
+    ///   lookups performed this frame. Zero in grid view or hit-testing;
+    ///   in block-view paint, equals the count of visible output lines.
+    ///   Used to assess whether styled-line caching is worth the complexity.
     pub(crate) session_block_count: usize,
     pub(crate) visible_block_count: usize,
     pub(crate) bv_rows_count: usize,
     pub(crate) block_layout_cache_hits: usize,
     pub(crate) block_layout_cache_misses: usize,
+    pub(crate) styled_line_lookups: usize,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -255,6 +261,7 @@ impl FrameTraceRecorder {
             bv_rows = counters.bv_rows_count,
             cache_hits = counters.block_layout_cache_hits,
             cache_misses = counters.block_layout_cache_misses,
+            styled_lookups = counters.styled_line_lookups,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -319,6 +326,7 @@ mod tests {
             bv_rows_count: 0,
             block_layout_cache_hits: 0,
             block_layout_cache_misses: 0,
+            styled_line_lookups: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));

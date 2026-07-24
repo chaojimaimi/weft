@@ -109,6 +109,16 @@ pub struct MetalRenderer {
     /// mouse move. None when the panel is closed or before the first draw
     /// that paints it.
     pub(crate) cached_panel_scroll_metrics: Cell<Option<(usize, usize, usize)>>,
+    /// Batch 6 Step 1: per-frame counter for `styled.line()` lookups in the
+    /// block-view layout pass. Reset to 0 before each paint, read at
+    /// `build_end` to populate `FrameCounters.styled_line_lookups`. Used to
+    /// assess whether styled-line caching is worth the complexity.
+    pub(crate) styled_lookup_counter: Cell<usize>,
+    /// Batch 6 Step 1: per-frame expanded block count from the last
+    /// `compute_block_layout_pass`. Written by `build_block_view_vertices`,
+    /// read at `build_end` to populate `FrameCounters.visible_block_count`.
+    /// 0 in grid view.
+    pub(crate) last_expanded_block_count: Cell<usize>,
     /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
     /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
     /// the previous frame. Eliminates per-frame iteration of all
@@ -533,6 +543,11 @@ impl MetalRenderer {
         let view_switched = show_blocks != self.prev_show_blocks.get();
         if view_switched {
             self.force_full_grid_redraw();
+            // Batch 6 Step 1: reset block-view-only counters so grid-view
+            // frames report 0 for visible_block_count / styled_line_lookups
+            // instead of the last block-view frame's stale values.
+            self.last_expanded_block_count.set(0);
+            self.styled_lookup_counter.set(0);
         }
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -799,10 +814,11 @@ impl MetalRenderer {
         // Step 1: drain per-frame block layout cache hit/miss counters.
         let (cache_hits, cache_misses) =
             self.block_layout_cache.borrow_mut().take_hit_miss_counts();
-        // Step 1: visible_block_count = session_block_count pre-Step-2 (no
-        // visibility culling yet); will become the actual expanded count after
-        // Step 2 lands. Reported separately so the trace can show the delta.
-        let visible_block_count = session_block_count;
+        // Batch 6 Step 1: visible_block_count now reflects the actual expanded
+        // count from compute_block_layout_pass (blocks whose internal lines
+        // were expanded, i.e. is_visible && !collapsed). 0 in grid view.
+        let visible_block_count = self.last_expanded_block_count.get();
+        let styled_line_lookups = self.styled_lookup_counter.get();
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
@@ -814,6 +830,7 @@ impl MetalRenderer {
                 bv_rows_count,
                 block_layout_cache_hits: cache_hits,
                 block_layout_cache_misses: cache_misses,
+                styled_line_lookups,
             });
         self.frame_trace.borrow_mut().encode_start();
 

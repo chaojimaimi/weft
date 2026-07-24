@@ -8,6 +8,7 @@
 //! By sharing this pass, visibility culling and y-band computation live
 //! in one place.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::block_component::{
@@ -59,6 +60,11 @@ pub(super) struct LayoutPassOutput<'a> {
     pub(super) rows: Vec<f32>,
     /// Row metadata parallel to `rows`.
     pub(super) row_data: Vec<LaidRow<'a>>,
+    /// Batch 6 Step 1: actual count of finished blocks whose internal lines
+    /// were expanded (is_visible && !collapsed). Excludes blocks that only
+    /// accumulated cursor_dist in the else branch. When this is << blocks.len(),
+    /// visibility culling is doing its job.
+    pub(super) expanded_block_count: usize,
 }
 
 /// Parameters for the shared layout pass. Extracted from `BlockViewPaintModel`
@@ -80,6 +86,10 @@ pub(super) struct LayoutPassInput<'a> {
     /// Whether to populate paint-only fields (`style`). Hit-testing passes
     /// `false` to skip `styled_output` lookups.
     pub(super) resolve_styles: bool,
+    /// Batch 6 Step 1: optional counter incremented for every `styled.line()`
+    /// lookup performed. Paint passes `Some(&Cell)` to collect data for the
+    /// styled-line caching decision; hit-testing passes `None`.
+    pub(super) styled_lookup_counter: Option<&'a Cell<usize>>,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
@@ -114,11 +124,18 @@ pub(super) fn compute_block_layout_pass<'a>(
         clip_top,
         clip_bottom,
         resolve_styles,
+        styled_lookup_counter,
     } = input;
 
     let mut rows: Vec<f32> = Vec::new();
     let mut row_data: Vec<LaidRow> = Vec::new();
     let mut cursor_dist = 0.0;
+    let mut expanded_block_count = 0usize;
+    let bump_styled = |n: usize| {
+        if let Some(c) = styled_lookup_counter {
+            c.set(c.get().saturating_add(n));
+        }
+    };
 
     // Live in-flight block (rendered above finished blocks).
     if let Some(live) = live {
@@ -138,7 +155,10 @@ pub(super) fn compute_block_layout_pass<'a>(
                 block_id: None,
                 line: line_idx,
                 style: if resolve_styles {
-                    live.styled_output.and_then(|styled| styled.line(line_idx))
+                    live.styled_output.and_then(|styled| {
+                        bump_styled(1);
+                        styled.line(line_idx)
+                    })
                 } else {
                     None
                 },
@@ -200,6 +220,7 @@ pub(super) fn compute_block_layout_pass<'a>(
             block_y_bottom >= clip_top - overscan && block_y_top <= clip_bottom + overscan;
 
         if is_visible && !b.collapsed {
+            expanded_block_count += 1;
             for hint in command_resume_hints(b).iter().rev() {
                 let chunks: Rc<[String]> =
                     Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
@@ -224,9 +245,10 @@ pub(super) fn compute_block_layout_pass<'a>(
                     block_id: Some(b.id),
                     line: line.idx,
                     style: if resolve_styles {
-                        b.styled_output
-                            .as_deref()
-                            .and_then(|styled| styled.line(line.idx))
+                        b.styled_output.as_deref().and_then(|styled| {
+                            bump_styled(1);
+                            styled.line(line.idx)
+                        })
                     } else {
                         None
                     },
@@ -261,7 +283,11 @@ pub(super) fn compute_block_layout_pass<'a>(
         }
     }
 
-    LayoutPassOutput { rows, row_data }
+    LayoutPassOutput {
+        rows,
+        row_data,
+        expanded_block_count,
+    }
 }
 
 #[cfg(test)]
@@ -289,10 +315,12 @@ mod tests {
             clip_top: 0.0,
             clip_bottom: 800.0,
             resolve_styles: false,
+            styled_lookup_counter: None,
         };
         let cache = BlockLayoutCache::default();
         let out = compute_block_layout_pass(input, &cache);
         assert!(out.rows.is_empty());
         assert!(out.row_data.is_empty());
+        assert_eq!(out.expanded_block_count, 0);
     }
 }
