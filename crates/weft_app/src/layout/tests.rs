@@ -607,10 +607,18 @@ fn prompt_hit_row_is_clamped_to_visible_scrolled_window() {
 #[test]
 fn block_visible_rows_use_clamped_prompt_height() {
     let ctx = sample_ctx();
-    let thirty = block_visible_rows(&ctx, 30, true);
-    let hundred = block_visible_rows(&ctx, 100, true);
+    let thirty = block_visible_rows(&ctx, Some(30), true);
+    let hundred = block_visible_rows(&ctx, Some(100), true);
     assert_eq!(thirty, hundred);
     assert!(thirty > 0);
+}
+
+#[test]
+fn running_block_view_uses_rows_reserved_for_no_prompt() {
+    let ctx = sample_ctx();
+    let editor = block_visible_rows(&ctx, Some(1), true);
+    let running = block_visible_rows(&ctx, None, false);
+    assert!(running > editor);
 }
 
 #[test]
@@ -628,12 +636,11 @@ fn fixed_cwd_header_is_reserved_only_for_the_editor() {
 /// fixed_cwd_y sits one pitch above region_bottom_y.
 #[test]
 fn block_view_editor_mode_reserves_cwd_band() {
-    let ctx = sample_ctx(); // ch=16.8, pitch=16.8*1.1=18.48
+    let ctx = sample_ctx(); // ch=16.8; history and live-grid rows share one pitch.
     let region_bottom_y = 1100.0;
     let layout = layout_block_view(&ctx, region_bottom_y, true);
 
-    // pitch = 16.8 * 1.1 = 18.48
-    assert!((layout.pitch - 18.48).abs() < 1e-3);
+    assert!((layout.pitch - 16.8).abs() < 1e-3);
     // left = padding_x = 16; right = vp_w - 16 = 1584
     assert_eq!(layout.left, 16.0);
     assert_eq!(layout.right, 1584.0);
@@ -641,10 +648,10 @@ fn block_view_editor_mode_reserves_cwd_band() {
     assert_eq!(layout.cols, 217);
     // clip_top = padding_y = 16
     assert_eq!(layout.clip_top, 16.0);
-    // content_bottom_y = 1100 - 2*18.48 = 1063.04
-    assert!((layout.clip_bottom - 1063.04).abs() < 1e-3);
-    // fixed_cwd_y = 1100 - 18.48 = 1081.52
-    assert!((layout.fixed_cwd_y - 1081.52).abs() < 1e-3);
+    // content_bottom_y = 1100 - 2*16.8 = 1066.4
+    assert!((layout.clip_bottom - 1066.4).abs() < 1e-3);
+    // fixed_cwd_y = 1100 - 16.8 = 1083.2
+    assert!((layout.fixed_cwd_y - 1083.2).abs() < 1e-3);
 }
 
 /// CommandExecuting mode (cwd_header_active=false): clip_bottom sits

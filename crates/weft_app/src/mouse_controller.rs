@@ -146,7 +146,7 @@ impl App {
             .active()
             .terminal
             .as_ref()
-            .map(|t| (t.mouse_protocol, t.sgr_mouse));
+            .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
         if let Some((mp, sgr)) = modes {
             self.sessions.active_mut().input_handler.mouse_protocol = mp;
             self.sessions.active_mut().input_handler.sgr_mouse = sgr;
@@ -603,12 +603,12 @@ impl App {
             // mouse event — mouse-aware apps (vim `set mouse=a`, tmux, htop)
             // never receive wheel/click input. Mirrors the `app_cursor_keys`
             // sync in handle_key_event.
-            let mp = t.mouse_protocol;
-            let sgr = t.sgr_mouse;
+            let mp = t.mouse_protocol();
+            let sgr = t.sgr_mouse();
             (
-                mp != MouseProtocol::Off,
+                t.accepts_mouse_reporting_input(),
                 t.is_alt_screen_active(),
-                t.app_cursor_keys,
+                t.app_cursor_keys(),
                 mp,
                 sgr,
             )
@@ -739,7 +739,7 @@ impl App {
                 let cols = t.grid().num_cols;
                 let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
                 let (total, _) = block_content_metrics(t, cols, header_rows);
-                (total, t.editor().buffer.lines.len())
+                (total, crate::block_component::block_prompt_lines(t))
             };
             let visible = self
                 .renderer

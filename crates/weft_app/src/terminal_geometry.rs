@@ -49,6 +49,22 @@ impl TerminalLayout {
         (self.rows, self.cols)
     }
 
+    /// Build the per-frame overlay context from this exact layout product.
+    /// Resize handlers use this before the next draw, so they never clamp
+    /// scroll state against a stale viewport from the previous frame.
+    pub fn layout_ctx(self) -> crate::layout::LayoutCtx {
+        let mut ctx = crate::layout::LayoutCtx::new(
+            (self.viewport.right as f32, self.viewport.bottom as f32),
+            self.cell_width as f32,
+            self.cell_height as f32,
+            self.padding_x as f32,
+            self.padding_y as f32,
+        );
+        ctx.chrome_top = self.chrome_top as f32;
+        ctx.chrome_left = self.chrome_left as f32;
+        ctx
+    }
+
     /// Whether a pointer is inside the PTY-owned cell rectangle. Chrome,
     /// padding and sidebars are excluded so their coordinates cannot clamp
     /// into Grid row/column zero.
@@ -225,6 +241,23 @@ mod tests {
         let old_rows = ((800.0_f64 - 20.0) / 20.0).floor() as usize;
         assert_eq!(old_rows, 39);
         assert!(10.0 + 56.0 + old_rows as f64 * 20.0 > 790.0);
+    }
+
+    #[test]
+    fn overlay_context_is_derived_from_the_same_layout_product() {
+        let layout = GridGeometry {
+            chrome_left: 240.0,
+            ..geometry()
+        }
+        .layout();
+        let ctx = layout.layout_ctx();
+        assert_eq!(ctx.viewport, (1200.0, 800.0));
+        assert_eq!(ctx.cell_w, 12.0);
+        assert_eq!(ctx.cell_h, 20.0);
+        assert_eq!(ctx.chrome_top, 56.0);
+        assert_eq!(ctx.chrome_left, 240.0);
+        assert_eq!(ctx.left() as f64, layout.content.left);
+        assert_eq!(ctx.top() as f64, layout.content.top);
     }
 
     #[test]

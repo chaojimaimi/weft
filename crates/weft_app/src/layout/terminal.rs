@@ -127,14 +127,20 @@ pub fn prompt_line_at_y(
     start + row.clamp(0, visible as isize - 1) as usize
 }
 
-/// Visible block rows above a prompt whose height is capped by
-/// [`layout_prompt`]. This is shared by drawing and scroll clamping.
-pub fn block_visible_rows(ctx: &LayoutCtx, prompt_lines: usize, cwd_header_active: bool) -> usize {
+/// Visible BlockView rows, optionally reserving a prompt whose height is capped
+/// by [`layout_prompt`]. This is shared by drawing and scroll clamping.
+pub fn block_visible_rows(
+    ctx: &LayoutCtx,
+    prompt_lines: Option<usize>,
+    cwd_header_active: bool,
+) -> usize {
     if ctx.cell_h <= 0.0 || ctx.height() <= 0.0 {
         return 1;
     }
-    let prompt = layout_prompt(ctx, prompt_lines, 0, 0, 0);
-    let block = layout_block_view(ctx, prompt.box_rect[1], cwd_header_active);
+    let region_bottom_y = prompt_lines
+        .map(|lines| layout_prompt(ctx, lines, 0, 0, 0).box_rect[1])
+        .unwrap_or_else(|| ctx.bottom());
+    let block = layout_block_view(ctx, region_bottom_y, cwd_header_active);
     let height = (block.clip_bottom - ctx.top()).max(0.0);
     ((height / block.pitch).floor() as usize).max(1)
 }
@@ -159,7 +165,7 @@ pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
 /// (renderer.rs:2126).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockViewLayout {
-    /// Row pitch in physical pixels (= ch * 1.1).
+    /// Row pitch in physical pixels (= ch), shared with the live Grid view.
     pub pitch: f32,
     /// Left edge of the content area (= padding_x).
     pub left: f32,
@@ -190,7 +196,10 @@ pub fn layout_block_view(
     let ch = ctx.cell_h;
     let vp_w = ctx.viewport.0;
 
-    let pitch = ch * 1.1;
+    // A primary-screen TUI switches from Grid to BlockView when history is
+    // opened. Sharing the exact row pitch keeps the same transcript from
+    // changing density and apparent glyph weight during that transition.
+    let pitch = ch;
     let left = ctx.left();
     let right = vp_w - ctx.padding_x;
     let cols = (((right - left) / cw).max(1.0)) as usize;

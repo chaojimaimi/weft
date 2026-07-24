@@ -30,7 +30,15 @@ impl Tab {
     }
 
     pub fn snap_to_bottom(&mut self) {
-        self.set_block_scroll(0);
+        self.block_scroll_offset = 0;
+        let changed = self.terminal.as_mut().is_some_and(|terminal| {
+            let changed = terminal.primary_history_view();
+            terminal.set_primary_history_view(false);
+            changed
+        });
+        if changed {
+            self.reset_primary_history_refresh();
+        }
     }
 
     pub fn scroll_up_by(&mut self, rows: usize) {
@@ -47,7 +55,13 @@ impl Tab {
 
     fn sync_primary_history_view(&mut self) {
         let changed = if let Some(terminal) = &mut self.terminal {
-            let browsing = self.block_scroll_offset > 0 && terminal.primary_screen_app_active();
+            // Reaching the history tail is still a history position. Keep the
+            // detached BlockView active at offset zero so the last wheel step
+            // cannot switch to the differently laid-out live Grid and appear
+            // to jump. Explicit input / ScrollToBottom calls `snap_to_bottom`
+            // and is the sole boundary that leaves history browsing.
+            let browsing = terminal.primary_screen_app_active()
+                && (self.block_scroll_offset > 0 || terminal.primary_history_view());
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
             changed

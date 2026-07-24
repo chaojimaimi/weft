@@ -27,14 +27,28 @@ impl StyledOutput {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StyledLine {
     pub line: u32,
+    #[serde(default)]
     pub foregrounds: Vec<ForegroundSpan>,
+    /// Non-default cell backgrounds (prompt bands, selections, and other
+    /// TUI-owned emphasis) captured alongside detached primary-screen text.
+    /// Defaulting keeps previously persisted snapshots backward compatible.
+    #[serde(default)]
+    pub backgrounds: Vec<ForegroundSpan>,
 }
 
 impl StyledLine {
     pub fn foreground_at(&self, index: usize) -> Option<CellColor> {
+        Self::color_at(&self.foregrounds, index)
+    }
+
+    pub fn background_at(&self, index: usize) -> Option<CellColor> {
+        Self::color_at(&self.backgrounds, index)
+    }
+
+    fn color_at(spans: &[ForegroundSpan], index: usize) -> Option<CellColor> {
         let index = u32::try_from(index).ok()?;
-        let position = self.foregrounds.partition_point(|span| span.end <= index);
-        self.foregrounds
+        let position = spans.partition_point(|span| span.end <= index);
+        spans
             .get(position)
             .and_then(|span| (span.start <= index && index < span.end).then_some(span.color))
     }
@@ -107,6 +121,11 @@ mod tests {
                     color: CellColor::Palette(4),
                 },
             ],
+            backgrounds: vec![ForegroundSpan {
+                start: 0,
+                end: 2,
+                color: CellColor::Palette(6),
+            }],
         };
 
         assert_eq!(line.foreground_at(0), None);
@@ -115,6 +134,9 @@ mod tests {
         assert_eq!(line.foreground_at(3), None);
         assert_eq!(line.foreground_at(5), Some(CellColor::Palette(4)));
         assert_eq!(line.foreground_at(6), None);
+        assert_eq!(line.background_at(0), Some(CellColor::Palette(6)));
+        assert_eq!(line.background_at(1), Some(CellColor::Palette(6)));
+        assert_eq!(line.background_at(2), None);
     }
 
     #[test]
@@ -124,10 +146,12 @@ mod tests {
                 StyledLine {
                     line: 2,
                     foregrounds: Vec::new(),
+                    backgrounds: Vec::new(),
                 },
                 StyledLine {
                     line: 7,
                     foregrounds: Vec::new(),
+                    backgrounds: Vec::new(),
                 },
             ],
         };

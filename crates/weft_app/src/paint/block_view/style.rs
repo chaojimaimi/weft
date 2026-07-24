@@ -1,4 +1,4 @@
-use crate::paint::primitives::resolve_cell_color;
+use crate::paint::primitives::{push_quad, resolve_cell_color};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::StyledLine;
 use weft_core::grid::Color;
@@ -41,6 +41,20 @@ impl MetalRenderer {
                 .and_then(|line| line.foreground_at(paint.char_offset + index))
                 .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
                 .unwrap_or(paint.fallback);
+            if let Some(background) = paint
+                .style
+                .and_then(|line| line.background_at(paint.char_offset + index))
+            {
+                let background = resolve_cell_color(background, [0.0; 4], paint.palette);
+                let cell_width = width as f32 * cw;
+                push_quad(
+                    vertices,
+                    [x, paint.y, x + cell_width, paint.y + paint.row_pitch],
+                    [0.0; 4],
+                    [0.0; 4],
+                    background,
+                );
+            }
             let mut encoded = [0; 4];
             let glyph_height = if fills_terminal_cell_edges(ch) {
                 paint.row_pitch

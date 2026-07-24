@@ -231,6 +231,9 @@ impl Tab {
         if data.is_empty() {
             return Ok(());
         }
+        // A history view remains sticky even at offset zero. Genuine PTY
+        // input is the semantic boundary for returning to the live TUI.
+        self.snap_to_bottom();
         if let Some(terminal) = &mut self.terminal {
             terminal.cancel_primary_screen_interrupt_capture();
         }
@@ -412,14 +415,14 @@ impl Tab {
             return Some(TuiScrollResolution::LocalRows(pending.rows));
         }
 
-        self.input_handler.app_cursor_keys = terminal.app_cursor_keys;
-        self.input_handler.mouse_protocol = terminal.mouse_protocol;
-        self.input_handler.sgr_mouse = terminal.sgr_mouse;
+        self.input_handler.app_cursor_keys = terminal.app_cursor_keys();
+        self.input_handler.mouse_protocol = terminal.mouse_protocol();
+        self.input_handler.sgr_mouse = terminal.sgr_mouse();
         self.tui_scroll_deadline = None;
         let count = pending.rows.unsigned_abs() as usize;
         let mut bytes = Vec::new();
 
-        if terminal.mouse_protocol != weft_core::input::MouseProtocol::Off {
+        if terminal.mouse_protocol() != weft_core::input::MouseProtocol::Off {
             for _ in 0..count {
                 if let Some(encoded) = self.input_handler.encode_scroll(
                     pending.rows > 0,

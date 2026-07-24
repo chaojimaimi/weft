@@ -10,14 +10,15 @@
 use std::rc::Rc;
 
 use crate::block_component::{
-    block_presentation, command_resume_hints, live_context_label, spinner_char_for_phase, BlockTone,
+    block_presentation, clear_block_spacer_rows, command_resume_hints, live_context_label,
+    spinner_char_for_phase, BlockTone,
 };
 use crate::paint::block_view::actions::{
     block_header_band_height, block_header_text_cols, push_block_header_actions,
     BlockHeaderActionPaint,
 };
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::grid_cache::wrap_line_chunks;
+use crate::paint::grid_cache::{block_line_chunks, MAX_LAYOUT_LINES_LIVE};
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
@@ -45,6 +46,7 @@ impl MetalRenderer {
             git_branch,
             live,
             block_scroll,
+            viewport_rows,
             block_hovered,
             spinner_phase,
             palette,
@@ -146,7 +148,6 @@ impl MetalRenderer {
         let mut cursor_dist = 0.0;
 
         if let Some(live) = live {
-            const MAX_LAYOUT_LINES_LIVE: usize = 2000;
             let all_lines: Vec<&str> = live.output.lines().collect();
             let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
             let live_lines: Vec<&str> = all_lines[skip..].to_vec();
@@ -154,7 +155,7 @@ impl MetalRenderer {
             for (i, line) in live_lines.iter().enumerate().rev() {
                 let line_idx = base_idx + i;
                 let chunks: Rc<[String]> =
-                    Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
+                    Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
                 let vis_rows = chunks.len();
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
@@ -195,7 +196,7 @@ impl MetalRenderer {
                 if !b.collapsed {
                     for hint in command_resume_hints(b).iter().rev() {
                         let chunks: Rc<[String]> =
-                            Rc::from(wrap_line_chunks(hint, cols).collect::<Vec<_>>());
+                            Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
                         cursor_dist += chunks.len() as f32 * pitch;
                         rows.push(cursor_dist);
                         row_data.push(LaidRow::Output {
@@ -242,8 +243,9 @@ impl MetalRenderer {
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
-                if b.command.split_whitespace().next() == Some("clear") {
-                    cursor_dist += vp_h;
+                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
+                if clear_rows > 0 {
+                    cursor_dist += clear_rows as f32 * pitch;
                     rows.push(cursor_dist);
                     row_data.push(LaidRow::Blank);
                 }

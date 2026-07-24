@@ -119,17 +119,17 @@ async fn vim_mouse_search_cjk_grid_and_exit_roundtrip() {
     assert!(
         session
             .wait_until(UPDATE_TIMEOUT, |s| {
-                s.terminal.mouse_protocol == MouseProtocol::ButtonEvent && s.terminal.sgr_mouse
+                s.terminal.mouse_protocol() == MouseProtocol::ButtonEvent && s.terminal.sgr_mouse()
             })
             .await,
         "Vim mouse mode was not negotiated; protocol={:?}, sgr={}",
-        session.terminal.mouse_protocol,
-        session.terminal.sgr_mouse
+        session.terminal.mouse_protocol(),
+        session.terminal.sgr_mouse()
     );
 
     let mut input = InputHandler::new();
-    input.mouse_protocol = session.terminal.mouse_protocol;
-    input.sgr_mouse = session.terminal.sgr_mouse;
+    input.mouse_protocol = session.terminal.mouse_protocol();
+    input.sgr_mouse = session.terminal.sgr_mouse();
     let wheel_down = input
         .encode_scroll(false, 10, 10, Modifiers::empty())
         .expect("encode Vim wheel-down report");
@@ -352,8 +352,8 @@ async fn tmux_panes_mouse_scrollback_resize_and_exit_roundtrip() {
         .wait_until(START_TIMEOUT, |s| {
             s.terminal.is_alt_screen_active()
                 && s.bottom_line().contains("WEFT_TMUX")
-                && s.terminal.mouse_protocol != MouseProtocol::Off
-                && s.terminal.sgr_mouse
+                && s.terminal.mouse_protocol() != MouseProtocol::Off
+                && s.terminal.sgr_mouse()
         })
         .await;
     if !initialized {
@@ -368,8 +368,8 @@ async fn tmux_panes_mouse_scrollback_resize_and_exit_roundtrip() {
     assert!(
         initialized,
         "tmux did not initialize alt screen, status, and SGR mouse; protocol={:?}, sgr={}, screen:\n{}",
-        session.terminal.mouse_protocol,
-        session.terminal.sgr_mouse,
+        session.terminal.mouse_protocol(),
+        session.terminal.sgr_mouse(),
         session.visible_text()
     );
 
@@ -428,8 +428,8 @@ async fn tmux_panes_mouse_scrollback_resize_and_exit_roundtrip() {
         session.visible_text()
     );
     let mut input = InputHandler::new();
-    input.mouse_protocol = session.terminal.mouse_protocol;
-    input.sgr_mouse = session.terminal.sgr_mouse;
+    input.mouse_protocol = session.terminal.mouse_protocol();
+    input.sgr_mouse = session.terminal.sgr_mouse();
     let wheel_up = input
         .encode_scroll(true, 10, 8, Modifiers::empty())
         .expect("encode tmux wheel-up report");

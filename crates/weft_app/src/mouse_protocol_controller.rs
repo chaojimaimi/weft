@@ -70,7 +70,7 @@ impl App {
         let Some(terminal) = session.terminal.as_ref() else {
             return false;
         };
-        if terminal.mouse_protocol == MouseProtocol::Off {
+        if !terminal.accepts_mouse_reporting_input() {
             return false;
         }
         let mut m = Modifiers::empty();

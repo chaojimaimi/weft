@@ -398,7 +398,6 @@ mod tests {
         let store = temp_store();
         store.insert(&block(1, "ls", "file_a", Some(0))).unwrap();
         store.insert(&block(2, "pwd", "/tmp", Some(0))).unwrap();
-
         let recent = store.recent(10).unwrap();
         assert_eq!(recent.len(), 2);
         // Newest first: block 2 has the larger started_ms.
@@ -422,11 +421,11 @@ mod tests {
                     end: 11,
                     color: crate::grid::CellColor::Palette(2),
                 }],
+                backgrounds: Vec::new(),
             }],
         }));
         store.insert(&original).unwrap();
         let loaded = store.recent(1).unwrap().pop().unwrap();
-
         assert_eq!(loaded.id, original.id);
         assert_eq!(loaded.command, original.command);
         assert_eq!(loaded.output, original.output);
@@ -478,6 +477,7 @@ mod tests {
                     end: 5,
                     color: crate::grid::CellColor::Palette(4),
                 }],
+                backgrounds: Vec::new(),
             }],
         }));
         store.insert(&new).unwrap();

@@ -48,10 +48,44 @@ impl App {
                         // (<1ms) so doing it on every intermediate event is
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
-                        for tab in self.sessions.tabs_mut() {
+                        let header_rows = renderer.block_header_rows();
+                        let layout_ctx = base_layout.layout_ctx();
+                        for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
                             if tab.terminal.is_some() {
                                 let (new_rows, new_cols) = base_layout.dimensions();
                                 tab.resize_terminal_and_queue(new_rows, new_cols);
+
+                                // `block_scroll_offset` is measured from the
+                                // bottom of a width-dependent document. A
+                                // larger viewport usually wraps fewer rows and
+                                // shows more of them, so an offset that was
+                                // valid before maximize can exceed the new
+                                // range and make the transcript tail
+                                // unreachable. Reconcile against the detached
+                                // snapshot now, before SIGWINCH causes the TUI
+                                // to repaint asynchronously.
+                                let previous = tab.block_scroll();
+                                let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
+                                    crate::block_component::reconciled_terminal_block_scroll(
+                                        terminal,
+                                        &layout_ctx,
+                                        header_rows,
+                                        previous,
+                                    )
+                                });
+                                if let Some((reconciled, total, visible)) = reconciliation {
+                                    if previous != reconciled {
+                                        info!(
+                                            tab = tab_index,
+                                            previous,
+                                            reconciled,
+                                            total,
+                                            visible,
+                                            "reconciled block scroll during resize"
+                                        );
+                                        tab.set_block_scroll(reconciled);
+                                    }
+                                }
                             }
                         }
                         info!(

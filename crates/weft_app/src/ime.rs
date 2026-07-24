@@ -7,9 +7,81 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::NSView;
+use unicode_width::UnicodeWidthChar;
+use weft_core::input::InputMode;
 use weft_core::input::{InputHandler, KeyCode, Modifiers};
+use weft_core::vt::Terminal;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+use crate::layout::{layout_prompt, LayoutCtx};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImeCursorArea {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn grid_cursor_area(ctx: LayoutCtx, row: usize, col: usize) -> Option<ImeCursorArea> {
+    (ctx.cell_w.is_finite() && ctx.cell_h.is_finite() && ctx.cell_w > 0.0 && ctx.cell_h > 0.0)
+        .then_some(ImeCursorArea {
+            x: ctx.left() + col as f32 * ctx.cell_w,
+            y: ctx.top() + row as f32 * ctx.cell_h,
+            width: ctx.cell_w,
+            height: ctx.cell_h,
+        })
+}
+
+fn editor_cursor_area_from_buffer(
+    ctx: LayoutCtx,
+    lines: &[String],
+    cursor: (usize, usize),
+    scroll_offset: usize,
+) -> Option<ImeCursorArea> {
+    let (line_index, char_index) = cursor;
+    let line = lines.get(line_index)?;
+    let display_col = line
+        .chars()
+        .take(char_index)
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum();
+    let prompt = layout_prompt(&ctx, lines.len(), line_index, display_col, scroll_offset);
+    Some(ImeCursorArea {
+        x: prompt.cursor_x,
+        y: prompt.cursor_y,
+        width: ctx.cell_w,
+        height: prompt.row_height,
+    })
+}
+
+fn editor_cursor_area(ctx: LayoutCtx, terminal: &Terminal) -> Option<ImeCursorArea> {
+    let buffer = &terminal.editor().buffer;
+    editor_cursor_area_from_buffer(ctx, &buffer.lines, buffer.cursor, buffer.scroll_offset)
+}
+
+/// Keep the native macOS candidate window attached to Weft's GPU caret.
+/// winit converts this physical top-left rectangle into AppKit's text-input
+/// coordinate system and invalidates the current character coordinates.
+pub fn update_cursor_area(window: &Window, ctx: LayoutCtx, terminal: &Terminal) {
+    let area = match terminal.effective_input_mode() {
+        InputMode::Editor => editor_cursor_area(ctx, terminal),
+        InputMode::Passthrough => {
+            let cursor = &terminal.grid().cursor;
+            grid_cursor_area(ctx, cursor.row, cursor.col)
+        }
+    };
+    let Some(area) = area else { return };
+    window.set_ime_cursor_area(
+        PhysicalPosition::new(area.x.round() as i32, area.y.round() as i32),
+        PhysicalSize::new(
+            area.width.max(1.0).round() as u32,
+            area.height.max(1.0).round() as u32,
+        ),
+    );
+}
 
 /// Prefer winit's layout-aware text for ordinary printable keyboard events.
 /// Control/Alt/Super chords must keep using the terminal key encoder because
@@ -72,7 +144,11 @@ pub fn discard_marked_text(window: &Window) {
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_keyboard_text, encode_passthrough_key};
+    use super::{
+        direct_keyboard_text, editor_cursor_area_from_buffer, encode_passthrough_key,
+        grid_cursor_area, ImeCursorArea,
+    };
+    use crate::layout::LayoutCtx;
     use weft_core::input::{InputHandler, KeyCode, Modifiers};
 
     #[test]
@@ -123,5 +199,49 @@ mod tests {
             encode_passthrough_key(&input, KeyCode::Char('c'), Modifiers::CONTROL, Some("c")),
             b"\x03"
         );
+    }
+
+    #[test]
+    fn tui_ime_anchor_uses_content_origin_and_grid_cursor() {
+        let ctx = LayoutCtx {
+            viewport: (1200.0, 800.0),
+            cell_w: 10.0,
+            cell_h: 20.0,
+            padding_x: 12.0,
+            padding_y: 8.0,
+            chrome_top: 32.0,
+            chrome_left: 200.0,
+            clip: None,
+        };
+        assert_eq!(
+            grid_cursor_area(ctx, 4, 7),
+            Some(ImeCursorArea {
+                x: 282.0,
+                y: 120.0,
+                width: 10.0,
+                height: 20.0,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_cell_metrics_do_not_publish_native_ime_anchor() {
+        let mut ctx = LayoutCtx::new((100.0, 100.0), 0.0, 20.0, 0.0, 0.0);
+        assert_eq!(grid_cursor_area(ctx, 0, 0), None);
+        ctx.cell_w = 10.0;
+        ctx.cell_h = f32::NAN;
+        assert_eq!(grid_cursor_area(ctx, 0, 0), None);
+    }
+
+    #[test]
+    fn editor_ime_anchor_counts_cjk_as_two_display_columns() {
+        let ctx = LayoutCtx::new((800.0, 600.0), 10.0, 20.0, 12.0, 8.0);
+        let lines = vec!["A中B".to_string()];
+        let area = editor_cursor_area_from_buffer(ctx, &lines, (0, 2), 0).unwrap();
+        // Prompt text begins after "❯ " (two cells); A + 中 occupy 3 cells.
+        assert_eq!(area.x, 12.0 + 5.0 * 10.0);
+        assert_eq!(area.y, 552.0);
+        assert_eq!(area.width, 10.0);
+        assert_eq!(area.height, 20.0);
     }
 }

@@ -2,9 +2,11 @@
 
 use std::rc::Rc;
 
-use crate::block_component::{block_presentation, command_resume_hints, live_context_label};
+use crate::block_component::{
+    block_presentation, clear_block_spacer_rows, command_resume_hints, live_context_label,
+};
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::grid_cache::wrap_line_chunks;
+use crate::paint::grid_cache::{block_line_chunks, MAX_LAYOUT_LINES_LIVE};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
 use weft_core::selection::{BlockViewRow, BlockViewRowKind};
@@ -46,7 +48,7 @@ impl MetalRenderer {
     ///
     /// The layout logic mirrors `build_block_view_vertices` (layout pass +
     /// bv_rows extraction). Both paths use the same `layout_block_view` +
-    /// `wrap_line_chunks` + `block_layout_cache` so the y-bands are identical.
+    /// `block_line_chunks` + `block_layout_cache` so the y-bands are identical.
     pub(crate) fn compute_block_view_rows(
         &self,
         model: BlockViewPaintModel<'_>,
@@ -58,6 +60,7 @@ impl MetalRenderer {
             git_branch,
             live,
             block_scroll,
+            viewport_rows,
             block_hovered: _,
             spinner_phase: _,
             palette: _,
@@ -113,13 +116,12 @@ impl MetalRenderer {
         let mut cursor_dist = 0.0;
 
         if let Some(live) = live {
-            const MAX_LAYOUT_LINES_LIVE: usize = 2000;
             let all_lines: Vec<&str> = live.output.lines().collect();
             let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
             let live_lines: Vec<&str> = all_lines[skip..].to_vec();
             for line in live_lines.iter().rev() {
                 let chunks: Rc<[String]> =
-                    Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
+                    Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
                 let vis_rows = chunks.len();
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
@@ -157,7 +159,7 @@ impl MetalRenderer {
                 if !b.collapsed {
                     for hint in command_resume_hints(b).iter().rev() {
                         let chunks: Rc<[String]> =
-                            Rc::from(wrap_line_chunks(hint, cols).collect::<Vec<_>>());
+                            Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
                         cursor_dist += chunks.len() as f32 * pitch;
                         rows.push(cursor_dist);
                         row_data.push(LaidRow::Output {
@@ -194,8 +196,9 @@ impl MetalRenderer {
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Separator);
-                if b.command.split_whitespace().next() == Some("clear") {
-                    cursor_dist += vp_h;
+                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
+                if clear_rows > 0 {
+                    cursor_dist += clear_rows as f32 * pitch;
                     rows.push(cursor_dist);
                     row_data.push(LaidRow::Blank);
                 }

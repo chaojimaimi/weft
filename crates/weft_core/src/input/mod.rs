@@ -88,6 +88,14 @@ mod tests {
             handler().encode_key(KeyCode::Tab, Modifiers::empty()),
             b"\t"
         );
+        assert_eq!(
+            handler().encode_key(KeyCode::Tab, Modifiers::SHIFT),
+            b"\x1b[Z"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::Tab, Modifiers::SHIFT | Modifiers::ALT),
+            b"\x1b[Z"
+        );
     }
 
     #[test]

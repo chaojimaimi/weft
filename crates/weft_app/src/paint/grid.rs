@@ -9,18 +9,26 @@ use crate::renderer::MetalRenderer;
 use weft_core::grid::{CellFlags, CellWidth, Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
 
-fn primary_screen_row_hidden(row: usize, hidden_before_row: Option<usize>) -> bool {
-    hidden_before_row.is_some_and(|start| row < start)
+fn primary_screen_row_hidden(
+    row: usize,
+    hidden_before_row: Option<usize>,
+    owned_rows: Option<&[bool]>,
+) -> bool {
+    owned_rows
+        .and_then(|owned| owned.get(row))
+        .is_some_and(|owned| !owned)
+        || hidden_before_row.is_some_and(|start| row < start)
 }
 
 fn primary_screen_mask_changed(previous: Option<usize>, current: Option<usize>) -> bool {
     previous != current
 }
 
-pub(crate) struct GridViewPolicy {
+pub(crate) struct GridViewPolicy<'a> {
     pub(crate) show_cursor: bool,
     pub(crate) cursor_style: CursorStyle,
     pub(crate) hidden_before_row: Option<usize>,
+    pub(crate) owned_rows: Option<&'a [bool]>,
 }
 
 impl MetalRenderer {
@@ -221,7 +229,7 @@ impl MetalRenderer {
         self.instances_unchanged.set(false);
 
         for &row in &rows_to_rebuild {
-            if primary_screen_row_hidden(row, policy.hidden_before_row) {
+            if primary_screen_row_hidden(row, policy.hidden_before_row, policy.owned_rows) {
                 cache[row].clear();
                 continue;
             }
@@ -413,12 +421,13 @@ mod tests {
     use super::{primary_screen_mask_changed, primary_screen_row_hidden};
 
     #[test]
-    fn primary_screen_mask_hides_only_rows_before_the_owned_boundary() {
-        assert!(primary_screen_row_hidden(0, Some(3)));
-        assert!(primary_screen_row_hidden(2, Some(3)));
-        assert!(!primary_screen_row_hidden(3, Some(3)));
-        assert!(!primary_screen_row_hidden(8, Some(3)));
-        assert!(!primary_screen_row_hidden(0, None));
+    fn primary_screen_mask_hides_unowned_rows_without_mutating_the_grid() {
+        let owned = [false, true, false, true];
+        assert!(primary_screen_row_hidden(0, Some(1), Some(&owned)));
+        assert!(!primary_screen_row_hidden(1, Some(1), Some(&owned)));
+        assert!(primary_screen_row_hidden(2, Some(1), Some(&owned)));
+        assert!(!primary_screen_row_hidden(3, Some(1), Some(&owned)));
+        assert!(!primary_screen_row_hidden(3, None, None));
     }
 
     #[test]

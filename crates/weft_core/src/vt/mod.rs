@@ -3,11 +3,13 @@
 //! Wraps the `vte` crate with a `Terminal` struct that implements
 //! `vte::Perform` to translate escape sequences into Grid operations.
 mod attrs;
+mod capability;
 mod grapheme;
 mod osc;
 mod perform;
 mod screen_exit;
 pub use attrs::{Attrs, ShellMarker};
+pub use capability::{ScreenOwner, SettleState};
 pub use screen_exit::{PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY};
 
 use crate::blocks::{BlockTracker, ShellPhase};
@@ -31,8 +33,6 @@ pub struct Terminal {
     git_branch: Option<String>,
     /// Editor command awaiting `133;B`; keeps the preexec window passthrough.
     command_from_editor: Option<String>,
-    /// Application cursor key mode (DECCKM, CSI ?1h/l).
-    pub app_cursor_keys: bool,
     pub bracketed_paste: bool,
     /// Origin mode (DECOM, CSI ?6h/l).
     origin_mode: bool,
@@ -40,18 +40,13 @@ pub struct Terminal {
     pub cursor_visible: bool,
     /// Cursor style (DECSCUSR, CSI <n> q).
     pub cursor_style: CursorStyle,
-    pub mouse_protocol: MouseProtocol, // active mouse reporting mode
     /// Start of a DEC 2026 atomic update; stale frames expire automatically.
     synchronized_output_started: Option<std::time::Instant>,
     synchronized_frame_cleared_rows: usize,
-    primary_screen_synchronized_frame_seen: bool,
-    /// SGR-1006 selects SGR vs legacy mouse report encoding.
-    pub sgr_mouse: bool,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
     /// Alternate screen buffer, swapped with `grid` for DEC 1049/47.
     alt_grid: Grid,
-    alt_active: bool, // true while the alternate screen is active
     /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
     saved_cursor: Option<Cursor>,
     /// Bytes written back for DA/DSR/size and capability queries.
@@ -64,12 +59,9 @@ pub struct Terminal {
     hyperlinks: HyperlinkRegistry,
     parser_in_ground_state: bool, // gates the printable-ASCII fast path
     suppress_joined_scalar: bool,
-    primary_screen_cursor_ops: u8,
-    primary_screen_document_candidate: u64,
-    primary_screen_exit: Option<screen_exit::PendingPrimaryScreenExit>,
-    primary_screen_interrupt_capture: Option<screen_exit::PrimaryScreenInterruptCapture>,
-    primary_history_view: bool,
-    primary_history_snapshot_at: Option<std::time::Instant>,
+    /// Single source of truth for capability + primary-screen lifecycle state.
+    /// See `capability.rs` for the field-by-field rationale.
+    pub(in crate::vt) capabilities: capability::CapabilityFlags,
 }
 
 impl Terminal {
@@ -90,32 +82,22 @@ impl Terminal {
             cwd: None,
             git_branch: None,
             command_from_editor: None,
-            app_cursor_keys: false,
             bracketed_paste: false,
             origin_mode: false,
             cursor_visible: true,
             cursor_style: CursorStyle::Block,
-            mouse_protocol: MouseProtocol::Off,
             synchronized_output_started: None,
             synchronized_frame_cleared_rows: 0,
-            primary_screen_synchronized_frame_seen: false,
-            sgr_mouse: false,
             palette: Self::init_palette(),
             // Alt-screen apps manage their own scrolling and history.
             alt_grid: Grid::with_scrollback(rows, cols, 0),
-            alt_active: false,
             saved_cursor: None,
             pending_output: Vec::new(),
             active_hyperlink_id: None,
             hyperlinks: HyperlinkRegistry::new(),
             parser_in_ground_state: true,
             suppress_joined_scalar: false,
-            primary_screen_cursor_ops: 0,
-            primary_screen_document_candidate: 0,
-            primary_screen_exit: None,
-            primary_screen_interrupt_capture: None,
-            primary_history_view: false,
-            primary_history_snapshot_at: None,
+            capabilities: capability::CapabilityFlags::default(),
         }
     }
 
@@ -176,7 +158,7 @@ impl Terminal {
     pub fn effective_input_mode(&self) -> InputMode {
         effective_mode(
             self.block_tracker.phase(),
-            self.alt_active,
+            self.capabilities.alt_active,
             self.block_tracker.bootstrap_ready(),
             self.command_from_editor.is_some(),
         )
@@ -191,7 +173,22 @@ impl Terminal {
 
     /// Whether the alternate screen buffer is currently active.
     pub fn is_alt_screen_active(&self) -> bool {
-        self.alt_active
+        self.capabilities.alt_active
+    }
+
+    /// Active mouse reporting mode (DEC modes 9/1000/1002/1003).
+    pub fn mouse_protocol(&self) -> MouseProtocol {
+        self.capabilities.mouse_protocol
+    }
+
+    /// Whether SGR-1006 mouse-report encoding is selected (DEC mode 1006).
+    pub fn sgr_mouse(&self) -> bool {
+        self.capabilities.sgr_mouse
+    }
+
+    /// Application cursor key mode (DECCKM, CSI ?1h/l).
+    pub fn app_cursor_keys(&self) -> bool {
+        self.capabilities.app_cursor_keys
     }
 
     /// Whether DEC synchronized-output mode (`CSI ?2026h`) is active.
@@ -214,7 +211,7 @@ impl Terminal {
     /// Modelled on Alacritty's `swap_alt` (O(1) `mem::swap`) with the
     /// parameterised clear/restore semantics from Warp's `SwapScreen` mode.
     fn swap_alt(&mut self, save_cursor_and_clear: bool) {
-        if !self.alt_active {
+        if !self.capabilities.alt_active {
             if save_cursor_and_clear {
                 self.saved_cursor = Some(self.grid.cursor.clone());
                 self.alt_grid.clear();
@@ -222,7 +219,7 @@ impl Terminal {
             // Alternate screen starts fresh with the cursor at home (0,0).
             self.alt_grid.cursor = Cursor::default();
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
-            self.alt_active = true;
+            self.capabilities.alt_active = true;
             // OSC 8 state is viewport-relative — entering the alt screen
             // invalidates any cell_map entries from the primary grid.
             self.hyperlinks.clear_cell_map();
@@ -234,13 +231,13 @@ impl Terminal {
                     self.grid.cursor = c;
                 }
             }
-            self.alt_active = false;
+            self.capabilities.alt_active = false;
             // Restoring the primary grid — alt-screen hyperlinks are gone.
             self.hyperlinks.clear_cell_map();
             self.active_hyperlink_id = None;
         }
         tracing::info!(
-            active = self.alt_active,
+            active = self.capabilities.alt_active,
             rows = self.grid.num_rows,
             cols = self.grid.num_cols,
             "alt-screen toggled"
@@ -356,7 +353,7 @@ impl Terminal {
         if phase != ShellPhase::AtPrompt {
             self.grid.scroll_offset = 0;
         }
-        let capturing = !self.alt_active && phase == ShellPhase::CommandExecuting;
+        let capturing = !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting;
         let num_cols = self.grid.num_cols;
         let num_rows = self.grid.num_rows;
         let fg = self.attrs.fg;
@@ -529,11 +526,11 @@ impl Terminal {
     /// SIGWINCH finally fires and the app repaints). Alacritty/Warp apply the
     /// same rule: never reflow the active screen during a TUI app's lifetime.
     pub fn resize(&mut self, rows: usize, cols: usize) {
-        let primary_screen_layout_owned = self.primary_screen_cursor_ops > 0
+        let primary_screen_layout_owned = self.capabilities.primary_screen_cursor_ops > 0
             || self.block_tracker.screen_document_start().is_some();
         let primary_screen_candidate_pending =
             self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting;
-        if self.alt_active {
+        if self.capabilities.alt_active {
             // self.grid is the visible alternate screen and is always
             // TUI-owned. The hidden primary grid must also stay
             // dimension-only once primary-screen ownership evidence exists;
@@ -541,7 +538,7 @@ impl Terminal {
             // the capture boundary still points into that document.
             self.grid.resize_dims(rows, cols);
             if primary_screen_layout_owned {
-                self.alt_grid.resize_dims(rows, cols);
+                self.resize_hidden_primary_screen_dims(rows, cols);
             } else if primary_screen_candidate_pending {
                 self.reflow_primary_screen_candidate(rows, cols, true);
             } else {
@@ -551,7 +548,7 @@ impl Terminal {
             // The visible primary grid is cursor-addressed or still owns a
             // deferred exit transcript. Preserve its row coordinates until
             // the app repaints or the snapshot settles.
-            self.grid.resize_dims(rows, cols);
+            self.resize_visible_primary_screen_dims(rows, cols);
             self.alt_grid.resize(rows, cols);
         } else if primary_screen_candidate_pending {
             self.reflow_primary_screen_candidate(rows, cols, false);
@@ -743,7 +740,7 @@ impl Terminal {
     /// Handle DEC private mode set/reset (CSI ? <n> h/l).
     fn handle_dec_private_mode(&mut self, mode: u16, set: bool) {
         match mode {
-            1 => self.app_cursor_keys = set, // DECCKM
+            1 => self.capabilities.app_cursor_keys = set, // DECCKM
             6 => {
                 // DECOM: CUP is relative to the scroll region.
                 self.origin_mode = set;
@@ -753,7 +750,7 @@ impl Terminal {
             25 => self.cursor_visible = set, // DECTCEM — cursor show/hide
             47 | 1049 => {
                 // Swap only on a real state change.
-                if set != self.alt_active {
+                if set != self.capabilities.alt_active {
                     self.swap_alt(mode == 1049);
                 }
                 if !set {
@@ -773,28 +770,28 @@ impl Terminal {
                 tracing::debug!(set, "DEC synchronized output toggled");
             }
             9 => {
-                self.mouse_protocol = if set {
+                self.capabilities.mouse_protocol = if set {
                     MouseProtocol::X10
                 } else {
                     MouseProtocol::Off
                 }
             }
             1000 => {
-                self.mouse_protocol = if set {
+                self.capabilities.mouse_protocol = if set {
                     MouseProtocol::Normal
                 } else {
                     MouseProtocol::Off
                 }
             }
             1002 => {
-                self.mouse_protocol = if set {
+                self.capabilities.mouse_protocol = if set {
                     MouseProtocol::ButtonEvent
                 } else {
                     MouseProtocol::Off
                 }
             }
             1003 => {
-                self.mouse_protocol = if set {
+                self.capabilities.mouse_protocol = if set {
                     MouseProtocol::AnyEvent
                 } else {
                     MouseProtocol::Off
@@ -805,7 +802,7 @@ impl Terminal {
             // enable this together with 1000/1002/1003. Previously ignored →
             // we always emitted SGR format, corrupting apps that expected
             // legacy encoding and leaking bytes as visible text (vim `~@k`).
-            1006 => self.sgr_mouse = set,
+            1006 => self.capabilities.sgr_mouse = set,
             // SGR pixel-mode (1015) and urxvt-mode (1015): not implemented;
             // apps that request them fall back to our default (SGR-1006 when
             // sgr_mouse, legacy otherwise).

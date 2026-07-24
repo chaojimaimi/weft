@@ -1,30 +1,18 @@
 //! Find overlay controller extracted from the application shell.
 
 use super::*;
-use crate::block_component::completed_block_row_count;
+use crate::block_component::{completed_block_layout_rows, completed_block_match_row_from_bottom};
 
 pub(crate) fn toggled_find_option(current: bool) -> bool {
     !current
-}
-
-fn trimmed_block_output_lines(block: &weft_core::blocks::Block) -> usize {
-    if block.collapsed {
-        return 0;
-    }
-    let mut lines: Vec<&str> = block.output.lines().collect();
-    while lines.last().is_some_and(|line| {
-        let text = line.trim();
-        text.is_empty() || matches!(text, "%" | "$" | "#")
-    }) {
-        lines.pop();
-    }
-    lines.len()
 }
 
 fn block_find_scroll_target(
     blocks: &[weft_core::blocks::Block],
     hit: &weft_core::find::BlockMatch,
     header_rows: usize,
+    cols: usize,
+    viewport_rows: usize,
     visible: usize,
     max_scroll: usize,
 ) -> Option<usize> {
@@ -32,14 +20,9 @@ fn block_find_scroll_target(
     let rows_below = blocks
         .iter()
         .skip(block_idx + 1)
-        .map(|block| completed_block_row_count(trimmed_block_output_lines(block), header_rows))
+        .map(|block| completed_block_layout_rows(block, cols, header_rows, viewport_rows))
         .sum::<usize>();
-    let output_lines = trimmed_block_output_lines(&blocks[block_idx]);
-    let row_in_block = if hit.is_command {
-        output_lines + 1
-    } else {
-        output_lines.saturating_sub(hit.line)
-    };
+    let row_in_block = completed_block_match_row_from_bottom(&blocks[block_idx], hit, cols);
     Some(
         (rows_below + row_in_block)
             .saturating_sub(visible * 2 / 3)
@@ -415,7 +398,8 @@ impl App {
                 term.effective_input_mode() == weft_core::input::InputMode::Editor,
                 term.cwd().is_some(),
             );
-            let visible = renderer.block_visible_rows(1, cwd_header);
+            let visible = renderer
+                .block_visible_rows(crate::block_component::block_prompt_lines(term), cwd_header);
             // Scroll so the matching row lands at ~2/3 from the bottom of the
             // viewport (upper-middle). block_scroll_offset is "rows scrolled
             // up from the bottom", so target = rows_from_bottom - visible*2/3.
@@ -426,6 +410,8 @@ impl App {
                 blocks,
                 &bm,
                 renderer.block_header_rows(),
+                cols,
+                term.grid().num_rows,
                 visible,
                 max_scroll,
             ) else {
@@ -484,8 +470,21 @@ mod tests {
             col: 0,
             len: 1,
         };
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 1, 6, 100), Some(4));
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 6, 100), Some(5));
+        assert_eq!(
+            block_find_scroll_target(&blocks, &hit, 1, 80, 24, 6, 100),
+            Some(4)
+        );
+        assert_eq!(
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 6, 100),
+            Some(5)
+        );
+
+        let mut blocks_with_clear = blocks;
+        blocks_with_clear[1].command = "clear".into();
+        assert_eq!(
+            block_find_scroll_target(&blocks_with_clear, &hit, 1, 80, 24, 6, 100),
+            Some(28)
+        );
     }
 
     #[test]
@@ -498,9 +497,42 @@ mod tests {
             col: 0,
             len: 1,
         };
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 3, 100), Some(0));
+        assert_eq!(
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100),
+            Some(0)
+        );
         hit.is_command = true;
-        assert_eq!(block_find_scroll_target(&blocks, &hit, 2, 3, 100), Some(2));
+        assert_eq!(
+            block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn block_find_scroll_counts_wrapped_rows_and_resume_hints() {
+        let mut older = block(
+            1,
+            "first row is deliberately much longer than eight columns\nlast",
+        );
+        let newer = block(2, "newer output also wraps at narrow widths");
+        let hit = BlockMatch {
+            block_id: older.id,
+            is_command: false,
+            line: 0,
+            col: 20,
+            len: 4,
+        };
+        let wide =
+            block_find_scroll_target(&[older.clone(), newer.clone()], &hit, 1, 80, 24, 3, 100)
+                .unwrap();
+        let narrow =
+            block_find_scroll_target(&[older.clone(), newer], &hit, 1, 8, 24, 3, 100).unwrap();
+        assert!(narrow > wide);
+
+        older.command = "opencode".into();
+        older.exit_code = Some(130);
+        let with_hints = block_find_scroll_target(&[older], &hit, 1, 8, 24, 3, 100).unwrap();
+        assert!(with_hints > 0, "resume hints must contribute visual rows");
     }
 
     #[test]

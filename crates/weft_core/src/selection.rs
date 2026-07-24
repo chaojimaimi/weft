@@ -250,7 +250,7 @@ impl Default for SelectionHandler {
 //
 // The classic `Selection` / `GridPos` model indexes the terminal Grid by
 // (row, col). In the Warp-style block view the visible content is laid out
-// from `Block.output` strings with a `pitch = cell_h * 1.1` row spacing plus
+// from `Block.output` strings with the same `pitch = cell_h` as the live grid plus
 // inserted Header / Separator / CWD rows and a scroll offset — so grid
 // coordinates and visible pixel positions no longer correspond, and a
 // grid-based copy lands on the wrong line (the user-visible "复制错位" bug).

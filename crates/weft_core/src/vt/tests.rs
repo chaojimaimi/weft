@@ -250,12 +250,17 @@ fn primary_screen_live_view_starts_at_the_owned_document_boundary() {
 
     assert!(terminal.primary_screen_app_active());
     assert_eq!(terminal.primary_screen_visible_row_start(), Some(5));
+    assert_eq!(
+        terminal.primary_screen_viewport_ownership(),
+        Some([false, false, false, false, false, false, true, false, false, false].as_slice())
+    );
     assert_eq!(terminal.grid().row_text(0), "pwdd");
     assert_eq!(terminal.grid().row_text(5), "");
     assert_eq!(terminal.grid().row_text(6), "Claude Code");
 
     terminal.grid_mut().scroll_offset = 1;
     assert_eq!(terminal.primary_screen_visible_row_start(), None);
+    assert_eq!(terminal.primary_screen_viewport_ownership(), None);
 }
 
 #[test]
@@ -328,6 +333,147 @@ fn primary_screen_absolute_boundary_survives_forward_and_reverse_scrolls() {
     assert!(!output.contains("older"));
     assert!(output.contains("answer one"));
     assert!(output.contains("answer two"));
+}
+
+#[test]
+fn primary_screen_ownership_follows_rows_into_scrollback() {
+    let mut terminal = Terminal::new(3, 24);
+    for (row, text) in ["old shell", "owned answer", "owned prompt"]
+        .into_iter()
+        .enumerate()
+    {
+        for (col, character) in text.chars().enumerate() {
+            terminal.grid_mut().viewport[row].cells[col].character = character;
+        }
+    }
+    terminal.capabilities.primary_screen_ownership.viewport = Some(vec![false, true, true]);
+
+    terminal.process(b"\x1b[S");
+    assert_eq!(
+        terminal.capabilities.primary_screen_ownership.scrollback,
+        vec![false]
+    );
+    assert_eq!(
+        terminal
+            .capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_deref(),
+        Some([true, true, false].as_slice())
+    );
+
+    terminal.process(b"\x1b[S");
+    assert_eq!(
+        terminal.capabilities.primary_screen_ownership.scrollback,
+        vec![false, true]
+    );
+    let snapshot = terminal
+        .grid()
+        .document_snapshot_from_position_with_ownership_masks(
+            0,
+            &terminal.capabilities.primary_screen_ownership.scrollback,
+            terminal
+                .capabilities
+                .primary_screen_ownership
+                .viewport
+                .as_deref()
+                .unwrap(),
+        )
+        .0;
+    assert!(!snapshot.contains("old shell"));
+    assert!(snapshot.contains("owned answer"));
+    assert!(snapshot.contains("owned prompt"));
+}
+
+#[test]
+fn primary_screen_ownership_resizes_with_dimension_only_primary_grid() {
+    let mut terminal = Terminal::new(3, 32);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[Hbanner\x1b[2;1Hprompt");
+    assert!(terminal.primary_screen_app_active());
+
+    terminal.resize(5, 32);
+    assert_eq!(
+        terminal
+            .capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_ref()
+            .map(Vec::len),
+        Some(5)
+    );
+    terminal.process(b"\x1b[5;1Hnewly exposed tail");
+    terminal.set_primary_history_view(true);
+    assert!(terminal
+        .block_tracker()
+        .in_flight()
+        .unwrap()
+        .output
+        .contains("newly exposed tail"));
+
+    terminal.set_primary_history_view(false);
+    terminal.resize(2, 32);
+    terminal.resize(5, 32);
+    assert_eq!(
+        terminal
+            .capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_deref(),
+        Some([true, true, false, false, false].as_slice())
+    );
+    terminal.process(b"\x1b[5;1Htail after shrink and grow");
+    terminal.set_primary_history_view(true);
+    assert!(terminal
+        .block_tracker()
+        .in_flight()
+        .unwrap()
+        .output
+        .contains("tail after shrink and grow"));
+}
+
+#[test]
+fn alt_screen_csi_3j_preserves_hidden_primary_scrollback_ownership() {
+    let mut terminal = Terminal::new(3, 24);
+    terminal.capabilities.primary_screen_ownership.viewport = Some(vec![true, true, true]);
+    terminal.process(b"one\r\ntwo\r\nthree\r\nfour");
+    terminal.capabilities.primary_screen_ownership.scrollback =
+        vec![true; terminal.grid().scrollback_len()];
+    terminal.process(b"\x1b[?1049h");
+    let hidden_scrollback = terminal.alt_grid.scrollback.len();
+    let hidden_ownership = terminal
+        .capabilities
+        .primary_screen_ownership
+        .scrollback
+        .clone();
+
+    terminal.process(b"alternate\x1b[3J");
+
+    assert_eq!(terminal.alt_grid.scrollback.len(), hidden_scrollback);
+    assert_eq!(
+        terminal.capabilities.primary_screen_ownership.scrollback,
+        hidden_ownership
+    );
+}
+
+#[test]
+fn runtime_scrollback_shrink_keeps_primary_ownership_suffix() {
+    let mut terminal = Terminal::new(2, 16);
+    terminal.process(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight");
+    let retained = terminal.grid().scrollback_len();
+    assert!(retained >= 4);
+    terminal.capabilities.primary_screen_ownership.scrollback =
+        (0..retained).map(|index| index % 2 == 1).collect();
+    let expected =
+        terminal.capabilities.primary_screen_ownership.scrollback[retained - 2..].to_vec();
+    terminal.process(b"\x1b[?1049h");
+
+    terminal.set_scrollback_max_lines(2);
+
+    assert_eq!(terminal.alt_grid.scrollback.len(), 2);
+    assert_eq!(
+        terminal.capabilities.primary_screen_ownership.scrollback,
+        expected
+    );
 }
 
 #[test]
@@ -522,6 +668,86 @@ fn frozen_primary_screen_candidate_survives_resize_before_any_cursor_address() {
 }
 
 #[test]
+fn candidate_ownership_reflows_with_startup_output_before_tui_takeover() {
+    let mut terminal = Terminal::new(6, 18);
+    terminal.process(b"old shell heading\r\nold shell body\r\n");
+    terminal
+        .process(b"\x1b]133;B\x07\x1b]133;C\x07startup linear output that wraps before takeover");
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.resize(6, 9);
+    terminal.process(b"\x1b[1;1Hbanner\x1b[6;1Hprompt");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(
+        output.contains("startup"),
+        "reflowed startup output was lost: {output:?}"
+    );
+    assert!(output.contains("banner"));
+    assert!(output.contains("prompt"));
+    assert!(
+        !output.contains("old shell"),
+        "stale rows leaked: {output:?}"
+    );
+}
+
+#[test]
+fn candidate_ownership_reflow_drops_the_same_overflow_prefix_as_grid() {
+    let mut terminal = Terminal::with_scrollback(4, 16, 2);
+    terminal.process(b"old shell one\r\nold shell two\r\nold shell three\r\n");
+    terminal.process(
+        b"\x1b]133;B\x07\x1b]133;C\x07owned-start-a owned-start-b owned-start-c owned-start-d",
+    );
+    assert!(!terminal.primary_screen_app_active());
+
+    terminal.resize(4, 5);
+    assert_eq!(
+        terminal
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .len(),
+        terminal.grid().scrollback.len(),
+        "ownership and grid must retain the same reflow suffix"
+    );
+    terminal.process(b"\x1b[1;1Hhead\x1b[4;1Htail");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(
+        !output.contains("old shell"),
+        "stale prefix leaked: {output:?}"
+    );
+    assert!(output.contains("head"));
+    assert!(output.contains("tail"));
+}
+
+#[test]
+fn hidden_primary_candidate_ownership_survives_height_resize_before_takeover() {
+    let mut terminal = Terminal::new(5, 24);
+    terminal.process(b"old shell heading\r\nold shell body\r\n");
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07startup");
+    terminal.process(b"\x1b[?1049h");
+
+    terminal.resize(8, 24);
+    terminal.process(b"\x1b[?1049l\x1b[1;1Hbanner\x1b[8;1Hprompt");
+    assert!(terminal.primary_screen_app_active());
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(output.contains("startup"));
+    assert!(output.contains("banner"));
+    assert!(output.contains("prompt"));
+    assert!(
+        !output.contains("old shell"),
+        "stale rows leaked: {output:?}"
+    );
+}
+
+#[test]
 fn ordinary_running_command_still_reflows_while_candidate_is_pending() {
     let mut terminal = Terminal::new(5, 12);
     terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07abcdefghijklmnop");
@@ -554,6 +780,62 @@ fn primary_screen_snapshot_excludes_rows_scrolled_before_tui_detection() {
 }
 
 #[test]
+fn primary_screen_snapshot_filters_untouched_rows_without_destroying_live_grid() {
+    let mut terminal = Terminal::new(8, 48);
+    terminal.process(
+        b"previous command\r\nstale table heading\r\nstale table row one\r\nstale table row two",
+    );
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07");
+
+    // Primary-screen TUIs frequently paint a banner at the top and their
+    // prompt/status near the bottom without explicitly clearing intervening
+    // shell rows. Two absolute cursor moves establish viewport ownership.
+    terminal.process(b"\x1b[HClaude banner\x1b[7;1Hprompt\x1b[8;1Hstatus");
+    assert!(terminal.primary_screen_app_active());
+    assert_eq!(terminal.grid().row_text(1), "stale table heading");
+    assert_eq!(terminal.grid().row_text(2), "stale table row one");
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert!(output.contains("Claude banner"));
+    assert!(output.contains("prompt"));
+    assert!(output.contains("status"));
+    assert!(
+        !output.contains("stale table"),
+        "stale rows leaked: {output:?}"
+    );
+}
+
+#[test]
+fn mouse_reporting_is_suspended_while_primary_screen_interrupt_settles() {
+    let mut terminal = Terminal::new(5, 48);
+    terminal
+        .process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[Hbanner\x1b[2;1Hprompt\x1b[?1003h\x1b[?1006h");
+    assert!(terminal.primary_screen_app_active());
+    assert!(terminal.accepts_mouse_reporting_input());
+
+    terminal.begin_primary_screen_interrupt_capture();
+    assert!(!terminal.accepts_mouse_reporting_input());
+
+    terminal.cancel_primary_screen_interrupt_capture();
+    assert!(terminal.accepts_mouse_reporting_input());
+
+    terminal.process(b"\x1b]133;D;130\x07\x1b]133;A\x07");
+    assert!(!terminal.accepts_mouse_reporting_input());
+    terminal.settle_primary_screen_exit();
+    assert_eq!(terminal.mouse_protocol(), MouseProtocol::Off);
+    assert!(!terminal.sgr_mouse());
+    assert!(!terminal.accepts_mouse_reporting_input());
+}
+
+#[test]
+fn alternate_screen_mouse_reporting_works_without_shell_markers() {
+    let mut terminal = Terminal::new(5, 48);
+    terminal.process(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+    assert!(terminal.accepts_mouse_reporting_input());
+}
+
+#[test]
 fn primary_screen_destructive_repaint_requires_a_synchronized_frame() {
     let mut terminal = Terminal::new(6, 40);
     terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[Hprogress\x1b[2;1Hmore");
@@ -583,6 +865,30 @@ fn synchronized_full_repaint_discards_superseded_primary_screen_scrollback() {
         "superseded frame leaked: {output:?}"
     );
     assert!(output.contains("new banner"));
+}
+
+#[test]
+fn legal_repeated_rows_survive_after_atomic_repaint_evidence() {
+    let mut terminal = Terminal::new(16, 72);
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    terminal.process(b"\x1b[?2026h\x1b[2J\x1b[?2026l");
+    assert!(terminal.primary_screen_repaint_capable());
+    let row = b"legal repeated table row with important user-visible content";
+    for index in 0..6 {
+        terminal.process(format!("\x1b[{};1H", index + 1).as_bytes());
+        terminal.process(row);
+        terminal.process(format!("\x1b[{};1H", index + 9).as_bytes());
+        terminal.process(row);
+    }
+    terminal.set_primary_history_view(true);
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    assert_eq!(
+        output
+            .matches("legal repeated table row with important user-visible content")
+            .count(),
+        12
+    );
 }
 
 #[test]
@@ -1472,9 +1778,9 @@ fn delete_chars_csi() {
 fn dec_private_cursor_keys() {
     let mut t = term();
     t.process(b"\x1b[?1h");
-    assert!(t.app_cursor_keys);
+    assert!(t.app_cursor_keys());
     t.process(b"\x1b[?1l");
-    assert!(!t.app_cursor_keys);
+    assert!(!t.app_cursor_keys());
 }
 
 #[test]
@@ -1492,12 +1798,12 @@ fn vim_mouse_a_sequence_enables_sgr_button_event_reporting() {
     // Captured from macOS Vim 9.1 after `:set mouse=a`.
     t.process(b"\x1b[?1049h\x1b[?1006;1000h\x1b[?1002h");
     assert!(t.is_alt_screen_active());
-    assert_eq!(t.mouse_protocol, MouseProtocol::ButtonEvent);
-    assert!(t.sgr_mouse);
+    assert_eq!(t.mouse_protocol(), MouseProtocol::ButtonEvent);
+    assert!(t.sgr_mouse());
 
     t.process(b"\x1b[?1006;1000l\x1b[?1002l");
-    assert_eq!(t.mouse_protocol, MouseProtocol::Off);
-    assert!(!t.sgr_mouse);
+    assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+    assert!(!t.sgr_mouse());
 }
 
 // ── Full reset ───────────────────────────────────────────────
@@ -1506,9 +1812,9 @@ fn vim_mouse_a_sequence_enables_sgr_button_event_reporting() {
 fn ris_full_reset() {
     let mut t = term();
     t.process(b"\x1b[31mX\x1b[?1h");
-    assert!(t.app_cursor_keys);
+    assert!(t.app_cursor_keys());
     t.process(b"\x1bc");
-    assert!(!t.app_cursor_keys);
+    assert!(!t.app_cursor_keys());
     assert_eq!(t.grid().cell(0, 0).character, ' ');
 }
 

@@ -120,4 +120,21 @@ mod tests {
             "final"
         );
     }
+
+    #[test]
+    fn scrolling_to_history_tail_keeps_detached_view_until_explicit_snap() {
+        let mut tab = primary_tui_tab();
+        tab.scroll_up_by(1);
+        assert!(tab.terminal.as_ref().unwrap().primary_history_view());
+
+        tab.scroll_down_by(1);
+        assert_eq!(tab.block_scroll(), 0);
+        assert!(
+            tab.terminal.as_ref().unwrap().primary_history_view(),
+            "offset zero must not switch rendering models during wheel scroll"
+        );
+
+        tab.snap_to_bottom();
+        assert!(!tab.terminal.as_ref().unwrap().primary_history_view());
+    }
 }

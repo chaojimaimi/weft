@@ -314,7 +314,9 @@ impl InputHandler {
     }
 
     fn encode_tab(&self, mods: Modifiers) -> Vec<u8> {
-        if mods.contains(Modifiers::ALT) {
+        if mods.contains(Modifiers::SHIFT) {
+            b"\x1b[Z".to_vec()
+        } else if mods.contains(Modifiers::ALT) {
             vec![0x1B, b'\t']
         } else {
             vec![b'\t']

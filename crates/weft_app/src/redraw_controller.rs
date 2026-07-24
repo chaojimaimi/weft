@@ -39,7 +39,12 @@ impl App {
                 .active()
                 .terminal
                 .as_ref()
-                .map(|t| t.block_tracker().phase() == ShellPhase::CommandExecuting)
+                .map(|t| {
+                    crate::block_component::should_follow_running_output(
+                        t.block_tracker().phase(),
+                        t.primary_history_view(),
+                    )
+                })
                 .unwrap_or(false);
             if snap_to_bottom {
                 self.sessions.active_mut().snap_to_bottom();
@@ -291,7 +296,7 @@ impl App {
                 let cols = terminal.grid().num_cols;
                 let (total, _) =
                     block_content_metrics(terminal, cols, renderer.block_header_rows());
-                let prompt_lines = terminal.editor().buffer.lines.len();
+                let prompt_lines = crate::block_component::block_prompt_lines(terminal);
                 let cwd_header = crate::layout::block_cwd_header_active(
                     terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
                     terminal.cwd().is_some(),
@@ -427,6 +432,9 @@ impl App {
                 self.interaction.scrollbar_hovered || self.interaction.scrollbar_drag.is_some(),
                 &tab_bar,
             );
+            if let (Some(window), Some(ctx)) = (self.window.as_ref(), renderer.layout_ctx) {
+                crate::ime::update_cursor_area(window, ctx, terminal);
+            }
             // Flicker fix (Step 2): update the shared flag so the blink
             // timer thread knows whether to keep waking the loop. In
             // block view the caret only animates at the prompt; in grid

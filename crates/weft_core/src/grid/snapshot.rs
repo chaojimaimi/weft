@@ -122,7 +122,12 @@ impl Grid {
     }
 
     pub fn document_snapshot_from(&self, scrollback_start: u64) -> (String, StyledOutput) {
-        self.document_snapshot_from_indices(self.scrollback.index_since(scrollback_start), 0)
+        self.document_snapshot_from_indices(
+            self.scrollback.index_since(scrollback_start),
+            0,
+            None,
+            None,
+        )
     }
 
     pub fn document_snapshot_from_position(&self, document_start: u64) -> (String, StyledOutput) {
@@ -135,20 +140,54 @@ impl Grid {
                 document_start.saturating_sub(viewport_origin) as usize,
             )
         };
-        self.document_snapshot_from_indices(scrollback_start, viewport_start)
+        self.document_snapshot_from_indices(scrollback_start, viewport_start, None, None)
+    }
+
+    /// Snapshot a primary-screen document while omitting retained rows that
+    /// the current application has never owned. Filtering is deliberately
+    /// non-destructive: the live Grid keeps shell context needed by terminal
+    /// emulation, while detached history sees only application output.
+    pub(crate) fn document_snapshot_from_position_with_ownership_masks(
+        &self,
+        document_start: u64,
+        scrollback_owned: &[bool],
+        viewport_owned: &[bool],
+    ) -> (String, StyledOutput) {
+        let viewport_origin = self.scrollback.position();
+        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
+            (self.scrollback.index_since(document_start), 0)
+        } else {
+            (
+                self.scrollback.len(),
+                document_start.saturating_sub(viewport_origin) as usize,
+            )
+        };
+        self.document_snapshot_from_indices(
+            scrollback_start,
+            viewport_start,
+            Some(scrollback_owned),
+            Some(viewport_owned),
+        )
     }
 
     fn document_snapshot_from_indices(
         &self,
         scrollback_start: usize,
         viewport_start: usize,
+        scrollback_owned: Option<&[bool]>,
+        viewport_owned: Option<&[bool]>,
     ) -> (String, StyledOutput) {
-        let scrollback =
-            (scrollback_start..self.scrollback.len()).filter_map(|i| self.scrollback.get(i));
+        let scrollback = (scrollback_start..self.scrollback.len()).filter_map(|index| {
+            scrollback_owned
+                .map_or(true, |owned| owned.get(index).copied().unwrap_or(false))
+                .then(|| self.scrollback.get(index))
+                .flatten()
+        });
         let viewport = self
             .viewport
             .iter()
             .take(self.num_rows)
+            .enumerate()
             .skip(viewport_start.min(self.num_rows));
         let mut text = String::new();
         let mut lines = Vec::new();
@@ -157,7 +196,11 @@ impl Grid {
         let mut started = false;
         let mut pending_empty = 0_usize;
         let mut line_index = 0_usize;
-        for row in scrollback.chain(viewport) {
+        for row in scrollback.chain(viewport.filter_map(|(index, row)| {
+            viewport_owned
+                .map_or(true, |owned| owned.get(index).copied().unwrap_or(false))
+                .then_some(row)
+        })) {
             let style_budget =
                 style_enabled.then(|| MAX_SNAPSHOT_COLOR_SPANS.saturating_sub(span_count));
             let row = styled_row(
@@ -199,11 +242,15 @@ impl Grid {
             if row.style_overflow {
                 style_enabled = false;
                 lines.clear();
-            } else if style_enabled && !row.foregrounds.is_empty() {
-                span_count = span_count.saturating_add(row.foregrounds.len());
+            } else if style_enabled && (!row.foregrounds.is_empty() || !row.backgrounds.is_empty())
+            {
+                span_count = span_count
+                    .saturating_add(row.foregrounds.len())
+                    .saturating_add(row.backgrounds.len());
                 lines.push(StyledLine {
                     line: line_index as u32,
                     foregrounds: row.foregrounds,
+                    backgrounds: row.backgrounds,
                 });
             }
         }
@@ -214,6 +261,7 @@ impl Grid {
 struct SnapshotRow {
     text: String,
     foregrounds: Vec<ForegroundSpan>,
+    backgrounds: Vec<ForegroundSpan>,
     text_overflow: bool,
     style_overflow: bool,
 }
@@ -238,6 +286,34 @@ fn mark_snapshot_truncated(text: &mut String) {
     }
 }
 
+fn push_color_span(
+    spans: &mut Vec<ForegroundSpan>,
+    color: crate::grid::CellColor,
+    char_index: u32,
+    used: &mut usize,
+    budget: usize,
+) -> bool {
+    if color == crate::grid::CellColor::Default {
+        return true;
+    }
+    if let Some(span) = spans.last_mut() {
+        if span.end == char_index && span.color == color {
+            span.end += 1;
+            return true;
+        }
+    }
+    if *used >= budget {
+        return false;
+    }
+    spans.push(ForegroundSpan {
+        start: char_index,
+        end: char_index + 1,
+        color,
+    });
+    *used += 1;
+    true
+}
+
 fn styled_row(
     row: &Row,
     num_cols: usize,
@@ -253,9 +329,11 @@ fn styled_row(
         .unwrap_or(0);
     let mut text = String::with_capacity(last.min(text_budget));
     let mut foregrounds: Vec<ForegroundSpan> = Vec::new();
+    let mut backgrounds: Vec<ForegroundSpan> = Vec::new();
     let mut char_index = 0_u32;
     let mut text_overflow = false;
     let mut style_overflow = false;
+    let mut style_spans_used = 0_usize;
     for cell in row.cells.iter().take(last) {
         if !cell.flags.contains(CellFlags::WIDE_SPACER) {
             let character = if cell.character == '\0' {
@@ -268,31 +346,20 @@ fn styled_row(
                 break;
             }
             text.push(character);
-            if style_budget.is_some()
-                && !style_overflow
-                && cell.fg != crate::grid::CellColor::Default
-            {
-                if let Some(span) = foregrounds.last_mut() {
-                    if span.end == char_index && span.color == cell.fg {
-                        span.end += 1;
-                    } else if foregrounds.len() < style_budget.unwrap_or(0) {
-                        foregrounds.push(ForegroundSpan {
-                            start: char_index,
-                            end: char_index + 1,
-                            color: cell.fg,
-                        });
-                    } else {
-                        style_overflow = true;
-                    }
-                } else if foregrounds.len() < style_budget.unwrap_or(0) {
-                    foregrounds.push(ForegroundSpan {
-                        start: char_index,
-                        end: char_index + 1,
-                        color: cell.fg,
-                    });
-                } else {
-                    style_overflow = true;
-                }
+            if let Some(style_budget) = style_budget.filter(|_| !style_overflow) {
+                style_overflow = !push_color_span(
+                    &mut foregrounds,
+                    cell.fg,
+                    char_index,
+                    &mut style_spans_used,
+                    style_budget,
+                ) || !push_color_span(
+                    &mut backgrounds,
+                    cell.bg,
+                    char_index,
+                    &mut style_spans_used,
+                    style_budget,
+                );
             }
             char_index += 1;
         }
@@ -300,6 +367,7 @@ fn styled_row(
     SnapshotRow {
         text,
         foregrounds,
+        backgrounds,
         text_overflow,
         style_overflow,
     }
@@ -404,6 +472,48 @@ mod tests {
     }
 
     #[test]
+    fn owned_viewport_snapshot_omits_stale_rows_without_mutating_grid() {
+        let mut grid = Grid::with_scrollback(5, 24, 16);
+        grid.viewport[0] = row("Claude banner", 24);
+        grid.viewport[1] = row("stale shell table", 24);
+        grid.viewport[2] = row("restored answer", 24);
+        grid.viewport[3] = row("stale shell footer", 24);
+        grid.viewport[4] = row("prompt", 24);
+        let owned = [true, false, true, false, true];
+
+        let snapshot = grid
+            .document_snapshot_from_position_with_ownership_masks(0, &[], &owned)
+            .0;
+
+        assert_eq!(snapshot, "Claude banner\nrestored answer\nprompt");
+        assert_eq!(grid.row_text(1), "stale shell table");
+        assert_eq!(grid.row_text(3), "stale shell footer");
+    }
+
+    #[test]
+    fn owned_snapshot_filters_scrollback_and_viewport_with_aligned_masks() {
+        let mut grid = Grid::with_scrollback(3, 24, 16);
+        grid.scrollback.push(row("old shell context", 24));
+        grid.scrollback.push(row("owned answer page", 24));
+        grid.viewport[0] = row("owned answer tail", 24);
+        grid.viewport[1] = row("stale shell footer", 24);
+        grid.viewport[2] = row("owned prompt", 24);
+
+        let snapshot = grid
+            .document_snapshot_from_position_with_ownership_masks(
+                0,
+                &[false, true],
+                &[true, false, true],
+            )
+            .0;
+
+        assert_eq!(
+            snapshot,
+            "owned answer page\nowned answer tail\nowned prompt"
+        );
+    }
+
+    #[test]
     fn reflow_maps_a_blank_boundary_after_wrapped_shell_rows() {
         let mut grid = Grid::with_scrollback(5, 12, 16);
         grid.viewport[0] = row("old shell", 12);
@@ -432,6 +542,7 @@ mod tests {
         styled.cells[1].character = '中';
         styled.cells[1].width = crate::grid::CellWidth::Full;
         styled.cells[1].fg = crate::grid::CellColor::Rgb(crate::grid::Color::rgb(2, 3, 4));
+        styled.cells[1].bg = crate::grid::CellColor::Palette(7);
         styled.cells[2].flags.insert(CellFlags::WIDE_SPACER);
         styled.cells[3].character = 'B';
         styled.cells[3].fg = crate::grid::CellColor::Palette(5);
@@ -454,6 +565,12 @@ mod tests {
             line.foreground_at(2),
             Some(crate::grid::CellColor::Palette(5))
         );
+        assert_eq!(line.background_at(0), None);
+        assert_eq!(
+            line.background_at(1),
+            Some(crate::grid::CellColor::Palette(7))
+        );
+        assert_eq!(line.background_at(2), None);
     }
 
     #[test]

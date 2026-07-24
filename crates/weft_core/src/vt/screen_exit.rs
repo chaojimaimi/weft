@@ -2,33 +2,37 @@ use super::Terminal;
 use crate::blocks::{OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
 use std::time::{Duration, Instant};
 
+mod ownership;
+
+pub(in crate::vt) use ownership::PrimaryScreenOwnership;
+
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
 pub const PRIMARY_HISTORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 
-pub(super) struct PendingPrimaryScreenExit {
-    exit_code: Option<i32>,
-    last_activity: Instant,
+pub(in crate::vt) struct PendingPrimaryScreenExit {
+    pub(in crate::vt) exit_code: Option<i32>,
+    pub(in crate::vt) last_activity: Instant,
 }
 
-pub(super) struct PrimaryScreenInterruptCapture {
-    frozen_text: String,
-    frozen_styled: StyledOutput,
-    tail: OutputCapture,
-    origin_row: Option<usize>,
+pub(in crate::vt) struct PrimaryScreenInterruptCapture {
+    pub(in crate::vt) frozen_text: String,
+    pub(in crate::vt) frozen_styled: StyledOutput,
+    pub(in crate::vt) tail: OutputCapture,
+    pub(in crate::vt) origin_row: Option<usize>,
 }
 
 impl Terminal {
     /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
     /// repeatedly use absolute cursor addressing to own the whole viewport.
     pub fn primary_screen_app_active(&self) -> bool {
-        !self.alt_active
+        !self.capabilities.alt_active
             && self.block_tracker.phase() == ShellPhase::CommandExecuting
-            && self.primary_screen_cursor_ops >= 2
+            && self.capabilities.primary_screen_cursor_ops >= 2
     }
 
     /// Whether this primary-screen owner has demonstrated atomic full-frame repainting.
     pub fn primary_screen_repaint_capable(&self) -> bool {
-        self.primary_screen_app_active() && self.primary_screen_synchronized_frame_seen
+        self.primary_screen_app_active() && self.capabilities.primary_screen_synchronized_frame_seen
     }
 
     pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
@@ -42,21 +46,21 @@ impl Terminal {
             if complete_primary_frame {
                 self.discard_superseded_primary_screen_frame();
             }
-            self.primary_screen_synchronized_frame_seen |= complete_primary_frame;
+            self.capabilities.primary_screen_synchronized_frame_seen |= complete_primary_frame;
         }
     }
 
     pub(super) fn reset_primary_screen_synchronized_frame(&mut self) {
         self.synchronized_output_started = None;
         self.synchronized_frame_cleared_rows = 0;
-        self.primary_screen_synchronized_frame_seen = false;
+        self.capabilities.primary_screen_synchronized_frame_seen = false;
     }
 
     pub(super) fn note_primary_screen_full_erase(&mut self) {
-        if !self.alt_active {
+        if !self.capabilities.alt_active {
             self.include_primary_screen_viewport_row(0);
         }
-        if self.synchronized_output_started.is_some() && !self.alt_active {
+        if self.synchronized_output_started.is_some() && !self.capabilities.alt_active {
             self.synchronized_frame_cleared_rows = self.grid.num_rows;
             if self.primary_screen_app_active() {
                 self.discard_superseded_primary_screen_frame();
@@ -65,11 +69,11 @@ impl Terminal {
     }
 
     pub(super) fn note_primary_screen_line_erase(&mut self) {
-        if !self.alt_active {
+        if !self.capabilities.alt_active {
             self.include_primary_screen_viewport_row(self.grid.cursor.row);
         }
         if self.synchronized_output_started.is_some()
-            && !self.alt_active
+            && !self.capabilities.alt_active
             && self.grid.cursor.row == self.synchronized_frame_cleared_rows
         {
             self.synchronized_frame_cleared_rows += 1;
@@ -77,8 +81,13 @@ impl Terminal {
     }
 
     pub(super) fn note_primary_screen_cursor_addressing(&mut self) {
-        if !self.alt_active && self.block_tracker.phase() == ShellPhase::CommandExecuting {
-            self.primary_screen_cursor_ops = self.primary_screen_cursor_ops.saturating_add(1);
+        if !self.capabilities.alt_active
+            && self.block_tracker.phase() == ShellPhase::CommandExecuting
+        {
+            self.capabilities.primary_screen_cursor_ops = self
+                .capabilities
+                .primary_screen_cursor_ops
+                .saturating_add(1);
             if self.primary_screen_app_active() {
                 self.begin_primary_screen_output_capture();
             }
@@ -86,15 +95,16 @@ impl Terminal {
     }
 
     pub fn begin_primary_screen_interrupt_capture(&mut self) {
-        if !self.primary_screen_app_active() || self.primary_screen_interrupt_capture.is_some() {
+        if !self.primary_screen_app_active()
+            || self.capabilities.primary_screen_interrupt_capture.is_some()
+        {
             return;
         }
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
-        let (frozen_text, frozen_styled) =
-            self.grid.document_snapshot_from_position(document_start);
-        self.primary_screen_interrupt_capture = Some(PrimaryScreenInterruptCapture {
+        let (frozen_text, frozen_styled) = self.primary_screen_document_snapshot(document_start);
+        self.capabilities.primary_screen_interrupt_capture = Some(PrimaryScreenInterruptCapture {
             frozen_text,
             frozen_styled,
             tail: OutputCapture::default(),
@@ -104,47 +114,59 @@ impl Terminal {
     }
 
     pub fn cancel_primary_screen_interrupt_capture(&mut self) {
-        self.primary_screen_interrupt_capture = None;
+        self.capabilities.primary_screen_interrupt_capture = None;
+    }
+
+    /// Mouse protocol bytes are meaningful only while the TUI still owns the
+    /// PTY. During Ctrl-C settlement they can race behind the exit marker and
+    /// become literal `48;x;yM` shell input, so suspend reporting until the
+    /// application either continues or the command is finalized.
+    pub fn accepts_mouse_reporting_input(&self) -> bool {
+        self.capabilities.mouse_protocol != crate::input::MouseProtocol::Off
+            && (self.capabilities.alt_active
+                || self.block_tracker.phase() == ShellPhase::CommandExecuting)
+            && self.capabilities.primary_screen_interrupt_capture.is_none()
+            && self.capabilities.primary_screen_exit.is_none()
     }
 
     pub(super) fn capture_primary_screen_interrupt_print(&mut self, c: char) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.print(c, MAX_OUTPUT_BYTES);
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_ascii(&mut self, bytes: &[u8]) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.print_ascii(bytes, MAX_OUTPUT_BYTES);
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_newline(&mut self) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.newline(MAX_OUTPUT_BYTES);
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_carriage_return(&mut self) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.carriage_return();
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_backspace(&mut self) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.backspace();
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_erase_line(&mut self, mode: u16) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             capture.tail.erase_line(mode);
         }
     }
 
     pub(super) fn capture_primary_screen_interrupt_cursor_position(&mut self, clear_line: bool) {
-        if let Some(capture) = &mut self.primary_screen_interrupt_capture {
+        if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
             let origin_row = *capture.origin_row.get_or_insert(self.grid.cursor.row);
             let row = self.grid.cursor.row.saturating_sub(origin_row);
             let col = self.grid.cursor.col;
@@ -157,9 +179,9 @@ impl Terminal {
     }
 
     pub(super) fn discard_superseded_primary_screen_frame(&mut self) {
-        self.grid.clear_scrollback();
+        self.clear_primary_screen_scrollback();
         let origin = self.grid.scrollback.position();
-        self.primary_screen_document_candidate = origin;
+        self.capabilities.primary_screen_document_candidate = origin;
         if self.block_tracker.screen_document_start().is_some() {
             self.block_tracker.set_screen_document_start(origin);
         }
@@ -191,7 +213,7 @@ impl Terminal {
             count,
             down,
         );
-        if self.alt_active {
+        if self.capabilities.alt_active {
             self.grid.discard_scroll_and_dirty_all();
         }
         if !self.hyperlinks.cell_map_is_empty() {
@@ -201,25 +223,41 @@ impl Terminal {
 
     pub(super) fn begin_primary_screen_output_capture(&mut self) {
         self.block_tracker
-            .begin_screen_owned_output(self.primary_screen_document_candidate);
+            .begin_screen_owned_output(self.capabilities.primary_screen_document_candidate);
     }
 
-    pub(super) fn reflow_primary_screen_candidate(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        hidden: bool,
-    ) {
-        let grid = if hidden {
+    fn primary_screen_document_snapshot(&self, document_start: u64) -> (String, StyledOutput) {
+        self.capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_ref()
+            .map_or_else(
+                || self.grid.document_snapshot_from_position(document_start),
+                |owned| {
+                    self.grid
+                        .document_snapshot_from_position_with_ownership_masks(
+                            document_start,
+                            &self.capabilities.primary_screen_ownership.scrollback,
+                            owned,
+                        )
+                },
+            )
+    }
+
+    /// Apply a runtime scrollback limit to the primary grid and its ownership
+    /// mask as one transaction. The primary grid is hidden in `alt_grid`
+    /// while an alternate-screen application is active.
+    pub fn set_scrollback_max_lines(&mut self, max_lines: usize) {
+        let primary = if self.capabilities.alt_active {
             &mut self.alt_grid
         } else {
             &mut self.grid
         };
-        self.primary_screen_document_candidate = grid.resize_preserving_document_position(
-            self.primary_screen_document_candidate,
-            rows,
-            cols,
-        );
+        let cols = primary.num_cols;
+        primary.scrollback.set_max_lines(max_lines, cols);
+        self.capabilities
+            .primary_screen_ownership
+            .retain_scrollback_suffix(primary.scrollback.len());
     }
 
     /// Freeze the shell/TUI boundary at OSC 133;B, before the launched
@@ -229,26 +267,36 @@ impl Terminal {
             .rev()
             .find(|&row| !self.grid.row_text(row).trim().is_empty())
             .map_or(0, |row| row.saturating_add(1));
-        self.primary_screen_document_candidate = self
+        self.capabilities.primary_screen_document_candidate = self
             .grid
             .scrollback
             .position()
             .saturating_add(viewport_start as u64);
+        self.capabilities.primary_screen_ownership.scrollback =
+            vec![false; self.grid.scrollback.len()];
+        self.capabilities.primary_screen_ownership.viewport = Some(vec![false; self.grid.num_rows]);
         tracing::debug!(
             viewport_start,
-            document_start = self.primary_screen_document_candidate,
+            document_start = self.capabilities.primary_screen_document_candidate,
             "primary-screen document boundary"
         );
     }
 
     pub(super) fn include_primary_screen_viewport_row(&mut self, row: usize) {
-        if self.alt_active {
+        if self.capabilities.alt_active {
             return;
+        }
+        if let Some(touched) = &mut self.capabilities.primary_screen_ownership.viewport {
+            if let Some(owned) = touched.get_mut(row) {
+                *owned = true;
+            }
         }
         let position = self.grid.scrollback.position().saturating_add(row as u64);
         if self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting {
-            self.primary_screen_document_candidate =
-                self.primary_screen_document_candidate.min(position);
+            self.capabilities.primary_screen_document_candidate = self
+                .capabilities
+                .primary_screen_document_candidate
+                .min(position);
         }
         self.block_tracker
             .include_screen_document_position(position);
@@ -263,20 +311,60 @@ impl Terminal {
         count: usize,
         down: bool,
     ) {
-        if self.alt_active {
+        if self.capabilities.alt_active {
             return;
         }
         let transform = |start| {
             transform_document_start(start, origin_before, origin_after, top, bottom, count, down)
         };
         if self.block_tracker.phase() == crate::blocks::ShellPhase::CommandExecuting {
-            self.primary_screen_document_candidate =
-                transform(self.primary_screen_document_candidate);
+            self.capabilities.primary_screen_document_candidate =
+                transform(self.capabilities.primary_screen_document_candidate);
         }
         if let Some(start) = self.block_tracker.screen_document_start() {
             self.block_tracker
                 .set_screen_document_start(transform(start));
         }
+        if let Some(owned) = &mut self.capabilities.primary_screen_ownership.viewport {
+            let pushed = origin_after.saturating_sub(origin_before) as usize;
+            if !down && top == 0 && pushed > 0 {
+                self.capabilities
+                    .primary_screen_ownership
+                    .scrollback
+                    .extend(owned.iter().take(pushed.min(owned.len())).copied());
+                if self.capabilities.primary_screen_ownership.scrollback.len()
+                    > self.grid.scrollback.len()
+                {
+                    let expired = self
+                        .capabilities
+                        .primary_screen_ownership
+                        .scrollback
+                        .len()
+                        .saturating_sub(self.grid.scrollback.len());
+                    self.capabilities
+                        .primary_screen_ownership
+                        .scrollback
+                        .drain(..expired);
+                }
+                while self.capabilities.primary_screen_ownership.scrollback.len()
+                    < self.grid.scrollback.len()
+                {
+                    self.capabilities
+                        .primary_screen_ownership
+                        .scrollback
+                        .insert(0, false);
+                }
+            }
+            transform_viewport_ownership(owned, top, bottom, count, down);
+        }
+    }
+
+    pub(super) fn clear_primary_screen_scrollback(&mut self) {
+        self.grid.clear_scrollback();
+        self.capabilities
+            .primary_screen_ownership
+            .scrollback
+            .clear();
     }
 
     pub(super) fn index_primary_screen(&mut self) -> bool {
@@ -335,13 +423,13 @@ impl Terminal {
 
     pub fn show_block_view(&self) -> bool {
         self.block_tracker.bootstrap_ready()
-            && !self.alt_active
+            && !self.capabilities.alt_active
             && !self.primary_screen_exit_pending()
-            && (!self.primary_screen_app_active() || self.primary_history_view)
+            && (!self.primary_screen_app_active() || self.capabilities.primary_history_view)
     }
 
     pub fn primary_screen_exit_pending(&self) -> bool {
-        self.primary_screen_exit.is_some()
+        self.capabilities.primary_screen_exit.is_some()
     }
 
     /// First viewport row owned by the active primary-screen application.
@@ -352,7 +440,7 @@ impl Terminal {
     /// the application's frame.
     pub fn primary_screen_visible_row_start(&self) -> Option<usize> {
         let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
-        if self.alt_active || !owns_live_view || self.grid.scroll_offset > 0 {
+        if self.capabilities.alt_active || !owns_live_view || self.grid.scroll_offset > 0 {
             return None;
         }
         self.block_tracker.screen_document_start().map(|start| {
@@ -364,21 +452,38 @@ impl Terminal {
         })
     }
 
+    /// Rows currently owned by a primary-screen application for live paint.
+    ///
+    /// This is a rendering policy only: unowned shell rows remain in the Grid
+    /// so a sparse, multi-stage TUI repaint cannot destroy data needed by a
+    /// later stage or by detached history capture.
+    pub fn primary_screen_viewport_ownership(&self) -> Option<&[bool]> {
+        let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
+        (!self.capabilities.alt_active && owns_live_view && self.grid.scroll_offset == 0)
+            .then_some(
+                self.capabilities
+                    .primary_screen_ownership
+                    .viewport
+                    .as_deref(),
+            )
+            .flatten()
+    }
+
     pub fn primary_history_view(&self) -> bool {
-        self.primary_history_view
+        self.capabilities.primary_history_view
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
-        let entering = active && !self.primary_history_view;
-        self.primary_history_view = active;
+        let entering = active && !self.capabilities.primary_history_view;
+        self.capabilities.primary_history_view = active;
         if active {
             self.grid.scroll_offset = 0;
         } else {
-            self.primary_history_snapshot_at = None;
+            self.capabilities.primary_history_snapshot_at = None;
         }
         if entering && self.primary_screen_app_active() {
             self.snapshot_primary_screen_output();
-            self.primary_history_snapshot_at = Some(Instant::now());
+            self.capabilities.primary_history_snapshot_at = Some(Instant::now());
             tracing::debug!(
                 bytes = self
                     .block_tracker
@@ -397,21 +502,25 @@ impl Terminal {
     }
 
     pub(super) fn refresh_primary_history_snapshot_at(&mut self, now: Instant) -> bool {
-        if !self.primary_history_view || !self.primary_screen_app_active() {
+        if !self.capabilities.primary_history_view || !self.primary_screen_app_active() {
             return false;
         }
-        if self.primary_history_snapshot_at.is_some_and(|previous| {
-            now.saturating_duration_since(previous) < PRIMARY_HISTORY_SNAPSHOT_INTERVAL
-        }) {
+        if self
+            .capabilities
+            .primary_history_snapshot_at
+            .is_some_and(|previous| {
+                now.saturating_duration_since(previous) < PRIMARY_HISTORY_SNAPSHOT_INTERVAL
+            })
+        {
             return false;
         }
         self.snapshot_primary_screen_output();
-        self.primary_history_snapshot_at = Some(now);
+        self.capabilities.primary_history_snapshot_at = Some(now);
         true
     }
 
     pub(super) fn snapshot_primary_screen_output(&mut self) {
-        if let Some(capture) = &self.primary_screen_interrupt_capture {
+        if let Some(capture) = &self.capabilities.primary_screen_interrupt_capture {
             let (text, styled) = merge_primary_screen_interrupt_tail(
                 capture.frozen_text.clone(),
                 capture.frozen_styled.clone(),
@@ -423,14 +532,14 @@ impl Terminal {
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
-        let (text, styled) = self.grid.document_snapshot_from_position(document_start);
+        let (text, styled) = self.primary_screen_document_snapshot(document_start);
         let (text, styled) = space_primary_screen_exit_tail(text, styled);
         self.block_tracker.replace_screen_snapshot(&text, styled);
     }
 
     pub(super) fn defer_primary_screen_exit(&mut self, exit_code: Option<i32>) {
         self.block_tracker.defer_screen_command_end();
-        self.primary_screen_exit = Some(PendingPrimaryScreenExit {
+        self.capabilities.primary_screen_exit = Some(PendingPrimaryScreenExit {
             exit_code,
             last_activity: Instant::now(),
         });
@@ -442,7 +551,7 @@ impl Terminal {
     }
 
     pub(super) fn note_primary_screen_exit_activity(&mut self) {
-        if let Some(pending) = &mut self.primary_screen_exit {
+        if let Some(pending) = &mut self.capabilities.primary_screen_exit {
             pending.last_activity = Instant::now();
         }
     }
@@ -451,7 +560,10 @@ impl Terminal {
     /// without first issuing EL. Clear the old row before that first scalar so
     /// shorter status/resume lines cannot retain stale suffix cells.
     pub(super) fn prepare_primary_screen_exit_row_overwrite(&mut self) {
-        if self.primary_screen_exit.is_some() && !self.alt_active && self.grid.cursor.col == 0 {
+        if self.capabilities.primary_screen_exit.is_some()
+            && !self.capabilities.alt_active
+            && self.grid.cursor.col == 0
+        {
             let row = self.grid.cursor.row;
             self.grid.clear_line_all();
             self.hyperlinks.unlink_row(row);
@@ -459,20 +571,30 @@ impl Terminal {
     }
 
     pub fn settle_primary_screen_exit_if_idle(&mut self, now: Instant) -> bool {
-        let ready = self.primary_screen_exit.as_ref().is_some_and(|pending| {
-            now.saturating_duration_since(pending.last_activity) >= PRIMARY_SCREEN_EXIT_SETTLE_DELAY
-        });
+        let ready = self
+            .capabilities
+            .primary_screen_exit
+            .as_ref()
+            .is_some_and(|pending| {
+                now.saturating_duration_since(pending.last_activity)
+                    >= PRIMARY_SCREEN_EXIT_SETTLE_DELAY
+            });
         ready && self.settle_primary_screen_exit()
     }
 
     pub fn settle_primary_screen_exit(&mut self) -> bool {
-        let Some(pending) = self.primary_screen_exit.take() else {
+        let Some(pending) = self.capabilities.primary_screen_exit.take() else {
             return false;
         };
         self.snapshot_primary_screen_output();
         self.block_tracker
             .finish_deferred_screen_command(pending.exit_code);
-        self.primary_screen_interrupt_capture = None;
+        self.capabilities.primary_screen_interrupt_capture = None;
+        // A killed TUI is not guaranteed to emit DEC mouse-mode resets. Do
+        // not let stale reporting state turn later shell clicks into literal
+        // SGR mouse coordinates such as `48;62;25M`.
+        self.capabilities.mouse_protocol = crate::input::MouseProtocol::Off;
+        self.capabilities.sgr_mouse = false;
         tracing::info!(
             exit_code = ?pending.exit_code,
             "settled primary-screen command finalization"
@@ -521,6 +643,30 @@ fn line_marker_start(text: &str, marker: &str) -> Option<usize> {
     text.match_indices(marker)
         .map(|(start, _)| start)
         .find(|&start| start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n'))
+}
+
+fn transform_viewport_ownership(
+    owned: &mut [bool],
+    top: usize,
+    bottom: usize,
+    count: usize,
+    down: bool,
+) {
+    let Some(region) = owned.get_mut(top..=bottom) else {
+        return;
+    };
+    let count = count.min(region.len());
+    if count == 0 {
+        return;
+    }
+    if down {
+        region.rotate_right(count);
+        region[..count].fill(false);
+    } else {
+        region.rotate_left(count);
+        let clear_from = region.len() - count;
+        region[clear_from..].fill(false);
+    }
 }
 
 fn transform_document_start(
@@ -608,6 +754,7 @@ mod tests {
                 .map(|line| StyledLine {
                     line,
                     foregrounds: Vec::new(),
+                    backgrounds: Vec::new(),
                 })
                 .collect(),
         };
@@ -656,5 +803,18 @@ mod tests {
         assert_eq!(viewport_row_for_document_start(12, 10, 8), 2);
         assert_eq!(viewport_row_for_document_start(8, 10, 8), 0);
         assert_eq!(viewport_row_for_document_start(30, 10, 8), 8);
+    }
+
+    #[test]
+    fn viewport_ownership_follows_scrolls_and_insert_delete_lines() {
+        let mut owned = vec![true, false, true, false, true];
+        transform_viewport_ownership(&mut owned, 0, 4, 1, false);
+        assert_eq!(owned, [false, true, false, true, false]);
+
+        transform_viewport_ownership(&mut owned, 1, 4, 2, true);
+        assert_eq!(owned, [false, false, false, true, false]);
+
+        transform_viewport_ownership(&mut owned, 1, 4, 1, false);
+        assert_eq!(owned, [false, false, true, false, false]);
     }
 }

@@ -292,13 +292,13 @@ impl Theme {
             (0xd3, 0x36, 0x82), // 5 magenta
             (0x2a, 0xa1, 0x98), // 6 cyan
             (0xee, 0xe8, 0xd5), // 7 white   (base2)
-            (0x00, 0x2b, 0x36), // 8 bright black (base03)
+            (0x65, 0x7b, 0x83), // 8 bright black (base00, dim but visible)
             (0xcb, 0x4b, 0x16), // 9 bright red (orange)
             (0x58, 0x6e, 0x75), // 10 bright green (base01)
             (0x83, 0x94, 0x96), // 11 bright yellow (base0)
             (0x93, 0xa1, 0xa1), // 12 bright blue (base1)
             (0x6c, 0x71, 0xc4), // 13 bright magenta (violet)
-            (0x07, 0x36, 0x42), // 14 bright cyan (== base02 for harmony)
+            (0x93, 0xa1, 0xa1), // 14 bright cyan (base1)
             (0xfd, 0xf6, 0xe3), // 15 bright white (base3)
         ];
         for (i, (r, g, b)) in ansi.iter().enumerate() {

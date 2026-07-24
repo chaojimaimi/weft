@@ -334,6 +334,19 @@ fn built_in_themes() -> [(&'static str, Theme); 11] {
     ]
 }
 
+#[test]
+fn built_in_themes_keep_ansi_bright_colors_visible_on_the_canvas() {
+    for (name, theme) in built_in_themes() {
+        for index in 8..16 {
+            let ratio = contrast_ratio(theme.palette[index], theme.background);
+            assert!(
+                ratio >= 1.5,
+                "{name} ANSI bright slot {index} contrast {ratio:.3} is too close to its background"
+            );
+        }
+    }
+}
+
 fn composite_over(foreground: Color, background: Color, alpha: f64) -> Color {
     let channel = |foreground: u8, background: u8| {
         (f64::from(background) + (f64::from(foreground) - f64::from(background)) * alpha).round()

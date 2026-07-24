@@ -592,7 +592,7 @@ impl App {
             .tab()
             .terminal
             .as_ref()
-            .map(|t| t.app_cursor_keys)
+            .map(|t| t.app_cursor_keys())
             .unwrap_or(false);
         self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
 

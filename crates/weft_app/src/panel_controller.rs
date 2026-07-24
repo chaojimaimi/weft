@@ -1,7 +1,7 @@
 //! History panel controller extracted from the application shell.
 
 use super::*;
-use crate::block_component::completed_block_row_count;
+use crate::block_component::{completed_block_layout_rows, completed_block_output_rows};
 
 impl App {
     pub(super) fn update_sidebar_drag(&mut self, pointer_x: f64) -> bool {
@@ -182,7 +182,10 @@ impl App {
             term.effective_input_mode() == weft_core::input::InputMode::Editor,
             term.cwd().is_some(),
         );
+        let prompt_lines = crate::block_component::block_prompt_lines(term);
         let blocks = term.block_tracker().session_blocks();
+        let viewport_rows = term.grid().num_rows;
+        let cols = term.grid().num_cols;
         let block_idx = blocks.iter().position(|b| b.id == block_id);
         let Some(block_idx) = block_idx else { return };
 
@@ -192,32 +195,20 @@ impl App {
         // For each block BELOW the target (i.e. with higher index), add its
         // full height using the renderer's current Header row span.
         let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
-        let trim_output_lines = |b: &weft_core::blocks::Block| -> usize {
-            if b.collapsed {
-                return 0;
-            }
-            let mut lines: Vec<&str> = b.output.lines().collect();
-            while lines.last().is_some_and(|l| {
-                let t = l.trim();
-                t.is_empty() || matches!(t, "%" | "$" | "#")
-            }) {
-                lines.pop();
-            }
-            lines.len()
-        };
         let mut rows_from_bottom = 0usize;
         for (i, b) in blocks.iter().enumerate().rev() {
             if i == block_idx {
                 break;
             }
-            rows_from_bottom += completed_block_row_count(trim_output_lines(b), header_rows);
+            rows_from_bottom += completed_block_layout_rows(b, cols, header_rows, viewport_rows);
         }
+        rows_from_bottom += completed_block_output_rows(&blocks[block_idx], cols);
         // Position the block's command line at ~1/3 from the bottom of the
         // viewport so the user sees the command + most of its output above.
         let Some(renderer) = self.renderer.as_ref() else {
             return;
         };
-        let visible = renderer.block_visible_rows(1, cwd_header_active);
+        let visible = renderer.block_visible_rows(prompt_lines, cwd_header_active);
         let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
         self.sessions.active_mut().set_block_scroll(target);
 
@@ -248,7 +239,7 @@ impl App {
         if block_view {
             let (total, _) = block_content_metrics(terminal, cols, header_rows);
             // Compute visible rows from the renderer's actual geometry.
-            let prompt_lines = terminal.editor().buffer.lines.len();
+            let prompt_lines = crate::block_component::block_prompt_lines(terminal);
             let visible = self
                 .renderer
                 .as_ref()

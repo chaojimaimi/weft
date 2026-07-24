@@ -17,7 +17,10 @@ impl App {
         let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
         let cwd_header =
             crate::layout::block_cwd_header_active(editor_mode, terminal.cwd().is_some());
-        let visible = renderer.block_visible_rows(terminal.editor().buffer.lines.len(), cwd_header);
+        let visible = renderer.block_visible_rows(
+            crate::block_component::block_prompt_lines(terminal),
+            cwd_header,
+        );
         let max_scroll = total.saturating_sub(visible);
         crate::scrollbar_component::scrollbar_layout(
             &ctx,
@@ -147,11 +150,35 @@ impl App {
         // the active tab sends a PTY resize immediately; background tabs get
         // their PTY resize on activation (refresh_grid_for_active_tab).
         let active = self.sessions.active_idx();
+        let header_rows = renderer.block_header_rows();
+        let layout_ctx = base_layout.layout_ctx();
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if tab.terminal.is_some() {
                 let (new_rows, new_cols) = base_layout.dimensions();
                 if tab.resize_terminal_and_queue(new_rows, new_cols) && i == active {
                     info!(rows = new_rows, cols = new_cols, "terminal resized");
+                }
+                let previous = tab.block_scroll();
+                let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
+                    crate::block_component::reconciled_terminal_block_scroll(
+                        terminal,
+                        &layout_ctx,
+                        header_rows,
+                        previous,
+                    )
+                });
+                if let Some((reconciled, total, visible)) = reconciliation {
+                    if previous != reconciled {
+                        info!(
+                            tab = i,
+                            previous,
+                            reconciled,
+                            total,
+                            visible,
+                            "reconciled block scroll during layout recompute"
+                        );
+                        tab.set_block_scroll(reconciled);
+                    }
                 }
             }
         }
@@ -389,6 +416,7 @@ impl App {
                 .then(|| terminal.block_tracker().in_flight())
                 .flatten(),
             block_scroll: self.sessions.active().block_scroll(),
+            viewport_rows: terminal.grid().num_rows,
             block_hovered: self.interaction.block_hovered,
             spinner_phase: -1.0,
             palette: terminal.palette(),
@@ -446,7 +474,7 @@ impl App {
             .active()
             .terminal
             .as_ref()
-            .map(|t| t.mouse_protocol != MouseProtocol::Off)
+            .map(|t| t.mouse_protocol() != MouseProtocol::Off)
             .unwrap_or(false)
     }
 

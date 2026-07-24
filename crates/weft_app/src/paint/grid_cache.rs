@@ -15,6 +15,21 @@ use std::rc::Rc;
 use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::Block;
 
+pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
+
+pub(crate) fn trimmed_output_line_count(lines: &[&str]) -> usize {
+    let mut len = lines.len();
+    while len > 0 {
+        let text = lines[len - 1].trim();
+        if text.is_empty() || matches!(text, "%" | "$" | "#") {
+            len -= 1;
+        } else {
+            break;
+        }
+    }
+    len
+}
+
 /// Iterator yielding wrapped row chunks of `text` at `cols` columns. Each
 /// yielded `String` fits within `cols` columns (respecting wide-char widths).
 /// The first yielded chunk is the top row, subsequent chunks are continuation
@@ -43,6 +58,48 @@ pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = 
     chunks.into_iter()
 }
 
+/// Block history normally reflows prose, but terminal-drawn structure must
+/// retain its row identity. Wrapping a full-width rule produces several
+/// identical prompt dividers after a resize; wrapping a table row detaches
+/// cells from their border. Keep those rows atomic and clip them to the
+/// current viewport instead.
+pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
+    if !is_terminal_structure_line(text) || cols == 0 {
+        return wrap_line_chunks(text, cols).collect::<Vec<_>>().into_iter();
+    }
+
+    let mut clipped = String::new();
+    let mut col = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = weft_core::grid::terminal_text_width(grapheme);
+        if width == 0 {
+            continue;
+        }
+        if col + width > cols {
+            break;
+        }
+        clipped.push_str(grapheme);
+        col += width;
+    }
+    vec![clipped].into_iter()
+}
+
+fn is_terminal_structure_line(text: &str) -> bool {
+    let mut visible = 0usize;
+    let mut box_drawing = 0usize;
+    let mut vertical_separators = 0usize;
+    for ch in text.chars().filter(|ch| !ch.is_whitespace()) {
+        visible += 1;
+        if matches!(ch, '\u{2500}'..='\u{257f}') {
+            box_drawing += 1;
+        }
+        if matches!(ch, '│' | '┃' | '║' | '┆' | '┇' | '┊' | '┋') {
+            vertical_separators += 1;
+        }
+    }
+    (visible >= 8 && box_drawing == visible) || vertical_separators >= 2
+}
+
 /// Pre-computed wrapping data for a single output line of a block.
 #[derive(Clone)]
 pub(crate) struct CachedLine {
@@ -64,6 +121,10 @@ pub(crate) struct CachedBlockLayout {
     /// Snapshot of `block.output.len()` — if the current block's output
     /// length differs, the cache is stale.
     pub(crate) output_len: usize,
+    /// Identity of the immutable output allocation. Continuation updates can
+    /// replace a block's output with equal-length text while retaining its
+    /// BlockId; length alone would then reuse stale byte ranges and chunks.
+    pub(crate) output_identity: usize,
     /// Snapshot of `block.command.len()`.
     pub(crate) command_len: usize,
     /// Snapshot of `block.collapsed` — toggling invalidates.
@@ -94,6 +155,7 @@ impl BlockLayoutCache {
             None => true,
             Some(c) => {
                 c.output_len != block.output.len()
+                    || c.output_identity != block.output.as_ptr() as usize
                     || c.command_len != block.command.len()
                     || c.collapsed != block.collapsed
                     || c.cols != cols
@@ -123,15 +185,7 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
 
     // Collect raw lines and trim trailing empty/prompt lines.
     let raw_lines: Vec<&str> = block.output.lines().collect();
-    let mut trimmed_len = raw_lines.len();
-    while trimmed_len > 0 {
-        let t = raw_lines[trimmed_len - 1].trim();
-        if t.is_empty() || matches!(t, "%" | "$" | "#") {
-            trimmed_len -= 1;
-        } else {
-            break;
-        }
-    }
+    let trimmed_len = trimmed_output_line_count(&raw_lines);
 
     // Pre-compute wrapped chunks for each surviving line.
     let lines: Vec<CachedLine> = raw_lines[..trimmed_len]
@@ -140,7 +194,7 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         .map(|(idx, line)| {
             let byte_start = line.as_ptr() as usize - block.output.as_ptr() as usize;
             let byte_end = byte_start + line.len();
-            let chunks: Rc<[String]> = Rc::from(wrap_line_chunks(line, cols).collect::<Vec<_>>());
+            let chunks: Rc<[String]> = Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
             CachedLine {
                 idx,
                 byte_start,
@@ -152,6 +206,7 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
 
     CachedBlockLayout {
         output_len: block.output.len(),
+        output_identity: block.output.as_ptr() as usize,
         command_len: block.command.len(),
         collapsed: block.collapsed,
         cols,
@@ -256,6 +311,25 @@ mod tests {
     }
 
     #[test]
+    fn terminal_rule_is_clipped_instead_of_wrapped_after_resize() {
+        let chunks: Vec<_> = block_line_chunks("────────────────────", 8).collect();
+        assert_eq!(chunks, ["────────"]);
+    }
+
+    #[test]
+    fn unicode_table_row_is_clipped_instead_of_split_after_resize() {
+        let chunks: Vec<_> = block_line_chunks("│ 磁盘 │ Data 426G / 926G │ 充裕 │", 16).collect();
+        assert_eq!(chunks.len(), 1);
+        assert!(weft_core::grid::terminal_text_width(&chunks[0]) <= 16);
+    }
+
+    #[test]
+    fn prose_still_wraps_after_resize() {
+        let chunks: Vec<_> = block_line_chunks("ordinary terminal prose", 8).collect();
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
     fn block_layout_cache_foldable_false_for_empty_output() {
         let block = mk_block_with_output(1, "true", "\n\n\n");
         let layout = compute_block_layout(&block, 80);
@@ -292,6 +366,23 @@ mod tests {
             2,
             "output change should trigger rebuild"
         );
+    }
+
+    #[test]
+    fn block_layout_cache_rebuilds_for_equal_length_replacement() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "abcdef\n");
+        cache.ensure_cached(&block, 80);
+        assert_eq!(cache.get(1).lines[0].byte_end, 6);
+
+        // Same BlockId and byte length, but a different immutable allocation
+        // and UTF-8 boundary. Reusing the old byte range could panic while
+        // slicing the replacement output.
+        let replacement = mk_block_with_output(1, "echo", "中文\n");
+        assert_eq!(block.output.len(), replacement.output.len());
+        cache.ensure_cached(&replacement, 80);
+        let line = &cache.get(1).lines[0];
+        assert_eq!(&replacement.output[line.byte_start..line.byte_end], "中文");
     }
 
     #[test]

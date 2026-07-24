@@ -10,6 +10,8 @@ pub(crate) struct BlockViewPaintModel<'a> {
     pub(crate) git_branch: Option<&'a str>,
     pub(crate) live: Option<InFlightBlock<'a>>,
     pub(crate) block_scroll: usize,
+    /// Terminal rows represented by a completed `clear` command's blank band.
+    pub(crate) viewport_rows: usize,
     /// F3-1: Block currently hovered by the mouse. The header row for this
     /// block renders inline copy/fold action buttons.
     pub(crate) block_hovered: Option<BlockId>,

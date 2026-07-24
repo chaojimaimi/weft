@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+mod continuation;
 mod output_capture;
 #[cfg(test)]
 mod screen_capture_tests;
@@ -128,6 +129,10 @@ pub struct BlockTracker {
     styled_output: Option<Arc<StyledOutput>>,
     /// Absolute document position where primary-screen output begins.
     screen_document_start: Option<u64>,
+    /// Session-local primary-screen blocks eligible for replay continuation.
+    screen_owned_blocks: HashSet<u64>,
+    continuation_candidate: Option<BlockId>,
+    continuation_base: Option<Block>,
     /// Index in `blocks` where the current session's blocks begin. Blocks
     /// before this were loaded from SQLite on startup (history search only —
     /// NOT shown in the main block view, which is session-scoped).
@@ -159,6 +164,9 @@ impl BlockTracker {
             output: OutputCapture::default(),
             styled_output: None,
             screen_document_start: None,
+            screen_owned_blocks: HashSet::new(),
+            continuation_candidate: None,
+            continuation_base: None,
             session_start: 0,
             dirty_blocks: HashSet::new(),
         }
@@ -190,6 +198,7 @@ impl BlockTracker {
         if self.phase == ShellPhase::CommandExecuting && self.screen_document_start.is_none() {
             self.output.clear();
             self.screen_document_start = Some(document_start);
+            self.activate_screen_continuation();
         }
     }
 
@@ -249,10 +258,19 @@ impl BlockTracker {
         if self.phase != ShellPhase::CommandExecuting {
             return None;
         }
-        let command = self.pending_command.as_deref()?;
+        let command = self
+            .continuation_base
+            .as_ref()
+            .map_or(self.pending_command.as_deref()?, |block| {
+                block.command.as_str()
+            });
         Some(InFlightBlock {
             command,
-            cwd: self.pending_cwd.as_deref(),
+            cwd: self
+                .continuation_base
+                .as_ref()
+                .and_then(|block| block.cwd.as_deref())
+                .or(self.pending_cwd.as_deref()),
             output: self.output.as_str(),
             styled_output: self.styled_output.as_deref(),
         })
@@ -308,6 +326,7 @@ impl BlockTracker {
     /// `133;B` — command start (preexec). `command` is the prompt-row text the
     /// caller extracted from the grid. Begins output capture.
     pub fn on_command_start(&mut self, command: String) {
+        self.prepare_screen_continuation(&command);
         self.pending_command = Some(command);
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
@@ -374,49 +393,6 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.erase_line(mode);
         }
-    }
-
-    /// Finalize the in-flight command into a [`Block`], appending it to both
-    /// the history list and the unpersisted queue. A stray `133;D` with no
-    /// preceding `133;B` (no pending command) is discarded — it produces no
-    /// garbage block.
-    fn finalize(&mut self, exit_code: Option<i32>) {
-        let Some(command) = self.pending_command.take() else {
-            self.pending_started = None;
-            self.output.clear();
-            self.styled_output = None;
-            self.screen_document_start = None;
-            return;
-        };
-        let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
-        let cwd = self.pending_cwd.take();
-        let raw_output = self.output.take();
-        self.screen_document_start = None;
-        // Mask secrets capture-side so the stored block (history / search /
-        // future AI context) never holds a credential. The live grid stays raw.
-        let output = crate::secrets::mask(&raw_output);
-        let styled_output = if output == raw_output {
-            self.styled_output.take()
-        } else {
-            self.styled_output = None;
-            None
-        };
-
-        let block_id = BlockId(self.ids.allocate());
-        let block = Block {
-            id: block_id,
-            command,
-            cwd,
-            output: output.into(),
-            styled_output,
-            exit_code,
-            started_at,
-            finished_at: Some(SystemTime::now()),
-            collapsed: false,
-        };
-        self.blocks.push(block.clone());
-        self.unpersisted.push(block);
-        self.dirty_blocks.insert(block_id.0);
     }
 }
 

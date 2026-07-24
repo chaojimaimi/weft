@@ -281,25 +281,12 @@ impl MetalRenderer {
             ),
             chrome_left as f64,
         );
-        let chrome_top = terminal_layout.chrome_top as f32;
-
         // Build this frame's LayoutCtx: the single source of truth for
         // coordinate math in every overlay builder (v0.8 stage 1). Stored on
         // self so methods that don't receive it directly can still access it
         // during this draw; rebuilt every frame so resizes/padding changes
         // take effect immediately.
-        let mut ctx = crate::layout::LayoutCtx::new(
-            (
-                terminal_layout.viewport.right as f32,
-                terminal_layout.viewport.bottom as f32,
-            ),
-            terminal_layout.cell_width as f32,
-            terminal_layout.cell_height as f32,
-            terminal_layout.padding_x as f32,
-            terminal_layout.padding_y as f32,
-        );
-        ctx.chrome_top = chrome_top;
-        ctx.chrome_left = terminal_layout.chrome_left as f32;
+        let ctx = terminal_layout.layout_ctx();
         self.layout_ctx = Some(ctx);
 
         let grid = terminal.grid();
@@ -544,6 +531,7 @@ impl MetalRenderer {
                         git_branch: terminal.git_branch(),
                         live: None,
                         block_scroll,
+                        viewport_rows: terminal.grid().num_rows,
                         block_hovered: self.block_hovered,
                         spinner_phase: self.spinner_phase,
                         palette: terminal.palette(),
@@ -564,6 +552,7 @@ impl MetalRenderer {
                         git_branch: terminal.git_branch(),
                         live: terminal.block_tracker().in_flight(),
                         block_scroll,
+                        viewport_rows: terminal.grid().num_rows,
                         block_hovered: self.block_hovered,
                         spinner_phase: self.spinner_phase,
                         palette: terminal.palette(),
@@ -607,6 +596,7 @@ impl MetalRenderer {
                     show_cursor: cursor_visible_this_frame,
                     cursor_style: terminal.cursor_style,
                     hidden_before_row: terminal.primary_screen_visible_row_start(),
+                    owned_rows: terminal.primary_screen_viewport_ownership(),
                 },
             );
             Vec::new()

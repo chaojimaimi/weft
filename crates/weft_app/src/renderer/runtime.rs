@@ -155,7 +155,11 @@ impl MetalRenderer {
     /// full viewport (command-executing mode). The scroll handler clamps
     /// `block_scroll_offset` to `total - visible`, so this must match the
     /// renderer's actual capacity to avoid blank space when scrolling.
-    pub fn block_visible_rows(&self, prompt_lines: usize, cwd_header_active: bool) -> usize {
+    pub fn block_visible_rows(
+        &self,
+        prompt_lines: Option<usize>,
+        cwd_header_active: bool,
+    ) -> usize {
         self.layout_ctx
             .map(|ctx| crate::layout::block_visible_rows(&ctx, prompt_lines, cwd_header_active))
             .unwrap_or(1)

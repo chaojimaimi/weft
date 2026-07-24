@@ -18,6 +18,7 @@ use pathfinder_geometry::vector::{Vector2F, Vector2I};
 use tracing::{debug, info, warn};
 use weft_core::config::FontConfig;
 
+mod atlas;
 mod special;
 
 fn nonzero_cell_dimension(dimension: u32) -> u32 {
@@ -565,11 +566,8 @@ impl GlyphAtlas {
         let dst_x = *next_x;
         let dst_y = *next_y;
 
-        let uv_origin = (dst_x as f32 / atlas_w as f32, dst_y as f32 / atlas_h as f32);
-        let uv_size = (
-            glyph_w as f32 / atlas_w as f32,
-            cell_h as f32 / atlas_h as f32,
-        );
+        let (uv_origin, uv_size) =
+            atlas::pixel_center_uv(dst_x, dst_y, glyph_w, cell_h, atlas_w, atlas_h);
 
         // Advance position
         *next_x += glyph_w;
@@ -779,11 +777,8 @@ impl GlyphAtlas {
         }
 
         // Store glyph info with normalized UV coordinates
-        let uv_origin = (dst_x as f32 / atlas_w as f32, dst_y as f32 / atlas_h as f32);
-        let uv_size = (
-            glyph_w as f32 / atlas_w as f32,
-            cell_h as f32 / atlas_h as f32,
-        );
+        let (uv_origin, uv_size) =
+            atlas::pixel_center_uv(dst_x, dst_y, glyph_w, cell_h, atlas_w, atlas_h);
 
         // Advance position
         *next_x += glyph_w;

@@ -89,7 +89,7 @@ impl App {
             .active()
             .terminal
             .as_ref()
-            .map(|t| (t.mouse_protocol, t.sgr_mouse));
+            .map(|t| (t.mouse_protocol(), t.sgr_mouse()));
         if let Some((mp, sgr)) = modes {
             self.sessions.active_mut().input_handler.mouse_protocol = mp;
             self.sessions.active_mut().input_handler.sgr_mouse = sgr;

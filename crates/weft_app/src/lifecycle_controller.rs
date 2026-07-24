@@ -705,10 +705,7 @@ impl App {
 
         // Scrollback capacity.
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
-            let cols = t.grid().num_cols;
-            t.grid_mut()
-                .scrollback
-                .set_max_lines(config.scrollback.lines, cols);
+            t.set_scrollback_max_lines(config.scrollback.lines);
         }
 
         // v1.0 Logo: sync Dock icon if variant changed.

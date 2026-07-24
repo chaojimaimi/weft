@@ -27,7 +27,7 @@ impl vte::Perform for Terminal {
         // Feed the printed char to the active command block's output capture.
         // v1.0 perf: check is_capturing() here to skip the function call
         // overhead when not capturing (e.g. AtPrompt, NotIntegrated).
-        if !self.alt_active && phase == ShellPhase::CommandExecuting {
+        if !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting {
             self.block_tracker.on_print(c);
         }
         self.capture_primary_screen_interrupt_print(c);
@@ -240,7 +240,7 @@ impl vte::Perform for Terminal {
             0x07 => { /* BEL — bell, ignored in v0.1 */ }
             0x08 => {
                 self.grid.backspace();
-                if !self.alt_active {
+                if !self.capabilities.alt_active {
                     self.block_tracker.on_backspace();
                 }
                 self.capture_primary_screen_interrupt_backspace();
@@ -253,7 +253,7 @@ impl vte::Perform for Terminal {
                 let prev_col = self.grid.cursor.col;
                 self.grid.advance_tab(1);
                 // v1.0 perf: skip on_print calls when not capturing.
-                if !self.alt_active && self.block_tracker.is_capturing() {
+                if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
                     let advanced = self.grid.cursor.col.saturating_sub(prev_col);
                     for _ in 0..advanced {
                         self.block_tracker.on_print(' ');
@@ -268,7 +268,7 @@ impl vte::Perform for Terminal {
                 // The raw VT `index()` only moves down; Unix terminals
                 // treat LF as newline (carriage return + index).
                 // v1.0 perf: skip on_newline call when not capturing.
-                if !self.alt_active && self.block_tracker.is_capturing() {
+                if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
                     self.block_tracker.on_newline();
                 }
                 self.capture_primary_screen_interrupt_newline();
@@ -279,7 +279,7 @@ impl vte::Perform for Terminal {
             }
             0x0D => {
                 self.grid.carriage_return();
-                if !self.alt_active {
+                if !self.capabilities.alt_active {
                     self.block_tracker.on_carriage_return();
                 }
                 self.capture_primary_screen_interrupt_carriage_return();
@@ -410,7 +410,8 @@ impl vte::Perform for Terminal {
                         self.note_primary_screen_full_erase();
                         self.grid.clear_screen_all();
                     }
-                    3 => self.grid.clear_scrollback(),
+                    3 if self.capabilities.alt_active => self.grid.clear_scrollback(),
+                    3 => self.clear_primary_screen_scrollback(),
                     _ => {}
                 }
             }
@@ -425,7 +426,7 @@ impl vte::Perform for Terminal {
                     }
                     _ => {}
                 }
-                if !self.alt_active {
+                if !self.capabilities.alt_active {
                     self.block_tracker.on_erase_line(mode);
                 }
                 self.capture_primary_screen_interrupt_erase_line(mode);
@@ -670,7 +671,7 @@ impl vte::Perform for Terminal {
                             let defer_screen_exit =
                                 self.block_tracker.screen_document_start().is_some()
                                     && self.block_tracker.phase() == ShellPhase::CommandExecuting;
-                            self.primary_screen_cursor_ops = 0;
+                            self.capabilities.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             self.shell_markers.push(ShellMarker::PromptStart);
@@ -692,8 +693,8 @@ impl vte::Perform for Terminal {
                         }
                         b"B" => {
                             self.settle_primary_screen_exit();
-                            self.primary_history_view = false;
-                            self.primary_screen_cursor_ops = 0;
+                            self.capabilities.primary_history_view = false;
+                            self.capabilities.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
                             self.shell_markers.push(ShellMarker::CommandStart);
                             // 133;B (preexec): if the editor submitted the
@@ -717,7 +718,7 @@ impl vte::Perform for Terminal {
                             let defer_screen_exit =
                                 self.block_tracker.screen_document_start().is_some();
                             self.snapshot_primary_screen_output();
-                            self.primary_screen_cursor_ops = 0;
+                            self.capabilities.primary_screen_cursor_ops = 0;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             let exit_code = if params.len() > 2 {
