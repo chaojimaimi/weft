@@ -1,0 +1,222 @@
+//! Keyboard routing extracted from `main.rs`.
+//!
+//! `handle_key_event` is the entry point from winit's KeyboardInput. It
+//! resolves keybindings, routes to overlay handlers (palette/settings/find/
+//! context-menu/panel-search), falls through to the editor, and finally
+//! encodes passthrough bytes for the PTY.
+
+use crate::input_router::{OverlayInputContext, OverlayInputOwner};
+use crate::macos_system::clipboard_paste;
+use weft_core::input::{KeyCode, Modifiers};
+use winit::event::Modifiers as WinitModifiers;
+use winit::keyboard::KeyCode as WinitKeyCode;
+
+impl crate::App {
+    pub(crate) fn overlay_input_owner(&self) -> Option<OverlayInputOwner> {
+        OverlayInputOwner::resolve(OverlayInputContext {
+            palette_open: self.palette.open,
+            settings_open: self.settings.open,
+            find_open: self.find.open,
+            context_menu_open: self.interaction.context_menu.is_some(),
+            panel_search_focused: self.panel.open && self.panel.search_focused,
+        })
+    }
+
+    pub(crate) fn handle_key_event(
+        &mut self,
+        key_code: WinitKeyCode,
+        mods: WinitModifiers,
+        text: Option<&str>,
+    ) {
+        let Some(key) = crate::event_replay::map_winit_key(key_code) else {
+            return;
+        };
+
+        let mut m = Modifiers::empty();
+        if mods.state().shift_key() {
+            m |= Modifiers::SHIFT;
+        }
+        if mods.state().control_key() {
+            m |= Modifiers::CONTROL;
+        }
+        if mods.state().alt_key() {
+            m |= Modifiers::ALT;
+        }
+        if mods.state().super_key() {
+            m |= Modifiers::SUPER;
+        }
+
+        let bound_action = self.config_state.keybindings.lookup(key, m);
+        let has_terminal = self
+            .sessions
+            .tab(self.sessions.active_idx())
+            .is_some_and(|tab| tab.terminal.is_some());
+        match crate::input_router::route_keyboard_entry(
+            !self.sessions.is_empty(),
+            has_terminal,
+            bound_action,
+        ) {
+            crate::input_router::KeyboardEntryRoute::Action(action) => {
+                self.execute_action(action);
+                return;
+            }
+            crate::input_router::KeyboardEntryRoute::Consume => return,
+            crate::input_router::KeyboardEntryRoute::Session => {}
+        }
+
+        // Configurable keybindings: resolve (key, mods) → action. If it maps to
+        // a weft action (copy/paste/scroll/reload), dispatch and consume; else
+        // fall through to encoding the key for the PTY.
+        //
+        // v0.9 fix: when the Find bar is open, intercept Paste (Cmd+V) and
+        // SelectAll (Cmd+A) so they target the find query, not the shell
+        // editor. Other Cmd chords (Cmd+R regex toggle, Cmd+I case toggle)
+        // are handled inside `handle_find_key` below.
+        if self.find.open
+            && m.contains(Modifiers::SUPER)
+            && matches!(key, KeyCode::Char('v') | KeyCode::Char('a'))
+        {
+            if key == KeyCode::Char('v') {
+                if let Some(text) = clipboard_paste() {
+                    self.find.query.push_str(&text);
+                    self.arm_find_refresh();
+                }
+                return;
+            }
+            if key == KeyCode::Char('a') {
+                // Select-all in the find bar: clear and re-type from clipboard?
+                // For now, just signal "select all" by moving cursor to end —
+                // the find bar is single-line with no selection model. No-op.
+                return;
+            }
+        }
+        if let Some(action) = bound_action {
+            if self.execute_action(action) {
+                return;
+            }
+        }
+
+        let overlay_owner = self.overlay_input_owner();
+        let overlay_consumed = match overlay_owner {
+            Some(OverlayInputOwner::Palette) => self.handle_palette_key(key, m, text),
+            Some(OverlayInputOwner::Settings) => self.handle_settings_key(key, m, text),
+            Some(OverlayInputOwner::Find) => self.handle_find_key(key, m, text),
+            Some(OverlayInputOwner::ContextMenu) => self.handle_context_menu_key(key, m),
+            Some(OverlayInputOwner::PanelSearch) => self.handle_panel_key(key, m),
+            None => false,
+        };
+        if overlay_consumed {
+            return;
+        }
+
+        // Editor takeover: at the prompt with integration ready, keys drive the
+        // input-box editor instead of being forwarded to the PTY. Enter submits
+        // (writes the command); Shift+Enter grows the box. Drops back to
+        // passthrough automatically in alt-screen / command-running / SSH.
+        let input_mode = self
+            .tab()
+            .terminal
+            .as_ref()
+            .map(|t| t.effective_input_mode())
+            .unwrap_or(weft_core::input::InputMode::Passthrough);
+        if input_mode == weft_core::input::InputMode::Editor {
+            let prev_lines = self
+                .tab()
+                .terminal
+                .as_ref()
+                .map(|t| t.editor().line_count())
+                .unwrap_or(1);
+            let consumed = self.handle_editor_key(key, m, text);
+            let new_lines = self
+                .tab()
+                .terminal
+                .as_ref()
+                .map(|t| t.editor().line_count())
+                .unwrap_or(1);
+            if new_lines != prev_lines {
+                self.recompute_layout();
+            }
+            if consumed {
+                self.request_redraw();
+                return;
+            }
+        }
+
+        let app_cursor_keys = self
+            .tab()
+            .terminal
+            .as_ref()
+            .map(|t| t.app_cursor_keys())
+            .unwrap_or(false);
+        self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
+
+        let bytes = crate::ime::encode_passthrough_key(&self.tab().input_handler, key, m, text);
+        // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
+        // send for each key, including whether DECCKM/app-cursor mode is on.
+        let input_seq = self.tab_mut().next_input_seq();
+        tracing::debug!(
+            session_id = self.tab().session_id,
+            input_seq,
+            ?key,
+            ?m,
+            app_cursor_keys = self.tab().input_handler.app_cursor_keys,
+            ?bytes,
+            "key → pty"
+        );
+        let effects = crate::effect::passthrough_key_effects(self.sessions.active_idx(), bytes);
+        self.drain_effects(effects);
+    }
+
+    /// Handle a key while the panel search box is focused. Returns true if
+    /// consumed (search typing / arrow nav / expand / unfocus). Modifier
+    /// chords fall through (returns false) so keybindings still work.
+    pub(crate) fn handle_panel_key(&mut self, key: KeyCode, mods: Modifiers) -> bool {
+        // Let cmd/ctrl/alt chords pass through to keybindings / PTY.
+        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
+            return false;
+        }
+        match key {
+            // v0.9 fix: Esc unfocuses the search box instead of closing the
+            // panel. The panel itself closes via the Cmd+Shift+B keybinding
+            // or by clicking outside the sidebar.
+            KeyCode::Escape => {
+                self.panel.search_focused = false;
+                self.request_redraw();
+                true
+            }
+            KeyCode::Up => {
+                self.panel.selection = self.panel.selection.saturating_sub(1);
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Down => {
+                self.panel.selection = self.panel.selection.saturating_add(1);
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Backspace => {
+                self.panel.query.pop();
+                self.clamp_panel_scroll();
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            KeyCode::Enter => {
+                // v0.9 fix: send the selected command to the prompt input
+                // (Warp-style: Enter on a history entry reruns the command).
+                self.send_panel_selection_to_input();
+                true
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.panel.query.push(c);
+                self.clamp_panel_scroll();
+                self.clamp_panel_selection();
+                self.request_redraw();
+                true
+            }
+            _ => false,
+        }
+    }
+}
