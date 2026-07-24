@@ -38,7 +38,11 @@ pub(crate) fn panel_scrollbar_layout(
         .min(track_height);
     let travel = (track_height - thumb_height).max(0.0);
     let ratio = scroll.min(max_scroll) as f32 / max_scroll as f32;
-    let thumb_top = list_top + travel * ratio;
+    // Step 4: snap thumb_top to 0.5px to avoid sub-pixel rendering blur at
+    // 1× scale. At 2× scale, 0.5 logical px = 1 physical px, so snapping
+    // still produces integer physical pixels.
+    let thumb_offset = (travel * ratio * 2.0).round() * 0.5;
+    let thumb_top = list_top + thumb_offset;
     let thumb = [track[0], thumb_top, track[2], thumb_top + thumb_height];
     let hit = [panel[2] - 18.0, list_top, panel[2] - 5.0, panel[3]];
     Some(PanelScrollbarLayout {

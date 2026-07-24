@@ -398,7 +398,8 @@ impl MetalRenderer {
                 // baseline. Click handling is in main.rs (Cmd+Click → open URL
                 // from the registry's side-map). Wide-char cells span 2 cols.
                 if cell.flags.contains(CellFlags::HYPERLINK) {
-                    let line_h = 1.5;
+                    // Step 4: 2.0px (was 1.5) to avoid sub-pixel blur at 1× scale.
+                    let line_h = 2.0;
                     let link_color = [0.36, 0.62, 0.94, 1.0]; // soft cyan
                     push_cell_instance(
                         &mut instances,

@@ -100,9 +100,11 @@ impl MetalRenderer {
         if cwd_header_active {
             let cwd = cwd.expect("active fixed CWD has text");
             let fixed_y = layout.fixed_cwd_y;
+            // Step 4: 2.0px separator (was 1.5) to avoid sub-pixel blur at
+            // 1× scale. At 2× scale, 2 logical px = 4 physical px — crisp.
             push_quad(
                 &mut verts,
-                [left, fixed_y, right, fixed_y + 1.5],
+                [left, fixed_y, right, fixed_y + 2.0],
                 bg_uv,
                 [0.0; 4],
                 separator,
