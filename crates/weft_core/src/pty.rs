@@ -431,6 +431,21 @@ async fn read_loop<W: Fn() + Send + 'static>(
             }
             Ok(Ok(n)) => {
                 let data = buf[..n].to_vec();
+                // R1-4: env-gated capture tee for recording real PTY byte
+                // streams. Disabled by default (one env::var lookup per read);
+                // set WEFT_PTY_CAPTURE=/path/to/capture.bin to record. Fixtures
+                // committed to the repo use inline byte literals (see
+                // tests/replay_fixtures.rs), but this tee is the tool for
+                // discovering the exact byte shapes of new TUI apps.
+                if let Ok(path) = std::env::var("WEFT_PTY_CAPTURE") {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&path)
+                    {
+                        let _ = std::io::Write::write_all(&mut f, &data);
+                    }
+                }
                 if tx.send(PtyEvent::Output(data)).is_err() {
                     // Receiver dropped — shutdown.
                     tracing::debug!("PTY event receiver dropped, stopping read loop");
