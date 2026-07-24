@@ -266,7 +266,6 @@ impl UiColors {
     ///
     /// Returns a new `UiColors` (the original is unchanged). Pure function
     /// so it can be unit-tested without a renderer.
-    #[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
     pub fn with_increase_contrast(self, increase_contrast: bool) -> Self {
         if !increase_contrast {
             return self;

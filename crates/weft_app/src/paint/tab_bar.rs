@@ -90,7 +90,8 @@ impl MetalRenderer {
         let pad_x = self.padding_x;
         let chrome_left = tab_bar.chrome_left;
 
-        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
         let bg = color_to_normalized(ui.canvas);
         let fg = color_to_normalized(ui.text_primary);
         let accent = color_to_normalized(ui.focus);

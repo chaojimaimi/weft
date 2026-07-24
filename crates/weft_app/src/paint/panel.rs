@@ -53,7 +53,8 @@ impl MetalRenderer {
         // panel in the canvas luminance family for light/custom themes so
         // status text can remain readable on both surfaces.
         let theme_bg = color_to_normalized(self.theme.background);
-        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
         let panel_bg = color_to_normalized(ui.panel);
         let sel_bg = color_to_normalized(ui.selection);
         let selection_fg = color_to_normalized(ui.selection_text);
@@ -167,6 +168,33 @@ impl MetalRenderer {
             [0.0; 4],
             border_color,
         );
+
+        // F6: Focus ring — an additional accessibility indicator drawn
+        // slightly outside the field bounds when the search input has
+        // keyboard focus. Thickness/alpha scale with Increase Contrast.
+        if p.search_focused {
+            use crate::paint::primitives::{
+                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+            };
+            let accent = color_to_normalized(self.theme.accent);
+            let ring_color = [
+                accent[0],
+                accent[1],
+                accent[2],
+                focus_ring_alpha(self.increase_contrast),
+            ];
+            build_focus_ring(
+                &mut vertices,
+                [
+                    field_x0 - 2.0,
+                    field_y0 - 2.0,
+                    field_x1 + 2.0,
+                    field_y1 + 2.0,
+                ],
+                ring_color,
+                focus_ring_thickness(self.increase_contrast),
+            );
+        }
 
         // Text inside the field: show query, or placeholder "Search…" when empty.
         let text_y = field_y0 + (field_y1 - field_y0 - ch) * 0.5;

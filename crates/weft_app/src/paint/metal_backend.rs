@@ -198,6 +198,7 @@ impl MetalRenderer {
             block_hovered: None,
             spinner_phase: -1.0,
             reduce_motion: false,
+            increase_contrast: false,
             sidebar_width_override: None,
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),

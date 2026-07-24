@@ -203,7 +203,6 @@ pub(crate) fn syntax_color(kind: TokenKind, theme: &Theme) -> [f32; 4] {
 ///
 /// Pure vertex emitter — no renderer dependency. The caller passes the
 /// resulting `verts` to the same vertex buffer used by other overlay quads.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
 pub(crate) fn build_focus_ring(
     verts: &mut Vec<f32>,
     bounds: [f32; 4],
@@ -226,7 +225,6 @@ pub(crate) fn build_focus_ring(
 
 /// F6: Resolve the focus ring thickness based on the Increase Contrast
 /// setting. Pure function so callers don't hardcode the contrast multiplier.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
 pub(crate) fn focus_ring_thickness(increase_contrast: bool) -> f32 {
     if increase_contrast {
         3.0
@@ -238,7 +236,6 @@ pub(crate) fn focus_ring_thickness(increase_contrast: bool) -> f32 {
 /// F6: Resolve the focus ring alpha based on the Increase Contrast setting.
 /// When contrast is increased, the ring uses full opacity so it's visible
 /// against any background; otherwise it uses 0.70 for a subtler appearance.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
 pub(crate) fn focus_ring_alpha(increase_contrast: bool) -> f32 {
     if increase_contrast {
         1.0

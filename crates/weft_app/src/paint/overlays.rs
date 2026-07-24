@@ -73,7 +73,8 @@ impl MetalRenderer {
 
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
-        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
         let fg = color_to_normalized(ui.text_primary);
         let prompt_c = color_to_normalized(ui.text_secondary);
         let selection_bg = color_to_normalized(ui.selection);
@@ -201,6 +202,28 @@ impl MetalRenderer {
             CommandSurfaceShell::canonical(layout.popup_rect, 2.0, false, theme_bg, bg_uv),
         );
 
+        // F6: Focus ring — the Find popup captures keyboard input while open,
+        // so draw a focus ring to indicate it's the active input target.
+        {
+            use crate::paint::primitives::{
+                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+            };
+            let [px0, py0, px1, py1] = layout.popup_rect;
+            let accent = color_to_normalized(self.theme.accent);
+            let ring_color = [
+                accent[0],
+                accent[1],
+                accent[2],
+                focus_ring_alpha(self.increase_contrast),
+            ];
+            build_focus_ring(
+                &mut verts,
+                [px0 - 1.0, py0 - 1.0, px1 + 1.0, py1 + 1.0],
+                ring_color,
+                focus_ring_thickness(self.increase_contrast),
+            );
+        }
+
         // ── Accent-colored left stripe (3px) — v0.8 signature accent ────
         // Replaces the previous top accent stripe so the popup still reads
         // as branded without occupying vertical space at the card edge.
@@ -229,7 +252,8 @@ impl MetalRenderer {
             let hy1 = hy0 + ch;
             // F3-5: use the semantic find_match token instead of a hardcoded
             // yellow so the color adapts to the active theme.
-            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                .with_increase_contrast(self.increase_contrast);
             let fm = color_to_normalized(ui.find_match);
             let highlight_color = [fm[0], fm[1], fm[2], 0.50];
             for (seg_col, seg_len) in split_highlight_around_cursor(

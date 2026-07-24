@@ -81,6 +81,10 @@ pub struct MetalRenderer {
     /// F3-2: macOS Reduce Motion setting. When true, the spinner uses a
     /// static `●` instead of animated braille glyphs.
     pub reduce_motion: bool,
+    /// F6: macOS Increase Contrast setting. When true, `UiColors` are
+    /// strengthened via `with_increase_contrast()` and focus rings use
+    /// thicker, fully-opaque edges. Synced from `window_runtime` at 1Hz.
+    pub increase_contrast: bool,
     /// F3-3: User-overridden sidebar width in logical points. `None` falls
     /// back to the responsive `SidebarMetrics::for_logical_width`. Set by
     /// `set_sidebar_width` during drag, or synced from config on load.

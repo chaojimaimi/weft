@@ -413,6 +413,7 @@ impl App {
             renderer.panel_highlight = self.panel.highlight;
             renderer.block_hovered = self.interaction.block_hovered;
             renderer.reduce_motion = self.window_runtime.reduce_motion;
+            renderer.increase_contrast = self.window_runtime.increase_contrast;
             // F3-2: compute spinner phase for the running-command indicator.
             // Only active when a command is executing in block view and the
             // user hasn't enabled Reduce Motion.

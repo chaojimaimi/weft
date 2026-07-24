@@ -271,7 +271,8 @@ impl MetalRenderer {
         // F3-5: find match highlight color from the semantic token (was
         // hardcoded [0.95, 0.78, 0.20, 0.50]).
         let find_hl_bg = {
-            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                .with_increase_contrast(self.increase_contrast);
             let fm = color_to_normalized(ui.find_match);
             [fm[0], fm[1], fm[2], 0.50]
         };
@@ -502,7 +503,8 @@ impl MetalRenderer {
                             selection_bg,
                         );
                     }
-                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                        .with_increase_contrast(self.increase_contrast);
                     let color = match tone {
                         BlockTone::Success => dim,
                         BlockTone::Error => color_to_normalized(ui.error),
@@ -530,7 +532,8 @@ impl MetalRenderer {
                     );
                 }
                 LaidRow::LiveHeader { text } => {
-                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                    let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                        .with_increase_contrast(self.increase_contrast);
                     self.push_text(
                         &mut verts,
                         left,
@@ -586,7 +589,8 @@ impl MetalRenderer {
                         let spinner_char =
                             spinner_char_for_phase(spinner_phase, self.reduce_motion);
                         let spinner_x = right - cw;
-                        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+                        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                            .with_increase_contrast(self.increase_contrast);
                         let spinner_color = color_to_normalized(ui.focus);
                         self.push_text(
                             &mut verts,

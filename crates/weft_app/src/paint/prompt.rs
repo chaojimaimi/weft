@@ -278,7 +278,8 @@ impl MetalRenderer {
         // semantics. Dim color, more prominent when multi-line input is active.
         let hint_y = layout.box_rect[3] - ch;
         if let Some(hint_text) = prompt_hint_text(p.submit_on_ctrl_enter, p.lines.len()) {
-            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme);
+            let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+                .with_increase_contrast(self.increase_contrast);
             let dim_c = color_to_normalized(ui.text_secondary);
             // Multi-line input makes the hint slightly more visible (0.70
             // alpha vs 0.45) since the user is actively composing a multi-line
