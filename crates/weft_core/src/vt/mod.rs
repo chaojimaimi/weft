@@ -213,6 +213,14 @@ impl Terminal {
         self.capabilities.settle_state(std::time::Instant::now())
     }
 
+    /// R1-5: Whether the history-snapshot rate-limit window has elapsed,
+    /// surfaced for the diagnostic tracing layer. `false` when history
+    /// browsing is inactive. See `capability::CapabilityFlags::history_snapshot_due`.
+    pub fn history_snapshot_due(&self) -> bool {
+        self.capabilities
+            .history_snapshot_due(std::time::Instant::now())
+    }
+
     /// Swap the primary and alternate screen buffers (DEC 1049/47).
     ///
     /// `save_cursor_and_clear` distinguishes the two modes:

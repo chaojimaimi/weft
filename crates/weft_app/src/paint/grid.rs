@@ -38,6 +38,12 @@ impl MetalRenderer {
     /// 6-vertex-per-cell emission (~288 B/cell) — ~4.5x smaller per-frame
     /// upload. The per-row cache (`grid_row_cache`) stores instance floats
     /// (16 per cell) instead of vertex floats (72 per cell).
+    ///
+    /// R3-1: returns `(instances, dirty_row_count)` so the frame trace can
+    /// report how many rows were actually rebuilt this frame. `dirty_row_count`
+    /// is the number of non-hidden rows rebuilt: `num_rows` (or fewer if
+    /// primary-screen masking hides some) on `force_full`, 0 on the idle
+    /// fast path, and the actual dirty set size otherwise.
     pub(crate) fn build_grid_instances(
         &self,
         grid: &weft_core::grid::Grid,
@@ -45,7 +51,7 @@ impl MetalRenderer {
         cursor: &weft_core::grid::Cursor,
         selection: &SelectionHandler,
         policy: GridViewPolicy,
-    ) -> Vec<f32> {
+    ) -> (Vec<f32>, usize) {
         // Render at the atlas's native cell size — do NOT stretch cells to
         // fill the viewport (cw = viewport / num_cols). Stretching distorts
         // glyphs and, for full-width CJK, amplifies the baked intra-slot
@@ -224,15 +230,17 @@ impl MetalRenderer {
         if rows_to_rebuild.is_empty() {
             drop(cache);
             self.instances_unchanged.set(true);
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         self.instances_unchanged.set(false);
 
+        let mut rebuilt_rows = 0usize;
         for &row in &rows_to_rebuild {
             if primary_screen_row_hidden(row, policy.hidden_before_row, policy.owned_rows) {
                 cache[row].clear();
                 continue;
             }
+            rebuilt_rows += 1;
             // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
             // for cursor bar/underline + hyperlink underline decorations.
             let mut instances = Vec::with_capacity(num_cols * 16 + 48);
@@ -412,7 +420,7 @@ impl MetalRenderer {
         for rv in cache.iter() {
             out.extend_from_slice(rv);
         }
-        out
+        (out, rebuilt_rows)
     }
 }
 

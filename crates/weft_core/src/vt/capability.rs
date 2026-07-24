@@ -168,9 +168,10 @@ impl CapabilityFlags {
     //
     // The three readers below (`screen_owner`, `settle_state`,
     // `history_snapshot_due`) are consumed by the diagnostic tracing layer
-    // (R1 task 2 — `session_id`/`screen_owner`/`settle_state` trace fields).
-    // `screen_owner` and `settle_state` are wired via `Terminal` accessors;
-    // `history_snapshot_due` is a derivation helper kept for the trace layer.
+    // (R1 task 2 + R1-5 — `session_id`/`screen_owner`/`settle_state`/
+    // `history_snapshot_due` trace fields). `screen_owner` and `settle_state`
+    // are wired via `Terminal` accessors; `history_snapshot_due` is wired via
+    // `Terminal::history_snapshot_due()` (R1-5, v1.2.3).
     pub(in crate::vt) fn screen_owner(&self, phase: ShellPhase) -> ScreenOwner {
         if self.alt_active {
             return ScreenOwner::AltScreenApp;
@@ -203,7 +204,14 @@ impl CapabilityFlags {
 
     /// Whether the history-snapshot rate-limit window has elapsed since the
     /// last refresh. `false` when history browsing is inactive.
-    #[allow(dead_code)]
+    ///
+    /// R1-5: consumed by the diagnostic tracing layer via
+    /// `Terminal::history_snapshot_due()` to surface whether a snapshot
+    /// refresh is due at this instant. The actual refresh is driven by
+    /// `refresh_primary_history_snapshot_at` (see `screen_exit.rs`), which
+    /// performs the same rate-limit check inline; this helper exists purely
+    /// for observability so the trace can answer "why didn't a snapshot
+    /// fire at moment X?" without reconstructing the state by hand.
     pub(in crate::vt) fn history_snapshot_due(&self, now: Instant) -> bool {
         self.primary_history_view
             && now.saturating_duration_since(self.primary_history_snapshot_at.unwrap_or(now))

@@ -530,6 +530,9 @@ impl MetalRenderer {
         // `instances` carries the cells and `vertices` carries only overlays;
         // in block view, `instances` is empty and `vertices` carries everything.
         let mut instances: Vec<f32> = Vec::new();
+        // R3-1: dirty row count for frame trace. 0 for block view (no dirty
+        // concept); populated by build_grid_instances for grid view.
+        let mut dirty_row_count: usize = 0;
         let mut vertices: Vec<f32> = if show_blocks {
             let (v, regions, _) = if let Some(p) = prompt {
                 let box_top_y = crate::layout::layout_prompt(
@@ -604,7 +607,7 @@ impl MetalRenderer {
                 cursor_blink_on,
                 prompt.is_some(),
             );
-            instances = self.build_grid_instances(
+            let (grid_instances, grid_dirty_rows) = self.build_grid_instances(
                 grid,
                 terminal.palette(),
                 cursor,
@@ -616,6 +619,8 @@ impl MetalRenderer {
                     owned_rows: terminal.primary_screen_viewport_ownership(),
                 },
             );
+            instances = grid_instances;
+            dirty_row_count = grid_dirty_rows;
             Vec::new()
         };
 
@@ -762,15 +767,16 @@ impl MetalRenderer {
         // R3 task 6: BUILD-VERTICES segment ends; ENCODE segment starts.
         // Counters: vertex_count covers overlay/block-view verts (12 floats
         // each), instance_count covers grid cells (16 floats each:
-        // dst/uv/fg/bg). dirty_rows stays 0 for now — wiring grid dirty-row
-        // counts from build_grid_instances into this counter is a follow-up
-        // once the grid trace is validated against the existing probe.
+        // dst/uv/fg/bg). R3-1: dirty_rows now wired from
+        // build_grid_instances — reports actual rebuilt rows (0 for block
+        // view, num_rows for alt-screen force_full, dirty set size otherwise,
+        // 0 for idle fast path).
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
                 vertex_count: vertices.len() / 12,
                 instance_count: instances.len() / 16,
-                dirty_rows: 0,
+                dirty_rows: dirty_row_count,
             });
         self.frame_trace.borrow_mut().encode_start();
 

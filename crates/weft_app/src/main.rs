@@ -354,13 +354,14 @@ impl App {
                     if let Some(session) = self.sessions.tab_mut(tab) {
                         let session_id = session.session_id;
                         let input_seq = session.input_seq();
-                        let (screen_owner, settle_state) = session
+                        let (screen_owner, settle_state, history_snapshot_due) = session
                             .terminal
                             .as_ref()
-                            .map(|t| (t.screen_owner(), t.settle_state()))
+                            .map(|t| (t.screen_owner(), t.settle_state(), t.history_snapshot_due()))
                             .unwrap_or((
                                 weft_core::vt::ScreenOwner::Shell,
                                 weft_core::vt::SettleState::Idle,
+                                false,
                             ));
                         tracing::debug!(
                             session_id,
@@ -369,6 +370,7 @@ impl App {
                             bytes_len = bytes.len(),
                             %screen_owner,
                             %settle_state,
+                            history_snapshot_due,
                             delivery = "pty-write",
                             "effect dispatched",
                         );
@@ -381,13 +383,14 @@ impl App {
                     if let Some(session) = self.sessions.tab_mut(tab) {
                         let session_id = session.session_id;
                         let input_seq = session.input_seq();
-                        let (screen_owner, settle_state) = session
+                        let (screen_owner, settle_state, history_snapshot_due) = session
                             .terminal
                             .as_ref()
-                            .map(|t| (t.screen_owner(), t.settle_state()))
+                            .map(|t| (t.screen_owner(), t.settle_state(), t.history_snapshot_due()))
                             .unwrap_or((
                                 weft_core::vt::ScreenOwner::Shell,
                                 weft_core::vt::SettleState::Idle,
+                                false,
                             ));
                         tracing::debug!(
                             session_id,
@@ -395,6 +398,7 @@ impl App {
                             tab,
                             %screen_owner,
                             %settle_state,
+                            history_snapshot_due,
                             delivery = "pty-etx",
                             "interrupt effect dispatched",
                         );
