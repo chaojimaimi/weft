@@ -533,8 +533,12 @@ impl MetalRenderer {
         // R3-1: dirty row count for frame trace. 0 for block view (no dirty
         // concept); populated by build_grid_instances for grid view.
         let mut dirty_row_count: usize = 0;
+        // Step 1: block-specific counters for frame trace. Captured here in
+        // the block view branch; remain 0 in grid view.
+        let mut session_block_count: usize = 0;
+        let mut bv_rows_count: usize = 0;
         let mut vertices: Vec<f32> = if show_blocks {
-            let (v, regions, _) = if let Some(p) = prompt {
+            let (v, regions, bv_rows) = if let Some(p) = prompt {
                 let box_top_y = crate::layout::layout_prompt(
                     &ctx,
                     p.lines.len(),
@@ -581,6 +585,11 @@ impl MetalRenderer {
                 )
             };
             pending_hit_regions = regions;
+            // Step 1: capture block-specific counters for frame trace.
+            session_block_count = terminal.block_tracker().session_blocks().len();
+            // Step 2 will make this << session_block_count via visibility culling;
+            // for now (pre-Step-2) it equals the total expanded row count.
+            bv_rows_count = bv_rows.len();
             v
         } else {
             // Grid view (alt-screen apps): build per-cell instances
@@ -771,12 +780,24 @@ impl MetalRenderer {
         // build_grid_instances — reports actual rebuilt rows (0 for block
         // view, num_rows for alt-screen force_full, dirty set size otherwise,
         // 0 for idle fast path).
+        // Step 1: drain per-frame block layout cache hit/miss counters.
+        let (cache_hits, cache_misses) =
+            self.block_layout_cache.borrow_mut().take_hit_miss_counts();
+        // Step 1: visible_block_count = session_block_count pre-Step-2 (no
+        // visibility culling yet); will become the actual expanded count after
+        // Step 2 lands. Reported separately so the trace can show the delta.
+        let visible_block_count = session_block_count;
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
                 vertex_count: vertices.len() / 12,
                 instance_count: instances.len() / 16,
                 dirty_rows: dirty_row_count,
+                session_block_count,
+                visible_block_count,
+                bv_rows_count,
+                block_layout_cache_hits: cache_hits,
+                block_layout_cache_misses: cache_misses,
             });
         self.frame_trace.borrow_mut().encode_start();
 

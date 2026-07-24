@@ -149,6 +149,13 @@ pub(crate) struct CachedBlockLayout {
 #[derive(Default)]
 pub(crate) struct BlockLayoutCache {
     entries: HashMap<u64, CachedBlockLayout>,
+    /// Step 1: cache hit/miss counters for frame_trace observability.
+    /// A "hit" is an `ensure_cached` call that found a fresh entry;
+    /// a "miss" is one that triggered a rebuild. Reset by
+    /// `take_hit_miss_counts` at the end of each frame so the trace
+    /// reports per-frame deltas, not cumulative totals.
+    hits: usize,
+    misses: usize,
 }
 
 impl BlockLayoutCache {
@@ -168,7 +175,10 @@ impl BlockLayoutCache {
             }
         };
         if needs_rebuild {
+            self.misses += 1;
             self.entries.insert(id, compute_block_layout(block, cols));
+        } else {
+            self.hits += 1;
         }
     }
 
@@ -184,6 +194,17 @@ impl BlockLayoutCache {
     /// block was finalized between the last paint and the scrollbar layout).
     pub(crate) fn get_if_cached(&self, id: u64) -> Option<&CachedBlockLayout> {
         self.entries.get(&id)
+    }
+
+    /// Step 1: drain the per-frame hit/miss counters for frame_trace.
+    /// Returns `(hits, misses)` accumulated since the last call and resets
+    /// the internal accumulators. Call this once per frame at build_end.
+    pub(crate) fn take_hit_miss_counts(&mut self) -> (usize, usize) {
+        let h = self.hits;
+        let m = self.misses;
+        self.hits = 0;
+        self.misses = 0;
+        (h, m)
     }
 }
 

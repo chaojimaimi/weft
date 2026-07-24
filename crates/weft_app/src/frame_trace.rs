@@ -64,6 +64,24 @@ pub(crate) struct FrameCounters {
     pub(crate) vertex_count: usize,
     pub(crate) instance_count: usize,
     pub(crate) dirty_rows: usize,
+    /// Step 1: block-specific counters for BlockView path observability.
+    /// All zero in grid view. In block view:
+    /// - `session_block_count`: total finished blocks in the session
+    ///   (`terminal.block_tracker().session_blocks().len()`)
+    /// - `visible_block_count`: blocks whose rows were actually expanded
+    ///   into `bv_rows` (after clipping). Equals session_block_count until
+    ///   Step 2 visibility culling lands; thereafter should be << total.
+    /// - `bv_rows_count`: total rows in the returned `bv_rows` Vec — the
+    ///   rows the hit-tester / selection syncer / find highlighter will see.
+    /// - `block_layout_cache_hits` / `_misses`: increments since last frame
+    ///   from `BlockLayoutCache::ensure_cached`. A "miss" is a rebuild
+    ///   (cache entry absent or stale); a "hit" is a no-op ensure_cached.
+    ///   Steady-state should be hits >> misses.
+    pub(crate) session_block_count: usize,
+    pub(crate) visible_block_count: usize,
+    pub(crate) bv_rows_count: usize,
+    pub(crate) block_layout_cache_hits: usize,
+    pub(crate) block_layout_cache_misses: usize,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -232,6 +250,11 @@ impl FrameTraceRecorder {
             vertices = counters.vertex_count,
             instances = counters.instance_count,
             dirty_rows = counters.dirty_rows,
+            session_blocks = counters.session_block_count,
+            visible_blocks = counters.visible_block_count,
+            bv_rows = counters.bv_rows_count,
+            cache_hits = counters.block_layout_cache_hits,
+            cache_misses = counters.block_layout_cache_misses,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -291,6 +314,11 @@ mod tests {
             vertex_count: 100,
             instance_count: 2000,
             dirty_rows: 5,
+            session_block_count: 0,
+            visible_block_count: 0,
+            bv_rows_count: 0,
+            block_layout_cache_hits: 0,
+            block_layout_cache_misses: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));
