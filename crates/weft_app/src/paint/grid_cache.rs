@@ -143,6 +143,13 @@ pub(crate) struct CachedBlockLayout {
     /// per-frame parameters, not per-block cache keys. This lets
     /// `block_content_metrics` skip the O(m) re-wrap per block and read O(1).
     pub(crate) output_rows: usize,
+    /// R2-2 (Batch 7): base row count for prefix-sum = hint_rows +
+    /// output_rows + 2 (command + separator). Excludes clear_rows (depends
+    /// on per-frame viewport_rows) and header_height (per-frame). Used by
+    /// `BlockLayoutCache::build_prefix_sum` for O(log n) binary search to
+    /// locate the first visible block, eliminating O(n) traversal of
+    /// offscreen blocks.
+    pub(crate) base_row_count: usize,
 }
 
 /// Per-renderer block layout cache. Keyed by `BlockId.0`.
@@ -156,6 +163,20 @@ pub(crate) struct BlockLayoutCache {
     /// reports per-frame deltas, not cumulative totals.
     hits: usize,
     misses: usize,
+    /// R2-2 (Batch 7): prefix sum of `base_row_count`, indexed from the
+    /// newest block. `prefix_sum[0] = 0`, `prefix_sum[i]` = sum of
+    /// `base_row_count` for the i newest blocks. Enables O(log n) binary
+    /// search to locate the first visible block, eliminating O(n)
+    /// traversal of offscreen blocks.
+    prefix_sum: Vec<usize>,
+    /// Block IDs from the last `build_prefix_sum` call, in newest-to-oldest
+    /// order. Used to detect block set changes (add/remove) that invalidate
+    /// the prefix sum.
+    prefix_sum_block_ids: Vec<u64>,
+    /// Set true when any `ensure_cached` call triggers a rebuild (cache
+    /// miss), which may change a `base_row_count`. Cleared by
+    /// `build_prefix_sum` after rebuild.
+    prefix_sum_dirty: bool,
 }
 
 impl BlockLayoutCache {
@@ -176,6 +197,7 @@ impl BlockLayoutCache {
         };
         if needs_rebuild {
             self.misses += 1;
+            self.prefix_sum_dirty = true;
             self.entries.insert(id, compute_block_layout(block, cols));
         } else {
             self.hits += 1;
@@ -205,6 +227,54 @@ impl BlockLayoutCache {
         self.hits = 0;
         self.misses = 0;
         (h, m)
+    }
+
+    /// R2-2 (Batch 7): Build the prefix sum array for O(log n) binary
+    /// search. Must be called after all blocks have been `ensure_cached`
+    /// and before `prefix_sum()` is read.
+    ///
+    /// Rebuilds only when the block set changes (add/remove/reorder) or
+    /// any cache entry was rebuilt (base_row_count may have changed). When
+    /// neither condition holds, this is O(n) comparison + early return.
+    pub(crate) fn build_prefix_sum(&mut self, blocks: &[Block]) {
+        // Detect block set changes by comparing IDs (newest-to-oldest).
+        let ids_changed = self.prefix_sum_block_ids.len() != blocks.len()
+            || blocks
+                .iter()
+                .rev()
+                .zip(self.prefix_sum_block_ids.iter())
+                .any(|(b, &old_id)| b.id.0 != old_id);
+
+        // First call (prefix_sum never initialized) must build even when
+        // blocks is empty, so the invariant prefix_sum.len() == n + 1 holds.
+        if !ids_changed && !self.prefix_sum_dirty && !self.prefix_sum.is_empty() {
+            return;
+        }
+
+        // Rebuild: walk newest-to-oldest to match layout_pass traversal.
+        self.prefix_sum_block_ids = blocks.iter().rev().map(|b| b.id.0).collect();
+        self.prefix_sum.clear();
+        self.prefix_sum.reserve(blocks.len() + 1);
+        self.prefix_sum.push(0);
+        let mut acc = 0usize;
+        for b in blocks.iter().rev() {
+            let base = self
+                .entries
+                .get(&b.id.0)
+                .map(|c| c.base_row_count)
+                .unwrap_or(0);
+            acc += base;
+            self.prefix_sum.push(acc);
+        }
+        self.prefix_sum_dirty = false;
+    }
+
+    /// R2-2 (Batch 7): Prefix sum of `base_row_count`, indexed from the
+    /// newest block. `prefix_sum()[0] = 0`, `prefix_sum()[i]` = sum of
+    /// `base_row_count` for the i newest blocks. Empty if
+    /// `build_prefix_sum` hasn't been called.
+    pub(crate) fn prefix_sum(&self) -> &[usize] {
+        &self.prefix_sum
     }
 }
 
@@ -257,6 +327,20 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         hint_rows + line_rows
     };
 
+    // R2-2 (Batch 7): base_row_count for prefix-sum. Matches the
+    // layout_pass formula: (hint_rows + output_rows + 2) where the +2
+    // covers command + separator rows. clear_rows and header_height are
+    // per-frame and excluded.
+    let hint_rows_for_base = if block.collapsed {
+        0
+    } else {
+        crate::block_component::command_resume_hints(block)
+            .iter()
+            .map(|hint| block_line_chunks(hint, cols).count())
+            .sum::<usize>()
+    };
+    let base_row_count = hint_rows_for_base + output_rows + 2;
+
     CachedBlockLayout {
         output_len: block.output.len(),
         output_identity: block.output.as_ptr() as usize,
@@ -266,6 +350,7 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         foldable,
         lines,
         output_rows,
+        base_row_count,
     }
 }
 
@@ -481,5 +566,133 @@ mod tests {
         let layout = compute_block_layout(&block, 80);
         assert_eq!(layout.lines.len(), 0);
         assert!(!layout.foldable);
+    }
+
+    // ── R2-2 (Batch 7): prefix sum tests ───────────────────────────────
+
+    /// `base_row_count` must equal `hint_rows + output_rows + 2` (command +
+    /// separator) for non-collapsed blocks, and `2` for collapsed blocks
+    /// (output_rows=0, hint_rows=0). This invariant is what makes the prefix
+    /// sum match the layout_pass height formula.
+    #[test]
+    fn base_row_count_matches_layout_formula() {
+        // 3 output lines, no resume hints → base = 0 + 3 + 2 = 5
+        let block = mk_block_with_output(1, "echo", "a\nb\nc\n");
+        let layout = compute_block_layout(&block, 80);
+        assert_eq!(layout.base_row_count, 5);
+
+        // Collapsed → output_rows=0, hint_rows=0 → base = 2
+        let mut collapsed = block;
+        collapsed.collapsed = true;
+        let layout_c = compute_block_layout(&collapsed, 80);
+        assert_eq!(layout_c.base_row_count, 2);
+
+        // Empty output → output_rows=0 → base = 0 + 0 + 2 = 2
+        let empty = mk_block_with_output(2, "true", "");
+        let layout_e = compute_block_layout(&empty, 80);
+        assert_eq!(layout_e.base_row_count, 2);
+    }
+
+    #[test]
+    fn build_prefix_sum_empty_blocks() {
+        let mut cache = BlockLayoutCache::default();
+        cache.build_prefix_sum(&[]);
+        assert_eq!(cache.prefix_sum(), &[0]);
+    }
+
+    #[test]
+    fn build_prefix_sum_single_block() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "a\nb\nc\n"); // base=5
+        cache.ensure_cached(&block, 80);
+        cache.build_prefix_sum(&[block]);
+        // prefix_sum[0]=0, prefix_sum[1]=5
+        assert_eq!(cache.prefix_sum(), &[0, 5]);
+    }
+
+    #[test]
+    fn build_prefix_sum_multiple_blocks_cumulative() {
+        let mut cache = BlockLayoutCache::default();
+        // Newest-first ordering in `blocks` vec; build_prefix_sum walks
+        // .rev() so prefix_sum[1] = newest block's base, prefix_sum[2] =
+        // newest + second-newest, etc.
+        // blocks[0] = oldest (id=1, base=2: empty output)
+        // blocks[1] = newest (id=2, base=5: 3 lines)
+        let b1 = mk_block_with_output(1, "true", "");
+        let b2 = mk_block_with_output(2, "echo", "a\nb\nc\n");
+        let blocks = vec![b1, b2];
+        cache.ensure_cached(&blocks[0], 80);
+        cache.ensure_cached(&blocks[1], 80);
+        cache.build_prefix_sum(&blocks);
+        // rev() walks b2 (base=5) then b1 (base=2).
+        // prefix_sum = [0, 5, 7]
+        assert_eq!(cache.prefix_sum(), &[0, 5, 7]);
+    }
+
+    /// Rebuild is skipped when neither block IDs nor any cache entry changed.
+    /// This is the steady-state hot path (no rebuild per frame).
+    #[test]
+    fn build_prefix_sum_skips_rebuild_when_unchanged() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "a\nb\n");
+        cache.ensure_cached(&block, 80);
+        cache.build_prefix_sum(&[block.clone()]);
+        let ps1 = cache.prefix_sum().to_vec();
+
+        // Second call with same blocks — should be a no-op.
+        cache.build_prefix_sum(&[block]);
+        assert_eq!(cache.prefix_sum(), ps1.as_slice());
+    }
+
+    /// Adding a block triggers rebuild (ids_changed path).
+    #[test]
+    fn build_prefix_sum_rebuilds_on_block_added() {
+        let mut cache = BlockLayoutCache::default();
+        let b1 = mk_block_with_output(1, "echo", "a\n");
+        cache.ensure_cached(&b1, 80);
+        cache.build_prefix_sum(&[b1.clone()]);
+        assert_eq!(cache.prefix_sum(), &[0, 3]); // base = 1 + 2 = 3
+
+        // Add a second block (older). blocks = [b2, b1] (b1 is newest).
+        let b2 = mk_block_with_output(2, "echo", "x\ny\nz\n");
+        cache.ensure_cached(&b2, 80);
+        cache.build_prefix_sum(&[b2, b1.clone()]);
+        // rev() → b1 (base=3) then b2 (base=5). prefix_sum = [0, 3, 8]
+        assert_eq!(cache.prefix_sum(), &[0, 3, 8]);
+    }
+
+    /// A cache miss (output change) sets prefix_sum_dirty, forcing rebuild
+    /// on the next build_prefix_sum call even if IDs are unchanged.
+    #[test]
+    fn build_prefix_sum_rebuilds_on_output_change() {
+        let mut cache = BlockLayoutCache::default();
+        let block = mk_block_with_output(1, "echo", "a\n");
+        cache.ensure_cached(&block, 80);
+        cache.build_prefix_sum(&[block.clone()]);
+        assert_eq!(cache.prefix_sum(), &[0, 3]);
+
+        // Output grows → ensure_cached triggers rebuild, sets dirty.
+        let block2 = mk_block_with_output(1, "echo", "a\nb\nc\nd\n");
+        cache.ensure_cached(&block2, 80);
+        cache.build_prefix_sum(&[block2]);
+        // base = 4 + 2 = 6
+        assert_eq!(cache.prefix_sum(), &[0, 6]);
+    }
+
+    /// Collapsed blocks contribute base_row_count=2 to the prefix sum,
+    /// matching the layout_pass formula (cursor_dist += pitch*0 + pitch
+    /// + header_height + pitch for command+header+separator).
+    #[test]
+    fn build_prefix_sum_handles_collapsed_blocks() {
+        let mut cache = BlockLayoutCache::default();
+        let mut b1 = mk_block_with_output(1, "echo", "a\nb\nc\n");
+        b1.collapsed = true; // base = 2
+        let b2 = mk_block_with_output(2, "echo", "x\n"); // base = 3
+        let blocks = vec![b1, b2];
+        cache.ensure_cached(&blocks[0], 80);
+        cache.ensure_cached(&blocks[1], 80);
+        cache.build_prefix_sum(&blocks);
+        // rev() → b2 (base=3) then b1 (base=2). prefix_sum = [0, 3, 5]
+        assert_eq!(cache.prefix_sum(), &[0, 3, 5]);
     }
 }

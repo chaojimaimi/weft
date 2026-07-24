@@ -180,17 +180,64 @@ pub(super) fn compute_block_layout_pass<'a>(
         row_data.push(LaidRow::Separator);
     }
 
-    // Finished blocks (walked bottom-to-top).
-    // Step 2: visibility culling. Compute scroll_px and clip bounds once,
-    // then for each block decide whether to expand its internal lines.
-    // Blocks fully offscreen only accumulate cursor_dist without pushing
-    // rows, reducing layout pass from O(n*m) to O(n + k*m) where k =
-    // visible block count. A 1-block overscan on each side covers partial
-    // blocks and the sticky header.
+    // Finished blocks: R2-2 (Batch 7) prefix-sum binary search.
+    //
+    // Instead of O(n) traversal of all blocks, binary search for the
+    // visible range using the prefix sum of `base_row_count` and only
+    // iterate those blocks + 1 overscan on each side. Offscreen blocks
+    // are skipped entirely (no push to rows/row_data), reducing layout
+    // pass from O(n + k*m) to O(log n + k*m) where k = visible count.
+    //
+    // `sync_rows` (selection.rs:409) already handles rows scrolling out
+    // of the visible set by remapping to the closest y-center, so
+    // omitting offscreen blocks from rows/row_data is safe.
     let scroll_px = (block_scroll as f32) * pitch;
     let overscan = header_height + pitch * 2.0;
+    let live_cursor_dist = cursor_dist;
 
-    for b in blocks.iter().rev() {
+    let prefix_sum = cache.prefix_sum();
+    let n = blocks.len();
+
+    // Determine the visible block range [start_idx, end_idx) in
+    // "newest-first" index space (0 = newest = blocks[n-1]).
+    let (start_idx, end_idx) = if n == 0 || prefix_sum.len() != n + 1 {
+        (0usize, n) // fallback: iterate all (no prefix sum built yet)
+    } else {
+        // cumulative_height(i) = prefix_sum[i] * pitch + i * header_height
+        // = total height of the i newest finished blocks (excl. live).
+        // clear_rows (per-frame, only for `clear` command) is intentionally
+        // excluded from the prefix sum; this may cause ±1 block of slop
+        // at the edges, covered by the 1-block overscan below.
+        let threshold_low =
+            content_bottom_y + scroll_px - clip_bottom - overscan - live_cursor_dist;
+        let threshold_high = content_bottom_y + scroll_px - clip_top + overscan - live_cursor_dist;
+
+        // first_visible: smallest idx where cumulative_height(idx+1) >= threshold_low
+        let j_low = lower_bound_height(prefix_sum, pitch, header_height, threshold_low);
+        let first_visible = j_low.saturating_sub(1);
+
+        // last_visible+1: smallest idx where cumulative_height(idx) > threshold_high
+        let j_high = upper_bound_height(prefix_sum, pitch, header_height, threshold_high);
+
+        // 1-block overscan on each side to cover partial blocks and the
+        // sticky header (which references the topmost visible block).
+        let start = first_visible.saturating_sub(1);
+        let end = (j_high + 1).min(n);
+        (start, end)
+    };
+
+    // Fast-forward cursor_dist to the start of the visible range.
+    // Blocks before start_idx (newer, already below the viewport) are
+    // skipped — their height is accounted for via the prefix sum.
+    if start_idx > 0 && prefix_sum.len() == n + 1 {
+        cursor_dist = live_cursor_dist
+            + prefix_sum[start_idx] as f32 * pitch
+            + start_idx as f32 * header_height;
+    }
+
+    // Iterate visible range (newest to oldest).
+    for idx in start_idx..end_idx {
+        let b = &blocks[n - 1 - idx];
         let cached = cache.get(b.id.0);
 
         // Compute this block's total height without expanding internal
@@ -290,6 +337,52 @@ pub(super) fn compute_block_layout_pass<'a>(
     }
 }
 
+/// R2-2 (Batch 7): Find smallest j where `prefix_sum[j] * pitch +
+/// j * header_height >= threshold`. Returns `prefix_sum.len()` if all
+/// elements are below threshold.
+fn lower_bound_height(
+    prefix_sum: &[usize],
+    pitch: f32,
+    header_height: f32,
+    threshold: f32,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = prefix_sum.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let height = prefix_sum[mid] as f32 * pitch + mid as f32 * header_height;
+        if height < threshold {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// R2-2 (Batch 7): Find smallest j where `prefix_sum[j] * pitch +
+/// j * header_height > threshold` (upper bound). Returns
+/// `prefix_sum.len()` if all elements are <= threshold.
+fn upper_bound_height(
+    prefix_sum: &[usize],
+    pitch: f32,
+    header_height: f32,
+    threshold: f32,
+) -> usize {
+    let mut lo = 0usize;
+    let mut hi = prefix_sum.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let height = prefix_sum[mid] as f32 * pitch + mid as f32 * header_height;
+        if height <= threshold {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +415,103 @@ mod tests {
         assert!(out.rows.is_empty());
         assert!(out.row_data.is_empty());
         assert_eq!(out.expanded_block_count, 0);
+    }
+
+    // ── R2-2 (Batch 7): binary search helpers ─────────────────────────
+    //
+    // `lower_bound_height` / `upper_bound_height` find the visible block
+    // range via binary search on the prefix sum. Their correctness is what
+    // keeps the O(log n) fast path from skipping or duplicating blocks.
+    // The height formula is `prefix_sum[j] * pitch + j * header_height`.
+
+    #[test]
+    fn lower_bound_height_empty_returns_zero() {
+        // Empty prefix sum (just [0]) → always returns 0 (nothing >= threshold).
+        assert_eq!(lower_bound_height(&[0], 20.0, 24.0, 100.0), 1);
+        assert_eq!(lower_bound_height(&[0], 20.0, 24.0, 0.0), 0);
+    }
+
+    #[test]
+    fn lower_bound_height_all_below_threshold_returns_len() {
+        // prefix_sum = [0, 5, 10, 15], pitch=20, header=24
+        // heights = [0, 5*20+1*24=124, 10*20+2*24=248, 15*20+3*24=372]
+        let ps = [0, 5, 10, 15];
+        // threshold=400 → all below → returns 4 (len)
+        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 400.0), 4);
+    }
+
+    #[test]
+    fn lower_bound_height_all_above_threshold_returns_zero() {
+        let ps = [0, 5, 10, 15];
+        // threshold=-10 → all above (height[0]=0 >= -10) → returns 0
+        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, -10.0), 0);
+    }
+
+    #[test]
+    fn lower_bound_height_finds_first_ge_threshold() {
+        // heights = [0, 124, 248, 372]
+        let ps = [0, 5, 10, 15];
+        // threshold=200 → first >= 200 is index 2 (height=248)
+        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 200.0), 2);
+        // threshold=124 → first >= 124 is index 1 (exact match)
+        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 124.0), 1);
+        // threshold=125 → first >= 125 is still index 2
+        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 125.0), 2);
+    }
+
+    #[test]
+    fn upper_bound_height_empty_returns_zero() {
+        // upper_bound is strict > : height[0]=0 > -1 → returns 0
+        assert_eq!(upper_bound_height(&[0], 20.0, 24.0, -1.0), 0);
+        // height[0]=0 > 0 is false → returns 1 (len)
+        assert_eq!(upper_bound_height(&[0], 20.0, 24.0, 0.0), 1);
+    }
+
+    #[test]
+    fn upper_bound_height_all_le_threshold_returns_len() {
+        // heights = [0, 124, 248, 372]
+        let ps = [0, 5, 10, 15];
+        // threshold=400 → all <= 400 → returns 4 (len)
+        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 400.0), 4);
+    }
+
+    #[test]
+    fn upper_bound_height_finds_first_gt_threshold() {
+        // heights = [0, 124, 248, 372]
+        let ps = [0, 5, 10, 15];
+        // threshold=200 → first > 200 is index 2 (height=248)
+        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 200.0), 2);
+        // threshold=124 → first > 124 is index 2 (strict: 124 is not > 124)
+        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 124.0), 2);
+        // threshold=125 → first > 125 is index 2
+        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 125.0), 2);
+    }
+
+    /// The visible range is [lower_bound(threshold_low) - 1, upper_bound(threshold_high) + 1)
+    /// with 1-block overscan on each side. This test verifies the bounds
+    /// produce a valid range that contains the visible blocks.
+    #[test]
+    fn binary_search_visible_range_contains_expected_blocks() {
+        // 10 blocks, each base_row_count=5 → prefix_sum = [0,5,10,...,50]
+        let ps: Vec<usize> = (0..=10).map(|i| i * 5).collect();
+        let pitch = 20.0_f32;
+        let header = 24.0_f32;
+        // height(i) = 5i * 20 + i * 24 = 124i
+        // Say viewport covers blocks 3..6 (heights 372..744).
+        // threshold_low=350 → lower_bound finds first >= 350 → idx 3 (height=372)
+        // threshold_high=760 → upper_bound finds first > 760 → idx 7 (height=868)
+        let j_low = lower_bound_height(&ps, pitch, header, 350.0);
+        let j_high = upper_bound_height(&ps, pitch, header, 760.0);
+        assert_eq!(j_low, 3);
+        assert_eq!(j_high, 7);
+        // first_visible = j_low - 1 = 2, with overscan start=1
+        // end = j_high + 1 = 8
+        // Visible range [1, 8) covers blocks 1..7 — includes 3..6 with overscan.
+        let first_visible = j_low.saturating_sub(1);
+        let start = first_visible.saturating_sub(1);
+        let end = (j_high + 1).min(10);
+        assert_eq!(start, 1);
+        assert_eq!(end, 8);
     }
 
     /// Batch 6 Step 3 (R2-2): criterion micro-benchmark for
@@ -380,6 +570,9 @@ mod tests {
             for b in &blocks {
                 cache.ensure_cached(b, 80);
             }
+            // R2-2 (Batch 7): build prefix sum so the binary-search fast
+            // path is exercised (otherwise the fallback iterates all blocks).
+            cache.build_prefix_sum(&blocks);
 
             // Scenario 1: all blocks visible (clip bounds = ±∞)
             group.bench_function(format!("all_visible/{count}"), |b| {

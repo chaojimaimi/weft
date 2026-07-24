@@ -127,6 +127,10 @@ impl MetalRenderer {
             for b in blocks.iter() {
                 cache.ensure_cached(b, cols);
             }
+            // R2-2 (Batch 7): build prefix sum so compute_block_layout_pass
+            // can binary-search the visible block range (O(log n)) instead
+            // of iterating all blocks (O(n)). No-op when nothing changed.
+            cache.build_prefix_sum(blocks);
         }
         // Batch 6 Step 1: reset styled lookup counter before the pass; the
         // pass bumps it via styled_lookup_counter for each styled.line() call.

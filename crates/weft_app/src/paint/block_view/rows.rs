@@ -87,6 +87,10 @@ impl MetalRenderer {
             for b in blocks.iter() {
                 cache.ensure_cached(b, cols);
             }
+            // R2-2 (Batch 7): build prefix sum so the layout pass can
+            // binary-search the visible range. Must mirror the paint path
+            // (build_block_view_vertices) so hit-testing y-bands match.
+            cache.build_prefix_sum(blocks);
         }
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
