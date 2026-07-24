@@ -135,6 +135,8 @@ impl MetalRenderer {
         // Batch 6 Step 1: reset styled lookup counter before the pass; the
         // pass bumps it via styled_lookup_counter for each styled.line() call.
         self.styled_lookup_counter.set(0);
+        // Batch 7 Step 4: reset styled paint timer before the pass.
+        self.styled_paint_us_counter.set(0);
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
             compute_block_layout_pass(
@@ -370,6 +372,7 @@ impl MetalRenderer {
                                 );
                             }
                         }
+                        let t0 = std::time::Instant::now();
                         self.push_block_output_text(
                             &mut verts,
                             BlockOutputTextPaint {
@@ -383,6 +386,9 @@ impl MetalRenderer {
                                 palette,
                                 row_pitch: pitch,
                             },
+                        );
+                        self.styled_paint_us_counter.set(
+                            self.styled_paint_us_counter.get() + t0.elapsed().as_micros() as u64,
                         );
                     } else {
                         let mut char_offset = 0;
@@ -421,6 +427,7 @@ impl MetalRenderer {
                                         }
                                     }
                                 }
+                                let t0 = std::time::Instant::now();
                                 self.push_block_output_text(
                                     &mut verts,
                                     BlockOutputTextPaint {
@@ -434,6 +441,10 @@ impl MetalRenderer {
                                         palette,
                                         row_pitch: pitch,
                                     },
+                                );
+                                self.styled_paint_us_counter.set(
+                                    self.styled_paint_us_counter.get()
+                                        + t0.elapsed().as_micros() as u64,
                                 );
                             }
                             char_offset += chunk.chars().count();

@@ -88,6 +88,13 @@ pub(crate) struct FrameCounters {
     pub(crate) block_layout_cache_hits: usize,
     pub(crate) block_layout_cache_misses: usize,
     pub(crate) styled_line_lookups: usize,
+    /// Batch 7 Step 4: wall-clock time spent inside `push_block_output_text`
+    /// this frame, in microseconds. Complements `styled_line_lookups` (which
+    /// only counts calls) by measuring the actual CPU cost of styled-line
+    /// painting — including per-char `partition_point` lookups and glyph
+    /// pushes. Zero in grid view. Used to decide whether styled-line caching
+    /// is worth the vertex-relative-coords refactor.
+    pub(crate) styled_paint_us: u64,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -262,6 +269,7 @@ impl FrameTraceRecorder {
             cache_hits = counters.block_layout_cache_hits,
             cache_misses = counters.block_layout_cache_misses,
             styled_lookups = counters.styled_line_lookups,
+            styled_paint_us = counters.styled_paint_us,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -327,6 +335,7 @@ mod tests {
             block_layout_cache_hits: 0,
             block_layout_cache_misses: 0,
             styled_line_lookups: 0,
+            styled_paint_us: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));

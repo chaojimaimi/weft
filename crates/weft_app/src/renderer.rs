@@ -118,6 +118,12 @@ pub struct MetalRenderer {
     /// `build_end` to populate `FrameCounters.styled_line_lookups`. Used to
     /// assess whether styled-line caching is worth the complexity.
     pub(crate) styled_lookup_counter: Cell<usize>,
+    /// Batch 7 Step 4: per-frame wall-clock timer for `push_block_output_text`.
+    /// Accumulated in microseconds across all calls within a single paint.
+    /// Reset to 0 before each paint, read at `build_end` to populate
+    /// `FrameCounters.styled_paint_us`. Complements `styled_lookup_counter`
+    /// (call count) with actual CPU cost for styled-line caching decisions.
+    pub(crate) styled_paint_us_counter: Cell<u64>,
     /// Batch 6 Step 1: per-frame expanded block count from the last
     /// `compute_block_layout_pass`. Written by `build_block_view_vertices`,
     /// read at `build_end` to populate `FrameCounters.visible_block_count`.
@@ -552,6 +558,7 @@ impl MetalRenderer {
             // instead of the last block-view frame's stale values.
             self.last_expanded_block_count.set(0);
             self.styled_lookup_counter.set(0);
+            self.styled_paint_us_counter.set(0);
         }
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -823,6 +830,7 @@ impl MetalRenderer {
         // were expanded, i.e. is_visible && !collapsed). 0 in grid view.
         let visible_block_count = self.last_expanded_block_count.get();
         let styled_line_lookups = self.styled_lookup_counter.get();
+        let styled_paint_us = self.styled_paint_us_counter.get();
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
@@ -835,6 +843,7 @@ impl MetalRenderer {
                 block_layout_cache_hits: cache_hits,
                 block_layout_cache_misses: cache_misses,
                 styled_line_lookups,
+                styled_paint_us,
             });
         self.frame_trace.borrow_mut().encode_start();
 

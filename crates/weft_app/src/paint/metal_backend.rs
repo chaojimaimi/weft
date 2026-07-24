@@ -205,6 +205,7 @@ impl MetalRenderer {
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),
             styled_lookup_counter: Cell::new(0),
+            styled_paint_us_counter: Cell::new(0),
             last_expanded_block_count: Cell::new(0),
             grid_row_cache: RefCell::new(Vec::new()),
             force_full_grid: Cell::new(true),
