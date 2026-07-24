@@ -3,16 +3,8 @@
 //! The terminal grid keeps its specialized instance renderer. UI components
 //! migrate here incrementally so paint, hit testing, focus and accessibility
 //! share one bounds object.
-#![allow(dead_code)]
 
 use crate::layout::Rect;
-use weft_core::grid::Color;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Layer(pub(crate) u16);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ClipId(pub(crate) usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FocusId {
@@ -29,6 +21,10 @@ impl FocusId {
     /// F6: Map a `FocusId` to its containing [`FocusScope`]. Tab/Shift+Tab
     /// cycles only within the current scope so focus doesn't escape a modal
     /// surface or jump from the sidebar to the terminal unexpectedly.
+    ///
+    /// Batch 7: focus scope stack wiring deferred to Batch 9+; this mapping
+    /// is exercised by unit tests until then.
+    #[allow(dead_code)]
     pub(crate) fn scope(self) -> FocusScope {
         match self {
             FocusId::Tab(_) | FocusId::Completion => FocusScope::Terminal,
@@ -51,28 +47,15 @@ impl FocusId {
 ///
 /// Tab/Shift+Tab cycles within the current scope. When a modal opens, the
 /// previous scope is saved on the focus stack; closing the modal restores it.
+///
+/// Batch 7: focus scope stack wiring deferred to Batch 9+; variants are
+/// exercised by unit tests until then.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FocusScope {
     Terminal,
     Sidebar,
     Modal,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Primitive {
-    Rect {
-        bounds: Rect,
-        color: Color,
-        layer: Layer,
-        clip: Option<ClipId>,
-    },
-    GlyphRun {
-        origin: [f32; 2],
-        text: String,
-        color: Color,
-        layer: Layer,
-        clip: Option<ClipId>,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,10 +70,6 @@ pub(crate) struct HitRegion<T> {
 impl<T> HitRegion<T> {
     pub(crate) fn bounds(&self) -> Rect {
         [self.x0, self.y0, self.x1, self.y1]
-    }
-
-    pub(crate) fn contains(&self, x: f32, y: f32) -> bool {
-        x >= self.x0 && x <= self.x1 && y >= self.y0 && y <= self.y1
     }
 
     pub(crate) fn contains_half_open(&self, x: f32, y: f32) -> bool {
@@ -146,8 +125,6 @@ pub(crate) struct SemanticNode {
 }
 
 pub(crate) struct Scene<T> {
-    pub(crate) primitives: Vec<Primitive>,
-    pub(crate) clips: Vec<Rect>,
     pub(crate) hits: Vec<HitRegion<T>>,
     pub(crate) semantics: Vec<SemanticNode>,
 }
@@ -155,8 +132,6 @@ pub(crate) struct Scene<T> {
 impl<T> Default for Scene<T> {
     fn default() -> Self {
         Self {
-            primitives: Vec::new(),
-            clips: Vec::new(),
             hits: Vec::new(),
             semantics: Vec::new(),
         }
@@ -184,8 +159,10 @@ mod tests {
             state: String::new(),
         };
         assert_eq!(semantic.bounds, hit.bounds());
-        assert!(hit.contains(10.0, 52.0));
-        assert!(!hit.contains(111.0, 52.0));
+        // contains_half_open: [x0, x1) × [y0, y1)
+        assert!(hit.contains_half_open(10.0, 20.0)); // top-left corner included
+        assert!(!hit.contains_half_open(110.0, 52.0)); // x1 (right edge) excluded
+        assert!(!hit.contains_half_open(111.0, 52.0)); // outside
     }
 
     #[test]
@@ -204,7 +181,6 @@ mod tests {
             target: TargetWithoutDefault::Row(1),
         });
         assert_eq!(scene.hits.len(), 1);
-        assert!(scene.primitives.is_empty());
         assert!(scene.semantics.is_empty());
     }
 

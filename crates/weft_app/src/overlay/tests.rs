@@ -28,9 +28,9 @@ fn hit_region_contains_point_inside() {
         y1: 60.0,
         target: HitTarget::CompletionItem(0),
     };
-    assert!(r.contains(30.0, 40.0));
-    assert!(r.contains(10.0, 20.0)); // top-left corner inclusive
-    assert!(r.contains(50.0, 60.0)); // bottom-right inclusive
+    assert!(r.contains_half_open(30.0, 40.0));
+    assert!(r.contains_half_open(10.0, 20.0)); // top-left corner inclusive
+    assert!(!r.contains_half_open(50.0, 60.0)); // bottom-right exclusive (half-open)
 }
 
 #[test]
@@ -42,10 +42,10 @@ fn hit_region_contains_point_outside() {
         y1: 60.0,
         target: HitTarget::CompletionItem(0),
     };
-    assert!(!r.contains(5.0, 30.0)); // left of region
-    assert!(!r.contains(55.0, 30.0)); // right of region
-    assert!(!r.contains(30.0, 10.0)); // above
-    assert!(!r.contains(30.0, 70.0)); // below
+    assert!(!r.contains_half_open(5.0, 30.0)); // left of region
+    assert!(!r.contains_half_open(55.0, 30.0)); // right of region
+    assert!(!r.contains_half_open(30.0, 10.0)); // above
+    assert!(!r.contains_half_open(30.0, 70.0)); // below
 }
 
 #[test]

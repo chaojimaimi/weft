@@ -200,18 +200,6 @@ pub(crate) fn build_command_surface_resize_handles(
 
 // ── Row ────────────────────────────────────────────────────────────────
 
-/// Unified row data for command surfaces. Each surface maps its domain
-/// model (PaletteEntry, completion::Match, FindMatch, …) into this shape so
-/// the row renderer can treat them uniformly.
-#[allow(dead_code)] // F4: data model for future unified row rendering
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CommandSurfaceRow {
-    pub label: String,
-    pub description: String,
-    pub kind: String,
-    pub shortcut: String,
-}
-
 /// Per-row visual state. Drives the background treatment. Multiple states
 /// can be combined (e.g. a disabled row that happens to be selected still
 /// renders as disabled). `disabled` wins over `selected`/`hovered`.
@@ -283,7 +271,6 @@ pub(crate) fn build_command_surface_row_bg(
 /// "blank space" rendering with an explicit, accessible status. Each
 /// surface derives its state from its own inputs (Find: query/matches/
 /// regex_error; Palette: query/results/store; Completion: matches).
-#[allow(dead_code)] // F4: complete state set; some variants await wiring
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum CommandSurfaceState {
     /// Results are ready to display (the normal case).
@@ -299,6 +286,7 @@ pub(crate) enum CommandSurfaceState {
     /// Surface is temporarily disabled (e.g. no terminal attached, or the
     /// command store couldn't be opened). Distinct from Empty because the
     /// user's query is not at fault.
+    #[allow(dead_code)] // exercised by tests; awaiting production wiring
     Disabled,
 }
 

@@ -296,7 +296,7 @@ impl App {
     /// approximations), so hot-zone detection is accurate.
     pub(super) fn check_popup_border_drag(&self, x: f64, y: f64) -> Option<DragState> {
         let renderer = self.renderer.as_ref()?;
-        let (cw, ch) = (renderer.cell_width() as f32, renderer.cell_height() as f32);
+        let ch = renderer.cell_height() as f32;
         // Completion geometry is derived from the current editor state and
         // shared Scene, rather than a rectangle retained by the last frame.
         if let Some(scene) = self.completion_scene() {
@@ -308,7 +308,6 @@ impl App {
                         start_y: y,
                         start_scale: self.interaction.popup_width_scale,
                         start_rows: self.interaction.popup_max_rows,
-                        cell_w: cw,
                         cell_h: ch,
                     });
                 }
@@ -319,7 +318,6 @@ impl App {
                         start_y: y,
                         start_scale: self.interaction.popup_width_scale,
                         start_rows: self.interaction.popup_max_rows,
-                        cell_w: cw,
                         cell_h: ch,
                     });
                 }
@@ -340,7 +338,6 @@ impl App {
                 start_y: y,
                 start_scale: self.interaction.popup_width_scale,
                 start_rows: self.interaction.popup_max_rows,
-                cell_w: cw,
                 cell_h: ch,
             });
         }

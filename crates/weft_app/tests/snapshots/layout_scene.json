@@ -21,7 +21,6 @@
       ],
       "row_height": 19.8,
       "scene": {
-        "clips": [],
         "hit_count": 13,
         "hits": [
           {
@@ -142,7 +141,6 @@
             "target": "Row(11)"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 13,
         "semantics": [
           {
@@ -459,7 +457,6 @@
       "footer_y": 596.0,
       "max_rows": 24,
       "scene": {
-        "clips": [],
         "hit_count": 12,
         "hits": [
           {
@@ -571,7 +568,6 @@
             "target": "ApplyButton"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 13,
         "semantics": [
           {
@@ -756,7 +752,6 @@
       "footer_y": 596.0,
       "max_rows": 25,
       "scene": {
-        "clips": [],
         "hit_count": 7,
         "hits": [
           {
@@ -823,7 +818,6 @@
             "target": "ApplyButton"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 8,
         "semantics": [
           {
@@ -948,7 +942,6 @@
       "footer_y": 774.0,
       "max_rows": 34,
       "scene": {
-        "clips": [],
         "hit_count": 20,
         "hits": [
           {
@@ -1132,7 +1125,6 @@
             "target": "SaveButton"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 21,
         "semantics": [
           {
@@ -1440,7 +1432,6 @@
         }
       ],
       "scene": {
-        "clips": [],
         "hit_count": 3,
         "hits": [
           {
@@ -1471,7 +1462,6 @@
             "target": "NewTab"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 2,
         "semantics": [
           {
@@ -1547,7 +1537,6 @@
         }
       ],
       "scene": {
-        "clips": [],
         "hit_count": 7,
         "hits": [
           {
@@ -1614,7 +1603,6 @@
             "target": "NewTab"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 4,
         "semantics": [
           {
@@ -1714,7 +1702,6 @@
         }
       ],
       "scene": {
-        "clips": [],
         "hit_count": 18,
         "hits": [
           {
@@ -1880,7 +1867,6 @@
             "target": "NewTab"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 13,
         "semantics": [
           {
@@ -2088,7 +2074,6 @@
         }
       ],
       "scene": {
-        "clips": [],
         "hit_count": 38,
         "hits": [
           {
@@ -2434,7 +2419,6 @@
             "target": "NewTab"
           }
         ],
-        "primitive_count": 0,
         "semantic_count": 33,
         "semantics": [
           {

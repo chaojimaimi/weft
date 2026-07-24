@@ -328,12 +328,9 @@ pub struct DragState {
     pub start_y: f64,
     pub start_scale: f32,
     pub start_rows: usize,
-    #[allow(dead_code)]
-    pub cell_w: f32,
     pub cell_h: f32,
 }
 
-#[allow(dead_code)]
 pub struct ContextMenu {
     pub session_id: u64,
     pub block_id: Option<BlockId>,

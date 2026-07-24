@@ -8,7 +8,6 @@ use crate::glyph::GlyphAtlas;
 use crate::macos_window::set_layer_opaque;
 use crate::renderer::MetalRenderer;
 use weft_core::config::{FontConfig, Theme};
-use weft_core::grid::Color;
 
 impl MetalRenderer {
     /// Swap the active theme. Recolors the whole screen on the next draw
@@ -63,12 +62,6 @@ impl MetalRenderer {
         unsafe {
             set_layer_opaque(&self.layer, self.opacity >= 1.0);
         }
-    }
-
-    /// Current background color (for the render-pass clear value).
-    #[allow(dead_code)]
-    pub fn background(&self) -> Color {
-        self.theme.background
     }
 
     /// Current resolved theme (for applying to new tabs etc.).

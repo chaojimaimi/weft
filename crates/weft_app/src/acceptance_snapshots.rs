@@ -111,8 +111,6 @@ fn scene_snapshot<T: Debug>(scene: &Scene<T>) -> Value {
         })
         .collect::<Vec<_>>();
     json!({
-        "primitive_count": scene.primitives.len(),
-        "clips": scene.clips.iter().copied().map(rect32).collect::<Vec<_>>(),
         "hit_count": hits.len(),
         "semantic_count": semantics.len(),
         "hits": hits,
