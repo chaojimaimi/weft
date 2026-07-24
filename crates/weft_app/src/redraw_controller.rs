@@ -33,6 +33,10 @@ impl App {
         // During command execution, new output streams in — snap the
         // block view to the bottom so the user sees fresh content.
         // (At prompt / idle, preserve the user's scroll position.)
+        // R2-1: also skip snapping when the user has detached to a fixed
+        // document row. Without this guard, the first frame of output
+        // after scroll_up_by would snap_to_bottom and discard the user's
+        // scroll position — the exact bug this enum was introduced to fix.
         if had_output {
             let snap_to_bottom = self
                 .sessions
@@ -45,7 +49,11 @@ impl App {
                         t.primary_history_view(),
                     )
                 })
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && matches!(
+                    self.sessions.active().block_scroll_anchor(),
+                    crate::tab::BlockScrollAnchor::FollowBottom
+                );
             if snap_to_bottom {
                 self.sessions.active_mut().snap_to_bottom();
             }

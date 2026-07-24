@@ -20,6 +20,8 @@ mod lifecycle;
 mod primary_history;
 mod scroll;
 
+pub(crate) use scroll::BlockScrollAnchor;
+
 use primary_history::PrimaryHistoryRefresh;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -69,8 +71,10 @@ pub struct Tab {
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
     pending_pty_output: Option<Vec<u8>>,
-    /// M3.5: private — use the block-scroll API methods below instead.
-    block_scroll_offset: usize,
+    /// R2-1: private — use the block-scroll API methods below instead.
+    /// Replaces the raw `usize` offset with a `BlockScrollAnchor` so the
+    /// snap-to-bottom caller can tell follow-tail apart from detached-read.
+    block_scroll_anchor: BlockScrollAnchor,
     /// Original persisted state retained while a restored shell is starting.
     /// Until OSC 7 supplies an authoritative cwd, this prevents autosave from
     /// replacing the saved cwd with a transient `None`. It also preserves the
@@ -142,7 +146,7 @@ impl Tab {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             pending_pty_output: None,
-            block_scroll_offset: 0,
+            block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
@@ -167,7 +171,7 @@ impl Tab {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             pending_pty_output: None,
-            block_scroll_offset: 0,
+            block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
@@ -723,7 +727,7 @@ mod tests {
             ime_preedit_cursor: None,
             pending_pty_resize: None,
             pending_pty_output: None,
-            block_scroll_offset: 0,
+            block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
