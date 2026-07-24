@@ -15,7 +15,7 @@ use super::actions::block_header_band_height;
 
 /// Return the block whose output is clipped by the top edge while its command
 /// row is already offscreen. That block owns the sticky CWD/command header.
-pub(super) fn sticky_block_id(
+pub(crate) fn sticky_block_id(
     rows: &[BlockViewRow],
     clip_top: f32,
     clip_bottom: f32,

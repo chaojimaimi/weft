@@ -29,6 +29,10 @@ mod rows;
 mod style;
 use style::BlockOutputTextPaint;
 
+// R2-3: re-export so accessibility.rs can compute the sticky block id without
+// duplicating the geometric invariant (command row scrolled above clip_top).
+pub(crate) use rows::sticky_block_id;
+
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
         &self,
@@ -730,6 +734,28 @@ impl MetalRenderer {
             let cmd_x = left + 2.0 * cw;
             let avail = cols.saturating_sub(2).max(1);
             self.push_line_tokenized(&mut verts, cmd_x, command_y, cmd, avail);
+
+            // R2-3 Phase 1: sticky header is no longer a dead paint band —
+            // register copy/fold buttons + hit regions by reusing the same
+            // path as the in-flow header. The geometry is naturally
+            // disjoint: sticky buttons sit at y = clip_top, in-flow buttons
+            // sit at y < clip_top (the in-flow header has scrolled off).
+            push_block_header_actions(
+                self,
+                &mut verts,
+                &mut hit_regions,
+                blocks,
+                BlockHeaderActionPaint {
+                    block_id: block.id,
+                    block_hovered,
+                    y: sticky_y,
+                    pitch,
+                    right,
+                    cell_width: cw,
+                    cell_height: ch,
+                    foreground: fg,
+                },
+            );
         }
 
         if let Some(hl_id) = self.panel_highlight {

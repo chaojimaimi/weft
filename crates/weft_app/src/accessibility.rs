@@ -519,6 +519,9 @@ impl App {
 
         if let Some(layout) = self.terminal_layout() {
             let mut block_cache_update = None;
+            // R2-3: sticky header label + bounds for accessibility, filled
+            // inside the block-view branch where `rows` are already computed.
+            let mut sticky_header: Option<(String, [f32; 4])> = None;
             let text =
                 self.sessions
                     .active()
@@ -561,6 +564,34 @@ impl App {
                                     && row.y_top < layout.content.bottom as f32
                             });
                             rows.sort_by(|a, b| a.y_top.total_cmp(&b.y_top));
+
+                            // R2-3: while rows are still available, check for a
+                            // sticky header block and capture its label + bounds
+                            // for the accessibility node pushed below.
+                            let clip_top = layout.content.top as f32;
+                            let clip_bottom = layout.content.bottom as f32;
+                            if let Some(sid) = crate::paint::block_view::sticky_block_id(
+                                &rows,
+                                clip_top,
+                                clip_bottom,
+                            ) {
+                                if let Some(block) = blocks.iter().find(|b| b.id == sid) {
+                                    let cell_h = layout.cell_height as f32;
+                                    // At most 2 rows (CWD + command); use the
+                                    // full band so screen readers cover both.
+                                    let sticky_bottom = clip_top + cell_h * 2.0;
+                                    sticky_header = Some((
+                                        format!("Header: {}", block.command),
+                                        [
+                                            layout.content.left as f32,
+                                            clip_top,
+                                            layout.content.right as f32,
+                                            sticky_bottom,
+                                        ],
+                                    ));
+                                }
+                            }
+
                             let text = rows
                                 .into_iter()
                                 .filter(|row| row.is_selectable() && !row.text.is_empty())
@@ -596,6 +627,20 @@ impl App {
             if let Some((key, text)) = block_cache_update {
                 self.accessibility.block_text_key = Some(key);
                 self.accessibility.block_text = text;
+            }
+
+            // R2-3 Phase 1: expose the sticky header as a ListItem so screen
+            // readers announce the pinned command. Previously the sticky band
+            // was visible but accessibility-invisible (a "dead paint band").
+            if let Some((label, bounds)) = sticky_header {
+                let node = SemanticNode {
+                    role: SemanticRole::ListItem,
+                    label,
+                    bounds,
+                    focus: None,
+                    state: String::new(),
+                };
+                push_semantic(&mut semantics, "sticky-header", None, &node, false);
             }
         }
 
