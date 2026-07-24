@@ -12,22 +12,12 @@ impl App {
         if !terminal.show_block_view() {
             return None;
         }
-        let cols = terminal.grid().num_cols;
-        let cache = renderer.block_layout_cache.borrow();
-        let (total, _) = block_content_metrics_with_cache(
-            terminal,
-            cols,
-            renderer.block_header_rows(),
-            Some(&*cache),
-        );
-        let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
-        let cwd_header =
-            crate::layout::block_cwd_header_active(editor_mode, terminal.cwd().is_some());
-        let visible = renderer.block_visible_rows(
-            crate::block_component::block_prompt_lines(terminal),
-            cwd_header,
-        );
-        let max_scroll = total.saturating_sub(visible);
+        // Step 3: read cached scroll metrics from the last draw() instead of
+        // re-running block_content_metrics_with_cache (O(n)) on every mouse
+        // move. The cache is written at the end of each draw() call; mouse
+        // events read the previous frame's metrics (1-frame lag is
+        // imperceptible for scrollbar hit-testing).
+        let (total, visible, max_scroll) = renderer.cached_scroll_metrics.get()?;
         crate::scrollbar_component::scrollbar_layout(
             &ctx,
             total,

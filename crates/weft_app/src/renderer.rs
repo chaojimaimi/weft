@@ -95,6 +95,13 @@ pub struct MetalRenderer {
     /// `self.layer` (from `next_drawable`) across the entire frame, so
     /// `&mut self` is unavailable for cache mutation.
     pub(crate) block_layout_cache: RefCell<BlockLayoutCache>,
+    /// Step 3: cached scroll metrics (total, visible, max_scroll) from the
+    /// last draw() call. Read by `active_scrollbar_layout` in mouse handlers
+    /// to avoid re-running `block_content_metrics_with_cache` (O(n)) on every
+    /// mouse move event. None in grid view or before the first draw.
+    /// Uses `Cell` because draw() holds an immutable borrow of `self.layer`
+    /// across the entire frame (same constraint as block_layout_cache).
+    pub(crate) cached_scroll_metrics: Cell<Option<(usize, usize, usize)>>,
     /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
     /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
     /// the previous frame. Eliminates per-frame iteration of all
@@ -639,6 +646,8 @@ impl MetalRenderer {
         // thumb near top). v1.0: color uses label_c (was accent_dim —
         // invisible in Nord/Warp themes). Still subtle but always readable.
         // Only drawn when content overflows the viewport.
+        // Step 3: cache metrics for active_scrollbar_layout (mouse handlers).
+        self.cached_scroll_metrics.set(scroll_metrics);
         if show_blocks {
             if let Some((total, visible, max_scroll)) = scroll_metrics {
                 if let Some(scrollbar) = crate::scrollbar_component::scrollbar_layout(
