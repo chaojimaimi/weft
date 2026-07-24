@@ -190,7 +190,7 @@ pub(crate) fn map_winit_key(key: WinitKeyCode) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::{ime_commit_effects, Effect};
+    use crate::effect::{ime_commit_effects, passthrough_key_effects, Effect};
     use crate::input_router::{OverlayInputContext, OverlayInputOwner};
     use crate::paint::command_surface::{
         compute_current_focus, resolve_command_surface_key, save_focus_for_modal,
@@ -298,6 +298,21 @@ mod tests {
             if self.native_marked_text {
                 self.dispatch(ImeInput::Commit(text.into()), owner, mode);
             }
+        }
+
+        /// Batch 6 Step 2 (R5-3): Replay a physical keyboard event through the
+        /// same `encode_key → passthrough_key_effects` chokepoint the winit
+        /// callback uses (minus winit's layout-aware text, which is
+        /// non-deterministic across input sources). This lets tests assert the
+        /// exact Effect trace for modifier chords, arrow keys, function keys
+        /// and Ctrl+C without a live PTY or AppKit window.
+        fn dispatch_keyboard(&mut self, key: KeyCode, mods: Modifiers) {
+            let Some(tab) = self.tabs.get(self.active_tab) else {
+                return;
+            };
+            let bytes = tab.input_handler.encode_key(key, mods);
+            let effects = passthrough_key_effects(self.active_tab, bytes);
+            self.effects.extend(effects);
         }
     }
 
@@ -493,5 +508,199 @@ mod tests {
             assert_eq!(map_winit_key(native), Some(expected));
         }
         assert_eq!(map_winit_key(WinitKeyCode::AudioVolumeUp), None);
+    }
+
+    // ── Batch 6 Step 2 (R5-3): keyboard replay harness ─────────────────────
+    //
+    // These tests exercise the `dispatch_keyboard` path: a physical key +
+    // modifier chord → `InputHandler::encode_key` → `passthrough_key_effects`
+    // → Effect trace. They cover the deterministic VT encoding without
+    // winit's layout-aware text (which is non-deterministic across input
+    // sources) and without a live PTY or AppKit window.
+
+    #[test]
+    fn printable_char_emits_single_write_pty_for_active_tab() {
+        let mut replay = ReplayState::with_tabs(2);
+        replay.active_tab = 1;
+        replay.dispatch_keyboard(KeyCode::Char('a'), Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 1,
+                bytes: b"a".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_produces_atomic_interrupt_then_redraw() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Char('c'), Modifiers::CONTROL);
+        assert_eq!(
+            replay.effects,
+            [Effect::InterruptPty { tab: 0 }, Effect::RequestRedraw]
+        );
+    }
+
+    #[test]
+    fn arrow_keys_emit_csi_sequences_in_normal_cursor_mode() {
+        let mut replay = ReplayState::with_tabs(1);
+        for (key, suffix) in [
+            (KeyCode::Up, b'A'),
+            (KeyCode::Down, b'B'),
+            (KeyCode::Right, b'C'),
+            (KeyCode::Left, b'D'),
+        ] {
+            replay.effects.clear();
+            replay.dispatch_keyboard(key, Modifiers::empty());
+            assert_eq!(
+                replay.effects,
+                [Effect::WritePty {
+                    tab: 0,
+                    bytes: vec![0x1b, b'[', suffix],
+                }],
+                "key={key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_keys_emit_ss3_for_f1_through_f4() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::F(1), Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: vec![0x1b, b'O', b'P'],
+            }]
+        );
+    }
+
+    #[test]
+    fn function_keys_emit_csi_tilde_for_f5_through_f12() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::F(5), Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: b"\x1b[15~".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn alt_prefixes_key_with_escape_byte() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Char('a'), Modifiers::ALT);
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: vec![0x1b, b'a'],
+            }]
+        );
+    }
+
+    #[test]
+    fn shift_tab_emits_csi_z_for_reverse_tab() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Tab, Modifiers::SHIFT);
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: b"\x1b[Z".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn enter_emits_carriage_return() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Enter, Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: b"\r".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn keyboard_dispatch_targets_active_tab_after_switch() {
+        let mut replay = ReplayState::with_tabs(3);
+        replay.dispatch_keyboard(KeyCode::Char('x'), Modifiers::empty());
+        replay.switch_tab(2);
+        replay.dispatch_keyboard(KeyCode::Char('y'), Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [
+                Effect::WritePty {
+                    tab: 0,
+                    bytes: b"x".to_vec(),
+                },
+                Effect::WritePty {
+                    tab: 2,
+                    bytes: b"y".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_dispatch_with_no_tabs_is_a_noop() {
+        let mut replay = ReplayState::with_tabs(0);
+        replay.dispatch_keyboard(KeyCode::Char('a'), Modifiers::empty());
+        assert!(replay.effects.is_empty());
+    }
+
+    #[test]
+    fn ctrl_a_through_ctrl_z_emit_control_bytes() {
+        let mut replay = ReplayState::with_tabs(1);
+        // Ctrl+A = 0x01, Ctrl+Z = 0x1A
+        replay.dispatch_keyboard(KeyCode::Char('a'), Modifiers::CONTROL);
+        replay.dispatch_keyboard(KeyCode::Char('z'), Modifiers::CONTROL);
+        assert_eq!(
+            replay.effects,
+            [
+                Effect::WritePty {
+                    tab: 0,
+                    bytes: vec![0x01],
+                },
+                Effect::WritePty {
+                    tab: 0,
+                    bytes: vec![0x1a],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn escape_key_emits_single_esc_byte() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Escape, Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: vec![0x1b],
+            }]
+        );
+    }
+
+    #[test]
+    fn backspace_emits_del_byte() {
+        let mut replay = ReplayState::with_tabs(1);
+        replay.dispatch_keyboard(KeyCode::Backspace, Modifiers::empty());
+        assert_eq!(
+            replay.effects,
+            [Effect::WritePty {
+                tab: 0,
+                bytes: vec![0x7f],
+            }]
+        );
     }
 }
