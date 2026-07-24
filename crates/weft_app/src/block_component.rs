@@ -2,9 +2,11 @@
 
 use crate::paint::grid_cache::block_line_chunks;
 use crate::paint::ui_helpers::{abbreviate_path, block_duration_str};
-use weft_core::blocks::{Block, BlockId};
-use weft_core::selection::BlockViewRowKind;
+use weft_core::blocks::Block;
 use weft_core::vt::Terminal;
+
+mod hover;
+pub(crate) use hover::{block_header_action_at, hovered_block_for_row, BlockHeaderAction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockTone {
@@ -17,48 +19,6 @@ pub(crate) enum BlockTone {
 pub(crate) struct BlockPresentation {
     pub(crate) label: String,
     pub(crate) tone: BlockTone,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BlockHeaderAction {
-    Copy(BlockId),
-    ToggleFold(BlockId),
-}
-
-/// Resolve the finalized block that owns a rendered row for hover purposes.
-/// Header rows must retain hover because that is where inline actions are
-/// painted; otherwise moving from the command text onto an action makes the
-/// action disappear before it can be clicked.
-pub(crate) fn hovered_block_for_row(
-    kind: &BlockViewRowKind,
-    block_id: Option<BlockId>,
-) -> Option<BlockId> {
-    match kind {
-        BlockViewRowKind::Header | BlockViewRowKind::Command | BlockViewRowKind::Output => block_id,
-        BlockViewRowKind::Separator | BlockViewRowKind::LiveCommand => None,
-    }
-}
-
-/// Resolve only the inline header actions. Half-open bounds ensure a point on
-/// an adjacent row belongs to exactly one block and cannot fall through to
-/// terminal text selection.
-pub(crate) fn block_header_action_at(
-    regions: &[crate::overlay::HitRegion],
-    x: f32,
-    y: f32,
-) -> Option<BlockHeaderAction> {
-    regions.iter().find_map(|region| {
-        if !region.contains_half_open(x, y) {
-            return None;
-        }
-        match region.target {
-            crate::overlay::HitTarget::BlockActionCopy(id) => Some(BlockHeaderAction::Copy(id)),
-            crate::overlay::HitTarget::BlockActionFold(id) => {
-                Some(BlockHeaderAction::ToggleFold(id))
-            }
-            _ => None,
-        }
-    })
 }
 
 pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPresentation {
@@ -602,73 +562,6 @@ mod tests {
             spinner_char_for_phase(last + 0.001, false),
             SPINNER_CHARS[last_idx]
         );
-    }
-
-    #[test]
-    fn block_header_actions_use_half_open_row_boundaries() {
-        use crate::overlay::{HitRegion, HitTarget};
-
-        let regions = vec![
-            HitRegion {
-                x0: 80.0,
-                y0: 0.0,
-                x1: 100.0,
-                y1: 10.0,
-                target: HitTarget::BlockActionCopy(BlockId(1)),
-            },
-            HitRegion {
-                x0: 80.0,
-                y0: 10.0,
-                x1: 100.0,
-                y1: 20.0,
-                target: HitTarget::BlockActionCopy(BlockId(2)),
-            },
-        ];
-
-        assert_eq!(
-            block_header_action_at(&regions, 90.0, 10.0),
-            Some(BlockHeaderAction::Copy(BlockId(2)))
-        );
-        assert_eq!(block_header_action_at(&regions, 100.0, 10.0), None);
-    }
-
-    #[test]
-    fn block_header_row_retains_hover_for_inline_actions() {
-        let id = BlockId(7);
-        assert_eq!(
-            hovered_block_for_row(&BlockViewRowKind::Header, Some(id)),
-            Some(id)
-        );
-        assert_eq!(
-            hovered_block_for_row(&BlockViewRowKind::Command, Some(id)),
-            Some(id)
-        );
-        assert_eq!(
-            hovered_block_for_row(&BlockViewRowKind::Output, Some(id)),
-            Some(id)
-        );
-        assert_eq!(
-            hovered_block_for_row(&BlockViewRowKind::Separator, Some(id)),
-            None
-        );
-        assert_eq!(
-            hovered_block_for_row(&BlockViewRowKind::LiveCommand, Some(id)),
-            None
-        );
-    }
-
-    #[test]
-    fn block_header_action_resolver_ignores_non_actions() {
-        use crate::overlay::{HitRegion, HitTarget};
-
-        let regions = vec![HitRegion {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 20.0,
-            y1: 20.0,
-            target: HitTarget::BlockFold(BlockId(1)),
-        }];
-        assert_eq!(block_header_action_at(&regions, 10.0, 10.0), None);
     }
 
     // ---- R2-2 assumption falsification tests ----

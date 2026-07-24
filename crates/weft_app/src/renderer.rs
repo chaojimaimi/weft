@@ -11,12 +11,12 @@ use crate::paint::grid_cache::BlockLayoutCache;
 use crate::paint::overlays::FindDrawState;
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::tab_bar::TabBarDrawState;
-use crate::paint::ui_helpers::{block_duration_str, panel_display, visible_panel_rows};
 use weft_core::blocks::BlockId;
 use weft_core::config::{FontConfig, Theme};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
+mod atlas_warmup;
 mod runtime;
 
 /// Metal GPU renderer: draws the terminal Grid to screen.
@@ -397,146 +397,23 @@ impl MetalRenderer {
         );
         let clear_a = bg_a * self.opacity as f64;
 
-        // Collect unique on-screen GRID + panel characters not yet in the
-        // atlas, then rasterize each exactly once. (Partial borrow of
-        // self.atlas here is disjoint from the `drawable` borrow of self.layer,
-        // so it coexists.)
-        {
-            use std::collections::HashSet;
-            let mut missing = HashSet::new();
-            for row in 0..grid.num_rows {
-                for col in 0..grid.num_cols {
-                    let ch = grid.cell(row, col).character;
-                    if ch != '\0' && ch != ' ' && self.atlas.get(ch).is_none() {
-                        missing.insert(ch);
-                    }
-                }
-            }
-            if let Some(p) = panel {
-                missing.extend("Search:".chars());
-                missing.extend(p.query.chars());
-                let max_blocks = visible_panel_rows(self.viewport.1, self.cell_height());
-                for b in panel_display(p.blocks, p.query, p.scroll_offset, max_blocks) {
-                    missing.extend(b.command.chars());
-                    missing.extend(block_duration_str(b).chars());
-                    if Some(b.id) == p.expanded_id {
-                        for line in b.output.lines().take(8) {
-                            missing.extend(line.chars());
-                        }
-                    }
-                }
-            }
-            if let Some(p) = prompt {
-                missing.extend("❯ ".chars());
-                if let Some(cwd) = p.cwd {
-                    missing.extend(cwd.chars());
-                }
-                for line in p.lines {
-                    missing.extend(line.chars());
-                }
-                if let Some(preedit) = p.preedit {
-                    missing.extend(preedit.chars());
-                }
-                if let Some((q, sel)) = p.search {
-                    missing.extend("search: ".chars());
-                    missing.extend(q.chars());
-                    if let Some(m) = sel {
-                        missing.extend(m.chars());
-                    }
-                }
-            }
-            // Completion popup warm-up: scan emoji icons + match labels.
-            if let Some((completions, _)) = completions {
-                // Emoji icons used by the popup (📁📄 via CoreText color path).
-                missing.extend(['📁', '📄', '»']);
-                for m in completions {
-                    missing.extend(m.label.chars());
-                }
-            }
-            // Block-view (Editor mode + CommandExecuting overlay): commands,
-            // outputs, durations. Session blocks only — hydrated history stays
-            // in the panel.
-            if terminal.show_block_view() {
-                if let Some(cwd) = terminal.cwd() {
-                    missing.extend(cwd.chars());
-                }
-                if let Some(branch) = terminal.git_branch() {
-                    missing.extend(" git:()".chars());
-                    missing.extend(branch.chars());
-                }
-                for b in terminal
-                    .block_tracker()
-                    .session_blocks()
-                    .iter()
-                    .rev()
-                    .take(64)
-                {
-                    missing.extend("❯ ".chars());
-                    missing.extend(b.command.chars());
-                    missing.extend(block_duration_str(b).chars());
-                    for line in b.output.lines().take(200) {
-                        missing.extend(line.chars());
-                    }
-                }
-                // In-flight (live) block during CommandExecuting.
-                if let Some(live) = terminal.block_tracker().in_flight() {
-                    missing.extend("❯ ".chars());
-                    missing.extend(live.command.chars());
-                    for line in live.output.lines().take(200) {
-                        missing.extend(line.chars());
-                    }
-                }
-            }
-            // Find bar (Cmd+F): warm up the query + status text + button
-            // glyphs so CJK / other non-ASCII chars typed via IME render
-            // instead of leaving blank cells (the atlas only auto-warms
-            // grid/panel content; the find query is independent).
-            if let Some(find) = &self.find_state {
-                missing.extend("Find: ".chars());
-                missing.extend(find.query.chars());
-                // Button labels + status fragments.
-                missing.extend(['↑', '↓', 'A', 'a', '.', '*', '…']);
-                if let Some(err) = &find.regex_error {
-                    missing.extend(err.chars());
-                }
-            }
-            // v0.9 fix: warm up the command palette (Cmd+P) query + banner
-            // + submode input so CJK / other non-ASCII chars typed via IME
-            // render instead of leaving blank cells (same rationale as the
-            // find bar above).
-            if let Some(p) = palette {
-                missing.extend("> ".chars());
-                missing.extend(p.query.chars());
-                if !p.banner.is_empty() {
-                    missing.extend(p.banner.chars());
-                }
-                missing.extend(p.submode_input.chars());
-            }
-            // v1.0 S1: warm up the Settings panel (Cmd+,) — tab labels,
-            // status text, theme names, font family, keybinding strings.
-            if let Some(s) = settings {
-                use crate::overlay::OverlayWarmup;
-                OverlayContent::Settings(*s).warm_chars(&mut missing);
-            }
-            // v0.9 fix: warm up the tab bar close button "×" and separator
-            // chars so they render instead of being silently skipped by
-            // push_text (which drops chars not in the atlas).
-            missing.extend(['×', '·', '•', '…']);
-            // Explicit one-scalar fallbacks for unsupported multi-scalar
-            // graphemes; keep them resident before push_text uses them.
-            missing.extend(['\u{fffd}', '\u{ff1f}']);
-            for text in tab_bar.labels.iter().chain(&tab_bar.tooltips) {
-                missing.extend(text.chars());
-            }
-            // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
-            missing.extend("\u{25be} passthrough running".chars());
-            // F3-2: warm up the braille spinner glyphs (animated activity
-            // indicator) and the static ● used under Reduce Motion.
-            missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
-            for ch in &missing {
-                self.atlas.get_or_rasterize(*ch);
-            }
-        }
+        // Collect + rasterize on-screen characters into the glyph atlas.
+        // Passed as partial borrows (`&mut self.atlas`, `&self.find_state`)
+        // rather than a `&mut self` method call so they stay disjoint from
+        // the immutable `self.layer` borrow held by `drawable` for the frame.
+        Self::warm_atlas(
+            &mut self.atlas,
+            self.viewport.1,
+            &self.find_state,
+            terminal,
+            grid,
+            panel,
+            prompt,
+            completions,
+            palette,
+            settings,
+            tab_bar,
+        );
 
         // Editor mode (at the prompt): full block history + input box.
         // CommandExecuting (a tracked command is running — e.g. an interactive

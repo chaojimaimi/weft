@@ -88,7 +88,7 @@ impl Terminal {
             cursor_style: CursorStyle::Block,
             synchronized_output_started: None,
             synchronized_frame_cleared_rows: 0,
-            palette: Self::init_palette(),
+            palette: Color::standard_palette(),
             // Alt-screen apps manage their own scrolling and history.
             alt_grid: Grid::with_scrollback(rows, cols, 0),
             saved_cursor: None,
@@ -291,23 +291,10 @@ impl Terminal {
     /// Each byte is advanced through the parser, which calls back
     /// into our Perform implementation.
     ///
-    /// v1.0 perf: ASCII fast path — scan for runs of printable ASCII
-    /// (0x20..=0x7E) and write them directly to the grid via `print_ascii_run`,
-    /// bypassing vte's per-byte state machine. Only escape (0x1B) and C0
-    /// control bytes (< 0x20, except 0x07/0x08/0x09/0x0A/0x0D handled by
-    /// `execute`) go through `parser.advance()`. For `seq 1 100000` (~580KB
-    /// of ASCII digits + newlines), this reduces vte state-machine calls
-    /// from ~580000 to ~10000 (just the newlines), a ~58x reduction.
-    ///
-    /// Important: the fast path only triggers when vte's parser is in the
-    /// ground state (no escape sequence in progress). We track this via
-    /// `parser_in_ground_state` — set true initially, cleared ONLY on ESC
-    /// (0x1B) which is the sole byte that transitions vte out of ground.
-    /// C0 controls (\n, \r, \t, BEL, …) are "execute" actions that stay in
-    /// ground, so the fast path remains engaged after them. v1.0 P1.5-C3:
-    /// the previous code also cleared the flag on every C0 control, which
-    /// forced the first char of each line through vte's per-byte path —
-    /// ~100k wasted advance() calls for `seq 1 100000`.
+    /// v1.0 perf: ASCII fast path scans runs of printable ASCII (0x20..=0x7E)
+    /// and writes them directly via `print_ascii_run`, bypassing vte's
+    /// per-byte state machine. Only ESC (0x1B) and C0 controls go through
+    /// `parser.advance()`. See `parser_in_ground_state` and inline notes.
     pub fn process(&mut self, bytes: &[u8]) {
         let mut parser = std::mem::take(&mut self.parser);
         let mut i = 0;
@@ -628,14 +615,6 @@ impl Terminal {
         self.editor.push_history(&command);
         self.editor.clear();
         bytes
-    }
-
-    // ── Palette initialization ───────────────────────────────────
-
-    /// Initialize the xterm-256color palette (delegates to the shared
-    /// `Color::standard_palette`).
-    fn init_palette() -> [Color; 256] {
-        Color::standard_palette()
     }
 
     // ── SGR helpers ──────────────────────────────────────────────

@@ -4,8 +4,6 @@
 # The ceiling is the audited 2026-07-14 size. A listed file may shrink, but it
 # may not grow beyond its ceiling. New exceptions require an explicit review of
 # this file instead of a self-authorizing comment in the Rust source.
-crates/weft_app/src/glyph.rs|1271|CoreText rasterization, fallback, atlas cache, and transform probes remain coupled
-crates/weft_app/src/main.rs|2437|Legacy App shell is reduced from 7316 lines but still awaits the second extraction pass
 crates/weft_core/src/blocks.rs|829|Block tracker state machine and persistence-facing model remain one domain
 crates/weft_core/src/config/mod.rs|1567|Config facade still contains the legacy compatibility and integration test suite
 crates/weft_core/src/config/theme.rs|853|Built-in theme constructors are intentionally data-heavy
