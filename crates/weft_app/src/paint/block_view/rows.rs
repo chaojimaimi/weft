@@ -1,17 +1,12 @@
 //! Read-only BlockView row geometry used by pointer hit-testing.
 
-use std::rc::Rc;
-
-use crate::block_component::{
-    block_presentation, clear_block_spacer_rows, command_resume_hints, live_context_label,
-};
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::grid_cache::{block_line_chunks, MAX_LAYOUT_LINES_LIVE};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::BlockId;
 use weft_core::selection::{BlockViewRow, BlockViewRowKind};
 
 use super::actions::block_header_band_height;
+use super::layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput};
 
 /// Return the block whose output is clipped by the top edge while its command
 /// row is already offscreen. That block owns the sticky CWD/command header.
@@ -46,9 +41,9 @@ impl MetalRenderer {
     /// event arrives, so hit-testing uses current-frame data instead of
     /// the renderer's previous-frame cache.
     ///
-    /// The layout logic mirrors `build_block_view_vertices` (layout pass +
-    /// bv_rows extraction). Both paths use the same `layout_block_view` +
-    /// `block_line_chunks` + `block_layout_cache` so the y-bands are identical.
+    /// Shares the layout pass with `build_block_view_vertices` via
+    /// `compute_block_layout_pass`, so y-bands are identical between paint
+    /// and hit-testing. Only the bv_rows extraction is specific to this path.
     pub(crate) fn compute_block_view_rows(
         &self,
         model: BlockViewPaintModel<'_>,
@@ -85,172 +80,48 @@ impl MetalRenderer {
         let content_bottom_y = layout.clip_bottom;
         let cols = layout.cols;
 
-        // Layout pass: compute cumulative y-distances + row data.
-        // Mirrors build_block_view_vertices lines 96-209.
-        enum LaidRow<'a> {
-            Output {
-                text: &'a str,
-                chunks: Rc<[String]>,
-                block_id: Option<BlockId>,
-            },
-            Command {
-                command: &'a str,
-                block_id: BlockId,
-            },
-            Header {
-                text: String,
-                block_id: BlockId,
-            },
-            Separator,
-            LiveCommand {
-                command: &'a str,
-            },
-            LiveHeader {
-                text: String,
-            },
-            Blank,
-        }
-
-        let mut rows: Vec<f32> = Vec::new();
-        let mut row_data: Vec<LaidRow> = Vec::new();
-        let mut cursor_dist = 0.0;
-
-        if let Some(live) = live {
-            let all_lines: Vec<&str> = live.output.lines().collect();
-            let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
-            let live_lines: Vec<&str> = all_lines[skip..].to_vec();
-            for line in live_lines.iter().rev() {
-                let chunks: Rc<[String]> =
-                    Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
-                let vis_rows = chunks.len();
-                cursor_dist += vis_rows as f32 * pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Output {
-                    text: line,
-                    chunks,
-                    block_id: None,
-                });
-            }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::LiveCommand {
-                command: live.command,
-            });
-            if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch) {
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::LiveHeader { text });
-            }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Separator);
-        }
-
+        // Shared layout pass (single source of truth for row geometry).
+        // resolve_styles=false: hit-testing doesn't need StyledLine lookups.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
             for b in blocks.iter() {
                 cache.ensure_cached(b, cols);
             }
         }
-        {
+        let layout_out = {
             let cache = self.block_layout_cache.borrow();
-            // Step 2: visibility culling — mirrors build_block_view_vertices.
-            // Blocks fully offscreen only accumulate cursor_dist without
-            // expanding internal lines. O(n + k*m) instead of O(n*m).
-            let scroll_px = (block_scroll as f32) * pitch;
-            let clip_top = layout.clip_top;
-            let clip_bottom = content_bottom_y;
-            let overscan = header_height + pitch * 2.0;
-            for b in blocks.iter().rev() {
-                let cached = cache.get(b.id.0);
+            compute_block_layout_pass(
+                LayoutPassInput {
+                    blocks,
+                    live,
+                    cwd,
+                    git_branch,
+                    block_scroll,
+                    viewport_rows,
+                    cols,
+                    pitch,
+                    header_height,
+                    content_bottom_y,
+                    clip_top: layout.clip_top,
+                    clip_bottom: content_bottom_y,
+                    resolve_styles: false,
+                },
+                &cache,
+            )
+        };
 
-                // Compute block total height without expanding internal lines.
-                let hint_rows: usize = if b.collapsed {
-                    0
-                } else {
-                    command_resume_hints(b)
-                        .iter()
-                        .map(|hint| block_line_chunks(hint, cols).count())
-                        .sum()
-                };
-                let output_rows = if b.collapsed { 0 } else { cached.output_rows };
-                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
-                let block_total_height = (hint_rows + output_rows) as f32 * pitch
-                    + pitch
-                    + header_height
-                    + pitch
-                    + clear_rows as f32 * pitch;
-
-                let block_dist_before = cursor_dist;
-                let block_dist_after = cursor_dist + block_total_height;
-                let block_y_top = content_bottom_y - block_dist_after + scroll_px;
-                let block_y_bottom = content_bottom_y - block_dist_before + scroll_px;
-
-                let is_visible =
-                    block_y_bottom >= clip_top - overscan && block_y_top <= clip_bottom + overscan;
-
-                if is_visible && !b.collapsed {
-                    for hint in command_resume_hints(b).iter().rev() {
-                        let chunks: Rc<[String]> =
-                            Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
-                        cursor_dist += chunks.len() as f32 * pitch;
-                        rows.push(cursor_dist);
-                        row_data.push(LaidRow::Output {
-                            text: hint,
-                            chunks,
-                            block_id: Some(b.id),
-                        });
-                    }
-                    for line in cached.lines.iter().rev() {
-                        let text = &b.output[line.byte_start..line.byte_end];
-                        let vis_rows = line.chunks.len();
-                        cursor_dist += vis_rows as f32 * pitch;
-                        rows.push(cursor_dist);
-                        row_data.push(LaidRow::Output {
-                            text,
-                            chunks: Rc::clone(&line.chunks),
-                            block_id: Some(b.id),
-                        });
-                    }
-                } else {
-                    cursor_dist += (hint_rows + output_rows) as f32 * pitch;
-                }
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Command {
-                    command: &b.command,
-                    block_id: b.id,
-                });
-                cursor_dist += header_height;
-                rows.push(cursor_dist);
-                let presentation = block_presentation(b, cached.lines.len());
-                row_data.push(LaidRow::Header {
-                    text: presentation.label,
-                    block_id: b.id,
-                });
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Separator);
-                if clear_rows > 0 {
-                    cursor_dist += clear_rows as f32 * pitch;
-                    rows.push(cursor_dist);
-                    row_data.push(LaidRow::Blank);
-                }
-            }
-        }
-
-        // Extract bv_rows from the layout data.
-        // Mirrors build_block_view_vertices lines 229-302 (bv_rows portion only).
+        // Extract bv_rows from the layout output.
         let scroll_px = (block_scroll as f32) * pitch;
         let mut bv_rows = Vec::new();
 
-        for (i, &dist) in rows.iter().enumerate() {
+        for (i, &dist) in layout_out.rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
-            match &row_data[i] {
+            match &layout_out.row_data[i] {
                 LaidRow::Output {
                     text,
                     chunks,
                     block_id,
+                    ..
                 } => {
                     if chunks.len() <= 1 {
                         bv_rows.push(BlockViewRow {
@@ -273,7 +144,9 @@ impl MetalRenderer {
                         }
                     }
                 }
-                LaidRow::Command { command, block_id } => {
+                LaidRow::Command {
+                    command, block_id, ..
+                } => {
                     bv_rows.push(BlockViewRow {
                         kind: BlockViewRowKind::Command,
                         text: command.to_string(),
@@ -282,7 +155,7 @@ impl MetalRenderer {
                         y_bottom: row_top_y + pitch,
                     });
                 }
-                LaidRow::Header { text, block_id } => {
+                LaidRow::Header { text, block_id, .. } => {
                     bv_rows.push(BlockViewRow {
                         kind: BlockViewRowKind::Header,
                         text: text.clone(),

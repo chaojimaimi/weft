@@ -7,24 +7,18 @@
 //! Layout/cache/selection algorithms are unchanged; immutable frame inputs are
 //! grouped in BlockViewPaintModel while SelectionHandler stays explicitly mutable.
 
-use std::rc::Rc;
-
-use crate::block_component::{
-    block_presentation, clear_block_spacer_rows, command_resume_hints, live_context_label,
-    spinner_char_for_phase, BlockTone,
-};
+use crate::block_component::{spinner_char_for_phase, BlockTone};
 use crate::paint::block_view::actions::{
     block_header_band_height, block_header_text_cols, push_block_header_actions,
     BlockHeaderActionPaint,
 };
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::grid_cache::{block_line_chunks, MAX_LAYOUT_LINES_LIVE};
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
-use weft_core::blocks::{BlockId, StyledLine};
 
 mod actions;
+mod layout_pass;
 mod rows;
 mod style;
 use style::BlockOutputTextPaint;
@@ -120,190 +114,39 @@ impl MetalRenderer {
             }
         }
 
-        enum LaidRow<'a> {
-            Output {
-                text: &'a str,
-                chunks: Rc<[String]>,
-                block_id: Option<BlockId>,
-                line: usize,
-                style: Option<&'a StyledLine>,
-            },
-            Command {
-                command: &'a str,
-                collapsed: bool,
-                foldable: bool,
-                block_id: BlockId,
-            },
-            Header {
-                text: String,
-                tone: BlockTone,
-                block_id: BlockId,
-            },
-            Separator,
-            LiveCommand {
-                command: &'a str,
-            },
-            LiveHeader {
-                text: String,
-            },
-            Blank,
-        }
+        use layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput, LayoutPassOutput};
 
-        let mut rows: Vec<f32> = Vec::new();
-        let mut row_data: Vec<LaidRow> = Vec::new();
-        let mut cursor_dist = 0.0;
-
-        if let Some(live) = live {
-            let all_lines: Vec<&str> = live.output.lines().collect();
-            let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
-            let live_lines: Vec<&str> = all_lines[skip..].to_vec();
-            let base_idx = skip;
-            for (i, line) in live_lines.iter().enumerate().rev() {
-                let line_idx = base_idx + i;
-                let chunks: Rc<[String]> =
-                    Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
-                let vis_rows = chunks.len();
-                cursor_dist += vis_rows as f32 * pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Output {
-                    text: line,
-                    chunks,
-                    block_id: None,
-                    line: line_idx,
-                    style: live.styled_output.and_then(|styled| styled.line(line_idx)),
-                });
-            }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::LiveCommand {
-                command: live.command,
-            });
-            if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch) {
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::LiveHeader { text });
-            }
-            cursor_dist += pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Separator);
-        }
-
+        // Shared layout pass: single source of truth for row geometry.
+        // Both this function (paint) and compute_block_view_rows (hit-testing)
+        // call this, then walk the output to emit vertices or extract bv_rows.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
             for b in blocks.iter() {
                 cache.ensure_cached(b, cols);
             }
         }
-
-        {
+        let layout_out = {
             let cache = self.block_layout_cache.borrow();
-            // Step 2: visibility culling. Compute scroll_px and clip bounds
-            // once, then for each block decide whether to expand its internal
-            // lines. Blocks fully offscreen (y_bottom < clip_top OR y_top >
-            // clip_bottom) only accumulate cursor_dist without pushing rows,
-            // reducing layout pass from O(n*m) to O(n + k*m) where k = visible
-            // block count. A 1-block overscan on each side covers partial
-            // blocks and the sticky header.
-            let scroll_px = (block_scroll as f32) * pitch;
-            let clip_top = layout.clip_top;
-            let clip_bottom = content_bottom_y;
-            // Overscan: expand the visible range by 1 block height on each
-            // side to cover partially-visible blocks and the sticky header
-            // (which pulls a block from elsewhere into the viewport).
-            let overscan = header_height + pitch * 2.0;
-            for b in blocks.iter().rev() {
-                let cached = cache.get(b.id.0);
-
-                // Compute this block's total height without expanding internal
-                // lines. Uses cached.output_rows (O(1)) for the output portion.
-                let hint_rows: usize = if b.collapsed {
-                    0
-                } else {
-                    command_resume_hints(b)
-                        .iter()
-                        .map(|hint| block_line_chunks(hint, cols).count())
-                        .sum()
-                };
-                let output_rows = if b.collapsed { 0 } else { cached.output_rows };
-                let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
-                let block_total_height = (hint_rows + output_rows) as f32 * pitch
-                    + pitch // command
-                    + header_height
-                    + pitch // separator
-                    + clear_rows as f32 * pitch;
-
-                // Block y-range (before scroll adjustment: dist increases
-                // upward from content_bottom_y).
-                let block_dist_before = cursor_dist;
-                let block_dist_after = cursor_dist + block_total_height;
-                let block_y_top = content_bottom_y - block_dist_after + scroll_px;
-                let block_y_bottom = content_bottom_y - block_dist_before + scroll_px;
-
-                // Cull blocks fully outside the visible range + overscan.
-                let is_visible =
-                    block_y_bottom >= clip_top - overscan && block_y_top <= clip_bottom + overscan;
-
-                if is_visible && !b.collapsed {
-                    for hint in command_resume_hints(b).iter().rev() {
-                        let chunks: Rc<[String]> =
-                            Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
-                        cursor_dist += chunks.len() as f32 * pitch;
-                        rows.push(cursor_dist);
-                        row_data.push(LaidRow::Output {
-                            text: hint,
-                            chunks,
-                            block_id: Some(b.id),
-                            line: usize::MAX,
-                            style: None,
-                        });
-                    }
-                    for line in cached.lines.iter().rev() {
-                        let text = &b.output[line.byte_start..line.byte_end];
-                        let vis_rows = line.chunks.len();
-                        cursor_dist += vis_rows as f32 * pitch;
-                        rows.push(cursor_dist);
-                        row_data.push(LaidRow::Output {
-                            text,
-                            chunks: Rc::clone(&line.chunks),
-                            block_id: Some(b.id),
-                            line: line.idx,
-                            style: b
-                                .styled_output
-                                .as_deref()
-                                .and_then(|styled| styled.line(line.idx)),
-                        });
-                    }
-                } else {
-                    // Culled: skip expanding internal lines, just advance
-                    // cursor_dist by the output+hint height.
-                    cursor_dist += (hint_rows + output_rows) as f32 * pitch;
-                }
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Command {
-                    command: &b.command,
-                    collapsed: b.collapsed,
-                    foldable: cached.foldable,
-                    block_id: b.id,
-                });
-                let presentation = block_presentation(b, cached.lines.len());
-                cursor_dist += header_height;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Header {
-                    text: presentation.label,
-                    tone: presentation.tone,
-                    block_id: b.id,
-                });
-                cursor_dist += pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Separator);
-                if clear_rows > 0 {
-                    cursor_dist += clear_rows as f32 * pitch;
-                    rows.push(cursor_dist);
-                    row_data.push(LaidRow::Blank);
-                }
-            }
-        }
+            compute_block_layout_pass(
+                LayoutPassInput {
+                    blocks,
+                    live,
+                    cwd,
+                    git_branch,
+                    block_scroll,
+                    viewport_rows,
+                    cols,
+                    pitch,
+                    header_height,
+                    content_bottom_y,
+                    clip_top: layout.clip_top,
+                    clip_bottom: content_bottom_y,
+                    resolve_styles: true,
+                },
+                &cache,
+            )
+        };
+        let LayoutPassOutput { rows, row_data } = layout_out;
 
         let scroll_px = (block_scroll as f32) * pitch;
         let clip_top = layout.clip_top;
