@@ -32,6 +32,7 @@ min_os_version = "12.0"
 [dependencies]
 weft_core = { path = "../weft_core" }
 metal.workspace = true
+block.workspace = true
 objc2.workspace = true
 objc2-metal.workspace = true
 objc2-foundation.workspace = true

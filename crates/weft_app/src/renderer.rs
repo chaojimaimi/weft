@@ -189,6 +189,15 @@ pub struct MetalRenderer {
     /// v1.0 P1.5-B1: Capacity of each buffer in `instance_ring` (bytes).
     /// When instance data exceeds this, a new larger buffer is allocated.
     pub(crate) instance_capacity: Cell<u64>,
+    /// v1.2 R3 task 6: Per-frame trace recorder (layout/build/encode segments
+    /// and counters). Stored in a `RefCell` because `draw()` holds an immutable
+    /// borrow of `self.layer` for the whole frame, so `&mut self` is
+    /// unavailable for segment bookkeeping.
+    pub(crate) frame_trace: RefCell<crate::frame_trace::FrameTraceRecorder>,
+    /// v1.2 R3 task 6: Current frame id, stamped onto the Metal command buffer
+    /// label so the async `add_completed_handler` can correlate GPU completion
+    /// back to the originating frame. Set by `draw()`'s caller each frame.
+    pub(crate) frame_id: Cell<u64>,
 }
 
 impl MetalRenderer {
@@ -247,6 +256,10 @@ impl MetalRenderer {
         // viewport shift, so blit doesn't apply there).
         self.pending_scroll_delta.set(0);
         self.force_full_cached.set(true);
+        // R3 task 6: LAYOUT segment starts at draw entry (geometry + layout
+        // computation). build_start is marked below, just before the first
+        // vertex builder runs.
+        self.frame_trace.borrow_mut().layout_start();
 
         // v0.9 H1: compute chrome_top (tab bar height) and set it on the
         // LayoutCtx so all content is shifted below the tab bar. The bar is
@@ -288,6 +301,8 @@ impl MetalRenderer {
         // take effect immediately.
         let ctx = terminal_layout.layout_ctx();
         self.layout_ctx = Some(ctx);
+        // R3 task 6: LAYOUT segment ends once the LayoutCtx is built.
+        self.frame_trace.borrow_mut().layout_end();
 
         let grid = terminal.grid();
         let cursor = &grid.cursor;
@@ -507,6 +522,8 @@ impl MetalRenderer {
         }
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
+        // R3 task 6: BUILD-VERTICES segment starts here (first vertex builder).
+        self.frame_trace.borrow_mut().build_start();
         // Reset popup rects — settings still uses renderer-owned hit data.
         // v1.0 P1.5-B1: Grid cells render as instances (instanced pipeline);
         // overlays + block view render as legacy vertices. In grid view,
@@ -741,6 +758,21 @@ impl MetalRenderer {
                 );
             }
         }
+
+        // R3 task 6: BUILD-VERTICES segment ends; ENCODE segment starts.
+        // Counters: vertex_count covers overlay/block-view verts (12 floats
+        // each), instance_count covers grid cells (16 floats each:
+        // dst/uv/fg/bg). dirty_rows stays 0 for now — wiring grid dirty-row
+        // counts from build_grid_instances into this counter is a follow-up
+        // once the grid trace is validated against the existing probe.
+        self.frame_trace
+            .borrow_mut()
+            .build_end(crate::frame_trace::FrameCounters {
+                vertex_count: vertices.len() / 12,
+                instance_count: instances.len() / 16,
+                dirty_rows: 0,
+            });
+        self.frame_trace.borrow_mut().encode_start();
 
         self.encode_and_present(
             drawable,

@@ -421,6 +421,25 @@ impl App {
             // `&mut tab.selection_handler` borrow below — `block_scroll()`
             // takes `&self` and would conflict with the mutable borrow.
             let block_scroll = tab.block_scroll();
+            // R3 task 6: arm the per-frame trace recorder and stamp the frame
+            // id on the renderer (read by the Metal command-buffer label so the
+            // async GPU-completion handler can correlate). The recorder lives
+            // on the renderer in a RefCell so draw()/encode_and_present can
+            // mark segment boundaries despite holding an immutable layer borrow.
+            if self.frame_trace_enabled {
+                self.frame_id = self.frame_id.wrapping_add(1).max(1);
+                renderer.frame_id.set(self.frame_id);
+                let reason = crate::frame_trace::classify_reason(
+                    had_output,
+                    self.window_runtime.cursor_blink_phase >= 0.0,
+                    renderer.spinner_phase >= 0.0,
+                    // Live-resize is not currently tracked as a distinct flag;
+                    // resize-driven redraws fall into Other until a flag lands.
+                    false,
+                );
+                *renderer.frame_trace.borrow_mut() =
+                    crate::frame_trace::FrameTraceRecorder::begin(true, self.frame_id, reason);
+            }
             renderer.draw(
                 terminal,
                 &mut tab.selection_handler,
@@ -432,6 +451,14 @@ impl App {
                 self.interaction.scrollbar_hovered || self.interaction.scrollbar_drag.is_some(),
                 &tab_bar,
             );
+            // R3 task 6: finish the per-frame trace — drains any GPU-completion
+            // messages that landed since last frame and emits the frame line.
+            if self.frame_trace_enabled {
+                let recorder = renderer
+                    .frame_trace
+                    .replace(crate::frame_trace::FrameTraceRecorder::disabled());
+                recorder.finish(&self.gpu_completion_rx);
+            }
             if let (Some(window), Some(ctx)) = (self.window.as_ref(), renderer.layout_ctx) {
                 crate::ime::update_cursor_area(window, ctx, terminal);
             }

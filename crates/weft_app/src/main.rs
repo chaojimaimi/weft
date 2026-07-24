@@ -19,6 +19,7 @@ mod event_replay;
 mod find_component;
 mod find_controller;
 mod find_worker;
+mod frame_trace;
 mod geometry_controller;
 mod glyph;
 mod ime;
@@ -162,6 +163,12 @@ struct App {
     settings: SettingsState,
     accessibility: accessibility::AccessibilityBridge,
     performance_probe: performance_probe::PerformanceProbe,
+    /// Frame-trace state (WARP_REFERENCE R3 task 6). Monotonic frame id
+    /// stamped on each render; the GPU-completion receiver drains
+    /// `add_completed_handler` messages posted from Metal internal threads.
+    frame_id: u64,
+    frame_trace_enabled: bool,
+    gpu_completion_rx: std::sync::mpsc::Receiver<frame_trace::FrameGpuComplete>,
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
@@ -210,6 +217,8 @@ impl App {
             "config loaded"
         );
         let config_state = ConfigState::new(config, scan_path_bins());
+        let probe = performance_probe::PerformanceProbe::from_env();
+        let frame_trace_enabled = probe.enabled();
         Self {
             window: None,
             renderer: None,
@@ -227,7 +236,13 @@ impl App {
             palette: PaletteState::new(),
             settings: SettingsState::new(),
             accessibility: accessibility::AccessibilityBridge::default(),
-            performance_probe: performance_probe::PerformanceProbe::from_env(),
+            performance_probe: probe,
+            frame_id: 0,
+            // Frame trace follows the probe gate: only pay the instrumentation
+            // cost when the acceptance probe is active. Idle production runs
+            // keep the recorder in its disabled no-op mode.
+            frame_trace_enabled,
+            gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
         }
     }

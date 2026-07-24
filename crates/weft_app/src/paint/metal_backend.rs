@@ -225,6 +225,8 @@ impl MetalRenderer {
             instance_ring: RefCell::new(Vec::new()),
             instance_ring_idx: Cell::new(0),
             instance_capacity: Cell::new(0),
+            frame_trace: RefCell::new(crate::frame_trace::FrameTraceRecorder::disabled()),
+            frame_id: Cell::new(0),
         }
     }
 
@@ -288,6 +290,11 @@ impl MetalRenderer {
             let unchanged = self.instances_unchanged.get();
             let has_offscreen = unchanged && self.ensure_offscreen_texture();
             let command_buffer = self.queue.new_command_buffer();
+            // R3 task 6: stamp frame id + mark ENCODE end on the idle path too.
+            if self.frame_id.get() != 0 {
+                command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
+            }
+            self.frame_trace.borrow_mut().encode_end();
             if has_offscreen {
                 let blit = command_buffer.new_blit_command_encoder();
                 let cache = self.offscreen_texture.borrow();
@@ -324,6 +331,7 @@ impl MetalRenderer {
                 encoder.end_encoding();
             }
             command_buffer.present_drawable(drawable);
+            register_gpu_completion_handler(command_buffer);
             command_buffer.commit();
             return;
         }
@@ -479,6 +487,11 @@ impl MetalRenderer {
         let has_offscreen = !vp_mismatch && self.ensure_offscreen_texture();
 
         let command_buffer = self.queue.new_command_buffer();
+        // R3 task 6: stamp the frame id on the command buffer label so the
+        // async add_completed_handler can correlate GPU completion.
+        if self.frame_id.get() != 0 {
+            command_buffer.set_label(&format!("weft-frame-{}", self.frame_id.get()));
+        }
 
         // v1.0 P0-c: If scrolling and not force_full, blit the unchanged
         // region within the offscreen texture (src_y=Δ → dst_y=0) before
@@ -659,6 +672,44 @@ impl MetalRenderer {
         }
 
         command_buffer.present_drawable(drawable);
+        // R3 task 6: ENCODE segment ends here (just before commit). Register a
+        // GPU-completion handler so we can correlate the async GPU finish back
+        // to this frame's id. The handler captures the submit timestamp and
+        // posts FrameGpuComplete to the global channel drained on the main
+        // thread next frame. Triple-buffering means this lands 1–2 frames late.
+        self.frame_trace.borrow_mut().encode_end();
+        register_gpu_completion_handler(command_buffer);
         command_buffer.commit();
     }
+}
+
+/// Register an `add_completed_handler` on the command buffer that measures
+/// GPU elapsed time and posts it to the global frame-trace channel. No-op when
+/// the channel was never installed (probe disabled — the tx is `None`).
+///
+/// The `block::Block` must be `'static + Send` because Metal invokes it on an
+/// internal thread; we therefore capture only the submit `Instant` and the
+/// `frame_id`, never `&self`.
+fn register_gpu_completion_handler(command_buffer: &metal::CommandBufferRef) {
+    let Some(tx) = crate::frame_trace::gpu_completion_tx() else {
+        return;
+    };
+    let submitted = std::time::Instant::now();
+    let frame_id = command_buffer
+        .label()
+        .strip_prefix("weft-frame-")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    // ConcreteBlock::new wraps the closure; .copy() moves it to the heap as an
+    // RcBlock that derefs to Block<...>, which is what add_completed_handler
+    // expects. The block must outlive this call site — Metal retains it until
+    // the GPU invokes it, and the closure is 'static (captures only owned data).
+    let block = block::ConcreteBlock::new(move |_cmd_buf: &metal::CommandBufferRef| {
+        let gpu_us = submitted.elapsed().as_micros() as u64;
+        // Channel send errors (receiver dropped during shutdown) are ignored —
+        // the trace is best-effort and must never panic the GPU thread.
+        let _ = tx.send(crate::frame_trace::FrameGpuComplete { frame_id, gpu_us });
+    })
+    .copy();
+    command_buffer.add_completed_handler(&block);
 }

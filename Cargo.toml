@@ -28,6 +28,9 @@ objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeomet
 objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext"] }
 objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer"] }
 winit = "0.30"
+# `block` backs the `Block<...>` callback type used by Metal's
+# `add_completed_handler` (frame-trace GPU timing) and other Objective-C APIs.
+block = "0.1"
 
 # Fonts
 font-kit = "0.14"

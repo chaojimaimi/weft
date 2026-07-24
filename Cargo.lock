@@ -2198,6 +2198,7 @@ dependencies = [
 name = "weft_app"
 version = "1.2.0"
 dependencies = [
+ "block",
  "core-foundation",
  "core-graphics",
  "core-graphics-types",
