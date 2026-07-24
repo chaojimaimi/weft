@@ -160,13 +160,25 @@ pub struct UiColors {
     pub canvas: Color,
     pub chrome: Color,
     pub raised: Color,
+    /// R4: sunken surface — deeper than canvas for input wells/code blocks.
+    pub sunken: Color,
     pub panel: Color,
     pub selection: Color,
     pub selection_text: Color,
     pub text_primary: Color,
     pub text_secondary: Color,
+    /// R4: muted text — placeholders/hints, 3:1 large-text floor.
+    pub text_muted: Color,
+    /// R4: inverse text — readable on selection/highlight backgrounds.
+    pub text_inverse: Color,
     pub border_subtle: Color,
+    /// R4: strong border — active dividers, 40% toward foreground.
+    pub border_strong: Color,
     pub focus: Color,
+    /// R4: accent hover state — slightly brighter than focus.
+    pub accent_hover: Color,
+    /// R4: accent pressed state — slightly darker than focus.
+    pub accent_pressed: Color,
     pub success: Color,
     pub warning: Color,
     pub error: Color,
@@ -175,6 +187,19 @@ pub struct UiColors {
     /// readable underneath. Kept distinct from `warning` so theme tweaks
     /// don't accidentally change find highlighting.
     pub find_match: Color,
+}
+
+/// R4: Interaction state for hover/focus/pressed/disabled semantics.
+/// Passed to [`UiColors::accent_for`] to derive the correct accent variant.
+#[allow(dead_code)] // R4: scaffolding for hover/pressed paint migration (Batch 11+)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InteractionState {
+    #[default]
+    Normal,
+    Hover,
+    Pressed,
+    Disabled,
+    Focused,
 }
 
 impl UiColors {
@@ -203,20 +228,34 @@ impl UiColors {
         // still meet AA on canvas, chrome and raised surfaces.
         let text_primary = ensure_contrast(fg, &text_surfaces, 7.0);
         let text_secondary = ensure_contrast(mix(bg, text_primary, 0.70), &text_surfaces, 4.5);
+        let text_muted = ensure_contrast(mix(bg, text_primary, 0.50), &text_surfaces, 3.0);
         let (selection, selection_text) = selection_colors(panel, theme.accent, text_primary);
+        let text_inverse = preferred_contrast_extreme(&[selection]);
+        // R4: sunken is 12% toward the contrast extreme (deeper for dark themes,
+        // lighter for light themes) — visually distinct from canvas/raised.
+        let sunken = mix(bg, canvas_target, 0.12);
+        let border_strong = mix(bg, fg, 0.40);
+        let focus = ensure_contrast(theme.accent, &[bg, panel], 4.5);
+        // R4: accent interaction states — hover brightens, pressed darkens.
+        let accent_hover = mix(focus, canvas_target, 0.15);
+        let accent_pressed = mix(focus, bg, 0.20);
         Self {
             canvas: bg,
             chrome,
             raised,
+            sunken,
             panel,
             selection,
             selection_text,
             text_primary,
             text_secondary,
+            text_muted,
+            text_inverse,
             border_subtle: mix(bg, fg, 0.20),
-            // These tokens paint both indicators and normal-sized status
-            // text, so their canvas contrast follows the stricter 4.5 floor.
-            focus: ensure_contrast(theme.accent, &[bg, panel], 4.5),
+            border_strong,
+            focus,
+            accent_hover,
+            accent_pressed,
             success: ensure_contrast(
                 if light_text {
                     Color::rgb(135, 204, 92)
@@ -275,9 +314,24 @@ impl UiColors {
         let find_target = preferred_contrast_extreme(&[bg]);
         Self {
             border_subtle: mix(bg, fg, 0.65),
+            border_strong: mix(bg, fg, 0.80),
             text_secondary: fg,
+            text_muted: self.text_secondary,
             find_match: mix(self.find_match, find_target, 0.20),
             ..self
+        }
+    }
+
+    /// R4: Derive the accent color for a given interaction state.
+    /// Normal/Focused → focus; Hover → accent_hover; Pressed → accent_pressed;
+    /// Disabled → 50% desaturated toward canvas.
+    #[allow(dead_code)] // R4: scaffolding for hover/pressed paint migration (Batch 11+)
+    pub fn accent_for(&self, state: InteractionState) -> Color {
+        match state {
+            InteractionState::Normal | InteractionState::Focused => self.focus,
+            InteractionState::Hover => self.accent_hover,
+            InteractionState::Pressed => self.accent_pressed,
+            InteractionState::Disabled => mix(self.focus, self.canvas, 0.50),
         }
     }
 }
@@ -416,8 +470,8 @@ fn selection_colors(panel: Color, accent: Color, preferred_text: Color) -> (Colo
 mod tests {
     use super::{
         clamp_sidebar_width, compact_control_row_span, contrast_ratio, sidebar_edge_hit,
-        sidebar_placement, sidebar_visual_width, sidebar_width_after_drag, ResponsiveClass,
-        SidebarMetrics, UiColors, UiMetrics, MIN_WINDOW_WIDTH, SIDEBAR_MAX_WIDTH,
+        sidebar_placement, sidebar_visual_width, sidebar_width_after_drag, InteractionState,
+        ResponsiveClass, SidebarMetrics, UiColors, UiMetrics, MIN_WINDOW_WIDTH, SIDEBAR_MAX_WIDTH,
         SIDEBAR_MIN_WIDTH,
     };
     use weft_core::config::Theme;
@@ -690,5 +744,56 @@ mod tests {
         }
         assert!(contrast_ratio(colors.selection, colors.panel) >= 3.0);
         assert!(contrast_ratio(colors.selection_text, colors.selection) >= 4.5);
+    }
+
+    #[test]
+    fn r4_new_tokens_are_non_default() {
+        let colors = UiColors::from_theme(&Theme::weft_warm());
+        assert_ne!(colors.sunken, colors.canvas);
+        assert_ne!(colors.text_muted, colors.text_primary);
+        assert_ne!(colors.border_strong, colors.border_subtle);
+        assert_ne!(colors.accent_hover, colors.focus);
+        assert_ne!(colors.accent_pressed, colors.focus);
+        // text_inverse is a contrast extreme for selection.
+        assert!(
+            colors.text_inverse == weft_core::grid::Color::rgb(255, 255, 255)
+                || colors.text_inverse == weft_core::grid::Color::rgb(0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn r4_interaction_state_accent_progression() {
+        let colors = UiColors::from_theme(&Theme::weft_warm());
+        assert_eq!(colors.accent_for(InteractionState::Normal), colors.focus);
+        assert_eq!(colors.accent_for(InteractionState::Focused), colors.focus);
+        assert_ne!(colors.accent_for(InteractionState::Hover), colors.focus);
+        assert_ne!(colors.accent_for(InteractionState::Pressed), colors.focus);
+        assert_ne!(colors.accent_for(InteractionState::Disabled), colors.focus);
+    }
+
+    #[test]
+    fn r4_increase_contrast_strengthens_border_and_mutes() {
+        let normal = UiColors::from_theme(&Theme::weft_warm());
+        let ic = normal.with_increase_contrast(true);
+        assert_ne!(ic.border_strong, normal.border_strong);
+        assert_ne!(ic.text_muted, normal.text_muted);
+    }
+
+    #[test]
+    fn r4_text_muted_meets_large_text_contrast() {
+        for theme in [
+            Theme::weft_warm(),
+            Theme::weft_light(),
+            Theme::dracula(),
+            Theme::solarized_dark(),
+        ] {
+            let colors = UiColors::from_theme(&theme);
+            for surface in [colors.canvas, colors.chrome, colors.raised, colors.panel] {
+                assert!(
+                    contrast_ratio(colors.text_muted, surface) >= 3.0,
+                    "text_muted contrast < 3.0"
+                );
+            }
+        }
     }
 }

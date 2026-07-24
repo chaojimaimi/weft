@@ -77,10 +77,12 @@ impl MetalRenderer {
         )
         .expect("positive renderer geometry produces SettingsLayout");
 
-        let theme_bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.accent);
-        let separator = color_to_normalized(self.theme.separator);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
+        let theme_bg = color_to_normalized(ui.canvas);
+        let fg = color_to_normalized(ui.text_primary);
+        let accent = color_to_normalized(ui.focus);
+        let separator = color_to_normalized(ui.border_subtle);
         // Muted secondary text: 70% fg + 30% bg — always readable.
         let label_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,

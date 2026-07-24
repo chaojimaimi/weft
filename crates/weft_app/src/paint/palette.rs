@@ -36,9 +36,11 @@ impl MetalRenderer {
             return verts;
         }
 
-        let theme_bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.accent);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
+        let theme_bg = color_to_normalized(ui.canvas);
+        let fg = color_to_normalized(ui.text_primary);
+        let accent = color_to_normalized(ui.focus);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,
@@ -46,7 +48,7 @@ impl MetalRenderer {
             1.0,
         ];
         let dim = prompt_c;
-        let separator = color_to_normalized(self.theme.separator);
+        let separator = color_to_normalized(ui.border_subtle);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
@@ -222,9 +224,11 @@ impl MetalRenderer {
         let mut verts = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
-        let theme_bg = color_to_normalized(self.theme.background);
-        let fg = color_to_normalized(self.theme.foreground);
-        let accent = color_to_normalized(self.theme.accent);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
+        let theme_bg = color_to_normalized(ui.canvas);
+        let fg = color_to_normalized(ui.text_primary);
+        let accent = color_to_normalized(ui.focus);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,

@@ -48,7 +48,9 @@ impl MetalRenderer {
         // bottom padding. Keep it subtle — 50% alpha accent color.
         let x = ctx.left();
         let y = (ctx.bottom() - ch).max(ctx.top());
-        let accent = color_to_normalized(self.theme.accent);
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
+        let accent = color_to_normalized(ui.focus);
         let fg = [accent[0], accent[1], accent[2], accent[3] * 0.50];
         let max_cols = hint.chars().count();
         self.push_text(&mut verts, x, y, hint, fg, max_cols);
