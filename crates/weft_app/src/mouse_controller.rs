@@ -738,7 +738,12 @@ impl App {
                 };
                 let cols = t.grid().num_cols;
                 let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
-                let (total, _) = block_content_metrics(t, cols, header_rows);
+                let cache = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.block_layout_cache.borrow());
+                let (total, _) =
+                    block_content_metrics_with_cache(t, cols, header_rows, cache.as_deref());
                 (total, crate::block_component::block_prompt_lines(t))
             };
             let visible = self

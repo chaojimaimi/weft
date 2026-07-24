@@ -226,12 +226,46 @@ pub(crate) fn block_content_metrics(
     cols: usize,
     header_rows: usize,
 ) -> (usize, usize) {
+    block_content_metrics_with_cache(terminal, cols, header_rows, None)
+}
+
+/// R2-2: cached variant of [`block_content_metrics`]. When `cache` is `Some`
+/// and a block's layout is cached, reads `output_rows` in O(1) instead of
+/// re-wrapping every output line in O(m) via [`completed_block_output_rows`].
+/// Falls back to the direct path for uncached blocks (e.g. a block finalized
+/// after the last paint, or callers without renderer access).
+pub(crate) fn block_content_metrics_with_cache(
+    terminal: &Terminal,
+    cols: usize,
+    header_rows: usize,
+    cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
+) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
     let mut total = 0;
     let viewport_rows = terminal.grid().num_rows.max(1);
     for block in terminal.block_tracker().session_blocks() {
-        total += completed_block_layout_rows(block, cols, header_rows, viewport_rows);
+        // R2-2: read cached output_rows (O(1)) instead of re-wrapping every
+        // block's output every frame (O(m) per block). The cache is keyed by
+        // BlockId.0; ensure_cached was already called by the paint path, so
+        // the entry exists. If somehow it doesn't (e.g. block finalized after
+        // the last paint), fall back to the direct computation.
+        let output_rows = cache
+            .and_then(|c| c.get_if_cached(block.id.0))
+            .map(|c| {
+                if c.cols != cols || c.collapsed != block.collapsed {
+                    // Stale cache entry — fall back. ensure_cached will fix it
+                    // on the next paint frame. This is rare (resize between
+                    // paint and metrics) and correct, just not O(1).
+                    completed_block_output_rows(block, cols)
+                } else {
+                    c.output_rows
+                }
+            })
+            .unwrap_or_else(|| completed_block_output_rows(block, cols));
+        total += output_rows
+            + completed_block_row_count(0, header_rows)
+            + clear_block_spacer_rows(&block.command, viewport_rows);
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
         if let Some(live) = terminal.block_tracker().in_flight() {
@@ -739,6 +773,46 @@ mod tests {
         assert_eq!(
             cached_rows, direct_rows,
             "cache chunks must match direct wrap count"
+        );
+    }
+
+    /// R2-2 regression: collapsed blocks must report `output_rows = 0` in the
+    /// cache, matching `completed_block_output_rows`. Without the collapsed
+    /// guard in `compute_block_layout`, the cache would store non-zero rows
+    /// and the scrollbar thumb would be sized as if the output were visible.
+    #[test]
+    fn r22_collapsed_block_cache_reports_zero_output_rows() {
+        use crate::paint::grid_cache::BlockLayoutCache;
+        let mut b = r22_block("echo hi", "line one\nline two\nline three\n");
+        let cols = 80;
+
+        // Uncollapsed: cache should have non-zero output_rows.
+        let mut cache = BlockLayoutCache::default();
+        cache.ensure_cached(&b, cols);
+        let uncollapsed_rows = cache.get(b.id.0).output_rows;
+        assert_eq!(uncollapsed_rows, 3);
+
+        // Collapse: cache must rebuild with output_rows = 0.
+        b.collapsed = true;
+        cache.ensure_cached(&b, cols);
+        assert_eq!(cache.get(b.id.0).output_rows, 0);
+
+        // The cached path must agree with the fallback path.
+        let mut terminal = Terminal::new(24, 80);
+        terminal.process(b"\x1b]133;A\x07echo hi\x1b]133;B\x07\x1b]133;C\x07line one\r\nline two\r\nline three\r\n\x1b]133;D;0\x07");
+        // No direct API to collapse a finalized block; verify via the function
+        // contract: block_content_metrics (None cache) and _with_cache (Some)
+        // must agree.
+        let (total_none, _) = block_content_metrics(&terminal, 80, 1);
+        let cache = terminal.block_tracker(); // borrow to build a cache
+        let mut blk_cache = BlockLayoutCache::default();
+        for blk in cache.session_blocks() {
+            blk_cache.ensure_cached(blk, 80);
+        }
+        let (total_some, _) = block_content_metrics_with_cache(&terminal, 80, 1, Some(&blk_cache));
+        assert_eq!(
+            total_none, total_some,
+            "cached and uncached totals must match"
         );
     }
 }

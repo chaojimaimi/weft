@@ -404,7 +404,13 @@ impl App {
             // viewport (upper-middle). block_scroll_offset is "rows scrolled
             // up from the bottom", so target = rows_from_bottom - visible*2/3.
             let cols = term.grid().num_cols;
-            let (total, _) = block_content_metrics(term, cols, renderer.block_header_rows());
+            let cache = renderer.block_layout_cache.borrow();
+            let (total, _) = block_content_metrics_with_cache(
+                term,
+                cols,
+                renderer.block_header_rows(),
+                Some(&*cache),
+            );
             let max_scroll = total.saturating_sub(visible);
             let Some(target) = block_find_scroll_target(
                 blocks,

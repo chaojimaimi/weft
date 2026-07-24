@@ -60,7 +60,7 @@ use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
     SessionManager, SettingsState, TabBarState, WindowRuntimeState,
 };
-use block_component::block_content_metrics;
+use block_component::block_content_metrics_with_cache;
 use effect::Effect;
 use input_router::{OverlayInputContext, OverlayInputOwner};
 use macos_system::{

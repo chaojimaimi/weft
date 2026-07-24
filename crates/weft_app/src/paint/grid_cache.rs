@@ -137,6 +137,12 @@ pub(crate) struct CachedBlockLayout {
     /// Pre-trimmed, pre-wrapped line metadata. Trailing empty/prompt lines
     /// are already removed, matching the original trimming logic.
     pub(crate) lines: Vec<CachedLine>,
+    /// R2-2: cached wrapped output row count (sum of chunks.len() across
+    /// all lines + command resume hints). Excludes the header/gap/spacer
+    /// because those depend on `header_rows` and `viewport_rows` which are
+    /// per-frame parameters, not per-block cache keys. This lets
+    /// `block_content_metrics` skip the O(m) re-wrap per block and read O(1).
+    pub(crate) output_rows: usize,
 }
 
 /// Per-renderer block layout cache. Keyed by `BlockId.0`.
@@ -171,6 +177,14 @@ impl BlockLayoutCache {
             .get(&id)
             .expect("ensure_cached must be called before get")
     }
+
+    /// R2-2: like `get` but returns `None` for uncached blocks instead of
+    /// panicking. Used by `block_content_metrics_with_cache` to fall back
+    /// to direct computation when a block hasn't been cached yet (e.g. the
+    /// block was finalized between the last paint and the scrollbar layout).
+    pub(crate) fn get_if_cached(&self, id: u64) -> Option<&CachedBlockLayout> {
+        self.entries.get(&id)
+    }
 }
 
 /// Compute the layout for a single block (expensive — call once, then cache).
@@ -204,6 +218,24 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         })
         .collect();
 
+    // R2-2: cache the wrapped output row count so block_content_metrics can
+    // read O(1) instead of re-wrapping every block every frame. This sums
+    // command resume hints (static strings, opencode-only) + visible output
+    // lines — exactly what completed_block_output_rows computes, minus the
+    // per-frame header_rows/viewport_rows terms that don't belong in the cache.
+    // Collapsed blocks report 0 output rows (matching completed_block_output_rows)
+    // even though `lines` is still populated for foldable detection / uncollapse.
+    let output_rows = if block.collapsed {
+        0
+    } else {
+        let hint_rows: usize = crate::block_component::command_resume_hints(block)
+            .iter()
+            .map(|hint| block_line_chunks(hint, cols).count())
+            .sum();
+        let line_rows: usize = lines.iter().map(|l| l.chunks.len()).sum();
+        hint_rows + line_rows
+    };
+
     CachedBlockLayout {
         output_len: block.output.len(),
         output_identity: block.output.as_ptr() as usize,
@@ -212,6 +244,7 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         cols,
         foldable,
         lines,
+        output_rows,
     }
 }
 

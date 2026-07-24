@@ -13,7 +13,13 @@ impl App {
             return None;
         }
         let cols = terminal.grid().num_cols;
-        let (total, _) = block_content_metrics(terminal, cols, renderer.block_header_rows());
+        let cache = renderer.block_layout_cache.borrow();
+        let (total, _) = block_content_metrics_with_cache(
+            terminal,
+            cols,
+            renderer.block_header_rows(),
+            Some(&*cache),
+        );
         let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
         let cwd_header =
             crate::layout::block_cwd_header_active(editor_mode, terminal.cwd().is_some());

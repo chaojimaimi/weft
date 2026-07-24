@@ -237,7 +237,12 @@ impl App {
         // Block view uses a dedicated scroll offset.
         let block_view = terminal.show_block_view();
         if block_view {
-            let (total, _) = block_content_metrics(terminal, cols, header_rows);
+            let cache = self
+                .renderer
+                .as_ref()
+                .map(|r| r.block_layout_cache.borrow());
+            let (total, _) =
+                block_content_metrics_with_cache(terminal, cols, header_rows, cache.as_deref());
             // Compute visible rows from the renderer's actual geometry.
             let prompt_lines = crate::block_component::block_prompt_lines(terminal);
             let visible = self

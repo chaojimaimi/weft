@@ -302,8 +302,13 @@ impl App {
             // view — the scrollbar only shows in block view anyway.
             let scroll_metrics = if terminal.show_block_view() {
                 let cols = terminal.grid().num_cols;
-                let (total, _) =
-                    block_content_metrics(terminal, cols, renderer.block_header_rows());
+                let cache = renderer.block_layout_cache.borrow();
+                let (total, _) = block_content_metrics_with_cache(
+                    terminal,
+                    cols,
+                    renderer.block_header_rows(),
+                    Some(&*cache),
+                );
                 let prompt_lines = crate::block_component::block_prompt_lines(terminal);
                 let cwd_header = crate::layout::block_cwd_header_active(
                     terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
