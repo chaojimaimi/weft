@@ -13,6 +13,20 @@ struct BlockHeaderActionGeometry {
     fold_center: [f32; 2],
 }
 
+/// Batch 5 Step 3: expose copy/fold button bounds for accessibility.
+/// Returns `(copy_rect, fold_rect)` so screen readers can register
+/// independent Button semantics on the sticky header actions.
+pub(crate) fn block_header_action_rects(
+    right: f32,
+    y: f32,
+    pitch: f32,
+    cell_width: f32,
+    scale: f64,
+) -> ([f32; 4], [f32; 4]) {
+    let g = block_header_action_geometry(right, y, pitch, cell_width, scale);
+    (g.copy, g.fold)
+}
+
 fn block_header_action_geometry(
     right: f32,
     y: f32,

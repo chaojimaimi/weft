@@ -30,6 +30,7 @@ use crate::accessibility_model::{
 };
 use crate::scene::{SemanticNode, SemanticRole};
 use crate::{App, AppEvent, CONTEXT_MENU_ITEMS};
+use weft_core::blocks::BlockId;
 
 static EVENT_PROXY: OnceLock<EventLoopProxy<AppEvent>> = OnceLock::new();
 
@@ -521,7 +522,9 @@ impl App {
             let mut block_cache_update = None;
             // R2-3: sticky header label + bounds for accessibility, filled
             // inside the block-view branch where `rows` are already computed.
-            let mut sticky_header: Option<(String, [f32; 4])> = None;
+            // Batch 5 Step 3: also carry the block_id so we can emit Button
+            // semantics for the copy/fold actions on the sticky header.
+            let mut sticky_header: Option<(String, [f32; 4], BlockId)> = None;
             let text =
                 self.sessions
                     .active()
@@ -588,6 +591,7 @@ impl App {
                                             layout.content.right as f32,
                                             sticky_bottom,
                                         ],
+                                        sid,
                                     ));
                                 }
                             }
@@ -632,7 +636,9 @@ impl App {
             // R2-3 Phase 1: expose the sticky header as a ListItem so screen
             // readers announce the pinned command. Previously the sticky band
             // was visible but accessibility-invisible (a "dead paint band").
-            if let Some((label, bounds)) = sticky_header {
+            // Batch 5 Step 3: also emit Button semantics for the copy/fold
+            // actions so VoiceOver users can activate them independently.
+            if let Some((label, bounds, block_id)) = sticky_header {
                 let node = SemanticNode {
                     role: SemanticRole::ListItem,
                     label,
@@ -641,6 +647,67 @@ impl App {
                     state: String::new(),
                 };
                 push_semantic(&mut semantics, "sticky-header", None, &node, false);
+
+                // Compute copy/fold button bounds using the same geometry as
+                // the paint path (block_header_action_rects). The PressPoint
+                // action falls through to handle_mouse_press which hits the
+                // existing BlockActionCopy/BlockActionFold HitRegions.
+                let (copy_rect, fold_rect) = crate::paint::block_view::block_header_action_rects(
+                    layout.content.right as f32,
+                    layout.content.top as f32,
+                    layout.cell_height as f32,
+                    layout.cell_width as f32,
+                    renderer.scale(),
+                );
+                let copy_node = SemanticNode {
+                    role: SemanticRole::Button,
+                    label: "Copy command".to_string(),
+                    bounds: copy_rect,
+                    focus: None,
+                    state: String::new(),
+                };
+                push_semantic(
+                    &mut semantics,
+                    &format!("sticky-header/copy/{:016x}", block_id.0),
+                    Some("sticky-header"),
+                    &copy_node,
+                    true,
+                );
+                let fold_label = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .and_then(|terminal| {
+                        terminal
+                            .block_tracker()
+                            .session_blocks()
+                            .iter()
+                            .find(|b| b.id == block_id)
+                    })
+                    .map(|block| {
+                        if block.collapsed {
+                            "Expand block"
+                        } else {
+                            "Collapse block"
+                        }
+                    })
+                    .unwrap_or("Toggle fold")
+                    .to_string();
+                let fold_node = SemanticNode {
+                    role: SemanticRole::Button,
+                    label: fold_label,
+                    bounds: fold_rect,
+                    focus: None,
+                    state: String::new(),
+                };
+                push_semantic(
+                    &mut semantics,
+                    &format!("sticky-header/fold/{:016x}", block_id.0),
+                    Some("sticky-header"),
+                    &fold_node,
+                    true,
+                );
             }
         }
 

@@ -26,6 +26,9 @@ use style::BlockOutputTextPaint;
 // R2-3: re-export so accessibility.rs can compute the sticky block id without
 // duplicating the geometric invariant (command row scrolled above clip_top).
 pub(crate) use rows::sticky_block_id;
+// Batch 5 Step 3: re-export so accessibility.rs can compute copy/fold button
+// bounds for Button-level semantic nodes on the sticky header.
+pub(crate) use actions::block_header_action_rects;
 
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
