@@ -704,4 +704,94 @@ mod tests {
         h.clear();
         assert!(h.block_view_selection.is_none());
     }
+
+    // Step 2 assumption-falsifying tests: verify that sync_rows correctly
+    // handles the case where visibility culling (Step 2 of batch 4) removes
+    // rows from `new_rows` that were present in the selection's `rows`
+    // snapshot. These tests must pass BEFORE Step 2 lands, proving the
+    // fallback mechanism is correct independent of culling.
+
+    #[test]
+    fn sync_rows_clipped_row_falls_back_to_y_center() {
+        // Selection anchored on row idx 4 (Header, y=80..100) and idx 3
+        // (Command, y=60..80). After visibility culling, idx 4 is offscreen
+        // and absent from new_rows. The exact-match and text-match fallbacks
+        // both fail (Header row not in new_rows); y-center fallback must map
+        // idx 4 to the new row whose y-center is closest to 90.
+        //
+        // new_rows (post-cull, 3 rows): idx 0=Output(0..20), idx 1=Output(20..40),
+        // idx 2=Command(60..80). The old idx 4 (y-center=90) is closest to
+        // new idx 2 (y-center=70), so remap(4) should return 2.
+        let old_rows = bv_rows();
+        let mut sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 4,
+                char_index: 0,
+            },
+            end: BlockViewPos {
+                row_index: 3,
+                char_index: 5,
+            },
+            rows: old_rows,
+        };
+        let new_rows = vec![
+            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0),  // new idx 0
+            bv_row(BlockViewRowKind::Output, "hello", 20.0, 40.0), // new idx 1
+            bv_row(BlockViewRowKind::Command, "echo hi", 60.0, 80.0), // new idx 2
+        ];
+        sel.sync_rows(new_rows);
+        // start (old idx 4) remaps to new idx 2 (closest y-center to 90).
+        assert_eq!(sel.start.row_index, 2);
+        // end (old idx 3 "echo hi") exact-matches new idx 2.
+        assert_eq!(sel.end.row_index, 2);
+    }
+
+    #[test]
+    fn sync_rows_all_clipped_does_not_panic() {
+        // Extreme case: every row in the selection is offscreen. new_rows is
+        // a completely different set of rows. sync_rows must not panic and
+        // must clamp indices to valid range.
+        let old_rows = bv_rows();
+        let mut sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 4,
+                char_index: 0,
+            },
+            end: BlockViewPos {
+                row_index: 0,
+                char_index: 3,
+            },
+            rows: old_rows,
+        };
+        // Completely different rows — no exact or text match possible.
+        let new_rows = vec![
+            bv_row(BlockViewRowKind::Output, "completely_new", 200.0, 220.0),
+            bv_row(BlockViewRowKind::Output, "also_new", 220.0, 240.0),
+        ];
+        sel.sync_rows(new_rows);
+        // Both endpoints must be valid indices into new_rows (0 or 1).
+        assert!(sel.start.row_index < 2);
+        assert!(sel.end.row_index < 2);
+    }
+
+    #[test]
+    fn sync_rows_empty_new_rows_does_not_panic() {
+        // Degenerate case: new_rows is empty (e.g. first frame before any
+        // blocks are laid out). sync_rows must not panic; indices clamp to 0.
+        let old_rows = bv_rows();
+        let mut sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 2,
+                char_index: 0,
+            },
+            end: BlockViewPos {
+                row_index: 0,
+                char_index: 3,
+            },
+            rows: old_rows,
+        };
+        sel.sync_rows(Vec::new());
+        assert_eq!(sel.start.row_index, 0);
+        assert_eq!(sel.end.row_index, 0);
+    }
 }
