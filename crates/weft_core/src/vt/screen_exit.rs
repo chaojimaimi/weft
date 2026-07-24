@@ -1,3 +1,32 @@
+//! Primary-screen exit handling and command document lifecycle.
+//!
+//! # R1-3: Command Document Lifecycle Phases
+//!
+//! The WARP optimization plan defines three document lifecycle phases for
+//! primary-screen TUI sessions (Claude Code, OpenCode, etc.). They map to
+//! existing code entities as follows:
+//!
+//! | Plan term            | Code entity |
+//! |----------------------|-------------|
+//! | live grid snapshot   | [`Terminal::primary_screen_app_active()`] + viewport
+//! |                      | ownership mask (`primary_screen_viewport_ownership`)
+//! | settling tail        | [`SettleState::PendingDeferred`] / [`SettleState::Settling`]
+//! |                      | + [`PRIMARY_SCREEN_EXIT_SETTLE_DELAY`] (200ms window)
+//! | frozen block         | Terminal `Block` (finalized by
+//! |                      | `finish_deferred_screen_command` after settle)
+//!
+//! OSC 133 (A/B/C/D) drives `ShellPhase` in `BlockTracker`; the 200ms settle
+//! window drives `SettleState` in `CapabilityFlags`. The two state machines
+//! are orthogonal and bridged by `settle_primary_screen_exit()`, which calls
+//! `finish_deferred_screen_command()` when the settle window elapses.
+//!
+//! Naming note: "frozen" appears in three contexts — `freeze_primary_screen_`
+//! `document_candidate` (freezes the document *boundary*), `PrimaryScreen`
+//! `InterruptCapture.frozen_text` (freezes an interrupt-instant snapshot),
+//! and the terminal `Block` (the final "frozen block" state). All three are
+//! intentionally named for their distinct roles; this module comment exists
+//! to prevent confusion when mapping plan terminology to code.
+
 use super::Terminal;
 use crate::blocks::{OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
 use std::time::{Duration, Instant};
