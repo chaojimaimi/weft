@@ -202,6 +202,7 @@ impl MetalRenderer {
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
             cached_scroll_metrics: Cell::new(None),
+            cached_panel_scroll_metrics: Cell::new(None),
             grid_row_cache: RefCell::new(Vec::new()),
             force_full_grid: Cell::new(true),
             prev_cursor_row: Cell::new(None),

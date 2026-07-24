@@ -615,6 +615,12 @@ impl App {
             return None;
         }
         let renderer = self.renderer.as_ref()?;
+        // Batch 5 Step 2: read cached metrics from the last draw() instead of
+        // re-running panel_filtered_count (O(n) over all blocks) on every
+        // mouse move. The cache is written at the end of build_panel_vertices;
+        // mouse events read the previous frame's metrics (1-frame lag is
+        // imperceptible for scrollbar hit-testing).
+        let (total, visible, _max_scroll) = renderer.cached_panel_scroll_metrics.get()?;
         let chrome_top = renderer.layout_ctx.map(|ctx| ctx.chrome_top).unwrap_or(0.0);
         let layout = crate::layout::layout_panel(
             chrome_top,
@@ -623,14 +629,10 @@ impl App {
             renderer.sidebar_width(),
             renderer.viewport().1,
         );
-        let visible = crate::paint::ui_helpers::visible_panel_rows(
-            renderer.viewport().1,
-            renderer.cell_height(),
-        );
         crate::panel_scrollbar::panel_scrollbar_layout(
             layout.panel_rect,
             layout.list_top,
-            self.panel_total_filtered(),
+            total,
             visible,
             self.panel.scroll_offset,
             renderer.cell_height() as f32 * 0.8,

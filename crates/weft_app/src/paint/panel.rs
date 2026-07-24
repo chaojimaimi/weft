@@ -203,6 +203,11 @@ impl MetalRenderer {
         let max_rows = visible_panel_rows(vp_h, self.cell_height());
         let total_filtered = panel_filtered_count(p.blocks, p.query);
         let max_scroll = total_filtered.saturating_sub(max_rows);
+        // Batch 5 Step 2: cache metrics for active_panel_scrollbar_layout
+        // (mouse handlers). Written here once per frame; read on every mouse
+        // move to avoid re-running panel_filtered_count (O(n) over all blocks).
+        self.cached_panel_scroll_metrics
+            .set(Some((total_filtered, max_rows, max_scroll)));
         let scroll_offset = p.scroll_offset.min(max_scroll);
         let display = panel_display(p.blocks, p.query, scroll_offset, max_rows);
         let row_h = panel_layout.row_height;

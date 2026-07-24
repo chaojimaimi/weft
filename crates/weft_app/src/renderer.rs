@@ -102,6 +102,13 @@ pub struct MetalRenderer {
     /// Uses `Cell` because draw() holds an immutable borrow of `self.layer`
     /// across the entire frame (same constraint as block_layout_cache).
     pub(crate) cached_scroll_metrics: Cell<Option<(usize, usize, usize)>>,
+    /// Batch 5 Step 2: cached panel scrollbar metrics (total_filtered,
+    /// visible_rows, max_scroll) from the last `build_panel_vertices` call.
+    /// Read by `active_panel_scrollbar_layout` in mouse handlers to avoid
+    /// re-running `panel_filtered_count` (O(n) over all blocks) on every
+    /// mouse move. None when the panel is closed or before the first draw
+    /// that paints it.
+    pub(crate) cached_panel_scroll_metrics: Cell<Option<(usize, usize, usize)>>,
     /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
     /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
     /// the previous frame. Eliminates per-frame iteration of all
