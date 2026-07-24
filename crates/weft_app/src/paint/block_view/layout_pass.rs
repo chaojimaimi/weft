@@ -323,4 +323,116 @@ mod tests {
         assert!(out.row_data.is_empty());
         assert_eq!(out.expanded_block_count, 0);
     }
+
+    /// Batch 6 Step 3 (R2-2): criterion micro-benchmark for
+    /// `compute_block_layout_pass`.
+    ///
+    /// Run with:
+    /// ```sh
+    /// cargo test --release -p weft_app --bin weft \
+    ///   bench_layout_pass -- --nocapture --ignored --test-threads=1
+    /// ```
+    ///
+    /// Measures two scenarios at 1k/5k/10k/50k blocks:
+    /// - `all_visible`: clip bounds = ±∞ (every block expanded)
+    /// - `culling_heavy`: 800px viewport, scroll=0 (only ~2 blocks visible)
+    ///
+    /// The ratio proves whether visibility culling is effective, and the
+    /// absolute numbers drive the prefix-sum decision (BATCH4/5 deferred
+    /// pending real data).
+    #[test]
+    #[ignore = "criterion micro-benchmark; run with --release --ignored --nocapture"]
+    fn bench_layout_pass() {
+        use criterion::{black_box, Criterion};
+        use std::sync::Arc;
+        use std::time::SystemTime;
+        use weft_core::blocks::{Block, BlockId};
+
+        fn make_blocks(count: usize) -> Vec<Block> {
+            let line = "x".repeat(80);
+            let output: Arc<str> = Arc::from(
+                (0..20u32)
+                    .map(|i| format!("{i:03}: {line}\n"))
+                    .collect::<String>()
+                    .as_str(),
+            );
+            (0..count)
+                .map(|i| Block {
+                    id: BlockId(i as u64),
+                    command: format!("echo test_{i}"),
+                    cwd: Some("/home/user".into()),
+                    output: Arc::clone(&output),
+                    styled_output: None,
+                    exit_code: Some(0),
+                    started_at: SystemTime::now(),
+                    finished_at: Some(SystemTime::now()),
+                    collapsed: false,
+                })
+                .collect()
+        }
+
+        let mut criterion = Criterion::default().sample_size(10);
+        let mut group = criterion.benchmark_group("layout_pass");
+
+        for &count in &[1_000usize, 5_000, 10_000, 50_000] {
+            let blocks = make_blocks(count);
+            let mut cache = BlockLayoutCache::default();
+            for b in &blocks {
+                cache.ensure_cached(b, 80);
+            }
+
+            // Scenario 1: all blocks visible (clip bounds = ±∞)
+            group.bench_function(format!("all_visible/{count}"), |b| {
+                b.iter(|| {
+                    let input = LayoutPassInput {
+                        blocks: &blocks,
+                        live: None,
+                        cwd: None,
+                        git_branch: None,
+                        block_scroll: 0,
+                        viewport_rows: 40,
+                        cols: 80,
+                        pitch: 20.0,
+                        header_height: 24.0,
+                        content_bottom_y: 800.0,
+                        clip_top: -1e9,
+                        clip_bottom: 1e9,
+                        resolve_styles: true,
+                        styled_lookup_counter: None,
+                    };
+                    let out = compute_block_layout_pass(input, &cache);
+                    black_box(out.expanded_block_count);
+                });
+            });
+
+            // Scenario 2: heavy culling — 800px viewport, scroll=0.
+            // Only the bottom ~2 blocks are visible; the rest accumulate
+            // cursor_dist without expanding internal lines.
+            group.bench_function(format!("culling_heavy/{count}"), |b| {
+                b.iter(|| {
+                    let input = LayoutPassInput {
+                        blocks: &blocks,
+                        live: None,
+                        cwd: None,
+                        git_branch: None,
+                        block_scroll: 0,
+                        viewport_rows: 40,
+                        cols: 80,
+                        pitch: 20.0,
+                        header_height: 24.0,
+                        content_bottom_y: 800.0,
+                        clip_top: 0.0,
+                        clip_bottom: 800.0,
+                        resolve_styles: true,
+                        styled_lookup_counter: None,
+                    };
+                    let out = compute_block_layout_pass(input, &cache);
+                    black_box(out.expanded_block_count);
+                });
+            });
+        }
+
+        group.finish();
+        criterion.final_summary();
+    }
 }

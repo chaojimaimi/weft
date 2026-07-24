@@ -60,3 +60,5 @@ regex = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Benchmarking (Batch 6 Step 3)
+criterion = { version = "0.5", default-features = false }
