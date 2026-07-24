@@ -543,6 +543,9 @@ impl Terminal {
             exit_code,
             last_activity: Instant::now(),
         });
+        // No block_id here: the deferred command's BlockId is not allocated
+        // until `settle_primary_screen_exit` → `finish_deferred_screen_command`
+        // runs. Logging the previous block's id would mislead log analysis.
         tracing::info!(
             ?exit_code,
             settle_delay_ms = PRIMARY_SCREEN_EXIT_SETTLE_DELAY.as_millis(),
@@ -595,8 +598,15 @@ impl Terminal {
         // SGR mouse coordinates such as `48;62;25M`.
         self.capabilities.mouse_protocol = crate::input::MouseProtocol::Off;
         self.capabilities.sgr_mouse = false;
+        let block_id = self
+            .block_tracker
+            .blocks()
+            .last()
+            .map(|b| b.id.0)
+            .unwrap_or(0);
         tracing::info!(
-            exit_code = ?pending.exit_code,
+            ?pending.exit_code,
+            block_id,
             "settled primary-screen command finalization"
         );
         true

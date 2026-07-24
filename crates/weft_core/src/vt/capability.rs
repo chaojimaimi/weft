@@ -167,11 +167,10 @@ impl CapabilityFlags {
     /// truth.
     //
     // The three readers below (`screen_owner`, `settle_state`,
-    // `history_snapshot_due`) are consumed by the diagnostic tracing layer in
-    // the follow-up commit (R1 task 2 — `session_id`/`screen_owner`/
-    // `settle_state` trace fields). Kept here as the single derivation point so
-    // commit 2 only wires call sites, never re-derives.
-    #[allow(dead_code)]
+    // `history_snapshot_due`) are consumed by the diagnostic tracing layer
+    // (R1 task 2 — `session_id`/`screen_owner`/`settle_state` trace fields).
+    // `screen_owner` and `settle_state` are wired via `Terminal` accessors;
+    // `history_snapshot_due` is a derivation helper kept for the trace layer.
     pub(in crate::vt) fn screen_owner(&self, phase: ShellPhase) -> ScreenOwner {
         if self.alt_active {
             return ScreenOwner::AltScreenApp;
@@ -187,7 +186,6 @@ impl CapabilityFlags {
     }
 
     /// Snapshot the deferred-exit lifecycle phase at `now`.
-    #[allow(dead_code)]
     pub(in crate::vt) fn settle_state(&self, now: Instant) -> SettleState {
         match &self.primary_screen_exit {
             None => SettleState::Idle,

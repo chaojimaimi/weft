@@ -201,6 +201,18 @@ impl Terminal {
         })
     }
 
+    /// Coarse classification of who owns the viewport right now — a diagnostic
+    /// snapshot suitable for tracing. See `capability::ScreenOwner`.
+    pub fn screen_owner(&self) -> capability::ScreenOwner {
+        self.capabilities.screen_owner(self.block_tracker.phase())
+    }
+
+    /// Lifecycle phase of a deferred primary-screen exit — a diagnostic
+    /// snapshot suitable for tracing. See `capability::SettleState`.
+    pub fn settle_state(&self) -> capability::SettleState {
+        self.capabilities.settle_state(std::time::Instant::now())
+    }
+
     /// Swap the primary and alternate screen buffers (DEC 1049/47).
     ///
     /// `save_cursor_and_clear` distinguishes the two modes:

@@ -337,21 +337,59 @@ impl App {
             match effect {
                 Effect::WritePty { tab, bytes } => {
                     if let Some(session) = self.sessions.tab_mut(tab) {
+                        let session_id = session.session_id;
+                        let input_seq = session.input_seq();
+                        let (screen_owner, settle_state) = session
+                            .terminal
+                            .as_ref()
+                            .map(|t| (t.screen_owner(), t.settle_state()))
+                            .unwrap_or((
+                                weft_core::vt::ScreenOwner::Shell,
+                                weft_core::vt::SettleState::Idle,
+                            ));
+                        tracing::debug!(
+                            session_id,
+                            input_seq,
+                            tab,
+                            bytes_len = bytes.len(),
+                            %screen_owner,
+                            %settle_state,
+                            delivery = "pty-write",
+                            "effect dispatched",
+                        );
                         if let Err(error) = session.write_user_input(&bytes) {
                             warn!(%error, tab, "failed to apply PTY write effect");
                         }
                     }
                 }
                 Effect::InterruptPty { tab } => {
-                    let delivered = self
-                        .sessions
-                        .tab_mut(tab)
-                        .is_some_and(crate::tab::Tab::interrupt_pty);
-                    if !delivered {
-                        warn!(
+                    if let Some(session) = self.sessions.tab_mut(tab) {
+                        let session_id = session.session_id;
+                        let input_seq = session.input_seq();
+                        let (screen_owner, settle_state) = session
+                            .terminal
+                            .as_ref()
+                            .map(|t| (t.screen_owner(), t.settle_state()))
+                            .unwrap_or((
+                                weft_core::vt::ScreenOwner::Shell,
+                                weft_core::vt::SettleState::Idle,
+                            ));
+                        tracing::debug!(
+                            session_id,
+                            input_seq,
                             tab,
-                            "interrupt delivery failed; preserving PTY output and phase"
+                            %screen_owner,
+                            %settle_state,
+                            delivery = "pty-etx",
+                            "interrupt effect dispatched",
                         );
+                        let delivered = session.interrupt_pty();
+                        if !delivered {
+                            warn!(
+                                tab,
+                                "interrupt delivery failed; preserving PTY output and phase"
+                            );
+                        }
                     }
                 }
                 Effect::ResizePty { tab, rows, cols } => {
@@ -599,7 +637,10 @@ impl App {
         let bytes = ime::encode_passthrough_key(&self.tab().input_handler, key, m, text);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we
         // send for each key, including whether DECCKM/app-cursor mode is on.
+        let input_seq = self.tab_mut().next_input_seq();
         tracing::debug!(
+            session_id = self.tab().session_id,
+            input_seq,
             ?key,
             ?m,
             app_cursor_keys = self.tab().input_handler.app_cursor_keys,

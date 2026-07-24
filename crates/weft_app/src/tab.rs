@@ -24,6 +24,12 @@ use primary_history::PrimaryHistoryRefresh;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Monotonic per-process input-event sequence counter. Reset to 1 at launch;
+/// the per-tab copy (`Tab.input_seq`) mirrors the value so trace records can
+/// correlate a normalized input event with its Effect dispatch without
+/// threading a counter through the Effect enum.
+static NEXT_INPUT_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy)]
 struct PendingTuiScroll {
     rows: i32,
@@ -41,6 +47,14 @@ pub enum TuiScrollResolution {
 /// A single shell session (one PTY + one Terminal + per-session UI state).
 pub struct Tab {
     pub session_id: u64,
+    /// Per-tab monotonic input-event sequence. Bumped by `next_input_seq`
+    /// at the keyboard-encode chokepoint (the dominant input source). Read
+    /// from `drain_effects`/dispatch traces so a single log line answers
+    /// "which physical key press produced this Effect". IME commit, mouse
+    /// gestures, and paste are not yet wired — their trace lines retain the
+    /// last keyboard sequence, which is acceptable for the current
+    /// Claude/Ctrl-C-focused diagnostic scope.
+    input_seq: u64,
     pub terminal: Option<Terminal>,
     pub pty: Option<Pty>,
     pub msg_rx: Receiver<AppMsg>,
@@ -117,6 +131,7 @@ impl Tab {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: Some(terminal),
             pty: Some(pty),
             msg_rx,
@@ -141,6 +156,7 @@ impl Tab {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: None,
             pty: None,
             msg_rx,
@@ -158,6 +174,27 @@ impl Tab {
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
         }
+    }
+
+    /// Bump and return the next per-tab input-event sequence number.
+    ///
+    /// Currently called at the keyboard-encode chokepoint only. IME commit,
+    /// mouse gestures, and paste are not yet wired — extending coverage to
+    /// those sources is a follow-up if cross-source trace correlation is
+    /// needed. The counter is per-process monotonic (the static allocator
+    /// never resets), so two tabs never share a sequence number — useful for
+    /// cross-tab log correlation during free testing.
+    pub(crate) fn next_input_seq(&mut self) -> u64 {
+        let next = NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed);
+        self.input_seq = next;
+        next
+    }
+
+    /// Current input-event sequence (last value returned by `next_input_seq`).
+    /// Read from trace points that observe an Effect but did not themselves
+    /// bump the counter (e.g. `drain_effects`).
+    pub(crate) fn input_seq(&self) -> u64 {
+        self.input_seq
     }
 
     /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
@@ -675,6 +712,7 @@ mod tests {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Tab {
             session_id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+            input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: Some(Terminal::with_scrollback(24, 80, scrollback_lines)),
             pty: None,
             msg_rx,
