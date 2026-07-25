@@ -286,6 +286,13 @@ impl MetalRenderer {
         // common case — no change from pre-v1.3 behavior).
         active_pane_rect: crate::layout::Rect,
         background_panes: &[PaneRenderInfo<'_>],
+        // v1.3.1 Batch 7: full pane-layout snapshot (one `(PaneId, Rect)` per
+        // pane, from `SplitTree::layout(content_rect)`). Used to derive pane
+        // divider edges + the active-pane focus ring. Single-pane tabs pass a
+        // one-element vec; the divider path is a no-op when only one pane
+        // exists.
+        pane_layouts: &[(weft_core::pane_layout::PaneId, crate::layout::Rect)],
+        active_pane_id: weft_core::pane_layout::PaneId,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -463,7 +470,7 @@ impl MetalRenderer {
         // longer force grid view when background panes exist — the active pane
         // can show block view in a split.
         let show_blocks = terminal.show_block_view();
-        tracing::info!(
+        tracing::debug!(
             show_blocks_terminal = terminal.show_block_view(),
             background_panes_empty = background_panes.is_empty(),
             show_blocks,
@@ -533,7 +540,7 @@ impl MetalRenderer {
                 let bg_instance_count = bg_instances.len() / 16;
                 instances.extend_from_slice(&bg_instances);
                 let end = instances.len();
-                tracing::info!(
+                tracing::debug!(
                     bg_rect = ?bg.rect,
                     bg_instance_count,
                     grid_rows = bg.terminal.grid().num_rows,
@@ -684,7 +691,7 @@ impl MetalRenderer {
             let active_start = instances.len();
             instances.extend_from_slice(&grid_instances);
             let active_end = instances.len();
-            tracing::info!(
+            tracing::debug!(
                 active_rect = ?active_pane_rect,
                 active_instance_count = (active_end - active_start) / 16,
                 grid_rows = grid.num_rows,
@@ -845,6 +852,25 @@ impl MetalRenderer {
                 );
             }
         }
+
+        // v1.3.1 Batch 7: pane dividers + active-pane focus ring, drawn last
+        // so they stay visible atop the panes. No-op in single-pane tabs.
+        // content_rect x0 includes chrome_left so horizontal dividers don't
+        // over-extend across the sidebar push region.
+        crate::paint::pane_dividers::push_pane_overlays(
+            &mut vertices,
+            pane_layouts,
+            active_pane_id,
+            [
+                self.padding_x + chrome_left,
+                self.padding_y,
+                self.viewport.0 - self.padding_x,
+                self.viewport.1 - self.padding_y,
+            ],
+            color_to_normalized(self.theme.separator),
+            color_to_normalized(self.theme.accent),
+            self.increase_contrast,
+        );
 
         // R3 task 6: BUILD-VERTICES segment ends; ENCODE segment starts.
         // Counters: vertex_count covers overlay/block-view verts (12 floats

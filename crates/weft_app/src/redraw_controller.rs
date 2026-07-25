@@ -188,55 +188,58 @@ impl App {
         // call; background panes' terminals are only read (never mutated)
         // during draw; the only mutation is the active pane's
         // selection_handler.
-        let (active_pane_rect, bg_terminal_ptrs): (
-            crate::layout::Rect,
-            Vec<(crate::layout::Rect, *const Terminal)>,
-        ) = match self.renderer.as_ref() {
-            Some(renderer_ref) => {
-                let chrome_top = renderer_ref
-                    .tab_bar_height()
-                    .max(renderer_ref.titlebar_height());
-                let panel_open = self.panel.open;
-                let sidebar_placement = crate::ui_tokens::sidebar_placement(
-                    panel_open,
-                    renderer_ref.sidebar_width(),
-                    renderer_ref.sidebar_push_width(),
-                );
-                let chrome_left = sidebar_placement.terminal_push_width;
-                let content_rect: crate::layout::Rect = [
-                    renderer_ref.padding_x + chrome_left,
-                    renderer_ref.padding_y + chrome_top,
-                    renderer_ref.viewport.0 - renderer_ref.padding_x,
-                    renderer_ref.viewport.1 - renderer_ref.padding_y,
-                ];
-                let pane_layouts = tab.split_tree().layout(content_rect);
-                let active_id = tab.active_pane_id();
-                let active_rect = pane_layouts
-                    .iter()
-                    .find(|(id, _)| *id == active_id)
-                    .map(|(_, rect)| *rect)
-                    .unwrap_or(content_rect);
-                let ptrs: Vec<(crate::layout::Rect, *const Terminal)> = pane_layouts
-                    .iter()
-                    .filter(|(id, _)| *id != active_id)
-                    .filter_map(|(id, rect)| {
-                        let pane = tab.pane(*id)?;
-                        let terminal = pane.terminal.as_ref()?;
-                        Some((*rect, terminal as *const Terminal))
-                    })
-                    .collect();
-                tracing::info!(
-                    content_rect = ?content_rect,
-                    active_id = ?active_id,
-                    active_rect = ?active_rect,
-                    pane_layouts = ?pane_layouts,
-                    bg_count = ptrs.len(),
-                    "draw pane layouts"
-                );
-                (active_rect, ptrs)
-            }
-            None => ([0.0, 0.0, 0.0, 0.0], Vec::new()),
-        };
+        let (active_pane_rect, bg_terminal_ptrs, pane_layouts_snapshot, active_pane_id) =
+            match self.renderer.as_ref() {
+                Some(renderer_ref) => {
+                    let chrome_top = renderer_ref
+                        .tab_bar_height()
+                        .max(renderer_ref.titlebar_height());
+                    let panel_open = self.panel.open;
+                    let sidebar_placement = crate::ui_tokens::sidebar_placement(
+                        panel_open,
+                        renderer_ref.sidebar_width(),
+                        renderer_ref.sidebar_push_width(),
+                    );
+                    let chrome_left = sidebar_placement.terminal_push_width;
+                    let content_rect: crate::layout::Rect = [
+                        renderer_ref.padding_x + chrome_left,
+                        renderer_ref.padding_y + chrome_top,
+                        renderer_ref.viewport.0 - renderer_ref.padding_x,
+                        renderer_ref.viewport.1 - renderer_ref.padding_y,
+                    ];
+                    let pane_layouts = tab.split_tree().layout(content_rect);
+                    let active_id = tab.active_pane_id();
+                    let active_rect = pane_layouts
+                        .iter()
+                        .find(|(id, _)| *id == active_id)
+                        .map(|(_, rect)| *rect)
+                        .unwrap_or(content_rect);
+                    let ptrs: Vec<(crate::layout::Rect, *const Terminal)> = pane_layouts
+                        .iter()
+                        .filter(|(id, _)| *id != active_id)
+                        .filter_map(|(id, rect)| {
+                            let pane = tab.pane(*id)?;
+                            let terminal = pane.terminal.as_ref()?;
+                            Some((*rect, terminal as *const Terminal))
+                        })
+                        .collect();
+                    tracing::debug!(
+                        content_rect = ?content_rect,
+                        active_id = ?active_id,
+                        active_rect = ?active_rect,
+                        pane_layouts = ?pane_layouts,
+                        bg_count = ptrs.len(),
+                        "draw pane layouts"
+                    );
+                    (active_rect, ptrs, pane_layouts, active_id)
+                }
+                None => (
+                    [0.0, 0.0, 0.0, 0.0],
+                    Vec::new(),
+                    Vec::new(),
+                    weft_core::pane_layout::PaneId(0),
+                ),
+            };
         // Build PaneRenderInfo from raw pointers. The references are valid
         // for the entire draw scope (tab outlives draw; background terminals
         // are immutable during draw).
@@ -555,6 +558,10 @@ impl App {
                 // (the common case — no change from pre-v1.3 behavior).
                 active_pane_rect,
                 &background_panes,
+                // v1.3.1 Batch 7: pane layouts + active pane id for divider
+                // and focus-ring rendering in `draw()`.
+                &pane_layouts_snapshot,
+                active_pane_id,
             );
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.

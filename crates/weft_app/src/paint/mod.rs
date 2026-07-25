@@ -18,6 +18,7 @@ pub(crate) mod metal_backend;
 mod offscreen_snapshots;
 pub(crate) mod overlays;
 pub(crate) mod palette;
+pub(crate) mod pane_dividers;
 pub(crate) mod panel;
 pub(crate) mod primitives;
 pub(crate) mod prompt;
