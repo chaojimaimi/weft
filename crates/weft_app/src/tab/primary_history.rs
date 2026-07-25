@@ -73,7 +73,6 @@ mod tests {
     use super::*;
     use crate::pane::Pane;
     use crate::AppMsg;
-    use weft_core::vt::Terminal;
 
     fn primary_tui_tab() -> Tab {
         // v1.3: build a pane with a live Terminal (no PTY), wrap in a single-pane

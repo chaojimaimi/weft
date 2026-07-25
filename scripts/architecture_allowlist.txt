@@ -1,13 +1,14 @@
 # Centralized production-file budgets for files that currently exceed 800 lines.
 # Format: path|max_lines|reason
 #
-# The ceiling is the audited 2026-07-14 size. A listed file may shrink, but it
-# may not grow beyond its ceiling. New exceptions require an explicit review of
-# this file instead of a self-authorizing comment in the Rust source.
+# The ceiling is the audited size. A listed file may shrink, but it may not
+# grow beyond its ceiling. New exceptions require an explicit review of this
+# file instead of a self-authorizing comment in the Rust source.
+crates/weft_app/src/app_runtime.rs|810|v1.3 Batch 5 added per-pane resize/PTY-routing glue alongside the existing event-loop entry; a focused split (probe + effect dispatch into app/) is a follow-up.
+crates/weft_app/src/renderer.rs|900|v1.3 multi-pane draw() orchestration; draw() holds an immutable self.layer borrow for the whole frame, blocking &mut self extraction. A real draw() split (overlay tail + background-pane block into paint/ helpers) is a follow-up.
 crates/weft_core/src/blocks.rs|829|Block tracker state machine and persistence-facing model remain one domain
-crates/weft_core/src/config/mod.rs|1567|Config facade still contains the legacy compatibility and integration test suite
 crates/weft_core/src/config/theme.rs|853|Built-in theme constructors are intentionally data-heavy
 crates/weft_core/src/editor.rs|1107|Editor state machine and behavior tests remain one domain
 crates/weft_core/src/find.rs|977|Grid and block search algorithms plus tests remain one domain
 crates/weft_core/src/grid/mod.rs|1228|Core Grid implementation remains cohesive after cell, row, cursor, and scrollback extraction
-crates/weft_core/src/vt/mod.rs|835|Terminal state and parser facade remain cohesive after Perform and OSC extraction
+crates/weft_core/src/vt/mod.rs|840|Terminal state and parser facade remain cohesive after Perform and OSC extraction (v1.3 +3 for process-pass tracing)

@@ -43,7 +43,10 @@ pub use prompt::{
 };
 
 // Re-export the byte/history caps so the Settings UI / palette can hint at
-// the limits without depending on `prompt` directly.
+// the limits without depending on `prompt` directly. v1.6 consumers will
+// reach these via `ai::MAX_*`; today nothing imports them (module is
+// scaffolding-only), hence the allow.
+#[allow(unused_imports)]
 pub use prompt::{MAX_HISTORY_ENTRIES, MAX_OUTPUT_BYTES};
 
 /// A pending or completed AI request. The `id` lets the caller correlate
@@ -110,7 +113,7 @@ impl AiState {
     /// the caller checks `is_configured()` to decide whether to show AI UI).
     pub fn new(config: AiConfig) -> Self {
         let backend = match build_backend(&config) {
-            Ok(b) => b.map(|b| Arc::<dyn AiBackend>::from(b)),
+            Ok(b) => b.map(Arc::<dyn AiBackend>::from),
             Err(e) => {
                 warn!(error = %e, "AI backend construction failed; AI features disabled");
                 None

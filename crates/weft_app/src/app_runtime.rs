@@ -29,10 +29,11 @@ pub(crate) fn install_runtime_diagnostics() {
     setup_panic_hook(std::panic::take_hook());
 }
 
-fn setup_panic_hook(
-    default_hook: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Send + Sync + 'static>,
-) {
-    #[allow(deprecated)]
+// `PanicInfo` was renamed to `PanicHookInfo` in Rust 1.81, but our MSRV is
+// 1.75 (`rust-version` in Cargo.toml). Stay on the old name until the MSRV
+// bump and silence the deprecation at the use sites below.
+#[allow(deprecated)]
+fn setup_panic_hook(default_hook: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Send + Sync + 'static>) {
     std::panic::set_hook(Box::new(move |info: &std::panic::PanicInfo<'_>| {
         let path = panic_log_path(std::env::var_os("HOME").as_deref());
         if let Some(parent) = path.parent() {

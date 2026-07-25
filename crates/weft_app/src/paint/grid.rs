@@ -488,7 +488,8 @@ impl MetalRenderer {
         for row in 0..num_rows {
             for col in 0..num_cols {
                 let c = grid.cell(row, col);
-                if c.character != ' ' && c.character != '\0'
+                if c.character != ' '
+                    && c.character != '\0'
                     && !c.flags.contains(CellFlags::WIDE_SPACER)
                 {
                     non_empty_cells += 1;

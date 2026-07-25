@@ -199,6 +199,7 @@ point that out without echoing the secret.";
 /// Strip a leading `$` / `>` prompt and surrounding markdown fences from an
 /// AI-generated command. Models occasionally wrap their output in ```sh … ```
 /// fences despite being told not to; we want to recover a runnable command.
+#[allow(clippy::manual_strip)]
 pub fn clean_command_output(raw: &str) -> String {
     let trimmed = raw.trim();
     // Strip a single pair of ```lang … ``` fences if present.
