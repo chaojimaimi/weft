@@ -321,6 +321,22 @@ pub struct SidebarDragState {
     pub start_width: f32,
 }
 
+/// v1.3.2: Pane divider resize drag state. Stashed at drag start so each
+/// mouse-move can compute the new ratio from the pointer position and the
+/// split's bounds (stored here) without re-deriving which divider was grabbed.
+#[derive(Clone, Copy)]
+pub struct PaneDividerDragState {
+    /// The divider axis (Vertical → left/right panes; Horizontal → top/bottom).
+    pub axis: crate::paint::pane_dividers::DividerAxis,
+    /// The first child (top/left) of the split being resized.
+    pub first: weft_core::pane_layout::PaneId,
+    /// The second child (bottom/right) of the split being resized.
+    pub second: weft_core::pane_layout::PaneId,
+    /// The union rect of the two panes the divider separates. Used to compute
+    /// `new_ratio = (pointer - bounds[0]) / (bounds[2] - bounds[0])`.
+    pub bounds: crate::layout::Rect,
+}
+
 #[derive(Clone)]
 pub struct DragState {
     pub target: DragTarget,
@@ -365,6 +381,9 @@ pub struct InteractionState {
     /// F3-3: Active sidebar resize drag. Set on press at the sidebar's right
     /// edge; cleared on release (which persists the width to config).
     pub sidebar_drag: Option<SidebarDragState>,
+    /// v1.3.2: Active pane divider resize drag. Set on press at a pane
+    /// divider; cleared on release. Not persisted (ratio is in-memory only).
+    pub pane_divider_drag: Option<PaneDividerDragState>,
     /// F4: FocusId of the element that had keyboard focus before a modal
     /// surface (Palette/Find/Settings/ContextMenu) opened. Used to restore
     /// focus (visually / for accessibility) when the modal closes. `None`
@@ -397,6 +416,7 @@ impl InteractionState {
             context_menu: None,
             block_hovered: None,
             sidebar_drag: None,
+            pane_divider_drag: None,
             prev_focus: None,
             focus_stack: Vec::new(),
         }

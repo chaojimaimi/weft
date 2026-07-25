@@ -139,6 +139,25 @@ impl App {
             .pane_hit_test(x as f32, y as f32, content_rect)
     }
 
+    /// v1.3.2: Hit-test for a draggable pane divider at the given pointer
+    /// position. Returns the divider info (axis, coord, pane pair, bounds)
+    /// if the pointer is within 4px of a divider, or `None`.
+    pub(super) fn pane_divider_hit_test(
+        &self,
+        x: f32,
+        y: f32,
+    ) -> Option<crate::paint::pane_dividers::DraggableDivider> {
+        let layout = self.terminal_layout()?;
+        let content_rect: weft_core::pane_layout::Rect = [
+            layout.content.left as f32,
+            layout.content.top as f32,
+            layout.content.right as f32,
+            layout.content.bottom as f32,
+        ];
+        let pane_layouts = self.sessions.active().split_tree().layout(content_rect);
+        crate::paint::pane_dividers::pane_divider_at(&pane_layouts, x, y, 4.0)
+    }
+
     /// Recompute grid rows/cols from the current window + cell dimensions and
     /// resize the terminal / queue a PTY SIGWINCH. Used after a font or padding
     /// change (cell size or usable area changes) and on window resize.

@@ -190,6 +190,119 @@ pub(crate) fn push_pane_overlays(
     }
 }
 
+// ── v1.3.2: drag-to-resize hit-testing ─────────────────────────────────
+
+/// One draggable pane divider: the axis, its coordinate, and the two panes
+/// whose shared edge this is. `first` is the top/left pane, `second` the
+/// bottom/right — matching `SplitTree`'s first/second convention so the
+/// caller can compute the new ratio directly.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DraggableDivider {
+    pub axis: DividerAxis,
+    /// The divider's coordinate (x for Vertical, y for Horizontal). Read by
+    /// tests; production code computes the ratio from `bounds` + pointer.
+    #[allow(dead_code)]
+    pub coord: f32,
+    pub first: PaneId,
+    /// The bottom/right pane. Paired with `first` to uniquely identify the
+    /// split via `set_ratio_for_pair`.
+    pub second: PaneId,
+    /// The union rect the split divides — used to compute the new ratio:
+    /// `new_ratio = (pointer - bounds[0]) / (bounds[2] - bounds[0])` for
+    /// vertical dividers, or the y analog for horizontal.
+    pub bounds: Rect,
+}
+
+/// Hit-test a pointer against all draggable dividers derived from
+/// `pane_layouts`. Returns the nearest divider within `tolerance` pixels, or
+/// `None`. `tolerance` is in physical pixels (use 4.0 to match the sidebar
+/// resize handle).
+///
+/// Unlike `pane_divider_edges` (which dedupes edges for painting), this
+/// function tracks which pane pair each divider belongs to — needed to call
+/// `SplitTree::set_ratio`.
+pub(crate) fn pane_divider_at(
+    pane_layouts: &[(PaneId, Rect)],
+    x: f32,
+    y: f32,
+    tolerance: f32,
+) -> Option<DraggableDivider> {
+    let mut best: Option<(f32, DraggableDivider)> = None;
+    for (i, (id_a, rect_a)) in pane_layouts.iter().enumerate() {
+        let [ax0, ay0, ax1, ay1] = *rect_a;
+        for (id_b, rect_b) in pane_layouts.iter().skip(i + 1) {
+            let [bx0, by0, bx1, by1] = *rect_b;
+            let y_overlap = ay0 < by1 && by0 < ay1;
+            let x_overlap = ax0 < bx1 && bx0 < ax1;
+            // Vertical divider (left/right panes): a.x1 == b.x0 or b.x1 == a.x0
+            if y_overlap {
+                let (coord, left_id, left_rect, right_id, right_rect) = if (ax1 - bx0).abs() < 0.5 {
+                    (ax1, *id_a, *rect_a, *id_b, *rect_b)
+                } else if (bx1 - ax0).abs() < 0.5 {
+                    (bx1, *id_b, *rect_b, *id_a, *rect_a)
+                } else {
+                    continue;
+                };
+                let dist = (x - coord).abs();
+                if dist <= tolerance {
+                    let bounds = [
+                        left_rect[0].min(right_rect[0]),
+                        left_rect[1].min(right_rect[1]),
+                        left_rect[2].max(right_rect[2]),
+                        left_rect[3].max(right_rect[3]),
+                    ];
+                    let candidate = (
+                        dist,
+                        DraggableDivider {
+                            axis: DividerAxis::Vertical,
+                            coord,
+                            first: left_id,
+                            second: right_id,
+                            bounds,
+                        },
+                    );
+                    if best.as_ref().map_or(true, |(bd, _)| dist < *bd) {
+                        best = Some(candidate);
+                    }
+                }
+            }
+            // Horizontal divider (top/bottom panes): a.y1 == b.y0 or b.y1 == a.y0
+            if x_overlap {
+                let (coord, top_id, top_rect, bot_id, bot_rect) = if (ay1 - by0).abs() < 0.5 {
+                    (ay1, *id_a, *rect_a, *id_b, *rect_b)
+                } else if (by1 - ay0).abs() < 0.5 {
+                    (by1, *id_b, *rect_b, *id_a, *rect_a)
+                } else {
+                    continue;
+                };
+                let dist = (y - coord).abs();
+                if dist <= tolerance {
+                    let bounds = [
+                        top_rect[0].min(bot_rect[0]),
+                        top_rect[1].min(bot_rect[1]),
+                        top_rect[2].max(bot_rect[2]),
+                        top_rect[3].max(bot_rect[3]),
+                    ];
+                    let candidate = (
+                        dist,
+                        DraggableDivider {
+                            axis: DividerAxis::Horizontal,
+                            coord,
+                            first: top_id,
+                            second: bot_id,
+                            bounds,
+                        },
+                    );
+                    if best.as_ref().map_or(true, |(bd, _)| dist < *bd) {
+                        best = Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +395,65 @@ mod tests {
         );
         // build_focus_ring pushes 4 quads (top/bottom/left/right) = 4 × 72 floats.
         assert_eq!(verts.len(), 4 * 72);
+    }
+
+    // ── v1.3.2: pane_divider_at hit-testing ──────────────────────────────
+
+    #[test]
+    fn pane_divider_at_hits_vertical_divider_within_tolerance() {
+        let layouts = vec![
+            (PaneId(1), rect(0.0, 0.0, 400.0, 600.0)),
+            (PaneId(2), rect(400.0, 0.0, 800.0, 600.0)),
+        ];
+        let hit = pane_divider_at(&layouts, 402.0, 300.0, 4.0);
+        assert!(hit.is_some(), "should hit within 4px tolerance");
+        let d = hit.unwrap();
+        assert_eq!(d.axis, DividerAxis::Vertical);
+        assert!((d.coord - 400.0).abs() < 0.01);
+        assert_eq!(d.first, PaneId(1)); // left
+        assert_eq!(d.second, PaneId(2)); // right
+        assert_eq!(d.bounds, rect(0.0, 0.0, 800.0, 600.0));
+    }
+
+    #[test]
+    fn pane_divider_at_misses_outside_tolerance() {
+        let layouts = vec![
+            (PaneId(1), rect(0.0, 0.0, 400.0, 600.0)),
+            (PaneId(2), rect(400.0, 0.0, 800.0, 600.0)),
+        ];
+        // 10px away from the divider at x=400, tolerance=4 → miss.
+        assert!(pane_divider_at(&layouts, 410.0, 300.0, 4.0).is_none());
+    }
+
+    #[test]
+    fn pane_divider_at_hits_horizontal_divider() {
+        let layouts = vec![
+            (PaneId(1), rect(0.0, 0.0, 800.0, 300.0)),
+            (PaneId(2), rect(0.0, 300.0, 800.0, 600.0)),
+        ];
+        let d = pane_divider_at(&layouts, 400.0, 299.0, 4.0).unwrap();
+        assert_eq!(d.axis, DividerAxis::Horizontal);
+        assert!((d.coord - 300.0).abs() < 0.01);
+        assert_eq!(d.first, PaneId(1)); // top
+        assert_eq!(d.second, PaneId(2)); // bottom
+    }
+
+    #[test]
+    fn pane_divider_at_picks_nearest_when_two_dividers_near() {
+        // Two vertical dividers: one at x=400 (dist 2), one at x=410 (dist 8).
+        // tolerance=4 → only the x=400 one is in range, and it wins.
+        let layouts = vec![
+            (PaneId(1), rect(0.0, 0.0, 400.0, 600.0)),
+            (PaneId(2), rect(400.0, 0.0, 410.0, 600.0)),
+            (PaneId(3), rect(410.0, 0.0, 800.0, 600.0)),
+        ];
+        let d = pane_divider_at(&layouts, 402.0, 300.0, 4.0).unwrap();
+        assert!((d.coord - 400.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn pane_divider_at_none_for_single_pane() {
+        let layouts = vec![(PaneId(1), rect(0.0, 0.0, 800.0, 600.0))];
+        assert!(pane_divider_at(&layouts, 400.0, 300.0, 4.0).is_none());
     }
 }

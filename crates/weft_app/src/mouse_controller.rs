@@ -40,6 +40,29 @@ impl App {
             self.request_redraw();
             return;
         }
+        // v1.3.2: pane divider resize drag end — clear state, restore cursor.
+        // No persistence (ratio is in-memory only, per V13 non-goal).
+        if button == winit::event::MouseButton::Left
+            && self.interaction.pane_divider_drag.take().is_some()
+        {
+            let icon = if let Some(d) = self.pane_divider_hit_test(_x as f32, _y as f32) {
+                match d.axis {
+                    crate::paint::pane_dividers::DividerAxis::Vertical => {
+                        winit::window::CursorIcon::EwResize
+                    }
+                    crate::paint::pane_dividers::DividerAxis::Horizontal => {
+                        winit::window::CursorIcon::NsResize
+                    }
+                }
+            } else {
+                winit::window::CursorIcon::Default
+            };
+            if let Some(window) = &self.window {
+                window.set_cursor(icon);
+            }
+            self.request_redraw();
+            return;
+        }
         if button == winit::event::MouseButton::Left && self.finish_panel_scrollbar_drag() {
             return;
         }
@@ -119,6 +142,12 @@ impl App {
         if self.update_sidebar_drag(x) {
             return;
         }
+        // v1.3.2: pane divider resize drag — update the split ratio from the
+        // pointer position. PTY resize is throttled by the existing mechanism
+        // in recompute_layout (30ms active / 100ms background).
+        if self.update_pane_divider_drag(x as f32, y as f32) {
+            return;
+        }
         if self.update_panel_scrollbar_drag(y as f32) {
             return;
         }
@@ -189,8 +218,19 @@ impl App {
         // even when the pointer came from inside the terminal content or a
         // TUI app has mouse reporting on (the sidebar is app chrome, not PTY).
         let sidebar_resize_hovered = self.sidebar_resize_hit(x as f32, y as f32, 4.0);
+        // v1.3.2: pane divider hover — show resize cursor when hovering a divider.
+        let pane_divider_hovered = self.pane_divider_hit_test(x as f32, y as f32);
         if let Some(window) = &self.window {
-            let icon = if sidebar_resize_hovered {
+            let icon = if let Some(d) = pane_divider_hovered {
+                match d.axis {
+                    crate::paint::pane_dividers::DividerAxis::Vertical => {
+                        winit::window::CursorIcon::EwResize
+                    }
+                    crate::paint::pane_dividers::DividerAxis::Horizontal => {
+                        winit::window::CursorIcon::NsResize
+                    }
+                }
+            } else if sidebar_resize_hovered {
                 winit::window::CursorIcon::EwResize
             } else if mouse_reporting_active {
                 winit::window::CursorIcon::Default

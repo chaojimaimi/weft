@@ -23,6 +23,43 @@ impl App {
         true
     }
 
+    /// v1.3.2: Update the pane divider ratio from the pointer position during
+    /// a drag. Computes `new_ratio` from the drag state's `bounds` + the
+    /// current pointer, calls `tab.set_pane_ratio`, then `recompute_layout`
+    /// (which handles the throttled PTY resize). No-op if no drag is active.
+    pub(super) fn update_pane_divider_drag(&mut self, x: f32, y: f32) -> bool {
+        let Some(drag) = self.interaction.pane_divider_drag else {
+            return false;
+        };
+        let [bx0, _by0, bx1, _by1] = drag.bounds;
+        let new_ratio = match drag.axis {
+            crate::paint::pane_dividers::DividerAxis::Vertical => {
+                ((x - bx0) / (bx1 - bx0).max(1.0)).clamp(0.0, 1.0)
+            }
+            crate::paint::pane_dividers::DividerAxis::Horizontal => {
+                let [_bx0, by0, _bx1, by1] = drag.bounds;
+                ((y - by0) / (by1 - by0).max(1.0)).clamp(0.0, 1.0)
+            }
+        };
+        match self
+            .sessions
+            .active_mut()
+            .set_pane_ratio(drag.first, drag.second, new_ratio)
+        {
+            Ok(true) => {
+                self.recompute_layout();
+                self.request_redraw();
+                true
+            }
+            Ok(false) => true, // root leaf — no divider; keep consuming the drag
+            Err(e) => {
+                tracing::warn!(error = ?e, "pane divider drag: set_ratio failed; aborting drag");
+                self.interaction.pane_divider_drag = None;
+                false // release the drag so subsequent moves don't re-log
+            }
+        }
+    }
+
     pub(super) fn finish_panel_scrollbar_drag(&mut self) -> bool {
         if self.interaction.panel_scrollbar_drag.take().is_none() {
             return false;

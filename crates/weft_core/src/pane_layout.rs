@@ -363,6 +363,43 @@ impl SplitTree {
         }
         Ok(())
     }
+
+    /// v1.3.2: Set the ratio of the split whose two child subtrees contain
+    /// `first` and `second` respectively.
+    ///
+    /// Using **both** pane ids (instead of just one) uniquely identifies the
+    /// correct split even in nested layouts — e.g. a 3-pane tree where pane 1
+    /// appears in both an inner and an outer split. The divider the user
+    /// grabbed separates `first` (top/left) from `second` (bottom/right), so
+    /// only the split that has one in each child is the target.
+    ///
+    /// `new_ratio` is the first-child (top/left) share, clamped to
+    /// `[RATIO_MIN, RATIO_MAX]` = `[0.1, 0.9]`. Returns `Ok(false)` if the
+    /// root is a single leaf; `Ok(true)` if a split's ratio was updated.
+    pub fn set_ratio_for_pair(
+        &mut self,
+        first: PaneId,
+        second: PaneId,
+        new_ratio: f32,
+    ) -> Result<bool, SplitError> {
+        const RATIO_MIN: f32 = 0.1;
+        const RATIO_MAX: f32 = 0.9;
+        if !new_ratio.is_finite() {
+            return Err(SplitError::RatioOutOfRange(new_ratio));
+        }
+        let clamped = new_ratio.clamp(RATIO_MIN, RATIO_MAX);
+        let root = self.root.as_mut().ok_or(SplitError::Empty)?;
+        if !root.contains_leaf(first) {
+            return Err(SplitError::PaneNotFound(first));
+        }
+        if !root.contains_leaf(second) {
+            return Err(SplitError::PaneNotFound(second));
+        }
+        if matches!(root, Node::Leaf(_)) {
+            return Ok(false);
+        }
+        Ok(set_split_ratio_for_pair(root, first, second, clamped))
+    }
 }
 
 // ── Free helpers ───────────────────────────────────────────────────────
@@ -401,6 +438,38 @@ fn replace_leaf_id(node: &mut Node, old_id: PaneId, new_id: PaneId) -> bool {
         Node::Leaf(_) => false,
         Node::Split { first, second, .. } => {
             replace_leaf_id(first, old_id, new_id) || replace_leaf_id(second, old_id, new_id)
+        }
+    }
+}
+
+/// v1.3.2: Walk `node`, find the unique `Split` where one child subtree
+/// contains `a` and the other contains `b`, and set its `ratio` to
+/// `new_ratio`. Returns true iff a split was updated.
+///
+/// Using both pane ids uniquely identifies the correct split even in nested
+/// layouts — e.g. a 3-pane tree where pane 1 is a leaf in an inner split but
+/// also a descendant of the outer split. Only the split that separates `a`
+/// from `b` (one in each child) is the target.
+fn set_split_ratio_for_pair(node: &mut Node, a: PaneId, b: PaneId, new_ratio: f32) -> bool {
+    match node {
+        Node::Leaf(_) => false,
+        Node::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            let a_in_first = first.contains_leaf(a);
+            let b_in_first = first.contains_leaf(b);
+            // a in first & b in second, or vice versa → THIS is the split.
+            if (a_in_first && second.contains_leaf(b)) || (b_in_first && second.contains_leaf(a)) {
+                *ratio = new_ratio;
+                true
+            } else if a_in_first || b_in_first {
+                set_split_ratio_for_pair(first, a, b, new_ratio)
+            } else {
+                set_split_ratio_for_pair(second, a, b, new_ratio)
+            }
         }
     }
 }
@@ -691,6 +760,148 @@ mod tests {
             tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2)),
             Err(SplitError::Empty)
         );
+    }
+
+    // ── v1.3.2: set_ratio_for_pair ───────────────────────────────────────
+
+    #[test]
+    fn set_ratio_on_vertical_split_updates_divider() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        assert!(tree.set_ratio_for_pair(pid(1), pid(2), 0.25).unwrap());
+        let vp = [0.0, 0.0, 100.0, 100.0];
+        let layouts = tree.layout(vp);
+        let first = layouts.iter().find(|(id, _)| *id == pid(1)).unwrap().1;
+        // first child (left) gets 25% width = 25px
+        assert!((first[2] - 25.0).abs() < 0.01, "first.x1 = {}", first[2]);
+    }
+
+    #[test]
+    fn set_ratio_on_horizontal_split_updates_divider() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        assert!(tree.set_ratio_for_pair(pid(1), pid(2), 0.25).unwrap());
+        let vp = [0.0, 0.0, 100.0, 100.0];
+        let layouts = tree.layout(vp);
+        let first = layouts.iter().find(|(id, _)| *id == pid(1)).unwrap().1;
+        // first child (top) gets 25% height = 25px
+        assert!((first[3] - 25.0).abs() < 0.01, "first.y1 = {}", first[3]);
+    }
+
+    #[test]
+    fn set_ratio_clamps_to_0_1_0_9() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        assert!(tree.set_ratio_for_pair(pid(1), pid(2), 0.0).unwrap());
+        let vp = [0.0, 0.0, 100.0, 100.0];
+        let first = tree
+            .layout(vp)
+            .iter()
+            .find(|(id, _)| *id == pid(1))
+            .unwrap()
+            .1;
+        // 0.0 → clamped to 0.1 → 10px
+        assert!((first[2] - 10.0).abs() < 0.01);
+        assert!(tree.set_ratio_for_pair(pid(1), pid(2), 1.0).unwrap());
+        let first = tree
+            .layout(vp)
+            .iter()
+            .find(|(id, _)| *id == pid(1))
+            .unwrap()
+            .1;
+        // 1.0 → clamped to 0.9 → 90px
+        assert!((first[2] - 90.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn set_ratio_on_nested_split_targets_inner_split() {
+        // Root: Horizontal(1, 2), then split 1 into Vertical(1, 3).
+        // The inner Vertical divider separates 1↔3.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(3))
+            .unwrap();
+        // set_ratio_for_pair(1, 3) targets the inner Vertical split.
+        assert!(tree.set_ratio_for_pair(pid(1), pid(3), 0.8).unwrap());
+        let vp = [0.0, 0.0, 100.0, 100.0];
+        let layouts = tree.layout(vp);
+        let pane1 = layouts.iter().find(|(id, _)| *id == pid(1)).unwrap().1;
+        let pane2 = layouts.iter().find(|(id, _)| *id == pid(2)).unwrap().1;
+        // Outer Horizontal ratio is still 0.5 → pane 2 starts at y=50.
+        assert!((pane2[1] - 50.0).abs() < 0.01, "outer ratio unchanged");
+        // Inner Vertical ratio is 0.8 → pane 1 width = 80% of top band.
+        assert!((pane1[2] - 80.0).abs() < 0.01, "inner ratio updated");
+    }
+
+    #[test]
+    fn set_ratio_on_nested_split_targets_outer_split() {
+        // Same tree: Root: Horizontal(1, 2), then split 1 into Vertical(1, 3).
+        // The outer Horizontal divider separates {1,3}↔2.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(3))
+            .unwrap();
+        // set_ratio_for_pair(1, 2) targets the outer Horizontal split
+        // (1 is in first subtree, 2 is in second).
+        assert!(tree.set_ratio_for_pair(pid(1), pid(2), 0.3).unwrap());
+        let vp = [0.0, 0.0, 100.0, 100.0];
+        let pane2 = tree
+            .layout(vp)
+            .iter()
+            .find(|(id, _)| *id == pid(2))
+            .unwrap()
+            .1;
+        // Outer Horizontal ratio is now 0.3 → pane 2 (bottom) starts at y=30.
+        assert!(
+            (pane2[1] - 30.0).abs() < 0.01,
+            "outer ratio updated, pane2.y0 = {}",
+            pane2[1]
+        );
+    }
+
+    #[test]
+    fn set_ratio_on_root_leaf_returns_false() {
+        let mut tree = SplitTree::new(pid(1));
+        // Single pane — no pair to pass. Use itself as both.
+        assert_eq!(tree.set_ratio_for_pair(pid(1), pid(1), 0.5), Ok(false));
+    }
+
+    #[test]
+    fn set_ratio_unknown_pane_is_error() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        let snapshot = tree.clone();
+        assert_eq!(
+            tree.set_ratio_for_pair(pid(99), pid(2), 0.5),
+            Err(SplitError::PaneNotFound(pid(99)))
+        );
+        assert_eq!(tree, snapshot);
+    }
+
+    #[test]
+    fn set_ratio_on_empty_tree_is_error() {
+        let mut tree = SplitTree::default();
+        assert_eq!(
+            tree.set_ratio_for_pair(pid(1), pid(2), 0.5),
+            Err(SplitError::Empty)
+        );
+    }
+
+    #[test]
+    fn set_ratio_does_not_change_active() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.set_active(pid(2)).unwrap();
+        assert_eq!(tree.active(), Some(pid(2)));
+        tree.set_ratio_for_pair(pid(1), pid(2), 0.3).unwrap();
+        assert_eq!(tree.active(), Some(pid(2)));
     }
 
     #[test]

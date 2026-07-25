@@ -232,6 +232,18 @@ impl Tab {
         Ok(new_active.is_none())
     }
 
+    /// v1.3.2: Adjust the ratio of the split that separates `first` and
+    /// `second`. Mirrors `SplitTree::set_ratio_for_pair` — clamps to
+    /// [0.1, 0.9], returns `Ok(false)` if the tree is a single leaf.
+    pub(crate) fn set_pane_ratio(
+        &mut self,
+        first: weft_core::pane_layout::PaneId,
+        second: weft_core::pane_layout::PaneId,
+        new_ratio: f32,
+    ) -> Result<bool, weft_core::pane_layout::SplitError> {
+        self.split_tree.set_ratio_for_pair(first, second, new_ratio)
+    }
+
     /// Create a new tab with a PTY + Terminal pair at the given size.
     ///
     /// `cwd` — if `Some(path)`, the shell starts in that directory (via

@@ -77,6 +77,32 @@ impl App {
             return;
         }
 
+        // v1.3.2: check for pane-divider grab before focusing a pane.
+        // If the click lands on a divider strip (±4px), start a resize drag
+        // instead of focusing/selecting. Mirrors the sidebar resize pattern.
+        if button == winit::event::MouseButton::Left && !self.block_view_active() {
+            if let Some(divider) = self.pane_divider_hit_test(x as f32, y as f32) {
+                self.interaction.pane_divider_drag = Some(crate::app_state::PaneDividerDragState {
+                    axis: divider.axis,
+                    first: divider.first,
+                    second: divider.second,
+                    bounds: divider.bounds,
+                });
+                if let Some(window) = &self.window {
+                    let icon = match divider.axis {
+                        crate::paint::pane_dividers::DividerAxis::Vertical => {
+                            winit::window::CursorIcon::EwResize
+                        }
+                        crate::paint::pane_dividers::DividerAxis::Horizontal => {
+                            winit::window::CursorIcon::NsResize
+                        }
+                    };
+                    window.set_cursor(icon);
+                }
+                return;
+            }
+        }
+
         // v1.3 Batch 6: focus the pane under the cursor on click. This
         // switches the active pane BEFORE the rest of the mouse handling
         // (which all goes through `active_mut()`), so clicks/selections/
