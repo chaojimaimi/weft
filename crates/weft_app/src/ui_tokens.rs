@@ -190,8 +190,9 @@ pub struct UiColors {
 }
 
 /// R4: Interaction state for hover/focus/pressed/disabled semantics.
-/// Passed to [`UiColors::accent_for`] to derive the correct accent variant.
-#[allow(dead_code)] // R4: scaffolding for hover/pressed paint migration (Batch 11+)
+/// Passed to [`UiColors::accent_for`]. Batch 11 起在 tab_bar 首次消费；
+/// `Pressed`/`Disabled`/`Focused` 暂未消费，保留以稳定 R4 API。
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum InteractionState {
     #[default]
@@ -325,7 +326,6 @@ impl UiColors {
     /// R4: Derive the accent color for a given interaction state.
     /// Normal/Focused → focus; Hover → accent_hover; Pressed → accent_pressed;
     /// Disabled → 50% desaturated toward canvas.
-    #[allow(dead_code)] // R4: scaffolding for hover/pressed paint migration (Batch 11+)
     pub fn accent_for(&self, state: InteractionState) -> Color {
         match state {
             InteractionState::Normal | InteractionState::Focused => self.focus,

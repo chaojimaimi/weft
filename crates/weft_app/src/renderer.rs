@@ -721,6 +721,9 @@ impl MetalRenderer {
                 block_layout_cache_misses: cache_misses,
                 styled_line_lookups,
                 styled_paint_us,
+                // R5 task 4: resident_bytes is captured at begin() and
+                // preserved by build_end(); 0 here is overwritten.
+                resident_bytes: 0,
             });
         self.frame_trace.borrow_mut().encode_start();
 

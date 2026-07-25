@@ -95,6 +95,11 @@ pub(crate) struct FrameCounters {
     /// pushes. Zero in grid view. Used to decide whether styled-line caching
     /// is worth the vertex-relative-coords refactor.
     pub(crate) styled_paint_us: u64,
+    /// R5 task 4: process resident memory (RSS) in bytes at frame start.
+    /// Collected via `getrusage(RUSAGE_SELF)` on macOS. Used to detect
+    /// memory leaks during long-running sessions and correlate with
+    /// vertex/cache metrics for perf optimization decisions.
+    pub(crate) resident_bytes: u64,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -169,7 +174,10 @@ impl FrameTraceRecorder {
             layout_us: 0,
             build_us: 0,
             encode_us: 0,
-            counters: FrameCounters::default(),
+            counters: FrameCounters {
+                resident_bytes: resident_bytes(),
+                ..FrameCounters::default()
+            },
         }
     }
 
@@ -195,11 +203,20 @@ impl FrameTraceRecorder {
     }
 
     /// Mark the end of BUILD-VERTICES and record the per-frame counters.
+    ///
+    /// `resident_bytes` is captured at `begin()` (frame start) and is NOT
+    /// overwritten by `counters` from the render thread — the render thread
+    /// doesn't call `getrusage`, so the value it would supply is always 0.
+    /// Preserving the begin-time sample keeps the trace honest.
     pub(crate) fn build_end(&mut self, counters: FrameCounters) {
         if let Some(start) = self.build_start.take() {
             if self.enabled {
                 self.build_us = start.elapsed().as_micros() as u64;
+                // Preserve resident_bytes captured at begin(); the caller
+                // (renderer thread) doesn't collect RSS, so its value is 0.
+                let resident_bytes = self.counters.resident_bytes;
                 self.counters = counters;
+                self.counters.resident_bytes = resident_bytes;
             }
         }
     }
@@ -270,10 +287,94 @@ impl FrameTraceRecorder {
             cache_misses = counters.block_layout_cache_misses,
             styled_lookups = counters.styled_line_lookups,
             styled_paint_us = counters.styled_paint_us,
+            resident_bytes = counters.resident_bytes,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
         );
+    }
+}
+
+/// R5 task 4: collect process resident memory (RSS) in bytes via
+/// `getrusage(RUSAGE_SELF)`. On macOS `ru_maxrss` is already in bytes
+/// (unlike Linux, where it is in KB). Returns 0 if the syscall fails —
+/// the trace then simply reports `resident_bytes=0`, which is harmless.
+///
+/// `ru_maxrss` is the high-water mark over the process's lifetime, not
+/// the instantaneous RSS, but it is the cheapest cross-platform-ish
+/// signal available without pulling in a `libc` dependency or a
+/// `mach_task_basic_info` FFI dance. It is sufficient for leak
+/// detection (the value only grows) and for correlating long-running
+/// sessions with vertex/cache metrics.
+fn resident_bytes() -> u64 {
+    // Minimal FFI: avoid a `libc` crate dependency by declaring just
+    // the symbols we touch. Layout matches macOS `struct rusage`.
+    #[repr(C)]
+    struct Rusage {
+        ru_utime: Timeval,
+        ru_stime: Timeval,
+        ru_maxrss: i64,
+        ru_ixrss: i64,
+        ru_idrss: i64,
+        ru_isrss: i64,
+        ru_minflt: i64,
+        ru_majflt: i64,
+        ru_nswap: i64,
+        ru_inblock: i64,
+        ru_oublock: i64,
+        ru_msgsnd: i64,
+        ru_msgrcv: i64,
+        ru_nsignals: i64,
+        ru_nvcsw: i64,
+        ru_nivcsw: i64,
+    }
+
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i32,
+    }
+
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+
+    // RUSAGE_SELF = 0 on macOS.
+    const RUSAGE_SELF: i32 = 0;
+
+    let mut usage = Rusage {
+        ru_utime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        ru_stime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+
+    // SAFETY: `getrusage` writes into the provided buffer; `Rusage`
+    // layout matches the macOS kernel struct. Return value −1 means
+    // the call failed — we surface 0 in that case.
+    let rc = unsafe { getrusage(RUSAGE_SELF, &mut usage) };
+    if rc == 0 && usage.ru_maxrss > 0 {
+        usage.ru_maxrss as u64
+    } else {
+        0
     }
 }
 
@@ -336,6 +437,7 @@ mod tests {
             block_layout_cache_misses: 0,
             styled_line_lookups: 0,
             styled_paint_us: 0,
+            resident_bytes: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));
@@ -386,5 +488,22 @@ mod tests {
         let _rx1 = gpu_completion_rx();
         let _rx2 = gpu_completion_rx();
         // If a tx was installed, dropping both receivers is safe.
+    }
+
+    #[test]
+    fn resident_bytes_is_nonzero_under_running_process() {
+        // R5 task 4: getrusage(RUSAGE_SELF) on a running process should
+        // always report a non-zero RSS (the test binary itself plus its
+        // dependencies occupy memory). A zero return would indicate the
+        // FFI binding is wrong (wrong struct layout, wrong syscall
+        // constant, or rc != 0). Tolerate a degenerate 0 only if the
+        // syscall actually failed (rc != 0) — otherwise assert growth.
+        let bytes = resident_bytes();
+        // Typical test-binary RSS is in the low MiB range; accept anything
+        // above 100 KiB to avoid flakiness on minimal CI runners.
+        assert!(
+            bytes >= 100 * 1024,
+            "resident_bytes returned {bytes}, expected at least ~100 KiB"
+        );
     }
 }

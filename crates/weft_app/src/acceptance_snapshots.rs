@@ -201,6 +201,7 @@ fn layout_scene_snapshot() -> Value {
         padding_y: 8.0,
         chrome_top: 36.0,
         chrome_left: 240.0,
+        pane_origin: (0.0, 0.0),
         clip: None,
     };
     let block = layout_block_view(&ctx, 540.0, true);

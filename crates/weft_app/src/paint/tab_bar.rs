@@ -3,6 +3,7 @@
 use crate::paint::primitives::{color_to_normalized, push_line, push_quad};
 use crate::paint::ui_helpers::truncate_to_columns;
 use crate::renderer::MetalRenderer;
+use crate::ui_tokens::InteractionState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TabTitle {
@@ -94,7 +95,11 @@ impl MetalRenderer {
             .with_increase_contrast(self.increase_contrast);
         let bg = color_to_normalized(ui.canvas);
         let fg = color_to_normalized(ui.text_primary);
-        let accent = color_to_normalized(ui.focus);
+        // R4 Batch 11试点：active tab 的 accent 下划线根据 hover 状态派生，
+        // 从直接的 `ui.focus` 迁移到 `accent_for(InteractionState::*)`。
+        // Normal = focus；Hover = accent_hover（明亮 15%）。
+        let accent_normal = color_to_normalized(ui.accent_for(InteractionState::Normal));
+        let accent_hover = color_to_normalized(ui.accent_for(InteractionState::Hover));
         let separator = color_to_normalized(self.theme.separator);
 
         let bar_bg = color_to_normalized(ui.chrome);
@@ -160,12 +165,19 @@ impl MetalRenderer {
                     [0.0; 4],
                     bg,
                 );
+                // R4 Batch 11试点：active tab 下划线在 hover 时切换到 accent_hover，
+                // 否则使用 accent_normal。这是 InteractionState 的首个消费点。
+                let underline = if is_hovered {
+                    accent_hover
+                } else {
+                    accent_normal
+                };
                 push_quad(
                     &mut vertices,
                     [draw_x0, y1 - 2.0, draw_x1, y1],
                     [0.0; 4],
                     [0.0; 4],
-                    accent,
+                    underline,
                 );
             } else if is_hovered {
                 // v1.2: hover highlight — a subtle light overlay on inactive
