@@ -294,8 +294,14 @@ impl App {
                         self.settings.dirty = true;
                     }
                     1 => {
-                        // Font Family: cycle Menlo → Monaco → SF Mono → System.
-                        const FAMILIES: &[&str] = &["Menlo", "Monaco", "SF Mono", "System"];
+                        // Font Family: cycle Menlo → Monaco → SF Mono → Courier New.
+                        // v1.2.11 fix: 原列表含 "System"，但 font_kit 的
+                        // `FamilyName::Title("System")` 在 macOS 上无法解析（系统字体
+                        // 通过 CTFontDescriptorCreateWithTextStyle API 访问，不在
+                        // 家族名索引中），会回退到 Menlo，看起来"字体没变"。换成
+                        // Courier New —— 它是 macOS 内置的经典等宽字体，能被 font_kit
+                        // 正确解析，且与 Menlo/Monaco 视觉差异明显，便于用户感知变化。
+                        const FAMILIES: &[&str] = &["Menlo", "Monaco", "SF Mono", "Courier New"];
                         let cur = FAMILIES
                             .iter()
                             .position(|f| *f == self.settings.draft.font.family)
@@ -415,7 +421,115 @@ impl App {
         }
         if self.settings.dirty {
             self.refresh_settings_validation();
+            // v1.2.11 实时预览：调整后立即 apply 视觉设置到 renderer，无需等
+            // Apply/Save。仅当字段校验通过时才预览，避免无效值导致渲染崩溃。
+            // 预览只动 renderer，不修改 config_state.config，不写盘；关闭面板
+            // 时 draft 被丢弃，下次打开重新从 config 克隆，行为一致。
+            if self.settings.field_errors.is_empty() {
+                self.apply_settings_preview();
+            }
         }
+    }
+
+    /// v1.2.11: 实时预览 draft 中的视觉设置到 renderer。
+    ///
+    /// 这是 `apply_config` 的"只动 renderer"子集：不修改 `config_state.config`，
+    /// 不写盘，不影响 keybindings/scrollback 等非视觉设置。设计目的：
+    /// 让用户按 ←/→ 调整 Font/Size/Line Height/Opacity/Padding 时立即看到效果，
+    /// 而不是必须按 Enter/Apply 才生效。
+    ///
+    /// 关闭面板（Esc/点外面）时 `close_settings` 会调用
+    /// `revert_renderer_to_config` 立即把 renderer 回滚到 config 状态。
+    /// 如果用户按 Apply/Save，`save_settings_draft` → `reload_config` →
+    /// `apply_config` 会把 draft 持久化到 config，renderer 状态保持一致。
+    fn apply_settings_preview(&mut self) {
+        // Clone the relevant fields out of `draft` so we don't hold an
+        // immutable borrow of `self` while calling `&mut self` methods.
+        //
+        // v1.2.11 fix (P0-2): 不做 diff 判断，总是 apply。原来的 diff 基准是
+        // `config_state.config`，但预览只改 renderer 不改 config，导致用户
+        // "调回原值"时 diff 为空、renderer 停在中间状态。移除 diff 后，每次
+        // adjust 都会 apply，确保 renderer 始终与 draft 一致。rebuild_atlas
+        // 开销 ~10ms，按 ←/→ 的频率（人手速度）完全可接受。
+        let draft_font = self.settings.draft.font.clone();
+        let draft_opacity = self.settings.draft.window.opacity;
+        let draft_padding_x = self.settings.draft.window.padding_x;
+        let draft_padding_y = self.settings.draft.window.padding_y;
+        let draft_sidebar_width = self.settings.draft.window.sidebar_width;
+
+        // Font — always rebuild atlas with draft values.
+        if let Some(r) = &mut self.renderer {
+            let scaled = crate::settings_validation::runtime_scaled_font_config(
+                &draft_font,
+                self.config_state.font_scale,
+            );
+            r.rebuild_atlas(scaled);
+        }
+        self.recompute_layout();
+
+        // Opacity — always flip Metal layer + NSWindow opaque flag.
+        let new_opacity = crate::settings_validation::runtime_opacity(draft_opacity);
+        if let Some(r) = &mut self.renderer {
+            r.set_opacity(draft_opacity);
+        }
+        if let Some(window) = &self.window {
+            let _ = crate::macos_window::set_window_opaque(window, new_opacity >= 1.0);
+        }
+
+        // Padding — always update renderer padding + recompute layout.
+        if let Some(r) = &mut self.renderer {
+            r.set_padding((draft_padding_x, draft_padding_y));
+        }
+        self.recompute_layout();
+
+        // Sidebar width — always update renderer override.
+        if let Some(r) = &mut self.renderer {
+            r.set_sidebar_width(draft_sidebar_width);
+        }
+
+        self.request_redraw();
+    }
+
+    /// v1.2.11 fix (P0-1): 强制把 renderer 回滚到 `config_state.config` 的状态。
+    ///
+    /// 用于 `close_settings` 丢弃 draft 时把 renderer 从预览状态恢复回来。
+    /// 与 `apply_config` 不同，这里不做 diff（因为 `config_state.config` 没变，
+    /// diff 永远为空），而是无条件重 apply font/opacity/padding/sidebar 四项
+    /// 视觉设置到 renderer，确保 renderer 与 config 重新对齐。
+    pub(super) fn revert_renderer_to_config(&mut self) {
+        let config = self.config_state.config.clone();
+
+        // Font — rebuild atlas with config values (reverts preview).
+        if let Some(r) = &mut self.renderer {
+            let scaled = crate::settings_validation::runtime_scaled_font_config(
+                &config.font,
+                self.config_state.font_scale,
+            );
+            r.rebuild_atlas(scaled);
+        }
+        self.recompute_layout();
+
+        // Opacity — restore Metal layer + NSWindow opaque flag.
+        let cfg_opacity = crate::settings_validation::runtime_opacity(config.window.opacity);
+        if let Some(r) = &mut self.renderer {
+            r.set_opacity(config.window.opacity);
+        }
+        if let Some(window) = &self.window {
+            let _ = crate::macos_window::set_window_opaque(window, cfg_opacity >= 1.0);
+        }
+
+        // Padding — restore renderer padding + recompute layout.
+        if let Some(r) = &mut self.renderer {
+            r.set_padding((config.window.padding_x, config.window.padding_y));
+        }
+        self.recompute_layout();
+
+        // Sidebar width — restore renderer override.
+        if let Some(r) = &mut self.renderer {
+            r.set_sidebar_width(config.window.sidebar_width);
+        }
+
+        self.request_redraw();
     }
 
     /// F5: Number of selectable rows in the active Settings category.
@@ -552,6 +666,11 @@ impl App {
                 weft_core::config::Action::NextTab => "Next Tab",
                 weft_core::config::Action::PrevTab => "Previous Tab",
                 weft_core::config::Action::ToggleSettings => "Settings",
+                weft_core::config::Action::SplitHorizontal => "Split Horizontal",
+                weft_core::config::Action::SplitVertical => "Split Vertical",
+                weft_core::config::Action::FocusNextPane => "Focus Next Pane",
+                weft_core::config::Action::FocusPrevPane => "Focus Previous Pane",
+                weft_core::config::Action::ClosePane => "Close Pane",
             };
             views.push(SettingsKeybindingView {
                 action: label.to_string(),

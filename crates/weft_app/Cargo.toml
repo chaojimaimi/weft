@@ -53,6 +53,13 @@ crossbeam-channel.workspace = true
 regex.workspace = true
 image.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# v1.6 AI integration: dependencies for `crates/weft_app/src/ai/`. The module
+# is scaffolding-only in v1.3 (not wired into the app shell, see ROADMAP DC-8
+# and `ai/mod.rs`). Kept on the v1.3 cut so v1.6 builds on a reviewed baseline.
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true

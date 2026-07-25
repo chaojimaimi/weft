@@ -9,6 +9,7 @@ pub mod find;
 pub mod grid;
 pub mod hyperlink;
 pub mod input;
+pub mod pane_layout;
 pub mod persistence;
 pub mod pty;
 pub mod secrets;

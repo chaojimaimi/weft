@@ -120,6 +120,25 @@ impl App {
             .is_some_and(|layout| layout.contains_content(x, y))
     }
 
+    /// v1.3 Batch 6: Find the pane under the physical-pixel point `(x, y)`.
+    /// Returns `None` if the point is outside the content area or no panes
+    /// exist. Used by mouse hit-testing to route clicks to the correct pane.
+    pub(super) fn pane_at_pixel(&self, x: f64, y: f64) -> Option<weft_core::pane_layout::PaneId> {
+        let layout = self.terminal_layout()?;
+        if !layout.contains_content(x, y) {
+            return None;
+        }
+        let content_rect: weft_core::pane_layout::Rect = [
+            layout.content.left as f32,
+            layout.content.top as f32,
+            layout.content.right as f32,
+            layout.content.bottom as f32,
+        ];
+        self.sessions
+            .active()
+            .pane_hit_test(x as f32, y as f32, content_rect)
+    }
+
     /// Recompute grid rows/cols from the current window + cell dimensions and
     /// resize the terminal / queue a PTY SIGWINCH. Used after a font or padding
     /// change (cell size or usable area changes) and on window resize.
@@ -145,14 +164,39 @@ impl App {
         // up the new chrome_left (sidebar open/close shifts the grid). Only
         // the active tab sends a PTY resize immediately; background tabs get
         // their PTY resize on activation (refresh_grid_for_active_tab).
+        //
+        // v1.3 Batch 6: resize ALL panes per tab according to their split-tree
+        // rects. For single-pane tabs this is equivalent to the old
+        // `resize_terminal_and_queue` call (the split tree returns one rect
+        // equal to the content area).
         let active = self.sessions.active_idx();
         let header_rows = renderer.block_header_rows();
         let layout_ctx = base_layout.layout_ctx();
+        let content_rect: weft_core::pane_layout::Rect = [
+            base_layout.content.left as f32,
+            base_layout.content.top as f32,
+            base_layout.content.right as f32,
+            base_layout.content.bottom as f32,
+        ];
+        let cell_w = base_layout.cell_width as f32;
+        let cell_h = base_layout.cell_height as f32;
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if tab.terminal.is_some() {
-                let (new_rows, new_cols) = base_layout.dimensions();
-                if tab.resize_terminal_and_queue(new_rows, new_cols) && i == active {
-                    info!(rows = new_rows, cols = new_cols, "terminal resized");
+                let resized = tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
+                if resized && i == active {
+                    let active_id = tab.active_pane_id();
+                    let layouts = tab.split_tree().layout(content_rect);
+                    if let Some((_, rect)) = layouts.into_iter().find(|(id, _)| *id == active_id) {
+                        let [x0, y0, x1, y1] = rect;
+                        let w = (x1 - x0).max(0.0);
+                        let h = (y1 - y0).max(0.0);
+                        let cols = (w / cell_w).floor() as usize;
+                        let rows = (h / cell_h).floor() as usize;
+                        info!(active = ?active_id, rows, cols, pane_rect = ?rect, "terminal resized");
+                    } else {
+                        let (new_rows, new_cols) = base_layout.dimensions();
+                        info!(rows = new_rows, cols = new_cols, "terminal resized");
+                    }
                 }
                 let previous = tab.block_scroll();
                 let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
@@ -182,6 +226,12 @@ impl App {
     }
 
     /// Convert pixel coordinates to grid (row, col).
+    ///
+    /// v1.3 Batch 6: for multi-pane tabs, the grid position is relative to
+    /// the **active pane's** origin (not the full content area). Without this
+    /// adjustment, clicking in a right-side pane would produce column indices
+    /// offset by the left pane's width, clamping to the wrong cell. For
+    /// single-pane tabs the pane origin equals the content origin — no change.
     pub(super) fn pixel_to_grid(&self, x: f64, y: f64) -> GridPos {
         let Some(layout) = self.terminal_layout() else {
             return GridPos::new(0, 0);
@@ -196,7 +246,38 @@ impl App {
             .as_ref()
             .map(|t| (t.grid().num_rows, t.grid().num_cols))
             .unwrap_or((1, 1));
-        let (row, col) = layout.grid_position(x, y, num_rows, num_cols);
+
+        // v1.3 Batch 6: adjust (x, y) by the active pane's origin offset.
+        // `grid_position` subtracts `content.left/top` internally; we want it
+        // to subtract the pane's `x0/y0` instead. The adjustment is:
+        //   adjusted_x = x - (pane_x0 - content.left)
+        // so that grid_position computes (adjusted_x - content.left) = (x - pane_x0).
+        let (adj_x, adj_y) = if layout.contains_content(x, y) {
+            let content_rect: weft_core::pane_layout::Rect = [
+                layout.content.left as f32,
+                layout.content.top as f32,
+                layout.content.right as f32,
+                layout.content.bottom as f32,
+            ];
+            let active_id = self.sessions.active().active_pane_id();
+            self.sessions
+                .active()
+                .split_tree()
+                .layout(content_rect)
+                .into_iter()
+                .find(|(id, _)| *id == active_id)
+                .map(|(_, rect)| {
+                    let [px0, py0, _, _] = rect;
+                    let dx = px0 as f64 - layout.content.left;
+                    let dy = py0 as f64 - layout.content.top;
+                    (x - dx, y - dy)
+                })
+                .unwrap_or((x, y))
+        } else {
+            (x, y)
+        };
+
+        let (row, col) = layout.grid_position(adj_x, adj_y, num_rows, num_cols);
         GridPos::new(row, col)
     }
 

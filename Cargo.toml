@@ -60,5 +60,9 @@ regex = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
+# v1.6 AI integration: HTTP client (rustls-tls to avoid OpenSSL on macOS).
+# Pulled in by `crates/weft_app/src/ai/`; the module is scaffolding-only in
+# v1.3 and not wired into the app shell (see ROADMAP DC-8).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # Benchmarking (Batch 6 Step 3)
 criterion = { version = "0.5", default-features = false }

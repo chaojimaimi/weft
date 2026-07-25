@@ -22,7 +22,7 @@ pub(crate) enum BlockScrollAnchor {
 }
 
 impl BlockScrollAnchor {
-    fn offset_value(self) -> usize {
+    pub(crate) fn offset_value(self) -> usize {
         match self {
             Self::FollowBottom => 0,
             Self::FixedDocumentRow(n) => n,
@@ -99,14 +99,21 @@ impl Tab {
     }
 
     fn sync_primary_history_view(&mut self) {
-        let changed = if let Some(terminal) = &mut self.terminal {
+        // v1.3: snapshot the anchor offset before borrowing `terminal` so
+        // the disjoint-field borrow through `DerefMut` doesn't conflict.
+        // `block_scroll_anchor` and `terminal` are both on the active pane;
+        // reading the offset first releases the immutable pane borrow before
+        // `&mut pane.terminal` is taken.
+        let anchor_offset = self.block_scroll_anchor.offset_value();
+        let pane = self.active_mut();
+        let changed = if let Some(terminal) = &mut pane.terminal {
             // Reaching the history tail is still a history position. Keep the
             // detached BlockView active at offset zero so the last wheel step
             // cannot switch to the differently laid-out live Grid and appear
             // to jump. Explicit input / ScrollToBottom calls `snap_to_bottom`
             // and is the sole boundary that leaves history browsing.
             let browsing = terminal.primary_screen_app_active()
-                && (self.block_scroll_anchor.offset_value() > 0 || terminal.primary_history_view());
+                && (anchor_offset > 0 || terminal.primary_history_view());
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
             changed

@@ -54,7 +54,6 @@ pub fn layout_prompt(
 ) -> PromptLayout {
     let cw = ctx.cell_w;
     let ch = ctx.cell_h;
-    let vp_w = ctx.viewport.0;
     let vp_h = ctx.viewport.1;
 
     let n_lines = n_lines.max(1);
@@ -63,16 +62,20 @@ pub fn layout_prompt(
     // height is 1 pad row + N text rows + 1 pad row.
     let raw_box_h = ch * (n_lines as f32 + 2.0);
     let max_box_h = vp_h * 0.30;
-    let box_h = raw_box_h.min(max_box_h);
+    // v1.3: in multi-pane tabs the prompt belongs to the active pane, so
+    // the box must not exceed the pane's clipped height either.
+    let box_h = raw_box_h.min(max_box_h).min(ctx.height());
     // Visible text rows that fit in the clamped box (≥1).
     let visible_rows = (((box_h / ch).floor() - 2.0).max(1.0) as usize)
         .max(1)
         .min(n_lines);
 
-    let box_y1 = (vp_h - ctx.padding_y).max(0.0);
-    let box_y0 = (box_y1 - box_h).max(0.0);
+    // v1.3: pin the prompt to the active pane's clipped bounds so it does
+    // not bleed across background panes in a split.
+    let box_y1 = ctx.bottom();
+    let box_y0 = (box_y1 - box_h).max(ctx.top());
     let box_x0 = ctx.left();
-    let box_x1 = (vp_w - ctx.padding_x).max(box_x0);
+    let box_x1 = ctx.right();
 
     let text_y0 = box_y0 + ch;
     let left = box_x0;

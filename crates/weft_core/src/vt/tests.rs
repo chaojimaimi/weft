@@ -2029,6 +2029,41 @@ fn submit_command_builds_bytes_and_blocks_editor() {
 }
 
 #[test]
+fn run_command_sets_text_and_submits() {
+    // v1.3 AI integration: Terminal::run_command should produce the same
+    // bytes as manually typing the command then calling submit_command,
+    // and the command should be recorded in editor history so ↑ can recall
+    // it later (e.g. the user wants to tweak an AI-suggested command).
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]133;A\x07");
+    let bytes = t.run_command("find . -name '*.ts'");
+    assert_eq!(bytes, build_submit_bytes("find . -name '*.ts'", false));
+    assert_eq!(t.editor().text(), "");
+    assert_eq!(t.effective_input_mode(), InputMode::Passthrough);
+    // History is populated — Up-arrow navigates to the AI-suggested cmd.
+    assert_eq!(
+        t.editor().history().first(),
+        Some(&"find . -name '*.ts'".to_string())
+    );
+}
+
+#[test]
+fn run_command_empty_behaves_like_submit_empty() {
+    // Empty command should synthesize an empty block (Warp-style spacer)
+    // rather than sending a bare newline with no block.
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]133;A\x07");
+    let _ = t.run_command("");
+    let blocks = t.block_tracker().blocks();
+    assert_eq!(
+        blocks.len(),
+        1,
+        "empty run_command should still produce a block"
+    );
+    assert_eq!(blocks[0].command, "");
+}
+
+#[test]
 fn tab_in_command_output_is_captured_as_spaces() {
     // Regression: macOS `ls` separates columns with tabs, which are C0
     // controls (handled by `execute`, not `print`). Without mirroring the

@@ -680,13 +680,27 @@ impl App {
         }
 
         // Window background opacity (layer-level transparency; text stays
-        // opaque). Recolors the next frame. Window-level transparency is
-        // startup-only — see `resumed`.
+        // opaque). Recolors the next frame. v1.2.11 fix: now also flips the
+        // NSWindow's opaque flag + background color at runtime so lowering
+        // opacity below 1.0 actually shows the desktop through the window.
+        // Previously `with_transparent()` was creation-only, so a window
+        // started at opacity=1.0 could not become transparent without a
+        // relaunch — the Metal layer went non-opaque but the NSWindow's
+        // system background filled the transparent regions.
         if crate::settings_validation::runtime_opacity(self.config_state.config.window.opacity)
             != crate::settings_validation::runtime_opacity(config.window.opacity)
         {
+            let new_opacity = crate::settings_validation::runtime_opacity(config.window.opacity);
             if let Some(r) = &mut self.renderer {
                 r.set_opacity(config.window.opacity);
+            }
+            if let Some(window) = &self.window {
+                let ok = crate::macos_window::set_window_opaque(window, new_opacity >= 1.0);
+                if !ok {
+                    tracing::warn!(
+                        "set_window_opaque returned false — NSWindow handle unavailable"
+                    );
+                }
             }
         }
 
@@ -722,6 +736,24 @@ impl App {
         // the responsive SidebarMetrics default.
         if let Some(r) = &mut self.renderer {
             r.set_sidebar_width(config.window.sidebar_width);
+        }
+
+        // v1.2.11 fix: Window width/height 现在运行时生效。原代码注释说
+        // "apply on the next launch"，但实际上 winit 的 `request_inner_size` 可以
+        // 在运行时调整窗口尺寸。用户在 Settings → Window 调整 Width/Height 后
+        // 按 Apply/Save，窗口会立即 resize 到新尺寸（logical points）。
+        // 注意：这会触发 Resized 事件 → renderer.resize + recompute_layout，
+        // 所以不需要额外调用 recompute_layout。
+        if self.config_state.config.window.width != config.window.width
+            || self.config_state.config.window.height != config.window.height
+        {
+            if let Some(window) = &self.window {
+                let new_size = winit::dpi::LogicalSize::new(
+                    config.window.width as f64,
+                    config.window.height as f64,
+                );
+                let _ = window.request_inner_size(new_size);
+            }
         }
 
         self.config_state.config = config;

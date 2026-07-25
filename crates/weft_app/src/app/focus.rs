@@ -32,13 +32,25 @@ impl crate::App {
     /// v1.0 S1: close the Settings panel, discarding any unsaved draft
     /// changes. Used when another modal opens so only one owns keyboard
     /// input.
+    ///
+    /// v1.2.11: 如果存在未保存的预览改动（dirty=true），需要把 renderer
+    /// 回滚到 `config_state.config` 的状态——否则用户 Esc 关闭后，renderer
+    /// 还停留在预览的字体/透明度/padding 上，与 config 不一致。
+    /// 使用 `revert_renderer_to_config` 而非 `apply_config`，因为后者基于
+    /// `config_state.config` 做 diff（而 config 没变，diff 为空，不会 restore）。
+    /// `revert_renderer_to_config` 无条件重 apply，确保 renderer 与 config
+    /// 重新对齐。
     pub(crate) fn close_settings(&mut self) {
         if !self.settings.open {
             return;
         }
         self.reset_ime_context("settings closed");
+        let was_dirty = self.settings.dirty;
         self.settings.close();
         self.clear_prev_focus_if_no_modal();
+        if was_dirty {
+            self.revert_renderer_to_config();
+        }
     }
 
     /// Compute the current logical [`FocusId`] from the overlay state. Mirrors

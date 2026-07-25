@@ -54,6 +54,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "scrollback",
         "editor",
         "logo",
+        "ai",
         "keybindings",
     ] {
         let Some(item) = document.get_mut(section) else {
@@ -133,4 +134,84 @@ pub(super) fn set_usize_if_diff(
         return;
     }
     table.insert(key, toml_edit::value(i64::try_from(new).unwrap_or(0)));
+}
+
+/// v1.6 AI integration: write the `[ai]` section to a `toml_edit` document.
+///
+/// Only persists non-default values — an entirely-default `[ai]` section is
+/// removed so the file stays clean when AI is unconfigured. The plaintext
+/// `api_key` is written only when set (Settings UI prefers Keychain, but
+/// we keep the toml path for tests / quick local setups).
+///
+/// Kept in `save.rs` (rather than `mod.rs`) so the parent file's line count
+/// stays within its architecture-gate budget.
+pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiConfig) {
+    let default_ai = super::AiConfig::default();
+    let ai_dirty = ai.provider != default_ai.provider
+        || ai.api_key != default_ai.api_key
+        || ai.base_url != default_ai.base_url
+        || ai.model != default_ai.model
+        || ai.max_tokens != default_ai.max_tokens
+        || ai.timeout_secs != default_ai.timeout_secs
+        || ai.enable_error_diagnosis != default_ai.enable_error_diagnosis
+        || ai.enable_command_generation != default_ai.enable_command_generation;
+    if ai_dirty {
+        let ai_entry = doc.entry("ai").or_insert_with(toml_edit::table);
+        if ai_entry.is_none() {
+            *ai_entry = toml_edit::table();
+        }
+        let table = ai_entry.as_table_mut().expect("ai is a table");
+        set_opt_string(table, "provider", &ai.provider);
+        set_opt_string(table, "api_key", &ai.api_key);
+        set_opt_string(table, "base_url", &ai.base_url);
+        set_opt_string(table, "model", &ai.model);
+        if let Some(mt) = ai.max_tokens {
+            table["max_tokens"] = toml_edit::value(i64::from(mt));
+        } else if table.contains_key("max_tokens") {
+            table.remove("max_tokens");
+        }
+        if let Some(ts) = ai.timeout_secs {
+            table["timeout_secs"] = toml_edit::value(i64::from(ts));
+        } else if table.contains_key("timeout_secs") {
+            table.remove("timeout_secs");
+        }
+        // Booleans: only write when non-default.
+        if ai.enable_error_diagnosis {
+            table["enable_error_diagnosis"] = toml_edit::value(true);
+        } else if table.contains_key("enable_error_diagnosis") {
+            table.remove("enable_error_diagnosis");
+        }
+        if !ai.enable_command_generation {
+            table["enable_command_generation"] = toml_edit::value(false);
+        } else if table.contains_key("enable_command_generation") {
+            table.remove("enable_command_generation");
+        }
+    } else if let Some(ai_entry) = doc.get_mut("ai") {
+        // Whole section is at defaults — drop it so reload doesn't keep
+        // stale overrides (e.g. a previous api_key).
+        if ai_entry.as_table().is_some_and(|t| t.iter().count() == 0) {
+            doc.remove("ai");
+        } else {
+            // Section has stale content. Replace with an empty table so
+            // we don't lose the user's comments, but ensure no fields
+            // remain that would override defaults.
+            if let Some(table) = ai_entry.as_table_mut() {
+                for key in [
+                    "provider",
+                    "api_key",
+                    "base_url",
+                    "model",
+                    "max_tokens",
+                    "timeout_secs",
+                    "enable_error_diagnosis",
+                    "enable_command_generation",
+                ] {
+                    table.remove(key);
+                }
+                if table.iter().count() == 0 {
+                    doc.remove("ai");
+                }
+            }
+        }
+    }
 }

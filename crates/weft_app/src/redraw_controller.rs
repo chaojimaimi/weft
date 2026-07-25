@@ -97,7 +97,7 @@ impl App {
             .sessions
             .tabs()
             .iter()
-            .map(|tab| tab.pending_pty_resize)
+            .map(|tab| tab.pending_pane_resizes())
             .collect();
         let resize_effects = effect::pending_resize_effects(
             &pending,
@@ -177,7 +177,88 @@ impl App {
                     .ensure_cursor_visible(prompt_max_rows);
             }
         }
-        if let (Some(renderer), Some(terminal)) = (&mut self.renderer, &tab.terminal) {
+        // v1.3 Batch 5.5: compute pane layouts BEFORE the mutable `pane`
+        // borrow below. The split tree is read-only structure; background
+        // panes' Terminals are read-only during draw (only the active
+        // pane's selection_handler mutates). We collect background terminal
+        // pointers as raw `*const Terminal` because `PaneRenderInfo<'a>`
+        // holds `&'a Terminal` — a borrow that can't cross the
+        // `tab.active_mut()` call (std HashMap doesn't support disjoint
+        // &mut / & on different keys). Soundness: `tab` outlives the draw
+        // call; background panes' terminals are only read (never mutated)
+        // during draw; the only mutation is the active pane's
+        // selection_handler.
+        let (active_pane_rect, bg_terminal_ptrs): (
+            crate::layout::Rect,
+            Vec<(crate::layout::Rect, *const Terminal)>,
+        ) = match self.renderer.as_ref() {
+            Some(renderer_ref) => {
+                let chrome_top = renderer_ref
+                    .tab_bar_height()
+                    .max(renderer_ref.titlebar_height());
+                let panel_open = self.panel.open;
+                let sidebar_placement = crate::ui_tokens::sidebar_placement(
+                    panel_open,
+                    renderer_ref.sidebar_width(),
+                    renderer_ref.sidebar_push_width(),
+                );
+                let chrome_left = sidebar_placement.terminal_push_width;
+                let content_rect: crate::layout::Rect = [
+                    renderer_ref.padding_x + chrome_left,
+                    renderer_ref.padding_y + chrome_top,
+                    renderer_ref.viewport.0 - renderer_ref.padding_x,
+                    renderer_ref.viewport.1 - renderer_ref.padding_y,
+                ];
+                let pane_layouts = tab.split_tree().layout(content_rect);
+                let active_id = tab.active_pane_id();
+                let active_rect = pane_layouts
+                    .iter()
+                    .find(|(id, _)| *id == active_id)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or(content_rect);
+                let ptrs: Vec<(crate::layout::Rect, *const Terminal)> = pane_layouts
+                    .iter()
+                    .filter(|(id, _)| *id != active_id)
+                    .filter_map(|(id, rect)| {
+                        let pane = tab.pane(*id)?;
+                        let terminal = pane.terminal.as_ref()?;
+                        Some((*rect, terminal as *const Terminal))
+                    })
+                    .collect();
+                tracing::info!(
+                    content_rect = ?content_rect,
+                    active_id = ?active_id,
+                    active_rect = ?active_rect,
+                    pane_layouts = ?pane_layouts,
+                    bg_count = ptrs.len(),
+                    "draw pane layouts"
+                );
+                (active_rect, ptrs)
+            }
+            None => ([0.0, 0.0, 0.0, 0.0], Vec::new()),
+        };
+        // Build PaneRenderInfo from raw pointers. The references are valid
+        // for the entire draw scope (tab outlives draw; background terminals
+        // are immutable during draw).
+        let background_panes: Vec<crate::renderer::PaneRenderInfo> = bg_terminal_ptrs
+            .iter()
+            .map(|(rect, ptr)| crate::renderer::PaneRenderInfo {
+                rect: *rect,
+                // SAFETY: `ptr` was obtained from `tab.pane(id).terminal`
+                // above. `tab` outlives this scope; background panes'
+                // terminals are not mutated during draw (only the active
+                // pane's selection_handler is mutated, a disjoint Pane).
+                terminal: unsafe { &**ptr },
+            })
+            .collect();
+        // v1.3: take a single `&mut Pane` borrow so `terminal` (immutable)
+        // and `selection_handler` (mutable, passed to `renderer.draw` below)
+        // can be disjoint-field-borrowed from the same pane. Going through
+        // `&tab.terminal` / `&mut tab.selection_handler` separately would
+        // both deref through `Tab` and conflict.
+        let pane = tab.active_mut();
+        let terminal_opt = pane.terminal.as_ref();
+        if let (Some(renderer), Some(terminal)) = (&mut self.renderer, terminal_opt) {
             if tab_changed {
                 renderer.force_full_grid_redraw();
             }
@@ -261,8 +342,8 @@ impl App {
                 self.panel.expanded,
                 self.panel.search_focused,
                 self.panel.scroll_offset,
-                &tab.ime_preedit,
-                tab.ime_preedit_cursor,
+                &pane.ime_preedit,
+                pane.ime_preedit_cursor,
                 self.palette.open,
                 &self.palette.query,
                 self.palette.selection,
@@ -331,9 +412,9 @@ impl App {
             // leave a gap over the cursor cell. `has_selection` / `blink_on`
             // are needed here AND again below for `renderer.draw()`, so we
             // compute them once up front.
-            let has_selection = tab.selection_handler.selecting
-                || tab.selection_handler.block_view_selection.is_some()
-                || tab.selection_handler.selection.is_some();
+            let has_selection = pane.selection_handler.selecting
+                || pane.selection_handler.block_view_selection.is_some()
+                || pane.selection_handler.selection.is_some();
             let blink_on = self.window_runtime.cursor_blink_on && !has_selection;
             let find_state = if self.find.open {
                 let grid_total = self.find.matches.len();
@@ -431,10 +512,11 @@ impl App {
             // is cleared (click on empty area / prompt / Esc).
             // (`has_selection` / `blink_on` were computed above before the
             // Find state so the highlight can also use cursor visibility.)
-            // M3.5: read block_scroll into a local before the mutable
-            // `&mut tab.selection_handler` borrow below — `block_scroll()`
-            // takes `&self` and would conflict with the mutable borrow.
-            let block_scroll = tab.block_scroll();
+            // M3.5 / v1.3: read block_scroll into a local before the mutable
+            // `&mut pane.selection_handler` borrow below — `block_scroll()`
+            // takes `&self` and would conflict with the mutable borrow through
+            // the shared `pane` reference.
+            let block_scroll = pane.block_scroll_anchor.offset_value();
             // R3 task 6: arm the per-frame trace recorder and stamp the frame
             // id on the renderer (read by the Metal command-buffer label so the
             // async GPU-completion handler can correlate). The recorder lives
@@ -456,7 +538,7 @@ impl App {
             }
             renderer.draw(
                 terminal,
-                &mut tab.selection_handler,
+                &mut pane.selection_handler,
                 blink_on,
                 self.window_runtime.cursor_blink_phase,
                 &overlays,
@@ -464,6 +546,15 @@ impl App {
                 scroll_metrics,
                 self.interaction.scrollbar_hovered || self.interaction.scrollbar_drag.is_some(),
                 &tab_bar,
+                // v1.3 Batch 5.5: `active_pane_rect` is the split-tree-
+                // computed rect for the active pane; `background_panes`
+                // carries the other panes (each rendered as a grid-only
+                // background, clipped to its rect via a per-segment scissor
+                // in `encode_and_present`). Both are computed above before
+                // the mutable `pane` borrow. Empty for single-pane tabs
+                // (the common case — no change from pre-v1.3 behavior).
+                active_pane_rect,
+                &background_panes,
             );
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.

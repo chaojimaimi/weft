@@ -9,12 +9,12 @@ use weft_core::input::Modifiers;
 use super::Tab;
 
 #[derive(Clone, Copy)]
-pub(super) struct PendingTuiScroll {
-    pub(super) rows: i32,
-    pub(super) col: usize,
-    pub(super) row: usize,
-    pub(super) mods: Modifiers,
-    pub(super) resolve_at: Instant,
+pub(crate) struct PendingTuiScroll {
+    pub(crate) rows: i32,
+    pub(crate) col: usize,
+    pub(crate) row: usize,
+    pub(crate) mods: Modifiers,
+    pub(crate) resolve_at: Instant,
 }
 
 pub enum TuiScrollResolution {
@@ -65,16 +65,15 @@ impl Tab {
     /// Return the delay for the single wake needed to resolve the current
     /// ambiguous startup gesture. Repeated wheel events share the same wake.
     pub fn take_tui_scroll_wake_delay(&mut self) -> Option<std::time::Duration> {
-        let pending = self.pending_tui_scroll.as_ref()?;
+        // v1.3: snapshot `resolve_at` (Copy) so the `pending_tui_scroll` borrow
+        // releases before we mutate `tui_scroll_wake_scheduled` — both fields
+        // live on the active pane and would conflict through `DerefMut`.
+        let resolve_at = self.pending_tui_scroll.as_ref()?.resolve_at;
         if self.tui_scroll_wake_scheduled {
             return None;
         }
         self.tui_scroll_wake_scheduled = true;
-        Some(
-            pending
-                .resolve_at
-                .saturating_duration_since(std::time::Instant::now()),
-        )
+        Some(resolve_at.saturating_duration_since(std::time::Instant::now()))
     }
 
     /// Resolve an early gesture after the 50ms protocol grace period. If the
@@ -87,8 +86,13 @@ impl Tab {
         }
         let pending = self.pending_tui_scroll.take()?;
         self.tui_scroll_wake_scheduled = false;
-        let terminal = self.terminal.as_ref()?;
-        if !terminal.is_alt_screen_active() {
+        // v1.3: snapshot every value we need from `terminal` inside a single
+        // `if let` block so the immutable terminal borrow releases before we
+        // mutate `input_handler` / `tui_scroll_deadline` (which both deref
+        // through the active pane and would otherwise conflict).
+        let terminal_state = self.terminal.as_ref()?;
+        let is_alt_screen = terminal_state.is_alt_screen_active();
+        if !is_alt_screen {
             // The first ambiguous gesture has now been classified as ordinary
             // local scrolling. Consume the launch window so subsequent
             // trackpad events are immediate instead of paying 50ms each.
@@ -96,14 +100,22 @@ impl Tab {
             return Some(TuiScrollResolution::LocalRows(pending.rows));
         }
 
-        self.input_handler.app_cursor_keys = terminal.app_cursor_keys();
-        self.input_handler.mouse_protocol = terminal.mouse_protocol();
-        self.input_handler.sgr_mouse = terminal.sgr_mouse();
+        let app_cursor_keys = terminal_state.app_cursor_keys();
+        let mouse_protocol = terminal_state.mouse_protocol();
+        let sgr_mouse = terminal_state.sgr_mouse();
+        let mouse_protocol_off = mouse_protocol == weft_core::input::MouseProtocol::Off;
+        // NLL releases the immutable `pane.terminal` borrow at the end of the
+        // last expression above, so the mutations below are free to take a
+        // fresh `&mut` through `DerefMut`.
+
+        self.input_handler.app_cursor_keys = app_cursor_keys;
+        self.input_handler.mouse_protocol = mouse_protocol;
+        self.input_handler.sgr_mouse = sgr_mouse;
         self.tui_scroll_deadline = None;
         let count = pending.rows.unsigned_abs() as usize;
         let mut bytes = Vec::new();
 
-        if terminal.mouse_protocol() != weft_core::input::MouseProtocol::Off {
+        if !mouse_protocol_off {
             for _ in 0..count {
                 if let Some(encoded) = self.input_handler.encode_scroll(
                     pending.rows > 0,

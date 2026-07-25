@@ -67,4 +67,32 @@ pub enum Action {
     /// for Appearance / Font / Keybindings / Window.
     #[serde(rename = "toggle_settings")]
     ToggleSettings,
+    /// v1.3: Split the active pane horizontally (Cmd+D). The active pane's
+    /// content area is divided top/bottom, and a new shell session is
+    /// spawned in the bottom half. The new pane becomes the focused pane.
+    #[serde(rename = "split_horizontal")]
+    SplitHorizontal,
+    /// v1.3: Split the active pane vertically (Cmd+Shift+D). The active
+    /// pane's content area is divided left/right, and a new shell session
+    /// is spawned in the right half. The new pane becomes the focused pane.
+    #[serde(rename = "split_vertical")]
+    SplitVertical,
+    /// v1.3: Move keyboard focus to the next pane in declaration order
+    /// (Cmd+Option+] or Cmd+Option+Right). Wraps around to the first pane
+    /// when invoked on the last pane.
+    #[serde(rename = "focus_next_pane")]
+    FocusNextPane,
+    /// v1.3: Move keyboard focus to the previous pane in declaration order
+    /// (Cmd+Option+[ or Cmd+Option+Left). Wraps around to the last pane
+    /// when invoked on the first pane.
+    #[serde(rename = "focus_prev_pane")]
+    FocusPrevPane,
+    /// v1.3: Close the focused pane (Cmd+Shift+W). When the tab has only
+    /// one pane left, this is equivalent to `CloseTab` — the whole tab is
+    /// closed and the surrounding tab is activated. Distinct from
+    /// `CloseTab` (Cmd+W) which always closes the whole tab regardless of
+    /// pane count, preserving the Cmd+W shortcut's stable "close tab"
+    /// contract.
+    #[serde(rename = "close_pane")]
+    ClosePane,
 }

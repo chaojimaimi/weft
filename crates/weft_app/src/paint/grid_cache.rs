@@ -636,7 +636,7 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let block = mk_block_with_output(1, "echo", "a\nb\n");
         cache.ensure_cached(&block, 80);
-        cache.build_prefix_sum(&[block.clone()]);
+        cache.build_prefix_sum(std::slice::from_ref(&block));
         let ps1 = cache.prefix_sum().to_vec();
 
         // Second call with same blocks — should be a no-op.
@@ -650,7 +650,7 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let b1 = mk_block_with_output(1, "echo", "a\n");
         cache.ensure_cached(&b1, 80);
-        cache.build_prefix_sum(&[b1.clone()]);
+        cache.build_prefix_sum(std::slice::from_ref(&b1));
         assert_eq!(cache.prefix_sum(), &[0, 3]); // base = 1 + 2 = 3
 
         // Add a second block (older). blocks = [b2, b1] (b1 is newest).
@@ -668,7 +668,7 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let block = mk_block_with_output(1, "echo", "a\n");
         cache.ensure_cached(&block, 80);
-        cache.build_prefix_sum(&[block.clone()]);
+        cache.build_prefix_sum(std::slice::from_ref(&block));
         assert_eq!(cache.prefix_sum(), &[0, 3]);
 
         // Output grows → ensure_cached triggers rebuild, sets dirty.

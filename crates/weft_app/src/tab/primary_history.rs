@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use super::Tab;
 
 #[derive(Default)]
-pub(super) struct PrimaryHistoryRefresh {
+pub(crate) struct PrimaryHistoryRefresh {
     due: Option<Instant>,
     wake_scheduled: bool,
 }
@@ -71,17 +71,20 @@ impl Tab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane::Pane;
     use crate::AppMsg;
     use weft_core::vt::Terminal;
 
     fn primary_tui_tab() -> Tab {
-        let mut tab = Tab::empty();
-        tab.terminal = Some(Terminal::with_scrollback(24, 80, 100));
-        tab.terminal
+        // v1.3: build a pane with a live Terminal (no PTY), wrap in a single-pane
+        // tab, then drive the OSC 133 prompt/command sequence so the block tracker
+        // enters CommandExecuting — the precondition for primary-history snapshots.
+        let mut pane = Pane::with_terminal_only(100);
+        pane.terminal
             .as_mut()
             .unwrap()
             .process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b[6G\x1b[13G");
-        tab
+        Tab::with_single_pane(pane)
     }
 
     #[test]

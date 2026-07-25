@@ -59,8 +59,8 @@ pub use keybindings::KeyBindings;
 pub use parsers::{parse_binding, parse_hex};
 pub use save::ConfigSaveError;
 pub use sections::{
-    EditorConfig, FontConfig, LogoConfig, LogoVariant, ScrollbackConfig, SyntaxConfig, ThemeConfig,
-    WindowConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, ScrollbackConfig, SyntaxConfig,
+    ThemeConfig, WindowConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{SyntaxColors, Theme};
 
@@ -81,6 +81,11 @@ pub struct Config {
     pub scrollback: ScrollbackConfig,
     pub editor: EditorConfig,
     pub logo: LogoConfig,
+    /// v1.6 AI integration. Disabled by default (`provider = None`).
+    /// Config schema is parsed/serialized today so existing config files keep
+    /// working; the runtime consumer (`weft_app/src/ai/`) is scaffolding-only
+    /// in v1.3 (see ROADMAP DC-8).
+    pub ai: AiConfig,
     /// Raw user keybinding overrides: `"cmd+x" = "copy"`. Resolved later via
     /// [`Config::keybindings`] (merged onto defaults).
     pub keybindings: HashMap<String, Action>,
@@ -317,6 +322,11 @@ impl Config {
             }
         }
 
+        // [ai] section — v1.6 AI integration. Implementation lives in
+        // `save::write_ai_section` to keep this file within its
+        // architecture-gate line budget.
+        save::write_ai_section(&mut doc, &self.ai);
+
         // [keybindings] section.
         if !self.keybindings.is_empty() {
             let mut kb_table = toml_edit::table();
@@ -344,6 +354,11 @@ impl Config {
                     Action::NextTab => "next_tab",
                     Action::PrevTab => "prev_tab",
                     Action::ToggleSettings => "toggle_settings",
+                    Action::SplitHorizontal => "split_horizontal",
+                    Action::SplitVertical => "split_vertical",
+                    Action::FocusNextPane => "focus_next_pane",
+                    Action::FocusPrevPane => "focus_prev_pane",
+                    Action::ClosePane => "close_pane",
                 };
                 kt.insert(binding, toml_edit::value(action_str));
             }
@@ -1343,6 +1358,94 @@ path = "#0000ff"
         let s = "\"toggle_settings\"";
         let back: Action = serde_json::from_str(s).unwrap();
         assert_eq!(back, Action::ToggleSettings);
+    }
+
+    // ── v1.3: pane split / focus / close default bindings ─────────────
+
+    #[test]
+    fn split_vertical_has_default_keybinding_cmd_d() {
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char('d'), Modifiers::SUPER),
+            Some(Action::SplitVertical)
+        );
+    }
+
+    #[test]
+    fn split_horizontal_has_default_keybinding_cmd_shift_d() {
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char('d'), Modifiers::SUPER | Modifiers::SHIFT),
+            Some(Action::SplitHorizontal)
+        );
+    }
+
+    #[test]
+    fn focus_next_pane_has_default_keybindings_bracket_and_arrow() {
+        let kb = KeyBindings::default();
+        // Cmd+Option+]
+        assert_eq!(
+            kb.lookup(KeyCode::Char(']'), Modifiers::SUPER | Modifiers::ALT),
+            Some(Action::FocusNextPane)
+        );
+        // Cmd+Option+Right (spatial variant)
+        assert_eq!(
+            kb.lookup(KeyCode::Right, Modifiers::SUPER | Modifiers::ALT),
+            Some(Action::FocusNextPane)
+        );
+    }
+
+    #[test]
+    fn focus_prev_pane_has_default_keybindings_bracket_and_arrow() {
+        let kb = KeyBindings::default();
+        // Cmd+Option+[
+        assert_eq!(
+            kb.lookup(KeyCode::Char('['), Modifiers::SUPER | Modifiers::ALT),
+            Some(Action::FocusPrevPane)
+        );
+        // Cmd+Option+Left
+        assert_eq!(
+            kb.lookup(KeyCode::Left, Modifiers::SUPER | Modifiers::ALT),
+            Some(Action::FocusPrevPane)
+        );
+    }
+
+    #[test]
+    fn close_pane_has_default_keybinding_cmd_shift_w() {
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char('w'), Modifiers::SUPER | Modifiers::SHIFT),
+            Some(Action::ClosePane)
+        );
+    }
+
+    #[test]
+    fn pane_actions_serde_roundtrip() {
+        // Snake-case names survive a serde_json roundtrip so user TOML like
+        // `"cmd+d" = "split_horizontal"` parses to the right Action.
+        for (name, expected) in [
+            ("split_horizontal", Action::SplitHorizontal),
+            ("split_vertical", Action::SplitVertical),
+            ("focus_next_pane", Action::FocusNextPane),
+            ("focus_prev_pane", Action::FocusPrevPane),
+            ("close_pane", Action::ClosePane),
+        ] {
+            let s = format!("\"{name}\"");
+            let back: Action = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, expected, "serde roundtrip for {name}");
+        }
+    }
+
+    #[test]
+    fn close_tab_cmd_w_still_closes_tab_not_pane() {
+        // Cmd+W must remain CloseTab — pane close lives on Cmd+Shift+W so the
+        // two contracts stay independent and existing users don't lose a tab
+        // when they meant to close a pane.
+        let kb = KeyBindings::default();
+        assert_eq!(
+            kb.lookup(KeyCode::Char('w'), Modifiers::SUPER),
+            Some(Action::CloseTab)
+        );
     }
 
     // ── T2: per-field Config::save roundtrip tests ────────────────────

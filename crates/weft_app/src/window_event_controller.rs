@@ -48,12 +48,23 @@ impl App {
                         // (<1ms) so doing it on every intermediate event is
                         // fine. Background tabs also need resizing so their
                         // content wraps correctly when switched to.
+                        //
+                        // v1.3 Batch 6: resize ALL panes per tab according to
+                        // their split-tree rects. For single-pane tabs this is
+                        // equivalent to the old `resize_terminal_and_queue`.
                         let header_rows = renderer.block_header_rows();
                         let layout_ctx = base_layout.layout_ctx();
+                        let content_rect: weft_core::pane_layout::Rect = [
+                            base_layout.content.left as f32,
+                            base_layout.content.top as f32,
+                            base_layout.content.right as f32,
+                            base_layout.content.bottom as f32,
+                        ];
+                        let cell_w = base_layout.cell_width as f32;
+                        let cell_h = base_layout.cell_height as f32;
                         for (tab_index, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
                             if tab.terminal.is_some() {
-                                let (new_rows, new_cols) = base_layout.dimensions();
-                                tab.resize_terminal_and_queue(new_rows, new_cols);
+                                tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
 
                                 // `block_scroll_offset` is measured from the
                                 // bottom of a width-dependent document. A

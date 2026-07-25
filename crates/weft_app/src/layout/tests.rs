@@ -73,6 +73,19 @@ fn is_visible_rejects_degenerate_rect() {
     assert!(!ctx.is_visible([10.0, 10.0, 20.0, 10.0])); // zero height
 }
 
+#[test]
+fn right_and_bottom_respect_clip_rect() {
+    let ctx = sample_ctx().child([100.0, 200.0, 700.0, 900.0]);
+    // left()/top() are driven by padding + pane_origin, not clip.
+    assert_eq!(ctx.left(), 16.0);
+    assert_eq!(ctx.top(), 16.0);
+    // right()/bottom() clamp to the clip so pane-local overlays stay inside.
+    assert_eq!(ctx.right(), 700.0);
+    assert_eq!(ctx.bottom(), 900.0);
+    assert_eq!(ctx.width(), 700.0 - 16.0);
+    assert_eq!(ctx.height(), 900.0 - 16.0);
+}
+
 // ── Spacing tokens ──────────────────────────────────────────────────
 
 #[test]
@@ -602,6 +615,45 @@ fn prompt_hit_row_is_clamped_to_visible_scrolled_window() {
         prompt_line_at_y(&layout, layout.box_rect[3], 20, 30),
         29.min(20 + layout.visible_rows - 1)
     );
+}
+
+/// v1.3: when a clip rect is set (multi-pane active pane), the prompt box
+/// must stay inside the clip instead of spanning the full viewport.
+#[test]
+fn prompt_respects_clip_rect() {
+    // Build a context that mirrors the renderer's setup for the right pane
+    // of a vertical split: pane_origin shifts left()/top() to the pane's
+    // top-left, and clip clamps right()/bottom() to the pane's bottom-right.
+    let mut ctx = sample_ctx();
+    let pane_rect = [808.0_f32, 57.0, 1600.0, 1200.0];
+    ctx.pane_origin = (
+        pane_rect[0] - ctx.padding_x - ctx.chrome_left,
+        pane_rect[1] - ctx.padding_y - ctx.chrome_top,
+    );
+    ctx.clip = Some(pane_rect);
+
+    let layout = layout_prompt(&ctx, 1, 0, 0, 0);
+
+    // Box is pinned to pane edges.
+    assert!((layout.box_rect[0] - 808.0).abs() < 1e-3);
+    assert!((layout.box_rect[2] - (1600.0 - 16.0)).abs() < 1e-3);
+    assert!(
+        layout.box_rect[1] >= 57.0,
+        "box top must stay inside pane top"
+    );
+    assert!(
+        (layout.box_rect[3] - (1200.0 - 16.0)).abs() < 1e-3,
+        "box bottom must equal pane bottom"
+    );
+
+    // Width in columns is derived from the pane width, not full viewport.
+    let expected_cols = ((1600.0_f32 - 16.0 - 808.0) / 7.2).floor() as usize;
+    assert_eq!(layout.box_cols, expected_cols);
+
+    // Prompt glyph and caret are positioned relative to the pane left edge.
+    assert!((layout.left - 808.0).abs() < 1e-3);
+    assert!((layout.first_line_text_x - (808.0 + 2.0 * 7.2)).abs() < 1e-3);
+    assert!((layout.cursor_x - (808.0 + 2.0 * 7.2)).abs() < 1e-3);
 }
 
 #[test]

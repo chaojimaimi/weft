@@ -37,6 +37,11 @@ pub struct LayoutCtx {
     /// physical px. The content area starts to the right of the sidebar. 0 when
     /// the panel is closed.
     pub chrome_left: f32,
+    /// v1.3: Per-pane origin offset `(x, y)` in physical pixels. Added to
+    /// `left()` / `top()` so the grid and overlays render at the pane's
+    /// split-tree-computed position. `(0.0, 0.0)` for single-pane tabs (the
+    /// common case — no change from pre-v1.3 behavior).
+    pub pane_origin: (f32, f32),
     /// Optional clip rectangle for nested overlays (children stay inside).
     /// `None` means "use the full content rect". Stored as `[x0, y0, x1, y1]`.
     pub clip: Option<Rect>,
@@ -60,41 +65,68 @@ impl LayoutCtx {
             padding_y,
             chrome_top: 0.0,
             chrome_left: 0.0,
+            pane_origin: (0.0, 0.0),
             clip: None,
         }
     }
 
-    /// Left edge of the content area (= horizontal padding + chrome_left).
+    /// Left edge of the content area (= horizontal padding + chrome_left +
+    /// pane_origin.x).
     #[inline]
     pub fn left(&self) -> f32 {
-        self.padding_x + self.chrome_left
+        self.padding_x + self.chrome_left + self.pane_origin.0
     }
 
     /// Right edge of the content area.
+    ///
+    /// When a clip rectangle is set (multi-pane mode: the active pane's
+    /// split-tree rect), the right edge is clamped to the clip so pane-local
+    /// overlays like the prompt and Find dialog stay inside the active pane
+    /// instead of bleeding across the whole viewport.
     #[inline]
     pub fn right(&self) -> f32 {
-        self.viewport.0 - self.padding_x
+        let base = self.viewport.0 - self.padding_x;
+        match self.clip {
+            Some([_, _, x1, _]) => x1.min(base),
+            None => base,
+        }
     }
 
-    /// Top edge of the content area (= tab bar + vertical padding).
+    /// Top edge of the content area (= tab bar + vertical padding +
+    /// pane_origin.y).
     #[inline]
     pub fn top(&self) -> f32 {
-        self.padding_y + self.chrome_top
+        self.padding_y + self.chrome_top + self.pane_origin.1
     }
 
     /// Bottom edge of the content area.
+    ///
+    /// Like [`right`](Self::right), this respects a clip rectangle so
+    /// pane-local overlays are confined to the active pane in multi-pane tabs.
     #[inline]
     pub fn bottom(&self) -> f32 {
-        self.viewport.1 - self.padding_y
+        let base = self.viewport.1 - self.padding_y;
+        match self.clip {
+            Some([_, _, _, y1]) => y1.min(base),
+            None => base,
+        }
     }
 
-    /// Content width (viewport minus 2× horizontal padding).
+    /// Content width.
+    ///
+    /// In single-pane tabs this is `viewport - 2× horizontal padding`. In
+    /// multi-pane tabs it is the active pane's width because [`right`](Self::right)
+    /// is clipped to the active pane rect.
     #[inline]
     pub fn width(&self) -> f32 {
         self.right() - self.left()
     }
 
-    /// Content height (viewport minus 2× vertical padding, minus tab bar).
+    /// Content height.
+    ///
+    /// In single-pane tabs this is `viewport - 2× vertical padding - tab bar`.
+    /// In multi-pane tabs it is the active pane's height because
+    /// [`bottom`](Self::bottom) is clipped to the active pane rect.
     #[inline]
     pub fn height(&self) -> f32 {
         self.bottom() - self.top()

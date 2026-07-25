@@ -6,6 +6,7 @@
 
 use crate::effect::Effect;
 use weft_core::config::Action;
+use weft_core::pane_layout::SplitDirection;
 
 impl crate::App {
     /// Dispatch a weft action resolved from a keybinding. Returns true if the
@@ -142,6 +143,91 @@ impl crate::App {
                     self.open_settings();
                 }
                 self.request_redraw();
+                true
+            }
+            // v1.3 Batch 3: pane split / focus / close. The split tree and
+            // per-pane PTY/Terminal state are wired up; the multi-pane
+            // renderer (Batch 5) will make splits visible. Until then,
+            // splits "work" (panes exist, focus cycles, PTYs run) but only
+            // the active pane is drawn — the inactive panes keep their
+            // terminals updated in the background via pump_pty /
+            // process_messages on the active tab's Deref path.
+            Action::SplitHorizontal | Action::SplitVertical => {
+                let direction = match action {
+                    Action::SplitHorizontal => SplitDirection::Horizontal,
+                    Action::SplitVertical => SplitDirection::Vertical,
+                    // Unreachable: the match arm only enters for these two.
+                    _ => return true,
+                };
+                let scrollback = self.config_state.config.scrollback.lines;
+                let tab = self.sessions.active_mut();
+                let old_active = tab.active_pane_id();
+                match tab.split_active_pane(direction, 0.5, scrollback, &self.proxy) {
+                    Ok(id) => {
+                        tracing::info!(?id, ?direction, ?old_active, "pane split");
+                        let tab2 = self.sessions.active();
+                        tracing::info!(
+                            panes = ?tab2.split_tree().panes(),
+                            active = ?tab2.active_pane_id(),
+                            "split tree state after split"
+                        );
+                        // Apply theme palette to the new pane's terminal so
+                        // it matches the window's renderer theme (same as
+                        // new_tab does). The atlas is shared per-window.
+                        // Nested `if let` keeps the disjoint-field borrows
+                        // (`self.sessions` mut, `self.renderer` imm) visible
+                        // to the borrow checker.
+                        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                            if let Some(r) = self.renderer.as_ref() {
+                                t.set_palette(r.theme().palette);
+                            }
+                        }
+                        // v1.3 Batch 6 will resize the new pane to its
+                        // split-tree rect; for now recompute_layout keeps
+                        // the active pane's terminal in sync with the
+                        // viewport.
+                        self.recompute_layout();
+                        self.request_redraw();
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, ?action, "pane split failed");
+                    }
+                }
+                true
+            }
+            Action::FocusNextPane => {
+                if let Some(id) = self.sessions.active_mut().focus_next_pane() {
+                    tracing::info!(?id, "focus next pane");
+                    self.refresh_find_for_active_tab();
+                    self.request_redraw();
+                }
+                true
+            }
+            Action::FocusPrevPane => {
+                if let Some(id) = self.sessions.active_mut().focus_prev_pane() {
+                    tracing::info!(?id, "focus prev pane");
+                    self.refresh_find_for_active_tab();
+                    self.request_redraw();
+                }
+                true
+            }
+            Action::ClosePane => {
+                match self.sessions.active_mut().close_active_pane() {
+                    Ok(true) => {
+                        // Last pane closed — close the whole tab.
+                        tracing::info!("last pane closed, closing tab");
+                        let effects = self.close_tab();
+                        self.drain_effects(effects);
+                    }
+                    Ok(false) => {
+                        tracing::info!("pane closed, tab still has panes");
+                        self.recompute_layout();
+                        self.request_redraw();
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "close pane failed");
+                    }
+                }
                 true
             }
         }

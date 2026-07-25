@@ -3,6 +3,8 @@
 //! Controllers return these values instead of directly performing PTY,
 //! clipboard, persistence, exit or redraw side effects.
 
+use weft_core::pane_layout::PaneId;
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Effect {
     WritePty {
@@ -12,8 +14,12 @@ pub(crate) enum Effect {
     InterruptPty {
         tab: usize,
     },
+    /// Resize a specific pane's PTY. `pane_id` targets an individual pane
+    /// within the tab's split tree (v1.3 multi-pane); pre-v1.3 callers pass
+    /// the active pane's id.
     ResizePty {
         tab: usize,
+        pane_id: PaneId,
         rows: usize,
         cols: usize,
     },
@@ -125,7 +131,7 @@ pub(crate) fn ime_commit_effects(tab: usize, text: &str) -> Vec<Effect> {
 }
 
 pub(crate) fn pending_resize_effects(
-    pending: &[Option<(usize, usize)>],
+    pending: &[Vec<(PaneId, (usize, usize))>],
     active_tab: usize,
     active_ready: bool,
     cascade_settled: bool,
@@ -133,14 +139,20 @@ pub(crate) fn pending_resize_effects(
     pending
         .iter()
         .enumerate()
-        .filter_map(|(tab, dimensions)| {
-            let (rows, cols) = (*dimensions)?;
+        .flat_map(|(tab, panes)| {
             let ready = if tab == active_tab {
                 active_ready
             } else {
                 cascade_settled
             };
-            ready.then_some(Effect::ResizePty { tab, rows, cols })
+            panes.iter().filter_map(move |(pane_id, (rows, cols))| {
+                ready.then_some(Effect::ResizePty {
+                    tab,
+                    pane_id: *pane_id,
+                    rows: *rows,
+                    cols: *cols,
+                })
+            })
         })
         .collect()
 }
@@ -200,11 +212,17 @@ mod tests {
 
     #[test]
     fn active_resize_flushes_before_background_tabs() {
-        let pending = [Some((30, 100)), Some((40, 120)), None];
+        use weft_core::pane_layout::PaneId;
+        let pending = [
+            vec![(PaneId(1), (30, 100))],
+            vec![(PaneId(2), (40, 120))],
+            vec![],
+        ];
         assert_eq!(
             pending_resize_effects(&pending, 1, true, false),
             [Effect::ResizePty {
                 tab: 1,
+                pane_id: PaneId(2),
                 rows: 40,
                 cols: 120,
             }]
@@ -214,22 +232,46 @@ mod tests {
 
     #[test]
     fn settled_resize_emits_only_latest_pending_dimensions_per_tab() {
-        let pending = [Some((44, 132)), Some((36, 90))];
+        use weft_core::pane_layout::PaneId;
+        let pending = [vec![(PaneId(1), (44, 132))], vec![(PaneId(2), (36, 90))]];
         assert_eq!(
             pending_resize_effects(&pending, 0, true, true),
             [
                 Effect::ResizePty {
                     tab: 0,
+                    pane_id: PaneId(1),
                     rows: 44,
                     cols: 132,
                 },
                 Effect::ResizePty {
                     tab: 1,
+                    pane_id: PaneId(2),
                     rows: 36,
                     cols: 90,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn multi_pane_resize_emits_one_effect_per_pane() {
+        use weft_core::pane_layout::PaneId;
+        // Tab 0 has two panes pending resize; tab 1 has one.
+        let pending = [
+            vec![(PaneId(1), (30, 80)), (PaneId(2), (30, 40))],
+            vec![(PaneId(3), (40, 100))],
+        ];
+        let effects = pending_resize_effects(&pending, 0, true, true);
+        assert_eq!(effects.len(), 3);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::ResizePty {
+                pane_id: PaneId(2),
+                rows: 30,
+                cols: 40,
+                ..
+            }
+        )));
     }
 
     #[test]

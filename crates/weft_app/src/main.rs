@@ -8,6 +8,10 @@ mod acceptance_snapshots;
 mod accessibility;
 mod accessibility_actions;
 mod accessibility_model;
+// v1.6 AI integration — scaffolding only, not wired into the app shell in
+// v1.3. See `ai/mod.rs` header for the deferral rationale and DC-8.
+#[allow(dead_code)]
+mod ai;
 mod app;
 mod app_runtime;
 mod app_state;
@@ -39,6 +43,7 @@ mod paint;
 mod palette_component;
 mod palette_controller;
 mod palette_state;
+mod pane;
 mod panel_component;
 mod panel_controller;
 mod panel_scrollbar;

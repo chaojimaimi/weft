@@ -16,6 +16,18 @@ use weft_core::config::{FontConfig, Theme};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
+/// v1.3 Batch 5: A background (non-active) pane to render alongside the
+/// active pane. Carries the pane's split-tree-computed rect (physical px,
+/// `[x0, y0, x1, y1]`) and a borrow of the pane's `Terminal`. Background
+/// panes render as a grid only — no overlays, no cursor, no selection —
+/// and are clipped to `rect` via a per-segment scissor rect in
+/// `encode_and_present`.
+#[derive(Clone, Copy)]
+pub struct PaneRenderInfo<'a> {
+    pub rect: crate::layout::Rect,
+    pub terminal: &'a Terminal,
+}
+
 mod atlas_warmup;
 mod runtime;
 
@@ -232,6 +244,17 @@ pub struct MetalRenderer {
     /// label so the async `add_completed_handler` can correlate GPU completion
     /// back to the originating frame. Set by `draw()`'s caller each frame.
     pub(crate) frame_id: Cell<u64>,
+    /// v1.3 Batch 5: Per-pane `(rect, instance_range)` pairs for the current
+    /// frame. Populated by `draw()` while building grid instances for each
+    /// pane (active + background); read by `encode_and_present` to set a
+    /// scissor rect per segment so each pane's cells are clipped to its
+    /// split-tree-computed rect.
+    ///
+    /// Stored in a `RefCell` for the same reason as `frame_trace` / cache
+    /// fields: `draw()` holds an immutable `self.layer` borrow for the whole
+    /// frame, so `&mut self` is unavailable. Cleared at the top of each
+    /// `draw()` and rebuilt as panes are processed.
+    pub(crate) pane_instance_ranges: RefCell<Vec<(crate::layout::Rect, std::ops::Range<usize>)>>,
 }
 
 impl MetalRenderer {
@@ -254,11 +277,26 @@ impl MetalRenderer {
         // v0.9 H1: tab bar state. When tab_count > 1 the tab bar is drawn
         // at the top of the window and the content area is shifted down.
         tab_bar: &TabBarDrawState,
+        // v1.3 Batch 5: Multi-pane rendering. `active_pane_rect` is the
+        // split-tree-computed rect for the active pane (the `terminal` /
+        // `selection` args belong to it). `background_panes` carries the
+        // other panes — each is rendered as a grid only (no overlays, no
+        // cursor, no selection) and clipped to its rect via a per-segment
+        // scissor in `encode_and_present`. Empty for single-pane tabs (the
+        // common case — no change from pre-v1.3 behavior).
+        active_pane_rect: crate::layout::Rect,
+        background_panes: &[PaneRenderInfo<'_>],
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,
         };
+
+        // v1.3 Batch 5: reset per-pane scissor ranges for this frame. Each
+        // grid-instance segment (one per pane) is recorded here as
+        // `(rect, byte_range_in_instances)` so `encode_and_present` can
+        // set a scissor rect per segment before its draw call.
+        self.pane_instance_ranges.borrow_mut().clear();
 
         // v1.0 fix: detect drawable/viewport size mismatch during macOS live
         // resize. CAMetalLayer.set_drawable_size() is asynchronous — the
@@ -422,7 +460,21 @@ impl MetalRenderer {
         // reverts to raw text (matches Warp). Alt-screen / not-integrated: grid.
         let vp_h = self.viewport.1;
         let pad_y = self.padding_y;
-        let show_blocks = terminal.show_block_view();
+        // v1.3 fix: when there are background panes (split active), force
+        // grid view for the active pane. Block view draws an opaque full-
+        // viewport background quad ([0,0,vp_w,region_bottom_y]) that would
+        // cover the background panes' instances, and its layout (prompt
+        // position, block stacking) is computed against the full viewport
+        // rather than the pane rect. Grid view renders per-cell instances
+        // that respect pane_origin and scissor correctly. Block view multi-
+        // pane support is deferred to a later iteration.
+        let show_blocks = terminal.show_block_view() && background_panes.is_empty();
+        tracing::info!(
+            show_blocks_terminal = terminal.show_block_view(),
+            background_panes_empty = background_panes.is_empty(),
+            show_blocks,
+            "renderer view mode"
+        );
         // v1.0 P1.5-B2: when the view mode switches (alt screen enter/exit),
         // the grid_row_cache and offscreen content are stale — force a full
         // rebuild. Without this, an idle frame after the switch could set
@@ -454,6 +506,70 @@ impl MetalRenderer {
         // the block view branch; remain 0 in grid view.
         let mut session_block_count: usize = 0;
         let mut bv_rows_count: usize = 0;
+
+        // v1.3 Batch 5 fix: render background panes BEFORE the active pane's
+        // view (block or grid). Previously this only ran in the grid-view
+        // (alt-screen) branch, so splits were invisible in block view (the
+        // default shell prompt mode). Background panes render as grid cells
+        // (instances) regardless of the active pane's view mode — a
+        // background pane is always idle (no in-flight command), so its
+        // grid is the right thing to draw.
+        //
+        // LayoutCtx.pane_origin is swapped per-pane around the
+        // `build_grid_instances_for_background_pane` call so cell X/Y math
+        // offsets to the pane's split-tree-computed position. `base_ctx`
+        // holds the chrome-only context (padding + tab bar + sidebar) so
+        // each pane starts from the same chrome baseline before adding its
+        // origin.
+        if !background_panes.is_empty() {
+            let base_ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+            // The split-tree rects are in absolute viewport coordinates
+            // (they include padding + chrome). `pane_origin` must be the
+            // offset from the content-area origin so that `left()` / `top()`
+            // and the grid builders add padding + chrome + pane_origin once.
+            let content_origin_x = base_ctx.padding_x + base_ctx.chrome_left;
+            let content_origin_y = base_ctx.padding_y + base_ctx.chrome_top;
+            for bg in background_panes {
+                let [bx0, by0, _bx1, _by1] = bg.rect;
+                let mut bg_ctx = base_ctx;
+                bg_ctx.pane_origin = (bx0 - content_origin_x, by0 - content_origin_y);
+                self.layout_ctx = Some(bg_ctx);
+                let start = instances.len();
+                let bg_instances = self.build_grid_instances_for_background_pane(bg.terminal);
+                let bg_instance_count = bg_instances.len() / 16;
+                instances.extend_from_slice(&bg_instances);
+                let end = instances.len();
+                tracing::info!(
+                    bg_rect = ?bg.rect,
+                    bg_instance_count,
+                    grid_rows = bg.terminal.grid().num_rows,
+                    grid_cols = bg.terminal.grid().num_cols,
+                    "built background pane instances"
+                );
+                self.pane_instance_ranges
+                    .borrow_mut()
+                    .push((bg.rect, start..end));
+            }
+            // Restore layout_ctx to the active pane's origin before building
+            // its instances / vertices. The active pane's overlays (prompt,
+            // find, etc.) also read pane_origin from this context.
+            let [ax0, ay0, _ax1, _ay1] = active_pane_rect;
+            let mut active_ctx = base_ctx;
+            active_ctx.pane_origin = (ax0 - content_origin_x, ay0 - content_origin_y);
+            // v1.3: confine pane-local overlays (prompt, find, completion,
+            // status hint) to the active pane's rect so they don't bleed
+            // across background panes. Global overlays such as Settings use
+            // the full viewport directly and are unaffected.
+            active_ctx.clip = Some(active_pane_rect);
+            self.layout_ctx = Some(active_ctx);
+            // The renderer's per-row grid cache is global, not per-pane.
+            // When the active pane changes (e.g. after a split) the cache may
+            // hold content from a different pane; a newly-created pane may
+            // also have no dirty rows. Force a full rebuild of the active
+            // pane so its grid renders correctly on the first multi-pane frame.
+            self.force_full_grid_redraw();
+        }
+
         let mut vertices: Vec<f32> = if show_blocks {
             let (v, regions, bv_rows) = if let Some(p) = prompt {
                 let box_top_y = crate::layout::layout_prompt(
@@ -527,6 +643,16 @@ impl MetalRenderer {
             if terminal.is_alt_screen_active() || terminal.primary_screen_app_active() {
                 self.force_full_grid_redraw();
             }
+
+            // v1.3 Batch 5: background panes are rendered above (before the
+            // if/else) so both block view and grid view show them. Here we
+            // only need to ensure `layout_ctx` has the active pane's origin
+            // set (it was set above if background_panes is non-empty; for
+            // single-pane tabs it was never changed).
+            if !background_panes.is_empty() {
+                // layout_ctx already restored to active pane's origin above.
+            }
+
             let cursor_visible_this_frame = crate::terminal_geometry::grid_cursor_visible(
                 terminal.cursor_style,
                 terminal.cursor_visible,
@@ -545,7 +671,22 @@ impl MetalRenderer {
                     owned_rows: terminal.primary_screen_viewport_ownership(),
                 },
             );
-            instances = grid_instances;
+            // v1.3 Batch 5: record the active pane's instance range for the
+            // scissor pass. `start` is the current length BEFORE appending
+            // the active pane's instances; `end` is after.
+            let active_start = instances.len();
+            instances.extend_from_slice(&grid_instances);
+            let active_end = instances.len();
+            tracing::info!(
+                active_rect = ?active_pane_rect,
+                active_instance_count = (active_end - active_start) / 16,
+                grid_rows = grid.num_rows,
+                grid_cols = grid.num_cols,
+                "built active pane instances"
+            );
+            self.pane_instance_ranges
+                .borrow_mut()
+                .push((active_pane_rect, active_start..active_end));
             dirty_row_count = grid_dirty_rows;
             Vec::new()
         };

@@ -41,6 +41,25 @@ impl Default for KeyBindings {
             ("cmd+shift+left_bracket", Action::PrevTab),
             // v1.0 S1: Settings panel (macOS-standard Cmd+,).
             ("cmd+comma", Action::ToggleSettings),
+            // v1.3: pane splits. Cmd+D splits the active pane into left/right;
+            // Cmd+Shift+D splits into top/bottom. Matches tmux's prefix+% / +"|"
+            // mental model but without the prefix, mirroring IDE defaults
+            // (VSCode: Cmd+\, iTerm2: Cmd+D / Cmd+Shift+D).
+            ("cmd+d", Action::SplitVertical),
+            ("cmd+shift+d", Action::SplitHorizontal),
+            // v1.3: pane focus cycling. Cmd+Option+] / [ mirrors the existing
+            // Cmd+Shift+] / [ tab-switching shape, with Option as the "within
+            // tab" modifier. Cmd+Option+Arrow variants are also bound so users
+            // can navigate spatially.
+            ("cmd+alt+right_bracket", Action::FocusNextPane),
+            ("cmd+alt+left_bracket", Action::FocusPrevPane),
+            ("cmd+alt+right", Action::FocusNextPane),
+            ("cmd+alt+left", Action::FocusPrevPane),
+            // v1.3: close the focused pane. Cmd+Shift+W is distinct from
+            // Cmd+W (CloseTab) so the two contracts stay independent: Cmd+W
+            // always closes the whole tab; Cmd+Shift+W closes just the pane
+            // (and falls through to tab-close when only one pane remains).
+            ("cmd+shift+w", Action::ClosePane),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {

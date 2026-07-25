@@ -253,13 +253,18 @@ impl MetalRenderer {
                 }
 
                 let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-                let x = self.padding_x + chrome_left + col as f32 * cw;
+                // v1.3: pane_origin offsets the grid to the pane's
+                // split-tree-computed position. (0.0, 0.0) for single-pane
+                // tabs — no change from pre-v1.3 behavior.
+                let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
+                let x = self.padding_x + chrome_left + pane_origin_x + col as f32 * cw;
                 // v0.9 H1 fix: shift grid down by chrome_top (tab bar height)
                 // so the first row isn't covered by the tab bar. The LayoutCtx
                 // is set on self at the top of draw(); chrome_top is 0 when
                 // there's only one tab (no tab bar drawn).
                 let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
-                let y = self.padding_y + chrome_top + row as f32 * ch;
+                let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
+                let y = self.padding_y + chrome_top + pane_origin_y + row as f32 * ch;
 
                 // Determine cell colors (resolve the cell's color-origin against
                 // the palette / theme defaults).
@@ -422,6 +427,166 @@ impl MetalRenderer {
             out.extend_from_slice(rv);
         }
         (out, rebuilt_rows)
+    }
+
+    /// v1.3 Batch 5: Build grid instances for a **background** (non-active)
+    /// pane. Unlike [`build_grid_instances`](Self::build_grid_instances), this
+    /// path:
+    ///
+    /// - Does NOT touch `grid_row_cache` / `prev_cursor_*` / `force_full_grid`
+    ///   or any other active-pane cache state — background panes would
+    ///   otherwise pollute the active pane's incremental-rendering state.
+    /// - Does NOT render the cursor or selection (those belong to the active
+    ///   pane only — a background pane's cursor is invisible by convention).
+    /// - Rebuilds every cell every frame (no dirty-row tracking). This is
+    ///   acceptable because background panes are typically idle (no PTY output
+    ///   streaming), and the cost is bounded by pane size (usually ≤ 80×24 =
+    ///   ~1920 cells = ~30 KB of instance data per pane per frame).
+    ///
+    /// The caller (`draw()`) is responsible for setting `self.layout_ctx`
+    /// with the correct `pane_origin` for this pane BEFORE calling this
+    /// method, since the cell X/Y math reads `pane_origin` from the layout
+    /// context (same as the active-pane path).
+    pub(crate) fn build_grid_instances_for_background_pane(
+        &self,
+        terminal: &weft_core::vt::Terminal,
+    ) -> Vec<f32> {
+        let grid = terminal.grid();
+        let palette = terminal.palette();
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let num_rows = grid.num_rows;
+        let num_cols = grid.num_cols;
+
+        let default_fg = color_to_normalized(self.theme.foreground);
+        let default_bg = color_to_normalized(self.theme.background);
+
+        // Background panes scale bg alpha by window opacity (same as active
+        // pane) so transparent windows stay transparent across all panes.
+        // Selection/cursor colors are unused here.
+        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+        let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
+        let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+        let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
+
+        // Primary-screen masking: alt-screen TUIs (vim/less/man) own some
+        // viewport rows; the primary-screen transcript shows through the
+        // rest. Background panes share the same masking as the active pane
+        // so a split with one pane running vim and the other at the prompt
+        // renders correctly in both.
+        let hidden_before_row = terminal.primary_screen_visible_row_start();
+        let owned_rows = terminal.primary_screen_viewport_ownership();
+
+        // v1.3 diagnostic: count non-empty cells to verify the background
+        // pane's grid actually has content. In block view mode the grid may
+        // only hold the current prompt line while history lives in
+        // BlockTracker — if so, non_empty_cells will be near 0 and the
+        // background pane will appear blank.
+        let mut non_empty_cells = 0usize;
+        let mut first_non_empty_row: Option<usize> = None;
+        let mut last_non_empty_row: Option<usize> = None;
+        for row in 0..num_rows {
+            for col in 0..num_cols {
+                let c = grid.cell(row, col);
+                if c.character != ' ' && c.character != '\0'
+                    && !c.flags.contains(CellFlags::WIDE_SPACER)
+                {
+                    non_empty_cells += 1;
+                    if first_non_empty_row.is_none() {
+                        first_non_empty_row = Some(row);
+                    }
+                    last_non_empty_row = Some(row);
+                }
+            }
+        }
+        tracing::info!(
+            non_empty_cells,
+            first_non_empty_row = ?first_non_empty_row,
+            last_non_empty_row = ?last_non_empty_row,
+            scroll_offset = grid.scroll_offset,
+            show_block_view = terminal.show_block_view(),
+            hidden_before_row = ?hidden_before_row,
+            "background pane grid content diagnostic"
+        );
+
+        let mut out = Vec::with_capacity(num_rows * num_cols * 16);
+
+        for row in 0..num_rows {
+            if primary_screen_row_hidden(row, hidden_before_row, owned_rows) {
+                continue;
+            }
+
+            for col in 0..num_cols {
+                let cell = grid.cell(row, col);
+
+                if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                    continue;
+                }
+
+                let x = self.padding_x + chrome_left + pane_origin_x + col as f32 * cw;
+                let y = self.padding_y + chrome_top + pane_origin_y + row as f32 * ch;
+
+                let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
+                let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
+
+                if cell.flags.contains(CellFlags::REVERSE) {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                bg[3] *= self.opacity;
+
+                let ch_char =
+                    if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
+                        ' '
+                    } else {
+                        cell.character
+                    };
+
+                let (u0, v0, u1, v1) = if let Some(glyph) = self.atlas.get(ch_char) {
+                    let (u, v) = glyph.uv_origin;
+                    let (uw, vh) = glyph.uv_size;
+                    (u, v, u + uw, v + vh)
+                } else {
+                    let (u, v) = self
+                        .atlas
+                        .get(' ')
+                        .map(|g| g.uv_origin)
+                        .unwrap_or((0.0, 0.0));
+                    let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
+                    (u, v, u + uw, v + vh)
+                };
+                let (v0, v1) = (v1, v0);
+
+                let cell_render_width = if cell.width == CellWidth::Full && col + 1 < num_cols {
+                    cw * 2.0
+                } else {
+                    cw
+                };
+
+                push_cell_instance(
+                    &mut out,
+                    [x, y, x + cell_render_width, y + ch],
+                    [u0, v0, u1, v1],
+                    fg,
+                    bg,
+                );
+
+                // OSC 8 hyperlink underline (same as active pane — the link
+                // is part of the cell content, not an interaction state).
+                if cell.flags.contains(CellFlags::HYPERLINK) {
+                    let line_h = 2.0;
+                    let link_color = [0.36, 0.62, 0.94, 1.0];
+                    push_cell_instance(
+                        &mut out,
+                        [x, y + ch - line_h, x + cell_render_width, y + ch],
+                        [0.0, 0.0, 0.0, 1.0],
+                        [0.0; 4],
+                        link_color,
+                    );
+                }
+            }
+        }
+
+        out
     }
 }
 

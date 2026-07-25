@@ -617,6 +617,15 @@ impl Terminal {
         bytes
     }
 
+    /// v1.3 AI integration: programmatically run `command`. Sets the editor
+    /// buffer, submits it, and returns the PTY bytes. The AI palette uses
+    /// this so an AI-suggested command enters the same block lifecycle as
+    /// a user-typed one (133;B marker, BlockTracker, output capture).
+    pub fn run_command(&mut self, command: &str) -> Vec<u8> {
+        self.editor.buffer.set_text(command);
+        self.submit_command()
+    }
+
     // ── SGR helpers ──────────────────────────────────────────────
 
     /// Handle SGR (Select Graphic Rendition) — CSI m.

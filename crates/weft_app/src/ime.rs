@@ -211,6 +211,7 @@ mod tests {
             padding_y: 8.0,
             chrome_top: 32.0,
             chrome_left: 200.0,
+            pane_origin: (0.0, 0.0),
             clip: None,
         };
         assert_eq!(

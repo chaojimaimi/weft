@@ -3,9 +3,37 @@
 use super::*;
 
 pub(crate) fn install_runtime_diagnostics() {
-    tracing_subscriber::fmt::init();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    // v1.3: always write diagnostics to /tmp/weft.log so users can send
+    // logs regardless of how the app bundle is launched.
+    let log_path = std::path::PathBuf::from("/tmp/weft.log");
+    let _ = std::fs::remove_file(&log_path);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        Ok(f) => f,
+        Err(_) => {
+            tracing_subscriber::fmt::init();
+            let default_hook = std::panic::take_hook();
+            setup_panic_hook(default_hook);
+            return;
+        }
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::sync::Arc::new(file))
+        .with_ansi(false)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    setup_panic_hook(std::panic::take_hook());
+}
+
+fn setup_panic_hook(
+    default_hook: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Send + Sync + 'static>,
+) {
+    #[allow(deprecated)]
+    std::panic::set_hook(Box::new(move |info: &std::panic::PanicInfo<'_>| {
         let path = panic_log_path(std::env::var_os("HOME").as_deref());
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -239,9 +267,11 @@ impl ApplicationHandler<AppEvent> for App {
                 crate::ui_tokens::MIN_WINDOW_WIDTH,
                 crate::ui_tokens::MIN_WINDOW_HEIGHT,
             ))
-            // Window-level transparency is fixed at creation; the layer opaque
-            // flag + bg alpha still update live, but crossing the 1.0 boundary
-            // (opaque ↔ see-through) needs a relaunch.
+            // Window-level transparency at creation. v1.2.11: runtime opacity
+            // changes now also flip NSWindow.setOpaque: + backgroundColor
+            // (see `macos_window::set_window_opaque`), so this flag only
+            // governs the *initial* compositor hint. Lowering opacity below
+            // 1.0 at runtime will work even when the window started opaque.
             .with_transparent(win.opacity < 1.0)
             // Runtime window icon (shows in the Dock during `cargo run` and
             // in the app switcher). The .icns in the .app bundle takes over
@@ -575,27 +605,43 @@ impl ApplicationHandler<AppEvent> for App {
 }
 
 impl App {
-    pub(super) fn apply_pty_resize_effect(&mut self, tab: usize, rows: usize, cols: usize) {
+    pub(super) fn apply_pty_resize_effect(
+        &mut self,
+        tab: usize,
+        pane_id: weft_core::pane_layout::PaneId,
+        rows: usize,
+        cols: usize,
+    ) {
         let Some(session) = self.sessions.tab_mut(tab) else {
             return;
         };
-        let resize_failed = session.pty.as_ref().is_some_and(|pty| {
-            pty.resize(rows as u16, cols as u16)
-                .map(|()| {
-                    if let Some(terminal) = &mut session.terminal {
-                        invalidate_primary_tui_frame(terminal);
-                    }
-                    false
-                })
-                .unwrap_or_else(|error| {
-                    warn!(%error, tab, rows, cols, "failed to apply PTY resize effect");
-                    true
-                })
-        });
+        // v1.3 Batch 6: target the specific pane by id (not just the active
+        // pane). Pre-v1.3 callers always passed the active pane's id, so
+        // behavior is unchanged for single-pane tabs.
+        let Some(pane) = session.pane_mut(pane_id) else {
+            return;
+        };
+        let resize_result = pane
+            .pty
+            .as_ref()
+            .map(|pty| pty.resize(rows as u16, cols as u16));
+        let resize_failed = match resize_result {
+            Some(Ok(())) => {
+                if let Some(terminal) = &mut pane.terminal {
+                    invalidate_primary_tui_frame(terminal);
+                }
+                false
+            }
+            Some(Err(error)) => {
+                warn!(%error, tab, pane_id = %pane_id, rows, cols, "failed to apply PTY resize effect");
+                true
+            }
+            None => return,
+        };
         if should_clear_pending_resize(resize_failed)
-            && session.pending_pty_resize == Some((rows, cols))
+            && pane.pending_pty_resize == Some((rows, cols))
         {
-            session.pending_pty_resize = None;
+            pane.pending_pty_resize = None;
         }
     }
 }

@@ -77,8 +77,13 @@ impl crate::App {
                         }
                     }
                 }
-                Effect::ResizePty { tab, rows, cols } => {
-                    self.apply_pty_resize_effect(tab, rows, cols);
+                Effect::ResizePty {
+                    tab,
+                    pane_id,
+                    rows,
+                    cols,
+                } => {
+                    self.apply_pty_resize_effect(tab, pane_id, rows, cols);
                 }
                 Effect::CopyClipboard { text } => clipboard_copy(&text),
                 Effect::PersistTabs => self.save_all_tabs(),

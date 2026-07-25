@@ -1,0 +1,365 @@
+//! v1.3 AI integration — prompt construction (pure logic, fully testable).
+//!
+//! These functions build the user/system messages sent to the LLM. They are
+//! deliberately side-effect-free so they can be unit-tested without a network
+//! or a tokio runtime. The caller is responsible for:
+//!
+//! 1. Pulling the raw command/output/cwd out of the terminal state.
+//! 2. Calling [`mask_secrets`] (or `secrets::mask` from weft_core) *before*
+//!    passing strings here — defence in depth, but the AI client also masks
+//!    on its way out.
+//! 3. Spawning the request on a background tokio task.
+//!
+//! All prompts are intentionally short (Wellft is generating shell commands,
+//! not writing essays) and use a deterministic structure so the model is
+//! steered toward plain-shell output rather than chatty prose.
+
+use weft_core::secrets;
+
+/// Cap the amount of block output we send to the LLM. 4 KiB matches the
+/// plan in `docs/V13_IMPLEMENTATION_PLAN.md` §4.4 — enough for typical
+/// error messages + a stack-frame or two, without bloating the request.
+pub const MAX_OUTPUT_BYTES: usize = 4 * 1024;
+
+/// Cap the number of recent history commands included for context.
+pub const MAX_HISTORY_ENTRIES: usize = 10;
+
+/// A request to generate a shell command from natural language.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandGenPrompt {
+    /// The user's natural-language request, e.g. "find all .ts files".
+    pub user_query: String,
+    /// Current working directory of the shell (best-effort, may be empty).
+    pub cwd: String,
+    /// Recent command history (most-recent first), already trimmed to
+    /// [`MAX_HISTORY_ENTRIES`].
+    pub recent_history: Vec<String>,
+}
+
+/// A request to diagnose a failed command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosePrompt {
+    /// The command that was run, e.g. `ls /nonexistent`.
+    pub command: String,
+    /// Captured stdout+stderr (already truncated to [`MAX_OUTPUT_BYTES`]).
+    pub output: String,
+    /// Exit code reported by the shell. `-1` when unknown / signal-killed.
+    pub exit_code: i32,
+    /// Current working directory of the shell (best-effort).
+    pub cwd: String,
+}
+
+/// A single chat message in the OpenAI-style `role`/`content` schema.
+/// All three supported providers (OpenAI, Anthropic, Ollama) can be fed from
+/// this minimal shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChatRole::System => "system",
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// Mask any secret patterns in `text`. Thin wrapper around `weft_core::secrets`
+/// so prompt builders don't pull in the regex crate directly.
+pub fn mask_secrets(text: &str) -> String {
+    secrets::mask(text)
+}
+
+/// Truncate `text` to at most `max_bytes` bytes, ending on a UTF-8 char
+/// boundary. Appends a `"…[truncated]"` marker when truncation occurs.
+pub fn truncate_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let marker = "…[truncated]";
+    let budget = max_bytes.saturating_sub(marker.len());
+    let mut end = budget;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + marker.len());
+    out.push_str(&text[..end]);
+    out.push_str(marker);
+    out
+}
+
+/// Build the chat messages for a natural-language → shell-command request.
+///
+/// The system prompt steers the model to:
+///   - Reply with **only** the shell command (no markdown fences, no prose)
+///   - Prefer portable macOS/BSD tooling (matches the Weft platform)
+///   - Refuse to produce destructive commands (rm -rf /, dd to a disk, …)
+///
+/// Secrets in the cwd / history are masked before being sent.
+pub fn build_command_gen_messages(prompt: &CommandGenPrompt) -> Vec<ChatMessage> {
+    let system = "You are a shell-command generator for the Weft terminal emulator on macOS. \
+Convert the user's natural-language request into a single POSIX shell command. \
+Reply with ONLY the command — no markdown fences, no explanation, no leading $ prompt. \
+Prefer portable macOS/BSD tooling (grep -E instead of GNU grep -P, find over fd). \
+If the request is dangerous or destructive, reply with: # refused: <reason>. \
+If the request is unclear, reply with: # ambiguous: <one short clarifying question>.";
+
+    let masked_cwd = mask_secrets(&prompt.cwd);
+    let masked_history: Vec<String> = prompt
+        .recent_history
+        .iter()
+        .map(|h| mask_secrets(h))
+        .collect();
+
+    let mut user = String::new();
+    if !masked_cwd.is_empty() {
+        user.push_str("cwd: ");
+        user.push_str(&masked_cwd);
+        user.push('\n');
+    }
+    if !masked_history.is_empty() {
+        user.push_str("recent commands:\n");
+        for cmd in &masked_history {
+            user.push_str("  ");
+            user.push_str(cmd);
+            user.push('\n');
+        }
+    }
+    user.push_str("request: ");
+    user.push_str(&prompt.user_query);
+
+    vec![
+        ChatMessage {
+            role: ChatRole::System,
+            content: system.to_string(),
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: user,
+        },
+    ]
+}
+
+/// Build the chat messages for a failed-command diagnosis request.
+///
+/// The system prompt asks the model to produce a short structured explanation
+/// covering (1) why the command likely failed, and (2) a concrete fix or
+/// next step. Output is plain text (no JSON), kept under ~200 words so the
+/// result fits comfortably inside a block-view diagnostic panel.
+pub fn build_diagnose_messages(prompt: &DiagnosePrompt) -> Vec<ChatMessage> {
+    let system = "You are a shell-error diagnostician for the Weft terminal emulator. \
+The user ran a command that exited with a non-zero status. Explain in plain English: \
+(1) the most likely cause, and (2) a concrete fix or next diagnostic step. \
+Keep the answer under 200 words. Do not restate the command verbatim. \
+Do not use markdown headings. If the failure is secret-related (e.g. auth token), \
+point that out without echoing the secret.";
+
+    let masked_cmd = mask_secrets(&prompt.command);
+    let masked_out = mask_secrets(&truncate_bytes(&prompt.output, MAX_OUTPUT_BYTES));
+    let masked_cwd = mask_secrets(&prompt.cwd);
+
+    let mut user = String::new();
+    user.push_str("command: ");
+    user.push_str(&masked_cmd);
+    user.push('\n');
+    user.push_str("exit: ");
+    user.push_str(&prompt.exit_code.to_string());
+    user.push('\n');
+    if !masked_cwd.is_empty() {
+        user.push_str("cwd: ");
+        user.push_str(&masked_cwd);
+        user.push('\n');
+    }
+    user.push_str("output:\n");
+    user.push_str(&masked_out);
+
+    vec![
+        ChatMessage {
+            role: ChatRole::System,
+            content: system.to_string(),
+        },
+        ChatMessage {
+            role: ChatRole::User,
+            content: user,
+        },
+    ]
+}
+
+/// Strip a leading `$` / `>` prompt and surrounding markdown fences from an
+/// AI-generated command. Models occasionally wrap their output in ```sh … ```
+/// fences despite being told not to; we want to recover a runnable command.
+pub fn clean_command_output(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Strip a single pair of ```lang … ``` fences if present.
+    let inner = if trimmed.starts_with("```") {
+        let after_open = &trimmed[3..];
+        // skip optional language tag on the same line
+        let after_lang = match after_open.find('\n') {
+            Some(idx) => &after_open[idx + 1..],
+            None => after_open,
+        };
+        after_lang.trim_end()
+    } else {
+        trimmed
+    };
+    let inner = inner.strip_prefix("```").unwrap_or(inner);
+    // Drop a trailing closing fence if it survived.
+    let inner = inner.strip_suffix("```").unwrap_or(inner);
+    // Drop a leading "$ " or "> " prompt the model may have prepended.
+    let inner = inner
+        .strip_prefix("$ ")
+        .or_else(|| inner.strip_prefix("> "))
+        .unwrap_or(inner);
+    inner.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_under_budget_returns_input_unchanged() {
+        let s = "hello";
+        assert_eq!(truncate_bytes(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_over_budget_appends_marker_on_char_boundary() {
+        // 20 ASCII chars, budget 10 → cut to fit "…[truncated]" (12 chars)
+        // so the budget for content is 10 - 12 = -2 → saturating_sub → 0.
+        // The function then walks back to 0, so only the marker is emitted.
+        let s = "0123456789abcdefghij";
+        let out = truncate_bytes(s, 10);
+        assert!(out.ends_with("…[truncated]"));
+    }
+
+    #[test]
+    fn truncate_preserves_utf8_boundary() {
+        // 2-byte chars × 20 = 40 bytes. Budget 10 must not split a char.
+        let s = "αβγδεζηθικλμνξοπρστυφ"; // 20 Greek letters, 40 bytes UTF-8
+        assert!(s.len() > 10);
+        let out = truncate_bytes(s, 5);
+        // 5 - 12 = 0 (saturating), so only the marker is emitted.
+        assert_eq!(out, "…[truncated]");
+        // A larger budget keeps some chars intact.
+        let out = truncate_bytes(s, 20);
+        assert!(out.ends_with("…[truncated]"));
+        // Ensure no broken UTF-8.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        // The byte length is bounded.
+        assert!(out.len() <= 20);
+    }
+
+    #[test]
+    fn mask_secrets_strips_openai_keys_from_history() {
+        let p = CommandGenPrompt {
+            user_query: "find my key".into(),
+            cwd: "/home/me".into(),
+            recent_history: vec![
+                "export OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890abcd".into(),
+            ],
+        };
+        let msgs = build_command_gen_messages(&p);
+        let user_msg = &msgs[1];
+        assert!(user_msg.content.contains("••••••••"));
+        assert!(!user_msg.content.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn command_gen_messages_have_system_first() {
+        let p = CommandGenPrompt {
+            user_query: "list files".into(),
+            cwd: "/tmp".into(),
+            recent_history: vec![],
+        };
+        let msgs = build_command_gen_messages(&p);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, ChatRole::System);
+        assert_eq!(msgs[1].role, ChatRole::User);
+        assert!(msgs[1].content.contains("cwd: /tmp"));
+        assert!(msgs[1].content.contains("request: list files"));
+    }
+
+    #[test]
+    fn diagnose_messages_include_command_exit_output() {
+        let p = DiagnosePrompt {
+            command: "ls /nonexistent".into(),
+            output: "ls: /nonexistent: No such file or directory".into(),
+            exit_code: 1,
+            cwd: "/home/me".into(),
+        };
+        let msgs = build_diagnose_messages(&p);
+        assert_eq!(msgs[0].role, ChatRole::System);
+        assert!(msgs[1].content.contains("command: ls /nonexistent"));
+        assert!(msgs[1].content.contains("exit: 1"));
+        assert!(msgs[1].content.contains("cwd: /home/me"));
+        assert!(msgs[1].content.contains("No such file or directory"));
+    }
+
+    #[test]
+    fn diagnose_truncates_long_output() {
+        let long = "x".repeat(MAX_OUTPUT_BYTES * 2);
+        let p = DiagnosePrompt {
+            command: "cat /big".into(),
+            output: long,
+            exit_code: 0,
+            cwd: "".into(),
+        };
+        let msgs = build_diagnose_messages(&p);
+        let user = &msgs[1].content;
+        assert!(user.contains("…[truncated]"));
+        // User message size is bounded by the truncated output + overhead.
+        assert!(user.len() < MAX_OUTPUT_BYTES + 1024);
+    }
+
+    #[test]
+    fn clean_command_output_strips_fences_and_prompt() {
+        assert_eq!(clean_command_output("ls -la"), "ls -la");
+        assert_eq!(clean_command_output("```sh\nls -la\n```"), "ls -la");
+        assert_eq!(clean_command_output("```\nls -la\n```"), "ls -la");
+        assert_eq!(clean_command_output("$ ls -la"), "ls -la");
+        assert_eq!(clean_command_output("> ls -la"), "ls -la");
+        assert_eq!(clean_command_output("  ls -la  "), "ls -la");
+    }
+
+    #[test]
+    fn clean_command_output_preserves_complex_commands() {
+        let cmd = "find . -name '*.ts' -mtime -1 | xargs grep 'TODO'";
+        assert_eq!(clean_command_output(cmd), cmd);
+        assert_eq!(clean_command_output(&format!("```sh\n{cmd}\n```")), cmd);
+    }
+
+    #[test]
+    fn empty_cwd_is_omitted_from_command_gen() {
+        let p = CommandGenPrompt {
+            user_query: "list files".into(),
+            cwd: "".into(),
+            recent_history: vec![],
+        };
+        let msgs = build_command_gen_messages(&p);
+        assert!(!msgs[1].content.contains("cwd:"));
+    }
+
+    #[test]
+    fn empty_cwd_is_omitted_from_diagnose() {
+        let p = DiagnosePrompt {
+            command: "ls".into(),
+            output: "out".into(),
+            exit_code: 0,
+            cwd: "".into(),
+        };
+        let msgs = build_diagnose_messages(&p);
+        assert!(!msgs[1].content.contains("cwd:"));
+    }
+}

@@ -233,6 +233,7 @@ impl MetalRenderer {
             instance_capacity: Cell::new(0),
             frame_trace: RefCell::new(crate::frame_trace::FrameTraceRecorder::disabled()),
             frame_id: Cell::new(0),
+            pane_instance_ranges: RefCell::new(Vec::new()),
         }
     }
 
@@ -600,6 +601,12 @@ impl MetalRenderer {
         // instance is one cell (or cursor/hyperlink decoration); the static
         // index buffer + shader-side corner derivation mean only the
         // instance buffer changes per frame.
+        //
+        // v1.3 Batch 5: when multiple panes are present, instances are split
+        // into per-pane segments (recorded in `pane_instance_ranges`). Each
+        // segment is drawn with its own scissor rect so panes don't bleed
+        // into each other. Single-pane tabs still take the fast path: one
+        // scissor covering the full viewport, one draw call.
         let tex = self.atlas.texture();
         if instance_data_size > 0 {
             encoder.set_render_pipeline_state(&self.instanced_pipeline);
@@ -617,15 +624,74 @@ impl MetalRenderer {
             encoder.set_fragment_texture(0, Some(tex));
             encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-            let instance_count = instances.len() / 16;
-            encoder.draw_indexed_primitives_instanced(
-                MTLPrimitiveType::Triangle,
-                6, // index count (two triangles)
-                MTLIndexType::UInt16,
-                &self.index_buffer,
-                0, // index buffer offset
-                instance_count as u64,
-            );
+            // v1.3 Batch 5: per-pane scissor + draw. When the renderer is
+            // in single-pane mode (no background panes, block view, or
+            // idle frame with no instances built), `pane_instance_ranges`
+            // is empty — fall back to the legacy single draw call with no
+            // scissor (Metal defaults to the full viewport).
+            let ranges = self.pane_instance_ranges.borrow();
+            if ranges.is_empty() {
+                let instance_count = instances.len() / 16;
+                encoder.draw_indexed_primitives_instanced(
+                    MTLPrimitiveType::Triangle,
+                    6, // index count (two triangles)
+                    MTLIndexType::UInt16,
+                    &self.index_buffer,
+                    0, // index buffer offset
+                    instance_count as u64,
+                );
+            } else {
+                for (i, (rect, range)) in ranges.iter().enumerate() {
+                    let [x0, y0, x1, y1] = *rect;
+                    // Clamp to drawable bounds — Metal panics if scissor
+                    // rect extends past the attachment.
+                    let sx = x0.max(0.0).min(self.viewport.0) as u64;
+                    let sy = y0.max(0.0).min(self.viewport.1) as u64;
+                    let sw = (x1 - x0).max(0.0).min(self.viewport.0 - sx as f32) as u64;
+                    let sh = (y1 - y0).max(0.0).min(self.viewport.1 - sy as f32) as u64;
+                    if sw == 0 || sh == 0 {
+                        tracing::info!(segment = i, rect = ?rect, "skipping zero-area pane segment");
+                        continue;
+                    }
+                    let start_instance = range.start / 16;
+                    let instance_count = (range.end - range.start) / 16;
+                    tracing::info!(
+                        segment = i,
+                        rect = ?rect,
+                        scissor = ?[sx, sy, sw, sh],
+                        start_instance,
+                        instance_count,
+                        "draw pane segment"
+                    );
+                    encoder.set_scissor_rect(metal::MTLScissorRect {
+                        x: sx,
+                        y: sy,
+                        width: sw,
+                        height: sh,
+                    });
+                    if instance_count == 0 {
+                        continue;
+                    }
+                    encoder.draw_indexed_primitives_instanced_base_instance(
+                        MTLPrimitiveType::Triangle,
+                        6, // index count (two triangles)
+                        MTLIndexType::UInt16,
+                        &self.index_buffer,
+                        0, // index buffer offset
+                        instance_count as u64,
+                        0, // base vertex
+                        start_instance as u64,
+                    );
+                }
+                // Reset scissor to full viewport so subsequent overlay /
+                // block-view draws aren't clipped to the last pane's rect.
+                encoder.set_scissor_rect(metal::MTLScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: self.viewport.0 as u64,
+                    height: self.viewport.1 as u64,
+                });
+            }
         }
 
         // v1.0 P1.5-B1: Draw 2 — overlays / block view (legacy pipeline).

@@ -233,3 +233,156 @@ impl Default for LogoConfig {
         }
     }
 }
+
+/// v1.6 AI integration: configuration for the AI backend.
+///
+/// All fields are optional — when `provider` is `None` the AI features are
+/// disabled. API keys are *not* stored here in plaintext by default; the
+/// field exists for compatibility / quick setup, but the Settings UI will
+/// prefer the macOS Keychain (Batch 4-2). The TOML writer (config/save.rs)
+/// only persists non-default values, so an empty `[ai]` section stays empty.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct AiConfig {
+    /// Provider id: `"openai"` | `"anthropic"` | `"ollama"` | `"custom"`.
+    /// `None` ⇒ AI features disabled.
+    pub provider: Option<String>,
+    /// Plaintext API key (optional). For OpenAI/Anthropic. ⚠️ sensitive —
+    /// prefer the Keychain path when available. Kept here only for tests
+    /// and quick local setups.
+    pub api_key: Option<String>,
+    /// Custom endpoint base URL (e.g. `"http://localhost:11434"` for Ollama,
+    /// or a corporate proxy). When `None`, the provider's default URL is used.
+    pub base_url: Option<String>,
+    /// Model id, e.g. `"gpt-4o-mini"`, `"claude-3-5-sonnet"`, `"llama3.1"`.
+    pub model: Option<String>,
+    /// Max output tokens for a single completion. `None` ⇒ provider default.
+    pub max_tokens: Option<u32>,
+    /// Request timeout in seconds. `None` ⇒ 30.
+    pub timeout_secs: Option<u32>,
+    /// Auto-diagnose failed blocks (exit_code != 0). Off by default —
+    /// the user triggers diagnosis manually via the block action button
+    /// until they opt in here.
+    pub enable_error_diagnosis: bool,
+    /// Enable natural-language → command generation in the palette. On by
+    /// default so the "✨ Ask AI" entry is visible as soon as a provider
+    /// is configured.
+    pub enable_command_generation: bool,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: None,
+            api_key: None,
+            base_url: None,
+            model: None,
+            max_tokens: None,
+            timeout_secs: None,
+            enable_error_diagnosis: false,
+            enable_command_generation: true,
+        }
+    }
+}
+
+impl AiConfig {
+    /// True when the AI features can be considered "configured" — a provider
+    /// is set, and either an API key is set (for OpenAI/Anthropic) or the
+    /// provider doesn't need one (Ollama / custom endpoint).
+    pub fn is_configured(&self) -> bool {
+        match self.provider.as_deref() {
+            None => false,
+            Some("ollama") => true,
+            Some("custom") => true,
+            Some(_) => self
+                .api_key
+                .as_deref()
+                .is_some_and(|k| !k.trim().is_empty()),
+        }
+    }
+
+    /// Effective request timeout (seconds). Falls back to 30s.
+    pub fn effective_timeout_secs(&self) -> u64 {
+        self.timeout_secs.unwrap_or(30) as u64
+    }
+
+    /// Effective max_tokens. Falls back to 1024 (a reasonable default for
+    /// short shell-command generation / diagnosis).
+    pub fn effective_max_tokens(&self) -> u32 {
+        self.max_tokens.unwrap_or(1024)
+    }
+
+    /// Provider id, lowercased and trimmed, for `match` dispatch.
+    pub fn provider_kind(&self) -> Option<&str> {
+        self.provider
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod ai_config_tests {
+    use super::*;
+
+    #[test]
+    fn unconfigured_when_no_provider() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.is_configured());
+        assert_eq!(cfg.provider_kind(), None);
+        assert_eq!(cfg.effective_timeout_secs(), 30);
+        assert_eq!(cfg.effective_max_tokens(), 1024);
+    }
+
+    #[test]
+    fn ollama_configured_without_api_key() {
+        let cfg = AiConfig {
+            provider: Some("ollama".into()),
+            ..Default::default()
+        };
+        assert!(cfg.is_configured());
+        assert_eq!(cfg.provider_kind(), Some("ollama"));
+    }
+
+    #[test]
+    fn openai_requires_api_key() {
+        let cfg = AiConfig {
+            provider: Some("openai".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.is_configured());
+        let cfg = AiConfig {
+            provider: Some("openai".into()),
+            api_key: Some("sk-test".into()),
+            ..Default::default()
+        };
+        assert!(cfg.is_configured());
+    }
+
+    #[test]
+    fn empty_api_key_treated_as_unset() {
+        let cfg = AiConfig {
+            provider: Some("anthropic".into()),
+            api_key: Some("   ".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn custom_provider_configured_without_api_key() {
+        let cfg = AiConfig {
+            provider: Some("custom".into()),
+            base_url: Some("https://internal.example.com/v1".into()),
+            ..Default::default()
+        };
+        assert!(cfg.is_configured());
+    }
+
+    #[test]
+    fn defaults_command_generation_on_diagnosis_off() {
+        let cfg = AiConfig::default();
+        assert!(cfg.enable_command_generation);
+        assert!(!cfg.enable_error_diagnosis);
+    }
+}

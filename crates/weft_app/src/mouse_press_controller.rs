@@ -77,6 +77,28 @@ impl App {
             return;
         }
 
+        // v1.3 Batch 6: focus the pane under the cursor on click. This
+        // switches the active pane BEFORE the rest of the mouse handling
+        // (which all goes through `active_mut()`), so clicks/selections/
+        // PTY mouse events route to the clicked pane. For single-pane tabs
+        // `pane_at_pixel` always returns the one pane id — no-op switch.
+        // Skip in block view (block view is per-tab, not per-pane).
+        if !self.block_view_active() {
+            if let Some(pane_id) = self.pane_at_pixel(x, y) {
+                let tab = self.sessions.active_mut();
+                if tab.active_pane_id() != pane_id {
+                    if let Err(e) = tab.set_active_pane(pane_id) {
+                        tracing::warn!(error = ?e, "failed to focus pane under cursor");
+                    }
+                    // Force a full redraw so the newly active pane's cursor
+                    // and selection state render correctly.
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.force_full_grid_redraw();
+                    }
+                }
+            }
+        }
+
         // v1.0 fix: sync InputHandler.mouse_protocol + sgr_mouse from the
         // Terminal's VT-parsed values before any mouse-event encoding. Without
         // this the handler's copy stays `Off` (its setters are test-only) and

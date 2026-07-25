@@ -58,6 +58,14 @@ fn action_from_isize(tag: isize) -> Option<Action> {
         18 => Action::NextTab,
         19 => Action::PrevTab,
         20 => Action::ToggleSettings,
+        // v1.3: pane splits / focus / close. Keep in sync with Action decl
+        // order — `Action as isize` relies on declaration order matching
+        // these discriminant values.
+        21 => Action::SplitHorizontal,
+        22 => Action::SplitVertical,
+        23 => Action::FocusNextPane,
+        24 => Action::FocusPrevPane,
+        25 => Action::ClosePane,
         _ => return None,
     })
 }
@@ -235,6 +243,37 @@ pub fn install(mtm: MainThreadMarker, proxy: EventLoopProxy<AppEvent>) {
         &[
             action_item(mtm, &target, ns_string!("Next Tab"), Action::NextTab),
             action_item(mtm, &target, ns_string!("Previous Tab"), Action::PrevTab),
+            sep(mtm),
+            // v1.3: pane splits / focus / close. Menu items intentionally
+            // omit `keyEquivalent` (see file header) — shortcuts come from
+            // weft's KeyBindings so the PTY sees them first.
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Split Horizontal"),
+                Action::SplitHorizontal,
+            ),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Split Vertical"),
+                Action::SplitVertical,
+            ),
+            sep(mtm),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Next Pane"),
+                Action::FocusNextPane,
+            ),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Previous Pane"),
+                Action::FocusPrevPane,
+            ),
+            sep(mtm),
+            action_item(mtm, &target, ns_string!("Close Pane"), Action::ClosePane),
         ],
     );
 
