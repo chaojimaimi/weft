@@ -88,7 +88,10 @@ impl MetalRenderer {
 
         push_quad(
             &mut verts,
-            [0.0, 0.0, vp_w, region_bottom_y.max(0.0)],
+            // v1.3 multi-pane: confine the block-view background to the pane's
+            // [left..right] × [clip_top..region_bottom_y] rect so it doesn't
+            // cover background panes. Previously [0, 0, vp_w, region_bottom_y].
+            [left, layout.clip_top, right, region_bottom_y.max(0.0)],
             bg_uv,
             [0.0; 4],
             theme_bg,
@@ -636,14 +639,16 @@ impl MetalRenderer {
             ];
             push_quad(
                 &mut verts,
-                [0.0, sticky_y, vp_w, sticky_bottom],
+                // v1.3 multi-pane: confine sticky header bg to [left..right].
+                [left, sticky_y, right, sticky_bottom],
                 bg_uv,
                 [0.0; 4],
                 sticky_bg,
             );
             push_quad(
                 &mut verts,
-                [0.0, sticky_bottom, vp_w, sticky_bottom + 1.0],
+                // v1.3 multi-pane: confine sticky separator to [left..right].
+                [left, sticky_bottom, right, sticky_bottom + 1.0],
                 bg_uv,
                 [0.0; 4],
                 separator,

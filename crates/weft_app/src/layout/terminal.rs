@@ -197,14 +197,16 @@ pub fn layout_block_view(
 ) -> BlockViewLayout {
     let cw = ctx.cell_w;
     let ch = ctx.cell_h;
-    let vp_w = ctx.viewport.0;
 
     // A primary-screen TUI switches from Grid to BlockView when history is
     // opened. Sharing the exact row pitch keeps the same transcript from
     // changing density and apparent glyph weight during that transition.
     let pitch = ch;
     let left = ctx.left();
-    let right = vp_w - ctx.padding_x;
+    // v1.3 multi-pane: honor the pane's clip rect / pane_origin via ctx.right()
+    // instead of the full-viewport \`vp_w - padding_x\` (which would extend across
+    // background panes). ctx.right() clamps to clip.x1 and adds pane_origin.0.
+    let right = ctx.right();
     let cols = (((right - left) / cw).max(1.0)) as usize;
 
     // v0.9 H1: clip_top must include chrome_top (tab bar height) so the

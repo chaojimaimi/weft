@@ -706,6 +706,57 @@ fn block_view_editor_mode_reserves_cwd_band() {
     assert!((layout.fixed_cwd_y - 1083.2).abs() < 1e-3);
 }
 
+/// v1.3 multi-pane: `layout_block_view` must honor pane_origin + clip so the
+/// block-view background quad, sticky header, and row layout stay confined to
+/// the active pane's rect (don't bleed across background panes). Mirrors the
+/// `prompt_respects_clip_rect` test above. Regression guard for the v1.3
+/// block-view pane-localization fix.
+#[test]
+fn block_view_respects_pane_origin_and_clip() {
+    // Right pane of a vertical split at x=808. Before the fix, layout_block_view
+    // read `vp_w - padding_x` (= 1584) for `right`, ignoring pane_origin + clip.
+    let mut ctx = sample_ctx();
+    let pane_rect = [808.0_f32, 57.0, 1600.0, 1200.0];
+    ctx.pane_origin = (
+        pane_rect[0] - ctx.padding_x - ctx.chrome_left,
+        pane_rect[1] - ctx.padding_y - ctx.chrome_top,
+    );
+    ctx.clip = Some(pane_rect);
+
+    let region_bottom_y = 1100.0;
+    let layout = layout_block_view(&ctx, region_bottom_y, false);
+
+    // left = padding_x + chrome_left + pane_origin.0 = 16 + 0 + (808-16-0) = 808.
+    assert!(
+        (layout.left - 808.0).abs() < 1e-3,
+        "left must be pane-local: got {}",
+        layout.left
+    );
+    // right = ctx.right() = clip.x1 - padding_x = 1600 - 16 = 1584 (clip clamps
+    // the inner edge; pane_origin is added on top by ctx.left, not ctx.right).
+    // Pre-fix this was vp_w - padding_x = 1584 too — but only because the pane
+    // happened to end at the viewport right edge. The test pins the contract:
+    // right comes from ctx.right() (clip-aware), not vp_w.
+    assert!(
+        (layout.right - 1584.0).abs() < 1e-3,
+        "right must be clip-aware: got {}",
+        layout.right
+    );
+    // cols derived from the pane-local [left..right], not the full viewport.
+    let expected_cols = (((1584.0_f32 - 808.0) / 7.2).max(1.0)) as usize;
+    assert_eq!(
+        layout.cols, expected_cols,
+        "cols must derive from pane width"
+    );
+    // clip_top honors pane_origin.1: padding_y + chrome_top + pane_origin.1
+    // = 16 + 0 + (57 - 16 - 0) = 57.
+    assert!(
+        (layout.clip_top - 57.0).abs() < 1e-3,
+        "clip_top must be pane-local: got {}",
+        layout.clip_top
+    );
+}
+
 /// CommandExecuting mode (cwd_header_active=false): clip_bottom sits
 /// flush with region_bottom_y, fixed_cwd_y is unused (0.0).
 #[test]

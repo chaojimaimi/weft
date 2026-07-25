@@ -371,8 +371,7 @@ impl MetalRenderer {
         // self so methods that don't receive it directly can still access it
         // during this draw; rebuilt every frame so resizes/padding changes
         // take effect immediately.
-        let ctx = terminal_layout.layout_ctx();
-        self.layout_ctx = Some(ctx);
+        self.layout_ctx = Some(terminal_layout.layout_ctx());
         // R3 task 6: LAYOUT segment ends once the LayoutCtx is built.
         self.frame_trace.borrow_mut().layout_end();
 
@@ -458,17 +457,12 @@ impl MetalRenderer {
         // `sudo su` sub-shell): the live grid fills the bottom while the
         // completed block history is overlaid on top, so the history never
         // reverts to raw text (matches Warp). Alt-screen / not-integrated: grid.
-        let vp_h = self.viewport.1;
-        let pad_y = self.padding_y;
-        // v1.3 fix: when there are background panes (split active), force
-        // grid view for the active pane. Block view draws an opaque full-
-        // viewport background quad ([0,0,vp_w,region_bottom_y]) that would
-        // cover the background panes' instances, and its layout (prompt
-        // position, block stacking) is computed against the full viewport
-        // rather than the pane rect. Grid view renders per-cell instances
-        // that respect pane_origin and scissor correctly. Block view multi-
-        // pane support is deferred to a later iteration.
-        let show_blocks = terminal.show_block_view() && background_panes.is_empty();
+        // v1.3 multi-pane: block-view paint now honors pane_origin + clip via
+        // LayoutCtx (background quad, sticky header, and layout_block_view all
+        // confined to [left..right] × [clip_top..region_bottom_y]). So we no
+        // longer force grid view when background panes exist — the active pane
+        // can show block view in a split.
+        let show_blocks = terminal.show_block_view();
         tracing::info!(
             show_blocks_terminal = terminal.show_block_view(),
             background_panes_empty = background_panes.is_empty(),
@@ -572,8 +566,15 @@ impl MetalRenderer {
 
         let mut vertices: Vec<f32> = if show_blocks {
             let (v, regions, bv_rows) = if let Some(p) = prompt {
+                // v1.3 multi-pane: use the active pane's LayoutCtx (which
+                // carries pane_origin + clip set by the background-pane block
+                // above) instead of the stale full-viewport `ctx` local.
+                let active_ctx = self
+                    .layout_ctx
+                    .as_ref()
+                    .expect("LayoutCtx built at draw() entry");
                 let box_top_y = crate::layout::layout_prompt(
-                    &ctx,
+                    active_ctx,
                     p.lines.len(),
                     p.cursor.0,
                     0,
@@ -604,7 +605,13 @@ impl MetalRenderer {
                 self.build_block_view_vertices(
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
-                        region_bottom_y: vp_h - pad_y,
+                        // v1.3 multi-pane: region_bottom_y must be pane-local
+                        // (clip's bottom edge), not the full vp_h - pad_y.
+                        region_bottom_y: self
+                            .layout_ctx
+                            .as_ref()
+                            .expect("LayoutCtx built at draw() entry")
+                            .bottom(),
                         cwd: terminal.cwd(),
                         git_branch: terminal.git_branch(),
                         live: terminal.block_tracker().in_flight(),
@@ -701,8 +708,14 @@ impl MetalRenderer {
         self.cached_scroll_metrics.set(scroll_metrics);
         if show_blocks {
             if let Some((total, visible, max_scroll)) = scroll_metrics {
+                // v1.3 multi-pane: scrollbar uses the active pane's ctx (it
+                // carries pane_origin + clip), not the stale full-viewport `ctx`.
+                let scrollbar_ctx = self
+                    .layout_ctx
+                    .as_ref()
+                    .expect("LayoutCtx built at draw() entry");
                 if let Some(scrollbar) = crate::scrollbar_component::scrollbar_layout(
-                    &ctx,
+                    scrollbar_ctx,
                     total,
                     visible,
                     max_scroll,
