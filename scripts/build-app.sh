@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
 BUNDLE_ID="dev.weft.terminal"
-VERSION="1.3.0"
+VERSION="1.3.1"
 MIN_OS="12.0"
 
 # Paths
