@@ -17,6 +17,10 @@ impl MetalRenderer {
         self.theme = theme;
         // Colors are baked into cached vertices — force a full rebuild.
         self.force_full_grid.set(true);
+        // v1.4.1: invalidate styled-line cache — theme colors are baked into
+        // cached block-view vertices, so a theme change requires re-rendering
+        // all styled lines from scratch.
+        self.styled_line_cache.borrow_mut().bump_generation();
     }
 
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
@@ -62,6 +66,10 @@ impl MetalRenderer {
         unsafe {
             set_layer_opaque(&self.layer, self.opacity >= 1.0);
         }
+        // v1.4.1: invalidate styled-line cache — background alpha is baked
+        // into cached block-view vertices via `resolve_cell_color`, so an
+        // opacity change requires re-rendering all styled lines.
+        self.styled_line_cache.borrow_mut().bump_generation();
     }
 
     /// Current resolved theme (for applying to new tabs etc.).
@@ -134,6 +142,9 @@ impl MetalRenderer {
         }));
 
         self.force_full_grid_redraw();
+        // v1.4.1: atlas rebuild invalidates glyph UVs baked into cached
+        // block-view vertices, and the new scale changes pixel positions.
+        self.styled_line_cache.borrow_mut().bump_generation();
         info!(
             scale,
             cell_width = self.atlas.cell_width,
@@ -170,6 +181,9 @@ impl MetalRenderer {
     pub fn rebuild_atlas(&mut self, font_config: FontConfig) -> (u32, u32) {
         self.font_config = crate::settings_validation::runtime_atlas_font_config(&font_config);
         self.atlas = GlyphAtlas::new(&self.device, &self.font_config, self.scale);
+        // v1.4.1: font/line-height change invalidates glyph UVs and cell
+        // geometry baked into cached block-view vertices.
+        self.styled_line_cache.borrow_mut().bump_generation();
         (self.atlas.cell_width, self.atlas.cell_height)
     }
 

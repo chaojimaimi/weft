@@ -228,19 +228,21 @@ impl App {
                         .find(|(id, _)| *id == active_id)
                         .map(|(_, rect)| *rect)
                         .unwrap_or(content_rect);
-                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, usize)> = pane_layouts
-                        .iter()
-                        .filter(|(id, _)| *id != active_id)
-                        .filter_map(|(id, rect)| {
-                            let pane = tab.pane(*id)?;
-                            let terminal = pane.terminal.as_ref()?;
-                            Some((
-                                *rect,
-                                terminal as *const Terminal,
-                                pane.block_scroll_anchor.offset_value(),
-                            ))
-                        })
-                        .collect();
+                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, usize, u64)> =
+                        pane_layouts
+                            .iter()
+                            .filter(|(id, _)| *id != active_id)
+                            .filter_map(|(id, rect)| {
+                                let pane = tab.pane(*id)?;
+                                let terminal = pane.terminal.as_ref()?;
+                                Some((
+                                    *rect,
+                                    terminal as *const Terminal,
+                                    pane.block_scroll_anchor.offset_value(),
+                                    pane.pane_session_id,
+                                ))
+                            })
+                            .collect();
                     tracing::debug!(
                         content_rect = ?content_rect,
                         active_id = ?active_id,
@@ -253,7 +255,7 @@ impl App {
                 }
                 None => (
                     [0.0, 0.0, 0.0, 0.0],
-                    Vec::new(),
+                    Vec::<(crate::layout::Rect, *const Terminal, usize, u64)>::new(),
                     Vec::new(),
                     weft_core::pane_layout::PaneId(0),
                 ),
@@ -264,7 +266,7 @@ impl App {
         let background_panes: Vec<crate::renderer::PaneRenderInfo> = bg_terminal_ptrs
             .iter()
             .map(
-                |(rect, ptr, block_scroll)| crate::renderer::PaneRenderInfo {
+                |(rect, ptr, block_scroll, pane_session_id)| crate::renderer::PaneRenderInfo {
                     rect: *rect,
                     // SAFETY: `ptr` was obtained from `tab.pane(id).terminal`
                     // above. `tab` outlives this scope; background panes'
@@ -273,6 +275,7 @@ impl App {
                     terminal: unsafe { &**ptr },
                     block_scroll: *block_scroll,
                     submit_on_ctrl_enter: self.config_state.config.editor.submit_on_ctrl_enter,
+                    pane_session_id: *pane_session_id,
                 },
             )
             .collect();
@@ -583,6 +586,7 @@ impl App {
                 // and focus-ring rendering in `draw()`.
                 &pane_layouts_snapshot,
                 active_pane_id,
+                pane.pane_session_id,
             );
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.

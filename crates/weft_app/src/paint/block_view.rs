@@ -4,8 +4,8 @@
 // interdependent build_block_view_vertices + wrap + selection geometry.
 //! BlockView vertex builder extracted from renderer.rs (A5).
 //!
-//! Layout/cache/selection algorithms are unchanged; immutable frame inputs are
-//! grouped in BlockViewPaintModel while SelectionHandler stays explicitly mutable.
+//! Layout/cache/selection algorithms; immutable frame inputs in
+//! BlockViewPaintModel, SelectionHandler explicitly mutable.
 
 use crate::block_component::{spinner_char_for_phase, BlockTone};
 use crate::paint::block_view::actions::{
@@ -52,6 +52,7 @@ impl MetalRenderer {
             spinner_phase,
             find_block_highlight,
             palette,
+            cache_namespace,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -89,9 +90,8 @@ impl MetalRenderer {
 
         push_quad(
             &mut verts,
-            // v1.3 multi-pane: confine the block-view background to the pane's
-            // [left..right] × [clip_top..region_bottom_y] rect so it doesn't
-            // cover background panes. Previously [0, 0, vp_w, region_bottom_y].
+            // v1.3 multi-pane: confine bg to pane's [left..right] ×
+            // [clip_top..region_bottom_y] rect so it doesn't cover bg panes.
             [left, layout.clip_top, right, region_bottom_y.max(0.0)],
             bg_uv,
             [0.0; 4],
@@ -140,11 +140,14 @@ impl MetalRenderer {
             // of iterating all blocks (O(n)). No-op when nothing changed.
             cache.build_prefix_sum(blocks);
         }
-        // Batch 6 Step 1: reset styled lookup counter before the pass; the
-        // pass bumps it via styled_lookup_counter for each styled.line() call.
+        // Batch 6 Step 1: reset styled lookup counter before the pass.
         self.styled_lookup_counter.set(0);
         // Batch 7 Step 4: reset styled paint timer before the pass.
         self.styled_paint_us_counter.set(0);
+        // v1.4.1: palette fingerprint + render generation — embedded in every
+        // StyledLineCacheKey so cached vertices invalidate on OSC 4/104 or bump.
+        let palette_fp = self.block_palette_fingerprint(palette);
+        let render_generation = self.styled_cache_generation();
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
             compute_block_layout_pass(
@@ -380,7 +383,11 @@ impl MetalRenderer {
                             }
                         }
                         let t0 = std::time::Instant::now();
-                        self.push_block_output_text(
+                        let (source, styled) = style::block_arc_identity(blocks, *block_id);
+                        // v1.4.1: resume hints (`line == usize::MAX`) bypass cache —
+                        // multiple hints from one block share block_id + Arc identity.
+                        let source = (*line != usize::MAX).then_some(source).flatten();
+                        self.push_block_output_text_cached(
                             &mut verts,
                             BlockOutputTextPaint {
                                 x: left,
@@ -393,6 +400,17 @@ impl MetalRenderer {
                                 palette,
                                 row_pitch: pitch,
                             },
+                            style::CacheKeyInput {
+                                pane_session_id: cache_namespace,
+                                block_id: block_id.map(|b| b.0).unwrap_or(0),
+                                line_idx: *line,
+                                chunk_idx: 0,
+                                render_generation,
+                                palette_fingerprint: palette_fp,
+                                source,
+                                styled,
+                            },
+                            &self.styled_line_cache,
                         );
                         self.styled_paint_us_counter.set(
                             self.styled_paint_us_counter.get() + t0.elapsed().as_micros() as u64,
@@ -435,7 +453,8 @@ impl MetalRenderer {
                                     }
                                 }
                                 let t0 = std::time::Instant::now();
-                                self.push_block_output_text(
+                                let (source, styled) = style::block_arc_identity(blocks, *block_id);
+                                self.push_block_output_text_cached(
                                     &mut verts,
                                     BlockOutputTextPaint {
                                         x: left,
@@ -448,6 +467,17 @@ impl MetalRenderer {
                                         palette,
                                         row_pitch: pitch,
                                     },
+                                    style::CacheKeyInput {
+                                        pane_session_id: cache_namespace,
+                                        block_id: block_id.map(|b| b.0).unwrap_or(0),
+                                        line_idx: *line,
+                                        chunk_idx: ci,
+                                        render_generation,
+                                        palette_fingerprint: palette_fp,
+                                        source,
+                                        styled,
+                                    },
+                                    &self.styled_line_cache,
                                 );
                                 self.styled_paint_us_counter.set(
                                     self.styled_paint_us_counter.get()

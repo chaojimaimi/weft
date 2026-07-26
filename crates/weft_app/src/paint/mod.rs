@@ -24,6 +24,7 @@ pub(crate) mod primitives;
 pub(crate) mod prompt;
 pub(crate) mod settings;
 pub(crate) mod status_hint;
+pub(crate) mod styled_line_cache;
 pub(crate) mod tab_bar;
 pub(crate) mod text;
 pub(crate) mod ui_helpers;

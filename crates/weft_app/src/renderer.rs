@@ -115,21 +115,15 @@ pub struct MetalRenderer {
     /// mouse move. None when the panel is closed or before the first draw
     /// that paints it.
     pub(crate) cached_panel_scroll_metrics: Cell<Option<(usize, usize, usize)>>,
-    /// Batch 6 Step 1: per-frame counter for `styled.line()` lookups in the
-    /// block-view layout pass. Reset to 0 before each paint, read at
-    /// `build_end` to populate `FrameCounters.styled_line_lookups`. Used to
-    /// assess whether styled-line caching is worth the complexity.
+    /// Batch 6 Step 1: per-frame `styled.line()` lookup count, read at
+    /// `build_end` for `FrameCounters.styled_line_lookups`.
     pub(crate) styled_lookup_counter: Cell<usize>,
-    /// Batch 7 Step 4: per-frame wall-clock timer for `push_block_output_text`.
-    /// Accumulated in microseconds across all calls within a single paint.
-    /// Reset to 0 before each paint, read at `build_end` to populate
-    /// `FrameCounters.styled_paint_us`. Complements `styled_lookup_counter`
-    /// (call count) with actual CPU cost for styled-line caching decisions.
+    /// Batch 7 Step 4: per-frame wall-clock μs for `push_block_output_text`,
+    /// read at `build_end` for `FrameCounters.styled_paint_us`.
     pub(crate) styled_paint_us_counter: Cell<u64>,
-    /// Batch 6 Step 1: per-frame expanded block count from the last
-    /// `compute_block_layout_pass`. Written by `build_block_view_vertices`,
-    /// read at `build_end` to populate `FrameCounters.visible_block_count`.
-    /// 0 in grid view.
+    /// v1.4.1: bounded FIFO cache for completed-block styled-line vertices.
+    pub(crate) styled_line_cache: RefCell<crate::paint::styled_line_cache::StyledLineCache>,
+    /// Batch 6 Step 1: per-frame expanded block count from last layout pass.
     pub(crate) last_expanded_block_count: Cell<usize>,
     /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
     /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
@@ -285,6 +279,7 @@ impl MetalRenderer {
         // exists.
         pane_layouts: &[(weft_core::pane_layout::PaneId, crate::layout::Rect)],
         active_pane_id: weft_core::pane_layout::PaneId,
+        active_pane_session_id: u64,
     ) {
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
@@ -577,6 +572,7 @@ impl MetalRenderer {
                             .as_ref()
                             .and_then(|find| find.block_highlight),
                         palette: terminal.palette(),
+                        cache_namespace: active_pane_session_id,
                     },
                     selection,
                 )
@@ -608,6 +604,7 @@ impl MetalRenderer {
                             .as_ref()
                             .and_then(|find| find.block_highlight),
                         palette: terminal.palette(),
+                        cache_namespace: active_pane_session_id,
                     },
                     selection,
                 )
@@ -871,6 +868,9 @@ impl MetalRenderer {
         // Step 1: drain per-frame block layout cache hit/miss counters.
         let (cache_hits, cache_misses) =
             self.block_layout_cache.borrow_mut().take_hit_miss_counts();
+        let (styled_cache_hits, styled_cache_misses) =
+            self.styled_line_cache.borrow_mut().take_hit_miss_counts();
+        let styled_cache_bytes = self.styled_line_cache.borrow().bytes() as u64;
         // Batch 6 Step 1: visible_block_count now reflects the actual expanded
         // count from compute_block_layout_pass (blocks whose internal lines
         // were expanded, i.e. is_visible && !collapsed). 0 in grid view.
@@ -903,9 +903,9 @@ impl MetalRenderer {
                 grid_bg_instances: 0,
                 grid_glyph_instances,
                 grid_upload_bytes,
-                styled_cache_hits: 0,
-                styled_cache_misses: 0,
-                styled_cache_bytes: 0,
+                styled_cache_hits,
+                styled_cache_misses,
+                styled_cache_bytes,
             });
         self.frame_trace.borrow_mut().encode_start();
 

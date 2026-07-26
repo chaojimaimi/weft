@@ -17,6 +17,8 @@ pub struct PaneRenderInfo<'a> {
     pub terminal: &'a Terminal,
     pub block_scroll: usize,
     pub submit_on_ctrl_enter: bool,
+    /// v1.4.1: pane-scoped namespace for the styled-line vertex cache.
+    pub pane_session_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +134,7 @@ impl MetalRenderer {
                         spinner_phase: -1.0,
                         find_block_highlight: None,
                         palette: pane.terminal.palette(),
+                        cache_namespace: pane.pane_session_id,
                     },
                     &mut selection,
                 );
@@ -221,6 +224,7 @@ mod tests {
             terminal: &terminal,
             block_scroll: 0,
             submit_on_ctrl_enter: true,
+            pane_session_id: 1,
         };
 
         let prompt = background_prompt(&pane).expect("integrated prompt");

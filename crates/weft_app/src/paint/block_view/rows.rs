@@ -60,6 +60,7 @@ impl MetalRenderer {
             spinner_phase: _,
             find_block_highlight: _,
             palette: _,
+            cache_namespace: _,
         } = model;
 
         let cw = self.cell_width() as f32;

@@ -524,6 +524,7 @@ impl App {
                 .as_ref()
                 .and_then(|find| find.block_highlight),
             palette: terminal.palette(),
+            cache_namespace: self.sessions.active().pane_session_id,
         })
     }
 

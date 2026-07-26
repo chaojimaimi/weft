@@ -22,4 +22,8 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// Active-pane find highlight. Background panes always pass `None`.
     pub(crate) find_block_highlight: Option<(u64, usize, bool, usize, usize)>,
     pub(crate) palette: &'a [Color; 256],
+    /// v1.4.1: pane-scoped namespace for the styled-line vertex cache.
+    /// Uses `Pane::pane_session_id` (global, monotonic) so entries from a
+    /// closed pane naturally miss without explicit invalidation.
+    pub(crate) cache_namespace: u64,
 }
