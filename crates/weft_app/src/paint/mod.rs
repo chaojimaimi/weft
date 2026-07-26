@@ -14,6 +14,7 @@ pub(crate) mod grid;
 #[cfg(test)]
 mod grid_bench;
 pub(crate) mod grid_cache;
+pub(crate) mod grid_instances;
 pub(crate) mod key_hints;
 pub(crate) mod metal_backend;
 #[cfg(test)]

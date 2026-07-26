@@ -1,0 +1,733 @@
+//! v1.4.2 Phase B2: Dual-stream grid instance collector (pure logic).
+//!
+//! Types and functions here are not yet wired into the renderer (B3 will
+//! integrate them). `#[allow(dead_code)]` suppresses unused warnings until then.
+//!
+//! Splits the per-cell grid rendering into two streams:
+//! - **Background stream**: 8-float instances per run of same-bg cells.
+//!   Adjacent cells with identical resolved background colors are merged
+//!   into a single background quad, drastically reducing the instance
+//!   count for typical terminal rows (often 80+ cells of default bg).
+//! - **Glyph stream**: 16-float instances per content cell, matching the
+//!   existing `push_cell_instance` layout. Emitted only for cells with
+//!   visible text content or decoration (cursor bar/underline, hyperlink
+//!   underline), skipping empty/space cells whose background is already
+//!   covered by the bg stream.
+//!
+//! This module is **pure logic** — no `MetalRenderer` dependency. All
+//! renderer state (theme colors, atlas, opacity, layout) is passed in as
+//! parameters so the collector can be unit-tested in isolation and the
+//! per-row cache can be rebuilt by any caller. Glyph UV resolution is
+//! deferred to serialization time ([`GridInstanceBatch::push_row`]) so
+//! the builder itself does not depend on the glyph atlas.
+
+use crate::paint::primitives::{push_cell_instance, resolve_cell_color};
+use weft_core::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use weft_core::selection::SelectionHandler;
+
+// ── Data structures ───────────────────────────────────────────────────
+
+/// Background-stream instance: one per run of same-bg cells.
+///
+/// 8 floats: `origin(2) + size(2) + bg(4)`. Serialized via [`Self::push`]
+/// into a flat `Vec<f32>` for GPU upload. The bg stream is drawn first
+/// (no texture sampling, just solid color quads), then the glyph stream
+/// is drawn on top with atlas sampling.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BgInstance {
+    pub x0: f32,
+    pub y0: f32,
+    pub w: f32,
+    pub h: f32,
+    pub bg: [f32; 4],
+}
+
+impl BgInstance {
+    /// Push 8 floats into the flat bg instance buffer.
+    #[inline]
+    pub fn push(&self, out: &mut Vec<f32>) {
+        out.extend_from_slice(&[
+            self.x0, self.y0, self.w, self.h, self.bg[0], self.bg[1], self.bg[2], self.bg[3],
+        ]);
+    }
+}
+
+/// A glyph instance before UV resolution. The caller resolves UVs from
+/// the glyph atlas during serialization ([`GridInstanceBatch::push_row`]).
+///
+/// - `Text`: an atlas-sampled glyph. UV is resolved from `ch`; `fg` is
+///   the text color; bg is transparent (`[0; 4]`) because the bg stream
+///   already painted the cell background.
+/// - `Decoration`: a solid-color rectangle (cursor bar, cursor underline,
+///   hyperlink underline). UV = `[0, 0, 0, 1]` (mask = 0 → only bg shows);
+///   `color` is the visible decoration color.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum GlyphInstance {
+    Text {
+        dst: [f32; 4],
+        ch: char,
+        fg: [f32; 4],
+    },
+    Decoration {
+        dst: [f32; 4],
+        color: [f32; 4],
+    },
+}
+
+/// Per-row dual-stream instance collection. Built by [`build_row_instances`]
+/// and cached in the renderer's per-row cache (`grid_row_cache`). When the
+/// row is dirty, the cache entry is rebuilt; otherwise it's reused.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GridRowInstances {
+    /// Background instances for this row (typically 1-5 runs).
+    pub bg_instances: Vec<BgInstance>,
+    /// Glyph instances for this row (text + decoration).
+    pub glyph_instances: Vec<GlyphInstance>,
+}
+
+/// Per-pane ranges into the flat dual-stream buffers. Records where each
+/// pane's instances begin and end so the Metal backend can issue per-pane
+/// draw calls with scissor rects (v1.3 multi-pane support).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PaneInstanceRanges {
+    /// `[start, end)` float offsets into the bg stream.
+    pub bg_range: (usize, usize),
+    /// `[start, end)` float offsets into the glyph stream.
+    pub glyph_range: (usize, usize),
+}
+
+/// Full batch of grid instances for a single frame, split into two streams.
+///
+/// Built by flattening per-row caches (or direct collection for background
+/// panes). The Metal backend uploads each stream to its own ring buffer
+/// and issues two draw calls: bg stream (solid color pipeline) then glyph
+/// stream (atlas sampling pipeline).
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct GridInstanceBatch {
+    /// Flat bg instance buffer: 8 floats per run.
+    pub bg_stream: Vec<f32>,
+    /// Flat glyph instance buffer: 16 floats per content/decoration cell.
+    pub glyph_stream: Vec<f32>,
+    /// Per-pane ranges for multi-pane scissor draws. Empty for single-pane.
+    pub pane_ranges: Vec<PaneInstanceRanges>,
+}
+
+impl GridInstanceBatch {
+    /// Extend both streams with a row's instances, resolving glyph UVs via
+    /// `resolve_uv`. Returns the float offsets occupied by this row.
+    ///
+    /// The caller passes a UV resolver closure that wraps the glyph atlas
+    /// (`|ch| atlas.get(ch).map(|g| ...).unwrap_or(space_uv)`). This keeps
+    /// the builder pure-logic while still producing the 16-float instance
+    /// format the GPU expects.
+    #[allow(dead_code)]
+    pub(crate) fn push_row(
+        &mut self,
+        row: &GridRowInstances,
+        resolve_uv: &dyn Fn(char) -> [f32; 4],
+    ) -> PaneInstanceRanges {
+        let bg_start = self.bg_stream.len();
+        for bi in &row.bg_instances {
+            bi.push(&mut self.bg_stream);
+        }
+        let bg_end = self.bg_stream.len();
+
+        let glyph_start = self.glyph_stream.len();
+        for gi in &row.glyph_instances {
+            match gi {
+                GlyphInstance::Text { dst, ch, fg } => {
+                    let uv = resolve_uv(*ch);
+                    push_cell_instance(&mut self.glyph_stream, *dst, uv, *fg, [0.0; 4]);
+                }
+                GlyphInstance::Decoration { dst, color } => {
+                    // UV [0,0,0,1] → mask=0 → only bg (color) shows.
+                    push_cell_instance(
+                        &mut self.glyph_stream,
+                        *dst,
+                        [0.0, 0.0, 0.0, 1.0],
+                        [0.0; 4],
+                        *color,
+                    );
+                }
+            }
+        }
+        let glyph_end = self.glyph_stream.len();
+
+        PaneInstanceRanges {
+            bg_range: (bg_start, bg_end),
+            glyph_range: (glyph_start, glyph_end),
+        }
+    }
+}
+
+// ── Row instance builder ──────────────────────────────────────────────
+
+/// Soft cyan for OSC 8 hyperlink underlines (matches the existing
+/// single-stream renderer color).
+const HYPERLINK_COLOR: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
+
+/// Thickness of hyperlink and cursor-underline decorations, in physical px.
+const UNDERLINE_HEIGHT: f32 = 2.0;
+
+/// Build the dual-stream instances for a single grid row.
+///
+/// This is the pure-logic core of the grid renderer. For each cell in the
+/// row it:
+/// 1. Resolves the cell's fg/bg colors against the palette and theme.
+/// 2. Applies REVERSE (swap fg/bg), opacity (scale bg alpha).
+/// 3. Determines the final bg (cursor block / selection / normal) and fg.
+/// 4. Merges adjacent cells with identical `final_bg` into background runs.
+/// 5. Emits glyph instances for cells with visible content or decoration.
+///
+/// **Run merging**: a run breaks when `final_bg` changes (different cell
+/// bg, cursor block, or selection). Wide cells (CJK) span 2 columns within
+/// a run. The default background is still emitted as an explicit run (not
+/// skipped) so transparent windows paint a base layer.
+///
+/// **Glyph emission**: a `Text` glyph is emitted when the cell has a
+/// visible character (not space/NUL, not HIDDEN). `Decoration` glyphs are
+/// emitted for cursor bar/underline and hyperlink underlines. Space cells
+/// with no decoration skip the glyph stream (their bg is covered by the
+/// bg stream).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn build_row_instances(
+    grid: &Grid,
+    palette: &[Color; 256],
+    row: usize,
+    default_fg: [f32; 4],
+    default_bg: [f32; 4],
+    cursor_color: [f32; 4],
+    selection_bg: [f32; 4],
+    cursor: &Cursor,
+    cursor_style: CursorStyle,
+    show_cursor: bool,
+    selection: &SelectionHandler,
+    opacity: f32,
+    cw: f32,
+    ch: f32,
+    origin_x: f32,
+    origin_y: f32,
+) -> GridRowInstances {
+    let num_cols = grid.num_cols;
+    let mut result = GridRowInstances::default();
+
+    let y0 = origin_y;
+    let y1 = origin_y + ch;
+
+    // Run-merge state for the background stream.
+    let mut run_active = false;
+    let mut run_x0: f32 = 0.0;
+    let mut run_x1: f32 = 0.0;
+    let mut run_bg: [f32; 4] = default_bg;
+
+    for col in 0..num_cols {
+        let cell = grid.cell(row, col);
+
+        // Skip wide-char spacers — rendered as part of the preceding wide cell.
+        if cell.flags.contains(CellFlags::WIDE_SPACER) {
+            continue;
+        }
+
+        // ── Resolve cell colors ────────────────────────────────────
+        let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
+        let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
+
+        // SGR reverse video: swap fg/bg before cursor/selection overrides
+        // so the swap applies to the cell's own colors.
+        if cell.flags.contains(CellFlags::REVERSE) {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+
+        // Scale plain background alpha by window opacity so empty cells
+        // show the desktop through them. Cursor/selection colors are
+        // fully opaque (they override bg below).
+        bg[3] *= opacity;
+
+        // ── Determine cell state ───────────────────────────────────
+        let is_cursor = show_cursor && row == cursor.row && col == cursor.col;
+        let is_selected = selection
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.contains(row, col));
+
+        // ── Final bg (precedence: cursor block > selection > normal) ─
+        let final_bg = if is_cursor && cursor_style.is_block() {
+            cursor_color
+        } else if is_selected {
+            selection_bg
+        } else {
+            bg
+        };
+
+        // ── Final fg ───────────────────────────────────────────────
+        // Cursor block: black text on cursor color. Cursor bar/underline:
+        // cursor-colored text (matches existing single-stream behavior).
+        let final_fg = if is_cursor {
+            if cursor_style.is_block() {
+                [0.0, 0.0, 0.0, 1.0]
+            } else {
+                cursor_color
+            }
+        } else {
+            fg
+        };
+
+        // ── Cell render width ──────────────────────────────────────
+        let cell_w = if cell.width == CellWidth::Full && col + 1 < num_cols {
+            cw * 2.0
+        } else {
+            cw
+        };
+        let x0 = origin_x + col as f32 * cw;
+        let x1 = x0 + cell_w;
+
+        // ── Background run merge ───────────────────────────────────
+        // Extend the current run when bg matches and the cell is
+        // contiguous (x0 ≈ run_x1); otherwise flush and start a new run.
+        if !run_active {
+            run_active = true;
+            run_x0 = x0;
+            run_x1 = x1;
+            run_bg = final_bg;
+        } else if final_bg == run_bg && (x0 - run_x1).abs() < 0.01 {
+            run_x1 = x1;
+        } else {
+            if run_x1 > run_x0 {
+                result.bg_instances.push(BgInstance {
+                    x0: run_x0,
+                    y0,
+                    w: run_x1 - run_x0,
+                    h: ch,
+                    bg: run_bg,
+                });
+            }
+            run_x0 = x0;
+            run_x1 = x1;
+            run_bg = final_bg;
+        }
+
+        // ── Glyph stream: text ─────────────────────────────────────
+        let has_visible_text = !cell.flags.contains(CellFlags::HIDDEN)
+            && cell.character != ' '
+            && cell.character != '\0';
+
+        if has_visible_text {
+            result.glyph_instances.push(GlyphInstance::Text {
+                dst: [x0, y0, x1, y1],
+                ch: cell.character,
+                fg: final_fg,
+            });
+        }
+
+        // ── Glyph stream: cursor bar/underline decoration ──────────
+        if is_cursor && show_cursor {
+            if cursor_style.is_bar() {
+                let bar_w = (2.0_f32).max(1.0).min(cw * 0.15);
+                result.glyph_instances.push(GlyphInstance::Decoration {
+                    dst: [x0, y0, x0 + bar_w, y1],
+                    color: cursor_color,
+                });
+            } else if cursor_style.is_underline() {
+                result.glyph_instances.push(GlyphInstance::Decoration {
+                    dst: [x0, y1 - UNDERLINE_HEIGHT, x1, y1],
+                    color: cursor_color,
+                });
+            }
+        }
+
+        // ── Glyph stream: hyperlink underline ──────────────────────
+        if cell.flags.contains(CellFlags::HYPERLINK) {
+            result.glyph_instances.push(GlyphInstance::Decoration {
+                dst: [x0, y1 - UNDERLINE_HEIGHT, x1, y1],
+                color: HYPERLINK_COLOR,
+            });
+        }
+    }
+
+    // Flush the final run.
+    if run_active && run_x1 > run_x0 {
+        result.bg_instances.push(BgInstance {
+            x0: run_x0,
+            y0,
+            w: run_x1 - run_x0,
+            h: ch,
+            bg: run_bg,
+        });
+    }
+
+    result
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use weft_core::grid::{Cell, CellColor, CellFlags, Color, Cursor, CursorStyle, Grid};
+    use weft_core::selection::{GridPos, Selection, SelectionHandler, SelectionMode};
+
+    // Test constants.
+    const FG: [f32; 4] = [0.8, 0.8, 0.8, 1.0];
+    const BG: [f32; 4] = [0.1, 0.1, 0.2, 1.0];
+    const CURSOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const SELECTION: [f32; 4] = [0.3, 0.5, 0.7, 0.6];
+    const CW: f32 = 10.0;
+    const CH: f32 = 20.0;
+
+    /// Build instances for row 0 of a 1-row grid.
+    fn build(
+        grid: &Grid,
+        cursor: &Cursor,
+        style: CursorStyle,
+        show: bool,
+        sel: &SelectionHandler,
+        opacity: f32,
+    ) -> GridRowInstances {
+        let palette = Color::standard_palette();
+        build_row_instances(
+            grid, &palette, 0, FG, BG, CURSOR, SELECTION, cursor, style, show, sel, opacity, CW,
+            CH, 0.0, 0.0,
+        )
+    }
+
+    /// Build with default cursor (hidden) and no selection.
+    fn build_plain(grid: &Grid) -> GridRowInstances {
+        let cursor = Cursor::default();
+        let sel = SelectionHandler::new();
+        build(grid, &cursor, CursorStyle::Block, false, &sel, 1.0)
+    }
+
+    fn make_grid(cells: &[Cell]) -> Grid {
+        let cols = cells.len().max(1);
+        let mut grid = Grid::new(1, cols);
+        for (i, cell) in cells.iter().enumerate() {
+            grid.viewport[0].cells[i] = cell.clone();
+        }
+        grid
+    }
+
+    // ── Test 1: empty row ──────────────────────────────────────────
+
+    #[test]
+    fn empty_row_emits_single_default_bg_run_no_glyphs() {
+        let grid = Grid::new(1, 5);
+        let result = build_plain(&grid);
+
+        // One bg run covering the full row, no glyphs.
+        assert_eq!(result.bg_instances.len(), 1);
+        assert_eq!(result.bg_instances[0].x0, 0.0);
+        assert_eq!(result.bg_instances[0].w, 50.0); // 5 cols * 10 px
+        assert_eq!(result.bg_instances[0].bg, BG);
+        assert_eq!(result.glyph_instances.len(), 0);
+    }
+
+    // ── Test 2: single text cell ───────────────────────────────────
+
+    #[test]
+    fn single_text_cell_emits_bg_run_and_text_glyph() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 1);
+        assert_eq!(result.glyph_instances.len(), 1);
+        match &result.glyph_instances[0] {
+            GlyphInstance::Text { dst, ch, fg } => {
+                assert_eq!(*ch, 'A');
+                assert_eq!(*fg, FG);
+                assert_eq!(*dst, [0.0, 0.0, CW, CH]);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    // ── Test 3: wide char spans two columns ────────────────────────
+
+    #[test]
+    fn wide_char_cell_spans_two_columns_in_bg_run() {
+        // '中' is a wide char → width = Full, spans 2 cols.
+        // Need a 2-col grid with a WIDE_SPACER at col 1 (as the VT parser
+        // would set up) for the wide char to actually span 2 columns.
+        let mut grid = Grid::new(1, 2);
+        grid.viewport[0].cells[0] = Cell::with_char('中');
+        grid.viewport[0].cells[1].flags = CellFlags::WIDE_SPACER;
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 1);
+        assert_eq!(result.bg_instances[0].w, CW * 2.0); // 2 cols
+        assert_eq!(result.glyph_instances.len(), 1);
+        match &result.glyph_instances[0] {
+            GlyphInstance::Text { dst, ch, .. } => {
+                assert_eq!(*ch, '中');
+                assert_eq!(dst[2] - dst[0], CW * 2.0); // width = 2 cells
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    // ── Test 4: wide spacer is skipped ─────────────────────────────
+
+    #[test]
+    fn wide_spacer_cell_is_skipped_entirely() {
+        // A standalone WIDE_SPACER (edge case) produces nothing.
+        let spacer = Cell {
+            flags: CellFlags::WIDE_SPACER,
+            ..Cell::default()
+        };
+        let grid = make_grid(&[spacer]);
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 0);
+        assert_eq!(result.glyph_instances.len(), 0);
+    }
+
+    // ── Test 5: consecutive same-bg cells merge ────────────────────
+
+    #[test]
+    fn consecutive_same_bg_cells_merge_into_one_run() {
+        let mut cells: Vec<Cell> = "hello".chars().map(Cell::with_char).collect();
+        // All default bg → should merge into one run.
+        for c in &mut cells {
+            c.bg = CellColor::Default;
+        }
+        let grid = make_grid(&cells);
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 1);
+        assert_eq!(result.bg_instances[0].w, 50.0); // 5 * 10
+        assert_eq!(result.glyph_instances.len(), 5); // 5 text glyphs
+    }
+
+    // ── Test 6: different bg colors break the run ──────────────────
+
+    #[test]
+    fn different_bg_colors_break_into_separate_runs() {
+        let red = CellColor::Rgb(Color::rgb(255, 0, 0));
+        let green = CellColor::Rgb(Color::rgb(0, 255, 0));
+
+        let mut cell_a = Cell::with_char('A');
+        cell_a.bg = red;
+        let mut cell_b = Cell::with_char('B');
+        cell_b.bg = green;
+
+        let grid = make_grid(&[cell_a, cell_b]);
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 2);
+        // First run: red bg, width = CW
+        assert_eq!(result.bg_instances[0].w, CW);
+        assert_eq!(result.bg_instances[0].bg, [1.0, 0.0, 0.0, 1.0]);
+        // Second run: green bg, width = CW
+        assert_eq!(result.bg_instances[1].w, CW);
+        assert_eq!(result.bg_instances[1].bg, [0.0, 1.0, 0.0, 1.0]);
+    }
+
+    // ── Test 7: reverse video swaps fg and bg ──────────────────────
+
+    #[test]
+    fn reverse_video_swaps_fg_and_bg() {
+        let mut cell = Cell::with_char('A');
+        cell.fg = CellColor::Rgb(Color::rgb(255, 0, 0)); // red fg
+        cell.bg = CellColor::Rgb(Color::rgb(0, 0, 255)); // blue bg
+        cell.flags = CellFlags::REVERSE;
+
+        let grid = make_grid(&[cell]);
+        let result = build_plain(&grid);
+
+        // After swap: fg = blue, bg = red.
+        assert_eq!(result.bg_instances[0].bg, [1.0, 0.0, 0.0, 1.0]); // red bg
+        match &result.glyph_instances[0] {
+            GlyphInstance::Text { fg, .. } => {
+                assert_eq!(*fg, [0.0, 0.0, 1.0, 1.0]); // blue fg
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    // ── Test 8: hidden cell emits bg but no glyph ──────────────────
+
+    #[test]
+    fn hidden_cell_emits_bg_but_no_glyph() {
+        let mut cell = Cell::with_char('X');
+        cell.flags = CellFlags::HIDDEN;
+        let grid = make_grid(&[cell]);
+        let result = build_plain(&grid);
+
+        assert_eq!(result.bg_instances.len(), 1); // bg still painted
+        assert_eq!(result.glyph_instances.len(), 0); // no text glyph
+    }
+
+    // ── Test 9: cursor block overrides bg, uses black fg ───────────
+
+    #[test]
+    fn cursor_block_overrides_bg_and_uses_black_fg() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+            wrap_pending: false,
+        };
+        let sel = SelectionHandler::new();
+        let result = build(&grid, &cursor, CursorStyle::Block, true, &sel, 1.0);
+
+        // bg = cursor_color (overrides default).
+        assert_eq!(result.bg_instances[0].bg, CURSOR);
+        // fg = black (text on cursor block).
+        match &result.glyph_instances[0] {
+            GlyphInstance::Text { fg, .. } => assert_eq!(*fg, [0.0, 0.0, 0.0, 1.0]),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    // ── Test 10: cursor bar emits decoration glyph ─────────────────
+
+    #[test]
+    fn cursor_bar_emits_decoration_glyph() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+            wrap_pending: false,
+        };
+        let sel = SelectionHandler::new();
+        let result = build(&grid, &cursor, CursorStyle::Bar, true, &sel, 1.0);
+
+        // Text glyph + bar decoration.
+        assert_eq!(result.glyph_instances.len(), 2);
+        let has_deco = result
+            .glyph_instances
+            .iter()
+            .any(|g| matches!(g, GlyphInstance::Decoration { color, .. } if *color == CURSOR));
+        assert!(has_deco, "expected a cursor-colored Decoration glyph");
+
+        // bg should NOT be cursor_color (bar doesn't override bg).
+        assert_eq!(result.bg_instances[0].bg, BG);
+    }
+
+    // ── Test 11: cursor underline emits decoration glyph ───────────
+
+    #[test]
+    fn cursor_underline_emits_decoration_glyph() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+            wrap_pending: false,
+        };
+        let sel = SelectionHandler::new();
+        let result = build(&grid, &cursor, CursorStyle::Underline, true, &sel, 1.0);
+
+        assert_eq!(result.glyph_instances.len(), 2);
+        let has_deco = result.glyph_instances.iter().any(|g| {
+            matches!(g, GlyphInstance::Decoration { dst, color }
+                if *color == CURSOR && (dst[3] - dst[1]) == UNDERLINE_HEIGHT)
+        });
+        assert!(has_deco, "expected a cursor-colored underline Decoration");
+    }
+
+    // ── Test 12: selection overrides cell bg ───────────────────────
+
+    #[test]
+    fn selection_overrides_cell_bg() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let cursor = Cursor::default();
+        let mut sel = SelectionHandler::new();
+        sel.selection = Some(Selection::new(
+            GridPos::new(0, 0),
+            GridPos::new(0, 0),
+            SelectionMode::Simple,
+        ));
+        let result = build(&grid, &cursor, CursorStyle::Block, false, &sel, 1.0);
+
+        assert_eq!(result.bg_instances[0].bg, SELECTION);
+    }
+
+    // ── Test 13: hyperlink emits underline decoration ──────────────
+
+    #[test]
+    fn hyperlink_cell_emits_underline_decoration() {
+        let mut cell = Cell::with_char('A');
+        cell.flags = CellFlags::HYPERLINK;
+        let grid = make_grid(&[cell]);
+        let result = build_plain(&grid);
+
+        // Text glyph + hyperlink underline decoration.
+        assert_eq!(result.glyph_instances.len(), 2);
+        let has_link = result.glyph_instances.iter().any(|g| {
+            matches!(g, GlyphInstance::Decoration { color, dst }
+                if *color == HYPERLINK_COLOR && (dst[3] - dst[1]) == UNDERLINE_HEIGHT)
+        });
+        assert!(has_link, "expected a hyperlink underline Decoration");
+    }
+
+    // ── Test 14: opacity scales background alpha ───────────────────
+
+    #[test]
+    fn opacity_scales_background_alpha() {
+        let grid = Grid::new(1, 1);
+        let result = build_plain(&grid);
+        // opacity = 1.0 → bg alpha unchanged.
+        assert_eq!(result.bg_instances[0].bg[3], BG[3]);
+
+        let cursor = Cursor::default();
+        let sel = SelectionHandler::new();
+        let result_half = build(&grid, &cursor, CursorStyle::Block, false, &sel, 0.5);
+        // opacity = 0.5 → bg alpha halved.
+        assert!((result_half.bg_instances[0].bg[3] - BG[3] * 0.5).abs() < 1e-6);
+    }
+
+    // ── Serialization smoke test ───────────────────────────────────
+
+    #[test]
+    fn batch_push_row_serializes_both_streams() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let row = build_plain(&grid);
+
+        let mut batch = GridInstanceBatch::default();
+        let resolve_uv = |_ch: char| [0.1, 0.2, 0.3, 0.4];
+        let ranges = batch.push_row(&row, &resolve_uv);
+
+        // Bg stream: 8 floats per run.
+        assert_eq!(batch.bg_stream.len(), 8);
+        assert_eq!(ranges.bg_range, (0, 8));
+
+        // Glyph stream: 16 floats per glyph.
+        assert_eq!(batch.glyph_stream.len(), 16);
+        assert_eq!(ranges.glyph_range, (0, 16));
+    }
+
+    // ── Test 16: multi-pane ranges don't overlap ──────────────────
+
+    #[test]
+    fn multi_pane_ranges_are_sequential_and_non_overlapping() {
+        // Two rows, each producing 1 bg run (8 floats) + 1 glyph (16 floats).
+        let grid_a = make_grid(&[Cell::with_char('A')]);
+        let grid_b = make_grid(&[Cell::with_char('B')]);
+        let row_a = build_plain(&grid_a);
+        let row_b = build_plain(&grid_b);
+
+        let mut batch = GridInstanceBatch::default();
+        let resolve_uv = |_ch: char| [0.1, 0.2, 0.3, 0.4];
+        let ranges_a = batch.push_row(&row_a, &resolve_uv);
+        let ranges_b = batch.push_row(&row_b, &resolve_uv);
+
+        // Pane A occupies floats [0, 8) in bg and [0, 16) in glyph.
+        assert_eq!(ranges_a.bg_range, (0, 8));
+        assert_eq!(ranges_a.glyph_range, (0, 16));
+
+        // Pane B occupies floats [8, 16) in bg and [16, 32) in glyph.
+        assert_eq!(ranges_b.bg_range, (8, 16));
+        assert_eq!(ranges_b.glyph_range, (16, 32));
+
+        // Total: 2 bg runs × 8 floats + 2 glyphs × 16 floats.
+        assert_eq!(batch.bg_stream.len(), 16);
+        assert_eq!(batch.glyph_stream.len(), 32);
+    }
+}
