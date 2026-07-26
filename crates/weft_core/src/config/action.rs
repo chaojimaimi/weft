@@ -95,4 +95,32 @@ pub enum Action {
     /// contract.
     #[serde(rename = "close_pane")]
     ClosePane,
+    /// v1.3.3: Zoom the active pane to fill the viewport (Cmd+Shift+Return).
+    /// A second invocation restores the prior layout. While zoomed, focus
+    /// cycling and direction focus are no-ops, and the underlying tree
+    /// shape is preserved so un-zooming is a perfect inverse.
+    #[serde(rename = "toggle_pane_zoom")]
+    TogglePaneZoom,
+    /// v1.3.3: Move focus to the nearest pane above the active pane
+    /// (Cmd+Alt+Up). Spatial, not declaration-order — picks the candidate
+    /// whose bottom edge is nearest the active pane's top edge, requiring
+    /// real edge adjacency on the horizontal axis.
+    #[serde(rename = "focus_pane_up")]
+    FocusPaneUp,
+    /// v1.3.3: Move focus to the nearest pane below the active pane
+    /// (Cmd+Alt+Down). Mirror of `FocusPaneUp`.
+    #[serde(rename = "focus_pane_down")]
+    FocusPaneDown,
+    /// v1.3.3: Move focus to the nearest pane to the left of the active
+    /// pane (Cmd+Alt+Left). Replaces the v1.3.0 cyclic `FocusPrevPane`
+    /// binding on Cmd+Alt+Left — cyclic focus is still reachable via
+    /// Cmd+Alt+LeftBracket.
+    #[serde(rename = "focus_pane_left")]
+    FocusPaneLeft,
+    /// v1.3.3: Move focus to the nearest pane to the right of the active
+    /// pane (Cmd+Alt+Right). Replaces the v1.3.0 cyclic `FocusNextPane`
+    /// binding on Cmd+Alt+Right — cyclic focus is still reachable via
+    /// Cmd+Alt+RightBracket.
+    #[serde(rename = "focus_pane_right")]
+    FocusPaneRight,
 }

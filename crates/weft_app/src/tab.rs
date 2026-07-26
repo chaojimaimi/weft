@@ -244,6 +244,52 @@ impl Tab {
         self.split_tree.set_ratio_for_pair(first, second, new_ratio)
     }
 
+    /// v1.3.3: Toggle pane zoom on the active pane. When zooming in, the
+    /// active pane fills the viewport and siblings are hidden (but kept
+    /// in the tree). When zooming out, the prior layout is restored.
+    /// Returns `Some(pane_id)` when now zoomed, `None` when un-zoomed.
+    ///
+    /// `active_pane` is updated when zoom changes so callers that read it
+    /// (e.g. for cursor drawing) stay in sync.
+    pub(crate) fn toggle_pane_zoom(&mut self) -> Option<weft_core::pane_layout::PaneId> {
+        let zoomed = self.split_tree.toggle_zoom();
+        // Keep `active_pane` in lockstep with the tree's notion of focus.
+        // When zooming in, the active pane becomes the zoomed pane (which
+        // it already was — `toggle_zoom` zooms the active). When zooming
+        // out, the active stays where the tree left it (unchanged).
+        if let Some(id) = zoomed {
+            self.active_pane = id;
+        } else if let Some(active) = self.split_tree.active() {
+            self.active_pane = active;
+        }
+        zoomed
+    }
+
+    /// v1.3.3: Move focus to the nearest pane in `dir`, based on spatial
+    /// layout of `content_rect`. Returns the newly focused pane id, or
+    /// `None` if no neighbour exists in that direction.
+    pub(crate) fn focus_direction_pane(
+        &mut self,
+        dir: weft_core::pane_layout::FocusDirection,
+        content_rect: weft_core::pane_layout::Rect,
+    ) -> Option<weft_core::pane_layout::PaneId> {
+        let new_active = self.split_tree.focus_in_direction(dir, content_rect)?;
+        self.active_pane = new_active;
+        Some(new_active)
+    }
+
+    /// v1.3.3: True iff the tab is currently in pane-zoom mode (one pane
+    /// shown full-viewport, siblings hidden).
+    ///
+    /// Not yet read by the render path — `split_tree().layout()` already
+    /// collapses to a single-pane vec when zoomed, so the redraw pipeline
+    /// gets the right geometry without an explicit branch. Kept on the API
+    /// for the upcoming status-bar / zoom-indicator UX.
+    #[allow(dead_code)]
+    pub(crate) fn is_zoomed(&self) -> bool {
+        self.split_tree.is_zoomed()
+    }
+
     /// Create a new tab with a PTY + Terminal pair at the given size.
     ///
     /// `cwd` — if `Some(path)`, the shell starts in that directory (via

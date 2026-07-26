@@ -49,17 +49,27 @@ impl Default for KeyBindings {
             ("cmd+shift+d", Action::SplitHorizontal),
             // v1.3: pane focus cycling. Cmd+Option+] / [ mirrors the existing
             // Cmd+Shift+] / [ tab-switching shape, with Option as the "within
-            // tab" modifier. Cmd+Option+Arrow variants are also bound so users
-            // can navigate spatially.
+            // tab" modifier. These are the cyclic (declaration-order) bindings.
             ("cmd+alt+right_bracket", Action::FocusNextPane),
             ("cmd+alt+left_bracket", Action::FocusPrevPane),
-            ("cmd+alt+right", Action::FocusNextPane),
-            ("cmd+alt+left", Action::FocusPrevPane),
+            // v1.3.3: spatial direction focus. Cmd+Alt+Arrow now picks the
+            // nearest pane in that direction (replacing the v1.3.0 cyclic
+            // binding on the same keys — cyclic order is still on the bracket
+            // keys above). Up / Down are new; Left / Right were previously
+            // bound to FocusNextPane/FocusPrevPane.
+            ("cmd+alt+up", Action::FocusPaneUp),
+            ("cmd+alt+down", Action::FocusPaneDown),
+            ("cmd+alt+right", Action::FocusPaneRight),
+            ("cmd+alt+left", Action::FocusPaneLeft),
             // v1.3: close the focused pane. Cmd+Shift+W is distinct from
             // Cmd+W (CloseTab) so the two contracts stay independent: Cmd+W
             // always closes the whole tab; Cmd+Shift+W closes just the pane
             // (and falls through to tab-close when only one pane remains).
             ("cmd+shift+w", Action::ClosePane),
+            // v1.3.3: zoom the active pane to fill the viewport. Cmd+Shift+Return
+            // matches iTerm2's "toggle fullscreen on current pane" shortcut.
+            // The same key toggles back to the prior layout.
+            ("cmd+shift+return", Action::TogglePaneZoom),
         ];
         let mut map = HashMap::new();
         for (binding, action) in pairs {

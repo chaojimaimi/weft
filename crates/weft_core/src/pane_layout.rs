@@ -55,6 +55,20 @@ pub enum SplitDirection {
     Vertical,
 }
 
+/// v1.3.3: Spatial direction for `focus_in_direction`. Each variant is the
+/// side of the active pane to look for a neighbour (e.g. `Up` means "move
+/// focus to a pane whose bottom edge is above the active pane's top edge").
+///
+/// Mirrors the `Action::FocusPaneUp` / `FocusPaneDown` / `FocusPaneLeft` /
+/// `FocusPaneRight` variants 1:1, so dispatch is a plain translation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 /// Errors returned by tree mutations. Kept narrow so callers can `match`
 /// without a wildcard arm.
 //
@@ -164,10 +178,16 @@ impl Node {
 /// Binary tree of pane splits. Owns the layout structure and the currently
 /// focused leaf; does NOT own any PTY/Terminal state — the caller attaches
 /// that to each [`PaneId`] separately.
+///
+/// `zoomed_pane` (v1.3.3) is the pane id currently shown full-viewport,
+/// collapsing all siblings. When `Some`, `panes`/`layout`/`contains` etc.
+/// behave as if the tree had a single leaf, but the underlying tree shape
+/// is preserved so toggling zoom off restores the exact prior layout.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SplitTree {
     root: Option<Node>,
     active: Option<PaneId>,
+    zoomed_pane: Option<PaneId>,
 }
 
 impl SplitTree {
@@ -176,6 +196,7 @@ impl SplitTree {
         Self {
             root: Some(Node::Leaf(initial_pane)),
             active: Some(initial_pane),
+            zoomed_pane: None,
         }
     }
 
@@ -184,9 +205,19 @@ impl SplitTree {
         self.root.is_none()
     }
 
-    /// Number of leaf panes. O(n) — call once per frame, not per pixel.
+    /// Number of leaf panes in the underlying tree, ignoring zoom. O(n) —
+    /// call once per frame, not per pixel.
+    ///
+    /// v1.3.3: This is a **structural** query (callers ask "how many real
+    /// panes exist in this tab?"), so it walks the real tree even when
+    /// zoomed — `panes()` would return 1 while zoomed, fooling any caller
+    /// that uses this to decide "is this a single-pane tab?".
     pub fn pane_count(&self) -> usize {
-        self.panes().len()
+        let mut out = Vec::new();
+        if let Some(root) = &self.root {
+            root.collect_leaves(&mut out);
+        }
+        out.len()
     }
 
     /// Currently focused pane, or `None` when the tree is empty.
@@ -196,7 +227,14 @@ impl SplitTree {
 
     /// All leaf PaneIds in declaration order (depth-first, first child
     /// before second). Stable regardless of focus.
+    ///
+    /// v1.3.3: When zoomed, returns only `[zoomed_pane]` so renderers and
+    /// hit-testing naturally collapse to a single pane without each caller
+    /// needing to repeat the zoom check.
     pub fn panes(&self) -> Vec<PaneId> {
+        if let Some(zoomed) = self.zoomed_pane {
+            return vec![zoomed];
+        }
         let mut out = Vec::new();
         if let Some(root) = &self.root {
             root.collect_leaves(&mut out);
@@ -205,16 +243,31 @@ impl SplitTree {
     }
 
     /// True iff `pane` is a leaf in this tree.
+    ///
+    /// v1.3.3: When zoomed, only the zoomed pane counts as "present" for
+    /// hit-testing and validation; siblings are still in the tree but
+    /// logically hidden.
     pub fn contains(&self, pane: PaneId) -> bool {
+        if let Some(zoomed) = self.zoomed_pane {
+            return zoomed == pane;
+        }
         self.root.as_ref().is_some_and(|r| r.contains_leaf(pane))
     }
 
     /// Set the active pane. Returns `Err` if the pane isn't a leaf.
+    ///
+    /// v1.3.3: While zoomed, focus shifts are no-ops (the active pane can't
+    /// change without un-zooming first). We return `Ok(())` rather than an
+    /// error because callers like mouse hit-testing treat this as "nothing
+    /// to do" rather than a real failure.
     pub fn set_active(&mut self, pane: PaneId) -> Result<(), SplitError> {
         match &self.root {
             None => return Err(SplitError::Empty),
             Some(r) if !r.contains_leaf(pane) => return Err(SplitError::PaneNotFound(pane)),
             _ => {}
+        }
+        if self.zoomed_pane.is_some() {
+            return Ok(());
         }
         self.active = Some(pane);
         Ok(())
@@ -234,7 +287,13 @@ impl SplitTree {
 
     /// Shared helper for next/prev. `step == 1` advances by one; `step ==
     /// usize::MAX` is interpreted as "go back one" via wrapping arithmetic.
+    ///
+    /// v1.3.3: No-op when zoomed — `panes()` already returns a single-pane
+    /// vec, so there's nothing to cycle through.
     fn cycle_active(&mut self, step: usize) -> Option<PaneId> {
+        if self.zoomed_pane.is_some() {
+            return self.zoomed_pane;
+        }
         let panes = self.panes();
         if panes.is_empty() {
             return None;
@@ -289,6 +348,10 @@ impl SplitTree {
             first: Box::new(old_node),
             second: Box::new(Node::Leaf(new_pane)),
         });
+        // v1.3.3: Exit zoom so the freshly-split layout is visible. The
+        // new pane becomes active (and visible) regardless of whether the
+        // previously-zoomed pane was the one split.
+        self.zoomed_pane = None;
         self.active = Some(new_pane);
         Ok(new_pane)
     }
@@ -297,6 +360,11 @@ impl SplitTree {
     /// (the tree collapses one level). Closing the last pane empties the
     /// tree. After close, `active` moves to the sibling when present,
     /// otherwise falls back to the previous leaf in declaration order.
+    ///
+    /// v1.3.3: If the closed pane was the zoomed pane, zoom clears (the
+    /// surviving sibling becomes both active and visible). Closing a
+    /// hidden pane while zoomed is allowed — the tree updates, but the
+    /// zoomed pane stays zoomed unless it was the one closed.
     ///
     /// Returns the new active pane (or `None` when the tree is now empty).
     pub fn close_pane(&mut self, pane: PaneId) -> Result<Option<PaneId>, SplitError> {
@@ -311,6 +379,7 @@ impl SplitTree {
         // Special case: the root itself is the pane being closed.
         if root.is_leaf_with(pane) {
             self.active = None;
+            self.zoomed_pane = None;
             return Ok(None);
         }
 
@@ -332,13 +401,36 @@ impl SplitTree {
             panes.last().copied()
         };
         self.active = new_active;
+        // v1.3.3: If we just closed the zoomed pane, the zoom no longer
+        // points at a valid leaf — clear it. The new active pane (computed
+        // above) takes over the full viewport on the next layout pass.
+        if self.zoomed_pane == Some(pane) {
+            self.zoomed_pane = None;
+        } else if self.zoomed_pane.is_some() {
+            // Hidden pane was closed while zoomed. The `new_active` above
+            // may point at a now-hidden sibling (e.g. via the
+            // `surviving_sibling` path), which would put `active` and
+            // `zoomed_pane` in disagreement. Pin `active` to the zoomed
+            // pane so they stay consistent — the user is still looking at
+            // the zoomed pane, so it must also be the focused one.
+            self.active = self.zoomed_pane;
+            return Ok(self.zoomed_pane);
+        }
         Ok(new_active)
     }
 
     /// Compute the rect for every leaf in `viewport`. Returns
     /// `(pane_id, rect)` pairs in declaration order. Empty when the tree
     /// is empty.
+    ///
+    /// v1.3.3: When zoomed, returns `[(zoomed_pane, viewport)]` — the
+    /// underlying tree shape is preserved (so toggling zoom off restores
+    /// the exact prior layout) but the renderer sees only the zoomed pane
+    /// occupying the full viewport.
     pub fn layout(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
+        if let Some(zoomed) = self.zoomed_pane {
+            return vec![(zoomed, viewport)];
+        }
         let mut out = Vec::new();
         if let Some(root) = &self.root {
             root.layout_into(viewport, &mut out);
@@ -350,6 +442,9 @@ impl SplitTree {
     /// Used by the restore path to swap a placeholder id for the real
     /// session id once the PTY is spawned. The active pane is updated when
     /// the replaced pane was active.
+    ///
+    /// v1.3.3: Also updates `zoomed_pane` if it pointed at the replaced
+    /// id, so a restored session stays zoomed across the id swap.
     pub fn replace_pane(&mut self, old_pane: PaneId, new_pane: PaneId) -> Result<(), SplitError> {
         let root = self.root.as_mut().ok_or(SplitError::Empty)?;
         if root.contains_leaf(new_pane) {
@@ -360,6 +455,9 @@ impl SplitTree {
         }
         if self.active == Some(old_pane) {
             self.active = Some(new_pane);
+        }
+        if self.zoomed_pane == Some(old_pane) {
+            self.zoomed_pane = Some(new_pane);
         }
         Ok(())
     }
@@ -387,6 +485,12 @@ impl SplitTree {
         if !new_ratio.is_finite() {
             return Err(SplitError::RatioOutOfRange(new_ratio));
         }
+        // v1.3.3: When zoomed there's only one visible pane — no divider
+        // to drag. Return Ok(false) so the drag loop releases without
+        // erroring, matching the "single-leaf" code path below.
+        if self.zoomed_pane.is_some() {
+            return Ok(false);
+        }
         let clamped = new_ratio.clamp(RATIO_MIN, RATIO_MAX);
         let root = self.root.as_mut().ok_or(SplitError::Empty)?;
         if !root.contains_leaf(first) {
@@ -400,6 +504,147 @@ impl SplitTree {
         }
         Ok(set_split_ratio_for_pair(root, first, second, clamped))
     }
+
+    // ── v1.3.3: Pane zoom ────────────────────────────────────────────────
+
+    /// Currently zoomed pane (shown full-viewport), or `None` when the
+    /// tree is laid out normally.
+    pub fn zoomed_pane(&self) -> Option<PaneId> {
+        self.zoomed_pane
+    }
+
+    /// True iff a pane is currently zoomed (full-viewport).
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed_pane.is_some()
+    }
+
+    /// Toggle zoom on the active pane. When zooming in, the active pane
+    /// expands to fill the entire viewport (siblings are hidden but kept
+    /// in the tree). When zooming out, the prior layout is restored.
+    ///
+    /// Returns the pane id that is now zoomed (`Some` when zooming in),
+    /// or `None` when zooming out / when the tree is empty.
+    ///
+    /// Zooming into a single-pane tree is a no-op — there's nothing to
+    /// hide, and we want the toggle to be a true inverse (calling zoom
+    /// again should restore, not stay zoomed).
+    pub fn toggle_zoom(&mut self) -> Option<PaneId> {
+        if let Some(_zoomed) = self.zoomed_pane.take() {
+            // Was zoomed → un-zoom. Layout returns to normal on the next
+            // call to `layout()`.
+            return None;
+        }
+        // Need at least 2 panes for zoom to be meaningful.
+        let panes = self.panes();
+        if panes.len() < 2 {
+            return None;
+        }
+        let active = self.active?;
+        self.zoomed_pane = Some(active);
+        Some(active)
+    }
+
+    // ── v1.3.3: Direction-aware focus ───────────────────────────────────
+
+    /// Move focus to the nearest pane in the given direction, based on
+    /// spatial layout (not declaration order). Returns the newly focused
+    /// pane id, or `None` if no neighbour exists in that direction.
+    ///
+    /// Algorithm: compute every pane's rect via `layout(viewport)`, find
+    /// the active pane's rect, then for the requested axis pick the
+    /// candidate whose edge is "just past" the active pane in that
+    /// direction and whose span overlaps the active pane on the cross
+    /// axis. Among overlapping candidates, the one with the smallest
+    /// gap wins (nearest neighbour semantics, matches tmux/iTerm2 UX).
+    ///
+    /// No-op when zoomed (only one visible pane).
+    pub fn focus_in_direction(&mut self, dir: FocusDirection, viewport: Rect) -> Option<PaneId> {
+        if self.zoomed_pane.is_some() {
+            return None;
+        }
+        let layouts = self.layout(viewport);
+        if layouts.len() < 2 {
+            return None;
+        }
+        let active = self.active?;
+        let active_rect = layouts
+            .iter()
+            .find(|(id, _)| *id == active)
+            .map(|(_, r)| *r)?;
+        let best = nearest_pane_in_direction(active, active_rect, dir, &layouts);
+        if let Some(id) = best {
+            self.active = Some(id);
+        }
+        best
+    }
+}
+
+/// v1.3.3: Pick the nearest pane to `active`'s rect in the given direction.
+///
+/// "Nearest" = smallest positive gap along the direction axis, with the
+/// additional requirement that the candidate overlaps the active pane on
+/// the cross axis (so focus doesn't leap across a corner to a diagonally
+/// placed pane — matches tmux's behaviour where you need a real edge
+/// adjacency, not just a corner touch).
+fn nearest_pane_in_direction(
+    active: PaneId,
+    active_rect: Rect,
+    dir: FocusDirection,
+    layouts: &[(PaneId, Rect)],
+) -> Option<PaneId> {
+    let [ax0, ay0, ax1, ay1] = active_rect;
+    // Cross-axis overlap test: the candidate must share at least this
+    // much of the cross axis with the active pane. A small epsilon avoids
+    // floating-point corner-touch false positives.
+    const OVERLAP_EPS: f32 = 0.5;
+
+    let mut best: Option<(PaneId, f32)> = None;
+    for &(id, rect) in layouts {
+        if id == active {
+            continue;
+        }
+        let [cx0, cy0, cx1, cy1] = rect;
+        let (gap, overlap_ok) = match dir {
+            // Candidate is "Up" of active: its bottom edge is at or above
+            // active's top edge. Gap = active_top - candidate_bottom.
+            FocusDirection::Up => {
+                let gap = ay0 - cy1;
+                let overlap = (ax1.min(cx1) - ax0.max(cx0)).max(0.0);
+                (gap, overlap > OVERLAP_EPS)
+            }
+            // Candidate is "Down": its top edge is at or below active's
+            // bottom edge. Gap = candidate_top - active_bottom.
+            FocusDirection::Down => {
+                let gap = cy0 - ay1;
+                let overlap = (ax1.min(cx1) - ax0.max(cx0)).max(0.0);
+                (gap, overlap > OVERLAP_EPS)
+            }
+            // Candidate is "Left": its right edge is at or left of active's
+            // left edge. Gap = active_left - candidate_right.
+            FocusDirection::Left => {
+                let gap = ax0 - cx1;
+                let overlap = (ay1.min(cy1) - ay0.max(cy0)).max(0.0);
+                (gap, overlap > OVERLAP_EPS)
+            }
+            // Candidate is "Right": its left edge is at or right of active's
+            // right edge. Gap = candidate_left - active_right.
+            FocusDirection::Right => {
+                let gap = cx0 - ax1;
+                let overlap = (ay1.min(cy1) - ay0.max(cy0)).max(0.0);
+                (gap, overlap > OVERLAP_EPS)
+            }
+        };
+        if !overlap_ok || gap < -OVERLAP_EPS {
+            continue;
+        }
+        let gap = gap.max(0.0);
+        match best {
+            None => best = Some((id, gap)),
+            Some((_, bg)) if gap < bg => best = Some((id, gap)),
+            _ => {}
+        }
+    }
+    best.map(|(id, _)| id)
 }
 
 // ── Free helpers ───────────────────────────────────────────────────────
@@ -1001,5 +1246,374 @@ mod tests {
         assert_eq!(format!("{}", pid(42)), "PaneId(42)");
         assert!(pid(1) < pid(2));
         assert_eq!(pid(7).raw(), 7);
+    }
+
+    // ── v1.3.3: Pane zoom ───────────────────────────────────────────────
+
+    #[test]
+    fn toggle_zoom_on_active_pane_collapses_layout() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        // active is pane 2 (the new pane). Zoom it.
+        assert_eq!(tree.toggle_zoom(), Some(pid(2)));
+        assert!(tree.is_zoomed());
+        assert_eq!(tree.zoomed_pane(), Some(pid(2)));
+        // Layout returns only the zoomed pane filling the viewport.
+        assert_eq!(tree.layout(ROOT), vec![(pid(2), ROOT)]);
+        assert_eq!(tree.panes(), vec![pid(2)]);
+    }
+
+    #[test]
+    fn toggle_zoom_again_restores_layout() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom(); // zoom in
+        assert_eq!(tree.toggle_zoom(), None); // zoom out
+        assert!(!tree.is_zoomed());
+        // Both panes are back, in the original 50/50 split.
+        assert_eq!(
+            tree.layout(ROOT),
+            vec![
+                (pid(1), [0.0, 0.0, 50.0, 100.0]),
+                (pid(2), [50.0, 0.0, 100.0, 100.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn zoom_on_single_pane_tree_is_noop() {
+        let mut tree = SplitTree::new(pid(1));
+        // Nothing to hide — zoom is a no-op so the toggle stays invertible.
+        assert_eq!(tree.toggle_zoom(), None);
+        assert!(!tree.is_zoomed());
+    }
+
+    #[test]
+    fn zoom_on_empty_tree_is_noop() {
+        let mut tree = SplitTree::default();
+        assert_eq!(tree.toggle_zoom(), None);
+        assert!(!tree.is_zoomed());
+    }
+
+    #[test]
+    fn zoomed_tree_contains_only_returns_true_for_zoomed_pane() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        // Pane 1 is still in the underlying tree but logically hidden.
+        assert!(tree.contains(pid(2)));
+        assert!(!tree.contains(pid(1)));
+    }
+
+    #[test]
+    fn zoomed_focus_next_prev_are_noops() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.split_leaf(pid(2), SplitDirection::Horizontal, 0.5, pid(3))
+            .unwrap();
+        // Active is pane 3. Zoom.
+        tree.toggle_zoom();
+        assert_eq!(tree.active(), Some(pid(3)));
+        // Both focus ops return the zoomed pane (no cycling).
+        assert_eq!(tree.focus_next(), Some(pid(3)));
+        assert_eq!(tree.focus_prev(), Some(pid(3)));
+        assert_eq!(tree.active(), Some(pid(3)));
+    }
+
+    #[test]
+    fn zoomed_set_active_is_silent_noop() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        // set_active on a hidden pane returns Ok (not Err) but does not
+        // change focus — mouse clicks on hidden panes shouldn't error.
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(tree.active(), Some(pid(2)));
+    }
+
+    #[test]
+    fn split_leaf_exits_zoom() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        assert!(tree.is_zoomed());
+        // Splitting the zoomed pane forces un-zoom so the new layout shows.
+        tree.split_leaf(pid(2), SplitDirection::Horizontal, 0.5, pid(3))
+            .unwrap();
+        assert!(!tree.is_zoomed());
+        assert_eq!(tree.panes().len(), 3);
+    }
+
+    #[test]
+    fn close_zoomed_pane_clears_zoom() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom(); // zoom pane 2
+                            // Close pane 2 → zoom must clear, surviving sibling becomes active.
+        let new_active = tree.close_pane(pid(2)).unwrap();
+        assert_eq!(new_active, Some(pid(1)));
+        assert!(!tree.is_zoomed());
+        assert_eq!(tree.layout(ROOT), vec![(pid(1), ROOT)]);
+    }
+
+    #[test]
+    fn close_hidden_pane_while_zoomed_keeps_zoom() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom(); // zoom pane 2; pane 1 hidden but still in tree
+                            // Closing a hidden pane updates the tree shape
+                            // but the zoomed pane (2) is unaffected.
+        tree.close_pane(pid(1)).unwrap();
+        assert!(tree.is_zoomed());
+        assert_eq!(tree.zoomed_pane(), Some(pid(2)));
+        // v1.3.3 P2 fix: active must stay pinned to the zoomed pane so
+        // the two never disagree while zoomed.
+        assert_eq!(tree.active(), Some(pid(2)));
+        // After un-zoom, the layout is a single-pane tree.
+        tree.toggle_zoom();
+        assert_eq!(tree.layout(ROOT), vec![(pid(2), ROOT)]);
+    }
+
+    #[test]
+    fn pane_count_reflects_real_tree_while_zoomed() {
+        // v1.3.3 P2 fix: pane_count is structural, not rendering-related.
+        // It must report the underlying leaf count even when zoomed.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.split_leaf(pid(2), SplitDirection::Horizontal, 0.5, pid(3))
+            .unwrap();
+        assert_eq!(tree.pane_count(), 3);
+        tree.toggle_zoom();
+        // panes() collapses to 1 for rendering, but pane_count stays 3.
+        assert_eq!(tree.panes().len(), 1);
+        assert_eq!(tree.pane_count(), 3);
+    }
+
+    #[test]
+    fn replace_pane_propagates_zoom_id() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        // Restore path swaps pane 2 → 99. Zoom should follow.
+        tree.replace_pane(pid(2), pid(99)).unwrap();
+        assert_eq!(tree.zoomed_pane(), Some(pid(99)));
+        assert!(tree.is_zoomed());
+        assert_eq!(tree.layout(ROOT), vec![(pid(99), ROOT)]);
+    }
+
+    #[test]
+    fn set_ratio_for_pair_is_noop_while_zoomed() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        // No divider visible — drag should be a silent no-op.
+        assert_eq!(tree.set_ratio_for_pair(pid(1), pid(2), 0.3), Ok(false));
+        // After un-zoom the ratio is still 0.5.
+        tree.toggle_zoom();
+        let first = tree
+            .layout(ROOT)
+            .iter()
+            .find(|(id, _)| *id == pid(1))
+            .unwrap()
+            .1;
+        assert!((first[2] - 50.0).abs() < 0.01);
+    }
+
+    // ── v1.3.3: Direction-aware focus ───────────────────────────────────
+
+    #[test]
+    fn focus_left_in_vertical_split_moves_to_left_pane() {
+        // Vertical split: pane 1 (left), pane 2 (right). Active = 2.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        assert_eq!(tree.active(), Some(pid(2)));
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Left, ROOT),
+            Some(pid(1))
+        );
+        assert_eq!(tree.active(), Some(pid(1)));
+    }
+
+    #[test]
+    fn focus_right_in_vertical_split_moves_to_right_pane() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Right, ROOT),
+            Some(pid(2))
+        );
+    }
+
+    #[test]
+    fn focus_up_in_horizontal_split_moves_to_top_pane() {
+        // Horizontal split: pane 1 (top), pane 2 (bottom). Active = 2.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Up, ROOT),
+            Some(pid(1))
+        );
+    }
+
+    #[test]
+    fn focus_down_in_horizontal_split_moves_to_bottom_pane() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Down, ROOT),
+            Some(pid(2))
+        );
+    }
+
+    #[test]
+    fn focus_in_direction_no_neighbour_returns_none() {
+        // Single pane — no neighbour in any direction.
+        let mut tree = SplitTree::new(pid(1));
+        assert_eq!(tree.focus_in_direction(FocusDirection::Up, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Down, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Left, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Right, ROOT), None);
+    }
+
+    #[test]
+    fn focus_left_at_left_edge_returns_none() {
+        // Vertical split: pane 1 (left), pane 2 (right). Active = 1.
+        // Already at the left edge — no pane further left.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(tree.focus_in_direction(FocusDirection::Left, ROOT), None);
+        // Active unchanged.
+        assert_eq!(tree.active(), Some(pid(1)));
+    }
+
+    #[test]
+    fn focus_direction_in_2x2_grid_finds_correct_neighbour() {
+        // Build a 2x2 grid:
+        //   root (H): top = pane 1, bottom = pane 4
+        //   top (V): pane 1 (left), pane 2 (right)
+        //   bottom (V): pane 3 (left), pane 4 (right)
+        //
+        // Layout (100x100):
+        //   pane 1: [0,0,50,50]    pane 2: [50,0,100,50]
+        //   pane 3: [0,50,50,100]  pane 4: [50,50,100,100]
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(4))
+            .unwrap();
+        // Active is now pane 4 (bottom). Split top (pane 1) into V(1, 2).
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        // Split bottom (pane 4) into V(3, 4)? Careful: pane 4 is currently
+        // a leaf, so splitting it makes pane 3 (left) + pane 4 (right)? No —
+        // split_leaf keeps the original as first, new as second. So we get
+        // V(4, 3). Instead, split pane 1 first to get the top row, then
+        // split pane 4. To get V(3, 4) we'd need to insert pane 3 as the
+        // "original" — but the API only adds the new pane as second child.
+        //
+        // For test purposes the exact id placement doesn't matter as long
+        // as we know the geometry. Let's just split pane 4 → V(4, 3): pane
+        // 4 (left), pane 3 (right) in the bottom row. Final layout:
+        //   pane 1: [0,0,50,50]    pane 2: [50,0,100,50]
+        //   pane 4: [0,50,50,100]  pane 3: [50,50,100,100]
+        tree.split_leaf(pid(4), SplitDirection::Vertical, 0.5, pid(3))
+            .unwrap();
+        // Active is now pane 3 (last new pane). Set focus to pane 1 (top-left).
+        tree.set_active(pid(1)).unwrap();
+        // From pane 1 (top-left): Right → pane 2, Down → pane 4.
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Right, ROOT),
+            Some(pid(2))
+        );
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Down, ROOT),
+            Some(pid(4))
+        );
+        // From pane 1: Left/Up should be no-ops (edge of grid).
+        tree.set_active(pid(1)).unwrap();
+        assert_eq!(tree.focus_in_direction(FocusDirection::Left, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Up, ROOT), None);
+    }
+
+    #[test]
+    fn focus_direction_in_grid_wraps_via_multiple_splits() {
+        // Same grid as above. From pane 2 (top-right):
+        //   Left → pane 1, Down → pane 3.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(4))
+            .unwrap();
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.split_leaf(pid(4), SplitDirection::Vertical, 0.5, pid(3))
+            .unwrap();
+        tree.set_active(pid(2)).unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Left, ROOT),
+            Some(pid(1))
+        );
+        tree.set_active(pid(2)).unwrap();
+        assert_eq!(
+            tree.focus_in_direction(FocusDirection::Down, ROOT),
+            Some(pid(3))
+        );
+        // From pane 2: Right/Up should be no-ops.
+        tree.set_active(pid(2)).unwrap();
+        assert_eq!(tree.focus_in_direction(FocusDirection::Right, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Up, ROOT), None);
+    }
+
+    #[test]
+    fn focus_direction_picks_nearest_when_multiple_candidates() {
+        // Three panes stacked vertically (root H, then split bottom again):
+        //   pane 1: [0,0,100,33.33]
+        //   pane 2: [0,33.33,100,66.66]
+        //   pane 3: [0,66.66,100,100]
+        // From pane 1, "Down" → nearest is pane 2 (not pane 3).
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Horizontal, 0.5, pid(2))
+            .unwrap();
+        // Now split pane 2 (bottom) again to get a 3-pane stack. The
+        // outer ratio stays 0.5 so pane 1 keeps the top half; pane 2's
+        // half is then split 50/50 into panes 2 (middle) and 3 (bottom).
+        tree.split_leaf(pid(2), SplitDirection::Horizontal, 0.5, pid(3))
+            .unwrap();
+        tree.set_active(pid(1)).unwrap();
+        let down_target = tree.focus_in_direction(FocusDirection::Down, ROOT);
+        assert_eq!(down_target, Some(pid(2)));
+    }
+
+    #[test]
+    fn focus_direction_no_op_when_zoomed() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom();
+        // Zoomed → direction focus is a no-op (only one visible pane).
+        assert_eq!(tree.focus_in_direction(FocusDirection::Left, ROOT), None);
+        assert_eq!(tree.focus_in_direction(FocusDirection::Right, ROOT), None);
+    }
+
+    #[test]
+    fn focus_direction_on_empty_tree_returns_none() {
+        let mut tree = SplitTree::default();
+        assert_eq!(tree.focus_in_direction(FocusDirection::Up, ROOT), None);
     }
 }

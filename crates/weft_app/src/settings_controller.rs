@@ -671,6 +671,11 @@ impl App {
                 weft_core::config::Action::FocusNextPane => "Focus Next Pane",
                 weft_core::config::Action::FocusPrevPane => "Focus Previous Pane",
                 weft_core::config::Action::ClosePane => "Close Pane",
+                weft_core::config::Action::TogglePaneZoom => "Toggle Pane Zoom",
+                weft_core::config::Action::FocusPaneUp => "Focus Pane Up",
+                weft_core::config::Action::FocusPaneDown => "Focus Pane Down",
+                weft_core::config::Action::FocusPaneLeft => "Focus Pane Left",
+                weft_core::config::Action::FocusPaneRight => "Focus Pane Right",
             };
             views.push(SettingsKeybindingView {
                 action: label.to_string(),

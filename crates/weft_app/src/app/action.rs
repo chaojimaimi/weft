@@ -6,7 +6,7 @@
 
 use crate::effect::Effect;
 use weft_core::config::Action;
-use weft_core::pane_layout::SplitDirection;
+use weft_core::pane_layout::{FocusDirection, Rect, SplitDirection};
 
 impl crate::App {
     /// Dispatch a weft action resolved from a keybinding. Returns true if the
@@ -230,6 +230,58 @@ impl crate::App {
                 }
                 true
             }
+            Action::TogglePaneZoom => {
+                let was_zoomed = self.sessions.active().is_zoomed();
+                let zoomed = self.sessions.active_mut().toggle_pane_zoom();
+                if was_zoomed == zoomed.is_some() {
+                    // No state change (single-pane tree or empty) — skip
+                    // the layout work, just consume the key.
+                    return true;
+                }
+                if let Some(id) = zoomed {
+                    tracing::info!(?id, "pane zoomed in");
+                } else {
+                    tracing::info!("pane zoom toggled off");
+                }
+                // Layout must be recomputed so the grid/PTY sizing reflects
+                // the new single-pane (or restored multi-pane) geometry.
+                self.recompute_layout();
+                self.refresh_find_for_active_tab();
+                self.request_redraw();
+                true
+            }
+            Action::FocusPaneUp => self.focus_direction_pane(FocusDirection::Up),
+            Action::FocusPaneDown => self.focus_direction_pane(FocusDirection::Down),
+            Action::FocusPaneLeft => self.focus_direction_pane(FocusDirection::Left),
+            Action::FocusPaneRight => self.focus_direction_pane(FocusDirection::Right),
         }
+    }
+}
+
+impl crate::App {
+    /// v1.3.3: Move focus to the nearest pane in `dir`, based on the
+    /// current content rect. Falls back to a no-op redraw when the layout
+    /// can't be computed (e.g. window not yet ready) — better to silently
+    /// ignore the key than to panic on an early key event.
+    fn focus_direction_pane(&mut self, dir: FocusDirection) -> bool {
+        let Some(layout) = self.terminal_layout() else {
+            return true; // Consume the key even if we can't act on it yet.
+        };
+        let content_rect: Rect = [
+            layout.content.left as f32,
+            layout.content.top as f32,
+            layout.content.right as f32,
+            layout.content.bottom as f32,
+        ];
+        if let Some(id) = self
+            .sessions
+            .active_mut()
+            .focus_direction_pane(dir, content_rect)
+        {
+            tracing::info!(?id, ?dir, "focus direction pane");
+            self.refresh_find_for_active_tab();
+        }
+        self.request_redraw();
+        true
     }
 }

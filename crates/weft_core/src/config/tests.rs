@@ -981,32 +981,56 @@ fn split_horizontal_has_default_keybinding_cmd_shift_d() {
 }
 
 #[test]
-fn focus_next_pane_has_default_keybindings_bracket_and_arrow() {
+fn focus_next_pane_bracket_keybinds_cyclic_focus() {
     let kb = KeyBindings::default();
-    // Cmd+Option+]
+    // Cmd+Option+] — cyclic focus next (still bound in v1.3.3; only the
+    // arrow-key bindings were redirected to spatial FocusPane* variants).
     assert_eq!(
         kb.lookup(KeyCode::Char(']'), Modifiers::SUPER | Modifiers::ALT),
-        Some(Action::FocusNextPane)
-    );
-    // Cmd+Option+Right (spatial variant)
-    assert_eq!(
-        kb.lookup(KeyCode::Right, Modifiers::SUPER | Modifiers::ALT),
         Some(Action::FocusNextPane)
     );
 }
 
 #[test]
-fn focus_prev_pane_has_default_keybindings_bracket_and_arrow() {
+fn focus_prev_pane_bracket_keybinds_cyclic_focus() {
     let kb = KeyBindings::default();
-    // Cmd+Option+[
+    // Cmd+Option+[ — cyclic focus prev.
     assert_eq!(
         kb.lookup(KeyCode::Char('['), Modifiers::SUPER | Modifiers::ALT),
         Some(Action::FocusPrevPane)
     );
-    // Cmd+Option+Left
+}
+
+#[test]
+fn focus_pane_directions_have_cmd_alt_arrow_keybinds() {
+    // v1.3.3: arrow keys now do spatial direction focus (replacing the
+    // v1.3.0 cyclic binding on the same keys). Cyclic focus is still on
+    // the bracket keys (tested above).
+    let kb = KeyBindings::default();
+    assert_eq!(
+        kb.lookup(KeyCode::Up, Modifiers::SUPER | Modifiers::ALT),
+        Some(Action::FocusPaneUp)
+    );
+    assert_eq!(
+        kb.lookup(KeyCode::Down, Modifiers::SUPER | Modifiers::ALT),
+        Some(Action::FocusPaneDown)
+    );
     assert_eq!(
         kb.lookup(KeyCode::Left, Modifiers::SUPER | Modifiers::ALT),
-        Some(Action::FocusPrevPane)
+        Some(Action::FocusPaneLeft)
+    );
+    assert_eq!(
+        kb.lookup(KeyCode::Right, Modifiers::SUPER | Modifiers::ALT),
+        Some(Action::FocusPaneRight)
+    );
+}
+
+#[test]
+fn toggle_pane_zoom_has_cmd_shift_return_keybind() {
+    let kb = KeyBindings::default();
+    assert_eq!(
+        kb.lookup(KeyCode::Enter, Modifiers::SUPER | Modifiers::SHIFT),
+        Some(Action::TogglePaneZoom)
     );
 }
 
@@ -1029,6 +1053,12 @@ fn pane_actions_serde_roundtrip() {
         ("focus_next_pane", Action::FocusNextPane),
         ("focus_prev_pane", Action::FocusPrevPane),
         ("close_pane", Action::ClosePane),
+        // v1.3.3 additions.
+        ("toggle_pane_zoom", Action::TogglePaneZoom),
+        ("focus_pane_up", Action::FocusPaneUp),
+        ("focus_pane_down", Action::FocusPaneDown),
+        ("focus_pane_left", Action::FocusPaneLeft),
+        ("focus_pane_right", Action::FocusPaneRight),
     ] {
         let s = format!("\"{name}\"");
         let back: Action = serde_json::from_str(&s).unwrap();

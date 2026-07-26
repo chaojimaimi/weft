@@ -359,6 +359,11 @@ impl Config {
                     Action::FocusNextPane => "focus_next_pane",
                     Action::FocusPrevPane => "focus_prev_pane",
                     Action::ClosePane => "close_pane",
+                    Action::TogglePaneZoom => "toggle_pane_zoom",
+                    Action::FocusPaneUp => "focus_pane_up",
+                    Action::FocusPaneDown => "focus_pane_down",
+                    Action::FocusPaneLeft => "focus_pane_left",
+                    Action::FocusPaneRight => "focus_pane_right",
                 };
                 kt.insert(binding, toml_edit::value(action_str));
             }

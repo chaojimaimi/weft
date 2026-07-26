@@ -66,6 +66,13 @@ fn action_from_isize(tag: isize) -> Option<Action> {
         23 => Action::FocusNextPane,
         24 => Action::FocusPrevPane,
         25 => Action::ClosePane,
+        // v1.3.3: pane zoom + direction-aware focus. Appended after
+        // ClosePane to preserve existing discriminant values.
+        26 => Action::TogglePaneZoom,
+        27 => Action::FocusPaneUp,
+        28 => Action::FocusPaneDown,
+        29 => Action::FocusPaneLeft,
+        30 => Action::FocusPaneRight,
         _ => return None,
     })
 }
@@ -271,6 +278,40 @@ pub fn install(mtm: MainThreadMarker, proxy: EventLoopProxy<AppEvent>) {
                 &target,
                 ns_string!("Focus Previous Pane"),
                 Action::FocusPrevPane,
+            ),
+            // v1.3.3: spatial direction focus. Four entries grouped after
+            // the cyclic focus items so all focus ops sit together.
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Pane Up"),
+                Action::FocusPaneUp,
+            ),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Pane Down"),
+                Action::FocusPaneDown,
+            ),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Pane Left"),
+                Action::FocusPaneLeft,
+            ),
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Focus Pane Right"),
+                Action::FocusPaneRight,
+            ),
+            sep(mtm),
+            // v1.3.3: zoom active pane to full viewport.
+            action_item(
+                mtm,
+                &target,
+                ns_string!("Toggle Pane Zoom"),
+                Action::TogglePaneZoom,
             ),
             sep(mtm),
             action_item(mtm, &target, ns_string!("Close Pane"), Action::ClosePane),
