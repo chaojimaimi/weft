@@ -6,7 +6,7 @@
 
 use crate::effect::Effect;
 use weft_core::config::Action;
-use weft_core::pane_layout::{FocusDirection, Rect, SplitDirection};
+use weft_core::pane_layout::{FocusDirection, SplitDirection};
 
 impl crate::App {
     /// Dispatch a weft action resolved from a keybinding. Returns true if the
@@ -160,9 +160,30 @@ impl crate::App {
                     _ => return true,
                 };
                 let scrollback = self.config_state.config.scrollback.lines;
+                // v1.3.4: Pull the current content rect + cell size so the
+                // new pane can be forked at the correct post-split
+                // (rows, cols) — otherwise the shell prompt lands at the
+                // bottom of a full-viewport grid and the renderer clips it.
+                let geo = if let Some(layout) = self.terminal_layout() {
+                    crate::tab::PaneSplitGeometry {
+                        content_rect: [
+                            layout.content.left as f32,
+                            layout.content.top as f32,
+                            layout.content.right as f32,
+                            layout.content.bottom as f32,
+                        ],
+                        cell_w: layout.cell_width as f32,
+                        cell_h: layout.cell_height as f32,
+                    }
+                } else {
+                    // Renderer not ready yet — pass zeros so split_active_pane
+                    // falls back to the active pane's current size. The next
+                    // recompute_layout() corrects it.
+                    crate::tab::PaneSplitGeometry::default()
+                };
                 let tab = self.sessions.active_mut();
                 let old_active = tab.active_pane_id();
-                match tab.split_active_pane(direction, 0.5, scrollback, &self.proxy) {
+                match tab.split_active_pane(direction, 0.5, scrollback, &self.proxy, geo) {
                     Ok(id) => {
                         tracing::info!(?id, ?direction, ?old_active, "pane split");
                         let tab2 = self.sessions.active();
@@ -182,10 +203,9 @@ impl crate::App {
                                 t.set_palette(r.theme().palette);
                             }
                         }
-                        // v1.3 Batch 6 will resize the new pane to its
-                        // split-tree rect; for now recompute_layout keeps
-                        // the active pane's terminal in sync with the
-                        // viewport.
+                        // v1.3.4: New pane is already forked at the right
+                        // size. recompute_layout() still runs to queue the
+                        // matching SIGWINCH + resize the original pane.
                         self.recompute_layout();
                         self.request_redraw();
                     }
@@ -267,7 +287,7 @@ impl crate::App {
         let Some(layout) = self.terminal_layout() else {
             return true; // Consume the key even if we can't act on it yet.
         };
-        let content_rect: Rect = [
+        let content_rect: weft_core::pane_layout::Rect = [
             layout.content.left as f32,
             layout.content.top as f32,
             layout.content.right as f32,

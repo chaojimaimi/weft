@@ -23,6 +23,22 @@ use weft_core::vt::Terminal;
 use crate::pane::Pane;
 use crate::{AppEvent, AppMsg};
 
+/// v1.3.4: Geometry inputs for `Tab::split_active_pane`. Bundles the
+/// renderer's current content rect + cell size into a single value so the
+/// split method stays under clippy's `too_many_arguments` threshold and
+/// the call site reads naturally. Built by the dispatch layer from
+/// `App::terminal_layout()`; zeroed values mean "renderer not ready" and
+/// the split method falls back to the active pane's current size.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PaneSplitGeometry {
+    /// Content-area rect in physical pixels `[x0, y0, x1, y1]`.
+    pub content_rect: weft_core::pane_layout::Rect,
+    /// Cell width in physical pixels.
+    pub cell_w: f32,
+    /// Cell height in physical pixels.
+    pub cell_h: f32,
+}
+
 mod lifecycle;
 mod primary_history;
 mod scroll;
@@ -126,27 +142,75 @@ impl Tab {
 
     /// Split the active pane in `direction`. The new pane inherits the
     /// active pane's cwd (live OSC 7 if available, else the restored
-    /// snapshot cwd, else `None` to inherit the weft process cwd) and
-    /// starts at the active pane's current (rows, cols). The renderer /
-    /// PTY-resize pass (Batch 5/6) will shrink both panes to their
-    /// split-tree-computed rects on the next layout pass. The new pane
-    /// becomes active.
+    /// snapshot cwd, else `None` to inherit the weft process cwd).
     ///
-    /// Returns the new pane's id on success.
+    /// v1.3.4: The new pane is forked with the **post-split** `(rows, cols)`
+    /// derived from `preview_split_leaf_rect(content_rect, …)` ÷ cell size,
+    /// so the shell prompt lands at the correct row from the very first
+    /// frame — previously the new pane started at the active pane's
+    /// full-viewport size and the renderer clipped it to the half-rect,
+    /// leaving the prompt stranded at the bottom edge.
+    ///
+    /// `geo` carries the renderer's current content rect + cell size. When
+    /// the renderer isn't ready yet (early boot) it may be zeroed, in which
+    /// case the new pane falls back to the active pane's current
+    /// `(rows, cols)` — `recompute_layout()` corrects it on the next redraw.
+    ///
+    /// The new pane becomes active. Returns its id on success.
     pub(crate) fn split_active_pane(
         &mut self,
         direction: SplitDirection,
         ratio: f32,
         scrollback_lines: usize,
         proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
+        geo: PaneSplitGeometry,
     ) -> Result<PaneId, SplitError> {
         let cwd = self.launch_cwd().map(str::to_owned);
-        let (rows, cols) = self
-            .active()
-            .terminal
-            .as_ref()
-            .map(|t| (t.grid().num_rows, t.grid().num_cols))
-            .unwrap_or((24, 80));
+        let active_id = self.active_pane;
+        // Try to compute the new pane's intended (rows, cols) from the
+        // post-split rect. Falls back to the active pane's current size
+        // when the layout isn't usable (zero cell size, etc.).
+        let new_pane_dims = if geo.cell_w > 0.0 && geo.cell_h > 0.0 {
+            // `preview_split_leaf_rect` only needs an id that isn't already
+            // a leaf — it uses it solely for the duplicate check. The real
+            // pane id is assigned by `Pane::spawn` below. PaneId(0) is
+            // safe because the per-process session counter starts at 1
+            // (see `NEXT_PANE_SESSION` in pane.rs).
+            const PREVIEW_PLACEHOLDER: PaneId = PaneId(0);
+            match self.split_tree.preview_split_leaf_rect(
+                active_id,
+                direction,
+                ratio,
+                PREVIEW_PLACEHOLDER,
+                geo.content_rect,
+            ) {
+                Ok(rect) => {
+                    let [x0, y0, x1, y1] = rect;
+                    let w = (x1 - x0).max(0.0);
+                    let h = (y1 - y0).max(0.0);
+                    let cols = (w / geo.cell_w).floor() as usize;
+                    let rows = (h / geo.cell_h).floor() as usize;
+                    if rows > 0 && cols > 0 {
+                        Some((rows, cols))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(?e, "preview_split_leaf_rect fell back to active size");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (rows, cols) = new_pane_dims.unwrap_or_else(|| {
+            self.active()
+                .terminal
+                .as_ref()
+                .map(|t| (t.grid().num_rows, t.grid().num_cols))
+                .unwrap_or((24, 80))
+        });
         let new_pane = Pane::spawn(rows, cols, scrollback_lines, proxy, cwd.as_deref());
         self.split_active_pane_inner(direction, ratio, new_pane)
     }

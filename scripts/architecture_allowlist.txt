@@ -14,5 +14,5 @@ crates/weft_core/src/config/theme.rs|853|Built-in theme constructors are intenti
 crates/weft_core/src/editor.rs|1107|Editor state machine and behavior tests remain one domain
 crates/weft_core/src/find.rs|977|Grid and block search algorithms plus tests remain one domain
 crates/weft_core/src/grid/mod.rs|1228|Core Grid implementation remains cohesive after cell, row, cursor, and scrollback extraction
-crates/weft_core/src/pane_layout.rs|1640|v1.3.3 added pane zoom (toggle_zoom + 9 method guards) + spatial direction focus (focus_in_direction + nearest_pane_in_direction helper) + zoom/close consistency hardening + 23 tests. Tree domain stays cohesive — Node algebra + SplitTree methods + direction-focus geometry + tests all belong together.
+crates/weft_core/src/pane_layout.rs|1820|v1.3.3 added pane zoom + direction focus; v1.3.4 added preview_split_leaf_rect (rect preview without mutating tree, used to fork PTY at correct size) + 9 tests. Tree domain stays cohesive — Node algebra + SplitTree methods + direction-focus geometry + tests all belong together.
 crates/weft_core/src/vt/mod.rs|840|Terminal state and parser facade remain cohesive after Perform and OSC extraction (v1.3 +3 for process-pass tracing)

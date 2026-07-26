@@ -356,6 +356,62 @@ impl SplitTree {
         Ok(new_pane)
     }
 
+    /// v1.3.4: Preview the rect that the **new** pane would occupy if
+    /// `split_leaf(pane, dir, ratio, new_pane)` were called, without
+    /// mutating the tree. Used at split time to fork the new pane's PTY
+    /// with the correct (rows, cols) — otherwise the shell starts at the
+    /// active pane's full-viewport size and writes its prompt at the
+    /// bottom of a grid that the renderer then clips to the half-rect.
+    ///
+    /// Returns `Err` for the same reasons as `split_leaf` (Empty /
+    /// PaneNotFound / DuplicatePaneId / RatioOutOfRange) so the two stay
+    /// symmetric. The returned rect is the new pane's (second child's)
+    /// rect inside `viewport`.
+    pub fn preview_split_leaf_rect(
+        &self,
+        pane: PaneId,
+        dir: SplitDirection,
+        ratio: f32,
+        new_pane: PaneId,
+        viewport: Rect,
+    ) -> Result<Rect, SplitError> {
+        if !(0.0..=1.0).contains(&ratio) || ratio == 0.0 || ratio == 1.0 {
+            return Err(SplitError::RatioOutOfRange(ratio));
+        }
+        let root = self.root.as_ref().ok_or(SplitError::Empty)?;
+        if root.contains_leaf(new_pane) {
+            return Err(SplitError::DuplicatePaneId(new_pane));
+        }
+        if !root.contains_leaf(pane) {
+            return Err(SplitError::PaneNotFound(pane));
+        }
+        // v1.3.4: Always use the un-zoomed layout, because `split_leaf`
+        // clears zoom before computing the new pane's rect. If we used
+        // the zoomed `layout()`, the preview would return the full
+        // viewport, but the actual split would produce the un-zoomed rect
+        // (e.g. half-viewport for the active pane in a 2-pane tree).
+        let effective_viewport = self
+            .layout_unzoomed(viewport)
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .map(|(_, r)| *r)
+            .ok_or(SplitError::PaneNotFound(pane))?;
+        let [x0, y0, x1, y1] = effective_viewport;
+        let second_rect = match dir {
+            SplitDirection::Horizontal => {
+                let h = (y1 - y0).max(0.0);
+                let split_y = y0 + h * ratio;
+                [x0, split_y, x1, y1]
+            }
+            SplitDirection::Vertical => {
+                let w = (x1 - x0).max(0.0);
+                let split_x = x0 + w * ratio;
+                [split_x, y0, x1, y1]
+            }
+        };
+        Ok(second_rect)
+    }
+
     /// Close `pane`. If it has a sibling, the sibling replaces its parent
     /// (the tree collapses one level). Closing the last pane empties the
     /// tree. After close, `active` moves to the sibling when present,
@@ -431,6 +487,15 @@ impl SplitTree {
         if let Some(zoomed) = self.zoomed_pane {
             return vec![(zoomed, viewport)];
         }
+        self.layout_unzoomed(viewport)
+    }
+
+    /// v1.3.4: Compute the rect for every leaf ignoring zoom state —
+    /// the underlying tree shape, as it would appear after un-zooming.
+    /// Used by `preview_split_leaf_rect` because `split_leaf` clears zoom
+    /// before computing the new pane's rect, so the preview must reflect
+    /// the **un-zoomed** layout to match.
+    fn layout_unzoomed(&self, viewport: Rect) -> Vec<(PaneId, Rect)> {
         let mut out = Vec::new();
         if let Some(root) = &self.root {
             root.layout_into(viewport, &mut out);
@@ -1615,5 +1680,119 @@ mod tests {
     fn focus_direction_on_empty_tree_returns_none() {
         let mut tree = SplitTree::default();
         assert_eq!(tree.focus_in_direction(FocusDirection::Up, ROOT), None);
+    }
+
+    // ── v1.3.4: preview_split_leaf_rect ──────────────────────────────────
+
+    #[test]
+    fn preview_split_vertical_returns_right_half_rect() {
+        // Single pane filling the viewport. Splitting Vertical (left/right)
+        // with ratio 0.5 puts the new pane in the right half.
+        let tree = SplitTree::new(pid(1));
+        let rect = tree
+            .preview_split_leaf_rect(pid(1), SplitDirection::Vertical, 0.5, pid(2), ROOT)
+            .unwrap();
+        assert_eq!(rect, [50.0, 0.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn preview_split_horizontal_returns_bottom_half_rect() {
+        let tree = SplitTree::new(pid(1));
+        let rect = tree
+            .preview_split_leaf_rect(pid(1), SplitDirection::Horizontal, 0.5, pid(2), ROOT)
+            .unwrap();
+        assert_eq!(rect, [0.0, 50.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn preview_split_ratio_uneven_returns_correct_share() {
+        // ratio 0.25 → new pane (second child) takes 75% of the dimension.
+        let tree = SplitTree::new(pid(1));
+        let rect = tree
+            .preview_split_leaf_rect(pid(1), SplitDirection::Vertical, 0.25, pid(2), ROOT)
+            .unwrap();
+        // First child gets 25% width = 25; second starts at x=25.
+        assert_eq!(rect, [25.0, 0.0, 100.0, 100.0]);
+    }
+
+    #[test]
+    fn preview_split_returns_inner_rect_in_nested_tree() {
+        // 2-pane tree: Vertical(1, 2), each gets [0,0,50,100] and [50,0,100,100].
+        // Split pane 1 (left) Horizontal → new pane 3 takes the bottom half
+        // of pane 1's rect: [0, 50, 50, 100].
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        let rect = tree
+            .preview_split_leaf_rect(pid(1), SplitDirection::Horizontal, 0.5, pid(3), ROOT)
+            .unwrap();
+        assert_eq!(rect, [0.0, 50.0, 50.0, 100.0]);
+    }
+
+    #[test]
+    fn preview_split_does_not_mutate_tree() {
+        // preview should leave the tree untouched — verified by checking
+        // that pane_count and layout are unchanged after the call.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        let before_count = tree.pane_count();
+        let before_layout = tree.layout(ROOT);
+        let _ = tree.preview_split_leaf_rect(pid(1), SplitDirection::Horizontal, 0.5, pid(3), ROOT);
+        assert_eq!(tree.pane_count(), before_count);
+        assert_eq!(tree.layout(ROOT), before_layout);
+    }
+
+    #[test]
+    fn preview_split_unknown_pane_is_error() {
+        let tree = SplitTree::new(pid(1));
+        assert_eq!(
+            tree.preview_split_leaf_rect(pid(99), SplitDirection::Vertical, 0.5, pid(2), ROOT),
+            Err(SplitError::PaneNotFound(pid(99)))
+        );
+    }
+
+    #[test]
+    fn preview_split_duplicate_pane_is_error() {
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        // pane 2 already exists.
+        assert_eq!(
+            tree.preview_split_leaf_rect(pid(1), SplitDirection::Horizontal, 0.5, pid(2), ROOT),
+            Err(SplitError::DuplicatePaneId(pid(2)))
+        );
+    }
+
+    #[test]
+    fn preview_split_bad_ratio_is_error() {
+        let tree = SplitTree::new(pid(1));
+        assert_eq!(
+            tree.preview_split_leaf_rect(pid(1), SplitDirection::Vertical, 0.0, pid(2), ROOT),
+            Err(SplitError::RatioOutOfRange(0.0))
+        );
+        assert_eq!(
+            tree.preview_split_leaf_rect(pid(1), SplitDirection::Vertical, 1.0, pid(2), ROOT),
+            Err(SplitError::RatioOutOfRange(1.0))
+        );
+    }
+
+    #[test]
+    fn preview_split_on_zoomed_pane_uses_unzoomed_rect() {
+        // 2-pane tree: Vertical(1, 2). Pane 1 = [0,0,50,100], pane 2 = [50,0,100,100].
+        // Zoom pane 2 (active). Previewing a split on pane 2 must return
+        // pane 2's UN-ZOOMED rect, not the full viewport — because
+        // split_leaf clears zoom before computing the new pane's rect.
+        let mut tree = SplitTree::new(pid(1));
+        tree.split_leaf(pid(1), SplitDirection::Vertical, 0.5, pid(2))
+            .unwrap();
+        tree.toggle_zoom(); // zoom pane 2 (active)
+        let rect = tree
+            .preview_split_leaf_rect(pid(2), SplitDirection::Horizontal, 0.5, pid(3), ROOT)
+            .unwrap();
+        // Pane 2's un-zoomed rect is [50,0,100,100]. A horizontal split
+        // at ratio 0.5 puts the new pane in the bottom half of that:
+        // [50, 50, 100, 100].
+        assert_eq!(rect, [50.0, 50.0, 100.0, 100.0]);
     }
 }
