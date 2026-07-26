@@ -877,6 +877,13 @@ impl MetalRenderer {
         let visible_block_count = self.last_expanded_block_count.get();
         let styled_line_lookups = self.styled_lookup_counter.get();
         let styled_paint_us = self.styled_paint_us_counter.get();
+        // v1.4.0 baseline counters: single-stream grid pipeline, so bg=0 and
+        // glyph = existing instance count. upload_bytes is derived from the
+        // slices passed to encode_and_present (each f32 = 4 bytes), matching
+        // the actual Metal ring-buffer upload regardless of the idle fast-path
+        // skip. Styled cache counters are 0 (no cache yet).
+        let grid_glyph_instances = instances.len() / 16;
+        let grid_upload_bytes = (vertices.len() + instances.len()) as u64 * 4;
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
@@ -893,6 +900,12 @@ impl MetalRenderer {
                 // R5 task 4: resident_bytes is captured at begin() and
                 // preserved by build_end(); 0 here is overwritten.
                 resident_bytes: 0,
+                grid_bg_instances: 0,
+                grid_glyph_instances,
+                grid_upload_bytes,
+                styled_cache_hits: 0,
+                styled_cache_misses: 0,
+                styled_cache_bytes: 0,
             });
         self.frame_trace.borrow_mut().encode_start();
 

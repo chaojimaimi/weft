@@ -244,6 +244,64 @@ pub(crate) fn focus_ring_alpha(increase_contrast: bool) -> f32 {
     }
 }
 
+// ── v1.4.0: physical-pixel alignment ───────────────────────────────────
+//
+// WARP_REFERENCE R3-4: terminal chrome (separators, scrollbars, pane dividers,
+// focus rings) must land on integer physical-pixel boundaries to avoid
+// Retina blurriness. The renderer and `LayoutCtx` already work in physical
+// pixels, so snapping is a pure `round()` — no scale parameter, no divide-
+// then-multiply. The helpers below are the single source of truth; all chrome
+// geometry should pass through them before being pushed as vertex data.
+//
+// Why snap both edges of a rect (not just origin): if you snap origin and then
+// add a fractional width, the far edge lands on a non-integer and the GPU's
+// linear interpolation smears it across two physical pixels. Snapping both
+// `start` and `end` independently guarantees both edges are crisp, at the cost
+// of a sub-pixel width perturbation (≤ 1px) which is invisible.
+//
+// See `docs/V14_IMPLEMENTATION_PLAN.md` §4.1 for the design contract and
+// `docs/V14_IMPLEMENTATION_PLAN.md` §4.2 for the call-site list.
+
+/// Snap a single physical-pixel coordinate to an integer boundary.
+///
+/// `round()` is the correct choice (not `floor`/`ceil`) because it minimizes
+/// the maximum displacement: a value at `x.5` moves to `x+1`, but a value at
+/// `x.4999` moves to `x` — the average error is ~0.25px, half of `floor`.
+///
+/// Pure function; no global state. Inline-friendly — the compiler collapses
+/// this to a single `roundsd`/`vroundss` on x86/ARM.
+///
+/// Kept as part of the documented v1.4 snap API even though current chrome
+/// call sites use `snap_physical_rect` (the two-edge variant). Single-
+/// coordinate snapping is the natural primitive for future callers that need
+/// to align a 1-D position (e.g. an x-only or y-only guide line) and is
+/// exercised by the unit tests below.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn snap_physical(value: f32) -> f32 {
+    value.round()
+}
+
+/// Snap both edges of a 1-D interval to integer physical-pixel boundaries.
+///
+/// Returns `(start_rounded, end_rounded)`. The width may shrink or grow by
+/// up to 1px compared to the input, but both edges are guaranteed integer.
+/// Callers must NOT then re-derive width as `end - start` and assert it
+/// matches a design token — the snapped width is intentionally not pinned.
+///
+/// The two-edges rule (vs. snapping only `start`) is what eliminates Retina
+/// smearing: a 1.5px-wide line at `x=10.3` would otherwise become `x=10, w=1.5`
+/// → far edge at `11.5` → GPU rasterizes across pixels 11 and 12.
+///
+/// Returns `(start, end)` in the same order as the inputs. Inputs are not
+/// required to be ordered (start ≤ end); if `start > end` the return is
+/// `(start_rounded, end_rounded)` without swapping — callers that need
+/// ordering should sort first.
+#[inline]
+pub(crate) fn snap_physical_rect(start: f32, end: f32) -> (f32, f32) {
+    (start.round(), end.round())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +408,101 @@ mod tests {
         // Normal: thickness=2 → y0+2 = 22; Contrast: thickness=3 → y0+3 = 23.
         assert_eq!(verts_normal[13], 22.0); // y1 of top edge (vertex 1)
         assert_eq!(verts_contrast[13], 23.0);
+    }
+
+    // ── v1.4.0: snap_physical helpers ─────────────────────────────────
+
+    #[test]
+    fn snap_physical_rounds_integers_unchanged() {
+        // Integers are already on pixel boundaries — snap must be identity.
+        assert_eq!(snap_physical(0.0), 0.0);
+        assert_eq!(snap_physical(1.0), 1.0);
+        assert_eq!(snap_physical(100.0), 100.0);
+        assert_eq!(snap_physical(-5.0), -5.0);
+    }
+
+    #[test]
+    fn snap_physical_rounds_positive_fractionals() {
+        // round() uses banker's rounding in Rust (round-half-to-even),
+        // but for typical layout inputs the values are not exactly at .5.
+        // 0.4 → 0, 0.6 → 1, 10.49 → 10, 10.51 → 11.
+        assert_eq!(snap_physical(0.4), 0.0);
+        assert_eq!(snap_physical(0.6), 1.0);
+        assert_eq!(snap_physical(10.49), 10.0);
+        assert_eq!(snap_physical(10.51), 11.0);
+    }
+
+    #[test]
+    fn snap_physical_rounds_negative_fractionals() {
+        // Negative coordinates (e.g. offscreen scissor bounds) must round
+        // toward the nearest integer, not toward zero.
+        assert_eq!(snap_physical(-0.4), 0.0);
+        assert_eq!(snap_physical(-0.6), -1.0);
+        assert_eq!(snap_physical(-10.49), -10.0);
+        assert_eq!(snap_physical(-10.51), -11.0);
+    }
+
+    #[test]
+    fn snap_physical_rect_returns_integer_edges() {
+        // The contract: both edges must be integers.
+        let (s, e) = snap_physical_rect(10.3, 50.7);
+        assert_eq!(s, 10.0);
+        assert_eq!(e, 51.0);
+        assert!(s.fract() == 0.0);
+        assert!(e.fract() == 0.0);
+    }
+
+    #[test]
+    fn snap_physical_rect_supports_non_integer_widths() {
+        // A 1.4px-wide separator at x=10.3 → [10.3, 11.7] → snap → [10, 12].
+        // Both edges integer; width becomes 2.0 (was 1.4). The 0.6px growth
+        // is sub-pixel and invisible; what matters is no edge lands on x.5.
+        let (s, e) = snap_physical_rect(10.3, 11.7);
+        assert_eq!(s, 10.0);
+        assert_eq!(e, 12.0);
+    }
+
+    #[test]
+    fn snap_physical_rect_does_not_invert_for_ordered_inputs() {
+        // For start < end, the snapped pair must remain ordered (start ≤ end).
+        // This holds because round() is monotonic non-decreasing.
+        for (s_in, e_in) in [(10.0, 20.0), (10.3, 11.7), (-5.5, 5.5), (0.1, 0.9)] {
+            let (s, e) = snap_physical_rect(s_in, e_in);
+            assert!(s <= e, "snapped {s} > {e} for input ({s_in}, {e_in})");
+        }
+    }
+
+    #[test]
+    fn snap_physical_rect_preserves_input_order_for_inverted_inputs() {
+        // When start > end (caller error or intentional), the helper does
+        // NOT swap — it returns (round(start), round(end)) in the same order.
+        // Callers that need ordering must sort first. This contract avoids
+        // surprising silent swaps deep inside the geometry pipeline.
+        let (s, e) = snap_physical_rect(20.6, 10.3);
+        assert_eq!(s, 21.0);
+        assert_eq!(e, 10.0);
+        // Caller is responsible for detecting the inversion:
+        assert!(s > e);
+    }
+
+    #[test]
+    fn snap_physical_rect_handles_extremes() {
+        // Narrow 0.2px interval straddling an integer (10.4, 10.6) → snaps
+        // to (10, 11), width 1px. The helper does not collapse sub-pixel
+        // intervals that straddle a pixel boundary.
+        let (s, e) = snap_physical_rect(10.4, 10.6);
+        assert_eq!(s, 10.0);
+        assert_eq!(e, 11.0);
+        assert_eq!(e - s, 1.0);
+
+        // Large coordinates (4K/8K display ranges) must not lose precision.
+        let (s, e) = snap_physical_rect(3839.7, 3840.3);
+        assert_eq!(s, 3840.0);
+        assert_eq!(e, 3840.0);
+        // Note: a sub-pixel input straddling 3840 collapses to width 0.
+        // Callers must enforce a minimum-thickness invariant themselves
+        // (e.g. `thumb_height.max(2.0)`) before snapping — the snap helper
+        // is geometry-only and does not know the design intent.
+        assert_eq!(e - s, 0.0);
     }
 }

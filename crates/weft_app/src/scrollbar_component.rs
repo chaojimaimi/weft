@@ -1,6 +1,7 @@
 //! Block-view scrollbar layout and interaction mapping.
 
 use crate::layout::{LayoutCtx, Rect, Spacing};
+use crate::paint::primitives::snap_physical_rect;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScrollbarLayout {
@@ -40,7 +41,13 @@ pub(crate) fn scrollbar_layout(
     let travel = (ctx.height() - thumb_h).max(0.0);
     let scroll_ratio = scroll.min(max_scroll) as f32 / max_scroll as f32;
     let thumb_y = ctx.top() + travel * (1.0 - scroll_ratio);
-    let thumb = [bar_x, thumb_y, ctx.right(), thumb_y + thumb_h];
+    // v1.4.0: snap both thumb edges to integer physical pixels. The thumb's
+    // visible top/bottom otherwise land on fractional coordinates (derived
+    // from `travel * scroll_ratio`) and smear on 1× Retina. Snapping may
+    // perturb the height by ≤1px; the `min_thumb` invariant above already
+    // guarantees a comfortable minimum, so the perturbation is invisible.
+    let (thumb_top_snapped, thumb_bottom_snapped) = snap_physical_rect(thumb_y, thumb_y + thumb_h);
+    let thumb = [bar_x, thumb_top_snapped, ctx.right(), thumb_bottom_snapped];
     // Keep the indicator visually subtle while making it comfortably grabbable.
     let hit_w = (ctx.cell_w * 1.5).max(12.0);
     let hit = [ctx.right() - hit_w, ctx.top(), ctx.right(), ctx.bottom()];
@@ -166,5 +173,46 @@ mod tests {
     fn pointer_mapping_clamps_above_track_to_max_scroll() {
         let layout = scrollbar_layout(&ctx(), 100, 25, 75, 0).unwrap();
         assert_eq!(scroll_offset_for_pointer(&layout, -100.0, 0.0), 75);
+    }
+
+    // ── v1.4.0: physical-pixel alignment ──────────────────────────────
+
+    #[test]
+    fn thumb_edges_are_integer_physical_pixels_at_mid_scroll() {
+        // mid-scroll positions produce fractional thumb_y (travel * 0.5 of
+        // a non-integer height). Both edges must snap to integers.
+        let ctx = ctx(); // height 700, top 20
+        let layout = scrollbar_layout(&ctx, 100, 25, 75, 37).unwrap();
+        assert!(
+            layout.thumb[1].fract() == 0.0,
+            "thumb top not integer: {}",
+            layout.thumb[1]
+        );
+        assert!(
+            layout.thumb[3].fract() == 0.0,
+            "thumb bottom not integer: {}",
+            layout.thumb[3]
+        );
+    }
+
+    #[test]
+    fn thumb_edges_remain_integer_for_fractional_track_heights() {
+        // A track whose height produces fractional travel at mid-scroll.
+        // ctx() has top=20, bottom=720 → height=700. With 100/25 ratio and
+        // min_thumb enforcement, we still expect integer thumb edges.
+        let ctx = LayoutCtx::new((1000.0, 701.0), 10.0, 20.0, 8.0, 8.0);
+        for scroll in 0..=75 {
+            let layout = scrollbar_layout(&ctx, 100, 25, 75, scroll).unwrap();
+            assert!(
+                layout.thumb[1].fract() == 0.0,
+                "scroll={scroll}: thumb top not integer: {}",
+                layout.thumb[1]
+            );
+            assert!(
+                layout.thumb[3].fract() == 0.0,
+                "scroll={scroll}: thumb bottom not integer: {}",
+                layout.thumb[3]
+            );
+        }
     }
 }

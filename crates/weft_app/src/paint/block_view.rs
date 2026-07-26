@@ -13,7 +13,7 @@ use crate::paint::block_view::actions::{
     BlockHeaderActionPaint,
 };
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::primitives::{color_to_normalized, push_quad};
+use crate::paint::primitives::{color_to_normalized, push_quad, snap_physical_rect};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
 
@@ -101,11 +101,15 @@ impl MetalRenderer {
         if cwd_header_active {
             let cwd = cwd.expect("active fixed CWD has text");
             let fixed_y = layout.fixed_cwd_y;
-            // Step 4: 2.0px separator (was 1.5) to avoid sub-pixel blur at
-            // 1× scale. At 2× scale, 2 logical px = 4 physical px — crisp.
+            // v1.4.0: snap both edges of the separator to integer physical
+            // pixels. The visible thickness stays ≈2px (design token), but
+            // the far edge no longer lands on a sub-pixel boundary at 1×
+            // scale. Previously `[left, fixed_y, right, fixed_y + 2.0]` with
+            // `fixed_y` derived from a fractional layout pitch.
+            let (sep_y0, sep_y1) = snap_physical_rect(fixed_y, fixed_y + 2.0);
             push_quad(
                 &mut verts,
-                [left, fixed_y, right, fixed_y + 2.0],
+                [left, sep_y0, right, sep_y1],
                 bg_uv,
                 [0.0; 4],
                 separator,
@@ -567,10 +571,17 @@ impl MetalRenderer {
                             selection_bg,
                         );
                     }
+                    // v1.4.0: snap both edges of the 1.5px separator so it
+                    // lands on integer physical pixels. `ly` derives from
+                    // `y + pitch * 0.5` and is typically fractional; the far
+                    // edge `ly + 1.5` would otherwise smear across two pixels
+                    // on 1× Retina. The snapped width is 1 or 2px — invisible
+                    // difference, but both edges become crisp.
                     let ly = y + pitch * 0.5;
+                    let (sep_y0, sep_y1) = snap_physical_rect(ly, ly + 1.5);
                     push_quad(
                         &mut verts,
-                        [left, ly, right, ly + 1.5],
+                        [left, sep_y0, right, sep_y1],
                         bg_uv,
                         [0.0; 4],
                         separator,
@@ -648,7 +659,15 @@ impl MetalRenderer {
             push_quad(
                 &mut verts,
                 // v1.3 multi-pane: confine sticky separator to [left..right].
-                [left, sticky_bottom, right, sticky_bottom + 1.0],
+                // v1.4.0: snap both edges to integer physical pixels. The
+                // 1.0px separator was previously drawn at fractional `sticky_bottom`
+                // (derived from `clip_top + header_rows * pitch`); the far
+                // edge `sticky_bottom + 1.0` could land on a sub-pixel and
+                // smear on 1× Retina.
+                {
+                    let (y0, y1) = snap_physical_rect(sticky_bottom, sticky_bottom + 1.0);
+                    [left, y0, right, y1]
+                },
                 bg_uv,
                 [0.0; 4],
                 separator,

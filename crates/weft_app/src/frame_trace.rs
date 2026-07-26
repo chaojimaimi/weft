@@ -100,6 +100,34 @@ pub(crate) struct FrameCounters {
     /// memory leaks during long-running sessions and correlate with
     /// vertex/cache metrics for perf optimization decisions.
     pub(crate) resident_bytes: u64,
+    /// v1.4.0 baseline: grid background instances uploaded this frame. v1.4.0
+    /// keeps the single-stream grid pipeline, so this is always 0; v1.4.2's
+    /// background-run merge will populate it. Reported now so the v1.4.2 GO
+    /// decision can compare against a pre-existing counter instead of a new
+    /// field landing alongside the change it measures.
+    pub(crate) grid_bg_instances: usize,
+    /// v1.4.0 baseline: grid glyph instances uploaded this frame. v1.4.0 fills
+    /// this with the existing single-stream instance count (`instances.len() /
+    /// 16`). After v1.4.2's split, this will count only the glyph stream while
+    /// `grid_bg_instances` counts the background stream.
+    pub(crate) grid_glyph_instances: usize,
+    /// v1.4.0 baseline: bytes uploaded to GPU vertex/instance buffers this
+    /// frame (`size_of_val(vertices) + size_of_val(instances)`). Computed from
+    /// the slices passed to `encode_and_present`, so it matches the actual
+    /// upload regardless of the idle fast-path skip. Used by v1.4.2 to prove
+    /// the background-run merge reduces upload bytes.
+    pub(crate) grid_upload_bytes: u64,
+    /// v1.4.0 baseline: styled-line vertex cache hits this frame. Always 0 in
+    /// v1.4.0 (no cache yet); v1.4.1 populates it. Reported now so the v1.4.1
+    /// GO decision can cite a pre-existing counter.
+    pub(crate) styled_cache_hits: u64,
+    /// v1.4.0 baseline: styled-line vertex cache misses this frame. Always 0
+    /// in v1.4.0; v1.4.1 populates it.
+    pub(crate) styled_cache_misses: u64,
+    /// v1.4.0 baseline: styled-line vertex cache resident bytes. Always 0 in
+    /// v1.4.0; v1.4.1 populates it. Used to prove the cache stays within its
+    /// 16 MiB byte budget.
+    pub(crate) styled_cache_bytes: u64,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -288,6 +316,12 @@ impl FrameTraceRecorder {
             styled_lookups = counters.styled_line_lookups,
             styled_paint_us = counters.styled_paint_us,
             resident_bytes = counters.resident_bytes,
+            grid_bg_instances = counters.grid_bg_instances,
+            grid_glyph_instances = counters.grid_glyph_instances,
+            grid_upload_bytes = counters.grid_upload_bytes,
+            styled_cache_hits = counters.styled_cache_hits,
+            styled_cache_misses = counters.styled_cache_misses,
+            styled_cache_bytes = counters.styled_cache_bytes,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -438,6 +472,12 @@ mod tests {
             styled_line_lookups: 0,
             styled_paint_us: 0,
             resident_bytes: 0,
+            grid_bg_instances: 0,
+            grid_glyph_instances: 2000,
+            grid_upload_bytes: 0,
+            styled_cache_hits: 0,
+            styled_cache_misses: 0,
+            styled_cache_bytes: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));

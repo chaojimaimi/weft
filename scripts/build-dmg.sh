@@ -14,7 +14,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
-VERSION="1.3.5"
+VERSION="1.4.0"
 RELEASE_DIR="target/release"
 OSX_DIR="${RELEASE_DIR}/osx"
 APP_DIR="${OSX_DIR}/${APP_NAME}.app"

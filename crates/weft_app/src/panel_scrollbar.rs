@@ -1,6 +1,7 @@
 //! History-sidebar scrollbar geometry and pointer mapping.
 
 use crate::layout::Rect;
+use crate::paint::primitives::snap_physical_rect;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PanelScrollbarLayout {
@@ -38,12 +39,17 @@ pub(crate) fn panel_scrollbar_layout(
         .min(track_height);
     let travel = (track_height - thumb_height).max(0.0);
     let ratio = scroll.min(max_scroll) as f32 / max_scroll as f32;
-    // Step 4: snap thumb_top to 0.5px to avoid sub-pixel rendering blur at
-    // 1× scale. At 2× scale, 0.5 logical px = 1 physical px, so snapping
-    // still produces integer physical pixels.
-    let thumb_offset = (travel * ratio * 2.0).round() * 0.5;
-    let thumb_top = list_top + thumb_offset;
-    let thumb = [track[0], thumb_top, track[2], thumb_top + thumb_height];
+    // v1.4.0: snap both thumb edges to integer physical pixels. Previously
+    // this used `(travel * ratio * 2.0).round() * 0.5` to snap thumb_top to
+    // 0.5 logical px (1 physical px at 2× scale), but the far edge
+    // (`thumb_top + thumb_height`) was not snapped and could land on a
+    // sub-pixel at 1× scale. The physical-pixel snap helper (pure `round()`)
+    // is correct at every scale and snaps both edges in one call.
+    let thumb_offset = travel * ratio;
+    let thumb_top_raw = list_top + thumb_offset;
+    let thumb_bottom_raw = thumb_top_raw + thumb_height;
+    let (thumb_top, thumb_bottom) = snap_physical_rect(thumb_top_raw, thumb_bottom_raw);
+    let thumb = [track[0], thumb_top, track[2], thumb_bottom];
     let hit = [panel[2] - 18.0, list_top, panel[2] - 5.0, panel[3]];
     Some(PanelScrollbarLayout {
         track,
@@ -105,5 +111,48 @@ mod tests {
         assert_eq!(top, 0);
         assert!(middle > 0 && middle < layout.max_scroll);
         assert_eq!(bottom, layout.max_scroll);
+    }
+
+    // ── v1.4.0: physical-pixel alignment ──────────────────────────────
+
+    #[test]
+    fn thumb_edges_are_integer_physical_pixels_across_scroll_range() {
+        // The previous `*2 → round → *0.5` only snapped thumb_top to 0.5px;
+        // the far edge `thumb_top + thumb_height` was unaligned. The new
+        // snap_physical_rect path guarantees both edges are integer.
+        for scroll in [0, 1, 7, 100, 1234, 5000, 9_974, 9_975] {
+            let layout = panel_scrollbar_layout(PANEL, LIST_TOP, 10_000, 25, scroll, 20.0).unwrap();
+            assert!(
+                layout.thumb[1].fract() == 0.0,
+                "scroll={scroll}: thumb top not integer: {}",
+                layout.thumb[1]
+            );
+            assert!(
+                layout.thumb[3].fract() == 0.0,
+                "scroll={scroll}: thumb bottom not integer: {}",
+                layout.thumb[3]
+            );
+        }
+    }
+
+    #[test]
+    fn thumb_edges_remain_integer_for_fractional_list_top() {
+        // A fractional list_top would previously produce a fractional far
+        // edge. After snap_physical_rect, both edges are integer.
+        let panel: [f32; 4] = [0.0, 28.3, 240.7, 700.9];
+        let list_top = 78.5;
+        for scroll in [0, 100, 5000, 9_975] {
+            let layout = panel_scrollbar_layout(panel, list_top, 10_000, 25, scroll, 20.0).unwrap();
+            assert!(
+                layout.thumb[1].fract() == 0.0,
+                "scroll={scroll}: thumb top not integer: {}",
+                layout.thumb[1]
+            );
+            assert!(
+                layout.thumb[3].fract() == 0.0,
+                "scroll={scroll}: thumb bottom not integer: {}",
+                layout.thumb[3]
+            );
+        }
     }
 }

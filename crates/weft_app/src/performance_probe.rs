@@ -10,9 +10,47 @@ pub(crate) const ENV_NAME: &str = "WEFT_GUI_PERF_PROBE";
 pub(crate) const WARMUP: Duration = Duration::from_secs(3);
 pub(crate) const SAMPLE: Duration = Duration::from_secs(5);
 
+/// v1.4.0 baseline: env var that overrides `WARMUP` (seconds). The default
+/// acceptance gate uses 3s; the v1.4 perf-probe script sets this to 5s so the
+/// warm-up covers the first redraws after launch without eating into the
+/// 30-second sample window. Defaults to `WARMUP` when unset or unparseable.
+const WARMUP_ENV: &str = "WEFT_GUI_PROBE_WARMUP_SECS";
+/// v1.4.0 baseline: env var that overrides `SAMPLE` (seconds). The default
+/// acceptance gate uses 5s (total probe runtime 8s); the v1.4 perf-probe
+/// script sets this to 30s so steady-state p50/p95 percentiles are stable.
+/// Defaults to `SAMPLE` when unset or unparseable.
+const SAMPLE_ENV: &str = "WEFT_GUI_PROBE_SAMPLE_SECS";
+
 const MAX_WAKE_HZ: f64 = 3.0;
 const MAX_REDRAW_HZ: f64 = 4.0;
 const MAX_CPU_FRAME_P95_MS: f64 = 20.0;
+
+/// Resolve the warm-up duration from `WARMUP_ENV` or fall back to `WARMUP`.
+/// Used by `app_runtime.rs` to schedule `PerformanceProbeStart`. Unparseable
+/// values fall back to the default rather than panicking — the probe is a
+/// diagnostic tool and should never break the app on a bad env var.
+pub(crate) fn warmup_duration() -> Duration {
+    parse_secs_env(std::env::var_os(WARMUP_ENV).as_deref()).unwrap_or(WARMUP)
+}
+
+/// Resolve the sample duration from `SAMPLE_ENV` or fall back to `SAMPLE`.
+/// Used by `app_runtime.rs` to schedule `PerformanceProbeFinish`.
+pub(crate) fn sample_duration() -> Duration {
+    parse_secs_env(std::env::var_os(SAMPLE_ENV).as_deref()).unwrap_or(SAMPLE)
+}
+
+/// Parse a duration env var (seconds). Pure function for testability —
+/// callers pass the resolved env value so the parser has no global state.
+/// Returns `None` for empty, zero, negative, or non-numeric input.
+fn parse_secs_env(raw: Option<&std::ffi::OsStr>) -> Option<Duration> {
+    let raw = raw?;
+    let secs: u64 = raw.to_str()?.trim().parse().ok()?;
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PerformanceProbe {
@@ -162,5 +200,35 @@ mod tests {
         let busy = ProbeReport::new(Duration::from_secs(5), 16, 12, &[]);
         assert!(!busy.passes());
         assert!(busy.line().contains("status=FAIL"));
+    }
+
+    #[test]
+    fn parse_secs_env_accepts_positive_integers() {
+        assert_eq!(
+            parse_secs_env(Some(std::ffi::OsStr::new("30"))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_secs_env(Some(std::ffi::OsStr::new("  7  "))),
+            Some(Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn parse_secs_env_rejects_zero_and_garbage() {
+        assert_eq!(parse_secs_env(Some(std::ffi::OsStr::new("0"))), None);
+        assert_eq!(parse_secs_env(Some(std::ffi::OsStr::new(""))), None);
+        assert_eq!(parse_secs_env(Some(std::ffi::OsStr::new("abc"))), None);
+        assert_eq!(parse_secs_env(Some(std::ffi::OsStr::new("-5"))), None);
+        assert_eq!(parse_secs_env(None), None);
+    }
+
+    #[test]
+    fn warmup_and_sample_default_to_constants_when_env_unset() {
+        // No env var set → falls back to the gate's constants.
+        std::env::remove_var(WARMUP_ENV);
+        std::env::remove_var(SAMPLE_ENV);
+        assert_eq!(warmup_duration(), WARMUP);
+        assert_eq!(sample_duration(), SAMPLE);
     }
 }

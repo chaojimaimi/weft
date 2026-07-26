@@ -15,7 +15,7 @@
 //! (`y0`). Each such shared edge contributes one divider line.
 
 use crate::layout::Rect;
-use crate::paint::primitives::{build_focus_ring, push_quad};
+use crate::paint::primitives::{build_focus_ring, push_quad, snap_physical_rect};
 use weft_core::pane_layout::PaneId;
 
 /// Divider line axis.
@@ -122,23 +122,18 @@ pub(crate) fn push_pane_dividers(
         match axis {
             DividerAxis::Vertical => {
                 // 1px vertical line at x=coord, spanning content height.
-                push_quad(
-                    verts,
-                    [*coord, cy0, *coord + 1.0, cy1],
-                    uv,
-                    fg,
-                    separator_color,
-                );
+                // v1.4.0: snap both x-edges so the line lands on integer
+                // physical pixels. The split-tree layout already produces
+                // integer coords in most cases (full-pixel split ratios),
+                // but the snap guarantees correctness at any window size.
+                let (x0, x1) = snap_physical_rect(*coord, *coord + 1.0);
+                push_quad(verts, [x0, cy0, x1, cy1], uv, fg, separator_color);
             }
             DividerAxis::Horizontal => {
                 // 1px horizontal line at y=coord, spanning content width.
-                push_quad(
-                    verts,
-                    [cx0, *coord, cx1, *coord + 1.0],
-                    uv,
-                    fg,
-                    separator_color,
-                );
+                // v1.4.0: snap both y-edges (see Vertical above).
+                let (y0, y1) = snap_physical_rect(*coord, *coord + 1.0);
+                push_quad(verts, [cx0, y0, cx1, y1], uv, fg, separator_color);
             }
         }
     }
@@ -152,11 +147,22 @@ pub(crate) fn push_active_pane_focus_ring(
     accent_color: [f32; 4],
     increase_contrast: bool,
 ) {
+    // v1.4.0: snap all four edges of the focus-ring bounds to integer
+    // physical pixels. The active pane's rect comes from `SplitTree::layout`
+    // and is usually integer-aligned, but the snap guards against fractional
+    // split ratios (e.g. a 3-way split at 33.33% of an 800px content width
+    // would land on x=266.67). All four edges are snapped so the ring's
+    // top/bottom/left/right edges drawn by `build_focus_ring` all land on
+    // integer pixels — no smearing at 1× Retina.
+    let [x0, y0, x1, y1] = active_rect;
+    let (sx0, sx1) = snap_physical_rect(x0, x1);
+    let (sy0, sy1) = snap_physical_rect(y0, y1);
+    let snapped = [sx0, sy0, sx1, sy1];
     let mut color = accent_color;
     color[3] *= pane_focus_ring_alpha(increase_contrast);
     build_focus_ring(
         verts,
-        active_rect,
+        snapped,
         color,
         pane_focus_ring_thickness(increase_contrast),
     );
@@ -488,5 +494,95 @@ mod tests {
     fn pane_divider_at_none_for_single_pane() {
         let layouts = vec![(PaneId(1), rect(0.0, 0.0, 800.0, 600.0))];
         assert!(pane_divider_at(&layouts, 400.0, 300.0, 4.0).is_none());
+    }
+
+    // ── v1.4.0: physical-pixel alignment ──────────────────────────────
+
+    /// Pull every (x, y) coordinate from a quad-stream vertex buffer and
+    /// verify each is integer-aligned. Each `push_quad` vertex is laid out
+    /// as 12 floats: `[x, y, u, v, fg(4), bg(4)]`. So vertex N's x/y live at
+    /// `12*N` and `12*N + 1`.
+    fn assert_vertices_integer_aligned(verts: &[f32], context: &str) {
+        for i in 0..(verts.len() / 12) {
+            let x = verts[i * 12];
+            let y = verts[i * 12 + 1];
+            assert!(x.fract() == 0.0, "{context}: vertex {i} x not integer: {x}");
+            assert!(y.fract() == 0.0, "{context}: vertex {i} y not integer: {y}");
+        }
+    }
+
+    #[test]
+    fn push_pane_dividers_snaps_fractional_coords_to_integer_pixels() {
+        // A fractional divider coordinate (e.g. 400.7 from a 33.33%-of-1200px
+        // split) would previously produce a sub-pixel x boundary. After
+        // v1.4.0's snap_physical_rect, both edges of the 1px line are integer.
+        // The content rect is integer-aligned (matches production: the
+        // renderer's viewport is always integer physical pixels). What we
+        // are testing is that the divider's *own* x/y edges snap, not the
+        // content rect.
+        let mut verts = Vec::new();
+        let edges = vec![
+            (DividerAxis::Vertical, 400.7),
+            (DividerAxis::Horizontal, 300.3),
+        ];
+        push_pane_dividers(&mut verts, &edges, rect(0.0, 0.0, 800.0, 600.0), [1.0; 4]);
+        assert_vertices_integer_aligned(&verts, "push_pane_dividers with fractional input");
+    }
+
+    #[test]
+    fn push_pane_dividers_snaps_integer_coords_unchanged() {
+        // Integer coordinates must remain integer (snap is identity). This
+        // guards against a regression where the snap helper is removed.
+        let mut verts = Vec::new();
+        let edges = vec![
+            (DividerAxis::Vertical, 400.0),
+            (DividerAxis::Horizontal, 300.0),
+        ];
+        push_pane_dividers(&mut verts, &edges, rect(0.0, 0.0, 800.0, 600.0), [1.0; 4]);
+        assert_vertices_integer_aligned(&verts, "push_pane_dividers with integer input");
+    }
+
+    #[test]
+    fn push_active_pane_focus_ring_snaps_fractional_bounds_to_integer_pixels() {
+        // The active pane rect comes from SplitTree::layout; fractional split
+        // ratios (e.g. 3-way at 33.33%) produce fractional bounds. The focus
+        // ring must snap all four edges to integer pixels.
+        let mut verts = Vec::new();
+        push_active_pane_focus_ring(
+            &mut verts,
+            rect(10.3, 20.7, 410.4, 310.6),
+            [0.2, 0.5, 0.9, 1.0],
+            false,
+        );
+        assert_vertices_integer_aligned(
+            &verts,
+            "push_active_pane_focus_ring with fractional bounds",
+        );
+    }
+
+    #[test]
+    fn push_active_pane_focus_ring_snaps_integer_bounds_unchanged() {
+        let mut verts = Vec::new();
+        push_active_pane_focus_ring(
+            &mut verts,
+            rect(10.0, 20.0, 410.0, 310.0),
+            [0.2, 0.5, 0.9, 1.0],
+            false,
+        );
+        assert_vertices_integer_aligned(&verts, "push_active_pane_focus_ring with integer bounds");
+    }
+
+    #[test]
+    fn push_active_pane_focus_ring_snaps_under_increase_contrast() {
+        // Increase Contrast uses a thicker ring (2px); both the bounds snap
+        // and the inner edge offsets (thickness) must remain integer.
+        let mut verts = Vec::new();
+        push_active_pane_focus_ring(
+            &mut verts,
+            rect(33.3, 66.7, 533.3, 366.7),
+            [0.2, 0.5, 0.9, 1.0],
+            true,
+        );
+        assert_vertices_integer_aligned(&verts, "push_active_pane_focus_ring increase_contrast");
     }
 }

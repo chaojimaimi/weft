@@ -116,6 +116,42 @@ fn scene_vertices(theme: &Theme, scale: u32) -> Vec<f32> {
         [298.0 * s, 50.0 * s, 300.0 * s, 152.0 * s],
         focus,
     );
+
+    // v1.4.0: chrome elements that exercise the physical-pixel snap path.
+    // These are drawn at fractional logical-pixel origins (e.g. y = 158.3 * s)
+    // so the 1× and 2× goldens capture the snap output. Without these the
+    // goldens only test integer-aligned rects (which trivially round-trip
+    // through snap_physical_rect); the fractional cases prove the snap is
+    // actually applied and produces integer physical pixels.
+    //
+    // The chrome elements live in the lower band of the scene (y ≥ 158) so
+    // they don't overlap with the semantic surfaces above. Each rect's
+    // pre-snap origin is fractional at 1× (e.g. 158.3); the snap rounds both
+    // edges to integer physical pixels, and the golden captures the result.
+    // A regression that drops the snap would show sub-pixel smearing on 1×
+    // (the rect would render at y=158.3 → half-strength on pixel rows 158
+    // and 159). The 2× golden is a sanity check that snapping still produces
+    // integer physical pixels when the scale is 2 (158.3 * 2 = 316.6 → 317).
+    let chrome_snap = crate::paint::primitives::snap_physical_rect;
+
+    // Horizontal separator at fractional logical y=158.3 (post-snap: 158).
+    let (sep_y0, sep_y1) = chrome_snap(158.3 * s, 160.3 * s);
+    add_rect(&mut vertices, [0.0, sep_y0, w, sep_y1], focus);
+
+    // Vertical scrollbar thumb at fractional logical x and y. Mimics the
+    // block-view scrollbar: thumb on the right edge, 7px wide, ~30px tall.
+    let (thumb_x0, thumb_x1) = chrome_snap(w - 7.3 * s, w - 0.3 * s);
+    let (thumb_y0, thumb_y1) = chrome_snap(162.5 * s, 174.5 * s);
+    add_rect(
+        &mut vertices,
+        [thumb_x0, thumb_y0, thumb_x1, thumb_y1],
+        colors.selection,
+    );
+
+    // Horizontal pane divider at fractional logical y=176.4 (post-snap: 176).
+    let (div_y0, div_y1) = chrome_snap(176.4 * s, 177.4 * s);
+    add_rect(&mut vertices, [0.0, div_y0, w, div_y1], focus);
+
     vertices
 }
 

@@ -3,8 +3,7 @@
 use super::*;
 
 pub(crate) fn install_runtime_diagnostics() {
-    // v1.3: always write diagnostics to /tmp/weft.log so users can send
-    // logs regardless of how the app bundle is launched.
+    // v1.3: write diagnostics to /tmp/weft.log. v1.4.0: honor RUST_LOG.
     let log_path = std::path::PathBuf::from("/tmp/weft.log");
     let _ = std::fs::remove_file(&log_path);
     let file = match std::fs::OpenOptions::new()
@@ -21,9 +20,12 @@ pub(crate) fn install_runtime_diagnostics() {
             return;
         }
     };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = tracing_subscriber::fmt()
         .with_writer(std::sync::Arc::new(file))
         .with_ansi(false)
+        .with_env_filter(filter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
     setup_panic_hook(std::panic::take_hook());
@@ -530,14 +532,15 @@ impl ApplicationHandler<AppEvent> for App {
         if self.performance_probe.enabled() {
             let probe_proxy = self.proxy.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(performance_probe::WARMUP);
+                // v1.4.0: honor WEFT_GUI_PROBE_*_SECS env overrides.
+                std::thread::sleep(performance_probe::warmup_duration());
                 if probe_proxy
                     .send_event(AppEvent::PerformanceProbeStart)
                     .is_err()
                 {
                     return;
                 }
-                std::thread::sleep(performance_probe::SAMPLE);
+                std::thread::sleep(performance_probe::sample_duration());
                 let _ = probe_proxy.send_event(AppEvent::PerformanceProbeFinish);
             });
         }
