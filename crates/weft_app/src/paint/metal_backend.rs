@@ -234,6 +234,7 @@ impl MetalRenderer {
             frame_trace: RefCell::new(crate::frame_trace::FrameTraceRecorder::disabled()),
             frame_id: Cell::new(0),
             pane_instance_ranges: RefCell::new(Vec::new()),
+            pane_vertex_ranges: RefCell::new(Vec::new()),
         }
     }
 
@@ -711,10 +712,7 @@ impl MetalRenderer {
             encoder.set_fragment_texture(0, Some(tex));
             encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
-            let vertex_count = vertices.len() / 12;
-            if vertex_count > 0 {
-                encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
-            }
+            self.draw_legacy_vertex_ranges(encoder, vertices.len());
         }
         encoder.end_encoding();
 

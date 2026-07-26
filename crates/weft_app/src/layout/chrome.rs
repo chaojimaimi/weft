@@ -33,6 +33,25 @@ pub struct TabStripLayout {
     pub right_arrow_rect: Option<Rect>,
 }
 
+/// Keep global tabs out of the right pane's chrome area. For a vertical split,
+/// the strip stops at the nearest right edge among panes touching the leftmost
+/// content edge. Horizontal splits retain the full viewport width.
+pub fn tab_strip_right_edge(viewport_width: f32, pane_rects: &[Rect]) -> f32 {
+    if pane_rects.len() < 2 {
+        return viewport_width;
+    }
+    let left = pane_rects
+        .iter()
+        .map(|rect| rect[0])
+        .fold(f32::INFINITY, f32::min);
+    pane_rects
+        .iter()
+        .filter(|rect| (rect[0] - left).abs() < 0.5)
+        .map(|rect| rect[2])
+        .fold(viewport_width, f32::min)
+        .clamp(0.0, viewport_width)
+}
+
 impl TabStripLayout {
     pub fn tab_rect(self, index: usize) -> Rect {
         let x0 = self.tabs_start + index as f32 * self.tab_width - self.scroll_offset;

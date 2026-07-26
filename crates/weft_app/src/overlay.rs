@@ -484,6 +484,7 @@ pub fn build_overlay_stack<'a>(
             z: OverlayZ::Prompt,
             input_policy: OverlayInputPolicy::Focused,
             content: OverlayContent::Prompt(PromptDrawParams {
+                focused: true,
                 cwd: terminal.cwd(),
                 lines: &terminal.editor().buffer.lines,
                 cursor: terminal.editor().buffer.cursor,

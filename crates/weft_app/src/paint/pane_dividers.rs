@@ -15,9 +15,7 @@
 //! (`y0`). Each such shared edge contributes one divider line.
 
 use crate::layout::Rect;
-use crate::paint::primitives::{
-    build_focus_ring, focus_ring_alpha, focus_ring_thickness, push_quad,
-};
+use crate::paint::primitives::{build_focus_ring, push_quad};
 use weft_core::pane_layout::PaneId;
 
 /// Divider line axis.
@@ -155,13 +153,37 @@ pub(crate) fn push_active_pane_focus_ring(
     increase_contrast: bool,
 ) {
     let mut color = accent_color;
-    color[3] *= focus_ring_alpha(increase_contrast);
+    color[3] *= pane_focus_ring_alpha(increase_contrast);
     build_focus_ring(
         verts,
         active_rect,
         color,
-        focus_ring_thickness(increase_contrast),
+        pane_focus_ring_thickness(increase_contrast),
     );
+}
+
+fn pane_focus_ring_thickness(increase_contrast: bool) -> f32 {
+    if increase_contrast {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+fn pane_focus_ring_alpha(increase_contrast: bool) -> f32 {
+    if increase_contrast {
+        0.75
+    } else {
+        0.22
+    }
+}
+
+fn pane_divider_alpha(increase_contrast: bool) -> f32 {
+    if increase_contrast {
+        0.90
+    } else {
+        0.48
+    }
 }
 
 /// One-shot entry point for v1.3.1 pane overlays: derives divider edges from
@@ -184,7 +206,9 @@ pub(crate) fn push_pane_overlays(
         return;
     }
     let geo = pane_divider_edges(pane_layouts, active_pane_id);
-    push_pane_dividers(verts, &geo.edges, content_rect, separator_color);
+    let mut divider_color = separator_color;
+    divider_color[3] *= pane_divider_alpha(increase_contrast);
+    push_pane_dividers(verts, &geo.edges, content_rect, divider_color);
     if let Some(active) = geo.active_rect {
         push_active_pane_focus_ring(verts, active, accent_color, increase_contrast);
     }
@@ -395,6 +419,15 @@ mod tests {
         );
         // build_focus_ring pushes 4 quads (top/bottom/left/right) = 4 × 72 floats.
         assert_eq!(verts.len(), 4 * 72);
+    }
+
+    #[test]
+    fn pane_chrome_is_subtle_until_contrast_is_increased() {
+        assert_eq!(pane_focus_ring_thickness(false), 1.0);
+        assert!(pane_focus_ring_alpha(false) <= 0.25);
+        assert!(pane_divider_alpha(false) <= 0.55);
+        assert!(pane_focus_ring_alpha(true) > pane_focus_ring_alpha(false));
+        assert!(pane_divider_alpha(true) > pane_divider_alpha(false));
     }
 
     // ── v1.3.2: pane_divider_at hit-testing ──────────────────────────────

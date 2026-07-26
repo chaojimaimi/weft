@@ -477,39 +477,6 @@ impl MetalRenderer {
         let hidden_before_row = terminal.primary_screen_visible_row_start();
         let owned_rows = terminal.primary_screen_viewport_ownership();
 
-        // v1.3 diagnostic: count non-empty cells to verify the background
-        // pane's grid actually has content. In block view mode the grid may
-        // only hold the current prompt line while history lives in
-        // BlockTracker — if so, non_empty_cells will be near 0 and the
-        // background pane will appear blank.
-        let mut non_empty_cells = 0usize;
-        let mut first_non_empty_row: Option<usize> = None;
-        let mut last_non_empty_row: Option<usize> = None;
-        for row in 0..num_rows {
-            for col in 0..num_cols {
-                let c = grid.cell(row, col);
-                if c.character != ' '
-                    && c.character != '\0'
-                    && !c.flags.contains(CellFlags::WIDE_SPACER)
-                {
-                    non_empty_cells += 1;
-                    if first_non_empty_row.is_none() {
-                        first_non_empty_row = Some(row);
-                    }
-                    last_non_empty_row = Some(row);
-                }
-            }
-        }
-        tracing::info!(
-            non_empty_cells,
-            first_non_empty_row = ?first_non_empty_row,
-            last_non_empty_row = ?last_non_empty_row,
-            scroll_offset = grid.scroll_offset,
-            show_block_view = terminal.show_block_view(),
-            hidden_before_row = ?hidden_before_row,
-            "background pane grid content diagnostic"
-        );
-
         let mut out = Vec::with_capacity(num_rows * num_cols * 16);
 
         for row in 0..num_rows {

@@ -80,7 +80,7 @@ impl App {
         // v1.3.2: check for pane-divider grab before focusing a pane.
         // If the click lands on a divider strip (±4px), start a resize drag
         // instead of focusing/selecting. Mirrors the sidebar resize pattern.
-        if button == winit::event::MouseButton::Left && !self.block_view_active() {
+        if button == winit::event::MouseButton::Left {
             if let Some(divider) = self.pane_divider_hit_test(x as f32, y as f32) {
                 self.interaction.pane_divider_drag = Some(crate::app_state::PaneDividerDragState {
                     axis: divider.axis,
@@ -108,19 +108,22 @@ impl App {
         // (which all goes through `active_mut()`), so clicks/selections/
         // PTY mouse events route to the clicked pane. For single-pane tabs
         // `pane_at_pixel` always returns the one pane id — no-op switch.
-        // Skip in block view (block view is per-tab, not per-pane).
-        if !self.block_view_active() {
-            if let Some(pane_id) = self.pane_at_pixel(x, y) {
-                let tab = self.sessions.active_mut();
-                if tab.active_pane_id() != pane_id {
-                    if let Err(e) = tab.set_active_pane(pane_id) {
-                        tracing::warn!(error = ?e, "failed to focus pane under cursor");
-                    }
-                    // Force a full redraw so the newly active pane's cursor
-                    // and selection state render correctly.
+        if let Some(pane_id) = self.pane_at_pixel(x, y) {
+            let tab = self.sessions.active_mut();
+            if tab.active_pane_id() != pane_id {
+                if let Err(e) = tab.set_active_pane(pane_id) {
+                    tracing::warn!(error = ?e, "failed to focus pane under cursor");
+                } else {
+                    // Hit regions and block rows still describe the previously
+                    // active pane. Redraw before accepting a content action.
+                    self.refresh_find_for_active_tab();
                     if let Some(renderer) = &mut self.renderer {
                         renderer.force_full_grid_redraw();
                     }
+                    self.window_runtime.cursor_blink_on = true;
+                    self.window_runtime.cursor_blink_time = std::time::Instant::now();
+                    self.request_redraw();
+                    return;
                 }
             }
         }
@@ -409,8 +412,10 @@ impl App {
         if button == winit::event::MouseButton::Left && self.block_view_active() {
             if let Some(renderer) = &self.renderer {
                 let content_left = self
-                    .terminal_layout()
-                    .map(|layout| layout.content.left as f32)
+                    .renderer
+                    .as_ref()
+                    .and_then(|renderer| renderer.layout_ctx)
+                    .map(|ctx| ctx.left())
                     .unwrap_or_else(|| renderer.padding_x());
                 let cw = renderer.cell_width() as f32;
                 let xf = x as f32;

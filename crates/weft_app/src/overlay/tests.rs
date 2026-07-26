@@ -6,6 +6,7 @@ fn make_layer(z: OverlayZ, policy: OverlayInputPolicy) -> OverlayLayer<'static> 
         z,
         input_policy: policy,
         content: OverlayContent::Prompt(PromptDrawParams {
+            focused: true,
             cwd: None,
             lines: &[],
             cursor: (0, 0),
@@ -98,6 +99,7 @@ fn overlay_stack_topmost_modal_picks_highest_of_multiple() {
 #[test]
 fn overlay_warmup_prompt_collects_chars() {
     let prompt = PromptDrawParams {
+        focused: true,
         cwd: Some("/home"),
         lines: &["hello".to_string()],
         cursor: (0, 0),

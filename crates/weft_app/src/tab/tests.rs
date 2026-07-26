@@ -432,6 +432,22 @@ fn pane_hit_test_finds_correct_pane_in_vertical_split() {
     assert_eq!(t.pane_hit_test(-1.0, -1.0, content), None);
 }
 
+#[test]
+fn active_pane_dimensions_use_split_rect_not_full_content() {
+    let mut t = tab_with_terminal(100);
+    t.split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
+        .unwrap();
+
+    assert_eq!(
+        t.active_pane_dimensions_for_rect([0.0, 0.0, 800.0, 600.0], 10.0, 20.0),
+        Some((30, 40))
+    );
+    assert_eq!(
+        t.active_pane_dimensions_for_rect([0.0, 0.0, 800.0, 600.0], 0.0, 20.0),
+        None
+    );
+}
+
 /// v1.3 Batch 6: `set_active_pane` switches focus and is idempotent.
 #[test]
 fn set_active_pane_switches_focus() {

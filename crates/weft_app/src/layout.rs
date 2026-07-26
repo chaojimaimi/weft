@@ -70,6 +70,15 @@ impl LayoutCtx {
         }
     }
 
+    /// Derive a pane-local context from the full content context.
+    pub fn for_pane(mut self, rect: Rect) -> Self {
+        let content_x = self.padding_x + self.chrome_left;
+        let content_y = self.padding_y + self.chrome_top;
+        self.pane_origin = (rect[0] - content_x, rect[1] - content_y);
+        self.clip = Some(rect);
+        self
+    }
+
     /// Left edge of the content area (= horizontal padding + chrome_left +
     /// pane_origin.x).
     #[inline]
@@ -136,6 +145,12 @@ impl LayoutCtx {
     #[inline]
     pub fn col_x(&self, col: usize) -> f32 {
         self.left() + col as f32 * self.cell_w
+    }
+
+    /// Map an absolute pixel X coordinate to a pane-local terminal column.
+    #[inline]
+    pub fn col_at_x(&self, x: f32) -> usize {
+        ((x - self.left()) / self.cell_w).max(0.0) as usize
     }
 
     /// Y coordinate of the top edge of row `row` (0-based).
@@ -247,7 +262,8 @@ mod terminal;
 // result type is currently only named inside its owning submodule.
 #[allow(unused_imports)]
 pub use chrome::{
-    layout_panel, layout_tab_strip, layout_tab_tooltip, PanelLayout, TabStripInput, TabStripLayout,
+    layout_panel, layout_tab_strip, layout_tab_tooltip, tab_strip_right_edge, PanelLayout,
+    TabStripInput, TabStripLayout,
 };
 #[allow(unused_imports)]
 pub use settings::{layout_settings, FooterButtonRects, SettingsLayout, SETTINGS_NARROW_THRESHOLD};

@@ -62,7 +62,21 @@ impl App {
         // If the grid row count drifted from what the terminal holds
         // (font/padding/window-size change, the one-time convergence from the
         // spawn size to the padded size) — recompute.
-        let desired = self.grid_dims();
+        let desired = self
+            .terminal_layout()
+            .and_then(|layout| {
+                self.sessions.active().active_pane_dimensions_for_rect(
+                    [
+                        layout.content.left as f32,
+                        layout.content.top as f32,
+                        layout.content.right as f32,
+                        layout.content.bottom as f32,
+                    ],
+                    layout.cell_width as f32,
+                    layout.cell_height as f32,
+                )
+            })
+            .unwrap_or((0, 0));
         let current = self
             .sessions
             .active()
@@ -214,13 +228,17 @@ impl App {
                         .find(|(id, _)| *id == active_id)
                         .map(|(_, rect)| *rect)
                         .unwrap_or(content_rect);
-                    let ptrs: Vec<(crate::layout::Rect, *const Terminal)> = pane_layouts
+                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, usize)> = pane_layouts
                         .iter()
                         .filter(|(id, _)| *id != active_id)
                         .filter_map(|(id, rect)| {
                             let pane = tab.pane(*id)?;
                             let terminal = pane.terminal.as_ref()?;
-                            Some((*rect, terminal as *const Terminal))
+                            Some((
+                                *rect,
+                                terminal as *const Terminal,
+                                pane.block_scroll_anchor.offset_value(),
+                            ))
                         })
                         .collect();
                     tracing::debug!(
@@ -245,14 +263,18 @@ impl App {
         // are immutable during draw).
         let background_panes: Vec<crate::renderer::PaneRenderInfo> = bg_terminal_ptrs
             .iter()
-            .map(|(rect, ptr)| crate::renderer::PaneRenderInfo {
-                rect: *rect,
-                // SAFETY: `ptr` was obtained from `tab.pane(id).terminal`
-                // above. `tab` outlives this scope; background panes'
-                // terminals are not mutated during draw (only the active
-                // pane's selection_handler is mutated, a disjoint Pane).
-                terminal: unsafe { &**ptr },
-            })
+            .map(
+                |(rect, ptr, block_scroll)| crate::renderer::PaneRenderInfo {
+                    rect: *rect,
+                    // SAFETY: `ptr` was obtained from `tab.pane(id).terminal`
+                    // above. `tab` outlives this scope; background panes'
+                    // terminals are not mutated during draw (only the active
+                    // pane's selection_handler is mutated, a disjoint Pane).
+                    terminal: unsafe { &**ptr },
+                    block_scroll: *block_scroll,
+                    submit_on_ctrl_enter: self.config_state.config.editor.submit_on_ctrl_enter,
+                },
+            )
             .collect();
         // v1.3: take a single `&mut Pane` borrow so `terminal` (immutable)
         // and `selection_handler` (mutable, passed to `renderer.draw` below)
@@ -551,9 +573,8 @@ impl App {
                 &tab_bar,
                 // v1.3 Batch 5.5: `active_pane_rect` is the split-tree-
                 // computed rect for the active pane; `background_panes`
-                // carries the other panes (each rendered as a grid-only
-                // background, clipped to its rect via a per-segment scissor
-                // in `encode_and_present`). Both are computed above before
+                // carries the other panes (each choosing block/grid view from
+                // its own Terminal state). Both are computed above before
                 // the mutable `pane` borrow. Empty for single-pane tabs
                 // (the common case — no change from pre-v1.3 behavior).
                 active_pane_rect,

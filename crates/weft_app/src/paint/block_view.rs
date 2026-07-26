@@ -50,6 +50,7 @@ impl MetalRenderer {
             viewport_rows,
             block_hovered,
             spinner_phase,
+            find_block_highlight,
             palette,
         } = model;
         let mut verts = Vec::new();
@@ -272,7 +273,6 @@ impl MetalRenderer {
             sel.sync_rows(bv_rows.clone());
         }
         let sel_bv = selection.block_view_selection.as_ref();
-        let find_block_highlight = self.find_state.as_ref().and_then(|f| f.block_highlight);
         // F3-5: find match highlight color from the semantic token (was
         // hardcoded [0.95, 0.78, 0.20, 0.50]).
         let find_hl_bg = {

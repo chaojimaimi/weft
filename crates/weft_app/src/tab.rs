@@ -433,6 +433,29 @@ impl Tab {
         self.active_mut().resize_terminal_and_queue(rows, cols)
     }
 
+    /// Grid dimensions of the active pane for the current split layout.
+    /// Unlike the full content-area dimensions, this remains equal to the
+    /// active Terminal grid after a split and is safe for redraw convergence.
+    pub(crate) fn active_pane_dimensions_for_rect(
+        &self,
+        content_rect: weft_core::pane_layout::Rect,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> Option<(usize, usize)> {
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let rect = self
+            .split_tree
+            .layout(content_rect)
+            .into_iter()
+            .find_map(|(id, rect)| (id == self.active_pane).then_some(rect))?;
+        let [x0, y0, x1, y1] = rect;
+        let cols = ((x1 - x0).max(0.0) / cell_w).floor() as usize;
+        let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
+        (rows > 0 && cols > 0).then_some((rows, cols))
+    }
+
     /// v1.3 Batch 6: Resize every pane's terminal according to its split-tree-
     /// computed rect. `content_rect` is the full content area (chrome already
     /// subtracted); `cell_w` / `cell_h` are physical-pixel cell dimensions.
@@ -456,10 +479,8 @@ impl Tab {
         let mut active_resized = false;
         for (pane_id, rect) in layouts {
             let [x0, y0, x1, y1] = rect;
-            let w = (x1 - x0).max(0.0);
-            let h = (y1 - y0).max(0.0);
-            let cols = (w / cell_w).floor() as usize;
-            let rows = (h / cell_h).floor() as usize;
+            let cols = ((x1 - x0).max(0.0) / cell_w).floor() as usize;
+            let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
             if rows == 0 || cols == 0 {
                 continue;
             }

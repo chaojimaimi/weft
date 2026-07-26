@@ -195,6 +195,10 @@ impl MetalRenderer {
         // When `cursor_blink_on` is false (window unfocused OR user is
         // actively selecting — see main.rs::RedrawRequested), the breath
         // freezes at peak alpha so the caret stays visible but calm.
+        if !p.focused {
+            return verts;
+        }
+
         let s = if cursor_blink_on {
             cursor_blink_phase.sin()
         } else {
@@ -337,6 +341,9 @@ impl MetalRenderer {
 /// What the bottom editor input box should draw (v0.5 editor takeover). Built
 /// by the app only in Editor mode and passed to [`MetalRenderer::draw`].
 pub struct PromptDrawParams<'a> {
+    /// Whether this pane owns keyboard focus. Background panes retain their
+    /// editor contents but do not paint a caret.
+    pub focused: bool,
     /// Current working directory (from OSC 7) shown after the `❯` glyph.
     pub cwd: Option<&'a str>,
     /// Editor buffer lines (line 0 follows the prompt).

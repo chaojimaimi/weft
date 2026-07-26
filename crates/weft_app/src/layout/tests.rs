@@ -86,6 +86,21 @@ fn right_and_bottom_respect_clip_rect() {
     assert_eq!(ctx.height(), 900.0 - 16.0);
 }
 
+#[test]
+fn for_pane_aligns_origin_and_clip_to_split_rect() {
+    let mut ctx = LayoutCtx::new((1600.0, 1200.0), 10.0, 20.0, 16.0, 12.0);
+    ctx.chrome_top = 45.0;
+    ctx.chrome_left = 240.0;
+    let pane = [800.0, 600.0, 1584.0, 1188.0];
+    let pane_ctx = ctx.for_pane(pane);
+
+    assert_eq!(pane_ctx.left(), 800.0);
+    assert_eq!(pane_ctx.top(), 600.0);
+    assert_eq!(pane_ctx.right(), 1584.0);
+    assert_eq!(pane_ctx.bottom(), 1188.0);
+    assert_eq!(pane_ctx.clip, Some(pane));
+}
+
 // ── Spacing tokens ──────────────────────────────────────────────────
 
 #[test]
@@ -347,6 +362,55 @@ fn tab_strip_uses_three_tier_width_and_clamps_scroll() {
     assert!(ten.left_arrow_rect.is_some());
     assert!(ten.right_arrow_rect.is_some());
     assert_eq!(ten.plus_rect[0], ten.visible_right + ten.arrow_width);
+}
+
+#[test]
+fn tab_strip_stops_before_right_pane_only_for_vertical_splits() {
+    let vertical = [[0.0, 57.0, 800.0, 1200.0], [800.0, 57.0, 1600.0, 1200.0]];
+    let right = super::tab_strip_right_edge(1600.0, &vertical);
+    assert_eq!(right, 800.0);
+    let strip = layout_tab_strip(TabStripInput {
+        viewport_width: right,
+        bar_height: 57.0,
+        cell_width: 19.0,
+        padding_x: 0.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 144.0,
+        tab_count: 3,
+        requested_scroll_offset: 0.0,
+    });
+    assert!(strip.plus_rect[2] <= 800.0);
+    assert!((0..3).all(|index| strip.tab_rect(index)[2] <= 800.0));
+
+    let overflowing = layout_tab_strip(TabStripInput {
+        viewport_width: right,
+        bar_height: 57.0,
+        cell_width: 19.0,
+        padding_x: 0.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 144.0,
+        tab_count: 10,
+        requested_scroll_offset: 0.0,
+    });
+    let revealed = layout_tab_strip(TabStripInput {
+        requested_scroll_offset: overflowing.scroll_offset_for_tab(9),
+        tab_count: 10,
+        viewport_width: right,
+        bar_height: 57.0,
+        cell_width: 19.0,
+        padding_x: 0.0,
+        chrome_left: 0.0,
+        traffic_lights_width: 144.0,
+    });
+    assert!(revealed.tab_rect(9)[0] >= revealed.visible_left);
+    assert!(revealed.tab_rect(9)[2] <= revealed.visible_right);
+
+    let horizontal = [[0.0, 57.0, 1600.0, 628.5], [0.0, 628.5, 1600.0, 1200.0]];
+    assert_eq!(super::tab_strip_right_edge(1600.0, &horizontal), 1600.0);
+    assert_eq!(
+        super::tab_strip_right_edge(1600.0, &horizontal[..1]),
+        1600.0
+    );
 }
 
 #[test]
@@ -755,6 +819,15 @@ fn block_view_respects_pane_origin_and_clip() {
         "clip_top must be pane-local: got {}",
         layout.clip_top
     );
+}
+
+#[test]
+fn column_hit_testing_uses_right_pane_origin() {
+    let ctx = sample_ctx().for_pane([808.0, 57.0, 1600.0, 1200.0]);
+
+    assert_eq!(ctx.col_at_x(808.0), 0);
+    assert_eq!(ctx.col_at_x(829.5), 2);
+    assert_eq!(ctx.col_at_x(800.0), 0);
 }
 
 /// CommandExecuting mode (cwd_header_active=false): clip_bottom sits

@@ -19,5 +19,7 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// Advances ~once per 80ms; the renderer maps it to a braille spinner
     /// glyph. `-1.0` disables the spinner (reduce-motion or not running).
     pub(crate) spinner_phase: f32,
+    /// Active-pane find highlight. Background panes always pass `None`.
+    pub(crate) find_block_highlight: Option<(u64, usize, bool, usize, usize)>,
     pub(crate) palette: &'a [Color; 256],
 }

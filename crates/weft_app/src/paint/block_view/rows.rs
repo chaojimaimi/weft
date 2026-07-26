@@ -58,6 +58,7 @@ impl MetalRenderer {
             viewport_rows,
             block_hovered: _,
             spinner_phase: _,
+            find_block_highlight: _,
             palette: _,
         } = model;
 
