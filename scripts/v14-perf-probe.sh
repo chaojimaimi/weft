@@ -86,10 +86,10 @@ RUST_LOG=weft::frame_trace=debug \
 cat "$PROBE_STDERR"
 
 # Check that frame lines were captured.
-FRAME_COUNT=$(grep -c ' frame$' "$LOG_FILE" 2>/dev/null || true)
+FRAME_COUNT=$(grep -c 'frame_trace: frame ' "$LOG_FILE" 2>/dev/null || true)
 if [[ "$FRAME_COUNT" -eq 0 ]]; then
     echo "v14-perf-probe: no 'frame' trace lines captured in $LOG_FILE" >&2
-    echo "    (ensure RUST_LOG=weft_app::frame_trace=debug and WEFT_GUI_PERF_PROBE=1)" >&2
+    echo "    (ensure RUST_LOG=weft::frame_trace=debug and WEFT_GUI_PERF_PROBE=1)" >&2
     exit 1
 fi
 

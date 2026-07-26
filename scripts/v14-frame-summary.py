@@ -7,17 +7,18 @@ for every counter. Designed to be piped from `scripts/v14-perf-probe.sh`.
 
 A typical line looks like (one line, fields space-separated):
 
-    2026-07-26T... DEBUG weft_app::frame_trace: frame_id=1 reason=pty \
+    2026-07-26T... DEBUG weft::frame_trace: frame frame_id=1 reason=pty \
         layout_us=42 build_us=150 encode_us=80 cpu_total_us=272 \
         vertices=12 instances=1920 dirty_rows=0 session_blocks=0 \
         visible_blocks=0 bv_rows=0 cache_hits=0 cache_misses=0 \
         styled_lookups=0 styled_paint_us=0 resident_bytes=123456 \
         grid_bg_instances=0 grid_glyph_instances=1920 grid_upload_bytes=122880 \
         styled_cache_hits=0 styled_cache_misses=0 styled_cache_bytes=0 \
-        gpu_completions_this_frame=0 gpu_max_us=0 frame
+        gpu_completions_this_frame=0 gpu_max_us=0
 
-The trailing ` frame` is the message; everything else is key=value pairs.
-Unknown keys are ignored; missing keys default to 0.
+The `frame` message name appears right after the `frame_trace:` module prefix;
+everything else is key=value pairs. Unknown keys are ignored; missing keys
+default to 0.
 """
 
 import argparse
@@ -74,7 +75,10 @@ def percentile(values, pct):
 
 def parse_frame_line(line):
     """Return a dict of key→int for one `frame` log line, or None."""
-    if not line.rstrip().endswith(" frame"):
+    # Lines look like: `... DEBUG weft::frame_trace: frame frame_id=1 ...`
+    # The `frame` message name appears right after the module prefix, not at
+    # the end of the line (tracing emits message before kv pairs).
+    if "frame_trace: frame " not in line:
         return None
     kv = {m.group(1): m.group(2) for m in KV_RE.finditer(line)}
     out = {}
