@@ -1,8 +1,5 @@
 //! v1.4.2 Phase B2: Dual-stream grid instance collector (pure logic).
 //!
-//! Types and functions here are not yet wired into the renderer (B3 will
-//! integrate them). `#[allow(dead_code)]` suppresses unused warnings until then.
-//!
 //! Splits the per-cell grid rendering into two streams:
 //! - **Background stream**: 8-float instances per run of same-bg cells.
 //!   Adjacent cells with identical resolved background colors are merged
@@ -33,7 +30,6 @@ use weft_core::selection::SelectionHandler;
 /// into a flat `Vec<f32>` for GPU upload. The bg stream is drawn first
 /// (no texture sampling, just solid color quads), then the glyph stream
 /// is drawn on top with atlas sampling.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BgInstance {
     pub x0: f32,
@@ -62,7 +58,6 @@ impl BgInstance {
 /// - `Decoration`: a solid-color rectangle (cursor bar, cursor underline,
 ///   hyperlink underline). UV = `[0, 0, 0, 1]` (mask = 0 → only bg shows);
 ///   `color` is the visible decoration color.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GlyphInstance {
     Text {
@@ -79,7 +74,6 @@ pub(crate) enum GlyphInstance {
 /// Per-row dual-stream instance collection. Built by [`build_row_instances`]
 /// and cached in the renderer's per-row cache (`grid_row_cache`). When the
 /// row is dirty, the cache entry is rebuilt; otherwise it's reused.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GridRowInstances {
     /// Background instances for this row (typically 1-5 runs).
@@ -91,7 +85,6 @@ pub(crate) struct GridRowInstances {
 /// Per-pane ranges into the flat dual-stream buffers. Records where each
 /// pane's instances begin and end so the Metal backend can issue per-pane
 /// draw calls with scissor rects (v1.3 multi-pane support).
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PaneInstanceRanges {
     /// `[start, end)` float offsets into the bg stream.
@@ -106,18 +99,31 @@ pub(crate) struct PaneInstanceRanges {
 /// panes). The Metal backend uploads each stream to its own ring buffer
 /// and issues two draw calls: bg stream (solid color pipeline) then glyph
 /// stream (atlas sampling pipeline).
-#[allow(dead_code)]
+///
+/// Per-pane ranges are tracked separately on `MetalRenderer::pane_instance_ranges`
+/// (paired with pane rects for scissor draws) rather than on this struct,
+/// because the renderer pairs each range with its pane rect at push time.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GridInstanceBatch {
     /// Flat bg instance buffer: 8 floats per run.
     pub bg_stream: Vec<f32>,
     /// Flat glyph instance buffer: 16 floats per content/decoration cell.
     pub glyph_stream: Vec<f32>,
-    /// Per-pane ranges for multi-pane scissor draws. Empty for single-pane.
-    pub pane_ranges: Vec<PaneInstanceRanges>,
 }
 
 impl GridInstanceBatch {
+    /// Allocate with capacity hints based on grid dimensions. Estimates:
+    /// - bg: ~4 runs/row × 8 floats × num_rows
+    /// - glyph: ~num_cols/2 cells × 16 floats × num_rows (rough)
+    pub(crate) fn with_capacity(num_rows: usize, num_cols: usize) -> Self {
+        let bg_cap = num_rows.saturating_mul(4 * 8);
+        let glyph_cap = num_rows.saturating_mul(num_cols / 2 + 1).saturating_mul(16);
+        Self {
+            bg_stream: Vec::with_capacity(bg_cap),
+            glyph_stream: Vec::with_capacity(glyph_cap),
+        }
+    }
+
     /// Extend both streams with a row's instances, resolving glyph UVs via
     /// `resolve_uv`. Returns the float offsets occupied by this row.
     ///
@@ -125,7 +131,6 @@ impl GridInstanceBatch {
     /// (`|ch| atlas.get(ch).map(|g| ...).unwrap_or(space_uv)`). This keeps
     /// the builder pure-logic while still producing the 16-float instance
     /// format the GPU expects.
-    #[allow(dead_code)]
     pub(crate) fn push_row(
         &mut self,
         row: &GridRowInstances,
@@ -194,7 +199,7 @@ const UNDERLINE_HEIGHT: f32 = 2.0;
 /// emitted for cursor bar/underline and hyperlink underlines. Space cells
 /// with no decoration skip the glyph stream (their bg is covered by the
 /// bg stream).
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_row_instances(
     grid: &Grid,
     palette: &[Color; 256],
@@ -368,6 +373,7 @@ pub(crate) fn build_row_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paint::primitives::color_to_normalized;
     use weft_core::grid::{Cell, CellColor, CellFlags, Color, Cursor, CursorStyle, Grid};
     use weft_core::selection::{GridPos, Selection, SelectionHandler, SelectionMode};
 
@@ -729,5 +735,198 @@ mod tests {
         // Total: 2 bg runs × 8 floats + 2 glyphs × 16 floats.
         assert_eq!(batch.bg_stream.len(), 16);
         assert_eq!(batch.glyph_stream.len(), 32);
+    }
+
+    // ── Test 17: pixel-equivalence harness ─────────────────────────
+    //
+    // v1.4.2 Phase B3 exit criterion: verify that dual-stream rendering
+    // (bg runs + glyph instances with transparent bg) produces the same
+    // pixels as single-stream rendering (per-cell instances with baked-in
+    // bg). Since we can't rasterize in a unit test (no Metal device), we
+    // verify the data-level equivalence properties:
+    //
+    // 1. **Coverage**: the union of all bg run x-ranges == [0, num_cols·cw).
+    //    No gaps → no unpainted pixels.
+    // 2. **Non-overlap**: bg runs don't overlap in x. No double-blending.
+    // 3. **Glyph transparency**: all Text glyph instances have bg=[0;4].
+    //    The bg stream is solely responsible for the background.
+    // 4. **Glyph coverage**: every cell with visible text has a matching
+    //    Text glyph at the same dst rect.
+    // 5. **Run color consistency**: within a run, all covered cells share
+    //    the same final_bg (cursor/selection/normal).
+    //
+    // Uses a complex row mixing: default bg, custom bg, text, empty cells,
+    // cursor (bar style), and selection — exercising all merge-break paths.
+
+    #[test]
+    fn pixel_equivalence_dual_stream_matches_single_stream() {
+        // Build a row: [empty | text 'A' | custom-bg 'B' | default | selected 'C']
+        // Col indices:     0      1          2                3       4      5
+        let mut grid = Grid::new(1, 6);
+        grid.viewport[0].cells[1] = Cell::with_char('A');
+        let mut cell_b = Cell::with_char('B');
+        cell_b.bg = CellColor::Palette(1); // custom bg → breaks the run
+        grid.viewport[0].cells[2] = cell_b;
+        // col 3: default Cell (default bg) → breaks the custom-bg run
+        grid.viewport[0].cells[4] = Cell::with_char('C');
+        // col 5: empty
+
+        // Cursor at col 1 (bar style → decoration glyph + cursor fg).
+        let cursor = Cursor {
+            row: 0,
+            col: 1,
+            visible: true,
+            wrap_pending: false,
+        };
+        // Selection covering col 4 → selection bg override.
+        let mut sel = SelectionHandler::new();
+        sel.start(GridPos { row: 0, col: 4 }, SelectionMode::Simple);
+        sel.end();
+
+        let row_instances = build(&grid, &cursor, CursorStyle::Bar, true, &sel, 1.0);
+
+        // ── Property 1: Coverage ───────────────────────────────────
+        // The full row [0, 6·cw) must be covered by bg runs.
+        let full_width = 6.0 * CW;
+        let mut covered: Vec<(f32, f32)> = row_instances
+            .bg_instances
+            .iter()
+            .map(|r| (r.x0, r.x0 + r.w))
+            .collect();
+        covered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(!covered.is_empty(), "bg stream must have at least one run");
+        assert!(
+            (covered[0].0 - 0.0).abs() < 0.01,
+            "first run must start at x=0, got {}",
+            covered[0].0
+        );
+        let mut prev_end = covered[0].1;
+        for &(start, end) in covered.iter().skip(1) {
+            assert!(
+                (start - prev_end).abs() < 0.01,
+                "gap between runs: prev_end={}, next_start={}",
+                prev_end,
+                start
+            );
+            prev_end = end;
+        }
+        assert!(
+            (prev_end - full_width).abs() < 0.01,
+            "last run must end at {}, got {}",
+            full_width,
+            prev_end
+        );
+
+        // ── Property 2: Non-overlap ────────────────────────────────
+        for i in 0..covered.len() {
+            for j in (i + 1)..covered.len() {
+                let (a0, a1) = covered[i];
+                let (b0, b1) = covered[j];
+                let overlap = a0 < b1 && b0 < a1;
+                assert!(
+                    !overlap,
+                    "runs {} and {} overlap: [{},{}) vs [{},{})",
+                    i, j, a0, a1, b0, b1
+                );
+            }
+        }
+
+        // ── Property 3: Glyph transparency ─────────────────────────
+        // Text glyphs must have bg = [0;4] (the bg stream paints bg).
+        // Verified via batch serialization: floats [12..16) are the bg field.
+        let mut batch = GridInstanceBatch::default();
+        let resolve_uv = |_ch: char| [0.5, 0.5, 0.6, 0.6];
+        batch.push_row(&row_instances, &resolve_uv);
+        let gs = &batch.glyph_stream;
+        for chunk in gs.chunks(16) {
+            if chunk.len() == 16 {
+                let bg_field = [chunk[12], chunk[13], chunk[14], chunk[15]];
+                // Text glyphs (uv != [0,0,0,1]) must have transparent bg.
+                let uv = [chunk[4], chunk[5], chunk[6], chunk[7]];
+                if uv != [0.0, 0.0, 0.0, 1.0] {
+                    assert_eq!(
+                        bg_field,
+                        [0.0, 0.0, 0.0, 0.0],
+                        "Text glyph must have transparent bg (uv={:?})",
+                        uv
+                    );
+                }
+            }
+        }
+
+        // ── Property 4: Glyph coverage ────────────────────────────
+        // Every cell with visible text (A, B, C) must have a matching Text
+        // glyph at the correct dst rect.
+        let text_cells = [(1usize, 'A'), (2, 'B'), (4, 'C')];
+        for (col, ch) in text_cells {
+            let x0 = col as f32 * CW;
+            let x1 = x0 + CW;
+            let found = row_instances.glyph_instances.iter().any(|gi| {
+                if let GlyphInstance::Text { dst, ch: gc, .. } = gi {
+                    let [dx0, _dy0, dx1, _dy1] = dst;
+                    (dx0 - x0).abs() < 0.01 && (dx1 - x1).abs() < 0.01 && *gc == ch
+                } else {
+                    false
+                }
+            });
+            assert!(
+                found,
+                "col {} char '{}' must have a Text glyph at [{},{})",
+                col, ch, x0, x1
+            );
+        }
+
+        // ── Property 5: Run color consistency ────────────────────
+        // The cursor cell (col 1, bar style) uses cursor_color as fg (not bg),
+        // so its bg run still uses the default bg. The selected cell (col 4)
+        // uses SELECTION as its bg run color. Verify the run covering col 4
+        // has the selection color.
+        let sel_x0 = 4.0 * CW;
+        let sel_run = row_instances
+            .bg_instances
+            .iter()
+            .find(|r| r.x0 <= sel_x0 && r.x0 + r.w > sel_x0);
+        assert!(
+            sel_run.is_some(),
+            "must have a bg run covering col 4 (selection)"
+        );
+        let sel_run = sel_run.unwrap();
+        assert_eq!(
+            sel_run.bg, SELECTION,
+            "selection cell's bg run must use selection color"
+        );
+
+        // The custom-bg cell (col 2) must have a run with palette[1] color.
+        let cb_x0 = 2.0 * CW;
+        let cb_run = row_instances
+            .bg_instances
+            .iter()
+            .find(|r| r.x0 <= cb_x0 && r.x0 + r.w > cb_x0);
+        assert!(
+            cb_run.is_some(),
+            "must have a bg run covering col 2 (custom bg)"
+        );
+        let palette = Color::standard_palette();
+        let expected_bg = color_to_normalized(palette[1]);
+        let cb_run = cb_run.unwrap();
+        assert_eq!(
+            cb_run.bg, expected_bg,
+            "custom-bg cell's bg run must use palette[1] color"
+        );
+
+        // ── Property 6: Cursor decoration present ───────────────────
+        // Bar-style cursor at col 1 must emit a Decoration glyph.
+        let cursor_decoration = row_instances.glyph_instances.iter().any(|gi| {
+            if let GlyphInstance::Decoration { dst, color } = gi {
+                let [dx0, _dy0, dx1, _dy1] = dst;
+                (dx0 - 1.0 * CW).abs() < 0.01 && *color == CURSOR && dx1 - dx0 < CW
+            } else {
+                false
+            }
+        });
+        assert!(
+            cursor_decoration,
+            "bar cursor at col 1 must emit a Decoration glyph"
+        );
     }
 }

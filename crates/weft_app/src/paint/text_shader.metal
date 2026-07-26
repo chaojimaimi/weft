@@ -90,3 +90,54 @@ fragment float4 text_fragment(
     color.a = mix(in.bg_color.a, 1.0, mask);
     return color;
 }
+
+// v1.4.2 Phase B3: Background-stream pipeline. Draws solid color quads
+// without atlas sampling. Each instance is one run of same-bg cells
+// (8 floats: origin(2) + size(2) + bg(4) = 32 bytes). The bg stream is
+// drawn first per pane, then the glyph stream (instanced pipeline above)
+// draws text/decoration on top with transparent bg.
+//
+// Pixel equivalence with the single-stream path:
+//   single: color = mix(bg, fg, mask), alpha = mix(bg.a, 1, mask)
+//   dual:   bg stream draws bg (mask=0), then glyph stream draws
+//           mix(transparent, fg, mask) on top via alpha blending.
+//   Result: bg * (1-mask) + fg * mask — identical to single-stream.
+struct BgInstance {
+    float2 origin;
+    float2 size;
+    float4 bg;
+};
+
+struct BgVertexOut {
+    float4 position [[position]];
+    float4 bg_color;
+};
+
+vertex BgVertexOut bg_vertex(
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]],
+    constant float2& viewport_size [[buffer(1)]],
+    constant BgInstance* instances [[buffer(2)]]
+) {
+    BgVertexOut out;
+    float2 corner;
+    switch (vid) {
+        case 0: corner = float2(0.0, 0.0); break;
+        case 1: corner = float2(0.0, 1.0); break;
+        case 2: corner = float2(1.0, 1.0); break;
+        default: corner = float2(1.0, 0.0); break;
+    }
+    BgInstance inst = instances[iid];
+    float2 position = inst.origin + corner * inst.size;
+    float2 clip = (position / viewport_size) * 2.0 - 1.0;
+    clip.y = -clip.y;
+    out.position = float4(clip, 0.0, 1.0);
+    out.bg_color = inst.bg;
+    return out;
+}
+
+fragment float4 bg_fragment(
+    BgVertexOut in [[stage_in]]
+) {
+    return in.bg_color;
+}

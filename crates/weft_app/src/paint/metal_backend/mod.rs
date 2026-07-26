@@ -22,6 +22,27 @@ use weft_core::config::{FontConfig, Theme};
 
 mod grid_instances;
 
+/// v1.4.2 Phase B3: Per-pane dual-stream ranges paired with the pane's
+/// scissor rect. The Metal backend iterates this list to issue per-pane
+/// scissor + bg draw + glyph draw without re-deriving counts via `/16`/`/8`.
+/// Reuses B2's `PaneInstanceRanges` for the float offsets (Copy + Default
+/// via `(usize, usize)` tuples — `Range<usize>` is not `Default`).
+pub(crate) type PaneInstanceSegment = (
+    crate::layout::Rect,
+    crate::paint::grid_instances::PaneInstanceRanges,
+);
+
+/// v1.4.2 Phase B3: Background-stream Metal state. Groups the bg pipeline
+/// (no atlas sampling) + triple-buffered instance ring. Kept as a single
+/// field on `MetalRenderer` to avoid bloating the struct with 4 separate
+/// fields (renderer.rs is at the architecture-gate ceiling).
+pub(crate) struct BgStream {
+    pub pipeline: metal::RenderPipelineState,
+    pub ring: RefCell<Vec<metal::Buffer>>,
+    pub ring_idx: Cell<usize>,
+    pub capacity: Cell<u64>,
+}
+
 impl MetalRenderer {
     pub fn new(
         window: &Window,
@@ -133,6 +154,27 @@ impl MetalRenderer {
             .new_render_pipeline_state(&instanced_desc)
             .expect("Failed to create instanced render pipeline");
 
+        // v1.4.2 Phase B3: Background-stream pipeline. Same instanced quad
+        // topology (corner derived from vertex_id, instance buffer at slot 2)
+        // but uses `bg_vertex`/`bg_fragment` — no atlas sampling, just solid
+        // color quads. 8-float instances (origin+size+bg = 32B). Drawn before
+        // the glyph stream so text renders on top.
+        let bg_vertex_fn = library.get_function("bg_vertex", None).unwrap();
+        let bg_fragment_fn = library.get_function("bg_fragment", None).unwrap();
+        let bg_desc = RenderPipelineDescriptor::new();
+        bg_desc.set_vertex_function(Some(&bg_vertex_fn));
+        bg_desc.set_fragment_function(Some(&bg_fragment_fn));
+        let bg_color_att = bg_desc.color_attachments().object_at(0).unwrap();
+        bg_color_att.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        bg_color_att.set_blending_enabled(true);
+        bg_color_att.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        bg_color_att.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        bg_color_att.set_source_alpha_blend_factor(metal::MTLBlendFactor::SourceAlpha);
+        bg_color_att.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+        let bg_pipeline = device
+            .new_render_pipeline_state(&bg_desc)
+            .expect("Failed to create bg render pipeline");
+
         // v1.0 P1.5-B1: Static index buffer for the unit quad: two triangles
         // (TL-BL-BR, TL-BR-TR) indexing 4 corner vertices. The vertex shader
         // maps vertex_id 0..3 → corner (0,0), (0,1), (1,1), (1,0). Created
@@ -235,6 +277,13 @@ impl MetalRenderer {
             instance_ring: RefCell::new(Vec::new()),
             instance_ring_idx: Cell::new(0),
             instance_capacity: Cell::new(0),
+            // v1.4.2 Phase B3: background-stream pipeline + ring.
+            bg_stream: crate::paint::metal_backend::BgStream {
+                pipeline: bg_pipeline,
+                ring: RefCell::new(Vec::new()),
+                ring_idx: Cell::new(0),
+                capacity: Cell::new(0),
+            },
             frame_trace: RefCell::new(crate::frame_trace::FrameTraceRecorder::disabled()),
             frame_id: Cell::new(0),
             pane_instance_ranges: RefCell::new(Vec::new()),
@@ -281,7 +330,8 @@ impl MetalRenderer {
         &self,
         drawable: &metal::MetalDrawableRef,
         vertices: &[f32],
-        instances: &[f32],
+        bg_instances: &[f32],
+        glyph_instances: &[f32],
         clear_color: (f64, f64, f64, f64),
         drawable_tex_size: (f32, f32),
         vp_mismatch: bool,
@@ -292,7 +342,8 @@ impl MetalRenderer {
         // v1.0 P1.5-B1: early-exit only when BOTH instances (grid) and
         // vertices (overlays / block view) are empty. In grid view with no
         // overlays, `vertices` is empty but `instances` carries the cells.
-        if vertices.is_empty() && instances.is_empty() {
+        // v1.4.2 Phase B3: dual-stream — check both bg + glyph streams.
+        if vertices.is_empty() && bg_instances.is_empty() && glyph_instances.is_empty() {
             // v1.0 P1.5-B2: if instances didn't change this frame (no dirty
             // rows, no cursor toggle, no scroll) and the offscreen texture
             // is available, the previous frame's grid content is still valid
@@ -423,7 +474,11 @@ impl MetalRenderer {
 
         // v1.0 P1.5-B1: Upload instance buffer via triple-buffered ring.
         // Extracted to grid_instances.rs (v1.4.2 B1).
-        let (instance_ring_idx, instance_data_size) = self.upload_instance_ring(instances);
+        // v1.4.2 Phase B3: dual-stream — upload bg runs (8 floats each) and
+        // glyph instances (16 floats each) to separate rings. The glyph ring
+        // reuses `instance_ring` (same 16-float stride as the legacy path).
+        let (bg_ring_idx, bg_data_size) = self.upload_bg_ring(bg_instances);
+        let (glyph_ring_idx, glyph_data_size) = self.upload_instance_ring(glyph_instances);
 
         // v1.0 P1.5-B0: Use set_vertex_bytes for viewport uniform (8 bytes)
         // instead of allocating a new MTLBuffer every frame. This is the
@@ -546,11 +601,18 @@ impl MetalRenderer {
 
         // v1.0 P1.5-B1: Draw 1 — grid instances (instanced pipeline).
         // Extracted to grid_instances.rs (v1.4.2 B1).
+        // v1.4.2 Phase B3: dual-stream — bg runs (8 floats) drawn first
+        // with the bg pipeline (no atlas), then glyph instances (16 floats)
+        // with the instanced pipeline (atlas-sampled). Per-pane scissor is
+        // applied when `pane_instance_ranges` is non-empty (multi-pane).
         self.draw_grid_instances(
             encoder,
-            instances,
-            instance_data_size,
-            instance_ring_idx,
+            bg_instances,
+            bg_data_size,
+            bg_ring_idx,
+            glyph_instances,
+            glyph_data_size,
+            glyph_ring_idx,
             &vp_data,
         );
 

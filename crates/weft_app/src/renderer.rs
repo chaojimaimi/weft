@@ -128,12 +128,11 @@ pub struct MetalRenderer {
     pub(crate) styled_line_cache: RefCell<crate::paint::styled_line_cache::StyledLineCache>,
     /// Batch 6 Step 1: per-frame expanded block count from last layout pass.
     pub(crate) last_expanded_block_count: Cell<usize>,
-    /// v1.0 P0-b: Per-row grid vertex cache. Each entry holds the vertices for
-    /// one viewport row. Dirty rows are rebuilt; clean rows are reused from
-    /// the previous frame. Eliminates per-frame iteration of all
-    /// `num_rows × num_cols` cells when only a few rows changed (typical
-    /// terminal output: 1-3 rows per frame).
-    pub(crate) grid_row_cache: RefCell<Vec<Vec<f32>>>,
+    /// v1.0 P0-b / v1.4.2 Phase B3: Per-row dual-stream grid cache. Each
+    /// entry holds one row's bg floats (8 per run) + glyph floats (16 per
+    /// cell). Dirty rows are rebuilt; clean rows are reused. Eliminates
+    /// per-frame iteration of all cells when only a few rows changed.
+    pub(crate) grid_row_cache: RefCell<Vec<crate::paint::grid::GridRowDualCache>>,
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Set by the caller
     /// on resize / theme / tab switch / selection change. Cleared after the
     /// full redraw is performed.
@@ -222,6 +221,9 @@ pub struct MetalRenderer {
     /// v1.0 P1.5-B1: Capacity of each buffer in `instance_ring` (bytes).
     /// When instance data exceeds this, a new larger buffer is allocated.
     pub(crate) instance_capacity: Cell<u64>,
+    /// v1.4.2 Phase B3: Background-stream pipeline + triple-buffered ring.
+    /// Drawn before the glyph stream (instanced_pipeline) per pane.
+    pub(crate) bg_stream: crate::paint::metal_backend::BgStream,
     /// v1.2 R3 task 6: Per-frame trace recorder (layout/build/encode segments
     /// and counters). Stored in a `RefCell` because `draw()` holds an immutable
     /// borrow of `self.layer` for the whole frame, so `&mut self` is
@@ -231,17 +233,11 @@ pub struct MetalRenderer {
     /// label so the async `add_completed_handler` can correlate GPU completion
     /// back to the originating frame. Set by `draw()`'s caller each frame.
     pub(crate) frame_id: Cell<u64>,
-    /// v1.3 Batch 5: Per-pane `(rect, instance_range)` pairs for the current
-    /// frame. Populated by `draw()` while building grid instances for each
-    /// pane (active + background); read by `encode_and_present` to set a
-    /// scissor rect per segment so each pane's cells are clipped to its
-    /// split-tree-computed rect.
-    ///
-    /// Stored in a `RefCell` for the same reason as `frame_trace` / cache
-    /// fields: `draw()` holds an immutable `self.layer` borrow for the whole
-    /// frame, so `&mut self` is unavailable. Cleared at the top of each
-    /// `draw()` and rebuilt as panes are processed.
-    pub(crate) pane_instance_ranges: RefCell<Vec<(crate::layout::Rect, std::ops::Range<usize>)>>,
+    /// v1.3 Batch 5 / v1.4.2 Phase B3: Per-pane dual-stream instance segments
+    /// for the current frame. Each entry carries a pane's scissor rect + bg
+    /// and glyph float ranges. `RefCell` because `draw()` holds an immutable
+    /// `self.layer` borrow for the whole frame. Cleared at top of each `draw()`.
+    pub(crate) pane_instance_ranges: RefCell<Vec<crate::paint::metal_backend::PaneInstanceSegment>>,
     /// Per-pane ranges in the legacy vertex buffer. Block-view base content
     /// uses this path and needs the same hard GPU clipping as grid instances.
     pub(crate) pane_vertex_ranges: RefCell<Vec<(crate::layout::Rect, std::ops::Range<usize>)>>,
@@ -493,13 +489,10 @@ impl MetalRenderer {
         // R3 task 6: BUILD-VERTICES segment starts here (first vertex builder).
         self.frame_trace.borrow_mut().build_start();
         // Reset popup rects — settings still uses renderer-owned hit data.
-        // v1.0 P1.5-B1: Grid cells render as instances (instanced pipeline);
-        // overlays + block view render as legacy vertices. In grid view,
-        // `instances` carries the cells and `vertices` carries only overlays;
-        // in block view, `instances` is empty and `vertices` carries everything.
-        let mut instances: Vec<f32> = Vec::new();
-        // R3-1: dirty row count for frame trace. 0 for block view (no dirty
-        // concept); populated by build_grid_instances for grid view.
+        // v1.0 P1.5-B1: grid cells render as instances (instanced pipeline);
+        // overlays + block view render as legacy vertices.
+        // v1.4.2 Phase B3: dual-stream — bg runs (8 floats) + glyph instances
+        // (16 floats) replace the single `instances` buffer.
         let mut dirty_row_count: usize = 0;
         // Step 1: block-specific counters for frame trace. Captured here in
         // the block view branch; remain 0 in grid view.
@@ -509,7 +502,12 @@ impl MetalRenderer {
         // Render background panes before active-pane content. Each pane uses
         // its own Terminal view mode; LayoutCtx is swapped per pane so block
         // vertices and grid instances share the same split-tree geometry.
+        // v1.4.2 Phase B3: background grid panes append to dual-stream buffers
+        // (bg_stream + glyph_stream) and push a `PaneInstanceSegment` (rect +
+        // ranges). Background block panes still emit legacy vertices.
         let mut background_vertices = Vec::new();
+        let mut bg_stream: Vec<f32> = Vec::new();
+        let mut glyph_stream: Vec<f32> = Vec::new();
         if !background_panes.is_empty() {
             let base_ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
             // Split-tree rects are absolute viewport coordinates; `for_pane`
@@ -518,7 +516,11 @@ impl MetalRenderer {
                 let bg_ctx = base_ctx.for_pane(bg.rect);
                 self.layout_ctx = Some(bg_ctx);
                 let start = background_vertices.len();
-                background_vertices.extend(self.build_background_pane_content(bg, &mut instances));
+                background_vertices.extend(self.build_background_pane_content(
+                    bg,
+                    &mut bg_stream,
+                    &mut glyph_stream,
+                ));
                 let end = background_vertices.len();
                 if end > start {
                     self.pane_vertex_ranges
@@ -656,7 +658,7 @@ impl MetalRenderer {
                 prompt.is_some(),
             );
             let grid_build_start = std::time::Instant::now();
-            let (grid_instances, grid_dirty_rows) = self.build_grid_instances(
+            let (grid_batch, grid_dirty_rows) = self.build_grid_instances(
                 grid,
                 terminal.palette(),
                 cursor,
@@ -670,22 +672,20 @@ impl MetalRenderer {
             );
             self.grid_build_us_counter
                 .set(grid_build_start.elapsed().as_micros() as u64);
-            // v1.3 Batch 5: record the active pane's instance range for the
-            // scissor pass. `start` is the current length BEFORE appending
-            // the active pane's instances; `end` is after.
-            let active_start = instances.len();
-            instances.extend_from_slice(&grid_instances);
-            let active_end = instances.len();
-            tracing::debug!(
-                active_rect = ?active_pane_rect,
-                active_instance_count = (active_end - active_start) / 16,
-                grid_rows = grid.num_rows,
-                grid_cols = grid.num_cols,
-                "built active pane instances"
-            );
-            self.pane_instance_ranges
-                .borrow_mut()
-                .push((active_pane_rect, active_start..active_end));
+            // v1.4.2 Phase B3: append active pane's dual-stream instances.
+            let active_bg_start = bg_stream.len();
+            let active_glyph_start = glyph_stream.len();
+            bg_stream.extend(&grid_batch.bg_stream);
+            glyph_stream.extend(&grid_batch.glyph_stream);
+            let active_bg_end = bg_stream.len();
+            let active_glyph_end = glyph_stream.len();
+            self.pane_instance_ranges.borrow_mut().push((
+                active_pane_rect,
+                crate::paint::grid_instances::PaneInstanceRanges {
+                    bg_range: (active_bg_start, active_bg_end),
+                    glyph_range: (active_glyph_start, active_glyph_end),
+                },
+            ));
             dirty_row_count = grid_dirty_rows;
             Vec::new()
         };
@@ -866,29 +866,27 @@ impl MetalRenderer {
         );
 
         // R3 task 6: BUILD-VERTICES segment ends; ENCODE segment starts.
-        // Counters: vertex_count covers overlay/block-view verts (12 floats
-        // each), instance_count covers grid cells (16 floats each:
-        // dst/uv/fg/bg). R3-1: dirty_rows from build_grid_instances.
         // Step 1: drain per-frame block layout cache hit/miss counters.
         let (cache_hits, cache_misses) =
             self.block_layout_cache.borrow_mut().take_hit_miss_counts();
         let (styled_cache_hits, styled_cache_misses) =
             self.styled_line_cache.borrow_mut().take_hit_miss_counts();
         let styled_cache_bytes = self.styled_line_cache.borrow().bytes() as u64;
-        // Batch 6 Step 1: visible_block_count = expanded blocks (0 in grid view).
         let visible_block_count = self.last_expanded_block_count.get();
         let styled_line_lookups = self.styled_lookup_counter.get();
         let styled_paint_us = self.styled_paint_us_counter.get();
-        // v1.4.0 baseline: single-stream grid (bg=0, glyph=instances.len()/16).
-        // upload_bytes = (vertices+instances) * 4 (actual Metal ring upload).
-        let grid_glyph_instances = instances.len() / 16;
-        let grid_upload_bytes = (vertices.len() + instances.len()) as u64 * 4;
+        // v1.4.2 Phase B3: dual-stream grid counters (bg=8 floats/run,
+        // glyph=16 floats/cell; upload_bytes = (verts+bg+glyph)·4).
+        let grid_bg_instances = bg_stream.len() / 8;
+        let grid_glyph_instances = glyph_stream.len() / 16;
+        let grid_upload_bytes =
+            (vertices.len() + bg_stream.len() + glyph_stream.len()) as u64 * 4;
         let grid_build_us = self.grid_build_us_counter.get();
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
                 vertex_count: vertices.len() / 12,
-                instance_count: instances.len() / 16,
+                instance_count: grid_glyph_instances,
                 dirty_rows: dirty_row_count,
                 session_block_count,
                 visible_block_count,
@@ -900,7 +898,7 @@ impl MetalRenderer {
                 // R5 task 4: resident_bytes is captured at begin() and
                 // preserved by build_end(); 0 here is overwritten.
                 resident_bytes: 0,
-                grid_bg_instances: 0,
+                grid_bg_instances,
                 grid_glyph_instances,
                 grid_upload_bytes,
                 styled_cache_hits,
@@ -913,7 +911,8 @@ impl MetalRenderer {
         self.encode_and_present(
             drawable,
             &vertices,
-            &instances,
+            &bg_stream,
+            &glyph_stream,
             (bg_r, bg_g, bg_b, clear_a),
             drawable_tex_size,
             vp_mismatch,

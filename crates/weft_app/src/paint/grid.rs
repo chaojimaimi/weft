@@ -3,11 +3,23 @@
 //!
 //! Extracted from `renderer.rs` (M2). Still `impl MetalRenderer` because
 //! it needs `self.atlas`, `self.theme`, `self.grid_row_cache`, etc.
+//!
+//! v1.4.2 Phase B3: rewired to use B2's pure-logic `build_row_instances`
+//! collector. The per-row cache now stores `GridRowInstances` (bg runs +
+//! glyph instances) instead of a flat `Vec<f32>`. Each frame flattens the
+//! cache into a `GridInstanceBatch` (bg_stream + glyph_stream) for the
+//! Metal dual-stream pipeline.
 
-use crate::paint::primitives::{color_to_normalized, push_cell_instance, resolve_cell_color};
+use crate::paint::grid_instances::{build_row_instances, GridInstanceBatch, GridRowInstances};
+use crate::paint::primitives::color_to_normalized;
 use crate::renderer::MetalRenderer;
-use weft_core::grid::{CellFlags, CellWidth, Color, CursorStyle};
+use weft_core::grid::{Color, CursorStyle};
 use weft_core::selection::SelectionHandler;
+
+/// v1.4.2 Phase B3: per-row dual-stream cache entry. Re-exports B2's
+/// `GridRowInstances` so the renderer's `grid_row_cache` field type reads
+/// as a stable local alias (decoupling it from future B2 renames).
+pub(crate) type GridRowDualCache = GridRowInstances;
 
 fn primary_screen_row_hidden(
     row: usize,
@@ -39,7 +51,15 @@ impl MetalRenderer {
     /// upload. The per-row cache (`grid_row_cache`) stores instance floats
     /// (16 per cell) instead of vertex floats (72 per cell).
     ///
-    /// R3-1: returns `(instances, dirty_row_count)` so the frame trace can
+    /// v1.4.2 Phase B3: now produces a dual-stream `GridInstanceBatch`
+    /// (bg runs + glyph instances) instead of a single flat `Vec<f32>`.
+    /// The per-row cache stores `GridRowInstances` (B2 types). Dirty rows
+    /// are rebuilt by calling B2's `build_row_instances`; clean rows are
+    /// reused from the previous frame. The flatten step resolves glyph UVs
+    /// via `self.atlas` and splits into `bg_stream` (8 floats/run) +
+    /// `glyph_stream` (16 floats/cell).
+    ///
+    /// R3-1: returns `(batch, dirty_row_count)` so the frame trace can
     /// report how many rows were actually rebuilt this frame. `dirty_row_count`
     /// is the number of non-hidden rows rebuilt: `num_rows` (or fewer if
     /// primary-screen masking hides some) on `force_full`, 0 on the idle
@@ -51,32 +71,15 @@ impl MetalRenderer {
         cursor: &weft_core::grid::Cursor,
         selection: &SelectionHandler,
         policy: GridViewPolicy,
-    ) -> (Vec<f32>, usize) {
-        // Render at the atlas's native cell size — do NOT stretch cells to
-        // fill the viewport (cw = viewport / num_cols). Stretching distorts
-        // glyphs and, for full-width CJK, amplifies the baked intra-slot
-        // padding into a gap that drifts wider on every resize (cw diverges
-        // from cell_width as the window resizes within a column bucket). The
-        // grid occupies num_cols * cell_width px; any remainder is background.
-        // This also keeps rendered positions aligned with mouse hit-testing,
-        // which already divides by cell_width.
+    ) -> (GridInstanceBatch, usize) {
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let num_rows = grid.num_rows;
         let num_cols = grid.num_cols;
 
-        // Theme-derived colors (resolved per-frame from the active theme).
         let default_fg = color_to_normalized(self.theme.foreground);
         let default_bg = color_to_normalized(self.theme.background);
         let cursor_color = color_to_normalized(self.theme.cursor);
-        // v1.0 fix: use an accent-based blend (35% accent + 65% background)
-        // for the selection color. The old approach used `theme.selection`
-        // directly, but many themes had selection colors too close to the
-        // background (e.g. solarized-dark: bg #002b36, selection #073642 —
-        // nearly invisible at 55% opacity). The accent color is designed
-        // to contrast with the background, so blending it in ensures the
-        // selection is visible across ALL themes. Each theme gets a
-        // different selection tint because the accent varies per theme.
         let selection_bg = {
             let accent = color_to_normalized(self.theme.accent);
             let mut c = [
@@ -85,18 +88,10 @@ impl MetalRenderer {
                 accent[2] * 0.35 + default_bg[2] * 0.65,
                 1.0,
             ];
-            // Semi-transparent so the underlying text stays readable.
             c[3] = 0.60;
             c
         };
 
-        // v1.0 P0-b: incremental grid rendering. Instead of iterating every
-        // cell every frame, we cache per-row vertices and only rebuild rows
-        // that changed (dirty-tracked by Grid). A full redraw is forced when:
-        //   - the caller signals a global change (resize/theme/tab-switch)
-        //   - the grid scrolled (scroll_offset differs → scrollback cells shown)
-        //   - the grid dimensions changed (resize reflow)
-        // Cursor row is always rebuilt (blink / move changes the cursor cell).
         let force_full = self.force_full_grid.get()
             || grid.scroll_offset != self.prev_scroll_offset.get()
             || self.grid_cache_dims.get() != (num_rows, num_cols)
@@ -104,71 +99,44 @@ impl MetalRenderer {
                 self.prev_primary_screen_row_start.get(),
                 policy.hidden_before_row,
             )
-            // Selection overlay changes cell colors — rebuild all rows while
-            // a selection is active or being dragged.
             || selection.selection.is_some()
             || selection.selecting;
 
-        // v1.0 P0-c: stash force_full on self so draw()'s epilogue (which
-        // runs after this method returns) can decide whether to skip the
-        // GPU scroll blit on forced-full frames.
         self.force_full_cached.set(force_full);
 
-        // v1.0 P0-c: CPU-side cache shift for viewport scrolls. When the
-        // terminal scrolls (newline at bottom), the viewport rows shift up
-        // by N — the previously-rendered content at rows 0..rows-N is now
-        // at rows N..rows. Instead of rebuilding all rows, we shift the
-        // per-row vertex cache to match and only rebuild the newly exposed
-        // rows (empty cache entries).
-        //
-        // Key correctness: pre-scroll cell writes set dirty_occ on those
-        // rows, which moves WITH the rows during scroll_up. So dirty rows
-        // are still detected and rebuilt even after the cache shift.
         let pending_scroll = grid.take_pending_scroll();
-        // v1.0 P0-c: stash on self so draw()'s epilogue can issue a GPU blit.
         self.pending_scroll_delta.set(pending_scroll);
         if !force_full && pending_scroll != 0 {
             let mut cache = self.grid_row_cache.borrow_mut();
             if cache.len() == num_rows {
                 if pending_scroll > 0 {
-                    // Scroll up: rows moved up, new blank rows at bottom.
                     let d = pending_scroll as usize;
                     if d < cache.len() {
                         cache.drain(0..d);
                         for _ in 0..d {
-                            cache.push(Vec::new());
+                            cache.push(GridRowInstances::default());
                         }
                     } else {
                         for c in cache.iter_mut() {
-                            c.clear();
+                            *c = GridRowInstances::default();
                         }
                     }
                 } else {
-                    // Scroll down: rows moved down, new blank rows at top.
                     let d = (-pending_scroll) as usize;
                     if d < cache.len() {
                         for _ in 0..d {
-                            cache.insert(0, Vec::new());
+                            cache.insert(0, GridRowInstances::default());
                         }
                         cache.truncate(num_rows);
                     } else {
                         for c in cache.iter_mut() {
-                            c.clear();
+                            *c = GridRowInstances::default();
                         }
                     }
                 }
             }
         }
 
-        // Determine which rows need rebuilding.
-        // v1.0 P1.5-B2: only rebuild the cursor row when its state actually
-        // changed (blink toggle, move, or show/hide). Previously the cursor
-        // row was rebuilt every frame — wasteful for steady (non-blinking)
-        // cursors or idle terminals where nothing changes. `show_cursor`
-        // already encodes blink phase (caller passes
-        // `cursor_visible && cursor_blink_on && prompt.is_none()`), so a
-        // stable `show_cursor` + stable position means the cached cursor
-        // cell is still correct.
         let cursor_changed = force_full
             || self.prev_show_cursor.get() != policy.show_cursor
             || self.prev_cursor_row.get() != Some(cursor.row)
@@ -181,9 +149,6 @@ impl MetalRenderer {
                 if !dirty.contains(&cursor.row) {
                     dirty.push(cursor.row);
                 }
-                // Previous cursor row: when the cursor moves, the old row
-                // loses its cursor overlay and must be rebuilt to show plain
-                // content.
                 if let Some(prev) = self.prev_cursor_row.get() {
                     if prev != cursor.row && !dirty.contains(&prev) {
                         dirty.push(prev);
@@ -193,7 +158,6 @@ impl MetalRenderer {
             dirty
         };
 
-        // Update cached state for next frame's comparison.
         self.force_full_grid.set(false);
         self.prev_cursor_row.set(Some(cursor.row));
         self.prev_cursor_col.set(Some(cursor.col));
@@ -203,254 +167,103 @@ impl MetalRenderer {
             .set(policy.hidden_before_row);
         self.grid_cache_dims.set((num_rows, num_cols));
 
-        // Build vertices for dirty rows only. We build into a local Vec
-        // (not the RefCell) to avoid holding a RefMut while accessing self
-        // fields (atlas, layout_ctx, etc.) inside the per-cell loop.
         let mut cache = self.grid_row_cache.borrow_mut();
         if cache.len() != num_rows {
-            cache.resize(num_rows, Vec::new());
+            cache.resize(num_rows, GridRowInstances::default());
         }
 
-        // v1.0 P0-c: after cache shift, add rows with empty cache entries
-        // (newly exposed by scroll) to the rebuild set.
         if !force_full && pending_scroll != 0 {
             for (i, rv) in cache.iter().enumerate() {
-                if rv.is_empty() && !rows_to_rebuild.contains(&i) {
+                if rv.bg_instances.is_empty() && !rows_to_rebuild.contains(&i) {
                     rows_to_rebuild.push(i);
                 }
             }
         }
 
-        // v1.0 P1.5-B2: if no rows need rebuilding this frame, skip the
-        // per-cell loop + flatten memcpy + GPU upload entirely. The draw()
-        // method reads `instances_unchanged` and relies on the offscreen
-        // render pass's `Load` action to preserve the previous frame's grid
-        // content. This is the key optimization for idle frames: no terminal
-        // output, no cursor blink toggle, no scroll → no work.
         if rows_to_rebuild.is_empty() {
             drop(cache);
             self.instances_unchanged.set(true);
-            return (Vec::new(), 0);
+            return (GridInstanceBatch::default(), 0);
         }
         self.instances_unchanged.set(false);
+
+        // Layout offsets read from `self.layout_ctx` (set by draw() entry).
+        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
+        let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
+        let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
+        let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
+        let origin_x = self.padding_x + chrome_left + pane_origin_x;
+        let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
 
         let mut rebuilt_rows = 0usize;
         for &row in &rows_to_rebuild {
             if primary_screen_row_hidden(row, policy.hidden_before_row, policy.owned_rows) {
-                cache[row].clear();
+                cache[row] = GridRowInstances::default();
                 continue;
             }
             rebuilt_rows += 1;
-            // v1.0 P1.5-B1: per-row instance buffer. 16 floats/cell + slack
-            // for cursor bar/underline + hyperlink underline decorations.
-            let mut instances = Vec::with_capacity(num_cols * 16 + 48);
-            for col in 0..num_cols {
-                let cell = grid.cell(row, col);
+            cache[row] = build_row_instances(
+                grid,
+                palette,
+                row,
+                default_fg,
+                default_bg,
+                cursor_color,
+                selection_bg,
+                cursor,
+                policy.cursor_style,
+                policy.show_cursor,
+                selection,
+                self.opacity,
+                cw,
+                ch,
+                origin_x,
+                origin_y_base + row as f32 * ch,
+            );
+        }
+        drop(cache);
 
-                // Skip wide char spacers (rendered as part of the preceding cell)
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-
-                let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-                // v1.3: pane_origin offsets the grid to the pane's
-                // split-tree-computed position. (0.0, 0.0) for single-pane
-                // tabs — no change from pre-v1.3 behavior.
-                let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
-                let x = self.padding_x + chrome_left + pane_origin_x + col as f32 * cw;
-                // v0.9 H1 fix: shift grid down by chrome_top (tab bar height)
-                // so the first row isn't covered by the tab bar. The LayoutCtx
-                // is set on self at the top of draw(); chrome_top is 0 when
-                // there's only one tab (no tab bar drawn).
-                let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
-                let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
-                let y = self.padding_y + chrome_top + pane_origin_y + row as f32 * ch;
-
-                // Determine cell colors (resolve the cell's color-origin against
-                // the palette / theme defaults).
-                let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
-                let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
-
-                // v1.0 fix: honor SGR reverse video (DEC SGR 7 / `CSI 7m`).
-                // The VT parser sets CellFlags::REVERSE on cells printed while
-                // inverse video is active (e.g. `less` search-match highlight).
-                // Without this swap, matched text in `less` jumps to the right
-                // place but is never highlighted — it renders with normal
-                // fg/bg. Swap BEFORE the alpha scaling below so the opacity is
-                // applied to the (now background) color consistently.
-                if cell.flags.contains(CellFlags::REVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-
-                // Scale the plain background alpha by window opacity so empty
-                // cells show the desktop through them. Text/selection/cursor
-                // pick their own colors with alpha 1.0 in `final_bg` below, so
-                // they stay fully opaque regardless of this scaling.
-                bg[3] *= self.opacity;
-
-                // Check if this is the cursor position
-                let is_cursor = policy.show_cursor && row == cursor.row && col == cursor.col;
-
-                // Check if this cell is in the selection
-                let is_selected = selection
-                    .selection
-                    .as_ref()
-                    .is_some_and(|sel| sel.contains(row, col));
-
-                // Look up glyph UV
-                let ch_char =
-                    if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
-                        ' '
-                    } else {
-                        cell.character
-                    };
-
-                let (u0, v0, u1, v1) = if let Some(glyph) = self.atlas.get(ch_char) {
+        // Flatten the per-row cache into a dual-stream batch. Glyph UVs
+        // are resolved here (needs `self.atlas`) via the closure passed to
+        // `GridInstanceBatch::push_row`.
+        let cache = self.grid_row_cache.borrow();
+        let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
+        for row_inst in cache.iter() {
+            batch.push_row(row_inst, &|ch| {
+                let ch_resolved = if ch == '\0' { ' ' } else { ch };
+                if let Some(glyph) = self.atlas.get(ch_resolved) {
                     let (u, v) = glyph.uv_origin;
                     let (uw, vh) = glyph.uv_size;
-                    (u, v, u + uw, v + vh)
+                    // V-swap compensates for CAMetalLayer's vertical flip
+                    // (same convention as the legacy single-stream path).
+                    [u, v + vh, u + uw, v]
                 } else {
-                    // Character not in atlas — use space
                     let (u, v) = self
                         .atlas
                         .get(' ')
                         .map(|g| g.uv_origin)
                         .unwrap_or((0.0, 0.0));
                     let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-                    (u, v, u + uw, v + vh)
-                };
-                // Swap V to compensate for the CAMetalLayer's vertical flip: keep the
-                // glyph upright on screen while clip.y maps row 0 to the top.
-                let (v0, v1) = (v1, v0);
-
-                // Override colors for cursor
-                let final_fg = if is_cursor {
-                    if policy.cursor_style.is_block() {
-                        [0.0, 0.0, 0.0, 1.0] // Black text on cursor block
-                    } else {
-                        cursor_color
-                    }
-                } else {
-                    fg
-                };
-
-                let final_bg = if is_cursor && policy.cursor_style.is_block() {
-                    cursor_color
-                } else if is_selected {
-                    selection_bg
-                } else if is_cursor && policy.cursor_style.is_bar() {
-                    // Bar cursor: only highlight the left 2 pixels
-                    // We'll draw the full cell with normal bg, then overlay bar later
-                    bg
-                } else {
-                    bg
-                };
-
-                // Determine cell width for rendering
-                let cell_render_width = if cell.width == CellWidth::Full && col + 1 < num_cols {
-                    cw * 2.0
-                } else {
-                    cw
-                };
-
-                let x0 = x;
-                let y0 = y;
-                let x1 = x + cell_render_width;
-                let y1 = y + ch;
-
-                // v1.0 P1.5-B1: emit one instance per cell. The V-swap
-                // (`(v0, v1) = (v1, v0)` above) is stored directly in the
-                // instance's uv_rect: corner.y=0 (top of cell) samples v0
-                // (bottom of glyph in atlas space), compensating for the
-                // CAMetalLayer vertical flip — same convention as the old
-                // per-vertex emission.
-                push_cell_instance(
-                    &mut instances,
-                    [x0, y0, x1, y1],
-                    [u0, v0, u1, v1],
-                    final_fg,
-                    final_bg,
-                );
-
-                // Draw bar/underline cursor overlay
-                if is_cursor && policy.show_cursor {
-                    if policy.cursor_style.is_bar() {
-                        let bar_w = 2.0 * (self.viewport.0 / grid.num_cols as f32 / cw);
-                        let bar_w = bar_w.max(1.0).min(cw * 0.15);
-                        // v1.0 P1.5-B1: decoration instance. UV rect
-                        // (0,0,0,1) samples the atlas at u=0 (empty)
-                        // so mask=0 → only bg (cursor color) shows.
-                        push_cell_instance(
-                            &mut instances,
-                            [x0, y0, x0 + bar_w, y1],
-                            [0.0, 0.0, 0.0, 1.0],
-                            [0.0; 4],
-                            cursor_color,
-                        );
-                    } else if policy.cursor_style.is_underline() {
-                        let line_h = 2.0;
-                        push_cell_instance(
-                            &mut instances,
-                            [x0, y1 - line_h, x1, y1],
-                            [0.0, 0.0, 0.0, 1.0],
-                            [0.0; 4],
-                            cursor_color,
-                        );
-                    }
+                    [u, v + vh, u + uw, v]
                 }
-
-                // OSC 8 hyperlink underline: a thin cyan line at the cell's
-                // baseline. Click handling is in main.rs (Cmd+Click → open URL
-                // from the registry's side-map). Wide-char cells span 2 cols.
-                if cell.flags.contains(CellFlags::HYPERLINK) {
-                    // Step 4: 2.0px (was 1.5) to avoid sub-pixel blur at 1× scale.
-                    let line_h = 2.0;
-                    let link_color = [0.36, 0.62, 0.94, 1.0]; // soft cyan
-                    push_cell_instance(
-                        &mut instances,
-                        [x0, y1 - line_h, x1, y1],
-                        [0.0, 0.0, 0.0, 1.0],
-                        [0.0; 4],
-                        link_color,
-                    );
-                }
-            }
-            // v1.0 P1.5-B1: store this row's instances into the cache.
-            cache[row] = instances;
+            });
         }
-
-        // v1.0 P0-b: flatten the per-row cache into a single instance buffer.
-        // Clean rows are reused from the previous frame; dirty rows were
-        // rebuilt above. Each cell is 16 floats (one CellInstance).
-        let mut out = Vec::with_capacity(num_rows * num_cols * 16);
-        for rv in cache.iter() {
-            out.extend_from_slice(rv);
-        }
-        (out, rebuilt_rows)
+        (batch, rebuilt_rows)
     }
 
-    /// v1.3 Batch 5: Build grid instances for a **background** (non-active)
-    /// pane. Unlike [`build_grid_instances`](Self::build_grid_instances), this
-    /// path:
+    /// v1.3 Batch 5 / v1.4.2 Phase B3: Build grid instances for a
+    /// **background** (non-active) pane. Returns a dual-stream
+    /// `GridInstanceBatch` (bg + glyph) instead of a flat `Vec<f32>`.
     ///
     /// - Does NOT touch `grid_row_cache` / `prev_cursor_*` / `force_full_grid`
-    ///   or any other active-pane cache state — background panes would
-    ///   otherwise pollute the active pane's incremental-rendering state.
-    /// - Does NOT render the cursor or selection (those belong to the active
-    ///   pane only — a background pane's cursor is invisible by convention).
-    /// - Rebuilds every cell every frame (no dirty-row tracking). This is
-    ///   acceptable because background panes are typically idle (no PTY output
-    ///   streaming), and the cost is bounded by pane size (usually ≤ 80×24 =
-    ///   ~1920 cells = ~30 KB of instance data per pane per frame).
-    ///
-    /// The caller (`draw()`) is responsible for setting `self.layout_ctx`
-    /// with the correct `pane_origin` for this pane BEFORE calling this
-    /// method, since the cell X/Y math reads `pane_origin` from the layout
-    /// context (same as the active-pane path).
+    ///   or any other active-pane cache state.
+    /// - Does NOT render the cursor or selection (active pane only).
+    /// - Rebuilds every cell every frame (no dirty-row tracking). Acceptable
+    ///   because background panes are typically idle.
     pub(crate) fn build_grid_instances_for_background_pane(
         &self,
         terminal: &weft_core::vt::Terminal,
-    ) -> Vec<f32> {
+    ) -> GridInstanceBatch {
         let grid = terminal.grid();
         let palette = terminal.palette();
         let cw = self.cell_width() as f32;
@@ -460,59 +273,52 @@ impl MetalRenderer {
 
         let default_fg = color_to_normalized(self.theme.foreground);
         let default_bg = color_to_normalized(self.theme.background);
+        // Cursor/selection colors unused (background pane has no cursor/selection).
+        let cursor_color = default_fg;
+        let selection_bg = default_bg;
+        let cursor = weft_core::grid::Cursor::default();
+        let cursor_style = weft_core::grid::CursorStyle::Block;
+        let selection = SelectionHandler::new();
 
-        // Background panes scale bg alpha by window opacity (same as active
-        // pane) so transparent windows stay transparent across all panes.
-        // Selection/cursor colors are unused here.
         let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
         let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
         let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
         let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
+        let origin_x = self.padding_x + chrome_left + pane_origin_x;
+        let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
 
-        // Primary-screen masking: alt-screen TUIs (vim/less/man) own some
-        // viewport rows; the primary-screen transcript shows through the
-        // rest. Background panes share the same masking as the active pane
-        // so a split with one pane running vim and the other at the prompt
-        // renders correctly in both.
         let hidden_before_row = terminal.primary_screen_visible_row_start();
         let owned_rows = terminal.primary_screen_viewport_ownership();
 
-        let mut out = Vec::with_capacity(num_rows * num_cols * 16);
-
+        let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
         for row in 0..num_rows {
             if primary_screen_row_hidden(row, hidden_before_row, owned_rows) {
                 continue;
             }
-
-            for col in 0..num_cols {
-                let cell = grid.cell(row, col);
-
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-
-                let x = self.padding_x + chrome_left + pane_origin_x + col as f32 * cw;
-                let y = self.padding_y + chrome_top + pane_origin_y + row as f32 * ch;
-
-                let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
-                let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
-
-                if cell.flags.contains(CellFlags::REVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                bg[3] *= self.opacity;
-
-                let ch_char =
-                    if cell.character == '\0' || cell.flags.contains(CellFlags::WIDE_SPACER) {
-                        ' '
-                    } else {
-                        cell.character
-                    };
-
-                let (u0, v0, u1, v1) = if let Some(glyph) = self.atlas.get(ch_char) {
+            let row_inst = build_row_instances(
+                grid,
+                palette,
+                row,
+                default_fg,
+                default_bg,
+                cursor_color,
+                selection_bg,
+                &cursor,
+                cursor_style,
+                false,
+                &selection,
+                self.opacity,
+                cw,
+                ch,
+                origin_x,
+                origin_y_base + row as f32 * ch,
+            );
+            batch.push_row(&row_inst, &|ch| {
+                let ch_resolved = if ch == '\0' { ' ' } else { ch };
+                if let Some(glyph) = self.atlas.get(ch_resolved) {
                     let (u, v) = glyph.uv_origin;
                     let (uw, vh) = glyph.uv_size;
-                    (u, v, u + uw, v + vh)
+                    [u, v + vh, u + uw, v]
                 } else {
                     let (u, v) = self
                         .atlas
@@ -520,41 +326,11 @@ impl MetalRenderer {
                         .map(|g| g.uv_origin)
                         .unwrap_or((0.0, 0.0));
                     let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-                    (u, v, u + uw, v + vh)
-                };
-                let (v0, v1) = (v1, v0);
-
-                let cell_render_width = if cell.width == CellWidth::Full && col + 1 < num_cols {
-                    cw * 2.0
-                } else {
-                    cw
-                };
-
-                push_cell_instance(
-                    &mut out,
-                    [x, y, x + cell_render_width, y + ch],
-                    [u0, v0, u1, v1],
-                    fg,
-                    bg,
-                );
-
-                // OSC 8 hyperlink underline (same as active pane — the link
-                // is part of the cell content, not an interaction state).
-                if cell.flags.contains(CellFlags::HYPERLINK) {
-                    let line_h = 2.0;
-                    let link_color = [0.36, 0.62, 0.94, 1.0];
-                    push_cell_instance(
-                        &mut out,
-                        [x, y + ch - line_h, x + cell_render_width, y + ch],
-                        [0.0, 0.0, 0.0, 1.0],
-                        [0.0; 4],
-                        link_color,
-                    );
+                    [u, v + vh, u + uw, v]
                 }
-            }
+            });
         }
-
-        out
+        batch
     }
 }
 

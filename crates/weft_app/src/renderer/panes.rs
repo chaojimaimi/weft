@@ -77,24 +77,37 @@ impl MetalRenderer {
     }
 
     /// Build one background pane's base content. Block-view panes emit legacy
-    /// vertices bounded by LayoutCtx.clip; grid panes emit an instanced segment
-    /// with a matching Metal scissor. Interactive state remains active-only.
+    /// vertices bounded by LayoutCtx.clip; grid panes emit a dual-stream
+    /// `GridInstanceBatch` whose bg/glyph float offsets are appended to the
+    /// caller's flat buffers and recorded as a `PaneInstanceRanges` entry
+    /// (paired with the pane's scissor rect). Interactive state stays
+    /// active-only.
     pub(super) fn build_background_pane_content(
         &self,
         pane: &PaneRenderInfo<'_>,
-        instances: &mut Vec<f32>,
+        bg_stream: &mut Vec<f32>,
+        glyph_stream: &mut Vec<f32>,
     ) -> Vec<f32> {
         match pane_base_view(pane.terminal) {
             PaneBaseView::Grid => {
-                let start = instances.len();
-                instances.extend(self.build_grid_instances_for_background_pane(pane.terminal));
-                let end = instances.len();
-                self.pane_instance_ranges
-                    .borrow_mut()
-                    .push((pane.rect, start..end));
+                let bg_start = bg_stream.len();
+                let glyph_start = glyph_stream.len();
+                let pane_batch = self.build_grid_instances_for_background_pane(pane.terminal);
+                bg_stream.extend(pane_batch.bg_stream);
+                glyph_stream.extend(pane_batch.glyph_stream);
+                let bg_end = bg_stream.len();
+                let glyph_end = glyph_stream.len();
+                self.pane_instance_ranges.borrow_mut().push((
+                    pane.rect,
+                    crate::paint::grid_instances::PaneInstanceRanges {
+                        bg_range: (bg_start, bg_end),
+                        glyph_range: (glyph_start, glyph_end),
+                    },
+                ));
                 tracing::debug!(
                     bg_rect = ?pane.rect,
-                    bg_instance_count = (end - start) / 16,
+                    bg_run_count = (bg_end - bg_start) / 8,
+                    glyph_instance_count = (glyph_end - glyph_start) / 16,
                     grid_rows = pane.terminal.grid().num_rows,
                     grid_cols = pane.terminal.grid().num_cols,
                     "built background grid pane"
