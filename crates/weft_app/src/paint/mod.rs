@@ -11,6 +11,8 @@ pub(crate) mod block_view;
 pub(crate) mod block_view_model;
 pub(crate) mod command_surface;
 pub(crate) mod grid;
+#[cfg(test)]
+mod grid_bench;
 pub(crate) mod grid_cache;
 pub(crate) mod key_hints;
 pub(crate) mod metal_backend;

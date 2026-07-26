@@ -128,6 +128,16 @@ pub(crate) struct FrameCounters {
     /// v1.4.0; v1.4.1 populates it. Used to prove the cache stays within its
     /// 16 MiB byte budget.
     pub(crate) styled_cache_bytes: u64,
+    /// v1.4.2 Phase A baseline: wall-clock time spent inside
+    /// `build_grid_instances` this frame, in microseconds. Sub-timed within
+    /// the broader `build_us` segment (which also covers block-view + overlay
+    /// vertex emission). Zero in block view (counter is reset on view switch);
+    /// small (short-circuit overhead only) on idle grid frames where
+    /// `instances_unchanged` short-circuits. Used to decide whether the
+    /// background-run merge (B1-B3) is worth the Metal pipeline complexity:
+    /// the GO threshold is grid_build_us + encode_us p95 ≥ 1.0 ms OR
+    /// ≥ 15% of cpu_total_us p95.
+    pub(crate) grid_build_us: u64,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -322,6 +332,7 @@ impl FrameTraceRecorder {
             styled_cache_hits = counters.styled_cache_hits,
             styled_cache_misses = counters.styled_cache_misses,
             styled_cache_bytes = counters.styled_cache_bytes,
+            grid_build_us = counters.grid_build_us,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -478,6 +489,7 @@ mod tests {
             styled_cache_hits: 0,
             styled_cache_misses: 0,
             styled_cache_bytes: 0,
+            grid_build_us: 0,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));

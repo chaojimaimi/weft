@@ -35,6 +35,7 @@ DURATION_KEYS_US = [
     "encode_us",
     "cpu_total_us",
     "styled_paint_us",
+    "grid_build_us",
     "gpu_max_us",
 ]
 
@@ -193,6 +194,8 @@ def render_markdown(summary, frames, meta):
     lines.append("")
     sp = summary["styled_paint_us"]
     cpu = summary["cpu_total_us"]
+    gb = summary["grid_build_us"]
+    enc = summary["encode_us"]
     sp_p95_ms = sp["p95_us"] / 1000.0
     cpu_p95_ms = cpu["p95_us"] / 1000.0
     sp_share = (sp["p95_us"] / cpu["p95_us"] * 100.0) if cpu["p95_us"] else 0.0
@@ -202,6 +205,23 @@ def render_markdown(summary, frames, meta):
         f"(v1.4.1 GO if ≥ 15%)"
     )
     lines.append(f"- cpu_total_us p95: **{cpu_p95_ms:.3f} ms**")
+    lines.append("")
+    # v1.4.2 background-run merge GO criteria.
+    grid_plus_encode_p95_us = gb["p95_us"] + enc["p95_us"]
+    grid_plus_encode_p95_ms = grid_plus_encode_p95_us / 1000.0
+    grid_share = (grid_plus_encode_p95_us / cpu["p95_us"] * 100.0) if cpu["p95_us"] else 0.0
+    lines.append(
+        f"- grid_build_us + encode_us p95: **{grid_plus_encode_p95_ms:.3f} ms** "
+        f"(v1.4.2 GO if ≥ 1.0 ms OR ≥ 15% of cpu_total_us p95)"
+    )
+    lines.append(
+        f"- grid_build+encode share of cpu_total_us p95: **{grid_share:.1f}%** "
+        f"(v1.4.2 GO if ≥ 15%)"
+    )
+    lines.append(
+        f"- grid_build_us p95: **{gb['p95_us'] / 1000.0:.3f} ms**  "
+        f"encode_us p95: **{enc['p95_us'] / 1000.0:.3f} ms**"
+    )
     lines.append("")
     return "\n".join(lines)
 

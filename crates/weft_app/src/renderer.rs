@@ -121,6 +121,9 @@ pub struct MetalRenderer {
     /// Batch 7 Step 4: per-frame wall-clock μs for `push_block_output_text`,
     /// read at `build_end` for `FrameCounters.styled_paint_us`.
     pub(crate) styled_paint_us_counter: Cell<u64>,
+    /// v1.4.2 Phase A: per-frame wall-clock μs for `build_grid_instances`,
+    /// read at `build_end` for `FrameCounters.grid_build_us`.
+    pub(crate) grid_build_us_counter: Cell<u64>,
     /// v1.4.1: bounded FIFO cache for completed-block styled-line vertices.
     pub(crate) styled_line_cache: RefCell<crate::paint::styled_line_cache::StyledLineCache>,
     /// Batch 6 Step 1: per-frame expanded block count from last layout pass.
@@ -483,6 +486,7 @@ impl MetalRenderer {
             self.last_expanded_block_count.set(0);
             self.styled_lookup_counter.set(0);
             self.styled_paint_us_counter.set(0);
+            self.grid_build_us_counter.set(0);
         }
         self.prev_show_blocks.set(show_blocks);
         let mut pending_hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -651,6 +655,7 @@ impl MetalRenderer {
                 cursor_blink_on,
                 prompt.is_some(),
             );
+            let grid_build_start = std::time::Instant::now();
             let (grid_instances, grid_dirty_rows) = self.build_grid_instances(
                 grid,
                 terminal.palette(),
@@ -663,6 +668,8 @@ impl MetalRenderer {
                     owned_rows: terminal.primary_screen_viewport_ownership(),
                 },
             );
+            self.grid_build_us_counter
+                .set(grid_build_start.elapsed().as_micros() as u64);
             // v1.3 Batch 5: record the active pane's instance range for the
             // scissor pass. `start` is the current length BEFORE appending
             // the active pane's instances; `end` is after.
@@ -861,29 +868,22 @@ impl MetalRenderer {
         // R3 task 6: BUILD-VERTICES segment ends; ENCODE segment starts.
         // Counters: vertex_count covers overlay/block-view verts (12 floats
         // each), instance_count covers grid cells (16 floats each:
-        // dst/uv/fg/bg). R3-1: dirty_rows now wired from
-        // build_grid_instances — reports actual rebuilt rows (0 for block
-        // view, num_rows for alt-screen force_full, dirty set size otherwise,
-        // 0 for idle fast path).
+        // dst/uv/fg/bg). R3-1: dirty_rows from build_grid_instances.
         // Step 1: drain per-frame block layout cache hit/miss counters.
         let (cache_hits, cache_misses) =
             self.block_layout_cache.borrow_mut().take_hit_miss_counts();
         let (styled_cache_hits, styled_cache_misses) =
             self.styled_line_cache.borrow_mut().take_hit_miss_counts();
         let styled_cache_bytes = self.styled_line_cache.borrow().bytes() as u64;
-        // Batch 6 Step 1: visible_block_count now reflects the actual expanded
-        // count from compute_block_layout_pass (blocks whose internal lines
-        // were expanded, i.e. is_visible && !collapsed). 0 in grid view.
+        // Batch 6 Step 1: visible_block_count = expanded blocks (0 in grid view).
         let visible_block_count = self.last_expanded_block_count.get();
         let styled_line_lookups = self.styled_lookup_counter.get();
         let styled_paint_us = self.styled_paint_us_counter.get();
-        // v1.4.0 baseline counters: single-stream grid pipeline, so bg=0 and
-        // glyph = existing instance count. upload_bytes is derived from the
-        // slices passed to encode_and_present (each f32 = 4 bytes), matching
-        // the actual Metal ring-buffer upload regardless of the idle fast-path
-        // skip. Styled cache counters are 0 (no cache yet).
+        // v1.4.0 baseline: single-stream grid (bg=0, glyph=instances.len()/16).
+        // upload_bytes = (vertices+instances) * 4 (actual Metal ring upload).
         let grid_glyph_instances = instances.len() / 16;
         let grid_upload_bytes = (vertices.len() + instances.len()) as u64 * 4;
+        let grid_build_us = self.grid_build_us_counter.get();
         self.frame_trace
             .borrow_mut()
             .build_end(crate::frame_trace::FrameCounters {
@@ -906,6 +906,7 @@ impl MetalRenderer {
                 styled_cache_hits,
                 styled_cache_misses,
                 styled_cache_bytes,
+                grid_build_us,
             });
         self.frame_trace.borrow_mut().encode_start();
 
