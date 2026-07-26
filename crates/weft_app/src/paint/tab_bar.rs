@@ -71,6 +71,9 @@ pub struct TabBarDrawState {
     /// from terminal `chrome_left` in Compact mode, where the panel overlays
     /// the PTY instead of resizing it.
     pub chrome_left: f32,
+    /// Right edge available to tab items. The chrome background still spans
+    /// the full window; vertical splits reserve the right pane above itself.
+    pub layout_right: f32,
 }
 
 impl MetalRenderer {
@@ -88,6 +91,11 @@ impl MetalRenderer {
         let ch = self.cell_height() as f32;
         let bar_h = self.tab_bar_height();
         let vp_w = self.viewport.0;
+        let layout_right = if tab_bar.layout_right > 0.0 {
+            tab_bar.layout_right.min(vp_w)
+        } else {
+            vp_w
+        };
         let pad_x = self.padding_x;
         let chrome_left = tab_bar.chrome_left;
 
@@ -109,7 +117,7 @@ impl MetalRenderer {
         // v1.2 architecture: renderer and App scroll/hit behavior consume the
         // same pure tab-strip layout product.
         let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
-            viewport_width: vp_w,
+            viewport_width: layout_right,
             bar_height: bar_h,
             cell_width: cw,
             padding_x: pad_x,
@@ -127,7 +135,25 @@ impl MetalRenderer {
         let vis_left = strip.visible_left;
         let vis_right = strip.visible_right;
 
-        push_quad(&mut vertices, strip.bar_rect, [0.0; 4], [0.0; 4], bar_bg);
+        push_quad(
+            &mut vertices,
+            [0.0, 0.0, vp_w, bar_h],
+            [0.0; 4],
+            [0.0; 4],
+            bar_bg,
+        );
+
+        // Separate the global tab strip from the pane workspace. Draw this
+        // first so the active tab's accent underline remains visible over it.
+        let chrome_edge = color_to_normalized(ui.border_subtle);
+        let stroke = crate::ui_tokens::UiMetrics::for_scale(self.scale).stroke;
+        push_quad(
+            &mut vertices,
+            [0.0, (bar_h - stroke).max(0.0), vp_w, bar_h],
+            [0.0; 4],
+            [0.0; 4],
+            chrome_edge,
+        );
 
         let close_w = cw * 2.0;
         // v1.2-fix: reserve a small gap between label text and close button
@@ -285,12 +311,12 @@ impl MetalRenderer {
             .filter(|index| *index < tab_bar.tab_count)
         {
             if let Some(tooltip) = tab_bar.tooltips.get(index).filter(|text| !text.is_empty()) {
-                let viewport_cols = ((vp_w - 2.0 * cw).max(cw) / cw) as usize;
+                let viewport_cols = ((layout_right - 2.0 * cw).max(cw) / cw) as usize;
                 let display = truncate_to_columns(tooltip, viewport_cols.saturating_sub(2).max(1));
                 let text_cols = Self::text_col_width(&display).max(1);
                 let rect = crate::layout::layout_tab_tooltip(
                     strip.tab_rect(index),
-                    vp_w,
+                    layout_right,
                     bar_h,
                     cw,
                     ch,

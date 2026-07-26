@@ -53,7 +53,7 @@ pub enum Action {
     /// to it.
     #[serde(rename = "new_tab")]
     NewTab,
-    /// Close the current tab (Cmd+W). If this was the last tab, the app
+    /// Close the current tab (Cmd+Ctrl+W). If this was the last tab, the app
     /// exits.
     #[serde(rename = "close_tab")]
     CloseTab,
@@ -87,12 +87,11 @@ pub enum Action {
     /// when invoked on the first pane.
     #[serde(rename = "focus_prev_pane")]
     FocusPrevPane,
-    /// v1.3: Close the focused pane (Cmd+Shift+W). When the tab has only
+    /// v1.3: Close the focused pane (Cmd+W). When the tab has only
     /// one pane left, this is equivalent to `CloseTab` — the whole tab is
     /// closed and the surrounding tab is activated. Distinct from
-    /// `CloseTab` (Cmd+W) which always closes the whole tab regardless of
-    /// pane count, preserving the Cmd+W shortcut's stable "close tab"
-    /// contract.
+    /// `CloseTab` (Cmd+Ctrl+W) which always closes the whole tab regardless
+    /// of pane count.
     #[serde(rename = "close_pane")]
     ClosePane,
     /// v1.3.3: Zoom the active pane to fill the viewport (Cmd+Shift+Return).

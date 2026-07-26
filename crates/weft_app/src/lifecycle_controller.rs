@@ -79,7 +79,7 @@ impl App {
         self.request_redraw();
     }
 
-    /// Cmd+W — close the current tab and return the ordered side effects the
+    /// Cmd+Ctrl+W — close the current tab and return the ordered side effects the
     /// application shell must drain. Closing the last tab requests exit;
     /// otherwise the previous tab becomes active and a redraw is requested.
     pub(super) fn close_tab(&mut self) -> Vec<Effect> {
@@ -220,7 +220,7 @@ impl App {
         let chrome_left = self.tab_bar_chrome_left();
         Some(crate::layout::layout_tab_strip(
             crate::layout::TabStripInput {
-                viewport_width: renderer.viewport_width(),
+                viewport_width: self.tab_bar_layout_right(),
                 bar_height: renderer.tab_bar_height(),
                 cell_width: renderer.cell_width() as f32,
                 padding_x: renderer.padding_x(),
@@ -291,6 +291,7 @@ impl App {
             arrow_left_hovered: self.tab_bar.arrow_left_hovered,
             arrow_right_hovered: self.tab_bar.arrow_right_hovered,
             chrome_left: self.tab_bar_chrome_left(),
+            layout_right: self.tab_bar_layout_right(),
         }
     }
 

@@ -1035,10 +1035,10 @@ fn toggle_pane_zoom_has_cmd_shift_return_keybind() {
 }
 
 #[test]
-fn close_pane_has_default_keybinding_cmd_shift_w() {
+fn close_pane_has_contextual_cmd_w_binding() {
     let kb = KeyBindings::default();
     assert_eq!(
-        kb.lookup(KeyCode::Char('w'), Modifiers::SUPER | Modifiers::SHIFT),
+        kb.lookup(KeyCode::Char('w'), Modifiers::SUPER),
         Some(Action::ClosePane)
     );
 }
@@ -1067,13 +1067,10 @@ fn pane_actions_serde_roundtrip() {
 }
 
 #[test]
-fn close_tab_cmd_w_still_closes_tab_not_pane() {
-    // Cmd+W must remain CloseTab — pane close lives on Cmd+Shift+W so the
-    // two contracts stay independent and existing users don't lose a tab
-    // when they meant to close a pane.
+fn close_tab_has_explicit_cmd_ctrl_w_binding() {
     let kb = KeyBindings::default();
     assert_eq!(
-        kb.lookup(KeyCode::Char('w'), Modifiers::SUPER),
+        kb.lookup(KeyCode::Char('w'), Modifiers::SUPER | Modifiers::CONTROL),
         Some(Action::CloseTab)
     );
 }

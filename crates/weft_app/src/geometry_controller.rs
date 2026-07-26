@@ -107,8 +107,7 @@ impl App {
         Some(layout)
     }
 
-    /// Compute grid (rows, cols) from the shared terminal layout. Returns
-    /// (0, 0) until the window/renderer are ready.
+    /// Compute grid dimensions; returns `(0, 0)` until layout is ready.
     pub(super) fn grid_dims(&self) -> (usize, usize) {
         self.terminal_layout()
             .map(TerminalLayout::dimensions)
@@ -217,11 +216,19 @@ impl App {
                         info!(rows = new_rows, cols = new_cols, "terminal resized");
                     }
                 }
+                let pane_layout_ctx = tab
+                    .split_tree()
+                    .layout(content_rect)
+                    .into_iter()
+                    .find_map(|(id, rect)| {
+                        (id == tab.active_pane_id()).then_some(layout_ctx.for_pane(rect))
+                    })
+                    .unwrap_or(layout_ctx);
                 let previous = tab.block_scroll();
                 let reconciliation = tab.terminal.as_ref().and_then(|terminal| {
                     crate::block_component::reconciled_terminal_block_scroll(
                         terminal,
-                        &layout_ctx,
+                        &pane_layout_ctx,
                         header_rows,
                         previous,
                     )
@@ -242,6 +249,7 @@ impl App {
             }
         }
         self.window_runtime.last_resize_instant = std::time::Instant::now();
+        self.scroll_active_tab_into_view();
     }
 
     /// Convert pixel coordinates to grid (row, col).
@@ -338,14 +346,7 @@ impl App {
         if cw <= 0.0 {
             return None;
         }
-        // v0.9 W5: account for the left sidebar offset (chrome_left) so
-        // block-view clicks map to the correct char when the panel is open.
-        let chrome_left = if self.panel.open {
-            renderer.sidebar_push_width() as f64
-        } else {
-            0.0
-        };
-        let left = renderer.padding_x() as f64 + chrome_left;
+        let ctx = renderer.layout_ctx?;
         let rows = self.compute_block_view_rows();
         if rows.is_empty() {
             return None;
@@ -363,7 +364,7 @@ impl App {
         // A click in the right half of a double-width cell rounds to that
         // cell's index (so dragging across it selects the whole CJK char).
         let mut col_cursor = 0usize; // column units consumed so far
-        let target_col = ((x - left) / cw).max(0.0) as usize;
+        let target_col = ctx.col_at_x(x as f32);
         for (ci, c) in row.text.chars().enumerate() {
             let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
             if w == 0 {
@@ -501,7 +502,10 @@ impl App {
             )
             .box_rect[1]
         } else {
-            renderer.viewport.1 - renderer.padding_y()
+            let Some(ctx) = renderer.layout_ctx else {
+                return Vec::new();
+            };
+            ctx.bottom()
         };
         renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
             blocks: terminal.block_tracker().session_blocks(),
@@ -515,6 +519,10 @@ impl App {
             viewport_rows: terminal.grid().num_rows,
             block_hovered: self.interaction.block_hovered,
             spinner_phase: -1.0,
+            find_block_highlight: renderer
+                .find_state
+                .as_ref()
+                .and_then(|find| find.block_highlight),
             palette: terminal.palette(),
         })
     }
@@ -655,7 +663,7 @@ impl App {
         }
         let chrome_left = self.tab_bar_chrome_left();
         let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
-            viewport_width: renderer.viewport().0,
+            viewport_width: self.tab_bar_layout_right(),
             bar_height: renderer.tab_bar_height(),
             cell_width: renderer.cell_width() as f32,
             padding_x: renderer.padding_x(),

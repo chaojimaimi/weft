@@ -164,6 +164,36 @@ pub(crate) fn tab_bar_target_at(
         .map(|hit| hit.target)
 }
 
+impl crate::App {
+    /// Right edge available to global tab items. In a vertical split, tabs
+    /// stay above the left pane instead of straddling the pane divider.
+    pub(super) fn tab_bar_layout_right(&self) -> f32 {
+        let Some(renderer) = self.renderer.as_ref() else {
+            return 0.0;
+        };
+        let full = renderer.viewport_width();
+        let (Some(layout), Some(tab)) = (
+            self.terminal_layout(),
+            self.sessions.tab(self.sessions.active_idx()),
+        ) else {
+            return full;
+        };
+        let content = [
+            layout.content.left as f32,
+            layout.content.top as f32,
+            layout.content.right as f32,
+            layout.content.bottom as f32,
+        ];
+        let rects: Vec<_> = tab
+            .split_tree()
+            .layout(content)
+            .into_iter()
+            .map(|(_, rect)| rect)
+            .collect();
+        crate::layout::tab_strip_right_edge(full, &rects)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_tab_bar_scene, tab_bar_target_at, TabBarTarget};

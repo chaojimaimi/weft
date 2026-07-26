@@ -232,18 +232,23 @@ impl crate::App {
                 true
             }
             Action::ClosePane => {
+                if close_pane_disposition(self.sessions.active().pane_count())
+                    == ClosePaneDisposition::CloseTab
+                {
+                    // Preserve the final pane's Terminal until close_tab()
+                    // settles and persists any pending block output.
+                    let effects = self.close_tab();
+                    self.drain_effects(effects);
+                    return true;
+                }
                 match self.sessions.active_mut().close_active_pane() {
-                    Ok(true) => {
-                        // Last pane closed — close the whole tab.
-                        tracing::info!("last pane closed, closing tab");
-                        let effects = self.close_tab();
-                        self.drain_effects(effects);
-                    }
                     Ok(false) => {
                         tracing::info!("pane closed, tab still has panes");
                         self.recompute_layout();
+                        self.refresh_find_for_active_tab();
                         self.request_redraw();
                     }
+                    Ok(true) => tracing::error!("multi-pane close unexpectedly emptied tab"),
                     Err(e) => {
                         tracing::warn!(?e, "close pane failed");
                     }
@@ -278,6 +283,20 @@ impl crate::App {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosePaneDisposition {
+    ClosePane,
+    CloseTab,
+}
+
+fn close_pane_disposition(pane_count: usize) -> ClosePaneDisposition {
+    if pane_count <= 1 {
+        ClosePaneDisposition::CloseTab
+    } else {
+        ClosePaneDisposition::ClosePane
+    }
+}
+
 impl crate::App {
     /// v1.3.3: Move focus to the nearest pane in `dir`, based on the
     /// current content rect. Falls back to a no-op redraw when the layout
@@ -303,5 +322,16 @@ impl crate::App {
         }
         self.request_redraw();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{close_pane_disposition, ClosePaneDisposition};
+
+    #[test]
+    fn contextual_close_preserves_last_pane_for_tab_finalization() {
+        assert_eq!(close_pane_disposition(1), ClosePaneDisposition::CloseTab);
+        assert_eq!(close_pane_disposition(2), ClosePaneDisposition::ClosePane);
     }
 }

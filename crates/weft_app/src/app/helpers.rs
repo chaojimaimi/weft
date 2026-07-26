@@ -255,7 +255,7 @@ pub(crate) fn first_run_welcome() -> Option<String> {
     // shell history. The printf is one-shot; it doesn't persist anywhere.
     let banner = "\x1b[2m# Welcome to Weft v1.0\x1b[0m\n\
 \x1b[2m# Core shortcuts:\x1b[0m\n\
-\x1b[2m#   Cmd+T        New tab      Cmd+W  Close tab\x1b[0m\n\
+\x1b[2m#   Cmd+T        New tab      Cmd+W  Close pane/tab\x1b[0m\n\
 \x1b[2m#   Cmd+Shift+[  Prev tab     Cmd+Shift+]  Next tab\x1b[0m\n\
 \x1b[2m#   Cmd+P        Command palette (fuzzy)\x1b[0m\n\
 \x1b[2m#   Cmd+F        Find         Cmd+Shift+B  Toggle sidebar\x1b[0m\n\

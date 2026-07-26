@@ -6,11 +6,8 @@
 //! `App::user_event` → `execute_action` — the same dispatch keybindings use, so
 //! menu items and shortcuts stay in sync by construction.
 //!
-//! `keyEquivalent`s are intentionally left empty for weft-action items: weft's
-//! `KeyBindings` handle all shortcuts from winit keyboard events, and an
-//! NSMenuItem `keyEquivalent` would intercept those events before winit sees
-//! them. Standard system items (About/Hide/Quit) DO keep their key equivalents
-//! (⌘H/⌘Q) since those route to NSApplication stock selectors, not weft.
+//! Weft-action items leave `keyEquivalent` empty so configurable bindings
+//! reach winit. Standard system items keep their native equivalents.
 
 use std::sync::OnceLock;
 

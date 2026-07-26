@@ -204,7 +204,7 @@ impl App {
 
         let tab_state = self.tab_bar_state();
         let strip = crate::layout::layout_tab_strip(crate::layout::TabStripInput {
-            viewport_width: renderer.viewport().0,
+            viewport_width: self.tab_bar_layout_right(),
             bar_height: renderer.tab_bar_height(),
             cell_width: renderer.cell_width() as f32,
             padding_x: renderer.padding_x(),

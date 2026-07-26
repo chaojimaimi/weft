@@ -36,7 +36,10 @@ impl Default for KeyBindings {
             ("cmd+shift+t", Action::ToggleTheme),
             // v0.9 H1: tab management shortcuts.
             ("cmd+t", Action::NewTab),
-            ("cmd+w", Action::CloseTab),
+            // Close the focused pane when split, falling through to tab close
+            // when it is the tab's last pane. Cmd+Ctrl+W always closes the tab.
+            ("cmd+w", Action::ClosePane),
+            ("cmd+ctrl+w", Action::CloseTab),
             ("cmd+shift+right_bracket", Action::NextTab),
             ("cmd+shift+left_bracket", Action::PrevTab),
             // v1.0 S1: Settings panel (macOS-standard Cmd+,).
@@ -61,11 +64,6 @@ impl Default for KeyBindings {
             ("cmd+alt+down", Action::FocusPaneDown),
             ("cmd+alt+right", Action::FocusPaneRight),
             ("cmd+alt+left", Action::FocusPaneLeft),
-            // v1.3: close the focused pane. Cmd+Shift+W is distinct from
-            // Cmd+W (CloseTab) so the two contracts stay independent: Cmd+W
-            // always closes the whole tab; Cmd+Shift+W closes just the pane
-            // (and falls through to tab-close when only one pane remains).
-            ("cmd+shift+w", Action::ClosePane),
             // v1.3.3: zoom the active pane to fill the viewport. Cmd+Shift+Return
             // matches iTerm2's "toggle fullscreen on current pane" shortcut.
             // The same key toggles back to the prior layout.
