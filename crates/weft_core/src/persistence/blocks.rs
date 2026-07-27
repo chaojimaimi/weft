@@ -237,6 +237,7 @@ mod tests {
                     color: crate::grid::CellColor::Palette(2),
                 }],
                 backgrounds: Vec::new(),
+                links: Vec::new(),
             }],
         }));
         store.insert(&original).unwrap();
@@ -293,6 +294,7 @@ mod tests {
                     color: crate::grid::CellColor::Palette(4),
                 }],
                 backgrounds: Vec::new(),
+                links: Vec::new(),
             }],
         }));
         store.insert(&new).unwrap();

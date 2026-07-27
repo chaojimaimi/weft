@@ -34,6 +34,12 @@ pub struct StyledLine {
     /// Defaulting keeps previously persisted snapshots backward compatible.
     #[serde(default)]
     pub backgrounds: Vec<ForegroundSpan>,
+    /// v1.6.1: OSC 8 hyperlink spans captured alongside the text. Each span
+    /// carries the full URL (deduped via `Arc<str>` to share storage across
+    /// lines that link to the same URL). `#[serde(default)]` keeps old
+    /// SQLite snapshots loadable — lines without links deserialize as empty.
+    #[serde(default)]
+    pub links: Vec<LinkSpan>,
 }
 
 impl StyledLine {
@@ -43,6 +49,15 @@ impl StyledLine {
 
     pub fn background_at(&self, index: usize) -> Option<CellColor> {
         Self::color_at(&self.backgrounds, index)
+    }
+
+    /// v1.6.1: Resolve the URL for the char at `index`, if any.
+    pub fn link_at(&self, index: usize) -> Option<&str> {
+        let index = u32::try_from(index).ok()?;
+        let position = self.links.partition_point(|span| span.end <= index);
+        self.links
+            .get(position)
+            .and_then(|span| (span.start <= index && index < span.end).then_some(span.url.as_str()))
     }
 
     fn color_at(spans: &[ForegroundSpan], index: usize) -> Option<CellColor> {
@@ -59,6 +74,18 @@ pub struct ForegroundSpan {
     pub start: u32,
     pub end: u32,
     pub color: CellColor,
+}
+
+/// v1.6.1: A hyperlink span in a captured [`StyledLine`]. `start`/`end` are
+/// char indices into the line's text (same coordinate as `ForegroundSpan`).
+/// `url` is the full URL string. Stored as `String` (not `Arc<str>`) so serde
+/// can derive `Deserialize` — `Arc<str>` doesn't implement `Deserialize`.
+/// Memory overhead is negligible: links are rare (<10/line) and URLs are short.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LinkSpan {
+    pub start: u32,
+    pub end: u32,
+    pub url: String,
 }
 
 impl BlockTracker {
@@ -126,6 +153,7 @@ mod tests {
                 end: 2,
                 color: CellColor::Palette(6),
             }],
+            links: Vec::new(),
         };
 
         assert_eq!(line.foreground_at(0), None);
@@ -147,11 +175,13 @@ mod tests {
                     line: 2,
                     foregrounds: Vec::new(),
                     backgrounds: Vec::new(),
+                    links: Vec::new(),
                 },
                 StyledLine {
                     line: 7,
                     foregrounds: Vec::new(),
                     backgrounds: Vec::new(),
+                    links: Vec::new(),
                 },
             ],
         };

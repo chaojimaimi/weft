@@ -343,8 +343,7 @@ pub(crate) fn build_row_instances(
             // can rasterize it via the cluster atlas path. Falls back to
             // None for single-scalar cells (the common case — no alloc).
             let cluster: Option<std::sync::Arc<str>> = if cell.flags.contains(CellFlags::EXTRA) {
-                grid.grapheme_at(row, col)
-                    .map(std::sync::Arc::<str>::from)
+                grid.grapheme_at(row, col).map(std::sync::Arc::<str>::from)
             } else {
                 None
             };

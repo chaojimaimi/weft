@@ -307,6 +307,18 @@ pub struct BlockViewRow {
     pub y_top: f32,
     /// Bottom y of the row (`y_top + pitch`).
     pub y_bottom: f32,
+    /// v1.6.1: Line index into the owning block's `styled_output`. `None` for
+    /// non-Output rows (Command/Header/Separator/LiveCommand) and for resume
+    /// hints (which have `line == usize::MAX` in `LaidRow`). When `Some`,
+    /// callers can resolve OSC 8 hyperlink spans via
+    /// `block.styled_output.line(line_idx).link_at(char_index)`.
+    pub line: Option<usize>,
+    /// v1.6.1: Char offset of this row's text within the source line. For
+    /// single-chunk rows this is 0. For wrapped lines (multiple chunks), each
+    /// chunk's offset is the cumulative char count of preceding chunks. Add
+    /// this to the chunk-local `char_index` from `pixel_to_block_view_pos` to
+    /// get the full-line char index for `StyledLine::link_at`.
+    pub chunk_char_offset: usize,
 }
 
 impl BlockViewRow {
@@ -586,6 +598,8 @@ mod tests {
             block_id: None,
             y_top,
             y_bottom,
+            line: None,
+            chunk_char_offset: 0,
         }
     }
 

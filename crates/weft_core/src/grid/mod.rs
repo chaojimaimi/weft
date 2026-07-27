@@ -133,6 +133,37 @@ impl Grid {
         self.viewport.get(row)?.extras.grapheme_at(col)
     }
 
+    /// v1.6.1: Look up the hyperlink id for `(row, col)` from `RowExtras`.
+    ///
+    /// Returns `Some(id)` when the cell has a hyperlink tag in its extras,
+    /// `None` otherwise. The caller resolves `id` to a URL via
+    /// [`HyperlinkRegistry::url`](crate::hyperlink::HyperlinkRegistry::url)
+    /// (live viewport) or a Block's link span table (captured output).
+    ///
+    /// Like [`grapheme_at`](Self::grapheme_at), this honors `scroll_offset`
+    /// so links in scrollback are resolvable — the key improvement over the
+    /// v0.8 viewport-relative `HyperlinkRegistry::url_at` which lost links
+    /// on scroll.
+    pub fn hyperlink_id_at(&self, row: usize, col: usize) -> Option<u32> {
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        if offset > 0 {
+            let global = sb_len - offset + row;
+            if global < sb_len {
+                return self
+                    .scrollback
+                    .get(global)
+                    .and_then(|r| r.extras.hyperlink_id_at(col));
+            }
+            return self
+                .viewport
+                .get(global - sb_len)?
+                .extras
+                .hyperlink_id_at(col);
+        }
+        self.viewport.get(row)?.extras.hyperlink_id_at(col)
+    }
+
     /// Extract a single **live viewport** row's text — skipping wide-char
     /// spacers and trimming trailing blank/default cells. `row` is a viewport
     /// index (like `cursor.row`). Used to snapshot the command line at OSC
@@ -1048,29 +1079,47 @@ impl Grid {
         // A logical line is a sequence of rows where 2nd+ rows have
         // wrapped=true. Merging wrapped rows into one cell buffer allows
         // proper reflow: narrowing wraps, widening unwraps.
+        //
+        // v1.6.1: RowExtras (grapheme clusters + hyperlink ids) are merged
+        // alongside cells so they survive resize/reflow. The merge offset
+        // is the current `merge_buf.len()` (the column position where the
+        // row's content begins in the logical line).
         struct LogicalLine {
             cells: Vec<Cell>,
             has_cursor: bool,
             cursor_buf_offset: usize,
+            /// v1.6.1: merged extras for this logical line. Entries are keyed
+            /// by column index in the merged cell buffer. During rewrap
+            /// (Phase 3), they're split back into per-row extras.
+            extras: RowExtras,
         }
 
         let mut lines: Vec<LogicalLine> = Vec::new();
         let mut merge_buf: Vec<Cell> = Vec::new();
+        let mut merge_extras: RowExtras = RowExtras::new();
         let mut merge_has_cursor = false;
         let mut merge_cursor_offset: usize = 0;
 
-        let flush_line =
-            |buf: Vec<Cell>, has_cur: bool, cur_off: usize, lines: &mut Vec<LogicalLine>| {
-                let empty =
-                    !has_cur && buf.iter().all(|c| c.character == ' ' && c.flags.is_empty());
-                if !empty {
-                    lines.push(LogicalLine {
-                        cells: buf,
-                        has_cursor: has_cur,
-                        cursor_buf_offset: cur_off,
-                    });
-                }
-            };
+        // v1.6.1: flush_line now also accepts the merged extras. The closure
+        // takes ownership of both `buf` and `extras` and stores them in the
+        // LogicalLine. An empty line (all blanks, no cursor) is dropped, but
+        // its extras are also dropped since they can't correspond to real
+        // content.
+        let flush_line = |buf: Vec<Cell>,
+                          has_cur: bool,
+                          cur_off: usize,
+                          extras: RowExtras,
+                          lines: &mut Vec<LogicalLine>| {
+            let empty = !has_cur && buf.iter().all(|c| c.character == ' ' && c.flags.is_empty());
+            if !empty {
+                lines.push(LogicalLine {
+                    cells: buf,
+                    has_cursor: has_cur,
+                    cursor_buf_offset: cur_off,
+                    extras,
+                });
+            }
+        };
 
         // Track the PREVIOUS row's wrapped flag. wrapped=true means
         // "this row's content continues on the next row", so we check
@@ -1106,6 +1155,7 @@ impl Grid {
                         std::mem::take(&mut merge_buf),
                         merge_has_cursor,
                         merge_cursor_offset,
+                        std::mem::take(&mut merge_extras),
                         &mut lines,
                     );
                 }
@@ -1121,14 +1171,32 @@ impl Grid {
                 merge_has_cursor = true;
             }
 
+            // v1.6.1: merge this row's extras into the logical line's extras
+            // at the current buffer offset. Only entries for columns < content_end
+            // are relevant (beyond that is trimmed blanks). `merge_shifted`
+            // with cols=usize::MAX keeps all entries since the logical line
+            // has no width limit.
+            let offset = merge_buf.len();
+            merge_extras.merge_shifted(&row.extras, offset, usize::MAX);
+
             merge_buf.extend(row.cells.iter().take(content_end).cloned());
         }
         // Flush last line
         if !merge_buf.is_empty() {
-            flush_line(merge_buf, merge_has_cursor, merge_cursor_offset, &mut lines);
+            flush_line(
+                merge_buf,
+                merge_has_cursor,
+                merge_cursor_offset,
+                merge_extras,
+                &mut lines,
+            );
         }
 
         // ── Phase 3: Rewrap each logical line ────────────────────────
+        // v1.6.1: extras are split at wrap boundaries so each wrapped row
+        // gets the extras for its portion of the line. `split_off` removes
+        // entries at [wrap_col, cols) from the logical line's extras and
+        // returns them as a new RowExtras for the next wrapped row.
         let mut wrapped_rows: Vec<Row> = Vec::new();
         let mut cursor_wrap_start = 0;
         let mut new_cursor_col = 0;
@@ -1142,6 +1210,11 @@ impl Grid {
             let mut current = Row::new(new_cols);
             current.wrapped = false;
             let mut col: usize = 0;
+            // v1.6.1: track this line's extras, splitting off entries for
+            // each wrapped row as we go. We consume `line.extras` by cloning
+            // (can't take &mut of a borrowed line) — the clone is cheap
+            // because extras are sparse (most rows have 0-2 entries).
+            let mut line_extras = line.extras.clone();
 
             for (buf_idx, cell) in line.cells.iter().enumerate() {
                 // Record cursor position when we reach its offset
@@ -1152,8 +1225,14 @@ impl Grid {
                 // Wrap to next sub-row if current is full
                 if col >= new_cols {
                     current.wrapped = true;
+                    // v1.6.1: split extras at the wrap boundary. Entries in
+                    // [0, new_cols) stay with the current row; entries in
+                    // [new_cols, ∞) move to the next row (shifted to start at 0).
+                    let tail = line_extras.split_off(new_cols, usize::MAX);
+                    current.extras = line_extras;
                     wrapped_rows.push(current);
                     current = Row::new(new_cols);
+                    line_extras = tail;
                     col = 0;
                     if line.has_cursor && buf_idx == line.cursor_buf_offset {
                         new_cursor_col = 0;
@@ -1168,8 +1247,12 @@ impl Grid {
                 // Wide char at last column doesn't fit — wrap first.
                 if cell.width == CellWidth::Full && col + 1 >= new_cols && col > 0 {
                     current.wrapped = true;
+                    // v1.6.1: split extras before wrapping (same as above).
+                    let tail = line_extras.split_off(new_cols, usize::MAX);
+                    current.extras = line_extras;
                     wrapped_rows.push(current);
                     current = Row::new(new_cols);
+                    line_extras = tail;
                     col = 0;
                     if line.has_cursor && buf_idx == line.cursor_buf_offset {
                         new_cursor_col = 0;
@@ -1194,12 +1277,17 @@ impl Grid {
             if line.has_cursor && line.cursor_buf_offset >= line.cells.len() {
                 if col >= new_cols {
                     current.wrapped = true;
+                    let tail = line_extras.split_off(new_cols, usize::MAX);
+                    current.extras = line_extras;
                     wrapped_rows.push(current);
                     current = Row::new(new_cols);
+                    line_extras = tail;
                     col = 0;
                 }
                 new_cursor_col = col;
             }
+            // v1.6.1: assign remaining extras to the last wrapped row.
+            current.extras = line_extras;
             wrapped_rows.push(current);
         }
 

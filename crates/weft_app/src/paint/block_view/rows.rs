@@ -128,8 +128,14 @@ impl MetalRenderer {
                     text,
                     chunks,
                     block_id,
+                    line,
                     ..
                 } => {
+                    // v1.6.1: carry the line index so click-time hyperlink
+                    // resolution can look up `StyledLine::link_at`. Skip
+                    // resume hints (line == usize::MAX) — they have no styled
+                    // output and aren't clickable.
+                    let line_idx = (*line != usize::MAX).then_some(*line);
                     if chunks.len() <= 1 {
                         bv_rows.push(BlockViewRow {
                             kind: BlockViewRowKind::Output,
@@ -137,8 +143,14 @@ impl MetalRenderer {
                             block_id: *block_id,
                             y_top: row_top_y,
                             y_bottom: row_top_y + pitch,
+                            line: line_idx,
+                            chunk_char_offset: 0,
                         });
                     } else {
+                        // v1.6.1: track cumulative char offset per chunk so
+                        // wrapped-line link resolution can compute the
+                        // full-line char index.
+                        let mut offset = 0usize;
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = row_top_y + ci as f32 * pitch;
                             bv_rows.push(BlockViewRow {
@@ -147,7 +159,10 @@ impl MetalRenderer {
                                 block_id: *block_id,
                                 y_top: cy,
                                 y_bottom: cy + pitch,
+                                line: line_idx,
+                                chunk_char_offset: offset,
                             });
+                            offset += chunk.chars().count();
                         }
                     }
                 }
@@ -160,6 +175,8 @@ impl MetalRenderer {
                         block_id: Some(*block_id),
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Header { text, block_id, .. } => {
@@ -169,6 +186,8 @@ impl MetalRenderer {
                         block_id: Some(*block_id),
                         y_top: row_top_y,
                         y_bottom: row_top_y + header_height,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::LiveHeader { text } => {
@@ -178,6 +197,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Separator => {
@@ -187,6 +208,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::LiveCommand { command } => {
@@ -196,6 +219,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Blank => {}
@@ -217,6 +242,8 @@ mod tests {
             block_id: Some(BlockId(id)),
             y_top,
             y_bottom,
+            line: None,
+            chunk_char_offset: 0,
         }
     }
 

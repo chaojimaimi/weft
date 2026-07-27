@@ -1,7 +1,18 @@
 use super::{CellColor, CellFlags, Color, Grid, Row};
-use crate::blocks::{ForegroundSpan, StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{ForegroundSpan, LinkSpan, StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
+use std::sync::Arc;
 
 const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
+/// v1.6.1: Maximum link spans per captured row. Prevents a malicious TUI
+/// from spamming tiny links that bloat the snapshot. 256 is generous — a
+/// typical line has 0-2 links.
+const MAX_SNAPSHOT_LINK_SPANS: usize = 256;
+
+/// v1.6.1: Convert a resolved URL `Arc<str>` to the `String` that `LinkSpan`
+/// stores. Centralized so the conversion is consistent across all call sites.
+fn url_to_string(url: Arc<str>) -> String {
+    url.to_string()
+}
 
 fn retained_row(grid: &Grid, index: usize) -> Option<&Row> {
     if index < grid.scrollback.len() {
@@ -143,10 +154,40 @@ impl Grid {
         self.document_snapshot_from_indices(scrollback_start, viewport_start, None, None)
     }
 
+    /// v1.6.1: Same as [`document_snapshot_from_position`](Self::document_snapshot_from_position)
+    /// but resolves hyperlink ids to URLs via `url_resolver`. Used by the Block
+    /// capture path which has access to the Terminal's `HyperlinkRegistry`.
+    pub fn document_snapshot_from_position_with_resolver<F>(
+        &self,
+        document_start: u64,
+        url_resolver: F,
+    ) -> (String, StyledOutput)
+    where
+        F: Fn(u32) -> Option<Arc<str>>,
+    {
+        let viewport_origin = self.scrollback.position();
+        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
+            (self.scrollback.index_since(document_start), 0)
+        } else {
+            (
+                self.scrollback.len(),
+                document_start.saturating_sub(viewport_origin) as usize,
+            )
+        };
+        self.document_snapshot_with_url_resolver(
+            scrollback_start,
+            viewport_start,
+            None,
+            None,
+            url_resolver,
+        )
+    }
+
     /// Snapshot a primary-screen document while omitting retained rows that
     /// the current application has never owned. Filtering is deliberately
     /// non-destructive: the live Grid keeps shell context needed by terminal
     /// emulation, while detached history sees only application output.
+    #[allow(dead_code)] // used in tests + kept for callers that don't need link capture
     pub(crate) fn document_snapshot_from_position_with_ownership_masks(
         &self,
         document_start: u64,
@@ -170,6 +211,36 @@ impl Grid {
         )
     }
 
+    /// v1.6.1: Same as [`document_snapshot_from_position_with_ownership_masks`]
+    /// but resolves hyperlink ids to URLs via `url_resolver`.
+    pub(crate) fn document_snapshot_from_position_with_ownership_masks_and_resolver<F>(
+        &self,
+        document_start: u64,
+        scrollback_owned: &[bool],
+        viewport_owned: &[bool],
+        url_resolver: F,
+    ) -> (String, StyledOutput)
+    where
+        F: Fn(u32) -> Option<Arc<str>>,
+    {
+        let viewport_origin = self.scrollback.position();
+        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
+            (self.scrollback.index_since(document_start), 0)
+        } else {
+            (
+                self.scrollback.len(),
+                document_start.saturating_sub(viewport_origin) as usize,
+            )
+        };
+        self.document_snapshot_with_url_resolver(
+            scrollback_start,
+            viewport_start,
+            Some(scrollback_owned),
+            Some(viewport_owned),
+            url_resolver,
+        )
+    }
+
     fn document_snapshot_from_indices(
         &self,
         scrollback_start: usize,
@@ -177,6 +248,40 @@ impl Grid {
         scrollback_owned: Option<&[bool]>,
         viewport_owned: Option<&[bool]>,
     ) -> (String, StyledOutput) {
+        // v1.6.1: resolve hyperlink ids to URLs via the terminal's registry.
+        // The closure captures `&self` (immutable) so it can be called per row.
+        let url_resolver = |id: u32| -> Option<Arc<str>> {
+            // Grid doesn't own a HyperlinkRegistry — the Terminal does. We
+            // pass the resolver in from the caller (document_snapshot_with_url_resolver)
+            // or fall back to None here (no links captured).
+            let _ = id;
+            None
+        };
+        self.document_snapshot_with_url_resolver(
+            scrollback_start,
+            viewport_start,
+            scrollback_owned,
+            viewport_owned,
+            url_resolver,
+        )
+    }
+
+    /// v1.6.1: Snapshot variant that resolves hyperlink ids to URLs via the
+    /// provided closure. The closure receives a `u32` hyperlink id (from
+    /// `RowExtras.hyperlink_id`) and returns the URL string if known.
+    /// Used by the Block capture path which has access to the Terminal's
+    /// `HyperlinkRegistry`.
+    pub(crate) fn document_snapshot_with_url_resolver<F>(
+        &self,
+        scrollback_start: usize,
+        viewport_start: usize,
+        scrollback_owned: Option<&[bool]>,
+        viewport_owned: Option<&[bool]>,
+        url_resolver: F,
+    ) -> (String, StyledOutput)
+    where
+        F: Fn(u32) -> Option<Arc<str>>,
+    {
         let scrollback = (scrollback_start..self.scrollback.len()).filter_map(|index| {
             scrollback_owned
                 .map_or(true, |owned| owned.get(index).copied().unwrap_or(false))
@@ -208,6 +313,7 @@ impl Grid {
                 self.num_cols,
                 (MAX_OUTPUT_BYTES + 4).saturating_sub(text.len()),
                 style_budget,
+                &url_resolver,
             );
             if row.text.is_empty() {
                 if row.text_overflow {
@@ -242,7 +348,10 @@ impl Grid {
             if row.style_overflow {
                 style_enabled = false;
                 lines.clear();
-            } else if style_enabled && (!row.foregrounds.is_empty() || !row.backgrounds.is_empty())
+            } else if style_enabled
+                && (!row.foregrounds.is_empty()
+                    || !row.backgrounds.is_empty()
+                    || !row.links.is_empty())
             {
                 span_count = span_count
                     .saturating_add(row.foregrounds.len())
@@ -251,6 +360,7 @@ impl Grid {
                     line: line_index as u32,
                     foregrounds: row.foregrounds,
                     backgrounds: row.backgrounds,
+                    links: row.links,
                 });
             }
         }
@@ -262,6 +372,8 @@ struct SnapshotRow {
     text: String,
     foregrounds: Vec<ForegroundSpan>,
     backgrounds: Vec<ForegroundSpan>,
+    /// v1.6.1: OSC 8 hyperlink spans.
+    links: Vec<LinkSpan>,
     text_overflow: bool,
     style_overflow: bool,
 }
@@ -314,12 +426,16 @@ fn push_color_span(
     true
 }
 
-fn styled_row(
+fn styled_row<F>(
     row: &Row,
     num_cols: usize,
     text_budget: usize,
     style_budget: Option<usize>,
-) -> SnapshotRow {
+    url_resolver: &F,
+) -> SnapshotRow
+where
+    F: Fn(u32) -> Option<Arc<str>>,
+{
     let last = row
         .cells
         .iter()
@@ -330,6 +446,9 @@ fn styled_row(
     let mut text = String::with_capacity(last.min(text_budget));
     let mut foregrounds: Vec<ForegroundSpan> = Vec::new();
     let mut backgrounds: Vec<ForegroundSpan> = Vec::new();
+    // v1.6.1: collect link spans. Coalesce adjacent cells with the same URL
+    // into a single span to keep the span count small.
+    let mut links: Vec<LinkSpan> = Vec::new();
     let mut char_index = 0_u32;
     let mut text_overflow = false;
     let mut style_overflow = false;
@@ -384,6 +503,36 @@ fn styled_row(
                     style_budget,
                 );
             }
+            // v1.6.1: capture hyperlink spans. Resolve the id via the url_resolver
+            // closure (backed by HyperlinkRegistry). Coalesce adjacent cells
+            // pointing at the same URL into a single span.
+            if cell.flags.contains(CellFlags::HYPERLINK) {
+                if let Some(hyperlink_id) = row.extras.hyperlink_id_at(col) {
+                    if let Some(url) = url_resolver(hyperlink_id) {
+                        if links.len() < MAX_SNAPSHOT_LINK_SPANS {
+                            let url_string = url_to_string(url);
+                            // Coalesce: extend the last span if it has the same URL.
+                            if let Some(last_link) = links.last_mut() {
+                                if last_link.end == char_index && last_link.url == url_string {
+                                    last_link.end = char_index + 1;
+                                } else {
+                                    links.push(LinkSpan {
+                                        start: char_index,
+                                        end: char_index + 1,
+                                        url: url_string,
+                                    });
+                                }
+                            } else {
+                                links.push(LinkSpan {
+                                    start: char_index,
+                                    end: char_index + 1,
+                                    url: url_string,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             char_index += 1;
         }
     }
@@ -391,6 +540,7 @@ fn styled_row(
         text,
         foregrounds,
         backgrounds,
+        links,
         text_overflow,
         style_overflow,
     }

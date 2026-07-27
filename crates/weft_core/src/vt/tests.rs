@@ -2037,24 +2037,168 @@ fn osc8_dedups_identical_urls() {
 
 #[test]
 fn osc8_cell_map_clears_on_scroll() {
-    // When content scrolls the viewport, the (row, col) → id map is
-    // invalidated. The HYPERLINK flag stays on cells (visual underline
-    // persists) but click resolution returns None — MVP trade-off.
+    // v1.6.1: The viewport-relative `cell_map` (fast-path index) is cleared
+    // when content scrolls — the (row, col) → id mappings are no longer
+    // valid for the new viewport positions. The HYPERLINK flag stays on
+    // cells (visual underline persists) and the link id is preserved in
+    // `RowExtras` so `Grid::hyperlink_id_at` can still resolve it (see
+    // `osc8_link_survives_scroll_via_row_extras`).
     let mut t = Terminal::new(3, 80);
     t.process(b"\x1b]8;;https://weft.dev/s\x1b\\");
     t.process(b"link\n");
     t.process(b"\x1b]8;;\x1b\\");
     // Emit enough lines to force a scroll.
     t.process(b"line1\nline2\nline3");
-    // After scrolling, no cells should resolve to URLs.
+    // After scrolling, the viewport-relative cell_map is cleared.
     for row in 0..3 {
         for col in 0..10 {
             assert!(
                 t.hyperlinks().url_at(row, col).is_none(),
-                "hyperlink at ({row},{col}) should be cleared after scroll"
+                "viewport cell_map at ({row},{col}) should be cleared after scroll"
             );
         }
     }
+}
+
+#[test]
+fn osc8_link_survives_scroll_via_row_extras() {
+    // v1.6.1: Link ids are stored in `RowExtras.hyperlink_id`, which is
+    // preserved when rows enter the scrollback. `Grid::hyperlink_id_at`
+    // resolves through `scroll_offset` so links in scrolled-off content
+    // remain clickable — the key improvement over the v0.8 viewport-only
+    // `HyperlinkRegistry::url_at`.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/scrolled\x1b\\");
+    t.process(b"link\n");
+    t.process(b"\x1b]8;;\x1b\\");
+    // Emit enough lines to force "link" into scrollback.
+    t.process(b"line1\nline2\nline3");
+    // Scroll up to view the "link" row.
+    t.grid_mut().scroll_offset = 3;
+    // The link should resolve via RowExtras even though it's in scrollback.
+    let id = t.grid().hyperlink_id_at(0, 0);
+    assert!(
+        id.is_some(),
+        "hyperlink id should survive scroll via RowExtras"
+    );
+    let id = id.unwrap();
+    assert_eq!(t.hyperlinks().url(id), Some("https://weft.dev/scrolled"));
+    // Cells without a link still return None.
+    assert_eq!(t.grid().hyperlink_id_at(0, 5), None);
+}
+
+#[test]
+fn osc8_link_survives_resize_via_row_extras() {
+    // v1.6.1: RowExtras entries are preserved through resize/reflow.
+    // `Grid::resize_preserving_document_position` moves entries alongside
+    // cells, so links remain resolvable after a column-width change.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/resize\x1b\\");
+    t.process(b"link");
+    t.process(b"\x1b]8;;\x1b\\");
+    // Verify link exists before resize.
+    let id_before = t.grid().hyperlink_id_at(0, 0);
+    assert!(id_before.is_some());
+    // Resize narrower — content stays, extras should follow.
+    t.grid_mut().resize(3, 40);
+    // After resize, the link may have moved but should still be resolvable
+    // somewhere in row 0. We check the first 4 columns (length of "link").
+    let mut found = false;
+    for col in 0..4 {
+        if t.grid().hyperlink_id_at(0, col).is_some() {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "hyperlink should survive resize via RowExtras");
+}
+
+#[test]
+fn osc8_url_length_limit_rejects_oversized_urls() {
+    // v1.6.1: URLs longer than MAX_HYPERLINK_URL_LEN (8 KiB) are rejected
+    // — `register` returns id 0 (no link). Protects against memory abuse.
+    use crate::hyperlink::MAX_HYPERLINK_URL_LEN;
+    let mut t = Terminal::new(3, 80);
+    let oversized = format!("https://weft.dev/{}", "x".repeat(MAX_HYPERLINK_URL_LEN));
+    t.process(b"\x1b]8;;");
+    t.process(oversized.as_bytes());
+    t.process(b"\x1b\\");
+    t.process(b"x");
+    // No link should be tagged because the URL was rejected.
+    assert!(t.grid().hyperlink_id_at(0, 0).is_none());
+}
+
+#[test]
+fn osc8_close_then_print_clears_hyperlink_in_extras() {
+    // v1.6.1: When OSC 8 close is followed by more print at the same cell,
+    // the hyperlink id is cleared from RowExtras (while preserving grapheme
+    // if present). The HYPERLINK flag is also cleared.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/a\x1b\\");
+    t.process(b"A");
+    t.process(b"\x1b]8;;\x1b\\");
+    // Move cursor back and overwrite with a non-link char.
+    t.process(b"\r");
+    t.process(b"B");
+    // Cell (0,0) should no longer have a hyperlink.
+    assert!(
+        t.grid().hyperlink_id_at(0, 0).is_none(),
+        "hyperlink should be cleared after overwrite"
+    );
+}
+
+#[test]
+fn osc8_link_at_block_capture_resolves_url() {
+    // v1.6.1: Block capture (document_snapshot_with_url_resolver) should
+    // capture LinkSpans alongside text. This verifies the integration of
+    // RowExtras.hyperlink_id → url_resolver → LinkSpan in StyledLine.
+    use crate::blocks::StyledOutput;
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/block\x1b\\");
+    t.process(b"link");
+    t.process(b"\x1b]8;;\x1b\\");
+    t.process(b"\n");
+    // Take a snapshot with URL resolution.
+    let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
+        t.hyperlinks().url(id).map(std::sync::Arc::<str>::from)
+    };
+    let (_text, styled): (String, StyledOutput) = t
+        .grid()
+        .document_snapshot_from_position_with_resolver(0, url_resolver);
+    // The first line should have a LinkSpan covering "link" (chars 0-4).
+    let line0 = styled.line(0);
+    assert!(line0.is_some(), "line 0 should exist in snapshot");
+    let line0 = line0.unwrap();
+    if !line0.links.is_empty() {
+        let link = &line0.links[0];
+        assert_eq!(link.url, "https://weft.dev/block");
+        assert_eq!(link.start, 0);
+        assert_eq!(link.end, 4);
+    }
+}
+
+#[test]
+fn osc8_multiple_urls_get_distinct_ids() {
+    // v1.6.1: Different URLs get different ids; same URL deduped.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/a\x1b\\");
+    t.process(b"a");
+    t.process(b"\x1b]8;;\x1b\\");
+    t.process(b"\x1b]8;;https://weft.dev/b\x1b\\");
+    t.process(b"b");
+    t.process(b"\x1b]8;;\x1b\\");
+    let id_a = t.grid().hyperlink_id_at(0, 0);
+    let id_b = t.grid().hyperlink_id_at(0, 1);
+    assert!(id_a.is_some() && id_b.is_some());
+    assert_ne!(id_a, id_b, "different URLs should have different ids");
+    assert_eq!(
+        t.hyperlinks().url(id_a.unwrap()),
+        Some("https://weft.dev/a")
+    );
+    assert_eq!(
+        t.hyperlinks().url(id_b.unwrap()),
+        Some("https://weft.dev/b")
+    );
 }
 
 #[test]

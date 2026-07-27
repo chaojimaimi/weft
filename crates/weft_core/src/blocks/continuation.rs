@@ -303,6 +303,7 @@ mod tests {
                         color: CellColor::Palette(2),
                     }],
                     backgrounds: Vec::new(),
+                    links: Vec::new(),
                 }],
             },
         );

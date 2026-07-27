@@ -2823,7 +2823,6 @@ version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a0b683b20ef64071ff03745b14391751f6beab06a54347885459b77a3f2caa5"
 dependencies = [
- "arrayvec",
  "utf8parse",
  "vte_generate_state_changes",
 ]
@@ -3080,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "weft_app"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "block",
  "core-foundation",
@@ -3114,7 +3113,7 @@ dependencies = [
 
 [[package]]
 name = "weft_core"
-version = "1.6.0"
+version = "1.6.1"
 dependencies = [
  "bitflags 2.13.0",
  "nix",

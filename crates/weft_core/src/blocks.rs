@@ -31,7 +31,7 @@ mod screen_capture_tests;
 mod style;
 
 pub(crate) use output_capture::OutputCapture;
-pub use style::{ForegroundSpan, StyledLine, StyledOutput};
+pub use style::{ForegroundSpan, LinkSpan, StyledLine, StyledOutput};
 
 /// Hard cap on captured output to bound memory for commands like
 /// `cat huge.log`. Beyond this the capture stops and the block is marked

@@ -29,6 +29,7 @@ fn oversized_styled_output_is_not_persisted() {
                         color: CellColor::Palette(1),
                     }],
                     backgrounds: Vec::new(),
+                    links: Vec::new(),
                 })
                 .collect(),
         })),

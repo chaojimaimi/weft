@@ -1,4 +1,5 @@
-//! Sparse per-cell extension layer for multi-scalar graphemes (v1.6.0).
+//! Sparse per-cell extension layer for multi-scalar graphemes (v1.6.0) and
+//! OSC 8 hyperlink ids (v1.6.1).
 //!
 //! `Cell` is a fixed 24-byte struct that holds exactly one `char`. Multi-scalar
 //! grapheme clusters (e + combining acute, ZWJ emoji sequences, regional flag
@@ -6,9 +7,15 @@
 //! cluster string lives here in `RowExtras` — a sparse `BTreeMap<col, CellExtra>`
 //! attached to each `Row`.
 //!
-//! Only cells whose grapheme spans more than one scalar have an entry. ASCII
-//! output and single-scalar cells pay zero memory overhead — the fast path
-//! never touches `RowExtras`.
+//! v1.6.1 adds `hyperlink_id: Option<u32>` to the same `CellExtra` so OSC 8
+//! links survive scroll/reflow/resize/persistence alongside graphemes. The
+//! viewport-relative `HyperlinkRegistry` cell_map remains for the live
+//! viewport fast path, but the authoritative storage is now `RowExtras` —
+//! links in scrollback and captured Blocks resolve via `RowExtras::hyperlink_id_at`.
+//!
+//! Only cells with at least one of {grapheme, hyperlink_id} have an entry.
+//! ASCII output and single-scalar cells without links pay zero memory
+//! overhead — the fast path never touches `RowExtras`.
 //!
 //! Every `Row`/`Grid` operation that shifts, clears, or overwrites cells must
 //! keep `RowExtras` in sync via the [`RowExtras`] transform methods on this
@@ -20,18 +27,24 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Per-cell extension data. Stored sparsely in [`RowExtras`] — only cells
-/// whose grapheme cluster spans more than one scalar have an entry.
+/// with at least one of {multi-scalar grapheme, hyperlink id} have an entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CellExtra {
     /// The full grapheme cluster string (e.g. `"é"` for `e\u{0301}`,
     /// `"👩‍🔬"` for `woman + ZWJ + microscope`).
     ///
     /// `None` means the cell has no multi-scalar extension (the cell's
-    /// `character` field is the whole cluster). This variant is rare in
-    /// practice — most entries have `Some` — but keeping the `Option` lets
-    /// future fields (hyperlink_id in v1.6.1) coexist with a missing
-    /// grapheme.
+    /// `character` field is the whole cluster).
     pub grapheme: Option<Arc<str>>,
+    /// v1.6.1: OSC 8 hyperlink id. Resolved to a URL via [`HyperlinkRegistry`]
+    /// (live viewport) or via a Block's link span table (captured output).
+    /// `None` means the cell has no hyperlink.
+    ///
+    /// Stored here rather than in a viewport-relative side map so links
+    /// survive scroll, reflow, resize, and persistence. The viewport
+    /// registry's `cell_map` remains as a fast-path index for the live
+    /// viewport; `RowExtras` is the source of truth.
+    pub hyperlink_id: Option<u32>,
 }
 
 impl CellExtra {
@@ -39,12 +52,20 @@ impl CellExtra {
     pub fn grapheme(grapheme: Arc<str>) -> Self {
         Self {
             grapheme: Some(grapheme),
+            hyperlink_id: None,
         }
     }
 
     /// The grapheme string, if any.
     pub fn grapheme_str(&self) -> Option<&str> {
         self.grapheme.as_deref()
+    }
+
+    /// True when both `grapheme` and `hyperlink_id` are `None` — the entry
+    /// should be removed from the map to keep it sparse. Called by the
+    /// setter methods after they clear a field.
+    fn is_empty(&self) -> bool {
+        self.grapheme.is_none() && self.hyperlink_id.is_none()
     }
 }
 
@@ -96,14 +117,42 @@ impl RowExtras {
         self.cells.get(&col).and_then(|e| e.grapheme.as_deref())
     }
 
-    /// Set or replace the extra data for column `col`.
-    pub fn set(&mut self, col: usize, extra: CellExtra) {
-        self.cells.insert(col, extra);
+    /// v1.6.1: The hyperlink id for column `col`, if any. Resolved to a URL
+    /// via [`HyperlinkRegistry`](crate::hyperlink::HyperlinkRegistry) (live
+    /// viewport) or a Block's link span table (captured output).
+    pub fn hyperlink_id_at(&self, col: usize) -> Option<u32> {
+        self.cells.get(&col).and_then(|e| e.hyperlink_id)
     }
 
-    /// Store a full grapheme cluster string for column `col`.
+    /// Set or replace the extra data for column `col`.
+    pub fn set(&mut self, col: usize, extra: CellExtra) {
+        if extra.is_empty() {
+            self.cells.remove(&col);
+        } else {
+            self.cells.insert(col, extra);
+        }
+    }
+
+    /// Store a full grapheme cluster string for column `col`. Preserves
+    /// `hyperlink_id` if the cell already has one (v1.6.1).
     pub fn set_grapheme(&mut self, col: usize, grapheme: Arc<str>) {
-        self.set(col, CellExtra::grapheme(grapheme));
+        let entry = self.cells.entry(col).or_default();
+        entry.grapheme = Some(grapheme);
+    }
+
+    /// v1.6.1: Tag column `col` with hyperlink `id`. Preserves `grapheme` if
+    /// the cell already has one (multi-scalar cluster + link coexist).
+    /// Setting `id = None` clears the hyperlink while preserving grapheme.
+    pub fn set_hyperlink(&mut self, col: usize, id: Option<u32>) {
+        if let Some(id) = id {
+            let entry = self.cells.entry(col).or_default();
+            entry.hyperlink_id = Some(id);
+        } else if let Some(entry) = self.cells.get_mut(&col) {
+            entry.hyperlink_id = None;
+            if entry.is_empty() {
+                self.cells.remove(&col);
+            }
+        }
     }
 
     /// Append `scalar` to the grapheme at column `col`. If no entry exists
@@ -117,6 +166,7 @@ impl RowExtras {
     pub fn append_scalar(&mut self, col: usize, base_char: char, scalar: char) {
         let entry = self.cells.entry(col).or_insert_with(|| CellExtra {
             grapheme: Some(Arc::from(base_char.to_string().as_str())),
+            hyperlink_id: None,
         });
         if entry.grapheme.is_none() {
             entry.grapheme = Some(Arc::from(base_char.to_string().as_str()));
@@ -132,6 +182,13 @@ impl RowExtras {
     /// character overwrites a previously tagged cell.
     pub fn clear_cell(&mut self, col: usize) {
         self.cells.remove(&col);
+    }
+
+    /// v1.6.1: Clear only the hyperlink on column `col`, preserving the
+    /// grapheme if present. Called when OSC 8 close is followed by more
+    /// print at the same cell (rare — usually OSC 8 close moves the cursor).
+    pub fn clear_hyperlink(&mut self, col: usize) {
+        self.set_hyperlink(col, None);
     }
 
     /// Drop every entry — called when the whole row is cleared.

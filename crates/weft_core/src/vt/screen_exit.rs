@@ -248,18 +248,28 @@ impl Terminal {
     }
 
     fn primary_screen_document_snapshot(&self, document_start: u64) -> (String, StyledOutput) {
+        // v1.6.1: resolve hyperlink ids to URLs via the Terminal's registry
+        // so captured Block output preserves OSC 8 links. The closure borrows
+        // `&self.hyperlinks` immutably, which coexists with `&self.grid`.
+        let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
+            self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
+        };
         self.capabilities
             .primary_screen_ownership
             .viewport
             .as_ref()
             .map_or_else(
-                || self.grid.document_snapshot_from_position(document_start),
+                || {
+                    self.grid
+                        .document_snapshot_from_position_with_resolver(document_start, url_resolver)
+                },
                 |owned| {
                     self.grid
-                        .document_snapshot_from_position_with_ownership_masks(
+                        .document_snapshot_from_position_with_ownership_masks_and_resolver(
                             document_start,
                             &self.capabilities.primary_screen_ownership.scrollback,
                             owned,
+                            url_resolver,
                         )
                 },
             )
@@ -622,6 +632,7 @@ mod tests {
                     line,
                     foregrounds: Vec::new(),
                     backgrounds: Vec::new(),
+                    links: Vec::new(),
                 })
                 .collect(),
         };

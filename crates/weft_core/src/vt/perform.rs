@@ -132,26 +132,38 @@ impl vte::Perform for Terminal {
             self.include_primary_screen_viewport_row(new_row);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
-            let cells = &mut self.grid.viewport[new_row].cells;
-            let cell = &mut cells[new_col];
-            cell.character = c;
-            cell.fg = self.attrs.fg;
-            cell.bg = self.attrs.bg;
-            cell.flags = self.attrs.flags | CellFlags::DIRTY;
-            cell.width = CellWidth::Full;
-            // OSC 8: tag the wrapped wide-char cell with the active hyperlink.
+            {
+                let cells = &mut self.grid.viewport[new_row].cells;
+                let cell = &mut cells[new_col];
+                cell.character = c;
+                cell.fg = self.attrs.fg;
+                cell.bg = self.attrs.bg;
+                cell.flags = self.attrs.flags | CellFlags::DIRTY;
+                cell.width = CellWidth::Full;
+                // OSC 8: tag the wrapped wide-char cell with the active hyperlink.
+                if self.active_hyperlink_id.is_some() {
+                    cell.flags |= CellFlags::HYPERLINK;
+                }
+
+                if new_col + 1 < num_cols {
+                    let spacer = &mut cells[new_col + 1];
+                    spacer.character = ' ';
+                    spacer.flags = CellFlags::WIDE_SPACER;
+                    spacer.width = CellWidth::Half;
+                }
+            }
+            // v1.6.1: update hyperlink registry + RowExtras after releasing the
+            // `cells` borrow (same pattern as the standard print path above).
             if let Some(id) = self.active_hyperlink_id {
-                cell.flags |= CellFlags::HYPERLINK;
                 self.hyperlinks.link_cell(new_row, new_col, id);
+                self.grid.viewport[new_row]
+                    .extras
+                    .set_hyperlink(new_col, Some(id));
             } else {
                 self.hyperlinks.unlink_cell(new_row, new_col);
-            }
-
-            if new_col + 1 < num_cols {
-                let spacer = &mut cells[new_col + 1];
-                spacer.character = ' ';
-                spacer.flags = CellFlags::WIDE_SPACER;
-                spacer.width = CellWidth::Half;
+                self.grid.viewport[new_row]
+                    .extras
+                    .set_hyperlink(new_col, None);
             }
             self.grid.viewport[new_row].mark_dirty(new_col);
             if new_col + 1 < num_cols {
@@ -198,7 +210,6 @@ impl vte::Perform for Terminal {
             if width == CellWidth::Full {
                 self.grid.viewport[row].clear_wide_pair_at(col + 1);
             }
-            let cells = &mut self.grid.viewport[row].cells;
             // v1.0 fix (CJK splat): before writing a new char, clear any
             // existing wide-char pair that this write would bisect. Without
             // this, overwriting part of a double-width CJK char (or its
@@ -206,32 +217,42 @@ impl vte::Perform for Terminal {
             // as merged fragments and phantom spaces after a TUI app (vim)
             // scrolls via IL/DL and reprints shorter/different content. This
             // is the standard "wide splat" handling xterm/Alacritty perform.
-            let cell = &mut cells[col];
-            cell.character = c;
-            cell.fg = self.attrs.fg;
-            cell.bg = self.attrs.bg;
-            cell.flags = self.attrs.flags | CellFlags::DIRTY;
-            cell.width = width;
+            {
+                let cells = &mut self.grid.viewport[row].cells;
+                let cell = &mut cells[col];
+                cell.character = c;
+                cell.fg = self.attrs.fg;
+                cell.bg = self.attrs.bg;
+                cell.flags = self.attrs.flags | CellFlags::DIRTY;
+                cell.width = width;
 
-            // OSC 8: tag the cell with HYPERLINK and record its (row,col)→id
-            // in the registry side-map. When the active hyperlink is None
-            // (overwriting a previously tagged cell), drop the side-map entry
-            // and clear the flag so the underline disappears.
-            if let Some(id) = self.active_hyperlink_id {
-                cell.flags |= CellFlags::HYPERLINK;
-                self.hyperlinks.link_cell(row, col, id);
-            } else {
-                if cell.flags.contains(CellFlags::HYPERLINK) {
+                // OSC 8: tag the cell with HYPERLINK and record its (row,col)→id
+                // in the registry side-map. When the active hyperlink is None
+                // (overwriting a previously tagged cell), drop the side-map entry
+                // and clear the flag so the underline disappears.
+                if self.active_hyperlink_id.is_some() {
+                    cell.flags |= CellFlags::HYPERLINK;
+                } else if cell.flags.contains(CellFlags::HYPERLINK) {
                     cell.flags.remove(CellFlags::HYPERLINK);
                 }
-                self.hyperlinks.unlink_cell(row, col);
-            }
 
-            if width == CellWidth::Full && col + 1 < num_cols {
-                let spacer = &mut cells[col + 1];
-                spacer.character = ' ';
-                spacer.flags = CellFlags::WIDE_SPACER;
-                spacer.width = CellWidth::Half;
+                if width == CellWidth::Full && col + 1 < num_cols {
+                    let spacer = &mut cells[col + 1];
+                    spacer.character = ' ';
+                    spacer.flags = CellFlags::WIDE_SPACER;
+                    spacer.width = CellWidth::Half;
+                }
+            }
+            // v1.6.1: update hyperlink registry + RowExtras after releasing the
+            // `cells` borrow so we don't violate the borrow checker (cells and
+            // extras are different fields of the same Row, but the borrow
+            // checker can't prove non-aliasing through `&mut self.grid.viewport[row]`).
+            if let Some(id) = self.active_hyperlink_id {
+                self.hyperlinks.link_cell(row, col, id);
+                self.grid.viewport[row].extras.set_hyperlink(col, Some(id));
+            } else {
+                self.hyperlinks.unlink_cell(row, col);
+                self.grid.viewport[row].extras.set_hyperlink(col, None);
             }
             self.grid.viewport[row].mark_dirty(col);
             if width == CellWidth::Full && col + 1 < num_cols {
@@ -662,13 +683,16 @@ impl vte::Perform for Terminal {
                 //   `OSC 8 ; ; ST`         → end hyperlink (empty URI).
                 // We dedup URLs in the registry and remember the active id;
                 // `print()` stamps cells with HYPERLINK while this is Some.
+                // v1.6.1: register() returns 0 when URL is too long or the
+                // registry is full — treat 0 as "no link" so the cell doesn't
+                // get tagged with an unresolvable id.
                 if params.len() >= 3 {
                     let uri = std::str::from_utf8(params[2]).unwrap_or("");
                     if uri.is_empty() {
                         self.active_hyperlink_id = None;
                     } else {
                         let id = self.hyperlinks.register(uri.to_string());
-                        self.active_hyperlink_id = Some(id);
+                        self.active_hyperlink_id = (id != 0).then_some(id);
                     }
                 } else {
                     // OSC 8 ;; ST (no URI field) — clear.

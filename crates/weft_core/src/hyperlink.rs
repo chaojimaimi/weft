@@ -1,4 +1,4 @@
-//! OSC 8 hyperlink registry (v0.8 stage 5 — B2).
+//! OSC 8 hyperlink registry (v0.8 stage 5 — B2; v1.6.1 — size limits + RowExtras).
 //!
 //! Cells carry only a 1-bit `CellFlags::HYPERLINK` flag (the `Cell` struct
 //! must stay at 24 bytes), so the URL→cell association is held externally in
@@ -6,14 +6,33 @@
 //! pointing at the same URL share one id), and the `(row, col) → id` map is
 //! rebuilt every time the active OSC 8 hyperlink changes.
 //!
-//! Limitations (v0.8 MVP):
-//!   • Cell mappings are viewport-relative. Scrolling clears them, so
-//!     hyperlinks only resolve in the live viewport (scrollback text keeps
-//!     the HYPERLINK flag for underline styling but is no longer clickable).
+//! v1.6.1: The viewport-relative `cell_map` is now a fast-path index only;
+//! the authoritative hyperlink storage is `RowExtras.hyperlink_id` which
+//! survives scroll/reflow/resize/persistence. This registry still owns the
+//! URL→id dedup table and enforces size limits (max URL length, max total
+//! entries) to prevent unbounded growth from malicious or buggy TUI apps.
+//!
+//! Limitations:
 //!   • No per-link color cycling (kitty's `id` parameter) — every link
 //!     renders with the same underline.
+//!   • URL→id table is bounded; when full, new URLs are silently rejected
+//!     (the cell keeps the HYPERLINK flag for underline styling but is not
+//!     clickable). This matches xterm/Alacritty behavior.
 
 use std::collections::HashMap;
+
+/// v1.6.1: Maximum URL length accepted by [`HyperlinkRegistry::register`].
+/// URLs longer than this are rejected (return id 0 = "no link"). Protects
+/// against memory abuse from pathological OSC 8 sequences. 8 KiB matches
+/// xterm's hard limit and covers all reasonable URLs.
+pub const MAX_HYPERLINK_URL_LEN: usize = 8 * 1024;
+
+/// v1.6.1: Maximum number of distinct URLs the registry will track. When
+/// full, new URLs are rejected. 4096 is generous for terminal use (a typical
+/// session sees <100 distinct links) while bounding memory to ~32 MiB worst
+/// case (4096 × 8 KiB). Old URLs are not evicted — the registry is cleared
+/// on alt-screen exit and session reset, which naturally bounds lifetime.
+pub const MAX_HYPERLINK_ENTRIES: usize = 4096;
 
 /// External hyperlink registry: maps `(row, col) → id → URL`.
 #[derive(Default)]
@@ -36,9 +55,30 @@ impl HyperlinkRegistry {
 
     /// Register a URL (deduped by string). Returns the assigned id.
     /// Two calls with the same URL return the same id.
+    ///
+    /// v1.6.1: Returns 0 (no link) when the URL exceeds
+    /// [`MAX_HYPERLINK_URL_LEN`] or when the registry is full
+    /// ([`MAX_HYPERLINK_ENTRIES`]). This prevents unbounded memory growth
+    /// from malicious or buggy TUI apps emitting pathological OSC 8 sequences.
     pub fn register(&mut self, url: String) -> u32 {
+        if url.len() > MAX_HYPERLINK_URL_LEN {
+            tracing::warn!(
+                len = url.len(),
+                max = MAX_HYPERLINK_URL_LEN,
+                "OSC 8 URL rejected: exceeds max length"
+            );
+            return 0;
+        }
         if let Some(&id) = self.url_to_id.get(&url) {
             return id;
+        }
+        if self.urls.len() >= MAX_HYPERLINK_ENTRIES {
+            tracing::warn!(
+                count = self.urls.len(),
+                max = MAX_HYPERLINK_ENTRIES,
+                "OSC 8 URL rejected: registry full"
+            );
+            return 0;
         }
         // Skip 0 (reserved) and start at 1.
         self.next_id = self.next_id.wrapping_add(1).max(1);

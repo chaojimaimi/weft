@@ -313,23 +313,72 @@ impl App {
     }
 
     /// Resolve the OSC 8 hyperlink URL at pixel coordinates `(x, y)`, if any.
-    /// Returns `None` when the click misses a HYPERLINK-tagged cell or when
-    /// the cell_map has been invalidated by a scroll (MVP trade-off: links
-    /// in scrolled-off content aren't clickable).
+    ///
+    /// v1.6.1: Now resolves links via `Grid::hyperlink_id_at` (backed by
+    /// `RowExtras`) instead of the viewport-relative `HyperlinkRegistry::url_at`.
+    /// This means links in scrolled-off content remain clickable — the link id
+    /// is stored in `RowExtras` and survives scroll/reflow/resize. The
+    /// registry's `cell_map` is now just a fast-path index for the live
+    /// viewport; `RowExtras` is the source of truth.
+    ///
+    /// In block view, dispatches to [`block_view_hyperlink_at_pixel`](Self::block_view_hyperlink_at_pixel)
+    /// which resolves links from captured `StyledLine::links` spans.
     pub(super) fn hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let terminal = self.sessions.active().terminal.as_ref()?;
-        // Block view uses a separate scrollable layout — skip OSC 8 there.
         if self.block_view_active() {
-            return None;
+            return self.block_view_hyperlink_at_pixel(x, y);
         }
+        let terminal = self.sessions.active().terminal.as_ref()?;
         if !self.terminal_content_contains(x, y) {
             return None;
         }
         let pos = self.pixel_to_grid(x, y);
-        terminal
-            .hyperlinks()
-            .url_at(pos.row, pos.col)
-            .map(str::to_string)
+        // v1.6.1: resolve via RowExtras (scroll-aware) → registry URL lookup.
+        let id = terminal.grid().hyperlink_id_at(pos.row, pos.col)?;
+        terminal.hyperlinks().url(id).map(str::to_string)
+    }
+
+    /// v1.6.1: Resolve an OSC 8 hyperlink URL at pixel coordinates `(x, y)`
+    /// within the block view. Walks the cached block-view rows to find the
+    /// clicked row, then looks up the `LinkSpan` in the owning block's
+    /// `StyledLine`.
+    ///
+    /// Returns `None` when:
+    /// - the click misses all rows (e.g. on the CWD bar or input box),
+    /// - the row has no `line` index (Command/Header/Separator),
+    /// - the block has no `styled_output` (e.g. loaded from an old DB),
+    /// - the char at `char_index` has no link span.
+    ///
+    /// For wrapped lines (multiple chunks per source line), the chunk's
+    /// `chunk_char_offset` is added to the click's `char_index` to compute
+    /// the full-line char index that `StyledLine::link_at` expects.
+    pub(super) fn block_view_hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
+        let pos = self.pixel_to_block_view_pos(x, y)?;
+        let rows = self.compute_block_view_rows();
+        let row = rows.get(pos.row_index)?;
+        let line_idx = row.line?;
+        let char_index = row.chunk_char_offset + pos.char_index;
+        let terminal = self.sessions.active().terminal.as_ref()?;
+        let tracker = terminal.block_tracker();
+        // Resolve the StyledLine from either a finalized block or the live
+        // in-flight block (block_id is None for live rows).
+        let styled_line = if let Some(block_id) = row.block_id {
+            // Finalized block: search session_blocks by id. Linear scan is
+            // fine — click events are infrequent and session_blocks is small
+            // (typically <100 blocks).
+            tracker
+                .session_blocks()
+                .iter()
+                .find(|b| b.id == block_id)
+                .and_then(|b| b.styled_output.as_deref())
+                .and_then(|s| s.line(line_idx))
+        } else {
+            // Live in-flight block: styled_output is on InFlightBlock.
+            tracker
+                .in_flight()
+                .and_then(|live| live.styled_output)
+                .and_then(|s| s.line(line_idx))
+        };
+        styled_line.and_then(|line| line.link_at(char_index).map(str::to_string))
     }
 
     /// Convert pixel coordinates to a block-view position.

@@ -202,9 +202,10 @@ impl MetalRenderer {
                     text,
                     chunks,
                     block_id,
-                    line: _,
+                    line,
                     style: _,
                 } => {
+                    let line_idx = (*line != usize::MAX).then_some(*line);
                     if chunks.len() <= 1 {
                         bv_rows.push(weft_core::selection::BlockViewRow {
                             kind: weft_core::selection::BlockViewRowKind::Output,
@@ -212,8 +213,11 @@ impl MetalRenderer {
                             block_id: *block_id,
                             y_top: y,
                             y_bottom: y + pitch,
+                            line: line_idx,
+                            chunk_char_offset: 0,
                         });
                     } else {
+                        let mut offset = 0usize;
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             bv_rows.push(weft_core::selection::BlockViewRow {
@@ -222,7 +226,10 @@ impl MetalRenderer {
                                 block_id: *block_id,
                                 y_top: cy,
                                 y_bottom: cy + pitch,
+                                line: line_idx,
+                                chunk_char_offset: offset,
                             });
+                            offset += chunk.chars().count();
                         }
                     }
                 }
@@ -235,6 +242,8 @@ impl MetalRenderer {
                         block_id: Some(*block_id),
                         y_top: y,
                         y_bottom: y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Header { text, block_id, .. } => {
@@ -244,6 +253,8 @@ impl MetalRenderer {
                         block_id: Some(*block_id),
                         y_top: y,
                         y_bottom: y + header_height,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::LiveHeader { text } => {
@@ -253,6 +264,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: y,
                         y_bottom: y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Separator => {
@@ -262,6 +275,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: y,
                         y_bottom: y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::LiveCommand { command } => {
@@ -271,6 +286,8 @@ impl MetalRenderer {
                         block_id: None,
                         y_top: y,
                         y_bottom: y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
                     });
                 }
                 LaidRow::Blank => {}

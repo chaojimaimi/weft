@@ -456,6 +456,16 @@ impl Terminal {
                     for i in 0..count {
                         self.hyperlinks.link_cell(row, col + i, id);
                     }
+                    // v1.6.1: also write to RowExtras for persistence/scrollback.
+                    // Hyperlinks are rare (OSC 8 active), so per-cell BTreeMap
+                    // insert is acceptable here — the hot ASCII fast path below
+                    // never touches extras.
+                    {
+                        let extras = &mut self.grid.viewport[row].extras;
+                        for i in 0..count {
+                            extras.set_hyperlink(col + i, Some(id));
+                        }
+                    }
                 } else if need_unlink_check {
                     // Slow path: some cells might have old hyperlinks to clean.
                     // Collect positions first, then unlink after writing.
@@ -475,6 +485,13 @@ impl Terminal {
                     }
                     for &c in to_unlink.iter().take(unlink_n) {
                         self.hyperlinks.unlink_cell(row, c);
+                    }
+                    // v1.6.1: clear extras for unlinked cells too.
+                    {
+                        let extras = &mut self.grid.viewport[row].extras;
+                        for &c in to_unlink.iter().take(unlink_n) {
+                            extras.set_hyperlink(c, None);
+                        }
                     }
                 } else {
                     // Fast path: no hyperlink logic at all.

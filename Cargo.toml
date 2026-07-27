@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.6.0"
+version = "1.6.1"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -16,7 +16,13 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Core
-vte = "0.13"
+# v1.6.1: disable default `no_std` feature so `osc_raw` is a heap `Vec<u8>`
+# instead of a fixed 1024-byte `ArrayVec`. OSC 8 URLs can legitimately be
+# longer than 1 KiB (xterm allows up to 8 KiB); the 1 KiB ArrayVec silently
+# truncated them, defeating `MAX_HYPERLINK_URL_LEN` enforcement. The
+# `MAX_HYPERLINK_ENTRIES` + `MAX_HYPERLINK_URL_LEN` caps in `hyperlink.rs`
+# bound memory at the application level.
+vte = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["full"] }
 nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
 
