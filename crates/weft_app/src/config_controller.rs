@@ -118,6 +118,10 @@ impl App {
     /// reloads of identical content.
     pub(super) fn reload_config(&mut self) {
         let loaded = weft_core::config::load_resolved();
+        // v1.5.3: retain the error (if any) so we can surface a specific
+        // message via `surface_config_error`. `decide_reload` consumes
+        // the `Result`, so we clone the `Display` form here for the hint.
+        let err_message = loaded.as_ref().err().map(|e| e.to_string());
         let decision = decide_reload(
             self.config_state.config_fingerprint,
             self.config_state.source_config.is_some(),
@@ -128,7 +132,20 @@ impl App {
                 tracing::debug!("config reload skipped (same fingerprint)");
             }
             ReloadDecision::KeepLastKnownGood => {
-                tracing::warn!("config reload failed; keeping current config");
+                // v1.5.3: surface the reload failure so the user knows the
+                // config is in a bad state. The detailed error is logged;
+                // the Settings banner (if open) shows the full message;
+                // the status badge (always) shows a brief hint. The
+                // runtime config is NOT touched — last-known-good stays.
+                if let Some(msg) = err_message {
+                    tracing::warn!(error = %msg, "config reload failed; keeping current config");
+                    self.surface_config_error(&format!("Config reload failed: {msg}"));
+                } else {
+                    // Should be unreachable (KeepLastKnownGood only comes
+                    // from Err), but guard against future logic changes.
+                    tracing::warn!("config reload failed; keeping current config");
+                    self.surface_config_error("Config reload failed");
+                }
             }
             ReloadDecision::Apply(loaded) => {
                 // v1.5.0: update BOTH source and effective together via
@@ -145,6 +162,10 @@ impl App {
                 // already updated so a concurrent watcher tick can't
                 // re-trigger a duplicate apply.
                 self.apply_config(effective);
+                // v1.5.3: clear any prior reload error — the file is now
+                // healthy. Also clears the status badge so a stale
+                // "Config reload failed" doesn't linger after recovery.
+                self.clear_config_error();
                 info!(fingerprint, "config reloaded");
             }
         }

@@ -91,6 +91,9 @@ pub struct MetalRenderer {
     /// back to the responsive `SidebarMetrics::for_logical_width`. Set by
     /// `set_sidebar_width` during drag, or synced from config on load.
     pub(crate) sidebar_width_override: Option<f32>,
+    /// v1.5.3: Brief config error shown in the bottom-left status badge
+    /// when Settings is closed. See `set_config_status_hint` for semantics.
+    pub(crate) config_status_hint: Option<String>,
     /// v0.9: cached cursor-blink state for the current frame, so overlay
     /// builders (palette, panel) can draw a blinking caret without it being
     /// threaded through every helper signature.

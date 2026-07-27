@@ -371,9 +371,36 @@ impl Config {
         Ok(())
     }
 
-    /// The config file path: `$XDG_CONFIG_HOME/weft/config.toml`, else
-    /// `~/.config/weft/config.toml`. `None` when neither env var is set.
+    /// The config file path. Resolution order (v1.5.3):
+    ///
+    /// 1. `WEFT_CONFIG` (absolute path override). Empty values are ignored.
+    ///    Relative paths log a warning and fall through to XDG/HOME so a
+    ///    misconfigured `WEFT_CONFIG` can't silently point at an unintended
+    ///    file (especially risky when launched from Finder where `cwd` is
+    ///    indeterminate). The env var is read once at the call site; runtime
+    ///    mutations after startup are picked up on the next call but the
+    ///    watcher thread is not re-armed.
+    /// 2. `$XDG_CONFIG_HOME/weft/config.toml`.
+    /// 3. `~/.config/weft/config.toml`.
+    ///
+    /// Returns `None` only when none of `WEFT_CONFIG`/`XDG_CONFIG_HOME`/`HOME`
+    /// is set. All consumers (watcher, save, import backup, export default
+    /// directory) call this function so they consistently resolve to the
+    /// same path.
     pub fn config_path() -> Option<PathBuf> {
+        // v1.5.3: WEFT_CONFIG absolute path override (highest priority).
+        // Empty values are ignored; relative paths warn and fall through.
+        if let Some(weft_config) = std::env::var_os("WEFT_CONFIG").filter(|s| !s.is_empty()) {
+            let path = PathBuf::from(weft_config);
+            if path.is_absolute() {
+                return Some(path);
+            }
+            tracing::warn!(
+                path = %path.display(),
+                "WEFT_CONFIG must be an absolute path; falling back to XDG/HOME"
+            );
+        }
+
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
             return Some(PathBuf::from(xdg).join("weft").join("config.toml"));
         }

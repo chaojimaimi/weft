@@ -109,21 +109,52 @@ impl App {
         Ok(())
     }
 
-    /// v1.5.2: Surface a config-related error in the Settings error banner
-    /// (if Settings is open). When Settings is closed, the error is only
-    /// logged — the v1.5.3 batch will add the status hint.
-    fn surface_config_error(&mut self, message: &str) {
+    /// v1.5.2/v1.5.3: Surface a config-related error.
+    ///
+    /// - When Settings is open: show the detailed `message` in the Settings
+    ///   error banner (so the user can see the parse/profile error detail).
+    /// - Always: push a brief hint to the renderer's bottom-left status badge
+    ///   so the user sees *something* even when Settings is closed. The
+    ///   renderer truncates the hint to fit, so passing the full message is
+    ///   fine — the user sees the prefix (e.g. "Config reload failed: …").
+    /// - The detailed error is also logged by the caller.
+    ///
+    /// Made `pub(super)` in v1.5.3 so `reload_config` (in config_controller)
+    /// can call it alongside the import/export callers (in this module).
+    pub(super) fn surface_config_error(&mut self, message: &str) {
         if self.settings.open {
             self.settings.error = Some(message.to_string());
-            self.request_redraw();
         }
-        // TODO(v1.5.3): surface in status hint when Settings is closed.
+        // v1.5.3: always push the hint to the renderer — visible when
+        // Settings is closed (the badge takes priority over the
+        // passthrough hint). The renderer truncates to fit.
+        if let Some(r) = &mut self.renderer {
+            r.set_config_status_hint(Some(message.to_string()));
+        }
+        self.request_redraw();
     }
 
-    /// v1.5.2: Clear any prior config error after a successful transfer.
-    fn clear_config_error(&mut self) {
+    /// v1.5.2/v1.5.3: Clear any prior config error after a successful
+    /// reload / import / export. Clears both the Settings banner (if open)
+    /// and the renderer status hint.
+    pub(super) fn clear_config_error(&mut self) {
+        let mut changed = false;
         if self.settings.open && self.settings.error.is_some() {
             self.settings.error = None;
+            changed = true;
+        }
+        // v1.5.3: always clear the renderer hint — even if Settings is
+        // closed, a stale "Config reload failed" badge would mislead the
+        // user after the file has been fixed.
+        if let Some(r) = &mut self.renderer {
+            // Only request a redraw if the hint actually changes, to
+            // avoid spurious redraws on every successful reload.
+            if r.config_status_hint.is_some() {
+                r.set_config_status_hint(None);
+                changed = true;
+            }
+        }
+        if changed {
             self.request_redraw();
         }
     }

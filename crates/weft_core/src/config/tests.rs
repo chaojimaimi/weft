@@ -23,9 +23,9 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Serializes tests that mutate `XDG_CONFIG_HOME` — env vars are
-/// process-global, so parallel tests that touch the same var would
-/// clobber each other's values. The original value is saved and
+/// Serializes tests that mutate `XDG_CONFIG_HOME` / `WEFT_CONFIG` / `HOME` —
+/// env vars are process-global, so parallel tests that touch the same var
+/// would clobber each other's values. The original values are saved and
 /// restored around `f` to keep tests hermetic.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -38,6 +38,52 @@ fn with_xdg_config<F: FnOnce(&std::path::Path)>(tmp: &std::path::Path, f: F) {
     match old {
         Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
         None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+}
+
+/// v1.5.3: Run `f` with `WEFT_CONFIG` (and optionally `XDG_CONFIG_HOME` /
+/// `HOME`) temporarily set to the given values, then restore the originals.
+///
+/// Holds `ENV_LOCK` for the whole call so parallel env-mutating tests in
+/// this crate stay hermetic. The lock is also taken by `with_xdg_config`,
+/// so the two helpers never overlap.
+fn with_weft_config<F: FnOnce()>(
+    weft_config: Option<&std::ffi::OsStr>,
+    xdg: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    f: F,
+) {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let old_weft = std::env::var_os("WEFT_CONFIG");
+    let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let old_home = std::env::var_os("HOME");
+
+    match weft_config {
+        Some(v) => std::env::set_var("WEFT_CONFIG", v),
+        None => std::env::remove_var("WEFT_CONFIG"),
+    }
+    match xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+    match home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+
+    f();
+
+    match old_weft {
+        Some(v) => std::env::set_var("WEFT_CONFIG", v),
+        None => std::env::remove_var("WEFT_CONFIG"),
+    }
+    match old_xdg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+    match old_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
     }
 }
 
@@ -1484,4 +1530,222 @@ fn save_clears_active_profile_when_none() {
         "active_profile should be removed: {saved}"
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+// ── v1.5.3: WEFT_CONFIG override ──────────────────────────────────────
+//
+// The V15 plan §8.2 requires `Config::config_path()` to honor an absolute
+// `WEFT_CONFIG` env var ahead of `XDG_CONFIG_HOME` / `HOME`. Empty values
+// are ignored; relative paths log a warning and fall through (Finder launches
+// have an indeterminate `cwd`, so a relative `WEFT_CONFIG` would be a
+// footgun). These tests cover all four cases required by the v1.5.3 exit
+// criteria: absolute, empty, relative, and "parent dir doesn't exist"
+// (which is just a path that doesn't resolve yet — `config_path()` itself
+// doesn't check existence, only callers do, so we just verify it returns
+// the path verbatim and let `load_resolved_from_path` report the missing
+// file separately).
+//
+// All tests run under `ENV_LOCK` (via `with_weft_config`) because env vars
+// are process-global — without the lock, parallel tests in this module
+// would race on `WEFT_CONFIG` / `XDG_CONFIG_HOME` / `HOME`.
+
+#[test]
+fn weft_config_absolute_override_wins() {
+    // Absolute WEFT_CONFIG takes priority over both XDG_CONFIG_HOME and HOME.
+    // Path doesn't need to exist — config_path() only resolves the path,
+    // it doesn't stat it.
+    let abs = std::env::temp_dir().join("weft-config-absolute-override.toml");
+    let xdg_dir = std::env::temp_dir().join("weft-config-xdg-ignored");
+    let home_dir = std::env::temp_dir().join("weft-config-home-ignored");
+
+    let xdg_os: std::ffi::OsString = xdg_dir.as_os_str().into();
+    let home_os: std::ffi::OsString = home_dir.as_os_str().into();
+    let weft_os: std::ffi::OsString = abs.as_os_str().into();
+
+    let resolved = std::cell::RefCell::new(None);
+    with_weft_config(
+        Some(weft_os.as_os_str()),
+        Some(xdg_os.as_os_str()),
+        Some(home_os.as_os_str()),
+        || {
+            *resolved.borrow_mut() = Config::config_path();
+        },
+    );
+    let got = resolved
+        .borrow()
+        .clone()
+        .expect("config_path returned None");
+    assert_eq!(
+        got, abs,
+        "absolute WEFT_CONFIG must override XDG_CONFIG_HOME and HOME"
+    );
+}
+
+#[test]
+fn weft_config_empty_value_falls_through_to_xdg() {
+    // Empty WEFT_CONFIG is ignored — XDG_CONFIG_HOME wins.
+    let xdg_dir = std::env::temp_dir().join("weft-config-empty-xdg");
+    std::fs::create_dir_all(&xdg_dir).unwrap();
+    let home_dir = std::env::temp_dir().join("weft-config-empty-home");
+
+    let xdg_os: std::ffi::OsString = xdg_dir.as_os_str().into();
+    let home_os: std::ffi::OsString = home_dir.as_os_str().into();
+
+    let resolved = std::cell::RefCell::new(None);
+    with_weft_config(
+        Some(std::ffi::OsStr::new("")),
+        Some(xdg_os.as_os_str()),
+        Some(home_os.as_os_str()),
+        || {
+            *resolved.borrow_mut() = Config::config_path();
+        },
+    );
+    let got = resolved
+        .borrow()
+        .clone()
+        .expect("config_path returned None");
+    assert_eq!(
+        got,
+        xdg_dir.join("weft").join("config.toml"),
+        "empty WEFT_CONFIG must fall through to XDG_CONFIG_HOME"
+    );
+    let _ = std::fs::remove_dir_all(&xdg_dir);
+}
+
+#[test]
+fn weft_config_relative_falls_through_to_xdg() {
+    // Relative WEFT_CONFIG is rejected (warns and falls through) so a
+    // Finder launch with indeterminate cwd can't silently pick up an
+    // unintended file. XDG_CONFIG_HOME wins.
+    let xdg_dir = std::env::temp_dir().join("weft-config-rel-xdg");
+    std::fs::create_dir_all(&xdg_dir).unwrap();
+    let home_dir = std::env::temp_dir().join("weft-config-rel-home");
+
+    let xdg_os: std::ffi::OsString = xdg_dir.as_os_str().into();
+    let home_os: std::ffi::OsString = home_dir.as_os_str().into();
+
+    let resolved = std::cell::RefCell::new(None);
+    with_weft_config(
+        Some(std::ffi::OsStr::new("relative/config.toml")),
+        Some(xdg_os.as_os_str()),
+        Some(home_os.as_os_str()),
+        || {
+            *resolved.borrow_mut() = Config::config_path();
+        },
+    );
+    let got = resolved
+        .borrow()
+        .clone()
+        .expect("config_path returned None");
+    assert_eq!(
+        got,
+        xdg_dir.join("weft").join("config.toml"),
+        "relative WEFT_CONFIG must fall through to XDG_CONFIG_HOME"
+    );
+    let _ = std::fs::remove_dir_all(&xdg_dir);
+}
+
+#[test]
+fn weft_config_missing_parent_returns_path_verbatim() {
+    // config_path() doesn't check whether the parent dir exists — it just
+    // returns the path. Callers (load_resolved_from_path, save, watcher)
+    // are responsible for reporting a missing file / unwritable parent.
+    // The v1.5.3 exit criteria lists "missing parent" as a case to verify;
+    // here we confirm config_path() returns the absolute path as-is so a
+    // later load correctly surfaces `NotFound`.
+    let abs = std::env::temp_dir()
+        .join("weft-config-missing-parent-dir")
+        .join("nested")
+        .join("config.toml");
+
+    let weft_os: std::ffi::OsString = abs.as_os_str().into();
+    let xdg_os: std::ffi::OsString = std::env::temp_dir()
+        .join("weft-config-missing-xdg")
+        .into_os_string();
+    let home_os: std::ffi::OsString = std::env::temp_dir()
+        .join("weft-config-missing-home")
+        .into_os_string();
+
+    let resolved = std::cell::RefCell::new(None);
+    with_weft_config(
+        Some(weft_os.as_os_str()),
+        Some(xdg_os.as_os_str()),
+        Some(home_os.as_os_str()),
+        || {
+            *resolved.borrow_mut() = Config::config_path();
+        },
+    );
+    let got = resolved
+        .borrow()
+        .clone()
+        .expect("config_path returned None");
+    assert_eq!(
+        got, abs,
+        "absolute WEFT_CONFIG is returned verbatim even when parent doesn't exist"
+    );
+    // And load_resolved_from_path must surface the missing file as an
+    // Io(NotFound) error rather than panicking.
+    let err = load_resolved_from_path(&abs).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigLoadError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound
+        ),
+        "missing parent must surface as Io(NotFound), got {err:?}"
+    );
+}
+
+#[test]
+fn weft_config_unset_falls_through_to_xdg_then_home() {
+    // With WEFT_CONFIG unset, the legacy XDG_CONFIG_HOME → HOME order is
+    // preserved. This guards against regressions where the new WEFT_CONFIG
+    // branch accidentally short-circuits the fallback chain.
+    let xdg_dir = std::env::temp_dir().join("weft-config-unset-xdg");
+    std::fs::create_dir_all(&xdg_dir).unwrap();
+    let home_dir = std::env::temp_dir().join("weft-config-unset-home");
+
+    let xdg_os: std::ffi::OsString = xdg_dir.as_os_str().into();
+    let home_os: std::ffi::OsString = home_dir.as_os_str().into();
+
+    // XDG wins when both XDG and HOME are set.
+    let resolved = std::cell::RefCell::new(None);
+    with_weft_config(
+        None,
+        Some(xdg_os.as_os_str()),
+        Some(home_os.as_os_str()),
+        || {
+            *resolved.borrow_mut() = Config::config_path();
+        },
+    );
+    let got = resolved
+        .borrow()
+        .clone()
+        .expect("config_path returned None");
+    assert_eq!(
+        got,
+        xdg_dir.join("weft").join("config.toml"),
+        "XDG_CONFIG_HOME must win when WEFT_CONFIG is unset"
+    );
+    let _ = std::fs::remove_dir_all(&xdg_dir);
+
+    // HOME fallback when XDG is unset (and WEFT_CONFIG still unset).
+    // `~/.config/weft/config.toml` — the legacy default.
+    let resolved2 = std::cell::RefCell::new(None);
+    with_weft_config(
+        None,
+        None,
+        Some(home_os.as_os_str()),
+        || {
+            *resolved2.borrow_mut() = Config::config_path();
+        },
+    );
+    let got2 = resolved2
+        .borrow()
+        .clone()
+        .expect("config_path returned None with HOME set");
+    assert_eq!(
+        got2,
+        home_dir.join(".config").join("weft").join("config.toml"),
+        "HOME must be used when WEFT_CONFIG and XDG_CONFIG_HOME are both unset"
+    );
 }

@@ -249,4 +249,16 @@ impl MetalRenderer {
         self.sidebar_width_override = crate::settings_validation::runtime_sidebar_width(width)
             .map(crate::ui_tokens::clamp_sidebar_width);
     }
+
+    /// v1.5.3: Set the brief config error hint shown in the bottom-left
+    /// status badge when Settings is closed. Pass `None` to clear (e.g.
+    /// after a successful reload). The renderer truncates to fit the
+    /// available width so the caller can pass a full message.
+    ///
+    /// When `Some`, this takes priority over the terminal-state passthrough
+    /// hint — a stale/broken config is more important to surface than the
+    /// "passthrough" badge.
+    pub fn set_config_status_hint(&mut self, hint: Option<String>) {
+        self.config_status_hint = hint;
+    }
 }

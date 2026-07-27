@@ -244,6 +244,7 @@ impl MetalRenderer {
             reduce_motion: false,
             increase_contrast: false,
             sidebar_width_override: None,
+            config_status_hint: None,
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
             cached_scroll_metrics: Cell::new(None),
