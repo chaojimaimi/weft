@@ -10,6 +10,7 @@
 //! - `tests` — device-free rasterization and transform probes
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use font_kit::loaders::core_text::Font;
 use metal::Device;
@@ -17,9 +18,11 @@ use tracing::info;
 use weft_core::config::FontConfig;
 
 mod atlas;
+mod cluster;
 mod font;
 mod rasterize;
 mod special;
+mod tests;
 
 use font::{is_emoji_char, nonzero_cell_dimension, resolve_font};
 
@@ -49,6 +52,14 @@ pub struct GlyphAtlas {
     /// common case. `ascii[0..32]` are control chars (unused, always None);
     /// 32..=127 covers printable ASCII. Falls back to `cache` for non-ASCII.
     ascii: [Option<GlyphInfo>; 128],
+    /// v1.6.0 step 4: Cluster atlas for multi-scalar graphemes (e + combining
+    /// acute, ZWJ emoji, regional flag pairs, skin tone modifiers, VS16
+    /// promotions). Keyed by the full cluster string (e.g. `"e\u{0301}"`,
+    /// `"👩\u{200d}🔬"`). Empty in the common case — most terminal output is
+    /// single-scalar and goes through `cache`/`ascii` instead. The cluster
+    /// path costs one `Arc<str>` hash per lookup, which is intentionally
+    /// avoided for the ASCII fast path.
+    cluster_cache: HashMap<Arc<str>, GlyphInfo>,
     /// Monospace cell width in pixels.
     pub cell_width: u32,
     /// Monospace cell height in pixels (line height).
@@ -247,6 +258,7 @@ impl GlyphAtlas {
             texture,
             cache,
             ascii,
+            cluster_cache: HashMap::new(),
             cell_width: cell_w,
             cell_height: cell_h,
             atlas_w,
@@ -392,11 +404,159 @@ impl GlyphAtlas {
         }
     }
 
+    /// v1.6.0 step 4: Look up a cached cluster glyph by its full string.
+    ///
+    /// Returns `None` for clusters that haven't been rasterized yet. Call
+    /// [`get_or_rasterize_cluster`](Self::get_or_rasterize_cluster) to
+    /// rasterize on demand. The caller is responsible for only consulting
+    /// this path when `CellFlags::EXTRA` is set on the source cell — single
+    /// scalar cells must continue to use [`get`](Self::get) / the ASCII
+    /// direct-index array.
+    //
+    // v1.6.0 step 4: dead_code allowed — the paint path will be wired in
+    // step 5 ("接通 Grid、selection、copy、reflow、Block capture 和 Metal atlas").
+    #[allow(dead_code)]
+    pub fn get_cluster(&self, cluster: &str) -> Option<&GlyphInfo> {
+        self.cluster_cache.get(cluster)
+    }
+
+    /// v1.6.0 step 4: Look up a cached cluster glyph, or rasterize on demand.
+    ///
+    /// `cluster` is the full grapheme cluster string (e.g. `"e\u{0301}"`,
+    /// `"👩\u{200d}🔬"`). `base_char` is the lead scalar (the cell's
+    /// `character` field) — used to pick the right font (emoji vs CJK vs
+    /// primary) when the cluster contains characters from multiple scripts.
+    /// `is_wide` indicates whether the cluster occupies a double-width slot.
+    ///
+    /// Returns `None` if the atlas is full or the cluster cannot be shaped
+    /// by CoreText. Callers should fall back to the lead scalar's atlas
+    /// entry (via [`get`](Self::get)) in that case — the cell will render
+    /// with the lead scalar only, which is the v1.5 behavior.
+    ///
+    /// This is the POC entry point required by [V16_IMPLEMENTATION_PLAN.md
+    /// §3 step 4][plan]. The paint path is NOT yet wired to call it — that
+    /// is step 5.
+    ///
+    /// [plan]: ../../docs/V16_IMPLEMENTATION_PLAN.md
+    //
+    // v1.6.0 step 4: dead_code allowed — the paint path will be wired in
+    // step 5.
+    #[allow(dead_code)]
+    pub fn get_or_rasterize_cluster(
+        &mut self,
+        cluster: &str,
+        base_char: char,
+        is_wide: bool,
+    ) -> Option<&GlyphInfo> {
+        // Fast path: already rasterized. Use contains_key + get to keep the
+        // immutable borrow scoped to this block — a direct `if let Some(info)
+        // = self.cluster_cache.get(cluster)` would extend the borrow to the
+        // end of the function and block the insert below.
+        if self.cluster_cache.contains_key(cluster) {
+            return self.cluster_cache.get(cluster);
+        }
+
+        // Pick the font for the cluster's base scalar. Emoji clusters (ZWJ
+        // sequences, flag pairs, skin tone modifiers) need Apple Color Emoji;
+        // wide CJK clusters use the CJK fallback; everything else uses the
+        // primary font with the same fallback ladder as `get_or_rasterize`.
+        let is_emoji = is_emoji_char(base_char);
+        let font = if is_emoji {
+            self.emoji_font.as_ref().unwrap_or(&self.primary_font)
+        } else if is_wide {
+            self.cjk_font.as_ref().unwrap_or(&self.primary_font)
+        } else if self.primary_font.glyph_for_char(base_char).is_some() {
+            &self.primary_font
+        } else if self
+            .cjk_font
+            .as_ref()
+            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
+        {
+            self.cjk_font.as_ref().unwrap()
+        } else if self
+            .emoji_font
+            .as_ref()
+            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
+        {
+            self.emoji_font.as_ref().unwrap()
+        } else if self
+            .symbol_font
+            .as_ref()
+            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
+        {
+            self.symbol_font.as_ref().unwrap()
+        } else {
+            &self.primary_font
+        };
+
+        // Allocate atlas slot (layout only).
+        let info = Self::allocate_slot(
+            is_wide,
+            self.cell_width,
+            self.cell_height,
+            self.atlas_w,
+            self.atlas_h,
+            &mut self.next_x,
+            &mut self.next_y,
+            &mut self.row_height,
+        )?;
+
+        let glyph_w = if is_wide {
+            self.cell_width * 2
+        } else {
+            self.cell_width
+        };
+
+        // Shape + rasterize the full cluster via CoreText CTLine.
+        let pixels = cluster::rasterize_cluster_alpha(
+            font,
+            cluster,
+            glyph_w,
+            self.cell_height,
+            self.primary_descent_px,
+        );
+
+        let pixels = match pixels {
+            Some(p) => p,
+            None => {
+                // Cluster couldn't be shaped — fall back to rasterizing the
+                // lead scalar alone so the cell renders something visible
+                // (v1.5 behavior) instead of a blank slot.
+                Self::rasterize_glyph(
+                    font,
+                    base_char,
+                    self.scaled_size,
+                    glyph_w,
+                    self.cell_height,
+                    is_wide,
+                    self.primary_descent_px,
+                )
+            }
+        };
+
+        Self::upload_region(
+            &self.texture,
+            &pixels,
+            info.size.0,
+            info.uv_origin,
+            self.atlas_w,
+            self.atlas_h,
+        );
+
+        let key = Arc::from(cluster);
+        self.cluster_cache.insert(key, info);
+
+        // Return from cluster_cache so the caller's reference matches what
+        // future get_cluster() calls will return.
+        // SAFETY: we just inserted `info` under `key`; the lookup below
+        // borrows cluster_cache immutably and returns a reference into it.
+        // The mutable borrow of self ended with the insert above; the
+        // immutable borrow for the lookup is the only outstanding borrow.
+        self.cluster_cache.get(cluster)
+    }
+
     /// Get the Metal atlas texture.
     pub fn texture(&self) -> &metal::Texture {
         &self.texture
     }
 }
-
-#[cfg(test)]
-mod tests;
