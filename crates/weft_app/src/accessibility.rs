@@ -642,6 +642,8 @@ impl App {
             self.settings.tab,
             theme_count,
             ch,
+            // v1.5.1: profile_count = number of profiles + 1 (for "Base").
+            self.profile_names_sorted().len() + 1,
         );
         if theme_count > 0 {
             let themes = self.settings_theme_views();

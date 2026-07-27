@@ -47,6 +47,39 @@ impl App {
             }
         }
 
+        // v1.5.1: Profile entries. The "Switch Profile: <name>" labels are
+        // filtered by the query like any other entry. "Base" is always
+        // present (switching to base clears `active_profile`). The
+        // currently-active profile is marked so the renderer can show a
+        // checkmark and `activate_palette_entry` can no-op on re-selection.
+        //
+        // Profiles come from `config_state.source()` (raw, not effective)
+        // so the names match what's in the TOML file — important for the
+        // subsequent `switch_profile(name)` call.
+        let active = self.active_profile_name().map(str::to_owned);
+        let q = self.palette.query.to_lowercase();
+        let profile_filter = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
+        // "Base" entry — switching to base means `active_profile = None`.
+        // Label uses the "Switch Profile: " prefix so typing "profile" or
+        // "switch" surfaces all entries.
+        let base_label = "Switch Profile: Base";
+        if profile_filter(base_label) {
+            results.push(PaletteEntry::Profile {
+                name: "Base".to_string(),
+                active: active.is_none(),
+            });
+        }
+        for name in self.profile_names_sorted() {
+            let label = format!("Switch Profile: {name}");
+            if !profile_filter(&label) {
+                continue;
+            }
+            results.push(PaletteEntry::Profile {
+                name: name.clone(),
+                active: active.as_deref() == Some(name.as_str()),
+            });
+        }
+
         self.palette.results = results;
         // Clamp selection.
         if self.palette.selection >= self.palette.results.len() {
@@ -580,6 +613,35 @@ impl App {
                     BuiltinCmd::ReloadConfig => {
                         self.execute_action(Action::ReloadConfig);
                         self.close_palette();
+                    }
+                }
+                self.request_redraw();
+            }
+            PaletteEntry::Profile { name, active } => {
+                // v1.5.1: Switch to the selected profile. No-op if it's
+                // already active (the user can still re-select via Enter
+                // to confirm, but we skip the transaction to avoid a
+                // pointless save). The "Base" sentinel name maps to
+                // `active_profile = None`.
+                if active {
+                    self.close_palette();
+                    self.request_redraw();
+                    return;
+                }
+                let target = if name == "Base" {
+                    None
+                } else {
+                    Some(name.as_str())
+                };
+                match self.switch_profile(target) {
+                    Ok(()) => {
+                        info!(profile = %name, "palette switched profile");
+                        self.close_palette();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "palette profile switch failed");
+                        // Keep the palette open so the user sees the failure
+                        // (the next refresh keeps the same results list).
                     }
                 }
                 self.request_redraw();

@@ -256,6 +256,8 @@ fn layout_scene_snapshot() -> Value {
         SettingsTab::Appearance,
         11,
         18.0,
+        // v1.5.1: profile_count = 0 for snapshot tests.
+        0,
     );
     let narrow_sidebar_scene = build_settings_scene(
         &narrow_sidebar,
@@ -263,6 +265,7 @@ fn layout_scene_snapshot() -> Value {
         SettingsTab::Appearance,
         0,
         18.0,
+        0,
     );
     let narrow_content_scene = build_settings_scene(
         &narrow_content,
@@ -270,6 +273,7 @@ fn layout_scene_snapshot() -> Value {
         SettingsTab::Appearance,
         11,
         18.0,
+        0,
     );
 
     let shell = CommandSurfaceShell::canonical(

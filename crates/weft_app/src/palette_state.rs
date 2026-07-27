@@ -9,6 +9,14 @@ use weft_core::workflow::{Workflow, WorkflowStore};
 pub(crate) enum PaletteEntry {
     Workflow(Workflow),
     Builtin(BuiltinCmd),
+    /// v1.5.1: A config profile entry. `name` is the profile name (or the
+    /// special `"Base"` sentinel for "switch to base"). `active` marks the
+    /// currently-active profile so the palette can render a checkmark and
+    /// so `activate_palette_entry` can no-op on re-selection.
+    Profile {
+        name: String,
+        active: bool,
+    },
 }
 
 impl PaletteEntry {
@@ -16,6 +24,13 @@ impl PaletteEntry {
         match self {
             Self::Workflow(workflow) => format!("workflow/{}", workflow.id),
             Self::Builtin(command) => format!("builtin/{}", command.accessibility_key()),
+            // v1.5.1: profile accessibility identity is `profile/<name>` so
+            // the active-profile marker doesn't change the identity (the
+            // same profile stays the same element whether or not it's
+            // active). The "Base" sentinel uses `profile/Base` (the
+            // reserved name "base" is rejected by validate_profile_name
+            // case-insensitively, so it never collides with a real profile).
+            Self::Profile { name, .. } => format!("profile/{name}"),
         }
     }
 }
@@ -285,5 +300,49 @@ mod tests {
         assert!(!super::theme_name_is_dark("gruvbox-light"));
         assert!(super::theme_name_is_dark("weft-warm"));
         assert!(super::theme_name_is_dark("nord"));
+    }
+
+    // ── v1.5.1: PaletteEntry::Profile tests ──────────────────────────
+
+    #[test]
+    fn profile_entry_accessibility_key_uses_profile_prefix() {
+        // The accessibility identity is `profile/<name>` so the same
+        // profile stays the same element whether or not it's active.
+        let active = PaletteEntry::Profile {
+            name: "work".into(),
+            active: true,
+        };
+        let inactive = PaletteEntry::Profile {
+            name: "work".into(),
+            active: false,
+        };
+        assert_eq!(active.accessibility_key(), "profile/work");
+        assert_eq!(inactive.accessibility_key(), "profile/work");
+        // Active flag must NOT change the identity — same profile, same key.
+        assert_eq!(active.accessibility_key(), inactive.accessibility_key());
+    }
+
+    #[test]
+    fn profile_entry_base_uses_reserved_name() {
+        // The "Base" sentinel must produce `profile/base`, which never
+        // collides with a real profile (validate_profile_name rejects "base").
+        let base = PaletteEntry::Profile {
+            name: "Base".into(),
+            active: true,
+        };
+        assert_eq!(base.accessibility_key(), "profile/Base");
+    }
+
+    #[test]
+    fn profile_entry_distinct_names_have_distinct_keys() {
+        let a = PaletteEntry::Profile {
+            name: "work".into(),
+            active: false,
+        };
+        let b = PaletteEntry::Profile {
+            name: "personal".into(),
+            active: false,
+        };
+        assert_ne!(a.accessibility_key(), b.accessibility_key());
     }
 }

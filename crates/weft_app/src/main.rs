@@ -50,6 +50,7 @@ mod panel_component;
 mod panel_controller;
 mod panel_scrollbar;
 mod performance_probe;
+mod profiles_controller;
 mod redraw_controller;
 mod renderer;
 mod scene;

@@ -144,6 +144,20 @@ pub struct SettingsKeybindingView {
     pub conflict: bool,
 }
 
+/// v1.5.1: A profile entry in the Settings profile toolbar. The list is
+/// built per-frame by the redraw controller: index 0 is always "Base"
+/// (`is_active` = no active profile), followed by sorted profile names.
+/// The renderer draws each entry as a clickable tab in the toolbar; the
+/// active entry gets an accent underline.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsProfileView<'a> {
+    /// Display name. The special `"Base"` sentinel means "no active profile".
+    pub name: &'a str,
+    /// True when this entry is the currently-active profile (or Base when
+    /// no profile is active). The renderer highlights it.
+    pub is_active: bool,
+}
+
 /// F5: Settings panel rendering parameters. The renderer reads these to lay
 /// out the panel's sidebar + content form. All data is borrowed from the
 /// `App` struct's settings-related fields.
@@ -203,6 +217,11 @@ pub struct SettingsDrawParams<'a> {
     /// F5: Field-level validation errors (field_label, message). Rendered
     /// inline next to the offending field AND aggregated in the top summary.
     pub field_errors: &'a [(String, String)],
+    /// v1.5.1: Profile entries for the Settings toolbar. Index 0 is always
+    /// "Base" (no active profile); 1..N are sorted profile names. Empty when
+    /// the content area is hidden (narrow sidebar-only mode) — the toolbar
+    /// is zero-sized and the renderer skips it.
+    pub profiles: &'a [SettingsProfileView<'a>],
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -366,6 +385,14 @@ impl OverlayWarmup for OverlayContent<'_> {
                 for v in weft_core::config::LogoVariant::ALL {
                     missing.extend(v.label().chars());
                 }
+                // v1.5.1: profile toolbar glyphs: "Base" label, profile names,
+                // and the +/− buttons. The minus is U+2212 (not ASCII hyphen)
+                // so it must be warmed explicitly.
+                missing.extend("Base+".chars());
+                missing.insert('\u{2212}'); // − minus sign for delete button
+                for p in s.profiles {
+                    missing.extend(p.name.chars());
+                }
             }
         }
     }
@@ -454,6 +481,7 @@ pub fn build_overlay_stack<'a>(
     settings_drill_down: bool,
     settings_keybinding_conflict_count: usize,
     settings_field_errors: &'a [(String, String)],
+    settings_profiles: &'a [SettingsProfileView<'a>],
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -602,6 +630,7 @@ pub fn build_overlay_stack<'a>(
                 drill_down: settings_drill_down,
                 keybinding_conflict_count: settings_keybinding_conflict_count,
                 field_errors: settings_field_errors,
+                profiles: settings_profiles,
             }),
         });
     }

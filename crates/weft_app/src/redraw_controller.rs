@@ -146,6 +146,24 @@ impl App {
         let settings_keybinding_conflict_count =
             settings_keybindings.iter().filter(|v| v.conflict).count();
         let settings_field_errors: &[(String, String)] = &self.settings.field_errors;
+        // v1.5.1: Build profile views for the Settings toolbar. Index 0 is
+        // always "Base" (is_active = no active profile); 1..N are sorted
+        // profile names. Built before the mutable `tab` borrow below to
+        // avoid borrow conflicts.
+        let active_profile = self.active_profile_name();
+        let profile_names = self.profile_names_sorted();
+        let mut settings_profiles: Vec<crate::overlay::SettingsProfileView<'_>> =
+            Vec::with_capacity(profile_names.len() + 1);
+        settings_profiles.push(crate::overlay::SettingsProfileView {
+            name: "Base",
+            is_active: active_profile.is_none(),
+        });
+        for name in &profile_names {
+            settings_profiles.push(crate::overlay::SettingsProfileView {
+                name: name.as_str(),
+                is_active: active_profile == Some(name.as_str()),
+            });
+        }
         let palette_form_fields = self
             .palette
             .form
@@ -331,6 +349,15 @@ impl App {
                             PaletteEntry::Builtin(b) => {
                                 (b.label().to_string(), String::new(), "Builtin")
                             }
+                            // v1.5.1: Profile entries show as
+                            // "Switch Profile: <name>" with an active marker
+                            // in the description. The kind label is
+                            // "Profile" so the renderer can style it.
+                            PaletteEntry::Profile { name, active } => {
+                                let label = format!("Switch Profile: {name}");
+                                let desc = if *active { "active" } else { "" };
+                                (label, desc.to_string(), "Profile")
+                            }
                         })
                         .collect()
                 };
@@ -405,6 +432,7 @@ impl App {
                 settings_drill_down,
                 settings_keybinding_conflict_count,
                 settings_field_errors,
+                &settings_profiles,
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid

@@ -449,24 +449,33 @@
         430.0,
         623.0
       ],
-      "content_top": 140.0,
+      "content_top": 158.0,
       "content_x": [
         83.5,
         416.5
       ],
       "footer_y": 596.0,
-      "max_rows": 24,
+      "max_rows": 23,
       "scene": {
-        "hit_count": 12,
+        "hit_count": 14,
         "hits": [
           {
             "bounds": [
-              83.5,
+              353.5,
+              140.0,
+              380.5,
+              158.0
+            ],
+            "target": "ProfileCreate"
+          },
+          {
+            "bounds": [
+              389.5,
               140.0,
               416.5,
               158.0
             ],
-            "target": "Theme(0)"
+            "target": "ProfileDelete"
           },
           {
             "bounds": [
@@ -475,7 +484,7 @@
               416.5,
               176.0
             ],
-            "target": "Theme(1)"
+            "target": "Theme(0)"
           },
           {
             "bounds": [
@@ -484,7 +493,7 @@
               416.5,
               194.0
             ],
-            "target": "Theme(2)"
+            "target": "Theme(1)"
           },
           {
             "bounds": [
@@ -493,7 +502,7 @@
               416.5,
               212.0
             ],
-            "target": "Theme(3)"
+            "target": "Theme(2)"
           },
           {
             "bounds": [
@@ -502,7 +511,7 @@
               416.5,
               230.0
             ],
-            "target": "Theme(4)"
+            "target": "Theme(3)"
           },
           {
             "bounds": [
@@ -511,7 +520,7 @@
               416.5,
               248.0
             ],
-            "target": "Theme(5)"
+            "target": "Theme(4)"
           },
           {
             "bounds": [
@@ -520,7 +529,7 @@
               416.5,
               266.0
             ],
-            "target": "Theme(6)"
+            "target": "Theme(5)"
           },
           {
             "bounds": [
@@ -529,7 +538,7 @@
               416.5,
               284.0
             ],
-            "target": "Theme(7)"
+            "target": "Theme(6)"
           },
           {
             "bounds": [
@@ -538,7 +547,7 @@
               416.5,
               302.0
             ],
-            "target": "Theme(8)"
+            "target": "Theme(7)"
           },
           {
             "bounds": [
@@ -547,7 +556,7 @@
               416.5,
               320.0
             ],
-            "target": "Theme(9)"
+            "target": "Theme(8)"
           },
           {
             "bounds": [
@@ -555,6 +564,15 @@
               320.0,
               416.5,
               338.0
+            ],
+            "target": "Theme(9)"
+          },
+          {
+            "bounds": [
+              83.5,
+              338.0,
+              416.5,
+              356.0
             ],
             "target": "Theme(10)"
           },
@@ -568,7 +586,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 13,
+        "semantic_count": 14,
         "semantics": [
           {
             "bounds": [
@@ -589,9 +607,9 @@
               416.5,
               158.0
             ],
-            "focus": null,
-            "label": "Theme 1",
-            "role": "ListItem",
+            "focus": "Settings",
+            "label": "Profile selector",
+            "role": "List",
             "state": ""
           },
           {
@@ -602,7 +620,7 @@
               176.0
             ],
             "focus": null,
-            "label": "Theme 2",
+            "label": "Theme 1",
             "role": "ListItem",
             "state": ""
           },
@@ -614,7 +632,7 @@
               194.0
             ],
             "focus": null,
-            "label": "Theme 3",
+            "label": "Theme 2",
             "role": "ListItem",
             "state": ""
           },
@@ -626,7 +644,7 @@
               212.0
             ],
             "focus": null,
-            "label": "Theme 4",
+            "label": "Theme 3",
             "role": "ListItem",
             "state": ""
           },
@@ -638,7 +656,7 @@
               230.0
             ],
             "focus": null,
-            "label": "Theme 5",
+            "label": "Theme 4",
             "role": "ListItem",
             "state": ""
           },
@@ -650,7 +668,7 @@
               248.0
             ],
             "focus": null,
-            "label": "Theme 6",
+            "label": "Theme 5",
             "role": "ListItem",
             "state": ""
           },
@@ -662,7 +680,7 @@
               266.0
             ],
             "focus": null,
-            "label": "Theme 7",
+            "label": "Theme 6",
             "role": "ListItem",
             "state": ""
           },
@@ -674,7 +692,7 @@
               284.0
             ],
             "focus": null,
-            "label": "Theme 8",
+            "label": "Theme 7",
             "role": "ListItem",
             "state": ""
           },
@@ -686,7 +704,7 @@
               302.0
             ],
             "focus": null,
-            "label": "Theme 9",
+            "label": "Theme 8",
             "role": "ListItem",
             "state": ""
           },
@@ -698,7 +716,7 @@
               320.0
             ],
             "focus": null,
-            "label": "Theme 10",
+            "label": "Theme 9",
             "role": "ListItem",
             "state": ""
           },
@@ -708,6 +726,18 @@
               320.0,
               416.5,
               338.0
+            ],
+            "focus": null,
+            "label": "Theme 10",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              338.0,
+              416.5,
+              356.0
             ],
             "focus": null,
             "label": "Theme 11",
@@ -934,15 +964,15 @@
         1238.4,
         801.0
       ],
-      "content_top": 144.0,
+      "content_top": 162.0,
       "content_x": [
         496.404,
         1224.9
       ],
       "footer_y": 774.0,
-      "max_rows": 34,
+      "max_rows": 33,
       "scene": {
-        "hit_count": 20,
+        "hit_count": 22,
         "hits": [
           {
             "bounds": [
@@ -1000,12 +1030,21 @@
           },
           {
             "bounds": [
-              496.404,
+              1161.9,
+              144.0,
+              1188.9,
+              162.0
+            ],
+            "target": "ProfileCreate"
+          },
+          {
+            "bounds": [
+              1197.9,
               144.0,
               1224.9,
               162.0
             ],
-            "target": "Theme(0)"
+            "target": "ProfileDelete"
           },
           {
             "bounds": [
@@ -1014,7 +1053,7 @@
               1224.9,
               180.0
             ],
-            "target": "Theme(1)"
+            "target": "Theme(0)"
           },
           {
             "bounds": [
@@ -1023,7 +1062,7 @@
               1224.9,
               198.0
             ],
-            "target": "Theme(2)"
+            "target": "Theme(1)"
           },
           {
             "bounds": [
@@ -1032,7 +1071,7 @@
               1224.9,
               216.0
             ],
-            "target": "Theme(3)"
+            "target": "Theme(2)"
           },
           {
             "bounds": [
@@ -1041,7 +1080,7 @@
               1224.9,
               234.0
             ],
-            "target": "Theme(4)"
+            "target": "Theme(3)"
           },
           {
             "bounds": [
@@ -1050,7 +1089,7 @@
               1224.9,
               252.0
             ],
-            "target": "Theme(5)"
+            "target": "Theme(4)"
           },
           {
             "bounds": [
@@ -1059,7 +1098,7 @@
               1224.9,
               270.0
             ],
-            "target": "Theme(6)"
+            "target": "Theme(5)"
           },
           {
             "bounds": [
@@ -1068,7 +1107,7 @@
               1224.9,
               288.0
             ],
-            "target": "Theme(7)"
+            "target": "Theme(6)"
           },
           {
             "bounds": [
@@ -1077,7 +1116,7 @@
               1224.9,
               306.0
             ],
-            "target": "Theme(8)"
+            "target": "Theme(7)"
           },
           {
             "bounds": [
@@ -1086,7 +1125,7 @@
               1224.9,
               324.0
             ],
-            "target": "Theme(9)"
+            "target": "Theme(8)"
           },
           {
             "bounds": [
@@ -1094,6 +1133,15 @@
               324.0,
               1224.9,
               342.0
+            ],
+            "target": "Theme(9)"
+          },
+          {
+            "bounds": [
+              496.404,
+              342.0,
+              1224.9,
+              360.0
             ],
             "target": "Theme(10)"
           },
@@ -1125,7 +1173,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 21,
+        "semantic_count": 22,
         "semantics": [
           {
             "bounds": [
@@ -1218,9 +1266,9 @@
               1224.9,
               162.0
             ],
-            "focus": null,
-            "label": "Theme 1",
-            "role": "ListItem",
+            "focus": "Settings",
+            "label": "Profile selector",
+            "role": "List",
             "state": ""
           },
           {
@@ -1231,7 +1279,7 @@
               180.0
             ],
             "focus": null,
-            "label": "Theme 2",
+            "label": "Theme 1",
             "role": "ListItem",
             "state": ""
           },
@@ -1243,7 +1291,7 @@
               198.0
             ],
             "focus": null,
-            "label": "Theme 3",
+            "label": "Theme 2",
             "role": "ListItem",
             "state": ""
           },
@@ -1255,7 +1303,7 @@
               216.0
             ],
             "focus": null,
-            "label": "Theme 4",
+            "label": "Theme 3",
             "role": "ListItem",
             "state": ""
           },
@@ -1267,7 +1315,7 @@
               234.0
             ],
             "focus": null,
-            "label": "Theme 5",
+            "label": "Theme 4",
             "role": "ListItem",
             "state": ""
           },
@@ -1279,7 +1327,7 @@
               252.0
             ],
             "focus": null,
-            "label": "Theme 6",
+            "label": "Theme 5",
             "role": "ListItem",
             "state": ""
           },
@@ -1291,7 +1339,7 @@
               270.0
             ],
             "focus": null,
-            "label": "Theme 7",
+            "label": "Theme 6",
             "role": "ListItem",
             "state": ""
           },
@@ -1303,7 +1351,7 @@
               288.0
             ],
             "focus": null,
-            "label": "Theme 8",
+            "label": "Theme 7",
             "role": "ListItem",
             "state": ""
           },
@@ -1315,7 +1363,7 @@
               306.0
             ],
             "focus": null,
-            "label": "Theme 9",
+            "label": "Theme 8",
             "role": "ListItem",
             "state": ""
           },
@@ -1327,7 +1375,7 @@
               324.0
             ],
             "focus": null,
-            "label": "Theme 10",
+            "label": "Theme 9",
             "role": "ListItem",
             "state": ""
           },
@@ -1337,6 +1385,18 @@
               324.0,
               1224.9,
               342.0
+            ],
+            "focus": null,
+            "label": "Theme 10",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              342.0,
+              1224.9,
+              360.0
             ],
             "focus": null,
             "label": "Theme 11",

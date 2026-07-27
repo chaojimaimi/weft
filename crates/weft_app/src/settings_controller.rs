@@ -30,7 +30,9 @@ impl App {
         self.refresh_settings_validation();
     }
 
-    fn refresh_settings_validation(&mut self) {
+    /// v1.5.1: `pub(super)` so `profiles_controller` can call this after a
+    /// profile transaction reseeds the Settings draft.
+    pub(super) fn refresh_settings_validation(&mut self) {
         self.settings.field_errors = validate_settings(&self.settings.draft);
         self.settings.error = (!self.settings.field_errors.is_empty()).then(|| {
             format!(
@@ -70,6 +72,22 @@ impl App {
             }
             Some(SettingsTarget::ApplyButton) => {
                 self.save_settings_draft(false);
+                self.request_redraw();
+            }
+            // v1.5.1: Profile toolbar clicks. The index is into the
+            // per-frame sorted profile view (Base at 0, profiles at 1..).
+            // Out-of-bounds is a no-op (the view may have shrunk between
+            // the hit test and this dispatch).
+            Some(SettingsTarget::ProfileEntry(i)) => {
+                self.handle_profile_entry_click(i);
+                self.request_redraw();
+            }
+            Some(SettingsTarget::ProfileCreate) => {
+                self.handle_profile_create_click();
+                self.request_redraw();
+            }
+            Some(SettingsTarget::ProfileDelete) => {
+                self.handle_profile_delete_click();
                 self.request_redraw();
             }
             None if !self.point_inside_settings_box(x, y) => {

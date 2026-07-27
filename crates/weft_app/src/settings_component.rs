@@ -22,6 +22,19 @@ pub(crate) enum SettingsTarget {
     CloseButton,
     /// Footer "⌘⏎ save" button.
     SaveButton,
+    /// v1.5.1: A profile entry in the Settings profile toolbar. The index
+    /// is into the per-frame sorted profile view (BTreeMap order). Click
+    /// resolves the name from the same view; an out-of-bounds index is a
+    /// no-op (safe hit test).
+    ProfileEntry(usize),
+    /// v1.5.1: The "New" button in the profile toolbar. Creates a new
+    /// profile with a default name and switches to it.
+    ProfileCreate,
+    /// v1.5.1: The "Delete" button in the profile toolbar. Deletes the
+    /// currently-active profile. The controller implements a two-click
+    /// confirmation: the first click sets a pending-delete state, the
+    /// second click within the same Settings session confirms.
+    ProfileDelete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,12 +116,17 @@ pub(crate) fn settings_value_x(
 /// `layout.max_rows`). `tabs` is the ordered list of settings categories.
 /// `cell_h` is the physical cell height (drives sidebar row heights).
 /// `active_tab` is the currently-selected sidebar category (for highlight).
+/// `profile_count` is the number of profile entries to register for hit
+/// testing in the v1.5.1 profile toolbar (0 hides the profile entry hits
+/// even when the toolbar rect is non-zero — the toolbar still draws the
+/// "Base" label and +/- buttons).
 pub(crate) fn build_settings_scene(
     layout: &SettingsLayout,
     tabs: &[SettingsTab],
     active_tab: SettingsTab,
     theme_count: usize,
     cell_h: f32,
+    profile_count: usize,
 ) -> Scene<SettingsTarget> {
     let mut scene = Scene::default();
     let [box_x0, _box_y0, _box_x1, _box_y1] = layout.box_rect;
@@ -145,6 +163,59 @@ pub(crate) fn build_settings_scene(
                 } else {
                     String::new()
                 },
+            });
+        }
+    }
+
+    // v1.5.1: Profile toolbar hit regions. The toolbar sits at the top of
+    // the content area (above `content_top`). Hit regions:
+    // - ProfileEntry(0..profile_count): click to switch to that profile.
+    //   The "Base" entry is index 0; profiles follow at 1..=profile_count.
+    // - ProfileCreate: the "+" button.
+    // - ProfileDelete: the "−" button.
+    //
+    // The hit regions are only registered when the content area is
+    // visible (wide mode or narrow content view). In narrow sidebar-only
+    // mode the toolbar is zero-sized and the buttons are None.
+    if layout.show_content {
+        let [tx0, ty0, tx1, ty1] = layout.profile_toolbar_rect;
+        if tx1 > tx0 {
+            // Profile entry hits: divide the toolbar (minus the button area
+            // on the right) into profile_count equal-width slots. Each slot
+            // is a click target. The renderer draws the names; here we only
+            // register the geometry.
+            if profile_count > 0 {
+                let btn_w = cell_h * 1.5;
+                let gap = cell_h * 0.5;
+                let buttons_total = btn_w * 2.0 + gap;
+                let entries_area_w = (tx1 - tx0 - buttons_total).max(0.0);
+                let slot_w = entries_area_w / profile_count as f32;
+                for i in 0..profile_count {
+                    let slot_x0 = tx0 + i as f32 * slot_w;
+                    let slot_x1 = slot_x0 + slot_w;
+                    scene.hits.push(HitRegion::from_rect(
+                        [slot_x0, ty0, slot_x1, ty1],
+                        SettingsTarget::ProfileEntry(i),
+                    ));
+                }
+            }
+            // + and − buttons.
+            if let Some(btn) = layout.profile_create_button {
+                scene
+                    .hits
+                    .push(HitRegion::from_rect(btn, SettingsTarget::ProfileCreate));
+            }
+            if let Some(btn) = layout.profile_delete_button {
+                scene
+                    .hits
+                    .push(HitRegion::from_rect(btn, SettingsTarget::ProfileDelete));
+            }
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::List,
+                label: "Profile selector".into(),
+                bounds: layout.profile_toolbar_rect,
+                focus: Some(FocusId::Settings),
+                state: String::new(),
             });
         }
     }
@@ -243,6 +314,8 @@ mod tests {
             tab_width: CELL_H,
             content_x0: 412.0,
             content_x1: 988.0,
+            // v1.5.1: content_top is pushed down by the profile toolbar
+            // (toolbar at 180-200, form rows start at 200).
             content_top: 200.0,
             max_rows: 20,
             footer_y: 670.0,
@@ -251,6 +324,10 @@ mod tests {
                 close: Some([400.0, 670.0, 460.0, 690.0]),
                 save: Some([600.0, 670.0, 680.0, 690.0]),
             },
+            // v1.5.1: profile toolbar sits above content_top.
+            profile_toolbar_rect: [412.0, 180.0, 988.0, 200.0],
+            profile_create_button: Some([938.0, 180.0, 958.0, 200.0]),
+            profile_delete_button: Some([968.0, 180.0, 988.0, 200.0]),
         }
     }
 
@@ -258,7 +335,7 @@ mod tests {
     fn sidebar_category_hit_returns_correct_variant() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
         // Row 1 (Terminal) starts at sidebar_top + 1*20 = 140 + 20 = 160
         assert_eq!(
             settings_target_at(&scene, 300.0, 165.0),
@@ -270,7 +347,7 @@ mod tests {
     fn active_sidebar_category_highlighted() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Keybindings, 0, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Keybindings, 0, CELL_H, 0);
         // Row 3 (Keybindings) starts at sidebar_top + 3*20 = 140 + 60 = 200
         assert_eq!(
             settings_target_at(&scene, 300.0, 205.0),
@@ -288,6 +365,7 @@ mod tests {
             SettingsTab::Appearance,
             0,
             CELL_H,
+            0,
         );
         for (label, bounds) in [
             ("Apply settings", layout.footer_buttons.apply.unwrap()),
@@ -307,7 +385,7 @@ mod tests {
     fn theme_row_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H, 0);
         // Row 2 starts at content_top + 2*20 = 200 + 40 = 240
         assert_eq!(
             settings_target_at(&scene, 500.0, 245.0),
@@ -322,7 +400,7 @@ mod tests {
         let tabs = SettingsTab::ALL.to_vec();
         let mut layout = sample_layout();
         layout.show_content = false;
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H, 0);
         // Clicking where a theme row would be returns None (content hidden).
         assert_eq!(settings_target_at(&scene, 500.0, 245.0), None);
     }
@@ -331,7 +409,7 @@ mod tests {
     fn footer_button_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
         assert_eq!(
             settings_target_at(&scene, 250.0, 680.0),
             Some(SettingsTarget::ApplyButton),
@@ -345,7 +423,7 @@ mod tests {
         let tabs = SettingsTab::ALL.to_vec();
         let mut layout = sample_layout();
         layout.show_sidebar = false;
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H);
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
         // Clicking where a sidebar row would be returns None (sidebar hidden).
         assert_eq!(settings_target_at(&scene, 300.0, 165.0), None);
     }
@@ -369,5 +447,97 @@ mod tests {
             settings_keycap_width("↓", cell_w)
         );
         assert!(settings_key_group_width(&["⌘", "⏎"], cell_w) > cell_w * 2.0);
+    }
+
+    // ── v1.5.1: Profile toolbar hit tests ────────────────────────────
+
+    #[test]
+    fn profile_entry_hit_returns_indexed_target() {
+        // With 3 profiles (Base + 2), the toolbar should register
+        // ProfileEntry(0), ProfileEntry(1), ProfileEntry(2) hit regions
+        // equally spaced across the entries area.
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 3);
+
+        // Compute slot bounds to verify each entry is hit-testable.
+        // Toolbar: [412.0, 180.0, 988.0, 200.0] → 576 wide.
+        // Buttons: 2 × (1.5 × 20) + 0.5 × 20 = 70 px → entries area = 506 px.
+        // 3 slots → each ~168.7 px wide.
+        let btn_w = CELL_H * 1.5;
+        let gap = CELL_H * 0.5;
+        let buttons_total = btn_w * 2.0 + gap;
+        let entries_area_w = (988.0 - 412.0 - buttons_total).max(0.0);
+        let slot_w = entries_area_w / 3.0;
+
+        // Center of each slot.
+        for i in 0..3 {
+            let cx = 412.0 + i as f32 * slot_w + slot_w * 0.5;
+            assert_eq!(
+                settings_target_at(&scene, cx, 190.0),
+                Some(SettingsTarget::ProfileEntry(i)),
+                "ProfileEntry({i}) should be hit-testable at center ({cx}, 190)"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_create_and_delete_buttons_hit_testable() {
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 2);
+
+        // "+" button at [938.0, 180.0, 958.0, 200.0]
+        assert_eq!(
+            settings_target_at(&scene, 948.0, 190.0),
+            Some(SettingsTarget::ProfileCreate),
+        );
+        // "−" button at [968.0, 180.0, 988.0, 200.0]
+        assert_eq!(
+            settings_target_at(&scene, 978.0, 190.0),
+            Some(SettingsTarget::ProfileDelete),
+        );
+    }
+
+    #[test]
+    fn profile_toolbar_skipped_when_content_hidden() {
+        // In narrow sidebar-only mode (show_content = false), the profile
+        // toolbar must not register any hit regions even if profile_count
+        // is non-zero — the caller skips the toolbar entirely.
+        let tabs = SettingsTab::ALL.to_vec();
+        let mut layout = sample_layout();
+        layout.show_content = false;
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 3);
+        // Clicking where the toolbar would be returns None.
+        assert_eq!(settings_target_at(&scene, 500.0, 190.0), None);
+        assert_eq!(settings_target_at(&scene, 948.0, 190.0), None);
+    }
+
+    #[test]
+    fn profile_entry_zero_count_skips_entry_hits_but_keeps_buttons() {
+        // When profile_count = 0, no ProfileEntry hit regions are
+        // registered, but the +/- buttons remain (the toolbar still
+        // draws the "Base" label and buttons).
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
+
+        // No ProfileEntry hits — clicking in the entries area returns None
+        // (the toolbar draws the Base label but it's not clickable as a
+        // profile entry when there are no profiles).
+        assert_eq!(
+            settings_target_at(&scene, 500.0, 190.0),
+            None,
+            "ProfileEntry(0) should NOT be registered when profile_count = 0"
+        );
+        // But the + and − buttons ARE registered.
+        assert_eq!(
+            settings_target_at(&scene, 948.0, 190.0),
+            Some(SettingsTarget::ProfileCreate),
+        );
+        assert_eq!(
+            settings_target_at(&scene, 978.0, 190.0),
+            Some(SettingsTarget::ProfileDelete),
+        );
     }
 }

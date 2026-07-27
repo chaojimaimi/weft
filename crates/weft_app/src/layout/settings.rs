@@ -50,6 +50,18 @@ pub struct SettingsLayout {
     pub footer_y: f32,
     /// Footer button rects (only clickable buttons; None if culled).
     pub footer_buttons: FooterButtonRects,
+    /// v1.5.1: Profile toolbar rect `[x0, y0, x1, y1]`. Zero-sized when
+    /// the content area is hidden (narrow sidebar-only view). The toolbar
+    /// sits at the top of the content area, above `content_top`, and
+    /// pushes the form rows down by one row height.
+    pub profile_toolbar_rect: Rect,
+    /// v1.5.1: Hit rect for the "New" (+) button in the profile toolbar.
+    /// `None` when the toolbar is hidden or the button is culled.
+    pub profile_create_button: Option<Rect>,
+    /// v1.5.1: Hit rect for the "Delete" (−) button in the profile toolbar.
+    /// `None` when the toolbar is hidden, no active profile to delete, or
+    /// the button is culled.
+    pub profile_delete_button: Option<Rect>,
 }
 
 /// F5: Narrow-window breakpoint (logical points). Below this, the settings
@@ -103,13 +115,11 @@ pub fn layout_settings(
     let footer_y = box_y1 - ch * 1.5;
     let content_bottom = footer_y - ch * 0.5;
     let content_base = area_top + ch * 0.5;
-    let content_top = if has_error {
+    let content_top_initial = if has_error {
         content_base + ch
     } else {
         content_base
     };
-    let content_h = (content_bottom - content_top).max(0.0);
-    let max_rows = (content_h / ch).max(1.0) as usize;
 
     // F5: sidebar rect. In narrow mode the sidebar spans the full box width.
     let sidebar_rect = if show_sidebar {
@@ -138,6 +148,32 @@ pub fn layout_settings(
         // Content hidden — degenerate bounds.
         (box_x1, box_x1)
     };
+
+    // v1.5.1: Profile toolbar occupies one row at the top of the content
+    // area. It pushes the form rows down by `ch` so they don't overlap.
+    // The toolbar is only drawn when the content area is visible — in
+    // narrow sidebar-only mode the toolbar is zero-sized.
+    let (profile_toolbar_rect, profile_create_button, profile_delete_button, content_top) =
+        if show_content {
+            let toolbar_y0 = content_top_initial;
+            let toolbar_y1 = content_top_initial + ch;
+            let toolbar = [content_x0, toolbar_y0, content_x1, toolbar_y1];
+            // "+" and "-" buttons sit at the right edge of the toolbar.
+            let btn_w = ch * 1.5;
+            let gap = ch * 0.5;
+            let create_btn = Some([
+                content_x1 - btn_w * 2.0 - gap,
+                toolbar_y0,
+                content_x1 - btn_w - gap,
+                toolbar_y1,
+            ]);
+            let delete_btn = Some([content_x1 - btn_w, toolbar_y0, content_x1, toolbar_y1]);
+            (toolbar, create_btn, delete_btn, toolbar_y1)
+        } else {
+            ([0.0; 4], None, None, content_top_initial)
+        };
+    let content_h = (content_bottom - content_top).max(0.0);
+    let max_rows = (content_h / ch).max(1.0) as usize;
 
     // Footer pair layout: left-to-right from content_x0, gap between pairs.
     // `footer_pair_widths` already includes the per-pair `inner` gap (key↔desc)
@@ -187,5 +223,8 @@ pub fn layout_settings(
         max_rows,
         footer_y,
         footer_buttons: FooterButtonRects { apply, close, save },
+        profile_toolbar_rect,
+        profile_create_button,
+        profile_delete_button,
     })
 }

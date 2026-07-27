@@ -49,6 +49,10 @@ impl App {
                 .map(|entry| match entry {
                     PaletteEntry::Workflow(workflow) => workflow.name.clone(),
                     PaletteEntry::Builtin(command) => command.label().to_string(),
+                    // v1.5.1: Profile entries render as "Switch Profile: <name>".
+                    PaletteEntry::Profile { name, .. } => {
+                        format!("Switch Profile: {name}")
+                    }
                 })
                 .collect(),
         };
@@ -791,6 +795,7 @@ impl App {
             self.settings.tab,
             theme_count,
             ch,
+            self.profile_names_sorted().len() + 1, // v1.5.1: +1 for "Base"
         );
         crate::settings_component::settings_target_at(&scene, x, y)
     }

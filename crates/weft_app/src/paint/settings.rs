@@ -230,29 +230,41 @@ impl MetalRenderer {
 
         // ── F5: Content area ─────────────────────────────────────────
         if layout.show_content {
-            let content_base = layout.content_top - if s.error.is_some() { ch } else { 0.0 };
-            let content_top = if let Some(err) = s.error {
-                let err_bg = [0.65, 0.18, 0.18, 1.0];
+            // v1.5.1: Profile toolbar at top, error banner above it.
+            self.draw_profile_toolbar(
+                &mut verts,
+                s.profiles,
+                layout.profile_toolbar_rect,
+                layout.profile_create_button,
+                layout.profile_delete_button,
+                cw,
+                ch,
+                bg_uv,
+                theme_bg,
+                fg,
+                label_c,
+                accent,
+                separator,
+            );
+            if let Some(err) = s.error {
+                let err_y = layout.profile_toolbar_rect[1] - ch;
                 push_quad(
                     &mut verts,
-                    [content_x0, content_base, content_x1, content_base + ch],
+                    [content_x0, err_y, content_x1, err_y + ch],
                     bg_uv,
                     [0.0; 4],
-                    err_bg,
+                    [0.65, 0.18, 0.18, 1.0],
                 );
-                let msg = format!("\u{26a0} {}", err);
                 self.push_text(
                     &mut verts,
                     content_x0 + cw * 0.3,
-                    content_base,
-                    &msg,
-                    [1.0, 1.0, 1.0, 1.0],
+                    err_y,
+                    &format!("\u{26a0} {err}"),
+                    [1.0; 4],
                     content_cols,
                 );
-                content_base + ch
-            } else {
-                content_base
-            };
+            }
+            let content_top = layout.content_top;
             let max_rows = layout.max_rows;
             let value_x = (content_x0 + cw * 14.0).min(content_x1 - cw * 8.0);
 
