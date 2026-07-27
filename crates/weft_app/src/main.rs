@@ -34,6 +34,7 @@ mod ime_event_controller;
 mod input_router;
 mod layout;
 mod lifecycle_controller;
+mod macos_file_dialog;
 mod macos_system;
 mod macos_window;
 mod menu;
@@ -63,6 +64,7 @@ mod snapshot_persistence;
 mod tab;
 mod tab_bar_component;
 mod terminal_geometry;
+mod transfer_controller;
 mod ui_tokens;
 mod window_event_controller;
 use app_state::{
@@ -100,6 +102,10 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes};
+// v1.5.2: MainThreadMarker is required by the macOS file panel wrappers
+// (NSOpenPanel/NSSavePanel must run on the main thread). Re-exported here
+// so `transfer_controller` can request it via `use super::*`.
+use objc2_foundation::MainThreadMarker;
 
 // Re-export helpers used by other modules so they can call `crate::foo()`.
 pub(crate) use app::helpers::{

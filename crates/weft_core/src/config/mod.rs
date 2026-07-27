@@ -45,6 +45,7 @@ mod profiles;
 mod save;
 mod sections;
 mod theme;
+mod transfer;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -73,6 +74,7 @@ pub use sections::{
     ThemeConfig, WindowConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{SyntaxColors, Theme};
+pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
 
 use self::save::{
     parse_existing, set_f32_if_diff, set_opt_string, set_string_if_diff, set_u32_if_diff,

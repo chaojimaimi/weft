@@ -90,6 +90,24 @@ impl App {
                 self.handle_profile_delete_click();
                 self.request_redraw();
             }
+            // v1.5.2: Advanced → Import/Export action rows. Click triggers
+            // the same flow as Enter (see `handle_settings_key`). The draft
+            // is NOT saved first — Import replaces the config atomically,
+            // and Export reads from the on-disk source file, not the draft.
+            Some(SettingsTarget::AdvancedImport) => {
+                self.settings.selection = 2;
+                if let Err(e) = self.import_config_interactive() {
+                    warn!(error = %e, "Settings: import panel failed");
+                }
+                self.request_redraw();
+            }
+            Some(SettingsTarget::AdvancedExport) => {
+                self.settings.selection = 3;
+                if let Err(e) = self.export_config_interactive() {
+                    warn!(error = %e, "Settings: export panel failed");
+                }
+                self.request_redraw();
+            }
             None if !self.point_inside_settings_box(x, y) => {
                 self.close_settings();
                 self.request_redraw();
@@ -217,8 +235,33 @@ impl App {
                         self.settings.selection = 0;
                     }
                     SettingsEnterAction::Apply => {
-                        self.apply_settings_selection();
-                        self.save_settings_draft(false);
+                        // v1.5.2: Advanced → Import/Export rows are action
+                        // buttons. They trigger the file panel directly
+                        // WITHOUT saving the draft first (Import replaces
+                        // the config atomically; Export reads from the
+                        // on-disk source file). All other rows follow the
+                        // usual apply + save flow.
+                        if self.settings.tab == SettingsTab::Advanced {
+                            match self.settings.selection {
+                                2 => {
+                                    if let Err(e) = self.import_config_interactive() {
+                                        warn!(error = %e, "Settings: import panel failed");
+                                    }
+                                }
+                                3 => {
+                                    if let Err(e) = self.export_config_interactive() {
+                                        warn!(error = %e, "Settings: export panel failed");
+                                    }
+                                }
+                                _ => {
+                                    self.apply_settings_selection();
+                                    self.save_settings_draft(false);
+                                }
+                            }
+                        } else {
+                            self.apply_settings_selection();
+                            self.save_settings_draft(false);
+                        }
                     }
                 }
                 self.request_redraw();
@@ -562,7 +605,7 @@ impl App {
             SettingsTab::Input => 1,    // Submit on Ctrl+Enter.
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
             SettingsTab::Window => 3,   // Width + Height + Sidebar Width.
-            SettingsTab::Advanced => 2, // Debug Logging + Experimental (placeholders).
+            SettingsTab::Advanced => 4, // Debug Logging + Experimental + Import + Export (v1.5.2).
         }
     }
 

@@ -497,8 +497,16 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Advanced => {
-                    let rows: [(&str, &str); 2] =
-                        [("Debug Logging:", "Off"), ("Experimental:", "Disabled")];
+                    // v1.5.2: Added Import Config / Export Config action rows.
+                    // The first two rows (Debug Logging, Experimental) carry
+                    // restart-required badges; the action rows carry a "▶"
+                    // glyph to signal that Enter triggers a panel.
+                    let rows: [(&str, &str); 4] = [
+                        ("Debug Logging:", "Off"),
+                        ("Experimental:", "Disabled"),
+                        ("Import Config:", "\u{25b6} Open\u{2026}"),
+                        ("Export Config:", "\u{25b6} Save\u{2026}"),
+                    ];
                     for (i, (label, value)) in rows.iter().enumerate() {
                         let row_y = content_top + i as f32 * ch;
                         let is_sel = i == s.selection;
@@ -521,20 +529,24 @@ impl MetalRenderer {
                             accent,
                             None,
                         );
-                        // Restart-required badge (↻).
-                        let val_w = cw * Self::text_col_width(value) as f32;
-                        let badge_x = value_x + val_w + cw * 2.5;
-                        let badge_cols = content_cols
-                            .saturating_sub(((badge_x - content_x0) / cw).max(0.0) as usize);
-                        if badge_cols > 5 {
-                            self.push_text(
-                                &mut verts,
-                                badge_x,
-                                row_y,
-                                "\u{21bb} restart",
-                                warning_c,
-                                badge_cols,
-                            );
+                        // Restart-required badge (↻) — only the first two
+                        // rows (Debug Logging, Experimental). The Import /
+                        // Export action rows don't need a restart.
+                        if i < 2 {
+                            let val_w = cw * Self::text_col_width(value) as f32;
+                            let badge_x = value_x + val_w + cw * 2.5;
+                            let badge_cols = content_cols
+                                .saturating_sub(((badge_x - content_x0) / cw).max(0.0) as usize);
+                            if badge_cols > 5 {
+                                self.push_text(
+                                    &mut verts,
+                                    badge_x,
+                                    row_y,
+                                    "\u{21bb} restart",
+                                    warning_c,
+                                    badge_cols,
+                                );
+                            }
                         }
                     }
                 }

@@ -220,7 +220,10 @@ impl App {
     /// The draft is re-seeded from `config_state.config` (effective) so
     /// any in-progress edits are discarded — switching profiles mid-edit
     /// would otherwise mix edits from two different profile contexts.
-    fn sync_settings_after_profile_change(&mut self) {
+    ///
+    /// v1.5.2: `pub(super)` so `transfer_controller` can reuse the same
+    /// Settings refresh after an import transaction.
+    pub(super) fn sync_settings_after_profile_change(&mut self) {
         if !self.settings.open {
             return;
         }

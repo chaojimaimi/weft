@@ -35,6 +35,8 @@ impl App {
             BuiltinCmd::SelectTheme,
             BuiltinCmd::ToggleBlockPanel,
             BuiltinCmd::ReloadConfig,
+            BuiltinCmd::ImportConfig,
+            BuiltinCmd::ExportConfig,
         ];
         for b in &builtins {
             let label = b.label();
@@ -612,6 +614,34 @@ impl App {
                     }
                     BuiltinCmd::ReloadConfig => {
                         self.execute_action(Action::ReloadConfig);
+                        self.close_palette();
+                    }
+                    BuiltinCmd::ImportConfig => {
+                        // v1.5.2: Show NSOpenPanel → import_config_document
+                        // → apply. Errors are surfaced via `settings.error`
+                        // (visible when Settings is open) and the status hint
+                        // (visible when Settings is closed).
+                        match self.import_config_interactive() {
+                            Ok(()) => info!("palette import succeeded"),
+                            Err(crate::macos_file_dialog::FilePanelError::NotMainThread) => {
+                                warn!("import panel must run on the main thread");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "palette import failed");
+                            }
+                        }
+                        self.close_palette();
+                    }
+                    BuiltinCmd::ExportConfig => {
+                        match self.export_config_interactive() {
+                            Ok(()) => info!("palette export succeeded"),
+                            Err(crate::macos_file_dialog::FilePanelError::NotMainThread) => {
+                                warn!("export panel must run on the main thread");
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "palette export failed");
+                            }
+                        }
                         self.close_palette();
                     }
                 }

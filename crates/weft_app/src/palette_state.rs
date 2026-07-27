@@ -42,6 +42,14 @@ pub(crate) enum BuiltinCmd {
     SelectTheme,
     ToggleBlockPanel,
     ReloadConfig,
+    /// v1.5.2: Show NSOpenPanel to pick a `.toml` config file and atomically
+    /// replace the current config (with backup). Wired in
+    /// `palette_controller::activate_palette_entry`.
+    ImportConfig,
+    /// v1.5.2: Show NSSavePanel to export the source config document to a
+    /// `.toml` file (preserving comments + unknown fields when the source
+    /// file exists).
+    ExportConfig,
 }
 
 impl BuiltinCmd {
@@ -51,6 +59,8 @@ impl BuiltinCmd {
             Self::SelectTheme => "Select Theme",
             Self::ToggleBlockPanel => "Toggle History Panel",
             Self::ReloadConfig => "Reload Config",
+            Self::ImportConfig => "Import Config",
+            Self::ExportConfig => "Export Config",
         }
     }
 
@@ -60,6 +70,8 @@ impl BuiltinCmd {
             Self::SelectTheme => "select-theme",
             Self::ToggleBlockPanel => "toggle-history-panel",
             Self::ReloadConfig => "reload-config",
+            Self::ImportConfig => "import-config",
+            Self::ExportConfig => "export-config",
         }
     }
 }

@@ -35,6 +35,12 @@ pub(crate) enum SettingsTarget {
     /// confirmation: the first click sets a pending-delete state, the
     /// second click within the same Settings session confirms.
     ProfileDelete,
+    /// v1.5.2: Advanced → "Import Config:" row. Enter triggers the
+    /// NSOpenPanel flow (see `App::import_config_interactive`).
+    AdvancedImport,
+    /// v1.5.2: Advanced → "Export Config:" row. Enter triggers the
+    /// NSSavePanel flow (see `App::export_config_interactive`).
+    AdvancedExport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -233,6 +239,37 @@ pub(crate) fn build_settings_scene(
                 label: format!("Theme {}", i + 1),
                 bounds: row_rect,
                 focus: None,
+                state: String::new(),
+            });
+        }
+    }
+
+    // v1.5.2: Advanced → Import/Export action rows. Rows 2 and 3 in the
+    // Advanced category trigger the NSOpenPanel/NSSavePanel flow on click
+    // (matching Enter on the selected row). The first two rows (Debug
+    // Logging, Experimental) are placeholders and don't register hits —
+    // Enter on them is a no-op, just like before.
+    if layout.show_content && active_tab == SettingsTab::Advanced {
+        for (i, target) in [
+            SettingsTarget::AdvancedImport,
+            SettingsTarget::AdvancedExport,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let row_idx = 2 + i; // rows 2 and 3
+            let row_y = layout.content_top + row_idx as f32 * cell_h;
+            let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+            scene.hits.push(HitRegion::from_rect(row_rect, *target));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::Button,
+                label: if i == 0 {
+                    "Import config".into()
+                } else {
+                    "Export config".into()
+                },
+                bounds: row_rect,
+                focus: Some(FocusId::Settings),
                 state: String::new(),
             });
         }
@@ -538,6 +575,65 @@ mod tests {
         assert_eq!(
             settings_target_at(&scene, 978.0, 190.0),
             Some(SettingsTarget::ProfileDelete),
+        );
+    }
+
+    /// v1.5.2: When the Advanced tab is active, the Import Config and
+    /// Export Config rows (at content_top + 2*cell_h and + 3*cell_h)
+    /// must register `AdvancedImport` / `AdvancedExport` hit targets.
+    /// The first two rows (Debug Logging, Experimental) are not
+    /// clickable — Enter on them is a no-op, matching pre-v1.5.2
+    /// behavior.
+    #[test]
+    fn advanced_tab_registers_import_export_hit_regions() {
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Advanced, 0, CELL_H, 0);
+        // sample_layout() has content_top = 200, CELL_H = 20.
+        // Row 0 (Debug Logging): y = 200 — no hit region.
+        // Row 1 (Experimental): y = 220 — no hit region.
+        // Row 2 (Import Config):  y = 240 — AdvancedImport.
+        // Row 3 (Export Config): y = 260 — AdvancedExport.
+        let content_x = (layout.content_x0 + layout.content_x1) / 2.0;
+        assert_eq!(
+            settings_target_at(&scene, content_x, 205.0),
+            None,
+            "Debug Logging row should not be clickable"
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 225.0),
+            None,
+            "Experimental row should not be clickable"
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 245.0),
+            Some(SettingsTarget::AdvancedImport),
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 265.0),
+            Some(SettingsTarget::AdvancedExport),
+        );
+    }
+
+    /// v1.5.2: Non-Advanced tabs must NOT register AdvancedImport /
+    /// AdvancedExport hit regions (the action rows only exist in the
+    /// Advanced category). This guards against the hit regions leaking
+    /// into other categories when the active tab changes.
+    #[test]
+    fn non_advanced_tabs_do_not_register_import_export_hits() {
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Terminal, 0, CELL_H, 0);
+        let content_x = (layout.content_x0 + layout.content_x1) / 2.0;
+        // Rows 2 and 3 in the Terminal tab are Padding X and Padding Y —
+        // they must not be mapped to AdvancedImport / AdvancedExport.
+        assert_ne!(
+            settings_target_at(&scene, content_x, 245.0),
+            Some(SettingsTarget::AdvancedImport)
+        );
+        assert_ne!(
+            settings_target_at(&scene, content_x, 265.0),
+            Some(SettingsTarget::AdvancedExport)
         );
     }
 }
