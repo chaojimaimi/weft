@@ -999,77 +999,149 @@ fn claude_like_clear_and_repaint_keeps_command_context_across_resizes() {
 
 #[test]
 fn zero_width_scalars_do_not_consume_grid_cells() {
+    // v1.6.0: width-0 scalars are appended to the previous cell's grapheme
+    // cluster in RowExtras instead of being replaced with U+FFFD/U+FF1F
+    // fallbacks. The cell's `character` keeps the lead scalar; the full
+    // cluster lives in extras. Consumers (selection, copy, renderer) consult
+    // extras when the EXTRA flag is set.
+
+    // e + combining acute → cell keeps 'e', cluster "e\u{0301}" in extras.
     let mut t = term();
     t.process("e\u{0301}X".as_bytes());
-    assert_eq!(t.grid().row_text(0), "\u{fffd}X");
+    assert_eq!(t.grid().row_text(0), "eX");
+    assert_eq!(t.grid().cell(0, 0).character, 'e');
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(0),
+        Some("e\u{0301}")
+    );
     assert_eq!(t.grid().cell(0, 1).character, 'X');
     assert_eq!(t.grid().cursor.col, 2);
 
+    // ZWJ emoji sequence (woman + ZWJ + microscope): the microscope joins
+    // the cluster via suppress_joined_scalar. Cluster is preserved in extras.
     let mut t = term();
     t.process("👩‍🔬Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().row_text(0), "👩Y");
+    assert_eq!(t.grid().cell(0, 0).character, '👩');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(0),
+        Some("👩\u{200d}🔬")
+    );
     assert_eq!(t.grid().cell(0, 2).character, 'Y');
     assert_eq!(t.grid().cursor.col, 3);
 
+    // VS16 promotes '*' from width 1 to width 2 — cell expands to Full.
     let mut t = term();
     t.process("*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().row_text(0), "*Y");
+    assert_eq!(t.grid().cell(0, 0).character, '*');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
     assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
     assert_eq!(t.grid().cell(0, 2).character, 'Y');
     assert_eq!(t.grid().cursor.col, 3);
 
+    // Skin tone modifier on emoji — appended to cluster, width unchanged.
     let mut t = term();
     t.process("👩🏽Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().row_text(0), "👩Y");
+    assert_eq!(t.grid().cell(0, 0).character, '👩');
+    assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().viewport[0].extras.grapheme_at(0), Some("👩🏽"));
     assert_eq!(t.grid().cell(0, 2).character, 'Y');
     assert_eq!(t.grid().cursor.col, 3);
 
+    // Regional indicator pair (flag) — second RI extends the first.
     let mut t = term();
     t.process("🇨🇳Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "\u{ff1f}Y");
+    assert_eq!(t.grid().row_text(0), "🇨Y");
+    assert_eq!(t.grid().cell(0, 0).character, '🇨');
+    assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().viewport[0].extras.grapheme_at(0), Some("🇨🇳"));
     assert_eq!(t.grid().cell(0, 2).character, 'Y');
     assert_eq!(t.grid().cursor.col, 3);
 
+    // ZWJ at end of line with no following scalar — stays in extras, cursor
+    // moves to next line on '\n', and 'B' prints normally at (1, 0).
     let mut t = term();
     t.process("A\u{200d}\nB".as_bytes());
-    assert_eq!(t.grid().cell(0, 0).character, '\u{fffd}');
+    assert_eq!(t.grid().cell(0, 0).character, 'A');
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(0),
+        Some("A\u{200d}")
+    );
     assert_eq!(t.grid().cell(1, 0).character, 'B');
 
+    // ZWJ with no previous cell — dropped.
     let mut t = term();
     t.process("\u{200d}B".as_bytes());
     assert_eq!(t.grid().cell(0, 0).character, 'B');
+    assert!(t.grid().viewport[0].extras.is_empty());
 
+    // ZWJ followed by cursor move then 'B': 'B' can't join the cluster
+    // (previous cell is blank after the move), so it prints normally.
     let mut t = term();
     t.process("A\u{200d}\x1b[2CB".as_bytes());
-    assert_eq!(t.grid().cell(0, 0).character, '\u{fffd}');
+    assert_eq!(t.grid().cell(0, 0).character, 'A');
+    assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(0),
+        Some("A\u{200d}")
+    );
     assert_eq!(t.grid().cell(0, 3).character, 'B');
 
+    // VS16 at line boundary (2-col grid): cluster width grows to 2 but
+    // there's no room to expand — cell stays width 1, cluster in extras.
+    // 'Y' wraps to the next line as usual.
     let mut t = Terminal::new(4, 2);
     t.process("A*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "A");
-    assert_eq!(t.grid().row_text(1), "\u{ff1f}");
-    assert_eq!(t.grid().row_text(2), "Y");
+    assert_eq!(t.grid().row_text(0), "A*");
+    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(1),
+        Some("*\u{fe0f}")
+    );
+    assert_eq!(t.grid().row_text(1), "Y");
+    assert_eq!(t.grid().row_text(2), "");
 
+    // Regional flag at line boundary (2-col grid): flag wraps to next row.
     let mut t = Terminal::new(4, 2);
     t.process("A🇨🇳Y".as_bytes());
     assert_eq!(t.grid().row_text(0), "A");
-    assert_eq!(t.grid().row_text(1), "\u{ff1f}");
+    assert_eq!(t.grid().row_text(1), "🇨");
+    assert!(t.grid().cell(1, 0).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().viewport[1].extras.grapheme_at(0), Some("🇨🇳"));
     assert_eq!(t.grid().row_text(2), "Y");
 
+    // VS16 at end of 4-col row: cluster width grows but can't expand inline.
     let mut t = Terminal::new(4, 4);
     t.process("ABC*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "ABC");
-    assert_eq!(t.grid().row_text(1), "\u{ff1f}Y");
-    assert_eq!(t.grid().cell(1, 2).character, 'Y');
+    assert_eq!(t.grid().row_text(0), "ABC*");
+    assert!(t.grid().cell(0, 3).flags.contains(CellFlags::EXTRA));
+    assert_eq!(
+        t.grid().viewport[0].extras.grapheme_at(3),
+        Some("*\u{fe0f}")
+    );
+    assert_eq!(t.grid().row_text(1), "Y");
 
+    // v1.6.0: overwriting a cell with '*' + VS16 no longer destroys the
+    // hyperlink on a different row. The v1.5 fallback mechanism replaced
+    // '*' with U+FF1F and wrapped it, overwriting (1, 0). The v1.6.0 path
+    // keeps '*' at (0, 1) with the cluster in extras, leaving (1, 0) intact.
     let mut t = Terminal::new(3, 2);
     t.process(b"\x1b[2;1H\x1b]8;;https://weft.dev/stale\x1b\\X\x1b]8;;\x1b\\");
     assert_eq!(t.hyperlinks().url_at(1, 0), Some("https://weft.dev/stale"));
     t.process("\x1b[1;2H*\u{fe0f}".as_bytes());
-    assert_eq!(t.grid().cell(1, 0).character, '\u{ff1f}');
-    assert_eq!(t.hyperlinks().url_at(1, 0), None);
+    assert_eq!(t.grid().cell(0, 1).character, '*');
+    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
+    assert_eq!(t.grid().cell(1, 0).character, 'X');
+    assert_eq!(t.hyperlinks().url_at(1, 0), Some("https://weft.dev/stale"));
     assert_eq!(t.hyperlinks().url_at(1, 1), None);
 }
 

@@ -4,6 +4,7 @@ mod cell;
 mod cursor;
 mod display;
 mod row;
+mod row_extras;
 mod scrollback;
 mod snapshot;
 pub use cell::{
@@ -12,6 +13,7 @@ pub use cell::{
 };
 pub use cursor::{Cursor, CursorStyle};
 pub use row::Row;
+pub use row_extras::{CellExtra, RowExtras};
 pub use scrollback::Scrollback;
 
 #[cfg(test)]
@@ -420,6 +422,7 @@ impl Grid {
         self.viewport[row].clear_wide_pair_at(col);
         for c in col..self.num_cols {
             self.viewport[row].cells[c].reset();
+            self.viewport[row].extras.clear_cell(c);
         }
         self.viewport[row].mark_dirty(self.num_cols - 1);
         // Clear all subsequent rows
@@ -427,6 +430,7 @@ impl Grid {
             for cell in &mut self.viewport[r].cells {
                 cell.reset();
             }
+            self.viewport[r].extras.clear();
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
     }
@@ -440,12 +444,14 @@ impl Grid {
             for cell in &mut self.viewport[r].cells {
                 cell.reset();
             }
+            self.viewport[r].extras.clear();
             self.viewport[r].mark_dirty(self.num_cols - 1);
         }
         // Clear from start of current line to cursor
         self.viewport[row].clear_wide_pair_at(col);
         for c in 0..=col {
             self.viewport[row].cells[c].reset();
+            self.viewport[row].extras.clear_cell(c);
         }
         self.viewport[row].mark_dirty(col);
     }
@@ -456,6 +462,7 @@ impl Grid {
             for cell in &mut row.cells {
                 cell.reset();
             }
+            row.extras.clear();
             row.mark_dirty(self.num_cols - 1);
         }
         // Note: does NOT reset cursor position (VT behavior)
@@ -474,6 +481,7 @@ impl Grid {
         self.viewport[row].clear_wide_pair_at(col);
         for c in col..self.num_cols {
             self.viewport[row].cells[c].reset();
+            self.viewport[row].extras.clear_cell(c);
         }
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
@@ -485,6 +493,7 @@ impl Grid {
         self.viewport[row].clear_wide_pair_at(col);
         for c in 0..=col {
             self.viewport[row].cells[c].reset();
+            self.viewport[row].extras.clear_cell(c);
         }
         self.viewport[row].mark_dirty(col);
     }
@@ -495,6 +504,7 @@ impl Grid {
         for cell in &mut self.viewport[row].cells {
             cell.reset();
         }
+        self.viewport[row].extras.clear();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
 
@@ -510,6 +520,7 @@ impl Grid {
         }
         for c in col..end {
             self.viewport[row].cells[c].reset();
+            self.viewport[row].extras.clear_cell(c);
         }
         if end > 0 {
             self.viewport[row].mark_dirty(end - 1);
@@ -706,6 +717,10 @@ impl Grid {
         for i in (col + shift..self.num_cols).rev() {
             cells[i] = std::mem::take(&mut cells[i - shift]);
         }
+        // v1.6.0: shift extras to match the cell shift.
+        self.viewport[row]
+            .extras
+            .shift_right(col, shift, self.num_cols);
         self.viewport[row].repair_wide_pairs();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }
@@ -721,6 +736,10 @@ impl Grid {
         for i in col..self.num_cols - shift {
             cells[i] = std::mem::take(&mut cells[i + shift]);
         }
+        // v1.6.0: shift extras to match the cell shift.
+        self.viewport[row]
+            .extras
+            .shift_left(col, shift, self.num_cols);
         self.viewport[row].repair_wide_pairs();
         self.viewport[row].mark_dirty(self.num_cols - 1);
     }

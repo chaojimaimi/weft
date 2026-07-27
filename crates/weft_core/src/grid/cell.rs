@@ -18,6 +18,11 @@ bitflags! {
         const CURSOR        = 0x0800;
         const SELECTION     = 0x1000;
         const HYPERLINK     = 0x2000;
+        /// v1.6.0: this cell has multi-scalar grapheme data in `RowExtras`.
+        /// Consumers (selection, copy, block capture, renderer) must consult
+        /// `RowExtras::grapheme_at(col)` when this bit is set; otherwise the
+        /// cell's `character` field is the whole cluster.
+        const EXTRA         = 0x4000;
     }
 }
 
@@ -110,7 +115,28 @@ pub enum CellWidth {
 /// Column width used by the terminal protocol. East Asian ambiguous symbols
 /// (box/block drawing, middle dot, ellipsis) stay one cell, matching xterm and
 /// the cursor math used by modern TUIs; CJK ideographs remain two cells.
+///
+/// v1.6.0: Emoji modifiers (U+1F3FB..U+1F3FF, Fitzpatrick skin tones) are
+/// treated as width 0 because they combine with the preceding emoji and
+/// must never consume a terminal column. `unicode_width` returns 2 for
+/// them (they're emoji-presentation by default), which is correct for
+/// isolated rendering but wrong for terminal grid layout.
+///
+/// v1.6.0: Regional indicator symbols (U+1F1E6..U+1F1FF) are treated as
+/// width 2 — they form flag emoji when paired (🇨🇳, 🇺🇸) and every major
+/// terminal renders them as double-width. `unicode_width` 0.2 returns 1
+/// (Neutral), which is the Unicode East Asian Width property but not the
+/// terminal convention.
 pub fn terminal_char_width(ch: char) -> usize {
+    // v1.6.0: Emoji modifiers combine with the preceding base emoji — they
+    // must not advance the cursor or occupy a cell.
+    if matches!(ch, '\u{1f3fb}'..='\u{1f3ff}') {
+        return 0;
+    }
+    // v1.6.0: Regional indicators are double-width in terminals (flags).
+    if matches!(ch, '\u{1f1e6}'..='\u{1f1ff}') {
+        return 2;
+    }
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 

@@ -3080,7 +3080,7 @@ dependencies = [
 
 [[package]]
 name = "weft_app"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "block",
  "core-foundation",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "weft_core"
-version = "1.5.3"
+version = "1.6.0"
 dependencies = [
  "bitflags 2.13.0",
  "nix",
@@ -3128,6 +3128,7 @@ dependencies = [
  "toml",
  "toml_edit 0.22.27",
  "tracing",
+ "unicode-segmentation",
  "unicode-width",
  "vte",
 ]

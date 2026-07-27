@@ -32,12 +32,19 @@ impl vte::Perform for Terminal {
         }
         self.capture_primary_screen_interrupt_print(c);
 
+        // v1.6.0: Handle the char after ZWJ. Instead of dropping it (v1.5
+        // behavior), append it to the previous cell's grapheme cluster so
+        // ZWJ emoji sequences (👩‍🔬, 👨‍👩‍👧) are preserved.
         if self.suppress_joined_scalar && terminal_char_width(c) > 0 {
             self.suppress_joined_scalar = false;
+            self.append_scalar_to_previous_cluster(c);
             return;
         }
+        self.suppress_joined_scalar = false;
 
-        let is_emoji_modifier = matches!(c, '\u{1f3fb}'..='\u{1f3ff}');
+        // v1.6.0: Regional indicator pair — second RI extends the first into
+        // a flag cluster (🇺🇸). The first RI already consumed 2 cells; the
+        // second RI appends to its extras without advancing the cursor.
         let is_regional_indicator = matches!(c, '\u{1f1e6}'..='\u{1f1ff}');
         let follows_regional_indicator = is_regional_indicator
             && self.previous_cell_position().is_some_and(|(row, col)| {
@@ -46,26 +53,31 @@ impl vte::Perform for Terminal {
                     '\u{1f1e6}'..='\u{1f1ff}'
                 )
             });
-        if is_emoji_modifier && self.replace_previous_grapheme(false) {
-            return;
-        }
-        if follows_regional_indicator && self.replace_previous_grapheme(true) {
+        if follows_regional_indicator && self.append_scalar_to_previous_cluster(c) {
             return;
         }
 
         // Cell stores one base scalar. Combining marks, ZWJ and variation
         // selectors therefore cannot be retained yet, but they must never
         // consume a terminal column or trigger a deferred wrap.
+        //
+        // v1.6.0: Width-0 scalars (combining marks, ZWJ, VS, emoji modifiers)
+        // are appended to the previous cell's RowExtras grapheme cluster
+        // instead of being replaced with U+FFFD/U+FF1F fallbacks. The cell's
+        // `character` keeps the lead scalar; the full cluster lives in extras.
         let scalar_width = if c.is_ascii() {
             1
         } else {
             terminal_char_width(c)
         };
         if scalar_width == 0 {
-            let replaced = self.replace_previous_grapheme(c == '\u{fe0f}');
-            if c == '\u{200d}' && replaced {
-                self.suppress_joined_scalar = true;
+            if self.append_scalar_to_previous_cluster(c) {
+                if c == '\u{200d}' {
+                    self.suppress_joined_scalar = true;
+                }
+                return;
             }
+            // No previous cell to extend — drop the combining scalar.
             return;
         }
 

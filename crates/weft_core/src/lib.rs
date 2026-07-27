@@ -6,6 +6,7 @@ pub mod complete;
 pub mod config;
 pub mod editor;
 pub mod find;
+pub mod grapheme;
 pub mod grid;
 pub mod hyperlink;
 pub mod input;

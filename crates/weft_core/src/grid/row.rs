@@ -3,6 +3,7 @@
 //! `dirty_occ` tracks the last modified cell index for efficient rendering.
 
 use super::cell::{Cell, CellFlags, CellWidth};
+use super::row_extras::RowExtras;
 
 #[derive(Clone)]
 pub struct Row {
@@ -10,6 +11,10 @@ pub struct Row {
     pub dirty_occ: usize,
     /// Whether this row has been wrapped from the previous line.
     pub wrapped: bool,
+    /// v1.6.0: sparse per-cell extension data for multi-scalar graphemes.
+    /// Empty for the common case (ASCII / single-scalar cells). Entries are
+    /// keyed by column index; see [`RowExtras`] for invariants.
+    pub extras: RowExtras,
 }
 
 impl Row {
@@ -18,6 +23,7 @@ impl Row {
             cells: vec![Cell::default(); cols],
             dirty_occ: 0,
             wrapped: false,
+            extras: RowExtras::new(),
         }
     }
 
@@ -56,6 +62,8 @@ impl Row {
             && self.cells[col - 1].width == CellWidth::Full
         {
             self.cells[col - 1].reset();
+            // v1.6.0: a cleared lead cell loses its multi-scalar cluster.
+            self.extras.clear_cell(col - 1);
             self.mark_dirty(col - 1);
         }
         if self.cells[col].width == CellWidth::Full
@@ -64,6 +72,9 @@ impl Row {
         {
             self.cells[col + 1].reset();
             self.mark_dirty(col + 1);
+            // v1.6.0: the lead cell at `col` is being cleared by the caller;
+            // drop its cluster too so it doesn't leak into a new char.
+            self.extras.clear_cell(col);
         }
     }
 
@@ -90,5 +101,7 @@ impl Row {
         }
         self.dirty_occ = 0;
         self.wrapped = false;
+        // v1.6.0: drop sparse grapheme extras — cleared cells have no cluster.
+        self.extras.clear();
     }
 }

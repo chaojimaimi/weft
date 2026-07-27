@@ -19,6 +19,7 @@ bitflags.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 unicode-width.workspace = true
+unicode-segmentation.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
