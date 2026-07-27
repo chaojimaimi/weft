@@ -334,18 +334,41 @@ fn styled_row(
     let mut text_overflow = false;
     let mut style_overflow = false;
     let mut style_spans_used = 0_usize;
-    for cell in row.cells.iter().take(last) {
+    for (col, cell) in row.cells.iter().take(last).enumerate() {
         if !cell.flags.contains(CellFlags::WIDE_SPACER) {
-            let character = if cell.character == '\0' {
-                ' '
+            // v1.6.0: contribute the full cluster string when EXTRA is set so
+            // block-captured output preserves combining marks, ZWJ emoji, and
+            // regional flags. Falls back to the lead `char` when extras are
+            // missing (defensive — should not happen if EXTRA is set).
+            let cluster: &str = if cell.flags.contains(CellFlags::EXTRA) {
+                row.extras.grapheme_at(col).unwrap_or("")
             } else {
-                cell.character
+                ""
             };
-            if text.len() + character.len_utf8() > text_budget {
+            let push_len = if cluster.is_empty() {
+                let c = if cell.character == '\0' {
+                    ' '
+                } else {
+                    cell.character
+                };
+                c.len_utf8()
+            } else {
+                cluster.len()
+            };
+            if text.len() + push_len > text_budget {
                 text_overflow = true;
                 break;
             }
-            text.push(character);
+            if cluster.is_empty() {
+                let c = if cell.character == '\0' {
+                    ' '
+                } else {
+                    cell.character
+                };
+                text.push(c);
+            } else {
+                text.push_str(cluster);
+            }
             if let Some(style_budget) = style_budget.filter(|_| !style_overflow) {
                 style_overflow = !push_color_span(
                     &mut foregrounds,

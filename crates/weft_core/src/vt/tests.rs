@@ -1008,7 +1008,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // e + combining acute → cell keeps 'e', cluster "e\u{0301}" in extras.
     let mut t = term();
     t.process("e\u{0301}X".as_bytes());
-    assert_eq!(t.grid().row_text(0), "eX");
+    // v1.6.0: row_text returns the full cluster string, not just the lead char.
+    assert_eq!(t.grid().row_text(0), "e\u{0301}X");
     assert_eq!(t.grid().cell(0, 0).character, 'e');
     assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
     assert_eq!(
@@ -1022,7 +1023,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // the cluster via suppress_joined_scalar. Cluster is preserved in extras.
     let mut t = term();
     t.process("👩‍🔬Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "👩Y");
+    // v1.6.0: row_text returns the full ZWJ cluster string.
+    assert_eq!(t.grid().row_text(0), "👩\u{200d}🔬Y");
     assert_eq!(t.grid().cell(0, 0).character, '👩');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
     assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
@@ -1036,7 +1038,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // VS16 promotes '*' from width 1 to width 2 — cell expands to Full.
     let mut t = term();
     t.process("*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "*Y");
+    // v1.6.0: row_text returns the full cluster including VS16.
+    assert_eq!(t.grid().row_text(0), "*\u{fe0f}Y");
     assert_eq!(t.grid().cell(0, 0).character, '*');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
     assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
@@ -1047,7 +1050,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // Skin tone modifier on emoji — appended to cluster, width unchanged.
     let mut t = term();
     t.process("👩🏽Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "👩Y");
+    // v1.6.0: row_text returns the full cluster including skin tone.
+    assert_eq!(t.grid().row_text(0), "👩🏽Y");
     assert_eq!(t.grid().cell(0, 0).character, '👩');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
     assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
@@ -1058,7 +1062,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // Regional indicator pair (flag) — second RI extends the first.
     let mut t = term();
     t.process("🇨🇳Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "🇨Y");
+    // v1.6.0: row_text returns the full flag cluster (both regional indicators).
+    assert_eq!(t.grid().row_text(0), "🇨🇳Y");
     assert_eq!(t.grid().cell(0, 0).character, '🇨');
     assert_eq!(t.grid().cell(0, 0).width, CellWidth::Full);
     assert!(t.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
@@ -1101,7 +1106,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // 'Y' wraps to the next line as usual.
     let mut t = Terminal::new(4, 2);
     t.process("A*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "A*");
+    // v1.6.0: row_text returns the full cluster including VS16.
+    assert_eq!(t.grid().row_text(0), "A*\u{fe0f}");
     assert!(t.grid().cell(0, 1).flags.contains(CellFlags::EXTRA));
     assert_eq!(
         t.grid().viewport[0].extras.grapheme_at(1),
@@ -1114,7 +1120,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     let mut t = Terminal::new(4, 2);
     t.process("A🇨🇳Y".as_bytes());
     assert_eq!(t.grid().row_text(0), "A");
-    assert_eq!(t.grid().row_text(1), "🇨");
+    // v1.6.0: row_text returns the full flag cluster.
+    assert_eq!(t.grid().row_text(1), "🇨🇳");
     assert!(t.grid().cell(1, 0).flags.contains(CellFlags::EXTRA));
     assert_eq!(t.grid().viewport[1].extras.grapheme_at(0), Some("🇨🇳"));
     assert_eq!(t.grid().row_text(2), "Y");
@@ -1122,7 +1129,8 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
     // VS16 at end of 4-col row: cluster width grows but can't expand inline.
     let mut t = Terminal::new(4, 4);
     t.process("ABC*\u{fe0f}Y".as_bytes());
-    assert_eq!(t.grid().row_text(0), "ABC*");
+    // v1.6.0: row_text returns the full cluster including VS16.
+    assert_eq!(t.grid().row_text(0), "ABC*\u{fe0f}");
     assert!(t.grid().cell(0, 3).flags.contains(CellFlags::EXTRA));
     assert_eq!(
         t.grid().viewport[0].extras.grapheme_at(3),

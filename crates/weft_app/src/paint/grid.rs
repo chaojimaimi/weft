@@ -229,7 +229,21 @@ impl MetalRenderer {
         let cache = self.grid_row_cache.borrow();
         let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
         for row_inst in cache.iter() {
-            batch.push_row(row_inst, &|ch| {
+            batch.push_row(row_inst, &|ch, cluster| {
+                // v1.6.0: multi-scalar graphemes (EXTRA flag) resolve via
+                // the cluster atlas path; single-scalar cells use the
+                // fast `atlas.get(ch)` path.
+                if let Some(cluster) = cluster {
+                    if let Some(glyph) = self.atlas.get_cluster(cluster) {
+                        let (u, v) = glyph.uv_origin;
+                        let (uw, vh) = glyph.uv_size;
+                        return [u, v + vh, u + uw, v];
+                    }
+                    // Cluster not yet rasterized — fall through to lead char
+                    // so the cell isn't blank. The rasterization will happen
+                    // asynchronously via get_or_rasterize_cluster on a later
+                    // frame (or the cluster is already in cache from warmup).
+                }
                 let ch_resolved = if ch == '\0' { ' ' } else { ch };
                 if let Some(glyph) = self.atlas.get(ch_resolved) {
                     let (u, v) = glyph.uv_origin;
@@ -313,7 +327,15 @@ impl MetalRenderer {
                 origin_x,
                 origin_y_base + row as f32 * ch,
             );
-            batch.push_row(&row_inst, &|ch| {
+            batch.push_row(&row_inst, &|ch, cluster| {
+                // v1.6.0: multi-scalar graphemes resolve via cluster atlas.
+                if let Some(cluster) = cluster {
+                    if let Some(glyph) = self.atlas.get_cluster(cluster) {
+                        let (u, v) = glyph.uv_origin;
+                        let (uw, vh) = glyph.uv_size;
+                        return [u, v + vh, u + uw, v];
+                    }
+                }
                 let ch_resolved = if ch == '\0' { ' ' } else { ch };
                 if let Some(glyph) = self.atlas.get(ch_resolved) {
                     let (u, v) = glyph.uv_origin;

@@ -77,6 +77,12 @@ impl Selection {
     }
 
     /// Extract the selected text from the grid.
+    ///
+    /// v1.6.0: cells tagged with `CellFlags::EXTRA` contribute their full
+    /// multi-scalar grapheme cluster via [`Grid::grapheme_at`]. Copy/paste
+    /// therefore preserves combining marks, ZWJ emoji sequences, regional
+    /// flags, and skin-tone modifiers — the user copies the same decomposed
+    /// string the renderer painted.
     pub fn text_from_grid(&self, grid: &Grid) -> String {
         let (tl, br) = self.ordered();
         // Clamp endpoints to valid grid bounds — a selection endpoint past the
@@ -118,6 +124,12 @@ impl Selection {
                         if cell.flags.contains(CellFlags::WIDE_SPACER) {
                             continue;
                         }
+                        if cell.flags.contains(CellFlags::EXTRA) {
+                            if let Some(cluster) = grid.grapheme_at(row, col) {
+                                result.push_str(cluster);
+                                continue;
+                            }
+                        }
                         result.push(cell.character);
                     }
 
@@ -133,9 +145,16 @@ impl Selection {
                 for row in tl.row..=br.row {
                     for col in tl.col..=br.col {
                         let cell = grid.cell(row, col);
-                        if !cell.flags.contains(CellFlags::WIDE_SPACER) {
-                            result.push(cell.character);
+                        if cell.flags.contains(CellFlags::WIDE_SPACER) {
+                            continue;
                         }
+                        if cell.flags.contains(CellFlags::EXTRA) {
+                            if let Some(cluster) = grid.grapheme_at(row, col) {
+                                result.push_str(cluster);
+                                continue;
+                            }
+                        }
+                        result.push(cell.character);
                     }
                     if row < br.row {
                         result.push('\n');

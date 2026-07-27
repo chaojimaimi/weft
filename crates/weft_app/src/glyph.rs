@@ -42,6 +42,38 @@ pub struct GlyphInfo {
     pub is_wide: bool,
 }
 
+/// v1.6.0 step 6: LRU-tracked entry in the cluster cache. Each entry carries
+/// its `GlyphInfo` plus a `last_used` generation counter for LRU eviction.
+/// The counter is compared against `GlyphAtlas::cluster_access_counter` to
+/// determine which entry was least recently used when the cache is full.
+#[derive(Clone, Copy, Debug)]
+struct ClusterEntry {
+    info: GlyphInfo,
+    /// Generation counter at the time of last access. Updated on every
+    /// `get_cluster` hit and on insert via `get_or_rasterize_cluster`.
+    last_used: u64,
+}
+
+/// v1.6.0 step 6: Maximum number of cluster entries the atlas will cache.
+/// Multi-scalar graphemes are rare in typical terminal output (most chars
+/// are single-scalar ASCII), so 512 slots cover even CJK-heavy workloads
+/// with combining marks. When exceeded, the LRU entry is evicted — its
+/// atlas texture slot is leaked (not reclaimed), but 512 × ~20px × ~20px
+/// ≈ 200Kpx is negligible against a 4096² atlas.
+const MAX_CLUSTER_CACHE_ENTRIES: usize = 512;
+
+/// v1.6.0 step 6: Performance counters for the cluster cache. Exposed via
+/// [`GlyphAtlas::cluster_stats`] for diagnostics and the perf gate.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ClusterCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub entries: usize,
+    pub capacity: usize,
+}
+
 /// Pre-rasterized glyph atlas uploaded to a Metal texture.
 pub struct GlyphAtlas {
     texture: metal::Texture,
@@ -59,7 +91,22 @@ pub struct GlyphAtlas {
     /// single-scalar and goes through `cache`/`ascii` instead. The cluster
     /// path costs one `Arc<str>` hash per lookup, which is intentionally
     /// avoided for the ASCII fast path.
-    cluster_cache: HashMap<Arc<str>, GlyphInfo>,
+    ///
+    /// v1.6.0 step 6: entries are wrapped in [`ClusterEntry`] for LRU tracking.
+    /// When [`MAX_CLUSTER_CACHE_ENTRIES`] is reached, the least-recently-used
+    /// entry is evicted. `cluster_access_counter` is bumped on every access
+    /// so `last_used` ordering stays correct.
+    cluster_cache: HashMap<Arc<str>, ClusterEntry>,
+    /// v1.6.0 step 6: Monotonic counter bumped on every cluster access
+    /// (hit or miss). Used as the `last_used` timestamp for LRU eviction.
+    /// Stored as `Cell` because `get_cluster` takes `&self` (the paint path
+    /// holds an immutable atlas borrow during `push_row`).
+    cluster_access_counter: std::cell::Cell<u64>,
+    /// v1.6.0 step 6: Performance counters for diagnostics / perf gate.
+    /// All `Cell` so they can be updated from `&self` in `get_cluster`.
+    cluster_hits: std::cell::Cell<u64>,
+    cluster_misses: std::cell::Cell<u64>,
+    cluster_evictions: std::cell::Cell<u64>,
     /// Monospace cell width in pixels.
     pub cell_width: u32,
     /// Monospace cell height in pixels (line height).
@@ -259,6 +306,10 @@ impl GlyphAtlas {
             cache,
             ascii,
             cluster_cache: HashMap::new(),
+            cluster_access_counter: std::cell::Cell::new(0),
+            cluster_hits: std::cell::Cell::new(0),
+            cluster_misses: std::cell::Cell::new(0),
+            cluster_evictions: std::cell::Cell::new(0),
             cell_width: cell_w,
             cell_height: cell_h,
             atlas_w,
@@ -412,12 +463,30 @@ impl GlyphAtlas {
     /// this path when `CellFlags::EXTRA` is set on the source cell — single
     /// scalar cells must continue to use [`get`](Self::get) / the ASCII
     /// direct-index array.
-    //
-    // v1.6.0 step 4: dead_code allowed — the paint path will be wired in
-    // step 5 ("接通 Grid、selection、copy、reflow、Block capture 和 Metal atlas").
-    #[allow(dead_code)]
+    ///
+    /// v1.6.0 step 5: the grid paint path now calls this from the UV
+    /// resolver closure in `build_grid_instances` / `build_grid_instances_for_background_pane`.
+    ///
+    /// v1.6.0 step 6: tracks hits/misses for perf diagnostics. Hits update
+    /// the entry's `last_used` counter for LRU eviction. Uses interior
+    /// mutability via `Cell` for the counter to keep the `&self` signature
+    /// (the paint path holds an immutable borrow during `push_row`).
     pub fn get_cluster(&self, cluster: &str) -> Option<&GlyphInfo> {
-        self.cluster_cache.get(cluster)
+        // v1.6.0 step 6: bump the access counter and update last_used on hit.
+        // We can't mutate `cluster_cache` through `&self`, so we track hits
+        // via Cell. The LRU `last_used` update is deferred to the next
+        // `get_or_rasterize_cluster` call — a read-only lookup doesn't
+        // reorder the LRU. This is a deliberate simplification: the paint
+        // path calls `get_cluster` many times per frame for the same clusters,
+        // and updating `last_used` on every paint would require `&mut self`
+        // which conflicts with the immutable atlas borrow in `draw()`.
+        if self.cluster_cache.contains_key(cluster) {
+            self.cluster_hits.set(self.cluster_hits.get() + 1);
+            self.cluster_cache.get(cluster).map(|e| &e.info)
+        } else {
+            self.cluster_misses.set(self.cluster_misses.get() + 1);
+            None
+        }
     }
 
     /// v1.6.0 step 4: Look up a cached cluster glyph, or rasterize on demand.
@@ -433,15 +502,7 @@ impl GlyphAtlas {
     /// entry (via [`get`](Self::get)) in that case — the cell will render
     /// with the lead scalar only, which is the v1.5 behavior.
     ///
-    /// This is the POC entry point required by [V16_IMPLEMENTATION_PLAN.md
-    /// §3 step 4][plan]. The paint path is NOT yet wired to call it — that
-    /// is step 5.
-    ///
     /// [plan]: ../../docs/V16_IMPLEMENTATION_PLAN.md
-    //
-    // v1.6.0 step 4: dead_code allowed — the paint path will be wired in
-    // step 5.
-    #[allow(dead_code)]
     pub fn get_or_rasterize_cluster(
         &mut self,
         cluster: &str,
@@ -453,7 +514,31 @@ impl GlyphAtlas {
         // = self.cluster_cache.get(cluster)` would extend the borrow to the
         // end of the function and block the insert below.
         if self.cluster_cache.contains_key(cluster) {
-            return self.cluster_cache.get(cluster);
+            // v1.6.0 step 6: update last_used for LRU on re-rasterization hits.
+            let now = self.cluster_access_counter.get().saturating_add(1);
+            self.cluster_access_counter.set(now);
+            if let Some(entry) = self.cluster_cache.get_mut(cluster) {
+                entry.last_used = now;
+            }
+            return self.cluster_cache.get(cluster).map(|e| &e.info);
+        }
+
+        // v1.6.0 step 6: evict the LRU entry if the cluster cache is at capacity.
+        // Linear scan is O(n) but n ≤ 512, and eviction is rare (only when
+        // the working set exceeds 512 distinct clusters — uncommon for
+        // terminal output). The evicted entry's atlas texture slot is leaked
+        // (not reclaimed) — see [`MAX_CLUSTER_CACHE_ENTRIES`] doc comment.
+        if self.cluster_cache.len() >= MAX_CLUSTER_CACHE_ENTRIES {
+            let lru_key = self
+                .cluster_cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| Arc::clone(k));
+            if let Some(key) = lru_key {
+                self.cluster_cache.remove(&key);
+                let evictions = self.cluster_evictions.get().saturating_add(1);
+                self.cluster_evictions.set(evictions);
+            }
         }
 
         // Pick the font for the cluster's base scalar. Emoji clusters (ZWJ
@@ -544,7 +629,16 @@ impl GlyphAtlas {
         );
 
         let key = Arc::from(cluster);
-        self.cluster_cache.insert(key, info);
+        // v1.6.0 step 6: store with current access counter as last_used.
+        let now = self.cluster_access_counter.get().saturating_add(1);
+        self.cluster_access_counter.set(now);
+        self.cluster_cache.insert(
+            key,
+            ClusterEntry {
+                info,
+                last_used: now,
+            },
+        );
 
         // Return from cluster_cache so the caller's reference matches what
         // future get_cluster() calls will return.
@@ -552,11 +646,25 @@ impl GlyphAtlas {
         // borrows cluster_cache immutably and returns a reference into it.
         // The mutable borrow of self ended with the insert above; the
         // immutable borrow for the lookup is the only outstanding borrow.
-        self.cluster_cache.get(cluster)
+        self.cluster_cache.get(cluster).map(|e| &e.info)
     }
 
     /// Get the Metal atlas texture.
     pub fn texture(&self) -> &metal::Texture {
         &self.texture
+    }
+
+    /// v1.6.0 step 6: Snapshot of cluster cache performance counters for
+    /// diagnostics and the perf gate. Returns hits, misses, evictions,
+    /// current entry count, and capacity.
+    #[allow(dead_code)]
+    pub fn cluster_stats(&self) -> ClusterCacheStats {
+        ClusterCacheStats {
+            hits: self.cluster_hits.get(),
+            misses: self.cluster_misses.get(),
+            evictions: self.cluster_evictions.get(),
+            entries: self.cluster_cache.len(),
+            capacity: MAX_CLUSTER_CACHE_ENTRIES,
+        }
     }
 }

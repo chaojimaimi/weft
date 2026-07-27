@@ -41,11 +41,26 @@ impl MetalRenderer {
         // Collect unique on-screen GRID + panel characters not yet in the
         // atlas, then rasterize each exactly once.
         let mut missing = HashSet::new();
+        // v1.6.0: also collect multi-scalar grapheme cluster strings from
+        // cells with CellFlags::EXTRA. These are rasterized via the
+        // cluster atlas path (CoreText CTLine shaping) rather than the
+        // single-scalar fast path. The tuple is (cluster, base_char, is_wide).
+        let mut missing_clusters: HashSet<(String, char, bool)> = HashSet::new();
         for row in 0..grid.num_rows {
             for col in 0..grid.num_cols {
-                let ch = grid.cell(row, col).character;
+                let cell = grid.cell(row, col);
+                let ch = cell.character;
                 if ch != '\0' && ch != ' ' && atlas.get(ch).is_none() {
                     missing.insert(ch);
+                }
+                // v1.6.0: collect cluster strings for multi-scalar graphemes.
+                if cell.flags.contains(weft_core::grid::CellFlags::EXTRA) {
+                    if let Some(cluster) = grid.grapheme_at(row, col) {
+                        if atlas.get_cluster(cluster).is_none() {
+                            let is_wide = cell.width == weft_core::grid::CellWidth::Full;
+                            missing_clusters.insert((cluster.to_string(), ch, is_wide));
+                        }
+                    }
                 }
             }
         }
@@ -171,6 +186,13 @@ impl MetalRenderer {
         missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
         for ch in &missing {
             atlas.get_or_rasterize(*ch);
+        }
+        // v1.6.0: rasterize multi-scalar grapheme clusters via the CoreText
+        // cluster path. Each unique cluster string is shaped once and cached
+        // in `cluster_cache`. The paint path's UV resolver will then find
+        // them via `get_cluster`.
+        for (cluster, base_char, is_wide) in &missing_clusters {
+            atlas.get_or_rasterize_cluster(cluster, *base_char, *is_wide);
         }
     }
 }

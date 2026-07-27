@@ -5,6 +5,10 @@ impl Grid {
     /// scrollback offset. Accessibility and other viewport consumers must use
     /// this instead of [`row_text`](Self::row_text), which intentionally reads
     /// only the live buffer for shell-marker snapshots.
+    ///
+    /// v1.6.0: cells tagged with `CellFlags::EXTRA` contribute their full
+    /// multi-scalar grapheme cluster via [`Grid::grapheme_at`], so accessibility
+    /// reads the same decomposed string the renderer paints.
     pub fn displayed_row_text(&self, row: usize) -> String {
         if row >= self.num_rows {
             return String::new();
@@ -21,6 +25,12 @@ impl Grid {
             let cell = self.cell(row, col);
             if cell.flags.contains(CellFlags::WIDE_SPACER) {
                 continue;
+            }
+            if cell.flags.contains(CellFlags::EXTRA) {
+                if let Some(cluster) = self.grapheme_at(row, col) {
+                    out.push_str(cluster);
+                    continue;
+                }
             }
             out.push(if cell.character == '\0' {
                 ' '

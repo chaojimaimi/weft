@@ -51,14 +51,33 @@ pub struct RegexError(pub String);
 /// search (v0.9 U-P1). Contains only `(char, width)` per cell — skips
 /// color/flags/dirty/etc., ~60% smaller than a full `Grid` clone.
 ///
+/// v1.6.0: rows now carry an optional `cluster` string per cell for
+/// multi-scalar graphemes (e + combining acute, ZWJ emoji, regional flags).
+/// When `cluster` is `Some`, search matches against the cluster string;
+/// otherwise it falls back to the lead `char`. The cluster is stored as
+/// `Arc<str>` so the snapshot stays `Send` without cloning the string per
+/// row.
+///
 /// Row indexing matches the unified scheme used by `find_in_grid`:
 /// `rows[0]` = oldest scrollback line, `rows[sb_len - 1]` = newest
 /// scrollback line, `rows[sb_len]` = viewport row 0, etc.
 #[derive(Clone, Debug)]
 pub struct FindSnapshot {
-    /// `(char, cell_width)` per cell, skip WIDE_SPACER. `cell_width` ∈ {0,1,2}.
-    pub rows: Vec<Vec<(char, u8)>>,
+    /// `(char, cell_width, Option<cluster>)` per cell, skip WIDE_SPACER.
+    /// `cell_width` ∈ {0,1,2}. `cluster` is `Some` when the cell has
+    /// `CellFlags::EXTRA` and a `RowExtras` grapheme entry.
+    pub rows: Vec<Vec<FindSnapshotCell>>,
     pub num_cols: usize,
+}
+
+/// v1.6.0: A single cell in a [`FindSnapshot`]. Carries the lead `char`,
+/// its terminal width (1 or 2), and an optional multi-scalar cluster string.
+/// `cluster` is `Some` only when `CellFlags::EXTRA` is set on the source cell.
+#[derive(Clone, Debug)]
+pub struct FindSnapshotCell {
+    pub ch: char,
+    pub width: u8,
+    pub cluster: Option<std::sync::Arc<str>>,
 }
 
 impl Grid {
@@ -71,22 +90,26 @@ impl Grid {
         let total = sb_len + self.num_rows;
         let mut rows = Vec::with_capacity(total);
         for unified in 0..total {
-            let mut row_chars: Vec<(char, u8)> = Vec::with_capacity(self.num_cols);
+            let mut row_chars: Vec<FindSnapshotCell> = Vec::with_capacity(self.num_cols);
             // Borrow the right row: scrollback.get for history, viewport for live.
-            let cells: Vec<crate::grid::Cell> = if unified < sb_len {
-                self.scrollback
-                    .get(unified)
-                    .map(|r| r.cells.clone())
-                    .unwrap_or_default()
-            } else {
-                let vp = unified - sb_len;
-                if vp < self.viewport.len() {
-                    self.viewport[vp].cells.clone()
+            let (cells, extras): (Vec<crate::grid::Cell>, crate::grid::RowExtras) =
+                if unified < sb_len {
+                    self.scrollback
+                        .get(unified)
+                        .map(|r| (r.cells.clone(), r.extras.clone()))
+                        .unwrap_or_default()
                 } else {
-                    Vec::new()
-                }
-            };
-            for cell in cells {
+                    let vp = unified - sb_len;
+                    if vp < self.viewport.len() {
+                        (
+                            self.viewport[vp].cells.clone(),
+                            self.viewport[vp].extras.clone(),
+                        )
+                    } else {
+                        (Vec::new(), crate::grid::RowExtras::default())
+                    }
+                };
+            for (col, cell) in cells.into_iter().enumerate() {
                 if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
                     continue;
                 }
@@ -100,7 +123,16 @@ impl Grid {
                 } else {
                     cell.character
                 };
-                row_chars.push((c, w));
+                let cluster = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
+                    extras.grapheme_at(col).map(std::sync::Arc::<str>::from)
+                } else {
+                    None
+                };
+                row_chars.push(FindSnapshotCell {
+                    ch: c,
+                    width: w,
+                    cluster,
+                });
             }
             rows.push(row_chars);
         }
@@ -161,21 +193,34 @@ pub fn find_in_grid(
     let sb_len = grid.scrollback_len();
     let total_rows = sb_len + grid.num_rows;
 
-    // Helper: build the char stream for a unified row.
-    let build_chars = |unified_row: usize| -> Vec<(char, usize, usize)> {
-        let mut chars: Vec<(char, usize, usize)> = Vec::with_capacity(grid.num_cols);
-        let cells: Vec<crate::grid::Cell> = if unified_row < sb_len {
-            grid.scrollback
-                .get(unified_row)
-                .map(|r| r.cells.to_vec())
-                .unwrap_or_default()
-        } else {
-            let vp_row = unified_row - sb_len;
-            if vp_row >= grid.viewport.len() {
-                return chars;
-            }
-            grid.viewport[vp_row].cells.to_vec()
-        };
+    // Helper: build the per-cell token stream for a unified row. Each token
+    // carries either the multi-scalar cluster string (when EXTRA is set) or
+    // the lead `char` alone. The substring path compares token-by-token; the
+    // regex path concatenates tokens into a line string.
+    //
+    // v1.6.0: previously this returned `(char, col, width)`; now it returns
+    // `(String, col, width)` so multi-scalar clusters participate in matches.
+    // The String is small (1 char in the common case) so the per-row alloc
+    // cost is bounded; for ASCII-heavy rows the compiler optimizes the
+    // allocation away in practice.
+    let build_tokens = |unified_row: usize| -> Vec<(String, usize, usize)> {
+        let mut tokens: Vec<(String, usize, usize)> = Vec::with_capacity(grid.num_cols);
+        let (cells, extras): (Vec<crate::grid::Cell>, crate::grid::RowExtras) =
+            if unified_row < sb_len {
+                grid.scrollback
+                    .get(unified_row)
+                    .map(|r| (r.cells.to_vec(), r.extras.clone()))
+                    .unwrap_or_default()
+            } else {
+                let vp_row = unified_row - sb_len;
+                if vp_row >= grid.viewport.len() {
+                    return tokens;
+                }
+                (
+                    grid.viewport[vp_row].cells.to_vec(),
+                    grid.viewport[vp_row].extras.clone(),
+                )
+            };
         for (col, cell) in cells.into_iter().enumerate() {
             if cell.flags.contains(crate::grid::CellFlags::WIDE_SPACER) {
                 continue;
@@ -190,41 +235,50 @@ pub fn find_in_grid(
             } else {
                 cell.character
             };
-            let c = if case_sensitive {
-                c
+            // v1.6.0: prefer the multi-scalar cluster string when present.
+            let s: String = if cell.flags.contains(crate::grid::CellFlags::EXTRA) {
+                extras
+                    .grapheme_at(col)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| c.to_string())
             } else {
-                c.to_ascii_lowercase()
+                c.to_string()
             };
-            chars.push((c, col, w));
+            let s = if case_sensitive { s } else { s.to_lowercase() };
+            tokens.push((s, col, w));
         }
-        chars
+        tokens
     };
 
     'outer: for unified_row in 0..total_rows {
-        let chars = build_chars(unified_row);
-        if chars.is_empty() {
+        let tokens = build_tokens(unified_row);
+        if tokens.is_empty() {
             continue;
         }
 
         if let Some(re) = &re {
-            // Regex path: build the line string (lowercased if
-            // case-insensitive) and run find_iter.
-            let line_str: String = chars.iter().map(|(c, _, _)| *c).collect();
+            // Regex path: build the line string by concatenating tokens.
+            let line_str: String = tokens.iter().map(|(s, _, _)| s.as_str()).collect();
             for m in re.find_iter(&line_str) {
-                let start_char = m.start();
-                let end_char = m.end();
-                // Map char indices back to (col, width).
-                let mut char_pos = 0;
+                let start_byte = m.start();
+                let end_byte = m.end();
+                // Map byte offsets back to token indices, then to (col, width).
+                let mut byte_pos = 0;
                 let mut start_col = 0;
                 let mut len = 0;
-                for (c, col, w) in &chars {
-                    if char_pos == start_char {
+                let mut in_match = false;
+                for (s, col, w) in &tokens {
+                    if byte_pos == start_byte {
                         start_col = *col;
+                        in_match = true;
                     }
-                    if char_pos >= start_char && char_pos < end_char {
+                    if in_match && byte_pos < end_byte {
                         len += *w;
                     }
-                    char_pos += c.len_utf8();
+                    if byte_pos + s.len() >= end_byte && in_match {
+                        in_match = false;
+                    }
+                    byte_pos += s.len();
                 }
                 matches.push(FindMatch {
                     row: unified_row,
@@ -236,22 +290,42 @@ pub fn find_in_grid(
                 }
             }
         } else {
-            // Substring path (existing logic).
+            // Substring path: build a flat char stream + per-char → (col, w)
+            // back-pointers so a match can be mapped back to its originating
+            // cells. A multi-scalar token expands to multiple chars that all
+            // share the same (col, w) — the match length in cells is the sum
+            // of the widths of the *distinct* cells the match spans.
+            let mut line_chars: Vec<char> = Vec::with_capacity(tokens.len());
+            let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+            for (s, col, w) in &tokens {
+                for ch in s.chars() {
+                    line_chars.push(ch);
+                    char_to_cell.push((*col, *w));
+                }
+            }
+
             let mut i = 0;
-            while i + needle_chars.len() <= chars.len() {
-                let matches_here = chars[i..i + needle_chars.len()]
+            while i + needle_chars.len() <= line_chars.len() {
+                let matches_here = line_chars[i..i + needle_chars.len()]
                     .iter()
                     .zip(needle_chars.iter())
-                    .all(|((c, _, _), n)| c == n);
+                    .all(|(c, n)| *c == *n);
                 if matches_here {
-                    let col = chars[i].1;
-                    let len: usize = chars[i..i + needle_chars.len()]
-                        .iter()
-                        .map(|(_, _, w)| *w)
-                        .sum();
+                    let start_col = char_to_cell[i].0;
+                    // Sum widths of distinct cells covered by
+                    // [i, i+needle_chars.len()). A multi-scalar cluster
+                    // contributes multiple chars but only one cell width.
+                    let mut len = 0;
+                    let mut prev_col: Option<usize> = None;
+                    for &(c_col, c_w) in char_to_cell.iter().skip(i).take(needle_chars.len()) {
+                        if prev_col != Some(c_col) {
+                            len += c_w;
+                            prev_col = Some(c_col);
+                        }
+                    }
                     matches.push(FindMatch {
                         row: unified_row,
-                        col,
+                        col: start_col,
                         len,
                     });
                     if matches.len() >= MAX_MATCHES {
@@ -305,18 +379,47 @@ pub fn find_in_snapshot(
 
     let mut matches = Vec::with_capacity(64);
 
-    'outer: for (unified_row, chars) in snapshot.rows.iter().enumerate() {
-        if chars.is_empty() {
+    'outer: for (unified_row, cells) in snapshot.rows.iter().enumerate() {
+        if cells.is_empty() {
             continue;
         }
 
-        if let Some(re) = &re {
-            // Regex path. Build a lowercase line string if case-insensitive.
-            let line_str: String = if case_sensitive {
-                chars.iter().map(|(c, _)| *c).collect()
+        // v1.6.0: build a per-cell token stream — each token is the cluster
+        // string (when EXTRA is set) or the lead `char`. The flat char stream
+        // and (col, w) back-pointer arrays handle multi-scalar clusters the
+        // same way find_in_grid does.
+        let mut line_chars: Vec<char> = Vec::with_capacity(cells.len());
+        let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(cells.len());
+        let mut cumulative_col: usize = 0;
+        for cell in cells.iter() {
+            let col = cumulative_col.min(snapshot.num_cols);
+            let s: &str = cell.cluster.as_deref().unwrap_or("");
+            if s.is_empty() {
+                let c = if case_sensitive {
+                    cell.ch
+                } else {
+                    cell.ch.to_ascii_lowercase()
+                };
+                line_chars.push(c);
+                char_to_cell.push((col, cell.width as usize));
             } else {
-                chars.iter().map(|(c, _)| c.to_ascii_lowercase()).collect()
-            };
+                for ch in s.chars() {
+                    let ch_lower = if case_sensitive {
+                        ch
+                    } else {
+                        ch.to_ascii_lowercase()
+                    };
+                    line_chars.push(ch_lower);
+                    char_to_cell.push((col, cell.width as usize));
+                }
+            }
+            cumulative_col = cumulative_col.saturating_add(cell.width as usize);
+        }
+
+        if let Some(re) = &re {
+            // Regex path. The flat char stream is already lowercased if
+            // case-insensitive; concatenate into a string for find_iter.
+            let line_str: String = line_chars.iter().collect();
             for m in re.find_iter(&line_str) {
                 let start_char = m.start();
                 let end_char = m.end();
@@ -325,26 +428,25 @@ pub fn find_in_snapshot(
                 let mut start_col = 0;
                 let mut len = 0;
                 let mut in_match = false;
-                for (char_idx, (c, w)) in chars.iter().enumerate() {
+                let mut prev_col: Option<usize> = None;
+                for (char_idx, (c, (cell_col, cell_w))) in
+                    line_chars.iter().zip(char_to_cell.iter()).enumerate()
+                {
                     if byte_pos == start_char {
-                        start_col = chars
-                            .iter()
-                            .take(char_idx)
-                            .map(|(_, ww)| *ww as usize)
-                            .sum::<usize>()
-                            .min(snapshot.num_cols);
+                        start_col = *cell_col;
                         in_match = true;
+                        prev_col = None;
                     }
-                    if in_match && byte_pos < end_char {
-                        len += *w as usize;
+                    if in_match && byte_pos < end_char && prev_col != Some(*cell_col) {
+                        len += *cell_w;
+                        prev_col = Some(*cell_col);
                     }
                     if byte_pos + c.len_utf8() >= end_char && in_match {
                         in_match = false;
                     }
                     byte_pos += c.len_utf8();
+                    let _ = char_idx;
                 }
-                // Note: the above col mapping uses cumulative widths up to start.
-                // This matches the cell-column semantics of find_in_grid.
                 matches.push(FindMatch {
                     row: unified_row,
                     col: start_col,
@@ -355,29 +457,28 @@ pub fn find_in_snapshot(
                 }
             }
         } else {
-            // Substring path. When case-insensitive, compare lowercased chars.
+            // Substring path. line_chars is already lowercased if
+            // case-insensitive; compare directly against needle_chars.
             let mut i = 0;
-            while i + needle_chars.len() <= chars.len() {
-                let matches_here = chars[i..i + needle_chars.len()]
+            while i + needle_chars.len() <= line_chars.len() {
+                let matches_here = line_chars[i..i + needle_chars.len()]
                     .iter()
                     .zip(needle_chars.iter())
-                    .all(|((c, _), n)| {
-                        if case_sensitive {
-                            c == n
-                        } else {
-                            c.to_ascii_lowercase() == *n
-                        }
-                    });
+                    .all(|(c, n)| *c == *n);
                 if matches_here {
-                    // col = cumulative cell width of chars before position i
-                    let col: usize = chars[..i].iter().map(|(_, w)| *w as usize).sum();
-                    let len: usize = chars[i..i + needle_chars.len()]
-                        .iter()
-                        .map(|(_, w)| *w as usize)
-                        .sum();
+                    let start_col = char_to_cell[i].0;
+                    // Sum widths of distinct cells covered by the match.
+                    let mut len = 0;
+                    let mut prev_col: Option<usize> = None;
+                    for &(c_col, c_w) in char_to_cell.iter().skip(i).take(needle_chars.len()) {
+                        if prev_col != Some(c_col) {
+                            len += c_w;
+                            prev_col = Some(c_col);
+                        }
+                    }
                     matches.push(FindMatch {
                         row: unified_row,
-                        col,
+                        col: start_col,
                         len,
                     });
                     if matches.len() >= MAX_MATCHES {

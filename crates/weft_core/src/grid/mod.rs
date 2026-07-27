@@ -105,10 +105,44 @@ impl Grid {
         &mut r.cells[col]
     }
 
+    /// v1.6.0: Look up the multi-scalar grapheme cluster string for `(row, col)`.
+    ///
+    /// Returns `Some(cluster)` when the cell has `CellFlags::EXTRA` and a
+    /// `RowExtras` entry exists at `col`. Returns `None` for single-scalar
+    /// cells (callers fall back to `cell.character`). Honors `scroll_offset`
+    /// the same way [`cell`](Self::cell) does — history rows can have extras
+    /// too, because `Row` carries its `extras` field into the scrollback.
+    ///
+    /// This is the single read-side entry point consumers (selection, copy,
+    /// row_text, find, snapshot, renderer) should use to honor multi-scalar
+    /// graphemes. Writes happen in the VT print path via
+    /// `RowExtras::append_scalar` / `set_grapheme`.
+    pub fn grapheme_at(&self, row: usize, col: usize) -> Option<&str> {
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        if offset > 0 {
+            let global = sb_len - offset + row;
+            if global < sb_len {
+                return self
+                    .scrollback
+                    .get(global)
+                    .and_then(|r| r.extras.grapheme_at(col));
+            }
+            return self.viewport.get(global - sb_len)?.extras.grapheme_at(col);
+        }
+        self.viewport.get(row)?.extras.grapheme_at(col)
+    }
+
     /// Extract a single **live viewport** row's text — skipping wide-char
     /// spacers and trimming trailing blank/default cells. `row` is a viewport
     /// index (like `cursor.row`). Used to snapshot the command line at OSC
     /// 133;B (the prompt row, before any output scrolls it into history).
+    ///
+    /// v1.6.0: cells tagged with `CellFlags::EXTRA` contribute their full
+    /// multi-scalar grapheme cluster (from `RowExtras`) instead of just the
+    /// lead `char`. This keeps the snapshot faithful to what the user sees —
+    /// a prompt row containing `"e\u{0301}"` snapshots as `"é"` (decomposed)
+    /// rather than `'e'` alone.
     pub fn row_text(&self, row: usize) -> String {
         if row >= self.num_rows {
             return String::new();
@@ -123,9 +157,15 @@ impl Grid {
             .map(|i| i + 1)
             .unwrap_or(0);
         let mut out = String::with_capacity(last);
-        for cell in cells.iter().take(last) {
+        for (col, cell) in cells.iter().take(last).enumerate() {
             if cell.flags.contains(CellFlags::WIDE_SPACER) {
                 continue;
+            }
+            if cell.flags.contains(CellFlags::EXTRA) {
+                if let Some(cluster) = self.viewport[row].extras.grapheme_at(col) {
+                    out.push_str(cluster);
+                    continue;
+                }
             }
             out.push(if cell.character == '\0' {
                 ' '

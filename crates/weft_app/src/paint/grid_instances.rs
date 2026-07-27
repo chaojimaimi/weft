@@ -52,18 +52,28 @@ impl BgInstance {
 /// A glyph instance before UV resolution. The caller resolves UVs from
 /// the glyph atlas during serialization ([`GridInstanceBatch::push_row`]).
 ///
-/// - `Text`: an atlas-sampled glyph. UV is resolved from `ch`; `fg` is
+/// - `Text`: an atlas-sampled glyph. UV is resolved from `ch` (single scalar)
+///   or from `cluster` (multi-scalar grapheme, v1.6.0) when present; `fg` is
 ///   the text color; bg is transparent (`[0; 4]`) because the bg stream
 ///   already painted the cell background.
 /// - `Decoration`: a solid-color rectangle (cursor bar, cursor underline,
 ///   hyperlink underline). UV = `[0, 0, 0, 1]` (mask = 0 → only bg shows);
 ///   `color` is the visible decoration color.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// v1.6.0: `Text` now carries an optional `cluster: Arc<str>` for multi-scalar
+/// graphemes (combining marks, ZWJ emoji, regional flags). When `Some`, the
+/// UV resolver should call `atlas.get_or_rasterize_cluster(&cluster)` instead
+/// of `atlas.get(ch)`. This forced removing `Copy` (Arc is not Copy); callers
+/// use `Clone` where needed.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum GlyphInstance {
     Text {
         dst: [f32; 4],
         ch: char,
         fg: [f32; 4],
+        /// v1.6.0: full cluster string when `CellFlags::EXTRA` is set.
+        /// `None` for single-scalar cells (the common case).
+        cluster: Option<std::sync::Arc<str>>,
     },
     Decoration {
         dst: [f32; 4],
@@ -127,14 +137,15 @@ impl GridInstanceBatch {
     /// Extend both streams with a row's instances, resolving glyph UVs via
     /// `resolve_uv`. Returns the float offsets occupied by this row.
     ///
-    /// The caller passes a UV resolver closure that wraps the glyph atlas
-    /// (`|ch| atlas.get(ch).map(|g| ...).unwrap_or(space_uv)`). This keeps
-    /// the builder pure-logic while still producing the 16-float instance
-    /// format the GPU expects.
+    /// The caller passes a UV resolver closure that wraps the glyph atlas.
+    /// v1.6.0: the closure now receives `(ch, cluster)` so multi-scalar
+    /// graphemes can be resolved via `atlas.get_or_rasterize_cluster`.
+    /// When `cluster` is `Some`, the closure should use the cluster path;
+    /// otherwise it falls back to `atlas.get(ch)`.
     pub(crate) fn push_row(
         &mut self,
         row: &GridRowInstances,
-        resolve_uv: &dyn Fn(char) -> [f32; 4],
+        resolve_uv: &dyn Fn(char, Option<&str>) -> [f32; 4],
     ) -> PaneInstanceRanges {
         let bg_start = self.bg_stream.len();
         for bi in &row.bg_instances {
@@ -145,8 +156,13 @@ impl GridInstanceBatch {
         let glyph_start = self.glyph_stream.len();
         for gi in &row.glyph_instances {
             match gi {
-                GlyphInstance::Text { dst, ch, fg } => {
-                    let uv = resolve_uv(*ch);
+                GlyphInstance::Text {
+                    dst,
+                    ch,
+                    fg,
+                    cluster,
+                } => {
+                    let uv = resolve_uv(*ch, cluster.as_deref());
                     push_cell_instance(&mut self.glyph_stream, *dst, uv, *fg, [0.0; 4]);
                 }
                 GlyphInstance::Decoration { dst, color } => {
@@ -322,10 +338,21 @@ pub(crate) fn build_row_instances(
             && cell.character != '\0';
 
         if has_visible_text {
+            // v1.6.0: when CellFlags::EXTRA is set, look up the full
+            // multi-scalar grapheme cluster from RowExtras so the renderer
+            // can rasterize it via the cluster atlas path. Falls back to
+            // None for single-scalar cells (the common case — no alloc).
+            let cluster: Option<std::sync::Arc<str>> = if cell.flags.contains(CellFlags::EXTRA) {
+                grid.grapheme_at(row, col)
+                    .map(std::sync::Arc::<str>::from)
+            } else {
+                None
+            };
             result.glyph_instances.push(GlyphInstance::Text {
                 dst: [x0, y0, x1, y1],
                 ch: cell.character,
                 fg: final_fg,
+                cluster,
             });
         }
 
@@ -442,7 +469,12 @@ mod tests {
         assert_eq!(result.bg_instances.len(), 1);
         assert_eq!(result.glyph_instances.len(), 1);
         match &result.glyph_instances[0] {
-            GlyphInstance::Text { dst, ch, fg } => {
+            GlyphInstance::Text {
+                dst,
+                ch,
+                fg,
+                cluster: _,
+            } => {
                 assert_eq!(*ch, 'A');
                 assert_eq!(*fg, FG);
                 assert_eq!(*dst, [0.0, 0.0, CW, CH]);
@@ -697,7 +729,7 @@ mod tests {
         let row = build_plain(&grid);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char| [0.1, 0.2, 0.3, 0.4];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.1, 0.2, 0.3, 0.4];
         let ranges = batch.push_row(&row, &resolve_uv);
 
         // Bg stream: 8 floats per run.
@@ -720,7 +752,7 @@ mod tests {
         let row_b = build_plain(&grid_b);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char| [0.1, 0.2, 0.3, 0.4];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.1, 0.2, 0.3, 0.4];
         let ranges_a = batch.push_row(&row_a, &resolve_uv);
         let ranges_b = batch.push_row(&row_b, &resolve_uv);
 
@@ -835,7 +867,7 @@ mod tests {
         // Text glyphs must have bg = [0;4] (the bg stream paints bg).
         // Verified via batch serialization: floats [12..16) are the bg field.
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char| [0.5, 0.5, 0.6, 0.6];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.5, 0.5, 0.6, 0.6];
         batch.push_row(&row_instances, &resolve_uv);
         let gs = &batch.glyph_stream;
         for chunk in gs.chunks(16) {

@@ -347,12 +347,22 @@ fn scan_chunk(
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use weft_core::find::FindSnapshot;
+    use weft_core::find::{FindSnapshot, FindSnapshotCell};
 
     fn snap(rows: &[&str]) -> Arc<FindSnapshot> {
-        let rows: Vec<Vec<(char, u8)>> = rows
+        // v1.6.0: FindSnapshot rows use FindSnapshotCell with named fields.
+        // Tests use single-scalar rows, so cluster is always None here.
+        let rows: Vec<Vec<FindSnapshotCell>> = rows
             .iter()
-            .map(|r| r.chars().map(|c| (c, 1u8)).collect())
+            .map(|r| {
+                r.chars()
+                    .map(|c| FindSnapshotCell {
+                        ch: c,
+                        width: 1u8,
+                        cluster: None,
+                    })
+                    .collect()
+            })
             .collect();
         Arc::new(FindSnapshot { rows, num_cols: 80 })
     }
