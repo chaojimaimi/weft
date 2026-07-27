@@ -19,3 +19,4 @@ pub mod shell;
 pub mod syntax;
 pub mod vt;
 pub mod workflow;
+pub mod workspace;

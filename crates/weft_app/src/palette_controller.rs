@@ -37,6 +37,8 @@ impl App {
             BuiltinCmd::ReloadConfig,
             BuiltinCmd::ImportConfig,
             BuiltinCmd::ExportConfig,
+            BuiltinCmd::SaveWorkspace,
+            BuiltinCmd::OpenWorkspace,
         ];
         for b in &builtins {
             let label = b.label();
@@ -641,6 +643,37 @@ impl App {
                             Err(e) => {
                                 warn!(error = %e, "palette export failed");
                             }
+                        }
+                        self.close_palette();
+                    }
+                    BuiltinCmd::SaveWorkspace => {
+                        // v1.6.2: Show NSSavePanel → capture workspace → save.
+                        // Errors are logged; cancel is silent.
+                        let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+                            warn!("workspace save panel must run on the main thread");
+                            self.close_palette();
+                            self.request_redraw();
+                            return;
+                        };
+                        match self.workspace_save_interactive(mtm) {
+                            Ok(()) => info!("palette workspace save succeeded"),
+                            Err(crate::workspace_controller::WorkspaceInteractionError::Cancelled) => {}
+                            Err(e) => warn!(error = %e, "palette workspace save failed"),
+                        }
+                        self.close_palette();
+                    }
+                    BuiltinCmd::OpenWorkspace => {
+                        // v1.6.2: Show NSOpenPanel → load workspace → restore.
+                        let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+                            warn!("workspace open panel must run on the main thread");
+                            self.close_palette();
+                            self.request_redraw();
+                            return;
+                        };
+                        match self.workspace_open_interactive(mtm) {
+                            Ok(()) => info!("palette workspace open succeeded"),
+                            Err(crate::workspace_controller::WorkspaceInteractionError::Cancelled) => {}
+                            Err(e) => warn!(error = %e, "palette workspace open failed"),
                         }
                         self.close_palette();
                     }

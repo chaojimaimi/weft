@@ -256,6 +256,31 @@ impl Tab {
         Ok(new_pane_id)
     }
 
+    /// v1.6.2: Split a specific pane (identified by `leaf`) by inserting a
+    /// pre-built `new_pane` as its second child. Used by workspace restore
+    /// to rebuild a saved split tree — the pane being split may not be the
+    /// currently active pane (e.g. when the saved tree has a Split node
+    /// whose first child is itself a Split, so the active pane has moved
+    /// into the first child's subtree by the time we need to split the
+    /// root leaf to attach the second child).
+    ///
+    /// Unlike `split_active_pane_inner`, this does NOT change the active
+    /// pane. The caller controls focus separately.
+    pub(crate) fn split_pane_with_pane(
+        &mut self,
+        leaf: PaneId,
+        direction: SplitDirection,
+        ratio: f32,
+        new_pane: Pane,
+    ) -> Result<PaneId, SplitError> {
+        let new_pane_id = PaneId(new_pane.pane_session_id);
+        self.split_tree
+            .split_leaf(leaf, direction, ratio, new_pane_id)?;
+        self.panes.insert(new_pane_id, new_pane);
+        Ok(new_pane_id)
+    }
+
+
     /// Cycle focus to the next pane in declaration order (wraps around).
     /// Returns the new active pane id, or `None` if the tab has no panes
     /// (should never happen for a live tab — the tab is closed when its

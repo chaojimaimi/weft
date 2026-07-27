@@ -67,6 +67,7 @@ mod terminal_geometry;
 mod transfer_controller;
 mod ui_tokens;
 mod window_event_controller;
+mod workspace_controller;
 use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
     SessionManager, SettingsState, TabBarState, WindowRuntimeState,

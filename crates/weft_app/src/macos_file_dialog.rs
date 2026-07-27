@@ -159,3 +159,49 @@ fn run_modal_save_panel(panel: &NSSavePanel) -> FilePanelResult {
     let path = unsafe { url.path() }.ok_or(FilePanelError::NoPath)?;
     Ok(Some(PathBuf::from(path.to_string())))
 }
+
+// ── v1.6.2: Workspace file panels ─────────────────────────────────────
+
+/// v1.6.2: Show an NSSavePanel for saving a workspace YAML file.
+///
+/// Default file name is `weft-workspace.yaml`. Default directory is the
+/// user's home directory (workspaces can be saved anywhere).
+///
+/// Returns the same variants as [`pick_config_export_path`].
+pub fn pick_workspace_save_path(mtm: MainThreadMarker) -> FilePanelResult {
+    let panel = unsafe { NSSavePanel::savePanel(mtm) };
+    unsafe {
+        let title = NSString::from_str("Save Workspace");
+        panel.setTitle(Some(&title));
+        let prompt = NSString::from_str("Save");
+        panel.setPrompt(Some(&prompt));
+        let default_name = NSString::from_str("weft-workspace.yaml");
+        panel.setNameFieldStringValue(&default_name);
+        let yaml_type = NSString::from_str("yaml");
+        let types = NSArray::from_vec(vec![yaml_type]);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&types));
+    }
+    run_modal_save_panel(&panel)
+}
+
+/// v1.6.2: Show an NSOpenPanel for selecting a workspace YAML file.
+///
+/// Returns the same variants as [`pick_config_import_path`].
+pub fn pick_workspace_open_path(mtm: MainThreadMarker) -> FilePanelResult {
+    let panel = unsafe { NSOpenPanel::openPanel(mtm) };
+    unsafe {
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(false);
+        panel.setAllowsMultipleSelection(false);
+        let yaml_type = NSString::from_str("yaml");
+        let types = NSArray::from_vec(vec![yaml_type]);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&types));
+        let title = NSString::from_str("Open Workspace");
+        panel.setTitle(Some(&title));
+        let prompt = NSString::from_str("Open");
+        panel.setPrompt(Some(&prompt));
+    }
+    run_modal_open_panel(&panel)
+}

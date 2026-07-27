@@ -49,7 +49,7 @@ impl std::fmt::Display for PaneId {
 ///
 /// `Horizontal` stacks children top/bottom (the split line is horizontal).
 /// `Vertical` places children side-by-side (the split line is vertical).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SplitDirection {
     Horizontal,
     Vertical,
@@ -190,6 +190,30 @@ pub struct SplitTree {
     zoomed_pane: Option<PaneId>,
 }
 
+/// v1.6.2: Read-only snapshot of a [`SplitTree`]'s structure with a
+/// caller-supplied payload `T` at each leaf. Mirrors the private `Node`
+/// enum but exposes public fields so external callers (workspace
+/// controller) can walk the tree shape without depending on internal
+/// layout invariants.
+///
+/// Built by [`SplitTree::export_tree`], which substitutes each leaf's
+/// `PaneId` with a caller-provided value via the `leaf` closure. The
+/// active-leaf and zoom state are NOT carried here — the caller reads
+/// them via [`SplitTree::active`] / [`SplitTree::zoomed_pane`] before
+/// exporting.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaneTree<T> {
+    /// A single pane leaf carrying its payload.
+    Leaf(T),
+    /// A split between two sub-trees.
+    Split {
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<PaneTree<T>>,
+        second: Box<PaneTree<T>>,
+    },
+}
+
 impl SplitTree {
     /// Create a tree with a single root pane. The pane becomes active.
     pub fn new(initial_pane: PaneId) -> Self {
@@ -240,6 +264,28 @@ impl SplitTree {
             root.collect_leaves(&mut out);
         }
         out
+    }
+
+    /// v1.6.2: Export the tree's structure as a public recursive
+    /// [`PaneTree<T>`], substituting each leaf's `PaneId` with a
+    /// caller-supplied payload via the `leaf` closure. Returns `None`
+    /// when the tree is empty.
+    ///
+    /// Used by the workspace controller to capture the split topology
+    /// (direction + ratio at each internal node) alongside per-pane
+    /// restorable data (`cwd`, `draft`) without exposing the private
+    /// `Node` enum or requiring callers to walk `layout()` and rederive
+    /// the binary tree shape from a flat rect list.
+    ///
+    /// The closure is invoked once per leaf in DFS order (first child
+    /// before second). The zoom state is NOT applied — the exported tree
+    /// always reflects the underlying structural shape so a restore
+    /// path can recreate the exact pre-zoom layout.
+    pub fn export_tree<T, F>(&self, leaf: F) -> Option<PaneTree<T>>
+    where
+        F: Fn(PaneId) -> T,
+    {
+        self.root.as_ref().map(|node| export_node(node, &leaf))
     }
 
     /// True iff `pane` is a leaf in this tree.
@@ -713,6 +759,29 @@ fn nearest_pane_in_direction(
 }
 
 // ── Free helpers ───────────────────────────────────────────────────────
+
+/// v1.6.2: Recursive helper for [`SplitTree::export_tree`]. Walks `node`
+/// and produces a [`PaneTree<T>`] whose leaves carry the result of
+/// `leaf(id)` for each `PaneId`.
+fn export_node<T, F>(node: &Node, leaf: &F) -> PaneTree<T>
+where
+    F: Fn(PaneId) -> T,
+{
+    match node {
+        Node::Leaf(id) => PaneTree::Leaf(leaf(*id)),
+        Node::Split {
+            dir,
+            ratio,
+            first,
+            second,
+        } => PaneTree::Split {
+            direction: *dir,
+            ratio: *ratio,
+            first: Box::new(export_node(first, leaf)),
+            second: Box::new(export_node(second, leaf)),
+        },
+    }
+}
 
 /// Walk `node` and replace the leaf equal to `target` with the result of
 /// `with_leaf(old_leaf_node)`. Panics if `target` isn't present — callers

@@ -50,6 +50,13 @@ pub(crate) enum BuiltinCmd {
     /// `.toml` file (preserving comments + unknown fields when the source
     /// file exists).
     ExportConfig,
+    /// v1.6.2: Show NSSavePanel to save the current session (tabs, panes,
+    /// CWDs, drafts) as a workspace YAML file.
+    SaveWorkspace,
+    /// v1.6.2: Show NSOpenPanel to load a workspace YAML file and restore
+    /// the session tree. PTY processes are NOT restored — each leaf spawns
+    /// a fresh shell in the saved cwd.
+    OpenWorkspace,
 }
 
 impl BuiltinCmd {
@@ -61,6 +68,8 @@ impl BuiltinCmd {
             Self::ReloadConfig => "Reload Config",
             Self::ImportConfig => "Import Config",
             Self::ExportConfig => "Export Config",
+            Self::SaveWorkspace => "Save Workspace",
+            Self::OpenWorkspace => "Open Workspace",
         }
     }
 
@@ -72,6 +81,8 @@ impl BuiltinCmd {
             Self::ReloadConfig => "reload-config",
             Self::ImportConfig => "import-config",
             Self::ExportConfig => "export-config",
+            Self::SaveWorkspace => "save-workspace",
+            Self::OpenWorkspace => "open-workspace",
         }
     }
 }
