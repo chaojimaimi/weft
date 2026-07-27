@@ -1731,14 +1731,9 @@ fn weft_config_unset_falls_through_to_xdg_then_home() {
     // HOME fallback when XDG is unset (and WEFT_CONFIG still unset).
     // `~/.config/weft/config.toml` — the legacy default.
     let resolved2 = std::cell::RefCell::new(None);
-    with_weft_config(
-        None,
-        None,
-        Some(home_os.as_os_str()),
-        || {
-            *resolved2.borrow_mut() = Config::config_path();
-        },
-    );
+    with_weft_config(None, None, Some(home_os.as_os_str()), || {
+        *resolved2.borrow_mut() = Config::config_path();
+    });
     let got2 = resolved2
         .borrow()
         .clone()

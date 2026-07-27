@@ -104,9 +104,42 @@ pub(super) fn apply_scrollback_to_all_panes(tabs: &mut [Tab], max_lines: usize) 
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConfigApplyDelta {
+    rebuild_font: bool,
+    update_opacity: bool,
+    update_padding: bool,
+    resize_window: bool,
+}
+
+fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> ConfigApplyDelta {
+    ConfigApplyDelta {
+        rebuild_font: current.font.family != next.font.family
+            || current.font.cjk_family != next.font.cjk_family
+            || current.font.emoji_family != next.font.emoji_family
+            || current.font.size != next.font.size
+            || current.font.line_height != next.font.line_height
+            || font_scale != 1.0,
+        update_opacity: crate::settings_validation::runtime_opacity(current.window.opacity)
+            != crate::settings_validation::runtime_opacity(next.window.opacity),
+        update_padding: current.window.padding_x != next.window.padding_x
+            || current.window.padding_y != next.window.padding_y,
+        resize_window: current.window.width != next.window.width
+            || current.window.height != next.window.height,
+    }
+}
+
 // ── App methods (delegates to the pure functions above) ─────────────────
 
 impl App {
+    /// Apply runtime deltas while the previous effective config is still
+    /// available, then commit the raw/effective/fingerprint state together.
+    pub(super) fn commit_loaded_config(&mut self, loaded: weft_core::config::LoadedConfig) {
+        let effective = loaded.effective.clone();
+        self.apply_config(effective);
+        self.config_state.set_loaded(loaded);
+    }
+
     /// Re-read config from disk and apply it live. Triggered by the
     /// reload-config keybinding (and the file watcher).
     ///
@@ -148,20 +181,11 @@ impl App {
                 }
             }
             ReloadDecision::Apply(loaded) => {
-                // v1.5.0: update BOTH source and effective together via
-                // `set_loaded`, so an external edit followed by a watcher
-                // reload keeps `source_config` fresh. A stale source would
-                // cause the next Settings save to write back the OLD source,
-                // silently clobbering the external edit. The fingerprint is
-                // also stored here so the next watcher tick can dedup.
+                // `commit_loaded_config` applies against the previous
+                // effective config before replacing source/effective/fingerprint.
+                // Applying after `set_loaded` would hide font/window deltas.
                 let fingerprint = loaded.fingerprint;
-                let effective = loaded.effective.clone();
-                self.config_state.set_loaded(*loaded);
-                // Apply the effective config last — it may rebuild the
-                // glyph atlas (slowest step), and we want source/fingerprint
-                // already updated so a concurrent watcher tick can't
-                // re-trigger a duplicate apply.
-                self.apply_config(effective);
+                self.commit_loaded_config(*loaded);
                 // v1.5.3: clear any prior reload error — the file is now
                 // healthy. Also clears the status badge so a stale
                 // "Config reload failed" doesn't linger after recovery.
@@ -175,6 +199,11 @@ impl App {
     /// Theme/font/scrollback changes take effect immediately; window size/title
     /// apply on the next launch.
     pub(super) fn apply_config(&mut self, config: Config) {
+        let delta = config_apply_delta(
+            &self.config_state.config,
+            &config,
+            self.config_state.font_scale,
+        );
         // Theme — renderer defaults + terminal palette reseed (recolors all
         // Palette-indexed cells on the next draw).
         //
@@ -224,11 +253,7 @@ impl App {
         // Font — rebuild the atlas (cell dimensions may change → recompute).
         // The active `font_scale` (Cmd+/- zoom) is re-applied on top of the
         // freshly loaded config, so a reload doesn't lose the user's zoom.
-        if self.config_state.config.font.family != config.font.family
-            || self.config_state.config.font.size != config.font.size
-            || self.config_state.config.font.line_height != config.font.line_height
-            || self.config_state.font_scale != 1.0
-        {
+        if delta.rebuild_font {
             if let Some(r) = &mut self.renderer {
                 let scaled = crate::settings_validation::runtime_scaled_font_config(
                     &config.font,
@@ -247,9 +272,7 @@ impl App {
         // started at opacity=1.0 could not become transparent without a
         // relaunch — the Metal layer went non-opaque but the NSWindow's
         // system background filled the transparent regions.
-        if crate::settings_validation::runtime_opacity(self.config_state.config.window.opacity)
-            != crate::settings_validation::runtime_opacity(config.window.opacity)
-        {
+        if delta.update_opacity {
             let new_opacity = crate::settings_validation::runtime_opacity(config.window.opacity);
             if let Some(r) = &mut self.renderer {
                 r.set_opacity(config.window.opacity);
@@ -265,9 +288,7 @@ impl App {
         }
 
         // Content padding (changes usable rows/cols → recompute layout).
-        if self.config_state.config.window.padding_x != config.window.padding_x
-            || self.config_state.config.window.padding_y != config.window.padding_y
-        {
+        if delta.update_padding {
             if let Some(r) = &mut self.renderer {
                 r.set_padding((config.window.padding_x, config.window.padding_y));
             }
@@ -310,9 +331,7 @@ impl App {
         // 按 Apply/Save，窗口会立即 resize 到新尺寸（logical points）。
         // 注意：这会触发 Resized 事件 → renderer.resize + recompute_layout，
         // 所以不需要额外调用 recompute_layout。
-        if self.config_state.config.window.width != config.window.width
-            || self.config_state.config.window.height != config.window.height
-        {
+        if delta.resize_window {
             if let Some(window) = &self.window {
                 let new_size = winit::dpi::LogicalSize::new(
                     config.window.width as f64,
@@ -336,6 +355,7 @@ mod tests {
     use crate::tab::Tab;
     use weft_core::config::{Config, ConfigLoadError, LoadedConfig};
     use weft_core::grid::Color;
+    use weft_core::pane_layout::SplitDirection;
 
     /// Build a tab with a live terminal but no PTY — enough for palette /
     /// scrollback tests without spawning a shell.
@@ -444,6 +464,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_delta_uses_previous_config_for_runtime_updates() {
+        let current = Config::default();
+        let mut next = current.clone();
+        next.font.family = "Monaco".into();
+        next.window.opacity = 0.75;
+        next.window.padding_x = 3;
+        next.window.width += 120;
+
+        assert_eq!(
+            config_apply_delta(&current, &next, 1.0),
+            ConfigApplyDelta {
+                rebuild_font: true,
+                update_opacity: true,
+                update_padding: true,
+                resize_window: true,
+            }
+        );
+        assert_eq!(
+            config_apply_delta(&next, &next, 1.0),
+            ConfigApplyDelta {
+                rebuild_font: false,
+                update_opacity: false,
+                update_padding: false,
+                resize_window: false,
+            },
+            "committing loaded state before apply would hide every runtime delta"
+        );
+
+        let mut cjk = current.clone();
+        cjk.font.cjk_family = "Hiragino Sans GB".into();
+        assert!(config_apply_delta(&current, &cjk, 1.0).rebuild_font);
+
+        let mut emoji = current.clone();
+        emoji.font.emoji_family = "Noto Color Emoji".into();
+        assert!(config_apply_delta(&current, &emoji, 1.0).rebuild_font);
+    }
+
     // ── apply_palette_to_all_panes ──────────────────────────────────
 
     #[test]
@@ -515,6 +573,46 @@ mod tests {
                 new_limit,
                 "tab {i} scrollback not updated"
             );
+        }
+    }
+
+    #[test]
+    fn profile_switch_updates_two_tabs_with_four_panes_each() {
+        let mut tabs = [tab_with_terminal(100), tab_with_terminal(200)];
+        for tab in &mut tabs {
+            for _ in 0..3 {
+                tab.split_active_pane_test(SplitDirection::Vertical, 0.5, 300)
+                    .unwrap();
+            }
+            assert_eq!(tab.pane_count(), 4);
+        }
+
+        let mut palette = *tabs[0].terminal.as_ref().unwrap().palette();
+        palette[7] = Color {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+            a: 0xFF,
+        };
+        apply_palette_to_all_panes(&mut tabs, palette);
+        apply_scrollback_to_all_panes(&mut tabs, 4321);
+
+        for (tab_index, tab) in tabs.iter_mut().enumerate() {
+            let panes: Vec<_> = tab.panes_mut().collect();
+            assert_eq!(panes.len(), 4);
+            for (pane_index, pane) in panes.into_iter().enumerate() {
+                let terminal = pane.terminal.as_ref().unwrap();
+                assert_eq!(
+                    terminal.palette()[7],
+                    palette[7],
+                    "tab {tab_index} pane {pane_index} palette was stale"
+                );
+                assert_eq!(
+                    terminal.grid().scrollback.max_lines(),
+                    4321,
+                    "tab {tab_index} pane {pane_index} scrollback was stale"
+                );
+            }
         }
     }
 

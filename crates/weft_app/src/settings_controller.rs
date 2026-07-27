@@ -309,18 +309,21 @@ impl App {
         }
 
         if self.settings.dirty {
-            if let Err(e) = self.settings.draft.save() {
-                tracing::warn!(error = ?e, "failed to save settings draft");
-                self.settings.error = Some(e.to_string());
-                // Don't close on failure — the user needs to see the error.
-                return;
-            }
-            // Apply the new config immediately so theme/font changes
-            // take effect without a restart. reload_config() reads the
-            // freshly-saved file and calls apply_config(), which
-            // rebuilds the renderer theme + atlas.
-            self.reload_config();
+            let loaded = match crate::profiles_controller::persist_settings_draft(
+                self.config_state.source(),
+                &self.settings.draft,
+                self.settings.dirty_sections,
+            ) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to save settings draft");
+                    self.settings.error = Some(e.to_string());
+                    return;
+                }
+            };
+            self.commit_loaded_config(loaded);
             self.settings.dirty = false;
+            self.settings.dirty_sections = weft_core::config::ConfigSectionMask::empty();
             self.settings.error = None;
         }
         if close {
@@ -352,7 +355,8 @@ impl App {
                             .unwrap_or(0);
                         let next = (cur as i32 + delta).rem_euclid(variants.len() as i32) as usize;
                         self.settings.draft.logo.variant = variants[next];
-                        self.settings.dirty = true;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::LOGO);
                     }
                     1 => {
                         // Font Family: cycle Menlo → Monaco → SF Mono → Courier New.
@@ -369,7 +373,8 @@ impl App {
                             .unwrap_or(0);
                         let next = (cur as i32 + delta).rem_euclid(FAMILIES.len() as i32) as usize;
                         self.settings.draft.font.family = FAMILIES[next].to_string();
-                        self.settings.dirty = true;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::FONT);
                     }
                     2 => {
                         // Font Size: ±0.5 pt, clamped to [8.0, 24.0].
@@ -381,7 +386,8 @@ impl App {
                             24.0,
                             14.0,
                         );
-                        self.settings.dirty = true;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::FONT);
                     }
                     3 => {
                         // Line height: ±0.05, clamped to [1.0, 1.5].
@@ -393,7 +399,8 @@ impl App {
                             1.5,
                             1.2,
                         );
-                        self.settings.dirty = true;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::FONT);
                     }
                     4 => {
                         // Window opacity: ±0.05, clamped to [0.5, 1.0].
@@ -405,7 +412,8 @@ impl App {
                             1.0,
                             1.0,
                         );
-                        self.settings.dirty = true;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                     }
                     _ => {}
                 }
@@ -417,21 +425,24 @@ impl App {
                         ((self.settings.draft.scrollback.lines as i32 + delta * 1000).max(1000)
                             as usize)
                             .min(100000);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::SCROLLBACK);
                 }
                 1 => {
                     // Padding X: ±1 cell, clamped to [0, 20].
                     self.settings.draft.window.padding_x =
                         ((self.settings.draft.window.padding_x as i32 + delta).max(0) as u32)
                             .min(20);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
                 2 => {
                     // Padding Y: ±1 cell, clamped to [0, 20].
                     self.settings.draft.window.padding_y =
                         ((self.settings.draft.window.padding_y as i32 + delta).max(0) as u32)
                             .min(20);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
                 _ => {}
             },
@@ -440,7 +451,8 @@ impl App {
                     // Submit on Ctrl+Enter: toggle.
                     self.settings.draft.editor.submit_on_ctrl_enter =
                         !self.settings.draft.editor.submit_on_ctrl_enter;
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::EDITOR);
                 }
             }
             SettingsTab::Keybindings => {
@@ -452,14 +464,16 @@ impl App {
                     self.settings.draft.window.width =
                         ((self.settings.draft.window.width as i32 + delta * 20).max(400) as u32)
                             .min(4000);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
                 1 => {
                     // Window height: ±20 px, clamped to [300, 4000].
                     self.settings.draft.window.height =
                         ((self.settings.draft.window.height as i32 + delta * 20).max(300) as u32)
                             .min(4000);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
                 2 => {
                     // Sidebar width: ±10pt, clamped to [240, 360]. None → start at 280.
@@ -472,7 +486,8 @@ impl App {
                         280.0,
                     );
                     self.settings.draft.window.sidebar_width = Some(next);
-                    self.settings.dirty = true;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
                 _ => {}
             },
@@ -629,7 +644,8 @@ impl App {
                             if !view.name.contains("light") {
                                 self.config_state.preferred_dark_theme = view.name.to_string();
                             }
-                            self.settings.dirty = true;
+                            self.settings
+                                .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
                             self.refresh_settings_validation();
                         }
                     }

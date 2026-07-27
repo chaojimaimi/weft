@@ -1,7 +1,7 @@
 //! v1.5.2: Config import/export controller — wires the atomic transfer
 //! APIs (`weft_core::config::transfer`) to the macOS file panels
 //! (`macos_file_dialog`) and the runtime apply path
-//! (`config_state.set_loaded` + `apply_config`).
+//! (`commit_loaded_config`: runtime apply followed by state commit).
 //!
 //! Per V15_IMPLEMENTATION_PLAN.md §7:
 //!
@@ -55,13 +55,9 @@ impl App {
         // file is untouched (the transfer API guarantees this).
         match weft_core::config::import_config_document(&import_path, &config_path) {
             Ok(loaded) => {
-                // Step 5: apply to runtime. set_loaded updates source +
-                // effective + fingerprint atomically; apply_config
-                // rebuilds renderer state (theme/font/etc.) and reseeds
-                // all panes.
-                let effective = loaded.effective.clone();
-                self.config_state.set_loaded(loaded);
-                self.apply_config(effective);
+                // Step 5: apply against the previous runtime, then commit
+                // source + effective + fingerprint together.
+                self.commit_loaded_config(loaded);
                 self.sync_settings_after_profile_change();
                 info!(?import_path, "config imported");
                 self.clear_config_error();

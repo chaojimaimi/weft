@@ -18,8 +18,8 @@
 #   scripts/v14-baseline-with-load.sh [sample_seconds] [output_md]
 #
 # Exit codes:
-#   0  probe ran and produced a report
-#   1  build failed, app missing, osascript permission denied, or no frames
+#   0  probe ran, injected load, and produced a report with styled cache data
+#   1  build failed, app missing, input injection failed, or no useful frames
 #
 # Requires: System Events permission for the controlling terminal (grant via
 # System Settings → Privacy & Security → Accessibility).
@@ -30,8 +30,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 SAMPLE_SECS="${1:-30}"
-OUTPUT_MD="${2:-docs/perf/v1.4/v1.3.5-baseline.md}"
+OUTPUT_MD="${2:-docs/perf/v1.4/v1.4.1-loaded-current.md}"
 WARMUP_SECS=5
+EXPECT_CACHE="${WEFT_V14_EXPECT_CACHE:-1}"
 
 if [[ "$SAMPLE_SECS" -lt 30 ]]; then
     echo "v14-baseline-with-load: sample_seconds must be >= 30 (got $SAMPLE_SECS)" >&2
@@ -48,8 +49,13 @@ if [[ -z "${WEFT_V14_NO_BUILD:-}" ]]; then
     cargo build --release -p weft_app 2>&1 | tail -3
 fi
 
-APP_PATH=""
-if [[ -x "target/release/osx/Weft.app/Contents/MacOS/weft" ]]; then
+APP_PATH="${WEFT_V14_APP_PATH:-}"
+if [[ -n "$APP_PATH" && ! -x "$APP_PATH" ]]; then
+    echo "v14-baseline-with-load: WEFT_V14_APP_PATH is not executable: $APP_PATH" >&2
+    exit 1
+elif [[ -n "$APP_PATH" ]]; then
+    :
+elif [[ -x "target/release/osx/Weft.app/Contents/MacOS/weft" ]]; then
     APP_PATH="target/release/osx/Weft.app/Contents/MacOS/weft"
 elif [[ -x "target/release/weft" ]]; then
     APP_PATH="target/release/weft"
@@ -58,7 +64,7 @@ else
     exit 1
 fi
 
-COMMIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+COMMIT_HASH="${WEFT_V14_COMMIT_HASH:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 OS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo unknown)"
 SCALE_HINT="$(system_profiler SPDisplaysDataType 2>/dev/null | grep -i 'retina' | head -1 || echo 'unknown')"
 
@@ -94,15 +100,27 @@ echo "==> v1.4 baseline-with-load: typing load command every 2s during sample"
 # shell has time to render the output (and so the BlockView records multiple
 # completed blocks).
 SAMPLE_END=$(( $(date +%s) + SAMPLE_SECS - 5 ))
+INJECTION_COUNT=0
 while [[ $(date +%s) -lt $SAMPLE_END ]]; do
     # Activate Weft window and type the command. The `delay 0.2` after
     # activation gives the window server time to focus Weft before keystrokes
     # start, so they don't end up in whatever app was previously frontmost.
-    osascript -e "tell application \"Weft\" to activate" \
-              -e "delay 0.2" \
-              -e "tell application \"System Events\" to keystroke \"$LOAD_CMD\"" \
-              -e "tell application \"System Events\" to keystroke return" \
-        2>/dev/null || true
+    if ! osascript \
+        -e 'on run argv' \
+        -e 'set appPid to (item 2 of argv) as integer' \
+        -e 'tell application "System Events" to set frontmost of first process whose unix id is appPid to true' \
+        -e 'delay 0.2' \
+        -e 'tell application "System Events" to keystroke (item 1 of argv)' \
+        -e 'delay 0.8' \
+        -e 'tell application "System Events" to key code 36 using command down' \
+        -e 'end run' \
+        -- "$LOAD_CMD" "$APP_PID" >/dev/null; then
+        echo "v14-baseline-with-load: input injection failed; grant Accessibility permission" >&2
+        kill "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+        exit 1
+    fi
+    INJECTION_COUNT=$((INJECTION_COUNT + 1))
     sleep 2
 done
 
@@ -111,14 +129,53 @@ wait $APP_PID 2>/dev/null || true
 
 cat "$PROBE_STDERR" >&2 || true
 
-FRAME_COUNT=$(grep -c ' frame$' "$LOG_FILE" 2>/dev/null || true)
+FRAME_COUNT=$(grep -c 'frame_trace: frame ' "$LOG_FILE" 2>/dev/null || true)
 if [[ "$FRAME_COUNT" -eq 0 ]]; then
-    echo "v14-baseline-with-load: no 'frame' trace lines captured in $LOG_FILE" >&2
+    echo "v14-baseline-with-load: no frame trace lines captured in $LOG_FILE" >&2
     exit 1
 fi
 
-STYLED_FRAMES=$(grep 'frame frame_id' "$LOG_FILE" | awk -F 'styled_paint_us=' '{print $2}' | awk '{print $1}' | grep -v '^0$' | wc -l | tr -d ' ')
-echo "==> v1.4 baseline-with-load: captured $FRAME_COUNT frames ($STYLED_FRAMES with styled_paint_us > 0)"
+STYLED_FRAMES=$(awk -F 'styled_paint_us=' '
+    /frame_trace: frame / { split($2, value, " "); if (value[1] > 0) count++ }
+    END { print count + 0 }
+' "$LOG_FILE")
+CACHE_HITS=$(awk -F 'styled_cache_hits=' '
+    /frame_trace: frame / { split($2, value, " "); total += value[1] }
+    END { print total + 0 }
+' "$LOG_FILE")
+CACHE_MISSES=$(awk -F 'styled_cache_misses=' '
+    /frame_trace: frame / { split($2, value, " "); total += value[1] }
+    END { print total + 0 }
+' "$LOG_FILE")
+CACHE_BYTES_MAX=$(awk -F 'styled_cache_bytes=' '
+    /frame_trace: frame / { split($2, value, " "); if (value[1] > max) max = value[1] }
+    END { print max + 0 }
+' "$LOG_FILE")
+
+if [[ "$INJECTION_COUNT" -eq 0 || "$STYLED_FRAMES" -eq 0 ]]; then
+    echo "v14-baseline-with-load: load did not exercise styled BlockView rendering" >&2
+    exit 1
+fi
+if [[ "$EXPECT_CACHE" == "1" && $((CACHE_HITS + CACHE_MISSES)) -eq 0 ]]; then
+    echo "v14-baseline-with-load: no styled cache lookups were recorded" >&2
+    exit 1
+fi
+
+if [[ "$EXPECT_CACHE" == "1" ]]; then
+    CACHE_LOOKUPS=$((CACHE_HITS + CACHE_MISSES))
+    CACHE_HIT_RATE_BPS=$((CACHE_HITS * 10000 / CACHE_LOOKUPS))
+    if [[ "$CACHE_HIT_RATE_BPS" -lt 7000 ]]; then
+        echo "v14-baseline-with-load: styled cache hit rate is below 70%" >&2
+        exit 1
+    fi
+    if [[ "$CACHE_BYTES_MAX" -gt 16777216 ]]; then
+        echo "v14-baseline-with-load: styled cache exceeded the 16 MiB budget" >&2
+        exit 1
+    fi
+fi
+
+echo "==> v1.4 baseline-with-load: captured $FRAME_COUNT frames"
+echo "    injections=$INJECTION_COUNT styled_frames=$STYLED_FRAMES cache_hits=$CACHE_HITS cache_misses=$CACHE_MISSES"
 
 SUMMARY="$(
     python3 scripts/v14-frame-summary.py \
@@ -128,10 +185,27 @@ SUMMARY="$(
         --sample-secs "$SAMPLE_SECS" \
         --warmup-secs "$WARMUP_SECS" \
         --scale-hint "$SCALE_HINT" \
-        --scenario "synthetic Claude-like transcript (osascript-driven)"
+        --title "${WEFT_V14_REPORT_TITLE:-v1.4.1 Loaded Styled-Line Cache Probe}"
 )"
 
 mkdir -p "$(dirname "$OUTPUT_MD")"
-printf '%s\n' "$SUMMARY" >"$OUTPUT_MD"
+{
+    printf '%s\n' "$SUMMARY"
+    printf '\n## Load execution\n\n'
+    printf -- '- Input injections: %s\n' "$INJECTION_COUNT"
+    printf -- '- Frames with `styled_paint_us > 0`: %s\n' "$STYLED_FRAMES"
+    if [[ "$EXPECT_CACHE" == "1" ]]; then
+        printf '\n## Loaded cache acceptance\n\n'
+        printf -- '- Cache hits / misses: %s / %s\n' "$CACHE_HITS" "$CACHE_MISSES"
+        printf -- '- Cache hit rate: %d.%02d%% (threshold >= 70%%)\n' \
+            $((CACHE_HIT_RATE_BPS / 100)) $((CACHE_HIT_RATE_BPS % 100))
+        printf -- '- Maximum cache bytes: %s (threshold <= 16777216)\n' "$CACHE_BYTES_MAX"
+        printf -- '- Operational cache verdict: **PASS**\n'
+        printf '\nThis operational probe does not replace a same-workload pre-cache comparison.\n'
+    else
+        printf '\n## Pre-cache baseline\n\n'
+        printf -- '- Styled cache counters are intentionally unavailable.\n'
+    fi
+} >"$OUTPUT_MD"
 echo "==> v1.4 baseline-with-load: report written to $OUTPUT_MD"
 echo "==> v1.4 baseline-with-load: done"

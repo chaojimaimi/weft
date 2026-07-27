@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use weft_core::blocks::BlockId;
-use weft_core::config::Config;
+use weft_core::config::{Config, ConfigSectionMask};
 use weft_core::find::{BlockMatch, FindMatch};
 use weft_core::persistence::BlockStore;
 
@@ -543,6 +543,7 @@ pub struct SettingsState {
     pub scroll_offset: usize,
     pub draft: Config,
     pub dirty: bool,
+    pub dirty_sections: ConfigSectionMask,
     pub error: Option<String>,
     /// F5: In narrow mode, true = show content (user drilled into a category),
     /// false = show sidebar. Wide mode ignores this (both are visible).
@@ -561,6 +562,7 @@ impl SettingsState {
             scroll_offset: 0,
             draft: Config::default(),
             dirty: false,
+            dirty_sections: ConfigSectionMask::empty(),
             error: None,
             drill_down: false,
             field_errors: Vec::new(),
@@ -574,6 +576,7 @@ impl SettingsState {
         self.scroll_offset = 0;
         self.draft = config.clone();
         self.dirty = false;
+        self.dirty_sections = ConfigSectionMask::empty();
         self.error = None;
         self.drill_down = false;
         self.field_errors.clear();
@@ -582,9 +585,15 @@ impl SettingsState {
     pub fn close(&mut self) {
         self.open = false;
         self.dirty = false;
+        self.dirty_sections = ConfigSectionMask::empty();
         self.error = None;
         self.drill_down = false;
         self.field_errors.clear();
+    }
+
+    pub fn mark_dirty(&mut self, section: ConfigSectionMask) {
+        self.dirty = true;
+        self.dirty_sections.insert(section);
     }
 }
 

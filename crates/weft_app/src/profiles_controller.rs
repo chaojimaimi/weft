@@ -7,8 +7,8 @@
 //! 2. modify the clone (active_profile / profiles map)
 //! 3. resolve the clone — fail → stop, keep old runtime state
 //! 4. atomic save the clone
-//! 5. sync source/effective/fingerprint via `set_loaded`
-//! 6. apply to renderer + all panes via `apply_config`
+//! 5. reload a validated `LoadedConfig`
+//! 6. apply against the old runtime, then sync source/effective/fingerprint
 //! 7. refresh Settings draft/validation if the panel is open
 //! 8. the watcher will later read the same fingerprint and skip
 //!
@@ -70,6 +70,171 @@ impl std::fmt::Display for ProfileTransactionError {
 
 impl std::error::Error for ProfileTransactionError {}
 
+#[derive(Clone, Copy, Debug)]
+enum ProfileChange<'a> {
+    Switch(Option<&'a str>),
+    Create(&'a str),
+    Delete(&'a str),
+}
+
+fn prepare_profile_change(
+    source: &Config,
+    change: ProfileChange<'_>,
+) -> Result<Config, ProfileTransactionError> {
+    let mut candidate = source.clone();
+    match change {
+        ProfileChange::Switch(name) => {
+            let normalized = name.map(str::trim).filter(|name| !name.is_empty());
+            if let Some(name) = normalized {
+                if !candidate.profiles.contains_key(name) {
+                    return Err(ProfileTransactionError::NotFound(name.to_string()));
+                }
+                candidate.active_profile = Some(name.to_string());
+            } else {
+                candidate.active_profile = None;
+            }
+        }
+        ProfileChange::Create(name) => {
+            weft_core::config::validate_profile_name(name)
+                .map_err(|_| ProfileTransactionError::InvalidName(name.to_string()))?;
+            if candidate.profiles.contains_key(name) {
+                return Err(ProfileTransactionError::AlreadyExists(name.to_string()));
+            }
+            if candidate.profiles.len() >= weft_core::config::MAX_PROFILES {
+                return Err(ProfileTransactionError::Resolve(
+                    weft_core::config::ProfileError::TooManyProfiles(candidate.profiles.len() + 1),
+                ));
+            }
+            candidate.profiles.insert(
+                name.to_string(),
+                weft_core::config::ProfileConfig::default(),
+            );
+            candidate.active_profile = Some(name.to_string());
+        }
+        ProfileChange::Delete(name) => {
+            if !candidate.profiles.contains_key(name) {
+                return Err(ProfileTransactionError::NotFound(name.to_string()));
+            }
+            if candidate.active_profile.as_deref() == Some(name) {
+                candidate.active_profile = None;
+            }
+            candidate.profiles.remove(name);
+        }
+    }
+    candidate
+        .resolve_active_profile()
+        .map_err(ProfileTransactionError::Resolve)?;
+    Ok(candidate)
+}
+
+fn run_profile_transaction<F>(
+    source: &Config,
+    change: ProfileChange<'_>,
+    persist_and_reload: F,
+) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError>
+where
+    F: FnOnce(&Config) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError>,
+{
+    let candidate = prepare_profile_change(source, change)?;
+    persist_and_reload(&candidate)
+}
+
+fn save_and_reload_profile(
+    source: &Config,
+) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError> {
+    source.save().map_err(ProfileTransactionError::Save)?;
+    weft_core::config::load_resolved().map_err(ProfileTransactionError::Reload)
+}
+
+pub(super) fn merge_settings_draft(
+    source: &Config,
+    draft: &Config,
+    dirty: weft_core::config::ConfigSectionMask,
+) -> Result<Config, ProfileTransactionError> {
+    let mut candidate = source.clone();
+    let active = source
+        .active_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+
+    if let Some(name) = active {
+        let profile = candidate
+            .profiles
+            .get_mut(name)
+            .ok_or_else(|| ProfileTransactionError::NotFound(name.to_string()))?;
+        if dirty.contains(weft_core::config::ConfigSectionMask::FONT) {
+            profile.font = Some(draft.font.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::THEME) {
+            profile.theme = Some(draft.theme.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::WINDOW) {
+            profile.window = Some(draft.window.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::SCROLLBACK) {
+            profile.scrollback = Some(draft.scrollback.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::EDITOR) {
+            profile.editor = Some(draft.editor.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::LOGO) {
+            profile.logo = Some(draft.logo.clone());
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::KEYBINDINGS) {
+            profile.keybindings = Some(draft.keybindings.clone());
+        }
+    } else {
+        if dirty.contains(weft_core::config::ConfigSectionMask::FONT) {
+            candidate.font = draft.font.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::THEME) {
+            candidate.theme = draft.theme.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::WINDOW) {
+            candidate.window = draft.window.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::SCROLLBACK) {
+            candidate.scrollback = draft.scrollback.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::EDITOR) {
+            candidate.editor = draft.editor.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::LOGO) {
+            candidate.logo = draft.logo.clone();
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::KEYBINDINGS) {
+            candidate.keybindings = draft.keybindings.clone();
+        }
+    }
+
+    candidate
+        .resolve_active_profile()
+        .map_err(ProfileTransactionError::Resolve)?;
+    Ok(candidate)
+}
+
+pub(super) fn persist_settings_draft(
+    source: &Config,
+    draft: &Config,
+    dirty: weft_core::config::ConfigSectionMask,
+) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError> {
+    run_settings_draft_transaction(source, draft, dirty, save_and_reload_profile)
+}
+
+fn run_settings_draft_transaction<F>(
+    source: &Config,
+    draft: &Config,
+    dirty: weft_core::config::ConfigSectionMask,
+    persist_and_reload: F,
+) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError>
+where
+    F: FnOnce(&Config) -> Result<weft_core::config::LoadedConfig, ProfileTransactionError>,
+{
+    let candidate = merge_settings_draft(source, draft, dirty)?;
+    persist_and_reload(&candidate)
+}
+
 impl App {
     /// v1.5.1: Switch to a profile by name. `None` switches to base
     /// (clears `active_profile`). The transaction is atomic — on any
@@ -81,33 +246,16 @@ impl App {
         &mut self,
         name: Option<&str>,
     ) -> Result<(), ProfileTransactionError> {
-        // Step 1: clone source.
-        let mut source = self.config_state.source().clone();
-
-        // Step 2: modify active_profile. Empty string normalizes to None.
         let normalized = name
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        source.active_profile = normalized.clone();
-
-        // Step 3: resolve — fail → stop.
-        let (_effective, _diags) = source
-            .resolve_active_profile()
-            .map_err(ProfileTransactionError::Resolve)?;
-
-        // Step 4: atomic save.
-        source.save().map_err(ProfileTransactionError::Save)?;
-
-        // Step 5: reload to get fresh fingerprint. The save wrote the file;
-        // if reload fails here the file is correct but runtime is stale —
-        // the watcher will retry on the next mtime tick.
-        let loaded = weft_core::config::load_resolved().map_err(ProfileTransactionError::Reload)?;
-        let effective = loaded.effective.clone();
-        self.config_state.set_loaded(loaded);
-
-        // Step 6: apply to renderer + all panes.
-        self.apply_config(effective);
+        let loaded = run_profile_transaction(
+            self.config_state.source(),
+            ProfileChange::Switch(name),
+            save_and_reload_profile,
+        )?;
+        self.commit_loaded_config(loaded);
 
         // Step 7: refresh Settings draft if open.
         self.sync_settings_after_profile_change();
@@ -120,45 +268,12 @@ impl App {
     /// validated, the profile map checked for duplicates and the 32-cap.
     /// On success the new profile is immediately active.
     pub(super) fn create_profile(&mut self, name: &str) -> Result<(), ProfileTransactionError> {
-        // Step 1: validate the name before touching source.
-        weft_core::config::validate_profile_name(name)
-            .map_err(|_| ProfileTransactionError::InvalidName(name.to_string()))?;
-
-        // Step 2: clone source.
-        let mut source = self.config_state.source().clone();
-
-        // Step 3: check duplicates + cap.
-        if source.profiles.contains_key(name) {
-            return Err(ProfileTransactionError::AlreadyExists(name.to_string()));
-        }
-        if source.profiles.len() >= weft_core::config::MAX_PROFILES {
-            return Err(ProfileTransactionError::InvalidName(
-                "too many profiles (max 32)".into(),
-            ));
-        }
-
-        // Step 4: insert empty profile + set active.
-        source.profiles.insert(
-            name.to_string(),
-            weft_core::config::ProfileConfig::default(),
-        );
-        source.active_profile = Some(name.to_string());
-
-        // Step 5: resolve (should always succeed — empty profile inherits base).
-        let (_effective, _diags) = source
-            .resolve_active_profile()
-            .map_err(ProfileTransactionError::Resolve)?;
-
-        // Step 6: atomic save.
-        source.save().map_err(ProfileTransactionError::Save)?;
-
-        // Step 7: reload + sync.
-        let loaded = weft_core::config::load_resolved().map_err(ProfileTransactionError::Reload)?;
-        let effective = loaded.effective.clone();
-        self.config_state.set_loaded(loaded);
-
-        // Step 8: apply.
-        self.apply_config(effective);
+        let loaded = run_profile_transaction(
+            self.config_state.source(),
+            ProfileChange::Create(name),
+            save_and_reload_profile,
+        )?;
+        self.commit_loaded_config(loaded);
 
         // Step 9: refresh Settings.
         self.sync_settings_after_profile_change();
@@ -171,40 +286,13 @@ impl App {
     /// active, `active_profile` is cleared (falls back to base) in the
     /// same atomic save. Other profiles are untouched.
     pub(super) fn delete_profile(&mut self, name: &str) -> Result<(), ProfileTransactionError> {
-        // Step 1: clone source.
-        let mut source = self.config_state.source().clone();
-
-        // Step 2: check the profile exists.
-        if !source.profiles.contains_key(name) {
-            return Err(ProfileTransactionError::NotFound(name.to_string()));
-        }
-
-        // Step 3: if it was active, clear active_profile so we don't
-        // leave a dangling reference.
-        let was_active = source.active_profile.as_deref() == Some(name);
-        if was_active {
-            source.active_profile = None;
-        }
-
-        // Step 4: remove the profile.
-        source.profiles.remove(name);
-
-        // Step 5: resolve (should succeed — removing a profile can't break
-        // the schema, and if it was active we already cleared the ref).
-        let (_effective, _diags) = source
-            .resolve_active_profile()
-            .map_err(ProfileTransactionError::Resolve)?;
-
-        // Step 6: atomic save.
-        source.save().map_err(ProfileTransactionError::Save)?;
-
-        // Step 7: reload + sync.
-        let loaded = weft_core::config::load_resolved().map_err(ProfileTransactionError::Reload)?;
-        let effective = loaded.effective.clone();
-        self.config_state.set_loaded(loaded);
-
-        // Step 8: apply.
-        self.apply_config(effective);
+        let was_active = self.config_state.source().active_profile.as_deref() == Some(name);
+        let loaded = run_profile_transaction(
+            self.config_state.source(),
+            ProfileChange::Delete(name),
+            save_and_reload_profile,
+        )?;
+        self.commit_loaded_config(loaded);
 
         // Step 9: refresh Settings.
         self.sync_settings_after_profile_change();
@@ -353,6 +441,211 @@ impl App {
 mod tests {
     use super::*;
     use weft_core::config::{validate_profile_name, ProfileConfig};
+
+    fn loaded_from(source: Config) -> weft_core::config::LoadedConfig {
+        let (effective, diagnostics) = source.resolve_active_profile().unwrap();
+        weft_core::config::LoadedConfig {
+            source,
+            effective,
+            fingerprint: 42,
+            diagnostics,
+        }
+    }
+
+    #[test]
+    fn profile_transactions_create_switch_and_delete_successfully() {
+        let base = Config::default();
+        let created = run_profile_transaction(&base, ProfileChange::Create("work"), |candidate| {
+            Ok(loaded_from(candidate.clone()))
+        })
+        .unwrap();
+        assert_eq!(created.source.active_profile.as_deref(), Some("work"));
+        assert!(created.source.profiles.contains_key("work"));
+
+        let switched =
+            run_profile_transaction(&created.source, ProfileChange::Switch(None), |candidate| {
+                Ok(loaded_from(candidate.clone()))
+            })
+            .unwrap();
+        assert_eq!(switched.source.active_profile, None);
+        assert!(switched.source.profiles.contains_key("work"));
+
+        let deleted = run_profile_transaction(
+            &created.source,
+            ProfileChange::Delete("work"),
+            |candidate| Ok(loaded_from(candidate.clone())),
+        )
+        .unwrap();
+        assert_eq!(deleted.source.active_profile, None);
+        assert!(!deleted.source.profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn switch_missing_profile_is_rejected_before_persist() {
+        let source = Config::default();
+        let persist_called = std::cell::Cell::new(false);
+        let result =
+            run_profile_transaction(&source, ProfileChange::Switch(Some("missing")), |_| {
+                persist_called.set(true);
+                unreachable!("missing profile must fail before persistence")
+            });
+
+        assert!(
+            matches!(result, Err(ProfileTransactionError::NotFound(name)) if name == "missing")
+        );
+        assert!(!persist_called.get());
+        assert_eq!(source.active_profile, None);
+    }
+
+    #[test]
+    fn persistence_failures_do_not_commit_source() {
+        let source = Config::default();
+        let save_result = run_profile_transaction(&source, ProfileChange::Create("work"), |_| {
+            Err(ProfileTransactionError::Save(
+                weft_core::config::ConfigSaveError::NoConfigPath,
+            ))
+        });
+        assert!(matches!(save_result, Err(ProfileTransactionError::Save(_))));
+
+        let disk_candidate = std::cell::RefCell::new(None);
+        let reload_result =
+            run_profile_transaction(&source, ProfileChange::Create("work"), |candidate| {
+                *disk_candidate.borrow_mut() = Some(candidate.clone());
+                Err(ProfileTransactionError::Reload(
+                    weft_core::config::ConfigLoadError::NoPath,
+                ))
+            });
+        assert!(matches!(
+            reload_result,
+            Err(ProfileTransactionError::Reload(_))
+        ));
+        assert_eq!(
+            disk_candidate
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .active_profile
+                .as_deref(),
+            Some("work"),
+            "save succeeded before the injected reload failure"
+        );
+        assert_eq!(
+            source.active_profile, None,
+            "runtime source was not committed"
+        );
+        assert!(
+            source.profiles.is_empty(),
+            "runtime profiles were not committed"
+        );
+    }
+
+    #[test]
+    fn active_profile_settings_write_only_dirty_sections() {
+        let mut source = Config::default();
+        source.font.size = 13.0;
+        source.window.padding_x = 2;
+        source.profiles.insert(
+            "work".into(),
+            ProfileConfig {
+                font: Some(weft_core::config::FontConfig {
+                    size: 18.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        source.active_profile = Some("work".into());
+        let (mut draft, _) = source.resolve_active_profile().unwrap();
+        draft.window.padding_x = 9;
+
+        let merged = merge_settings_draft(
+            &source,
+            &draft,
+            weft_core::config::ConfigSectionMask::WINDOW,
+        )
+        .unwrap();
+        assert_eq!(merged.font.size, 13.0, "base font must stay raw");
+        assert_eq!(merged.window.padding_x, 2, "base window must stay raw");
+        let profile = merged.profiles.get("work").unwrap();
+        assert_eq!(profile.font.as_ref().unwrap().size, 18.0);
+        assert_eq!(profile.window.as_ref().unwrap().padding_x, 9);
+        assert!(profile.theme.is_none());
+    }
+
+    #[test]
+    fn base_settings_do_not_modify_profiles() {
+        let mut source = Config::default();
+        source.profiles.insert(
+            "work".into(),
+            ProfileConfig {
+                font: Some(weft_core::config::FontConfig {
+                    size: 18.0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let mut draft = source.clone();
+        draft.font.size = 15.0;
+
+        let merged =
+            merge_settings_draft(&source, &draft, weft_core::config::ConfigSectionMask::FONT)
+                .unwrap();
+        assert_eq!(merged.font.size, 15.0);
+        assert_eq!(
+            merged
+                .profiles
+                .get("work")
+                .unwrap()
+                .font
+                .as_ref()
+                .unwrap()
+                .size,
+            18.0
+        );
+    }
+
+    #[test]
+    fn settings_reload_failure_keeps_runtime_source_uncommitted() {
+        let mut source = Config::default();
+        source
+            .profiles
+            .insert("work".into(), ProfileConfig::default());
+        source.active_profile = Some("work".into());
+        let (mut draft, _) = source.resolve_active_profile().unwrap();
+        draft.window.padding_x = 7;
+        let disk_candidate = std::cell::RefCell::new(None);
+
+        let result = run_settings_draft_transaction(
+            &source,
+            &draft,
+            weft_core::config::ConfigSectionMask::WINDOW,
+            |candidate| {
+                *disk_candidate.borrow_mut() = Some(candidate.clone());
+                Err(ProfileTransactionError::Reload(
+                    weft_core::config::ConfigLoadError::NoPath,
+                ))
+            },
+        );
+
+        assert!(matches!(result, Err(ProfileTransactionError::Reload(_))));
+        assert!(source.profiles.get("work").unwrap().window.is_none());
+        assert_eq!(source.window.padding_x, 0);
+        assert_eq!(
+            disk_candidate
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .profiles
+                .get("work")
+                .unwrap()
+                .window
+                .as_ref()
+                .unwrap()
+                .padding_x,
+            7
+        );
+    }
 
     /// Validate-profile-name is the first gate of `create_profile`.
     /// The transaction can't even start if the name is bad, so we test
