@@ -1293,3 +1293,195 @@ fn logo_variant_save_cool_clears_stale_non_default() {
     );
     let _ = std::fs::remove_file(&tmp);
 }
+
+// ── v1.5.0: Profile integration tests ──────────────────────────────────
+//
+// These tests live in `tests.rs` (not next to `profiles.rs` / `io.rs`) so
+// they exercise the full `Config::save_to_path` + `load_resolved_from_path`
+// round-trip the way the runtime does — catching toml_edit persistence bugs
+// that unit tests on the in-memory structs can't. The pure-logic coverage
+// (apply_overrides, name validation, resolve_active_profile) lives next to
+// the impl files; this file owns the persistence semantics.
+
+/// Profile `[keybindings]` is a full-section override: a profile that
+/// specifies keybindings replaces the base keybindings entirely, not a
+/// per-key merge. A base binding absent from the profile must NOT survive
+/// into the effective config.
+#[test]
+fn profile_keybindings_replace_instead_of_merge() {
+    let mut base = Config::default();
+    base.keybindings.insert("cmd+c".into(), Action::Copy);
+    base.keybindings.insert("cmd+v".into(), Action::Paste);
+
+    let mut profile = ProfileConfig::default();
+    let mut kb = std::collections::HashMap::new();
+    // Only `cmd+x` is in the profile. `cmd+c` / `cmd+v` from base must
+    // NOT appear in the effective keybindings.
+    kb.insert("cmd+x".into(), Action::Copy);
+    profile.keybindings = Some(kb);
+
+    apply_overrides(&mut base, &profile);
+    assert_eq!(base.keybindings.len(), 1);
+    assert!(base.keybindings.contains_key("cmd+x"));
+    assert!(!base.keybindings.contains_key("cmd+c"));
+    assert!(!base.keybindings.contains_key("cmd+v"));
+}
+
+/// Unknown top-level fields the user added (e.g. a future `[ai]` section
+/// or a comment marker) must survive a save that also writes profiles.
+/// This is the v1.5 analog of `save_preserves_unknown_fields` — the
+/// `profiles` table write path must not blow away unrelated top-level
+/// keys when it rewrites the `[profiles]` table.
+#[test]
+fn unknown_top_level_fields_survive_save_with_profiles() {
+    let path = unique_tmp_path("unknown-with-profiles");
+    std::fs::write(
+        &path,
+        "[font]\nsize = 14.0\n\n\
+         [unknown_section]\nfoo = \"bar\"\n\n\
+         [profiles.work.font]\nfamily = \"Profile-Mono\"\n",
+    )
+    .unwrap();
+    // Save a config that actually has a `work` profile so the
+    // `[profiles.work]` table survives the rewrite. Saving `default()`
+    // (no profiles) would correctly remove the table.
+    let mut cfg = Config::default();
+    cfg.profiles.insert(
+        "work".into(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                family: "Profile-Mono".into(),
+                ..FontConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("foo = \"bar\""),
+        "unknown top-level field should survive: {text}"
+    );
+    assert!(
+        text.contains("[profiles.work"),
+        "profile section should survive: {text}"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Saving a config with an active profile must not flatten the profile's
+/// overrides into the base `[font]` section. This is the persistence
+/// analog of `resolved_config_cannot_flatten_into_source_on_save` in
+/// `io.rs` — it verifies the save path itself preserves the split.
+#[test]
+fn save_does_not_flatten_active_profile_into_base() {
+    let path = unique_tmp_path("no-flatten-save");
+    let mut source = Config::default();
+    source.font.family = "Base-Mono".into();
+    source.active_profile = Some("work".into());
+    source.profiles.insert(
+        "work".into(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                family: "Profile-Mono".into(),
+                ..FontConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    source.save_to_path(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    // Base [font].family must remain "Base-Mono" — the profile override
+    // must NOT leak into the base section.
+    assert!(
+        saved.contains("family = \"Base-Mono\""),
+        "base font must not be flattened: {saved}"
+    );
+    // And the profile section must be present with its own family.
+    assert!(
+        saved.contains("Profile-Mono"),
+        "profile font must be preserved: {saved}"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Deleting a profile from `source.profiles` and saving must remove the
+/// corresponding `[profiles.<name>]` table from disk. Stale profiles must
+/// not survive a save.
+#[test]
+fn save_removes_deleted_profiles_from_disk() {
+    let path = unique_tmp_path("delete-profile");
+    let mut source = Config::default();
+    source.profiles.insert(
+        "work".into(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                family: "Work-Mono".into(),
+                ..FontConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    source.profiles.insert(
+        "play".into(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                family: "Play-Mono".into(),
+                ..FontConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    source.save_to_path(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("work"), "work profile should be present");
+    assert!(saved.contains("play"), "play profile should be present");
+
+    // Now delete `play` and re-save.
+    source.profiles.remove("play");
+    source.save_to_path(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        saved.contains("work"),
+        "work profile should still be present"
+    );
+    assert!(
+        !saved.contains("Play-Mono"),
+        "deleted profile content should be gone: {saved}"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// Clearing `active_profile` to `None` must remove the top-level
+/// `active_profile` key from disk, not leave a stale `active_profile = ""`.
+#[test]
+fn save_clears_active_profile_when_none() {
+    let path = unique_tmp_path("clear-active");
+    let mut source = Config {
+        active_profile: Some("work".into()),
+        ..Config::default()
+    };
+    source.profiles.insert(
+        "work".into(),
+        ProfileConfig {
+            font: Some(FontConfig {
+                family: "Work-Mono".into(),
+                ..FontConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    source.save_to_path(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("active_profile"));
+
+    // Now clear active_profile and re-save.
+    source.active_profile = None;
+    source.save_to_path(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !saved.contains("active_profile"),
+        "active_profile should be removed: {saved}"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

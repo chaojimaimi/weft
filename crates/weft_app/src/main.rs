@@ -17,6 +17,8 @@ mod app_runtime;
 mod app_state;
 mod block_component;
 mod completion_component;
+mod config_controller;
+mod config_state;
 mod context_menu_component;
 mod editor_controller;
 mod effect;
@@ -219,14 +221,36 @@ impl App {
     }
 
     fn new(proxy: EventLoopProxy<AppEvent>) -> Self {
-        let config = Config::load();
-        info!(
-            theme = %config.theme.name,
-            font = %config.font.family,
-            size = config.font.size,
-            "config loaded"
-        );
-        let config_state = ConfigState::new(config, scan_path_bins());
+        // v1.5.0: Use `load_resolved` so the source/effective split is
+        // preserved (profile overrides are not flattened into the base on
+        // save). On any error (missing file, parse error, profile error)
+        // we fall back to defaults — matching the legacy `Config::load()`
+        // startup behavior so a broken config never blocks app launch.
+        let path_bins = scan_path_bins();
+        let config_state = match weft_core::config::load_resolved() {
+            Ok(loaded) => {
+                info!(
+                    theme = %loaded.effective.theme.name,
+                    font = %loaded.effective.font.family,
+                    size = loaded.effective.font.size,
+                    active_profile = ?loaded.effective.active_profile,
+                    fingerprint = loaded.fingerprint,
+                    "config loaded"
+                );
+                ConfigState::from_loaded(loaded, path_bins)
+            }
+            Err(e) => {
+                // Missing file is the common case (fresh install) — log at
+                // debug. Parse / profile errors are louder so the user
+                // knows why their config didn't take effect.
+                if matches!(e, weft_core::config::ConfigLoadError::NoPath) {
+                    tracing::debug!("no config path; using defaults");
+                } else {
+                    tracing::warn!(error = %e, "config load failed; using defaults");
+                }
+                ConfigState::new(Config::default(), path_bins)
+            }
+        };
         let probe = performance_probe::PerformanceProbe::from_env();
         let frame_trace_enabled = probe.enabled();
         Self {

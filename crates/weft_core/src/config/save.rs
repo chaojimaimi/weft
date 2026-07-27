@@ -56,6 +56,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "logo",
         "ai",
         "keybindings",
+        "profiles",
     ] {
         let Some(item) = document.get_mut(section) else {
             continue;
@@ -214,4 +215,214 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
             }
         }
     }
+}
+
+// ── v1.5.0: active_profile + profiles ───────────────────────────────────
+
+/// v1.5.0: Write the top-level `active_profile = "name"` scalar. Writes
+/// `None`/empty as removal of any existing key so the file doesn't carry a
+/// stale reference to a deleted profile. Preserves comments via `toml_edit`.
+pub(super) fn write_active_profile(doc: &mut toml_edit::DocumentMut, active: &Option<String>) {
+    match active {
+        Some(name) if !name.trim().is_empty() => {
+            doc["active_profile"] = toml_edit::value(name.as_str());
+        }
+        _ => {
+            if doc.contains_key("active_profile") {
+                doc.remove("active_profile");
+            }
+        }
+    }
+}
+
+/// v1.5.0: Write the `[profiles.<name>]` tables, preserving comments and
+/// unknown fields where possible.
+///
+/// Strategy:
+/// - Walk the existing `[profiles]` table (if any) and remove entries that
+///   no longer exist in `source.profiles`.
+/// - For each profile in `source.profiles` (BTreeMap → stable order), write
+///   or update the `[profiles.<name>]` table with the profile's sections.
+/// - If `source.profiles` is empty, drop the whole `[profiles]` table so
+///   reload doesn't keep stale entries.
+///
+/// Section writes use the same "only write non-default" helpers as the base
+/// `[font]` / `[theme]` / … writers, so a profile that only overrides `[font]`
+/// doesn't emit empty `[profiles.x.theme]` tables.
+pub(super) fn write_profiles(doc: &mut toml_edit::DocumentMut, source: &super::Config) {
+    if source.profiles.is_empty() {
+        if doc.contains_key("profiles") {
+            doc.remove("profiles");
+        }
+        return;
+    }
+    let profiles_entry = doc.entry("profiles").or_insert_with(toml_edit::table);
+    if profiles_entry.is_none() {
+        *profiles_entry = toml_edit::table();
+    }
+    let profiles_table = profiles_entry.as_table_mut().expect("profiles is a table");
+
+    // Remove profiles that no longer exist in source.
+    let stale: Vec<String> = profiles_table
+        .iter()
+        .filter_map(|(k, _)| {
+            if source.profiles.contains_key(k) {
+                None
+            } else {
+                Some(k.to_string())
+            }
+        })
+        .collect();
+    for name in stale {
+        profiles_table.remove(&name);
+    }
+
+    // Write/update each profile. BTreeMap → alphabetical order.
+    for (name, profile) in &source.profiles {
+        let entry = profiles_entry
+            .as_table_mut()
+            .unwrap()
+            .entry(name)
+            .or_insert_with(toml_edit::table);
+        if entry.is_none() {
+            *entry = toml_edit::table();
+        }
+        let table = entry.as_table_mut().expect("profile is a table");
+        write_profile_sections(table, profile);
+    }
+}
+
+/// Write the section overrides for a single profile. Only present sections
+/// (the `Option<T>` is `Some`) are written; absent sections are removed so
+/// a stale override doesn't survive a profile edit.
+fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::ProfileConfig) {
+    write_profile_section(table, "font", profile.font.is_some(), |t| {
+        if let Some(f) = &profile.font {
+            let default = super::FontConfig::default();
+            set_string_if_diff(t, "family", &f.family, &default.family);
+            set_f32_if_diff(t, "size", f.size, default.size);
+            set_string_if_diff(t, "cjk_family", &f.cjk_family, &default.cjk_family);
+            set_string_if_diff(t, "emoji_family", &f.emoji_family, &default.emoji_family);
+            set_f32_if_diff(t, "line_height", f.line_height, default.line_height);
+        }
+    });
+    write_profile_section(table, "theme", profile.theme.is_some(), |t| {
+        if let Some(th) = &profile.theme {
+            let default = super::ThemeConfig::default();
+            set_string_if_diff(t, "name", &th.name, &default.name);
+            set_opt_string(t, "foreground", &th.foreground);
+            set_opt_string(t, "background", &th.background);
+            set_opt_string(t, "cursor", &th.cursor);
+            set_opt_string(t, "selection", &th.selection);
+            set_opt_string(t, "accent", &th.accent);
+            set_opt_string(t, "accent_dim", &th.accent_dim);
+            set_opt_string(t, "separator", &th.separator);
+            if !th.palette.is_empty() {
+                let mut arr = toml_edit::Array::new();
+                for hex in &th.palette {
+                    arr.push(hex.as_str());
+                }
+                t["palette"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            } else if t.contains_key("palette") {
+                t.remove("palette");
+            }
+            if th.follow_system {
+                t["follow_system"] = toml_edit::value(true);
+            } else if t.contains_key("follow_system") {
+                t["follow_system"] = toml_edit::value(false);
+            }
+            if let Some(ln) = &th.light_name {
+                t["light_name"] = toml_edit::value(ln.as_str());
+            }
+            if let Some(dn) = &th.dark_name {
+                t["dark_name"] = toml_edit::value(dn.as_str());
+            }
+        }
+    });
+    write_profile_section(table, "window", profile.window.is_some(), |t| {
+        if let Some(w) = &profile.window {
+            let default = super::WindowConfig::default();
+            set_u32_if_diff(t, "width", w.width, default.width);
+            set_u32_if_diff(t, "height", w.height, default.height);
+            set_string_if_diff(t, "title", &w.title, &default.title);
+            set_f32_if_diff(t, "opacity", w.opacity, default.opacity);
+            set_u32_if_diff(t, "padding_x", w.padding_x, default.padding_x);
+            set_u32_if_diff(t, "padding_y", w.padding_y, default.padding_y);
+            match w.sidebar_width {
+                Some(sw) => {
+                    t["sidebar_width"] = toml_edit::value(f64::from(sw));
+                }
+                None => {
+                    if t.contains_key("sidebar_width") {
+                        t.remove("sidebar_width");
+                    }
+                }
+            }
+        }
+    });
+    write_profile_section(table, "scrollback", profile.scrollback.is_some(), |t| {
+        if let Some(s) = &profile.scrollback {
+            let default = super::ScrollbackConfig::default();
+            set_usize_if_diff(t, "lines", s.lines, default.lines);
+        }
+    });
+    write_profile_section(table, "editor", profile.editor.is_some(), |t| {
+        if let Some(e) = &profile.editor {
+            if e.submit_on_ctrl_enter {
+                t["submit_on_ctrl_enter"] = toml_edit::value(true);
+            } else if t.contains_key("submit_on_ctrl_enter") {
+                t.remove("submit_on_ctrl_enter");
+            }
+        }
+    });
+    write_profile_section(table, "logo", profile.logo.is_some(), |t| {
+        if let Some(l) = &profile.logo {
+            let default = super::LogoConfig::default();
+            if l.variant != default.variant {
+                t["variant"] = toml_edit::value(l.variant.as_str());
+            } else if t.contains_key("variant") {
+                t.remove("variant");
+            }
+        }
+    });
+    write_profile_section(table, "keybindings", profile.keybindings.is_some(), |t| {
+        if let Some(kb) = &profile.keybindings {
+            if kb.is_empty() {
+                if t.contains_key("keybindings") {
+                    t.remove("keybindings");
+                }
+                return;
+            }
+            let mut kb_table = toml_edit::table();
+            let kt = kb_table.as_table_mut().unwrap();
+            for (binding, action) in kb {
+                let action_str = super::action::action_to_str(action);
+                kt.insert(binding, toml_edit::value(action_str));
+            }
+            // Replace wholesale — keybindings is a full-section override.
+            *t.entry("keybindings")
+                .or_insert_with(|| toml_edit::Item::None) = kb_table;
+        }
+    });
+}
+
+/// Write or remove a single profile section. When `present` is false the
+/// section is removed so a profile edit that drops a section takes effect
+/// on save. When true, `f` writes the section's fields.
+fn write_profile_section<F>(table: &mut toml_edit::Table, name: &str, present: bool, f: F)
+where
+    F: FnOnce(&mut toml_edit::Table),
+{
+    if !present {
+        if table.contains_key(name) {
+            table.remove(name);
+        }
+        return;
+    }
+    let entry = table.entry(name).or_insert_with(toml_edit::table);
+    if entry.is_none() {
+        *entry = toml_edit::table();
+    }
+    let section = entry.as_table_mut().expect("profile section is a table");
+    f(section);
 }

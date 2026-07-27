@@ -219,38 +219,11 @@ impl Default for SessionManager {
     }
 }
 
-pub struct ConfigState {
-    pub config: Config,
-    pub keybindings: weft_core::config::KeyBindings,
-    pub path_bins: Vec<String>,
-    pub theme_is_dark: bool,
-    pub preferred_dark_theme: String,
-    pub font_scale: f32,
-}
-
-impl ConfigState {
-    pub fn new(config: Config, path_bins: Vec<String>) -> Self {
-        let preferred_dark_theme =
-            if !config.theme.name.contains("light") && !config.theme.name.is_empty() {
-                config.theme.name.clone()
-            } else {
-                config
-                    .theme
-                    .dark_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-warm".into())
-            };
-        let keybindings = config.keybindings();
-        Self {
-            config,
-            keybindings,
-            path_bins,
-            theme_is_dark: true,
-            preferred_dark_theme,
-            font_scale: 1.0,
-        }
-    }
-}
+// v1.5.0: ConfigState moved to `config_state.rs` so the new profile fields
+// (source_config, config_fingerprint) don't push this file past its
+// architecture-gate ceiling. Re-exported here so the 48 existing
+// `config_state.config.<field>` read sites keep compiling unchanged.
+pub use crate::config_state::ConfigState;
 
 pub struct WindowRuntimeState {
     pub cursor_blink_on: bool,
@@ -618,12 +591,15 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigState, ContextMenu, InteractionState, PanelState, SessionManager, SettingsState,
-        TabBarState, WindowRuntimeState,
+        ContextMenu, InteractionState, PanelState, SessionManager, SettingsState, TabBarState,
+        WindowRuntimeState,
     };
     use crate::tab::Tab;
     use std::time::Instant;
     use weft_core::config::Config;
+
+    // v1.5.0: `config_state_preserves_preferred_dark_theme` moved to
+    // `config_state.rs` alongside the ConfigState struct.
 
     #[test]
     fn tab_bar_clear_hover_preserves_scroll_and_click_history() {
@@ -801,15 +777,5 @@ mod tests {
         let (new, prev) = sm.switch_to(99);
         assert_eq!(new, 0);
         assert_eq!(prev, 0);
-    }
-
-    #[test]
-    fn config_state_preserves_preferred_dark_theme() {
-        let mut config = Config::default();
-        config.theme.name = "solarized-dark".into();
-        let state = ConfigState::new(config, vec!["cargo".into()]);
-        assert_eq!(state.preferred_dark_theme, "solarized-dark");
-        assert_eq!(state.path_bins, ["cargo"]);
-        assert_eq!(state.font_scale, 1.0);
     }
 }

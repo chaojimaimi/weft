@@ -123,3 +123,43 @@ pub enum Action {
     #[serde(rename = "focus_pane_right")]
     FocusPaneRight,
 }
+
+/// v1.5.0: Canonical string form of an [`Action`], matching the serde
+/// `rename` attributes. Used by the profile keybindings writer (and any
+/// future code that needs the TOML string without going through serde).
+/// Keep in sync with the `#[serde(rename = …)]` list above.
+pub fn action_to_str(action: &Action) -> &'static str {
+    match action {
+        Action::Copy => "copy",
+        Action::Paste => "paste",
+        Action::ReloadConfig => "reload_config",
+        Action::ScrollPageUp => "scroll_page_up",
+        Action::ScrollPageDown => "scroll_page_down",
+        Action::ScrollLineUp => "scroll_line_up",
+        Action::ScrollLineDown => "scroll_line_down",
+        Action::ScrollToTop => "scroll_to_top",
+        Action::ScrollToBottom => "scroll_to_bottom",
+        Action::ToggleBlockPanel => "toggle_block_panel",
+        Action::ToggleCommandPalette => "toggle_command_palette",
+        Action::ZoomIn => "zoom_in",
+        Action::ZoomOut => "zoom_out",
+        Action::ZoomReset => "zoom_reset",
+        Action::FindInGrid => "find_in_grid",
+        Action::ToggleTheme => "toggle_theme",
+        Action::NewTab => "new_tab",
+        Action::CloseTab => "close_tab",
+        Action::NextTab => "next_tab",
+        Action::PrevTab => "prev_tab",
+        Action::ToggleSettings => "toggle_settings",
+        Action::SplitHorizontal => "split_horizontal",
+        Action::SplitVertical => "split_vertical",
+        Action::FocusNextPane => "focus_next_pane",
+        Action::FocusPrevPane => "focus_prev_pane",
+        Action::ClosePane => "close_pane",
+        Action::TogglePaneZoom => "toggle_pane_zoom",
+        Action::FocusPaneUp => "focus_pane_up",
+        Action::FocusPaneDown => "focus_pane_down",
+        Action::FocusPaneLeft => "focus_pane_left",
+        Action::FocusPaneRight => "focus_pane_right",
+    }
+}

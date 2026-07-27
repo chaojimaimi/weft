@@ -1,16 +1,13 @@
-//! Session, tab, configuration, and theme lifecycle controller.
+//! Session, tab, and theme lifecycle controller.
+//!
+//! v1.5.0: config reload / apply live in `config_controller.rs` (extracted
+//! so the per-pane update loops and reload decision can be unit-tested
+//! without spinning up a full `App`). This file keeps the tab lifecycle
+//! and theme cycling code that doesn't need the v1.5 profile-aware logic.
 
 use super::*;
 
 impl App {
-    /// Re-read config from disk and apply it live. Triggered by the
-    /// reload-config keybinding (and the file watcher).
-    pub(super) fn reload_config(&mut self) {
-        let config = Config::load();
-        self.apply_config(config);
-        info!("config reloaded");
-    }
-
     // ── v0.9 H1: Tab management ────────────────────────────────────────
 
     /// Get the current (rows, cols) of the active tab's terminal, falling
@@ -618,148 +615,9 @@ impl App {
         }
     }
 
-    /// Apply a (possibly new) config: theme, font, keybindings, scrollback.
-    /// Theme/font/scrollback changes take effect immediately; window size/title
-    /// apply on the next launch.
-    pub(super) fn apply_config(&mut self, config: Config) {
-        // Theme — renderer defaults + terminal palette reseed (recolors all
-        // Palette-indexed cells on the next draw).
-        //
-        // v0.9 U-D1: when `[theme] follow_system = true`, the system
-        // appearance picks the theme (via `light_name` / `dark_name`,
-        // defaulting to `weft-light` / `weft-warm`). The `name` field is
-        // ignored in this mode.
-        let theme = if config.theme.follow_system {
-            let dark = unsafe { system_appearance_is_dark() };
-            let name = if dark {
-                config
-                    .theme
-                    .dark_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-warm".to_string())
-            } else {
-                config
-                    .theme
-                    .light_name
-                    .clone()
-                    .unwrap_or_else(|| "weft-light".to_string())
-            };
-            weft_core::config::Theme::resolve_named(&name, &config.theme)
-        } else {
-            config.theme()
-        };
-        if let Some(r) = &mut self.renderer {
-            r.set_theme(theme.clone());
-        }
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
-            t.set_palette(theme.palette);
-        }
-        // v1.0: sync preferred_dark_theme from the freshly loaded config.
-        let cfg_name = &config.theme.name;
-        if !cfg_name.contains("light") && !cfg_name.is_empty() {
-            self.config_state.preferred_dark_theme = cfg_name.clone();
-        } else if let Some(dn) = &config.theme.dark_name {
-            self.config_state.preferred_dark_theme = dn.clone();
-        }
-
-        // Font — rebuild the atlas (cell dimensions may change → recompute).
-        // The active `font_scale` (Cmd+/- zoom) is re-applied on top of the
-        // freshly loaded config, so a reload doesn't lose the user's zoom.
-        if self.config_state.config.font.family != config.font.family
-            || self.config_state.config.font.size != config.font.size
-            || self.config_state.config.font.line_height != config.font.line_height
-            || self.config_state.font_scale != 1.0
-        {
-            if let Some(r) = &mut self.renderer {
-                let scaled = crate::settings_validation::runtime_scaled_font_config(
-                    &config.font,
-                    self.config_state.font_scale,
-                );
-                r.rebuild_atlas(scaled);
-            }
-            self.recompute_layout();
-        }
-
-        // Window background opacity (layer-level transparency; text stays
-        // opaque). Recolors the next frame. v1.2.11 fix: now also flips the
-        // NSWindow's opaque flag + background color at runtime so lowering
-        // opacity below 1.0 actually shows the desktop through the window.
-        // Previously `with_transparent()` was creation-only, so a window
-        // started at opacity=1.0 could not become transparent without a
-        // relaunch — the Metal layer went non-opaque but the NSWindow's
-        // system background filled the transparent regions.
-        if crate::settings_validation::runtime_opacity(self.config_state.config.window.opacity)
-            != crate::settings_validation::runtime_opacity(config.window.opacity)
-        {
-            let new_opacity = crate::settings_validation::runtime_opacity(config.window.opacity);
-            if let Some(r) = &mut self.renderer {
-                r.set_opacity(config.window.opacity);
-            }
-            if let Some(window) = &self.window {
-                let ok = crate::macos_window::set_window_opaque(window, new_opacity >= 1.0);
-                if !ok {
-                    tracing::warn!(
-                        "set_window_opaque returned false — NSWindow handle unavailable"
-                    );
-                }
-            }
-        }
-
-        // Content padding (changes usable rows/cols → recompute layout).
-        if self.config_state.config.window.padding_x != config.window.padding_x
-            || self.config_state.config.window.padding_y != config.window.padding_y
-        {
-            if let Some(r) = &mut self.renderer {
-                r.set_padding((config.window.padding_x, config.window.padding_y));
-            }
-            self.recompute_layout();
-        }
-
-        // Keybindings.
-        self.config_state.keybindings = config.keybindings();
-
-        // Scrollback capacity.
-        if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
-            t.set_scrollback_max_lines(config.scrollback.lines);
-        }
-
-        // v1.0 Logo: sync Dock icon if variant changed.
-        if config.logo.variant != self.window_runtime.current_logo_variant {
-            self.window_runtime.current_logo_variant = config.logo.variant;
-            unsafe {
-                set_dock_icon(self.window_runtime.current_logo_variant);
-            }
-        }
-
-        // F3-3: sync the persisted sidebar width override from config to the
-        // renderer so a reload (Cmd+Shift+,) or external edit picks up the new
-        // value. `None` clears any in-flight drag override and falls back to
-        // the responsive SidebarMetrics default.
-        if let Some(r) = &mut self.renderer {
-            r.set_sidebar_width(config.window.sidebar_width);
-        }
-
-        // v1.2.11 fix: Window width/height 现在运行时生效。原代码注释说
-        // "apply on the next launch"，但实际上 winit 的 `request_inner_size` 可以
-        // 在运行时调整窗口尺寸。用户在 Settings → Window 调整 Width/Height 后
-        // 按 Apply/Save，窗口会立即 resize 到新尺寸（logical points）。
-        // 注意：这会触发 Resized 事件 → renderer.resize + recompute_layout，
-        // 所以不需要额外调用 recompute_layout。
-        if self.config_state.config.window.width != config.window.width
-            || self.config_state.config.window.height != config.window.height
-        {
-            if let Some(window) = &self.window {
-                let new_size = winit::dpi::LogicalSize::new(
-                    config.window.width as f64,
-                    config.window.height as f64,
-                );
-                let _ = window.request_inner_size(new_size);
-            }
-        }
-
-        self.config_state.config = config;
-        self.request_redraw();
-    }
+    // v1.5.0: `apply_config` and `reload_config` now live in
+    // `config_controller.rs` — extracted so the per-pane update loops
+    // and reload decision can be unit-tested without a full App.
 
     /// Adjust `font_scale` for a zoom action (Cmd+= / Cmd+- / Cmd+0) and
     /// rebuild the glyph atlas with the scaled size. Each ZoomIn/Out step

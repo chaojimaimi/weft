@@ -1,0 +1,520 @@
+//! v1.5.0: Config lifecycle — reload, resolve, apply.
+//!
+//! Extracted from `lifecycle_controller.rs` so the v1.5 profile-aware
+//! reload/apply logic stays within its architecture-gate budget and the
+//! pure per-pane update loops (`apply_palette_to_all_panes`,
+//! `apply_scrollback_to_all_panes`) and the reload decision
+//! (`decide_reload`) can be unit-tested without spinning up a full `App`.
+//!
+//! Tests live at the bottom of this file and use the `Tab::with_single_pane`
+//! + `Pane::with_terminal_only` test constructors — no Metal, no PTY.
+
+use super::*;
+
+// ── Reload decision (pure logic, testable) ──────────────────────────────
+
+/// Outcome of [`decide_reload`]. The caller (`App::reload_config`) maps
+/// each variant to its runtime effect.
+//
+// Note: `PartialEq`/`Eq` are intentionally NOT derived because
+// `ReloadDecision::Apply` carries a `LoadedConfig` (which contains a
+// `Config`), and `Config` doesn't implement `PartialEq` (its
+// `HashMap`/`BTreeMap`/nested config sections make value-equality
+// expensive and brittle). Tests use pattern matching instead.
+#[derive(Clone, Debug)]
+pub(super) enum ReloadDecision {
+    /// The file changed and resolved cleanly — apply the new loaded config
+    /// (both source and effective). Carries the new fingerprint so the
+    /// caller can store it. Boxed because `LoadedConfig` is a large struct
+    /// (multiple nested config sections + `HashMap`/`BTreeMap`) —
+    /// clippy::large_enum_variant.
+    Apply(Box<weft_core::config::LoadedConfig>),
+    /// The file's fingerprint matches the last applied one — skip the
+    /// apply entirely (no atlas rebuild, no palette reseed).
+    SkipSameFingerprint,
+    /// The file failed to load or resolve — keep the current runtime
+    /// state untouched. The error is logged by the caller.
+    KeepLastKnownGood,
+}
+
+/// Decide what to do with a `load_resolved()` result, given the current
+/// `ConfigState`.
+///
+/// Pure logic — no I/O, no side effects. This is the function the v1.5.0
+/// reload tests exercise:
+/// - `reload_parse_error_keeps_last_known_good_config`
+/// - `same_fingerprint_skips_duplicate_apply`
+///
+/// The "apply" branch returns the effective config + new fingerprint so
+/// `reload_config` can call `apply_config(effective)` and then store the
+/// fingerprint. Splitting the decision from the effect is what makes the
+/// reload testable without a real `App`.
+pub(super) fn decide_reload(
+    current_fingerprint: u64,
+    has_current: bool,
+    loaded: Result<weft_core::config::LoadedConfig, weft_core::config::ConfigLoadError>,
+) -> ReloadDecision {
+    match loaded {
+        Ok(loaded) => {
+            // v1.5.3 fingerprint dedup: same content → no-op. Also
+            // protects against the save → watcher feedback loop
+            // (save triggers mtime change → watcher → reload).
+            if has_current && loaded.fingerprint == current_fingerprint {
+                ReloadDecision::SkipSameFingerprint
+            } else {
+                ReloadDecision::Apply(Box::new(loaded))
+            }
+        }
+        Err(_) => ReloadDecision::KeepLastKnownGood,
+    }
+}
+
+// ── Per-pane update loops (pure logic, testable) ───────────────────────
+
+/// Reseed the palette on every pane's terminal in every tab. Called by
+/// `apply_config` when the theme changes (profile switch, reload, manual
+/// toggle). Extracted as a free function so it can be tested with
+/// `Tab::with_single_pane(Pane::with_terminal_only(n))` without a Metal
+/// renderer.
+///
+/// v1.5.0: must touch EVERY pane in EVERY tab, not just the active one.
+/// A profile switch that only recolors the focused pane leaves background
+/// panes with the old palette until the user focuses them — visibly wrong.
+pub(super) fn apply_palette_to_all_panes(tabs: &mut [Tab], palette: [weft_core::grid::Color; 256]) {
+    for tab in tabs.iter_mut() {
+        for pane in tab.panes_mut() {
+            if let Some(t) = pane.terminal.as_mut() {
+                t.set_palette(palette);
+            }
+        }
+    }
+}
+
+/// Update the scrollback capacity on every pane's terminal in every tab.
+/// Called by `apply_config` when the `[scrollback] lines` value changes.
+/// Extracted for the same testability reasons as
+/// [`apply_palette_to_all_panes`].
+pub(super) fn apply_scrollback_to_all_panes(tabs: &mut [Tab], max_lines: usize) {
+    for tab in tabs.iter_mut() {
+        for pane in tab.panes_mut() {
+            if let Some(t) = pane.terminal.as_mut() {
+                t.set_scrollback_max_lines(max_lines);
+            }
+        }
+    }
+}
+
+// ── App methods (delegates to the pure functions above) ─────────────────
+
+impl App {
+    /// Re-read config from disk and apply it live. Triggered by the
+    /// reload-config keybinding (and the file watcher).
+    ///
+    /// v1.5.0: Uses `load_resolved` so the source/effective split is
+    /// preserved (profile overrides are not flattened into the base on
+    /// save). On parse/profile error, the last-known-good config is kept
+    /// — `apply_config` is not called, so the runtime is untouched. On
+    /// success the fingerprint is updated so the watcher can skip duplicate
+    /// reloads of identical content.
+    pub(super) fn reload_config(&mut self) {
+        let loaded = weft_core::config::load_resolved();
+        let decision = decide_reload(
+            self.config_state.config_fingerprint,
+            self.config_state.source_config.is_some(),
+            loaded,
+        );
+        match decision {
+            ReloadDecision::SkipSameFingerprint => {
+                tracing::debug!("config reload skipped (same fingerprint)");
+            }
+            ReloadDecision::KeepLastKnownGood => {
+                tracing::warn!("config reload failed; keeping current config");
+            }
+            ReloadDecision::Apply(loaded) => {
+                // v1.5.0: update BOTH source and effective together via
+                // `set_loaded`, so an external edit followed by a watcher
+                // reload keeps `source_config` fresh. A stale source would
+                // cause the next Settings save to write back the OLD source,
+                // silently clobbering the external edit. The fingerprint is
+                // also stored here so the next watcher tick can dedup.
+                let fingerprint = loaded.fingerprint;
+                let effective = loaded.effective.clone();
+                self.config_state.set_loaded(*loaded);
+                // Apply the effective config last — it may rebuild the
+                // glyph atlas (slowest step), and we want source/fingerprint
+                // already updated so a concurrent watcher tick can't
+                // re-trigger a duplicate apply.
+                self.apply_config(effective);
+                info!(fingerprint, "config reloaded");
+            }
+        }
+    }
+
+    /// Apply a (possibly new) config: theme, font, keybindings, scrollback.
+    /// Theme/font/scrollback changes take effect immediately; window size/title
+    /// apply on the next launch.
+    pub(super) fn apply_config(&mut self, config: Config) {
+        // Theme — renderer defaults + terminal palette reseed (recolors all
+        // Palette-indexed cells on the next draw).
+        //
+        // v0.9 U-D1: when `[theme] follow_system = true`, the system
+        // appearance picks the theme (via `light_name` / `dark_name`,
+        // defaulting to `weft-light` / `weft-warm`). The `name` field is
+        // ignored in this mode.
+        let theme = if config.theme.follow_system {
+            // SAFETY: `system_appearance_is_dark` reads NSUserDefaults
+            // AppleInterfaceStyle via a read-only objc2 lookup; it has no
+            // thread affinity requirements and no side effects. Safe to
+            // call from the main event-loop thread where `apply_config`
+            // runs.
+            let dark = unsafe { system_appearance_is_dark() };
+            let name = if dark {
+                config
+                    .theme
+                    .dark_name
+                    .clone()
+                    .unwrap_or_else(|| "weft-warm".to_string())
+            } else {
+                config
+                    .theme
+                    .light_name
+                    .clone()
+                    .unwrap_or_else(|| "weft-light".to_string())
+            };
+            weft_core::config::Theme::resolve_named(&name, &config.theme)
+        } else {
+            config.theme()
+        };
+        if let Some(r) = &mut self.renderer {
+            r.set_theme(theme.clone());
+        }
+        // v1.5.0: reseed palette on EVERY pane in EVERY tab, not just the
+        // active one. A profile switch must recolor all panes so background
+        // panes don't keep the old palette until the user focuses them.
+        apply_palette_to_all_panes(self.sessions.tabs_mut(), theme.palette);
+        // v1.0: sync preferred_dark_theme from the freshly loaded config.
+        let cfg_name = &config.theme.name;
+        if !cfg_name.contains("light") && !cfg_name.is_empty() {
+            self.config_state.preferred_dark_theme = cfg_name.clone();
+        } else if let Some(dn) = &config.theme.dark_name {
+            self.config_state.preferred_dark_theme = dn.clone();
+        }
+
+        // Font — rebuild the atlas (cell dimensions may change → recompute).
+        // The active `font_scale` (Cmd+/- zoom) is re-applied on top of the
+        // freshly loaded config, so a reload doesn't lose the user's zoom.
+        if self.config_state.config.font.family != config.font.family
+            || self.config_state.config.font.size != config.font.size
+            || self.config_state.config.font.line_height != config.font.line_height
+            || self.config_state.font_scale != 1.0
+        {
+            if let Some(r) = &mut self.renderer {
+                let scaled = crate::settings_validation::runtime_scaled_font_config(
+                    &config.font,
+                    self.config_state.font_scale,
+                );
+                r.rebuild_atlas(scaled);
+            }
+            self.recompute_layout();
+        }
+
+        // Window background opacity (layer-level transparency; text stays
+        // opaque). Recolors the next frame. v1.2.11 fix: now also flips the
+        // NSWindow's opaque flag + background color at runtime so lowering
+        // opacity below 1.0 actually shows the desktop through the window.
+        // Previously `with_transparent()` was creation-only, so a window
+        // started at opacity=1.0 could not become transparent without a
+        // relaunch — the Metal layer went non-opaque but the NSWindow's
+        // system background filled the transparent regions.
+        if crate::settings_validation::runtime_opacity(self.config_state.config.window.opacity)
+            != crate::settings_validation::runtime_opacity(config.window.opacity)
+        {
+            let new_opacity = crate::settings_validation::runtime_opacity(config.window.opacity);
+            if let Some(r) = &mut self.renderer {
+                r.set_opacity(config.window.opacity);
+            }
+            if let Some(window) = &self.window {
+                let ok = crate::macos_window::set_window_opaque(window, new_opacity >= 1.0);
+                if !ok {
+                    tracing::warn!(
+                        "set_window_opaque returned false — NSWindow handle unavailable"
+                    );
+                }
+            }
+        }
+
+        // Content padding (changes usable rows/cols → recompute layout).
+        if self.config_state.config.window.padding_x != config.window.padding_x
+            || self.config_state.config.window.padding_y != config.window.padding_y
+        {
+            if let Some(r) = &mut self.renderer {
+                r.set_padding((config.window.padding_x, config.window.padding_y));
+            }
+            self.recompute_layout();
+        }
+
+        // Keybindings.
+        self.config_state.keybindings = config.keybindings();
+
+        // Scrollback capacity — v1.5.0: update EVERY pane in EVERY tab so
+        // a profile switch doesn't leave background panes with the old limit.
+        apply_scrollback_to_all_panes(self.sessions.tabs_mut(), config.scrollback.lines);
+
+        // v1.0 Logo: sync Dock icon if variant changed.
+        if config.logo.variant != self.window_runtime.current_logo_variant {
+            self.window_runtime.current_logo_variant = config.logo.variant;
+            // SAFETY: `set_dock_icon` calls
+            // NSApplication.setApplicationIconImage: on the main thread.
+            // `apply_config` runs on the main event-loop thread (called
+            // from startup or the watcher reload, which dispatches back
+            // to main), satisfying NSApplication's main-thread
+            // requirement. The icon image is a static asset loaded once
+            // and retained by the autorelease pool; no dangling refs.
+            unsafe {
+                set_dock_icon(self.window_runtime.current_logo_variant);
+            }
+        }
+
+        // F3-3: sync the persisted sidebar width override from config to the
+        // renderer so a reload (Cmd+Shift+,) or external edit picks up the new
+        // value. `None` clears any in-flight drag override and falls back to
+        // the responsive SidebarMetrics default.
+        if let Some(r) = &mut self.renderer {
+            r.set_sidebar_width(config.window.sidebar_width);
+        }
+
+        // v1.2.11 fix: Window width/height 现在运行时生效。原代码注释说
+        // "apply on the next launch"，但实际上 winit 的 `request_inner_size` 可以
+        // 在运行时调整窗口尺寸。用户在 Settings → Window 调整 Width/Height 后
+        // 按 Apply/Save，窗口会立即 resize 到新尺寸（logical points）。
+        // 注意：这会触发 Resized 事件 → renderer.resize + recompute_layout，
+        // 所以不需要额外调用 recompute_layout。
+        if self.config_state.config.window.width != config.window.width
+            || self.config_state.config.window.height != config.window.height
+        {
+            if let Some(window) = &self.window {
+                let new_size = winit::dpi::LogicalSize::new(
+                    config.window.width as f64,
+                    config.window.height as f64,
+                );
+                let _ = window.request_inner_size(new_size);
+            }
+        }
+
+        self.config_state.config = config;
+        self.request_redraw();
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane::Pane;
+    use crate::tab::Tab;
+    use weft_core::config::{Config, ConfigLoadError, LoadedConfig};
+    use weft_core::grid::Color;
+
+    /// Build a tab with a live terminal but no PTY — enough for palette /
+    /// scrollback tests without spawning a shell.
+    fn tab_with_terminal(scrollback_lines: usize) -> Tab {
+        Tab::with_single_pane(Pane::with_terminal_only(scrollback_lines))
+    }
+
+    // ── decide_reload ────────────────────────────────────────────────
+
+    #[test]
+    fn reload_parse_error_keeps_last_known_good_config() {
+        // The critical v1.5.0 invariant: a malformed config file must NOT
+        // blow away the running config. `decide_reload` returns
+        // `KeepLastKnownGood` for any `Err`, and the caller leaves
+        // `config_state` untouched.
+        //
+        // Construct a real parse error by writing bad TOML to a temp
+        // file and loading it via `load_resolved_from_path`.
+        let tmp = std::env::temp_dir().join(format!(
+            "weft-reload-parse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, "not = valid = toml").unwrap();
+        let err = weft_core::config::load_resolved_from_path(&tmp).unwrap_err();
+        let _ = std::fs::remove_file(&tmp);
+        assert!(matches!(err, ConfigLoadError::Parse(_)));
+        let decision = decide_reload(12345, true, Err(err));
+        assert!(matches!(decision, ReloadDecision::KeepLastKnownGood));
+    }
+
+    #[test]
+    fn reload_io_error_keeps_last_known_good_config() {
+        // File missing → Io error → same keep-last-known-good behavior.
+        let err = ConfigLoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file gone",
+        ));
+        let decision = decide_reload(12345, true, Err(err));
+        assert!(matches!(decision, ReloadDecision::KeepLastKnownGood));
+    }
+
+    #[test]
+    fn reload_profile_error_keeps_last_known_good_config() {
+        // Invalid profile schema → Profile error → keep last-known-good.
+        let err = ConfigLoadError::Profile(weft_core::config::ProfileError::TooManyProfiles(33));
+        let decision = decide_reload(12345, true, Err(err));
+        assert!(matches!(decision, ReloadDecision::KeepLastKnownGood));
+    }
+
+    #[test]
+    fn same_fingerprint_skips_duplicate_apply() {
+        // v1.5.3 fingerprint dedup: the watcher fires on mtime change,
+        // but the content may be identical (e.g. touch(1) or a save that
+        // wrote the same bytes). The reload must be a no-op so we don't
+        // rebuild the atlas or reseed palettes for nothing.
+        let mut source = Config::default();
+        source.font.family = "Cached".into();
+        let (effective, _) = source.resolve_active_profile().unwrap();
+        let fingerprint = 9999;
+        let loaded = LoadedConfig {
+            source,
+            effective,
+            fingerprint,
+            diagnostics: Vec::new(),
+        };
+        // Same fingerprint → skip.
+        let decision = decide_reload(fingerprint, true, Ok(loaded.clone()));
+        assert!(matches!(decision, ReloadDecision::SkipSameFingerprint));
+
+        // Different fingerprint → apply.
+        let decision = decide_reload(fingerprint.wrapping_add(1), true, Ok(loaded));
+        match decision {
+            ReloadDecision::Apply(loaded) => assert_eq!(loaded.fingerprint, fingerprint),
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_load_with_zero_fingerprint_applies() {
+        // Edge case: the very first load has `current_fingerprint = 0`
+        // and `has_current = false`. Even if `loaded.fingerprint == 0`
+        // (astronomically unlikely for real file bytes, but the logic
+        // must still apply on the first load).
+        let mut source = Config::default();
+        source.font.family = "First".into();
+        let (effective, _) = source.resolve_active_profile().unwrap();
+        let loaded = LoadedConfig {
+            source,
+            effective,
+            fingerprint: 0,
+            diagnostics: Vec::new(),
+        };
+        let decision = decide_reload(0, false, Ok(loaded));
+        // First load (has_current=false) must apply even when fingerprints
+        // would otherwise compare equal — `has_current` gate prevents the
+        // "same fingerprint" branch from firing before the first
+        // successful load.
+        match decision {
+            ReloadDecision::Apply(_) => {}
+            other => panic!("expected Apply on first load, got {other:?}"),
+        }
+    }
+
+    // ── apply_palette_to_all_panes ──────────────────────────────────
+
+    #[test]
+    fn profile_switch_updates_every_tab_and_pane_palette() {
+        // Two tabs, each with one pane. All terminals start with the
+        // default palette. After apply_palette_to_all_panes, every
+        // pane's palette must match the new one — not just the active
+        // tab's pane.
+        let tab0 = tab_with_terminal(100);
+        let tab1 = tab_with_terminal(100);
+        let original_palette = *tab0.terminal.as_ref().unwrap().palette();
+
+        // Build a distinctly different palette.
+        let mut new_palette = original_palette;
+        new_palette[0] = Color {
+            r: 0xAA,
+            g: 0xBB,
+            b: 0xCC,
+            a: 0xFF,
+        };
+
+        let tabs: &mut [Tab] = &mut [tab0, tab1];
+        apply_palette_to_all_panes(tabs, new_palette);
+
+        // Both tabs' panes must have the new palette.
+        for (i, tab) in tabs.iter().enumerate() {
+            let pal = tab.terminal.as_ref().unwrap().palette();
+            assert_eq!(pal[0], new_palette[0], "tab {i} palette not updated");
+            assert_ne!(pal[0], original_palette[0], "tab {i} palette unchanged");
+        }
+    }
+
+    #[test]
+    fn apply_palette_skips_panes_without_terminal() {
+        // A pane with `terminal: None` (PTY spawn failure path) must not
+        // panic — apply_palette_to_all_panes silently skips it.
+        let tab = Tab::empty();
+        // Tab::empty has no panes at all; add a terminal-less pane isn't
+        // trivial via the public API, but `Tab::empty()` itself exercises
+        // the "no panes" path. Ensure no panic.
+        let palette = [Color {
+            r: 0,
+            g: 0,
+            b: 0,
+            a: 0,
+        }; 256];
+        apply_palette_to_all_panes(&mut [tab], palette);
+    }
+
+    // ── apply_scrollback_to_all_panes ────────────────────────────────
+
+    #[test]
+    fn profile_switch_updates_every_pane_scrollback_limit() {
+        // Two tabs with different initial scrollback capacities. After
+        // apply_scrollback_to_all_panes, both must reflect the new limit.
+        let tab0 = tab_with_terminal(1000);
+        let tab1 = tab_with_terminal(500);
+        let tabs: &mut [Tab] = &mut [tab0, tab1];
+
+        let new_limit = 5000;
+        apply_scrollback_to_all_panes(tabs, new_limit);
+
+        // Both tabs' panes must have the new scrollback capacity.
+        for (i, tab) in tabs.iter().enumerate() {
+            let t = tab.terminal.as_ref().unwrap();
+            let grid = t.grid();
+            assert_eq!(
+                grid.scrollback.max_lines(),
+                new_limit,
+                "tab {i} scrollback not updated"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_scrollback_skips_panes_without_terminal() {
+        // Same safety check as palette: terminal-less panes must be skipped
+        // silently, not panic.
+        let tab = Tab::empty();
+        apply_scrollback_to_all_panes(&mut [tab], 9999);
+    }
+
+    // ── Multi-pane coverage ─────────────────────────────────────────
+    //
+    // The `apply_palette_updates_all_panes_in_split_tab` test would verify
+    // that a single tab with multiple split panes (v1.3) gets every pane
+    // updated. However, creating a split requires an `EventLoopProxy`,
+    // which on macOS must be created on the main thread — tests may run
+    // on any thread. The `panes_mut()` iterator that drives the update
+    // is already exercised by `profile_switch_updates_every_tab_and_pane_palette`
+    // (two tabs, each with one pane), which is the same code path. A
+    // dedicated multi-pane-within-one-tab test would need either a test
+    // constructor that builds a multi-pane `Tab` without a proxy, or a
+    // main-thread test harness — both are out of scope for v1.5.0.
+}

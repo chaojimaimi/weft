@@ -38,13 +38,15 @@
 //! ```
 
 mod action;
+mod io;
 mod keybindings;
 mod parsers;
+mod profiles;
 mod save;
 mod sections;
 mod theme;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -55,8 +57,16 @@ use crate::grid::Color;
 use crate::input::{KeyCode, Modifiers};
 
 pub use action::Action;
+pub use io::{
+    atomic_write, fingerprint_bytes, load_resolved, load_resolved_from_path, ConfigLoadError,
+    LoadedConfig,
+};
 pub use keybindings::KeyBindings;
 pub use parsers::{parse_binding, parse_hex};
+pub use profiles::{
+    apply_overrides, validate_profile_name, ConfigDiagnostic, ConfigSectionMask, ProfileConfig,
+    ProfileError, MAX_PROFILES,
+};
 pub use save::ConfigSaveError;
 pub use sections::{
     AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, ScrollbackConfig, SyntaxConfig,
@@ -89,6 +99,14 @@ pub struct Config {
     /// Raw user keybinding overrides: `"cmd+x" = "copy"`. Resolved later via
     /// [`Config::keybindings`] (merged onto defaults).
     pub keybindings: HashMap<String, Action>,
+    /// v1.5.0: Name of the active profile. `None` or empty string means
+    /// "use base only". Resolved at load time via
+    /// [`Config::resolve_active_profile`].
+    pub active_profile: Option<String>,
+    /// v1.5.0: Named profiles. `BTreeMap` so Settings, serialization, palette
+    /// and tests all see a stable, alphabetical order. See
+    /// [`profiles::ProfileConfig`] for override semantics.
+    pub profiles: BTreeMap<String, ProfileConfig>,
 }
 
 impl Config {
@@ -332,43 +350,15 @@ impl Config {
             let mut kb_table = toml_edit::table();
             let kt = kb_table.as_table_mut().unwrap();
             for (binding, action) in &self.keybindings {
-                let action_str = match action {
-                    Action::Copy => "copy",
-                    Action::Paste => "paste",
-                    Action::ReloadConfig => "reload_config",
-                    Action::ScrollPageUp => "scroll_page_up",
-                    Action::ScrollPageDown => "scroll_page_down",
-                    Action::ScrollLineUp => "scroll_line_up",
-                    Action::ScrollLineDown => "scroll_line_down",
-                    Action::ScrollToTop => "scroll_to_top",
-                    Action::ScrollToBottom => "scroll_to_bottom",
-                    Action::ToggleBlockPanel => "toggle_block_panel",
-                    Action::ToggleCommandPalette => "toggle_command_palette",
-                    Action::ZoomIn => "zoom_in",
-                    Action::ZoomOut => "zoom_out",
-                    Action::ZoomReset => "zoom_reset",
-                    Action::FindInGrid => "find_in_grid",
-                    Action::ToggleTheme => "toggle_theme",
-                    Action::NewTab => "new_tab",
-                    Action::CloseTab => "close_tab",
-                    Action::NextTab => "next_tab",
-                    Action::PrevTab => "prev_tab",
-                    Action::ToggleSettings => "toggle_settings",
-                    Action::SplitHorizontal => "split_horizontal",
-                    Action::SplitVertical => "split_vertical",
-                    Action::FocusNextPane => "focus_next_pane",
-                    Action::FocusPrevPane => "focus_prev_pane",
-                    Action::ClosePane => "close_pane",
-                    Action::TogglePaneZoom => "toggle_pane_zoom",
-                    Action::FocusPaneUp => "focus_pane_up",
-                    Action::FocusPaneDown => "focus_pane_down",
-                    Action::FocusPaneLeft => "focus_pane_left",
-                    Action::FocusPaneRight => "focus_pane_right",
-                };
-                kt.insert(binding, toml_edit::value(action_str));
+                kt.insert(binding, toml_edit::value(action::action_to_str(action)));
             }
             doc["keybindings"] = kb_table;
         }
+
+        // v1.5.0: active_profile + profiles. Lives in `save::write_*` to
+        // keep this file within its architecture-gate budget.
+        save::write_active_profile(&mut doc, &self.active_profile);
+        save::write_profiles(&mut doc, self);
 
         // Atomic write: <path>.tmp → rename → <path>.
         let parent = path.parent().ok_or(ConfigSaveError::NoParentDir)?;

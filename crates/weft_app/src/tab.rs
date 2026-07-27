@@ -116,6 +116,13 @@ impl Tab {
         self.panes.get_mut(&id)
     }
 
+    /// v1.5.0: Mutable iterator over all panes. Used by `apply_config` to
+    /// reseed palette / scrollback on every pane in every tab when a
+    /// profile switch or config reload fires.
+    pub(crate) fn panes_mut(&mut self) -> impl Iterator<Item = &mut Pane> {
+        self.panes.values_mut()
+    }
+
     /// Id of the currently focused pane.
     #[allow(dead_code)] // v1.3 Batch 4+: consumed by split/focus/close handlers
     pub(crate) fn active_pane_id(&self) -> PaneId {

@@ -879,8 +879,7 @@ impl MetalRenderer {
         // glyph=16 floats/cell; upload_bytes = (verts+bg+glyph)·4).
         let grid_bg_instances = bg_stream.len() / 8;
         let grid_glyph_instances = glyph_stream.len() / 16;
-        let grid_upload_bytes =
-            (vertices.len() + bg_stream.len() + glyph_stream.len()) as u64 * 4;
+        let grid_upload_bytes = (vertices.len() + bg_stream.len() + glyph_stream.len()) as u64 * 4;
         let grid_build_us = self.grid_build_us_counter.get();
         self.frame_trace
             .borrow_mut()

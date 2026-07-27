@@ -57,6 +57,13 @@ impl Scrollback {
         self.len
     }
 
+    /// v1.5.0: Maximum scrollback capacity (the `[scrollback] lines` value).
+    /// Used by config_controller tests to verify
+    /// `apply_scrollback_to_all_panes` updated every pane.
+    pub fn max_lines(&self) -> usize {
+        self.max_lines
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

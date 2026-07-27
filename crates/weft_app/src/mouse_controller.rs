@@ -24,8 +24,14 @@ impl App {
                 .renderer
                 .as_ref()
                 .and_then(|r| r.sidebar_width_override);
+            // v1.5.0: persist via SOURCE config so an active profile's
+            // overrides aren't flattened into base on save. Effective is
+            // also updated so runtime reads see the new value.
             self.config_state.config.window.sidebar_width = new_width;
-            if let Err(e) = self.config_state.config.save() {
+            if let Some(source) = self.config_state.source_config.as_mut() {
+                source.window.sidebar_width = new_width;
+            }
+            if let Err(e) = self.config_state.source().save() {
                 tracing::warn!(error = ?e, "failed to persist sidebar_width");
             }
             // Restore cursor based on current hover state.
