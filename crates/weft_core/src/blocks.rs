@@ -24,8 +24,10 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+pub mod annotations;
 mod continuation;
 mod output_capture;
+
 #[cfg(test)]
 mod screen_capture_tests;
 mod semantic;

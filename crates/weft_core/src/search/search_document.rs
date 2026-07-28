@@ -115,6 +115,44 @@ impl SearchDocument {
         }
     }
 
+    /// v1.7.3: Construct from a block annotation (bookmark/note). The
+    /// `stable_id` is the block id so activating the hit can navigate to
+    /// the block. `title` prefers the note (or the block command when the
+    /// note is empty) so the palette shows something useful.
+    pub fn from_bookmark(
+        block_id: u64,
+        note: Option<&str>,
+        block_command: &str,
+        tags: &[String],
+        cwd: Option<&str>,
+        updated_ms: i64,
+    ) -> Self {
+        let title = note
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(block_command)
+            .to_string();
+        // Body = note + tags joined, so both are searchable.
+        let mut body_parts: Vec<String> = Vec::new();
+        if let Some(n) = note {
+            let n = n.trim();
+            if !n.is_empty() {
+                body_parts.push(n.to_string());
+            }
+        }
+        if !tags.is_empty() {
+            body_parts.push(tags.join(" "));
+        }
+        Self {
+            kind: SearchDocumentKind::Bookmark,
+            stable_id: block_id.to_string(),
+            title,
+            body: body_parts.join(" "),
+            cwd: cwd.map(|s| s.to_string()),
+            updated_at: updated_ms,
+        }
+    }
+
     /// Current time as milliseconds since Unix epoch. Convenience for
     /// documents without an explicit timestamp.
     pub fn now_ms() -> i64 {
@@ -203,6 +241,39 @@ mod tests {
     fn from_block_no_cwd() {
         let doc = SearchDocument::from_block(1, "echo hi", "hi\n", None, 100);
         assert!(doc.cwd.is_none());
+    }
+
+    #[test]
+    fn from_bookmark_with_note() {
+        let tags = vec!["deploy".to_string(), "prod".to_string()];
+        let doc = SearchDocument::from_bookmark(
+            42,
+            Some("deploy script"),
+            "kubectl apply -f deploy.yaml",
+            &tags,
+            Some("/repo"),
+            1_700_000_000,
+        );
+        assert_eq!(doc.kind, SearchDocumentKind::Bookmark);
+        assert_eq!(doc.stable_id, "42");
+        assert_eq!(doc.title, "deploy script");
+        assert_eq!(doc.body, "deploy script deploy prod");
+        assert_eq!(doc.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn from_bookmark_note_empty_falls_back_to_command() {
+        let doc = SearchDocument::from_bookmark(7, None, "git status", &[], None, 0);
+        assert_eq!(doc.title, "git status");
+        assert_eq!(doc.body, "");
+    }
+
+    #[test]
+    fn from_bookmark_tags_only() {
+        let tags = vec!["rust".to_string(), "cli".to_string()];
+        let doc = SearchDocument::from_bookmark(1, None, "cargo build", &tags, None, 0);
+        assert_eq!(doc.title, "cargo build");
+        assert_eq!(doc.body, "rust cli");
     }
 
     #[test]
