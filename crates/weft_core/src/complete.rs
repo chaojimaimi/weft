@@ -85,21 +85,8 @@ pub fn complete(prefix: &str, ctx: &CompleteCtx, position: CompletePosition) -> 
     // History and $PATH commands only make sense at a command position.
     // After `cd ` you want files, not a historical `cd /tmp`.
     if position == CompletePosition::Command {
-        // History: whole-line prefix matches (excluding exact duplicates of prefix).
-        for h in ctx.history {
-            if h.starts_with(prefix) && h.len() > prefix.len() {
-                out.push(Match::new(h.clone(), MatchKind::History, h.clone()));
-            }
-        }
-
-        // Command names ($PATH executables). The caller passes an empty
-        // path_bins when the cursor isn't at a command position, but we also
-        // gate here for safety.
-        for bin in ctx.path_bins {
-            if bin.starts_with(prefix) && bin.len() > prefix.len() {
-                out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
-            }
-        }
+        out.extend(history_matches(prefix, ctx.history));
+        out.extend(command_matches(prefix, ctx.path_bins));
     }
 
     // Filesystem paths — always consulted (both command and argument positions).
@@ -122,9 +109,36 @@ pub fn complete(prefix: &str, ctx: &CompleteCtx, position: CompletePosition) -> 
 
 const MAX_RESULTS: usize = 50;
 
+/// History prefix matches (whole-line). Excludes exact duplicates of prefix
+/// (entries whose length equals the prefix). Public so the v1.7.2
+/// `completion::providers` module can wrap the same logic in a
+/// `CompletionProvider` without duplicating it.
+pub fn history_matches(prefix: &str, history: &[String]) -> Vec<Match> {
+    let mut out = Vec::new();
+    for h in history {
+        if h.starts_with(prefix) && h.len() > prefix.len() {
+            out.push(Match::new(h.clone(), MatchKind::History, h.clone()));
+        }
+    }
+    out
+}
+
+/// `$PATH` executable prefix matches. Public so the v1.7.2
+/// `completion::providers` module can wrap the same logic.
+pub fn command_matches(prefix: &str, path_bins: &[String]) -> Vec<Match> {
+    let mut out = Vec::new();
+    for bin in path_bins {
+        if bin.starts_with(prefix) && bin.len() > prefix.len() {
+            out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
+        }
+    }
+    out
+}
+
 /// Resolve a directory prefix (possibly `~`-relative, absolute, or relative to
-/// `cwd`) to an absolute path for `read_dir`.
-fn resolve_dir(dir_part: &str, cwd: &str) -> String {
+/// `cwd`) to an absolute path for `read_dir`. Public so the v1.7.2
+/// `completion::FilesystemProvider` can reuse the same resolution logic.
+pub fn resolve_dir(dir_part: &str, cwd: &str) -> String {
     if let Some(rest) = dir_part.strip_prefix("~") {
         // ~/x or ~ (rest may start with '/')
         let home = std::env::var_os("HOME").map(|s| s.to_string_lossy().to_string());
@@ -141,8 +155,9 @@ fn resolve_dir(dir_part: &str, cwd: &str) -> String {
     }
 }
 
-/// Filesystem path completions for `prefix` within `cwd`.
-fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
+/// Filesystem path completions for `prefix` within `cwd`. Public so the
+/// v1.7.2 `completion::FilesystemProvider` can reuse the same logic.
+pub fn path_matches(prefix: &str, cwd: &str) -> Vec<Match> {
     let (dir_part, file_prefix) = match prefix.rfind('/') {
         Some(i) => (&prefix[..=i], &prefix[i + 1..]),
         None => ("", prefix),

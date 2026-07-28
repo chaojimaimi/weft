@@ -3,6 +3,7 @@
 mod block_id_sequence;
 pub mod blocks;
 pub mod complete;
+pub mod completion;
 pub mod config;
 pub mod editor;
 pub mod find;
