@@ -36,6 +36,8 @@ pub use semantic::{
     classify_block, classify_line, OutputSemanticRole, SemanticLine, SemanticOutput, SemanticSpan,
     MAX_SEMANTIC_SPANS_PER_BLOCK, MAX_SEMANTIC_SPANS_PER_LINE,
 };
+#[cfg(test)]
+pub(crate) use style::build_styled_output_from_runs;
 pub use style::{
     AttributeSpan, CapturedStyle, CapturedStyleRun, ForegroundSpan, LinkSpan, StyledLine,
     StyledOutput, ANSI_ATTRIBUTE_MASK, MAX_STYLE_RUNS_PER_BLOCK, MAX_STYLE_RUNS_PER_LINE,

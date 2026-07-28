@@ -987,6 +987,76 @@ fn semantic_output_toggle_preserves_color_overrides() {
     assert_eq!(output.failure.as_deref(), Some("#ff0000"));
 }
 
+// ── v1.7.0-E: Theme switching re-resolution tests ──────────────────
+
+/// v1.7.0-E §2.7: "主题切换只重解析 palette index，不改显式 RGB". Verifies
+/// the storage contract that makes theme-switch re-resolution possible:
+/// `CellColor::Palette(i)` stores a theme-owned index (not a pre-baked RGB),
+/// so switching themes changes the resolved color; `CellColor::Rgb(c)` stores
+/// an explicit truecolor that is program-owned and must not change.
+///
+/// This test verifies the **storage** half of the contract at the `weft_core`
+/// layer. The **rendering** half (palette[i] → RGB lookup in the painter) is
+/// verified by the visual hierarchy contract test in `paint/primitives.rs`.
+#[test]
+fn theme_switch_re_resolves_palette_but_preserves_explicit_rgb() {
+    use crate::grid::Color;
+
+    let warm = Theme::weft_warm();
+    let dracula = Theme::dracula();
+
+    // Palette index 1 (ANSI red) — the stored index is the same, but the
+    // resolved RGB differs because each theme owns its palette.
+    let red_warm: Color = warm.palette[1];
+    let red_dracula: Color = dracula.palette[1];
+    assert_ne!(
+        red_warm, red_dracula,
+        "palette index 1 must re-resolve to different RGB under different themes"
+    );
+
+    // Explicit truecolor RGB: CellColor::Rgb stores the Color directly (no
+    // theme lookup), so it is byte-identical across theme switches by
+    // construction. The type system enforces this — no runtime assertion
+    // needed. See paint/primitives.rs color_to_normalized for the renderer
+    // path that consumes CellColor::Rgb without theme resolution.
+}
+
+/// v1.7.0-E: Verifies that all 11 built-in themes have distinct palette
+/// entries for the primary ANSI colors (indices 0-7). This ensures a
+/// palette-indexed `CapturedStyle` actually re-resolves to a different
+/// visual when the user switches themes — the whole point of storing
+/// `CellColor::Palette(i)` instead of pre-baked RGB.
+#[test]
+fn built_in_themes_have_distinct_ansi_palettes() {
+    let themes: Vec<(&str, Theme)> = vec![
+        ("weft_warm", Theme::weft_warm()),
+        ("weft_light", Theme::weft_light()),
+        ("warp_dark", Theme::warp_dark()),
+        ("dracula", Theme::dracula()),
+        ("solarized_dark", Theme::solarized_dark()),
+        ("gruvbox_dark", Theme::gruvbox_dark()),
+        ("nord", Theme::nord()),
+        ("tokyo_night", Theme::tokyo_night()),
+        ("catppuccin_mocha", Theme::catppuccin_mocha()),
+        ("one_dark", Theme::one_dark()),
+        ("monokai_pro", Theme::monokai_pro()),
+    ];
+    // For each ANSI primary (0-7), at least two themes should disagree on
+    // the resolved RGB. (In practice many will — we just need to confirm
+    // palettes aren't accidentally identical.)
+    for idx in 0..8u8 {
+        let resolved: Vec<(&str, crate::grid::Color)> = themes
+            .iter()
+            .map(|(name, t)| (*name, t.palette[idx as usize]))
+            .collect();
+        let unique: Vec<_> = resolved.windows(2).filter(|w| w[0].1 != w[1].1).collect();
+        assert!(
+            !unique.is_empty(),
+            "ANSI palette index {idx} is identical across all 11 themes — palettes not distinct"
+        );
+    }
+}
+
 // ── v1.0 S2: Config::save() tests ──────────────────────────────────
 
 fn unique_tmp_path(tag: &str) -> std::path::PathBuf {

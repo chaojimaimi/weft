@@ -827,4 +827,123 @@ mod tests {
         assert_eq!(sel.start.row_index, 0);
         assert_eq!(sel.end.row_index, 0);
     }
+
+    // ── v1.7.0-E: Selection + ANSI non-corruption tests ──────────────
+
+    /// v1.7.0-E §2.7: "选择、搜索命中、hyperlink hover 和 ANSI/semantic
+    /// 不互相破坏". Verifies that performing a block-view selection on rows
+    /// that carry `line` indices into a `StyledOutput` does not corrupt the
+    /// styled output — the selection reads `row.text` (plain text) only and
+    /// has no mutable path to the style data.
+    ///
+    /// The test also asserts the extracted selection text contains no ESC
+    /// bytes (V17 §2.7: "复制/导出文本不含颜色控制字节" — selection is the
+    /// copy path for block view).
+    #[test]
+    fn selection_does_not_corrupt_styled_output() {
+        use crate::blocks::{build_styled_output_from_runs, CapturedStyle, CapturedStyleRun};
+        use crate::grid::{CellColor, CellFlags};
+
+        // Build a StyledOutput with 2 lines, each with a colored run.
+        // Line 0: "error: file not found" with red fg on "error"
+        // Line 1: "  see /tmp/log" with green fg on the path
+        let runs = vec![
+            CapturedStyleRun {
+                start_char: 0,
+                end_char: 5,
+                style: CapturedStyle::from_attrs(
+                    CellColor::Palette(1),
+                    CellColor::Default,
+                    CellFlags::BOLD,
+                ),
+            },
+            CapturedStyleRun {
+                start_char: 6,
+                end_char: 21,
+                style: CapturedStyle::default(),
+            },
+            // newline at 21; line 1 starts at 22 and is 14 chars ("  see /tmp/log")
+            CapturedStyleRun {
+                start_char: 22,
+                end_char: 36,
+                style: CapturedStyle::from_attrs(
+                    CellColor::Palette(2),
+                    CellColor::Default,
+                    CellFlags::empty(),
+                ),
+            },
+        ];
+        // Text is stored separately from StyledOutput (text is authoritative
+        // for search/copy; StyledOutput is the parallel style model).
+        let line0_text = "error: file not found";
+        let line1_text = "  see /tmp/log";
+        let full_text = format!("{line0_text}\n{line1_text}");
+        let styled = build_styled_output_from_runs(&full_text, &runs).expect("styled output");
+        // Snapshot the styled output before selection.
+        let original_line_count = styled.lines.len();
+        let original_line0_spans = styled.lines[0].attributes.len();
+        let original_line1_spans = styled.lines[1].attributes.len();
+
+        // Build BlockViewRows that reference lines in the styled output.
+        // The row text comes from the original text, not from StyledOutput
+        // (which doesn't store text).
+        let rows = vec![
+            BlockViewRow {
+                kind: BlockViewRowKind::Output,
+                text: line1_text.to_string(),
+                block_id: None,
+                y_top: 0.0,
+                y_bottom: 20.0,
+                line: Some(1),
+                chunk_char_offset: 0,
+            },
+            BlockViewRow {
+                kind: BlockViewRowKind::Output,
+                text: line0_text.to_string(),
+                block_id: None,
+                y_top: 20.0,
+                y_bottom: 40.0,
+                line: Some(0),
+                chunk_char_offset: 0,
+            },
+        ];
+
+        // Perform a selection spanning both rows.
+        let sel = BlockViewSelection {
+            start: BlockViewPos {
+                row_index: 1,
+                char_index: 0,
+            },
+            end: BlockViewPos {
+                row_index: 0,
+                char_index: 5,
+            },
+            rows,
+        };
+
+        // Extract selection text.
+        let selected_text = sel.text();
+        assert!(
+            !selected_text.is_empty(),
+            "selection text must not be empty"
+        );
+        // V17 §2.7: copied text contains no ANSI escape bytes.
+        assert!(
+            !selected_text.as_bytes().contains(&0x1b),
+            "selection text contains ESC bytes"
+        );
+
+        // The styled output is unchanged — selection had no mutable path.
+        assert_eq!(styled.lines.len(), original_line_count);
+        assert_eq!(
+            styled.lines[0].attributes.len(),
+            original_line0_spans,
+            "line 0 attributes corrupted by selection"
+        );
+        assert_eq!(
+            styled.lines[1].attributes.len(),
+            original_line1_spans,
+            "line 1 attributes corrupted by selection"
+        );
+    }
 }

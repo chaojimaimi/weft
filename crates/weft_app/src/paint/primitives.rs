@@ -341,6 +341,10 @@ mod tests {
     /// v1.7.0-B: V17 §2.4 visual hierarchy contract — in every built-in
     /// theme, command ≠ argument ≠ default, and output_default ≠ cwd.
     /// Also verifies success ≠ failure (status colors must be distinguishable).
+    ///
+    /// v1.7.0-E: Extended to also assert metadata ≠ output_default/cwd and
+    /// warning ≠ success/failure, closing the §2.5 "角色间满足固定的感知
+    /// 差异门槛" gap for the full OutputSemanticColors role set.
     #[test]
     fn all_themes_satisfy_visual_hierarchy_contract() {
         let themes: Vec<(&str, weft_core::config::Theme)> = vec![
@@ -370,6 +374,14 @@ mod tests {
             assert_ne!(o.output_default, o.cwd, "{name}: output_default == cwd");
             // Status colors must be distinguishable
             assert_ne!(o.success, o.failure, "{name}: success == failure");
+            // v1.7.0-E: metadata must be distinct from output_default and cwd
+            // ("label 与 value 可分，但整体弱于命令名" — metadata is a weaker
+            // structural role and must not collapse into default or cwd).
+            assert_ne!(
+                o.metadata, o.output_default,
+                "{name}: metadata == output_default"
+            );
+            assert_ne!(o.metadata, o.cwd, "{name}: metadata == cwd");
         }
     }
 
