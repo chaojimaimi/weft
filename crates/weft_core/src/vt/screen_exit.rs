@@ -28,7 +28,7 @@
 //! to prevent confusion when mapping plan terminology to code.
 
 use super::Terminal;
-use crate::blocks::{OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
 use std::time::{Duration, Instant};
 
 mod freeze;
@@ -159,15 +159,19 @@ impl Terminal {
             && self.capabilities.primary_screen_exit.is_none()
     }
 
-    pub(super) fn capture_primary_screen_interrupt_print(&mut self, c: char) {
+    pub(super) fn capture_primary_screen_interrupt_print(&mut self, c: char, style: CapturedStyle) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
-            capture.tail.print(c, MAX_OUTPUT_BYTES);
+            capture.tail.print(c, style, MAX_OUTPUT_BYTES);
         }
     }
 
-    pub(super) fn capture_primary_screen_interrupt_ascii(&mut self, bytes: &[u8]) {
+    pub(super) fn capture_primary_screen_interrupt_ascii(
+        &mut self,
+        bytes: &[u8],
+        style: CapturedStyle,
+    ) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
-            capture.tail.print_ascii(bytes, MAX_OUTPUT_BYTES);
+            capture.tail.print_ascii(bytes, style, MAX_OUTPUT_BYTES);
         }
     }
 
@@ -633,6 +637,7 @@ mod tests {
                     foregrounds: Vec::new(),
                     backgrounds: Vec::new(),
                     links: Vec::new(),
+                    attributes: Vec::new(),
                 })
                 .collect(),
         };

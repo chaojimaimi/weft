@@ -978,6 +978,30 @@ mod tests {
     }
 
     #[test]
+    fn regex_starting_inside_grapheme_maps_back_to_owning_cell() {
+        let mut g = Grid::new(2, 20);
+        write(&mut g, 0, 0, "ex");
+        g.viewport[0].cells[0].flags.insert(CellFlags::EXTRA);
+        g.viewport[0]
+            .extras
+            .set_grapheme(0, std::sync::Arc::from("e\u{0301}"));
+
+        let direct = find_in_grid(&g, "\u{0301}x", true, true);
+        assert_eq!(
+            direct,
+            [FindMatch {
+                row: 0,
+                col: 0,
+                len: 2,
+            }]
+        );
+
+        let snapshot = g.find_snapshot();
+        let background = find_in_snapshot(&snapshot, "\u{0301}x", true, true).unwrap();
+        assert_eq!(background, direct);
+    }
+
+    #[test]
     fn regex_invalid_returns_empty() {
         let mut g = Grid::new(2, 20);
         write(&mut g, 0, 0, "hello");

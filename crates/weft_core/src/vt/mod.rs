@@ -12,7 +12,7 @@ pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
 pub use screen_exit::{PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY};
 
-use crate::blocks::{BlockTracker, ShellPhase};
+use crate::blocks::{BlockTracker, CapturedStyle, ShellPhase};
 use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
@@ -426,10 +426,19 @@ impl Terminal {
             let chunk = &bytes[offset..offset + count];
 
             // Batch capture to block tracker — one push_str instead of N pushes.
+            // v1.7.0-A: capture the current VT SGR attrs for the whole ASCII
+            // run — all bytes share one style since the fast path only fires
+            // when no SGR change occurred mid-run.
             if capturing {
-                self.block_tracker.on_print_ascii_run(chunk);
+                let style =
+                    CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                self.block_tracker.on_print_ascii_run(chunk, style);
             }
-            self.capture_primary_screen_interrupt_ascii(chunk);
+            {
+                let style =
+                    CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                self.capture_primary_screen_interrupt_ascii(chunk, style);
+            }
 
             // The contiguous ASCII overwrite can only split a pre-existing
             // wide glyph at its two boundaries. Pairs fully inside the range

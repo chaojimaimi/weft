@@ -30,6 +30,7 @@ fn oversized_styled_output_is_not_persisted() {
                     }],
                     backgrounds: Vec::new(),
                     links: Vec::new(),
+                    attributes: Vec::new(),
                 })
                 .collect(),
         })),

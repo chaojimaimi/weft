@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.6.3"
+version = "1.7.0"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -44,7 +44,7 @@ rustybuzz = "0.20"
 pathfinder_geometry = "0.5"
 
 # Common
-bitflags = "2"
+bitflags = { version = "2", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

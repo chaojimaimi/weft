@@ -2,7 +2,7 @@
 # Verify the non-interactive part of the current release acceptance contract.
 #
 # This script intentionally does not claim that GUI, TUI, IME, DPI, or
-# VoiceOver behavior passed. v1.5 checks live in V15_MANUAL_ACCEPTANCE.md.
+# visual behavior passed. v1.6 checks live in V16_MANUAL_ACCEPTANCE.md.
 # Run after ./scripts/build-app.sh.
 
 set -euo pipefail
@@ -12,7 +12,7 @@ cd "$ROOT"
 
 APP_DIR="target/release/osx/Weft.app"
 PLIST="$APP_DIR/Contents/Info.plist"
-MANUAL_MATRIX="docs/V15_MANUAL_ACCEPTANCE.md"
+MANUAL_MATRIX="docs/V16_MANUAL_ACCEPTANCE.md"
 failures=0
 
 workspace_version=$(awk '
@@ -107,21 +107,21 @@ if [ ! -f "$MANUAL_MATRIX" ]; then
     echo "  FAIL: $MANUAL_MATRIX is missing"
     failures=$((failures + 1))
 else
-    for marker in V15-PROFILE-1 V15-TRANSFER-1 V15-RELOAD-1 V15-CONFIG-1 V15-RELEASE-1; do
+    for marker in V16-GRAPHEME-1 V16-OSC8-1 V16-WORKSPACE-1 V16-RECOVERY-1 V16-RELEASE-1; do
         if ! grep -Fq "**${marker}**" "$MANUAL_MATRIX"; then
             echo "  FAIL: $MANUAL_MATRIX is missing $marker"
             failures=$((failures + 1))
         fi
     done
     if [ "$failures" -eq 0 ]; then
-        echo "  OK: v1.5 manual acceptance matrix covers required release areas"
+        echo "  OK: v1.6 manual acceptance matrix covers required release areas"
     fi
 fi
 
 echo
 if [ "$failures" -eq 0 ]; then
     echo "Acceptance preflight: ALL AUTOMATED CHECKS PASSED"
-    echo "Manual v1.5 acceptance is still required; see $MANUAL_MATRIX."
+    echo "Manual v1.6 acceptance is still required; see $MANUAL_MATRIX."
     exit 0
 fi
 

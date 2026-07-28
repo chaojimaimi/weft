@@ -228,6 +228,20 @@ impl Pane {
         true
     }
 
+    pub(crate) fn set_restored_cwd_fallback(&mut self, cwd: Option<String>) {
+        if self.restored_snapshot.is_some() {
+            return;
+        }
+        self.restored_snapshot = Some(TabSnapshot {
+            position: 0,
+            active: false,
+            cwd,
+            block_scroll_offset: 0,
+            editor_buffer: String::new(),
+            shell_phase: "AtPrompt".to_string(),
+        });
+    }
+
     /// Non-blocking drain of PTY events into channel. Capped per frame.
     pub fn pump_pty(&mut self) {
         let Some(pty) = &mut self.pty else {
@@ -301,4 +315,30 @@ impl Pane {
     // future pane-level scroll helpers can use it without re-importing.
     #[allow(dead_code)]
     fn _tui_scroll_resolution_link(_: TuiScrollResolution) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restored_cwd_fallback_is_set_once_and_visible_to_snapshot_logic() {
+        let mut pane = Pane::with_terminal_only(1000);
+        pane.set_restored_cwd_fallback(Some("/saved".into()));
+        assert_eq!(
+            pane.restored_snapshot
+                .as_ref()
+                .and_then(|s| s.cwd.as_deref()),
+            Some("/saved")
+        );
+
+        pane.set_restored_cwd_fallback(Some("/replacement".into()));
+        assert_eq!(
+            pane.restored_snapshot
+                .as_ref()
+                .and_then(|s| s.cwd.as_deref()),
+            Some("/saved"),
+            "a later fallback must not replace the original recovery state"
+        );
+    }
 }

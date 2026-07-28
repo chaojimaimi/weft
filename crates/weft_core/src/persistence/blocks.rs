@@ -238,6 +238,7 @@ mod tests {
                 }],
                 backgrounds: Vec::new(),
                 links: Vec::new(),
+                attributes: Vec::new(),
             }],
         }));
         store.insert(&original).unwrap();
@@ -295,6 +296,7 @@ mod tests {
                 }],
                 backgrounds: Vec::new(),
                 links: Vec::new(),
+                attributes: Vec::new(),
             }],
         }));
         store.insert(&new).unwrap();

@@ -393,6 +393,40 @@ mod tests {
     }
 
     #[test]
+    fn clear_grapheme_preserves_hyperlink_and_removes_empty_entries() {
+        let mut e = RowExtras::new();
+        e.set_grapheme(1, Arc::from("e\u{0301}"));
+        e.set_hyperlink(1, Some(7));
+        e.set_grapheme(2, Arc::from("x\u{0301}"));
+
+        e.clear_grapheme(1);
+        assert_eq!(e.grapheme_at(1), None);
+        assert_eq!(e.hyperlink_id_at(1), Some(7));
+
+        e.clear_grapheme(2);
+        assert_eq!(e.get(2), None, "empty sparse entries must be removed");
+    }
+
+    #[test]
+    fn clear_grapheme_range_and_truncate_cols_keep_sparse_invariants() {
+        let mut e = RowExtras::new();
+        for col in 0..5 {
+            e.set_grapheme(col, Arc::from(format!("x{col}")));
+        }
+        e.set_hyperlink(2, Some(9));
+
+        e.clear_grapheme_range(1, 4);
+        assert_eq!(e.grapheme_at(0), Some("x0"));
+        assert_eq!(e.grapheme_at(1), None);
+        assert_eq!(e.hyperlink_id_at(2), Some(9));
+        assert_eq!(e.grapheme_at(4), Some("x4"));
+
+        e.truncate_cols(3);
+        assert!(e.iter().all(|(col, _)| col < 3));
+        assert_eq!(e.hyperlink_id_at(2), Some(9));
+    }
+
+    #[test]
     fn clear_drops_all() {
         let mut e = RowExtras::new();
         e.set_grapheme(0, Arc::from("é"));

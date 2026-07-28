@@ -3,7 +3,7 @@
 use bitflags::bitflags;
 
 bitflags! {
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
     pub struct CellFlags: u16 {
         const BOLD          = 0x0001;
         const ITALIC        = 0x0002;
@@ -96,9 +96,10 @@ impl Color {
 /// Where a cell's color comes from. Stored on the cell so a theme/palette
 /// change can recolor the whole screen instantly: cells remember their origin
 /// (default / palette index / explicit RGB) rather than a pre-resolved color.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum CellColor {
     /// Use the theme default (foreground or background depending on slot).
+    #[default]
     Default,
     /// Index into the 256-color palette (ANSI 0-15 + 6×6×6 cube + grayscale).
     Palette(u8),

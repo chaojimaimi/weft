@@ -1,5 +1,6 @@
 use super::{Block, BlockId, BlockTracker};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 const LINK_SCAN_LINES: usize = 12;
@@ -50,13 +51,18 @@ impl BlockTracker {
         };
         let started_at = self.pending_started.take().unwrap_or_else(SystemTime::now);
         let cwd = self.pending_cwd.take();
-        let raw_output = self.output.take();
+        let (raw_output, captured_styled) = self.output.take_styled();
         let screen_owned = self.screen_document_start.take().is_some();
         self.continuation_candidate = None;
 
         let output = crate::secrets::mask(&raw_output);
+        // v1.7.0-A: prefer the freshly-captured styled output from the RLE.
+        // Fall back to the screen-snapshot styled_output (primary-screen TUI
+        // blocks) only when the capture path didn't produce one.
         let styled_output = if output == raw_output {
-            self.styled_output.take()
+            captured_styled
+                .map(Arc::new)
+                .or_else(|| self.styled_output.take())
         } else {
             self.styled_output = None;
             None
@@ -178,7 +184,7 @@ fn meaningful_lines(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::{ForegroundSpan, StyledLine, StyledOutput};
+    use crate::blocks::{CapturedStyle, ForegroundSpan, StyledLine, StyledOutput};
     use crate::grid::CellColor;
 
     const REPLAY: &str = "banner line with enough content\nmodel and account information\nworking directory /tmp/project\nprompt asking for a performance report\nanswer line one with useful detail\nanswer line two with useful detail";
@@ -257,7 +263,7 @@ mod tests {
         tracker.drain_unpersisted();
 
         tracker.on_command_start("tool --resume unavailable".to_string());
-        tracker.on_print_ascii_run(b"session service is unavailable");
+        tracker.on_print_ascii_run(b"session service is unavailable", CapturedStyle::default());
         tracker.on_command_end(1);
 
         assert_eq!(tracker.blocks().len(), 2);
@@ -274,7 +280,10 @@ mod tests {
         let mut tracker = BlockTracker::new();
         tracker.on_prompt_start();
         tracker.on_command_start("printf help".to_string());
-        tracker.on_print_ascii_run(b"Resume this session with:\ntool --resume id");
+        tracker.on_print_ascii_run(
+            b"Resume this session with:\ntool --resume id",
+            CapturedStyle::default(),
+        );
         tracker.on_command_end(0);
 
         tracker.on_command_start("tool --resume id".to_string());
@@ -304,6 +313,7 @@ mod tests {
                     }],
                     backgrounds: Vec::new(),
                     links: Vec::new(),
+                    attributes: Vec::new(),
                 }],
             },
         );

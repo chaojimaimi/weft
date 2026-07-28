@@ -279,14 +279,18 @@ impl App {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                let age_secs = now_secs.saturating_sub(snapshot.created_at);
+                let age_secs = snapshot_age_secs(now_secs, snapshot.created_at);
                 let tab_count = snapshot.workspace.tabs.len();
                 if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
                     match crate::macos_alert::show_recovery_prompt(mtm, age_secs, tab_count) {
                         Ok(crate::macos_alert::RecoveryPromptResponse::Restore) => {
                             info!("user chose to restore from recovery snapshot");
                             match self.restore_workspace(&snapshot.workspace) {
-                                Ok(()) => {
+                                Ok(outcome) => {
+                                    if let Some(warning) = outcome.warning() {
+                                        warn!(warning = %warning, "recovery restored with warning");
+                                        self.surface_config_error(&warning.to_string());
+                                    }
                                     info!("recovery snapshot restored successfully");
                                     self.recovery.reset_debounce();
                                     return true;
@@ -326,6 +330,10 @@ fn hash_str(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+fn snapshot_age_secs(now_secs: u64, created_at: u64) -> u64 {
+    now_secs.saturating_sub(created_at)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -680,5 +688,11 @@ mod tests {
         assert!(!ctrl.paths.snapshot_exists());
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn snapshot_age_uses_elapsed_time_and_saturates_future_timestamps() {
+        assert_eq!(snapshot_age_secs(1_000, 940), 60);
+        assert_eq!(snapshot_age_secs(1_000, 1_001), 0);
     }
 }

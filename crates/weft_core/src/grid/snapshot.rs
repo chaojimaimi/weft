@@ -1,5 +1,8 @@
 use super::{CellColor, CellFlags, Color, Grid, Row};
-use crate::blocks::{ForegroundSpan, LinkSpan, StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{
+    AttributeSpan, ForegroundSpan, LinkSpan, StyledLine, StyledOutput, ANSI_ATTRIBUTE_MASK,
+    MAX_OUTPUT_BYTES,
+};
 use std::sync::Arc;
 
 const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
@@ -351,7 +354,8 @@ impl Grid {
             } else if style_enabled
                 && (!row.foregrounds.is_empty()
                     || !row.backgrounds.is_empty()
-                    || !row.links.is_empty())
+                    || !row.links.is_empty()
+                    || !row.attributes.is_empty())
             {
                 span_count = span_count
                     .saturating_add(row.foregrounds.len())
@@ -361,6 +365,7 @@ impl Grid {
                     foregrounds: row.foregrounds,
                     backgrounds: row.backgrounds,
                     links: row.links,
+                    attributes: row.attributes,
                 });
             }
         }
@@ -374,6 +379,10 @@ struct SnapshotRow {
     backgrounds: Vec<ForegroundSpan>,
     /// v1.6.1: OSC 8 hyperlink spans.
     links: Vec<LinkSpan>,
+    /// v1.7.0-A: ANSI attribute spans (bold/italic/underline/etc) captured
+    /// from the live grid cells' flags. Drives glyph selection and decoration
+    /// rendering in the Block view when the primary-screen TUI scrolls away.
+    attributes: Vec<AttributeSpan>,
     text_overflow: bool,
     style_overflow: bool,
 }
@@ -449,6 +458,9 @@ where
     // v1.6.1: collect link spans. Coalesce adjacent cells with the same URL
     // into a single span to keep the span count small.
     let mut links: Vec<LinkSpan> = Vec::new();
+    // v1.7.0-A: collect ANSI attribute spans (bold/italic/underline/etc).
+    // Coalesce adjacent cells with the same masked flags into a single span.
+    let mut attributes: Vec<AttributeSpan> = Vec::new();
     let mut char_index = 0_u32;
     let mut text_overflow = false;
     let mut style_overflow = false;
@@ -503,6 +515,31 @@ where
                     style_budget,
                 );
             }
+            // v1.7.0-A: capture ANSI attribute spans (bold/italic/underline/etc).
+            // Mask out grid-internal flags (DIRTY/WIDE_SPACER/CURSOR/etc) —
+            // only program-emitted SGR attributes belong in the snapshot.
+            // Coalesce with the preceding span when flags match and are
+            // adjacent, mirroring the color span coalescing logic.
+            let masked_flags = cell.flags & ANSI_ATTRIBUTE_MASK;
+            if !masked_flags.is_empty() {
+                if let Some(last) = attributes.last_mut() {
+                    if last.end == char_index && last.flags == masked_flags {
+                        last.end = char_index + 1;
+                    } else {
+                        attributes.push(AttributeSpan {
+                            start: char_index,
+                            end: char_index + 1,
+                            flags: masked_flags,
+                        });
+                    }
+                } else {
+                    attributes.push(AttributeSpan {
+                        start: char_index,
+                        end: char_index + 1,
+                        flags: masked_flags,
+                    });
+                }
+            }
             // v1.6.1: capture hyperlink spans. Resolve the id via the url_resolver
             // closure (backed by HyperlinkRegistry). Coalesce adjacent cells
             // pointing at the same URL into a single span.
@@ -541,6 +578,7 @@ where
         foregrounds,
         backgrounds,
         links,
+        attributes,
         text_overflow,
         style_overflow,
     }

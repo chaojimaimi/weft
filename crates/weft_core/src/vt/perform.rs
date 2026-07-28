@@ -2,7 +2,7 @@ use super::attrs::ShellMarker;
 use super::osc::{parse_osc7_cwd, parse_x11_color};
 use super::param;
 use super::Terminal;
-use crate::blocks::ShellPhase;
+use crate::blocks::{CapturedStyle, ShellPhase};
 use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
 impl vte::Perform for Terminal {
@@ -27,10 +27,16 @@ impl vte::Perform for Terminal {
         // Feed the printed char to the active command block's output capture.
         // v1.0 perf: check is_capturing() here to skip the function call
         // overhead when not capturing (e.g. AtPrompt, NotIntegrated).
+        // v1.7.0-A: capture the current VT SGR attrs so the block preserves
+        // program-emitted colors after the live grid scrolls away.
         if !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting {
-            self.block_tracker.on_print(c);
+            let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+            self.block_tracker.on_print(c, style);
         }
-        self.capture_primary_screen_interrupt_print(c);
+        {
+            let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+            self.capture_primary_screen_interrupt_print(c, style);
+        }
 
         // v1.6.0: Handle the char after ZWJ. Instead of dropping it (v1.5
         // behavior), append it to the previous cell's grapheme cluster so
@@ -303,12 +309,18 @@ impl vte::Perform for Terminal {
                 // v1.0 perf: skip on_print calls when not capturing.
                 if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
                     let advanced = self.grid.cursor.col.saturating_sub(prev_col);
+                    let style =
+                        CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
                     for _ in 0..advanced {
-                        self.block_tracker.on_print(' ');
+                        self.block_tracker.on_print(' ', style);
                     }
                 }
-                for _ in 0..self.grid.cursor.col.saturating_sub(prev_col) {
-                    self.capture_primary_screen_interrupt_print(' ');
+                {
+                    let style =
+                        CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                    for _ in 0..self.grid.cursor.col.saturating_sub(prev_col) {
+                        self.capture_primary_screen_interrupt_print(' ', style);
+                    }
                 }
             }
             0x0A..=0x0C => {

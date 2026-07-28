@@ -6,7 +6,7 @@ use crate::paint::styled_line_cache::{
 };
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::StyledLine;
-use weft_core::grid::Color;
+use weft_core::grid::{CellFlags, Color};
 
 pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) x: f32,
@@ -156,16 +156,46 @@ impl MetalRenderer {
             if col + width > paint.max_cols {
                 break;
             }
-            let color = paint
+
+            // v1.7.0-A: Resolve ANSI attribute flags for this char.
+            let flags = paint
+                .style
+                .map(|line| line.attributes_at(paint.char_offset + index))
+                .unwrap_or(CellFlags::empty());
+
+            // Resolve foreground and background colors.
+            let fg = paint
                 .style
                 .and_then(|line| line.foreground_at(paint.char_offset + index))
                 .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
                 .unwrap_or(paint.fallback);
-            if let Some(background) = paint
+            let bg = paint
                 .style
                 .and_then(|line| line.background_at(paint.char_offset + index))
-            {
-                let background = resolve_cell_color(background, [0.0; 4], paint.palette);
+                .map(|origin| resolve_cell_color(origin, [0.0; 4], paint.palette));
+
+            // SGR reverse video: swap fg and bg before emitting quads.
+            let (fg_final, bg_final) = if flags.contains(CellFlags::REVERSE) {
+                let bg_swapped = bg.unwrap_or([0.0, 0.0, 0.0, 0.0]);
+                (bg_swapped, Some(fg))
+            } else {
+                (fg, bg)
+            };
+
+            // DIM: reduce foreground intensity by mixing with background.
+            let fg_final = if flags.contains(CellFlags::DIM) {
+                [
+                    fg_final[0] * 0.5,
+                    fg_final[1] * 0.5,
+                    fg_final[2] * 0.5,
+                    fg_final[3],
+                ]
+            } else {
+                fg_final
+            };
+
+            // Draw background quad if non-transparent.
+            if let Some(background) = bg_final {
                 let cell_width = width as f32 * cw;
                 push_quad(
                     vertices,
@@ -175,20 +205,58 @@ impl MetalRenderer {
                     background,
                 );
             }
-            let mut encoded = [0; 4];
-            let glyph_height = if fills_terminal_cell_edges(ch) {
-                paint.row_pitch
-            } else {
-                self.cell_height() as f32
-            };
-            self.push_text_with_height(
-                vertices,
-                [x, paint.y],
-                ch.encode_utf8(&mut encoded),
-                color,
-                width,
-                glyph_height,
-            );
+
+            // HIDDEN: skip glyph emission, background already drawn.
+            if !flags.contains(CellFlags::HIDDEN) {
+                let mut encoded = [0; 4];
+                let glyph_height = if fills_terminal_cell_edges(ch) {
+                    paint.row_pitch
+                } else {
+                    self.cell_height() as f32
+                };
+                self.push_text_with_height(
+                    vertices,
+                    [x, paint.y],
+                    ch.encode_utf8(&mut encoded),
+                    fg_final,
+                    width,
+                    glyph_height,
+                );
+            }
+
+            // v1.7.0-A: Draw decoration quads for underline/strikethrough.
+            let cell_width = width as f32 * cw;
+            if flags.contains(CellFlags::UNDERLINE) || flags.contains(CellFlags::DOUBLE_UNDER) {
+                let underline_y = paint.y + paint.row_pitch - 2.0;
+                push_quad(
+                    vertices,
+                    [x, underline_y, x + cell_width, underline_y + 2.0],
+                    [0.0; 4],
+                    [0.0; 4],
+                    fg_final,
+                );
+                if flags.contains(CellFlags::DOUBLE_UNDER) {
+                    let second_y = underline_y - 3.0;
+                    push_quad(
+                        vertices,
+                        [x, second_y, x + cell_width, second_y + 2.0],
+                        [0.0; 4],
+                        [0.0; 4],
+                        fg_final,
+                    );
+                }
+            }
+            if flags.contains(CellFlags::STRIKETHROUGH) {
+                let strike_y = paint.y + paint.row_pitch * 0.5 - 1.0;
+                push_quad(
+                    vertices,
+                    [x, strike_y, x + cell_width, strike_y + 2.0],
+                    [0.0; 4],
+                    [0.0; 4],
+                    fg_final,
+                );
+            }
+
             col += width;
             x += width as f32 * cw;
         }

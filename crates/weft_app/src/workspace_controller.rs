@@ -49,6 +49,12 @@ use crate::pane::Pane;
 use crate::tab::Tab;
 use crate::App;
 
+#[path = "workspace_profile.rs"]
+mod workspace_profile;
+use workspace_profile::{
+    profile_restore_target, ProfileRestoreTarget, WorkspaceRestoreOutcome, WorkspaceRestoreWarning,
+};
+
 /// Type alias for the closure used by [`build_subtree`] to create a new pane
 /// when descending into a `Split` node's second child. The closure receives
 /// the leaf pane id to split, the split direction + ratio, and the new pane's
@@ -190,12 +196,13 @@ impl App {
     /// # Errors
     ///
     /// - [`WorkspaceRestoreError::NoTabs`] — the document has no tabs.
-    /// - [`WorkspaceRestoreError::ProfileSwitch`] — the saved profile
-    ///   doesn't exist; falls back to base but surfaces the error.
+    ///
+    /// A missing profile is reported in [`WorkspaceRestoreOutcome`] after
+    /// the workspace has been restored with the base profile.
     pub(super) fn restore_workspace(
         &mut self,
         doc: &WorkspaceDocument,
-    ) -> Result<(), WorkspaceRestoreError> {
+    ) -> Result<WorkspaceRestoreOutcome, WorkspaceRestoreError> {
         if doc.tabs.is_empty() {
             return Err(WorkspaceRestoreError::NoTabs);
         }
@@ -208,24 +215,49 @@ impl App {
         // despite the doc comment saying "restore continues". Now we
         // track the non-fatal error and return it at the end, after the
         // full restore has completed.
-        let mut profile_warning: Option<WorkspaceRestoreError> = None;
-        if let Some(profile) = &doc.profile {
-            if !profile.is_empty() && self.active_profile_name() != Some(profile.as_str()) {
-                if self.profile_names_sorted().iter().any(|p| p == profile) {
-                    if let Err(e) = self.switch_profile(Some(profile)) {
-                        tracing::warn!(error = %e, profile = %profile, "profile switch failed during workspace restore");
-                    }
-                } else {
-                    tracing::warn!(
-                        profile = %profile,
-                        "workspace profile not found, falling back to base"
-                    );
-                    profile_warning = Some(WorkspaceRestoreError::ProfileNotFound {
-                        profile: profile.clone(),
-                    });
-                }
+        let active_profile = self.active_profile_name().map(str::to_owned);
+        let requested_profile = doc.profile.as_deref().filter(|name| !name.is_empty());
+        let requested_exists = requested_profile.is_some_and(|requested| {
+            self.profile_names_sorted()
+                .iter()
+                .any(|available| available == requested)
+        });
+        let profile_target = profile_restore_target(
+            requested_profile,
+            active_profile.as_deref(),
+            requested_exists,
+        );
+        let profile_warning = match profile_target {
+            ProfileRestoreTarget::Keep => None,
+            ProfileRestoreTarget::Base => {
+                self.switch_profile(None)
+                    .map_err(|e| WorkspaceRestoreError::ProfileSwitch {
+                        profile: None,
+                        message: e.to_string(),
+                    })?;
+                None
             }
-        }
+            ProfileRestoreTarget::Named(profile) => {
+                self.switch_profile(Some(&profile)).map_err(|e| {
+                    WorkspaceRestoreError::ProfileSwitch {
+                        profile: Some(profile),
+                        message: e.to_string(),
+                    }
+                })?;
+                None
+            }
+            ProfileRestoreTarget::MissingUseBase(profile) => {
+                self.switch_profile(None)
+                    .map_err(|e| WorkspaceRestoreError::ProfileSwitch {
+                        profile: None,
+                        message: e.to_string(),
+                    })?;
+                Some(WorkspaceRestoreWarning::ProfileNotFound { profile })
+            }
+            ProfileRestoreTarget::MissingAlreadyBase(profile) => {
+                Some(WorkspaceRestoreWarning::ProfileNotFound { profile })
+            }
+        };
 
         // Step 2: close all existing tabs. We don't run block-finish
         // hooks here because the caller (palette entry) is expected to
@@ -259,12 +291,7 @@ impl App {
         self.refresh_find_for_active_tab();
         self.request_redraw();
 
-        // Return the non-fatal profile warning (if any) after a successful
-        // restore. Ok(()) when the profile was found or unset.
-        match profile_warning {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(WorkspaceRestoreOutcome::new(profile_warning))
     }
 
     /// Restore a single tab from a [`WorkspacePaneNode`] tree.
@@ -339,16 +366,7 @@ impl App {
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
             let root_pane_id = tab.active_pane_id();
             if let Some(pane) = tab.pane_mut(root_pane_id) {
-                if pane.restored_snapshot.is_none() {
-                    pane.restored_snapshot = Some(weft_core::persistence::TabSnapshot {
-                        position: 0,
-                        active: false,
-                        cwd: root_cwd.clone(),
-                        block_scroll_offset: 0,
-                        editor_buffer: String::new(),
-                        shell_phase: "AtPrompt".to_string(),
-                    });
-                }
+                pane.set_restored_cwd_fallback(root_cwd.clone());
             }
         }
 
@@ -373,18 +391,15 @@ impl App {
         // v1.6.2 review C4: restore the saved active pane. The DFS order
         // of `split_tree().panes()` matches the order leaves were created
         // by `build_subtree`, which matches the saved document's DFS order.
-        if active_pane_index > 0 {
-            if let Some(tab) = self.sessions.tab_mut(tab_idx) {
-                let panes_list = tab.split_tree().panes();
-                if active_pane_index < panes_list.len() {
-                    let target_id = panes_list[active_pane_index];
-                    if let Err(e) = tab.set_active_pane(target_id) {
-                        warn!(
-                            ?e,
-                            index = active_pane_index,
-                            "workspace restore: failed to set active pane"
-                        );
-                    }
+        if let Some(tab) = self.sessions.tab_mut(tab_idx) {
+            let panes_list = tab.split_tree().panes();
+            if let Some(target_id) = pane_id_at_index(&panes_list, active_pane_index) {
+                if let Err(e) = tab.set_active_pane(target_id) {
+                    warn!(
+                        ?e,
+                        index = active_pane_index,
+                        "workspace restore: failed to set active pane"
+                    );
                 }
             }
         }
@@ -431,11 +446,16 @@ impl App {
         let path = crate::macos_file_dialog::pick_workspace_open_path(mtm)?
             .ok_or(WorkspaceInteractionError::Cancelled)?;
         let doc = WorkspaceDocument::load(&path).map_err(WorkspaceInteractionError::Workspace)?;
-        self.restore_workspace(&doc)
-            .map_err(|e| WorkspaceInteractionError::Restore {
-                source: e,
-                path: path.clone(),
-            })?;
+        let outcome =
+            self.restore_workspace(&doc)
+                .map_err(|e| WorkspaceInteractionError::Restore {
+                    source: e,
+                    path: path.clone(),
+                })?;
+        if let Some(warning) = outcome.warning() {
+            warn!(warning = %warning, path = %path.display(), "workspace restored with warning");
+            self.surface_config_error(&warning.to_string());
+        }
         info!(path = %path.display(), "workspace restored");
         Ok(())
     }
@@ -491,14 +511,15 @@ fn pane_tree_to_workspace_node(tree: PaneTree<PanePayload>) -> WorkspacePaneNode
 /// it injects a no-PTY pane via `Pane::with_terminal_only`.
 fn build_subtree(tab: &mut Tab, node: &WorkspacePaneNode, pane_id: PaneId, mut split_fn: SplitFn) {
     match node {
-        WorkspacePaneNode::Pane { cwd: _, draft } => {
+        WorkspacePaneNode::Pane { cwd, draft } => {
             // Base case: set the draft on this pane. The pane already
             // exists (created by the tab-opening path for the root leaf,
             // or by split_fn for non-root leaves). The draft is set here
             // so every leaf gets its draft regardless of whether it's
             // a root, first child, or second child.
-            if !draft.is_empty() {
-                if let Some(pane) = tab.pane_mut(pane_id) {
+            if let Some(pane) = tab.pane_mut(pane_id) {
+                pane.set_restored_cwd_fallback(Some(cwd.to_string_lossy().into_owned()));
+                if !draft.is_empty() {
                     if let Some(terminal) = pane.terminal.as_mut() {
                         terminal.editor_mut().buffer.set_text(draft);
                     }
@@ -520,51 +541,13 @@ fn build_subtree(tab: &mut Tab, node: &WorkspacePaneNode, pane_id: PaneId, mut s
                 None => return,
             };
 
-            // Step 2: set up the new pane's cwd + draft.
-            set_pane_draft(tab, new_pane_id, second);
-            set_pane_cwd(tab, new_pane_id, second);
-
-            // Step 3: recursively build `first`'s subtree. `pane_id` is
+            // Step 2: recursively build `first`'s subtree. `pane_id` is
             // still a leaf (the `first` child of the new Split), so
             // `split_leaf` inside recursive calls can find and replace it.
             build_subtree(tab, first, pane_id, &mut split_fn);
 
-            // Step 4: recursively build `second`'s subtree.
+            // Step 3: recursively build `second`'s subtree.
             build_subtree(tab, second, new_pane_id, &mut split_fn);
-        }
-    }
-}
-
-/// Set the editor draft on a pane's terminal. No-op if the pane has no
-/// terminal (PTY spawn failure).
-fn set_pane_draft(tab: &mut Tab, pane_id: PaneId, node: &WorkspacePaneNode) {
-    if let WorkspacePaneNode::Pane { draft, .. } = node {
-        if draft.is_empty() {
-            return;
-        }
-        if let Some(pane) = tab.pane_mut(pane_id) {
-            if let Some(terminal) = pane.terminal.as_mut() {
-                terminal.editor_mut().buffer.set_text(draft);
-            }
-        }
-    }
-}
-
-/// Set the cwd on a pane's restored_snapshot (so launch_cwd returns it
-/// even before the shell reports OSC 7). No-op for Split nodes.
-fn set_pane_cwd(tab: &mut Tab, pane_id: PaneId, node: &WorkspacePaneNode) {
-    if let WorkspacePaneNode::Pane { cwd, .. } = node {
-        if let Some(pane) = tab.pane_mut(pane_id) {
-            if pane.restored_snapshot.is_none() {
-                pane.restored_snapshot = Some(weft_core::persistence::TabSnapshot {
-                    position: 0,
-                    active: false,
-                    cwd: Some(cwd.to_string_lossy().into_owned()),
-                    block_scroll_offset: 0,
-                    editor_buffer: String::new(),
-                    shell_phase: "AtPrompt".to_string(),
-                });
-            }
         }
     }
 }
@@ -592,6 +575,10 @@ fn root_leaf_draft(node: &WorkspacePaneNode) -> String {
     }
 }
 
+fn pane_id_at_index(panes: &[PaneId], index: usize) -> Option<PaneId> {
+    panes.get(index).copied()
+}
+
 // ── Errors ─────────────────────────────────────────────────────────────
 
 /// Errors raised during workspace restore (DTO → runtime).
@@ -599,18 +586,26 @@ fn root_leaf_draft(node: &WorkspacePaneNode) -> String {
 pub enum WorkspaceRestoreError {
     /// The document has no tabs.
     NoTabs,
-    /// The saved profile name doesn't exist in the current config.
-    /// Restore continues with the base profile.
-    ProfileNotFound { profile: String },
+    /// Switching to the workspace's requested profile failed transactionally.
+    ProfileSwitch {
+        profile: Option<String>,
+        message: String,
+    },
 }
 
 impl std::fmt::Display for WorkspaceRestoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoTabs => write!(f, "workspace document has no tabs"),
-            Self::ProfileNotFound { profile } => {
-                write!(f, "workspace profile '{profile}' not found, using base")
-            }
+            Self::ProfileSwitch { profile, message } => match profile {
+                Some(profile) => {
+                    write!(
+                        f,
+                        "failed to switch to workspace profile '{profile}': {message}"
+                    )
+                }
+                None => write!(f, "failed to switch to base profile: {message}"),
+            },
         }
     }
 }
@@ -874,9 +869,23 @@ mod tests {
         // Pane 1 is B — draft "build".
         let pane_b = tab.pane(panes[1]).unwrap();
         assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
+        assert_eq!(
+            pane_b
+                .restored_snapshot
+                .as_ref()
+                .and_then(|s| s.cwd.as_deref()),
+            Some("/b")
+        );
         // Pane 2 is C — draft "test".
         let pane_c = tab.pane(panes[2]).unwrap();
         assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
+        assert_eq!(
+            pane_c
+                .restored_snapshot
+                .as_ref()
+                .and_then(|s| s.cwd.as_deref()),
+            Some("/c")
+        );
     }
 
     #[test]
@@ -930,13 +939,38 @@ mod tests {
     fn workspace_restore_error_displays_nicely() {
         let e = WorkspaceRestoreError::NoTabs;
         assert_eq!(format!("{e}"), "workspace document has no tabs");
-        let e = WorkspaceRestoreError::ProfileNotFound {
-            profile: "dark".into(),
+        let e = WorkspaceRestoreError::ProfileSwitch {
+            profile: None,
+            message: "disk full".into(),
         };
         assert_eq!(
             format!("{e}"),
+            "failed to switch to base profile: disk full"
+        );
+    }
+
+    #[test]
+    fn workspace_profile_warning_is_a_success_outcome() {
+        let warning = WorkspaceRestoreWarning::ProfileNotFound {
+            profile: "dark".into(),
+        };
+        assert_eq!(
+            format!("{warning}"),
             "workspace profile 'dark' not found, using base"
         );
+        let outcome = WorkspaceRestoreOutcome::new(Some(warning));
+        assert!(matches!(
+            outcome.warning(),
+            Some(WorkspaceRestoreWarning::ProfileNotFound { profile }) if profile == "dark"
+        ));
+    }
+
+    #[test]
+    fn pane_id_at_index_restores_saved_dfs_focus() {
+        let panes = [PaneId(10), PaneId(20), PaneId(30)];
+        assert_eq!(pane_id_at_index(&panes, 0), Some(PaneId(10)));
+        assert_eq!(pane_id_at_index(&panes, 2), Some(PaneId(30)));
+        assert_eq!(pane_id_at_index(&panes, 3), None);
     }
 
     #[test]

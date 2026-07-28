@@ -31,7 +31,10 @@ mod screen_capture_tests;
 mod style;
 
 pub(crate) use output_capture::OutputCapture;
-pub use style::{ForegroundSpan, LinkSpan, StyledLine, StyledOutput};
+pub use style::{
+    AttributeSpan, CapturedStyle, CapturedStyleRun, ForegroundSpan, LinkSpan, StyledLine,
+    StyledOutput, ANSI_ATTRIBUTE_MASK, MAX_STYLE_RUNS_PER_BLOCK, MAX_STYLE_RUNS_PER_LINE,
+};
 
 /// Hard cap on captured output to bound memory for commands like
 /// `cat huge.log`. Beyond this the capture stops and the block is marked
@@ -351,10 +354,12 @@ impl BlockTracker {
     // ── Output capture (called from Terminal print / LF paths) ───────────
 
     /// Append a printed character to the in-flight block's output. No-op unless
-    /// a command is executing.
-    pub fn on_print(&mut self, c: char) {
+    /// a command is executing. v1.7.0-A: `style` captures the current VT SGR
+    /// attributes so the block preserves program-emitted colors after the live
+    /// grid scrolls away.
+    pub fn on_print(&mut self, c: char, style: CapturedStyle) {
         if self.is_capturing() {
-            self.output.print(c, MAX_OUTPUT_BYTES);
+            self.output.print(c, style, MAX_OUTPUT_BYTES);
         }
     }
 
@@ -362,11 +367,14 @@ impl BlockTracker {
     /// in-flight block's output. Avoids per-char `push_capped` method call
     /// overhead — one truncation check + one `extend_from_slice` instead of
     /// N individual `push` calls. No-op unless a command is executing.
-    pub fn on_print_ascii_run(&mut self, bytes: &[u8]) {
+    /// v1.7.0-A: `style` captures the current VT SGR attributes for the whole
+    /// ASCII run — all bytes share one style since the fast path only fires
+    /// when no SGR change occurred mid-run.
+    pub fn on_print_ascii_run(&mut self, bytes: &[u8], style: CapturedStyle) {
         if !self.is_capturing() || bytes.is_empty() {
             return;
         }
-        self.output.print_ascii(bytes, MAX_OUTPUT_BYTES);
+        self.output.print_ascii(bytes, style, MAX_OUTPUT_BYTES);
     }
 
     /// Append a newline to the in-flight block's output. No-op unless a command
@@ -412,7 +420,7 @@ mod tests {
         tracker.on_command_start(command.to_string());
         for line in output.split('\n') {
             for ch in line.chars() {
-                tracker.on_print(ch);
+                tracker.on_print(ch, CapturedStyle::default());
             }
             tracker.on_newline();
         }
@@ -483,14 +491,14 @@ mod tests {
         let mut t = BlockTracker::new();
         // Printing before any command must not be captured.
         t.on_prompt_start();
-        t.on_print('x');
+        t.on_print('x', CapturedStyle::default());
         t.on_newline();
         assert!(!t.is_capturing());
 
         t.on_command_start("cmd".to_string());
         assert!(t.is_capturing());
-        t.on_print('h');
-        t.on_print('i');
+        t.on_print('h', CapturedStyle::default());
+        t.on_print('i', CapturedStyle::default());
         t.on_command_end(0);
 
         let block = t.blocks().last().unwrap();
@@ -502,9 +510,9 @@ mod tests {
         let mut t = BlockTracker::new();
         t.on_prompt_start();
         t.on_command_start("c".to_string());
-        t.on_print('a');
+        t.on_print('a', CapturedStyle::default());
         t.on_newline();
-        t.on_print('b');
+        t.on_print('b', CapturedStyle::default());
         t.on_command_end(0);
         assert_eq!(t.blocks().last().unwrap().output.as_ref(), "a\nb");
     }
@@ -521,7 +529,7 @@ mod tests {
         let mut t = BlockTracker::new();
         t.on_prompt_start();
         t.on_command_start("sleep 100".to_string());
-        t.on_print('z');
+        t.on_print('z', CapturedStyle::default());
         // User hits Ctrl+C: shell re-prompts with 133;A, no 133;D.
         t.on_prompt_start();
 
@@ -540,7 +548,7 @@ mod tests {
         t.on_command_start("cat huge".to_string());
         // Push well past the cap.
         for _ in 0..(MAX_OUTPUT_BYTES + 1024) {
-            t.on_print('a');
+            t.on_print('a', CapturedStyle::default());
         }
         t.on_command_end(0);
 
@@ -644,7 +652,7 @@ mod tests {
         t.on_prompt_start();
         t.on_command_start("c".to_string());
         t.on_command_output_start();
-        t.on_print('x');
+        t.on_print('x', CapturedStyle::default());
         t.on_command_end(0);
         assert_eq!(t.blocks().last().unwrap().output.as_ref(), "x");
     }

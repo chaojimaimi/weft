@@ -1154,6 +1154,35 @@ fn zero_width_scalars_do_not_consume_grid_cells() {
 }
 
 #[test]
+fn scalar_overwrite_clears_stale_grapheme_extras() {
+    let mut ascii = term();
+    ascii.process("e\u{0301}".as_bytes());
+    assert_eq!(ascii.grid().grapheme_at(0, 0), Some("e\u{0301}"));
+    ascii.process(b"\rX");
+    assert_eq!(ascii.grid().row_text(0), "X");
+    assert_eq!(ascii.grid().grapheme_at(0, 0), None);
+    assert!(!ascii.grid().cell(0, 0).flags.contains(CellFlags::EXTRA));
+
+    let mut wide = term();
+    wide.process("e\u{0301}".as_bytes());
+    wide.process("\r中".as_bytes());
+    assert_eq!(wide.grid().row_text(0), "中");
+    assert_eq!(wide.grid().grapheme_at(0, 0), None);
+}
+
+#[test]
+fn vs16_width_expansion_clears_displaced_cell_extras() {
+    let mut t = term();
+    t.process(" e\u{0301}".as_bytes());
+    assert_eq!(t.grid().grapheme_at(0, 1), Some("e\u{0301}"));
+
+    t.process("\r*\u{fe0f}".as_bytes());
+    assert_eq!(t.grid().row_text(0), "*\u{fe0f}");
+    assert_eq!(t.grid().grapheme_at(0, 1), None);
+    assert!(t.grid().cell(0, 1).flags.contains(CellFlags::WIDE_SPACER));
+}
+
+#[test]
 fn synchronized_output_watchdog_releases_a_missing_reset() {
     let mut t = term();
     let now = std::time::Instant::now();
@@ -2145,6 +2174,18 @@ fn osc8_close_then_print_clears_hyperlink_in_extras() {
         t.grid().hyperlink_id_at(0, 0).is_none(),
         "hyperlink should be cleared after overwrite"
     );
+}
+
+#[test]
+fn hyperlink_lookup_rejects_stale_extras_without_cell_flag() {
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/stale\x1b\\A\x1b]8;;\x1b\\");
+    assert!(t.grid().hyperlink_id_at(0, 0).is_some());
+
+    t.grid_mut().viewport[0].cells[0]
+        .flags
+        .remove(CellFlags::HYPERLINK);
+    assert_eq!(t.grid().hyperlink_id_at(0, 0), None);
 }
 
 #[test]
