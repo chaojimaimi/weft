@@ -728,7 +728,7 @@ fn syntax_override_applies_to_resolved_theme() {
 }
 
 #[test]
-fn syntax_override_all_nine_fields() {
+fn syntax_override_all_ten_fields() {
     let cfg = ThemeConfig {
         name: "weft-warm".into(),
         syntax: Some(SyntaxConfig {
@@ -740,6 +740,7 @@ fn syntax_override_all_nine_fields() {
             variable: Some("#666666".into()),
             operator: Some("#777777".into()),
             comment: Some("#888888".into()),
+            argument: Some("#aaaaaa".into()),
             default: Some("#999999".into()),
         }),
         ..Default::default()
@@ -753,6 +754,7 @@ fn syntax_override_all_nine_fields() {
     assert_eq!(theme.syntax.variable, Color::rgb(0x66, 0x66, 0x66));
     assert_eq!(theme.syntax.operator, Color::rgb(0x77, 0x77, 0x77));
     assert_eq!(theme.syntax.comment, Color::rgb(0x88, 0x88, 0x88));
+    assert_eq!(theme.syntax.argument, Color::rgb(0xaa, 0xaa, 0xaa));
     assert_eq!(theme.syntax.default, Color::rgb(0x99, 0x99, 0x99));
 }
 
@@ -819,6 +821,50 @@ fn syntax_override_applies_to_all_themes() {
     // Unspecified fields inherit from warp base.
     assert_eq!(theme.syntax.flag, warp.syntax.flag);
     assert_eq!(theme.syntax.path, warp.syntax.path);
+}
+
+// ── v1.7.0-B: output semantic color override tests ─────────────────
+
+#[test]
+fn output_semantic_override_applies() {
+    let warm = Theme::weft_warm();
+    let cfg = ThemeConfig {
+        name: "weft-warm".into(),
+        output: Some(OutputSemanticConfig {
+            success: Some("#00ff00".into()),
+            failure: Some("#ff0000".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let theme = Theme::resolve(&cfg);
+    assert_eq!(theme.output.success, Color::rgb(0x00, 0xff, 0x00));
+    assert_eq!(theme.output.failure, Color::rgb(0xff, 0x00, 0x00));
+    // Unspecified fields inherit from base.
+    assert_eq!(theme.output.cwd, warm.output.cwd);
+    assert_eq!(theme.output.output_default, warm.output.output_default);
+    assert_eq!(theme.output.metadata, warm.output.metadata);
+}
+
+#[test]
+fn output_semantic_override_all_fields() {
+    let cfg = ThemeConfig {
+        name: "weft-warm".into(),
+        output: Some(OutputSemanticConfig {
+            output_default: Some("#111111".into()),
+            cwd: Some("#222222".into()),
+            metadata: Some("#333333".into()),
+            success: Some("#444444".into()),
+            failure: Some("#555555".into()),
+        }),
+        ..Default::default()
+    };
+    let theme = Theme::resolve(&cfg);
+    assert_eq!(theme.output.output_default, Color::rgb(0x11, 0x11, 0x11));
+    assert_eq!(theme.output.cwd, Color::rgb(0x22, 0x22, 0x22));
+    assert_eq!(theme.output.metadata, Color::rgb(0x33, 0x33, 0x33));
+    assert_eq!(theme.output.success, Color::rgb(0x44, 0x44, 0x44));
+    assert_eq!(theme.output.failure, Color::rgb(0x55, 0x55, 0x55));
 }
 
 // ── v1.0 S2: Config::save() tests ──────────────────────────────────

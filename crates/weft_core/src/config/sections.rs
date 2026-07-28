@@ -53,10 +53,14 @@ pub struct ThemeConfig {
     /// `SyntaxColors` field of the same name. Applied after the inline
     /// color overrides in [`Theme::resolve_named`].
     pub syntax: Option<SyntaxConfig>,
+    /// v1.7.0-B: output semantic color overrides. Each field is an optional
+    /// hex string; when present it overrides the base theme's
+    /// `OutputSemanticColors` field. Applied after syntax overrides.
+    pub output: Option<OutputSemanticConfig>,
 }
 
 /// v1.0 S5: TOML-facing syntax color overrides. All fields optional; absent
-/// fields inherit from the resolved base theme. Mirrors the 9 fields of
+/// fields inherit from the resolved base theme. Mirrors the fields of
 /// [`SyntaxColors`].
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -69,7 +73,22 @@ pub struct SyntaxConfig {
     pub variable: Option<String>,
     pub operator: Option<String>,
     pub comment: Option<String>,
+    /// v1.7.0-B: plain argument color override.
+    pub argument: Option<String>,
     pub default: Option<String>,
+}
+
+/// v1.7.0-B: TOML-facing output semantic color overrides. All fields
+/// optional; absent fields inherit from the resolved base theme. Mirrors
+/// the fields of [`OutputSemanticColors`].
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OutputSemanticConfig {
+    pub output_default: Option<String>,
+    pub cwd: Option<String>,
+    pub metadata: Option<String>,
+    pub success: Option<String>,
+    pub failure: Option<String>,
 }
 
 // Manual Default (deriving would give name = "").
@@ -89,6 +108,7 @@ impl Default for ThemeConfig {
             light_name: None,
             dark_name: None,
             syntax: None,
+            output: None,
         }
     }
 }

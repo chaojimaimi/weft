@@ -187,6 +187,7 @@ pub(crate) fn syntax_color(kind: TokenKind, theme: &Theme) -> [f32; 4] {
         TokenKind::Variable => color_to_normalized(s.variable),
         TokenKind::Operator => color_to_normalized(s.operator),
         TokenKind::Comment => color_to_normalized(s.comment),
+        TokenKind::Argument => color_to_normalized(s.argument),
         TokenKind::Whitespace | TokenKind::Default => color_to_normalized(s.default),
     }
 }
@@ -311,6 +312,7 @@ mod tests {
         // v0.8: syntax colors are now theme-driven. Verify the warm theme
         // produces distinct colors for every token kind, and that
         // Default/Whitespace resolve to theme.syntax.default.
+        // v1.7.0-B: now includes Argument (9 distinct kinds).
         let theme = weft_core::config::Theme::weft_warm();
         let kinds = [
             TokenKind::Command,
@@ -321,9 +323,10 @@ mod tests {
             TokenKind::Variable,
             TokenKind::Operator,
             TokenKind::Comment,
+            TokenKind::Argument,
         ];
         let colors: Vec<[f32; 4]> = kinds.iter().map(|&k| syntax_color(k, &theme)).collect();
-        // All 8 should be distinct (no two token kinds share a color).
+        // All 9 should be distinct (no two token kinds share a color).
         for i in 0..colors.len() {
             for j in (i + 1)..colors.len() {
                 assert_ne!(colors[i], colors[j], "syntax colors at {i}/{j} collide");
@@ -333,6 +336,41 @@ mod tests {
         let default_c = color_to_normalized(theme.syntax.default);
         assert_eq!(syntax_color(TokenKind::Default, &theme), default_c);
         assert_eq!(syntax_color(TokenKind::Whitespace, &theme), default_c);
+    }
+
+    /// v1.7.0-B: V17 §2.4 visual hierarchy contract — in every built-in
+    /// theme, command ≠ argument ≠ default, and output_default ≠ cwd.
+    /// Also verifies success ≠ failure (status colors must be distinguishable).
+    #[test]
+    fn all_themes_satisfy_visual_hierarchy_contract() {
+        let themes: Vec<(&str, weft_core::config::Theme)> = vec![
+            ("weft_warm", weft_core::config::Theme::weft_warm()),
+            ("weft_light", weft_core::config::Theme::weft_light()),
+            ("warp_dark", weft_core::config::Theme::warp_dark()),
+            ("dracula", weft_core::config::Theme::dracula()),
+            ("solarized_dark", weft_core::config::Theme::solarized_dark()),
+            ("gruvbox_dark", weft_core::config::Theme::gruvbox_dark()),
+            ("nord", weft_core::config::Theme::nord()),
+            ("tokyo_night", weft_core::config::Theme::tokyo_night()),
+            (
+                "catppuccin_mocha",
+                weft_core::config::Theme::catppuccin_mocha(),
+            ),
+            ("one_dark", weft_core::config::Theme::one_dark()),
+            ("monokai_pro", weft_core::config::Theme::monokai_pro()),
+        ];
+        for (name, theme) in &themes {
+            let s = &theme.syntax;
+            let o = &theme.output;
+            // V17 §2.4: command ≠ argument ≠ default
+            assert_ne!(s.command, s.argument, "{name}: command == argument");
+            assert_ne!(s.command, s.default, "{name}: command == default");
+            assert_ne!(s.argument, s.default, "{name}: argument == default");
+            // V17 §2.4: output_default ≠ cwd ("普通结果不得等于 CWD 色")
+            assert_ne!(o.output_default, o.cwd, "{name}: output_default == cwd");
+            // Status colors must be distinguishable
+            assert_ne!(o.success, o.failure, "{name}: success == failure");
+        }
     }
 
     // ── F6: Focus ring ────────────────────────────────────────────────

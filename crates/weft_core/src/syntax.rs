@@ -26,7 +26,12 @@ pub enum TokenKind {
     Comment,
     /// A run of whitespace (kept so the whole line is covered, spacing preserved).
     Whitespace,
-    /// Anything else (arguments, values).
+    /// v1.7.0-B: a plain argument — a non-command-position word that is not a
+    /// flag, path, number, string, or variable. Gets its own theme color so
+    /// arguments are visually distinguishable from the command name and from
+    /// true default text (rare; mostly bare punctuation fragments).
+    Argument,
+    /// Anything else (rare fallback for tokens that don't fit another kind).
     Default,
 }
 
@@ -65,7 +70,9 @@ fn classify_word(word: &str, at_command_position: bool) -> TokenKind {
     } else if word.contains('/') {
         TokenKind::Path
     } else {
-        TokenKind::Default
+        // v1.7.0-B: plain arguments get their own role so themes can color
+        // them distinctly from the command name and from true default text.
+        TokenKind::Argument
     }
 }
 
@@ -417,16 +424,16 @@ mod tests {
     }
 
     #[test]
-    fn non_numbers_stay_default() {
+    fn non_numbers_stay_argument() {
         // `1.2.3` is not a number (two dots); `4-` is not (sign must be leading);
-        // `.` alone is not.
+        // `.` alone is not. They fall through to Argument (v1.7.0-B: was Default).
         for w in ["1.2.3", "4-", ".", "0x1F", "v1.2"] {
             let toks = tokenize(&format!("echo {w}"));
             let arg = toks.last().expect("token exists");
             assert_eq!(
                 arg.kind,
-                TokenKind::Default,
-                "{w} should be Default, not Number"
+                TokenKind::Argument,
+                "{w} should be Argument, not Number"
             );
         }
     }
@@ -451,11 +458,78 @@ mod tests {
 
     #[test]
     fn hash_mid_word_is_not_comment() {
-        // `a#b` — the `#` is mid-word, so the whole thing is Default, NOT Comment.
+        // `a#b` — the `#` is mid-word, so the whole thing is Argument, NOT Comment.
         let toks = tokenize("echo a#b");
         assert!(!toks.iter().any(|t| t.kind == TokenKind::Comment));
         let arg = toks.last().unwrap();
-        assert_eq!(arg.kind, TokenKind::Default);
+        assert_eq!(arg.kind, TokenKind::Argument);
         assert_eq!(arg.text, "a#b");
+    }
+
+    // ── v1.7.0-B: Argument token kind ────────────────────────────────────
+
+    #[test]
+    fn plain_argument_is_argument_kind() {
+        // `echo hello` — hello is a plain argument, not Default.
+        assert_eq!(
+            kinds("echo hello"),
+            vec![
+                TokenKind::Command,
+                TokenKind::Whitespace,
+                TokenKind::Argument,
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_arguments_all_argument() {
+        // Multiple plain arguments after a command are all Argument.
+        assert_eq!(
+            kinds("git commit -m message"),
+            vec![
+                TokenKind::Command, // git
+                TokenKind::Whitespace,
+                TokenKind::Argument, // commit
+                TokenKind::Whitespace,
+                TokenKind::Flag, // -m
+                TokenKind::Whitespace,
+                TokenKind::Argument, // message
+            ]
+        );
+    }
+
+    #[test]
+    fn argument_after_pipe_is_command_not_argument() {
+        // After a pipe, the first word is a Command, not an Argument.
+        assert_eq!(
+            kinds("echo hi | grep pattern"),
+            vec![
+                TokenKind::Command, // echo
+                TokenKind::Whitespace,
+                TokenKind::Argument, // hi
+                TokenKind::Whitespace,
+                TokenKind::Operator, // |
+                TokenKind::Whitespace,
+                TokenKind::Command, // grep
+                TokenKind::Whitespace,
+                TokenKind::Argument, // pattern
+            ]
+        );
+    }
+
+    #[test]
+    fn argument_distinct_from_flag_path_number() {
+        // Verify the classifier distinguishes Argument from Flag/Path/Number.
+        let toks = tokenize("cmd --flag /path 42 arg");
+        let kinds: Vec<TokenKind> = toks.iter().map(|t| t.kind).collect();
+        assert!(kinds.contains(&TokenKind::Flag), "should have Flag");
+        assert!(kinds.contains(&TokenKind::Path), "should have Path");
+        assert!(kinds.contains(&TokenKind::Number), "should have Number");
+        assert!(kinds.contains(&TokenKind::Argument), "should have Argument");
+        // Default should NOT appear — all words classify into a specific kind.
+        assert!(
+            !kinds.contains(&TokenKind::Default),
+            "Default should not appear for normal command words"
+        );
     }
 }

@@ -70,10 +70,11 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, ScrollbackConfig, SyntaxConfig,
-    ThemeConfig, WindowConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, OutputSemanticConfig,
+    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH,
 };
-pub use theme::{SyntaxColors, Theme};
+pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
 
 use self::save::{

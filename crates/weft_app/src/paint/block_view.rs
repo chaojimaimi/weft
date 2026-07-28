@@ -73,7 +73,9 @@ impl MetalRenderer {
             fg[2] * 0.70 + theme_bg[2] * 0.30,
             1.0,
         ];
-        let dim = prompt_c;
+        // v1.7.0-B: dedicated CWD color (was `dim`/`accent_dim` — now a
+        // distinct output semantic role so CWD ≠ output_default).
+        let cwd_c = color_to_normalized(self.theme.output.cwd);
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
@@ -121,7 +123,7 @@ impl MetalRenderer {
                 display
             };
             if !display.is_empty() {
-                self.push_text(&mut verts, left, fixed_y, &display, dim, cols);
+                self.push_text(&mut verts, left, fixed_y, &display, cwd_c, cols);
             }
         }
 
@@ -571,7 +573,7 @@ impl MetalRenderer {
                     let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
                         .with_increase_contrast(self.increase_contrast);
                     let color = match tone {
-                        BlockTone::Success => dim,
+                        BlockTone::Success => color_to_normalized(self.theme.output.success),
                         BlockTone::Error => color_to_normalized(ui.error),
                         BlockTone::Warning => color_to_normalized(ui.warning),
                     };
@@ -722,7 +724,7 @@ impl MetalRenderer {
             let command_y = if block_cwd.is_empty() {
                 sticky_y
             } else {
-                self.push_text(&mut verts, left, sticky_y, &block_cwd, dim, cols);
+                self.push_text(&mut verts, left, sticky_y, &block_cwd, cwd_c, cols);
                 sticky_y + pitch
             };
             self.push_text(&mut verts, left, command_y, "❯ ", prompt_c, cols);

@@ -10,10 +10,14 @@ use crate::grid::Color;
 use super::parsers::parse_hex;
 use super::sections::ThemeConfig;
 
-/// Syntax-highlight color palette (9 colors). Theme-driven so every theme
+/// Syntax-highlight color palette. Theme-driven so every theme
 /// can define its own command/flag/path/string colors; replaces the hardcoded
 /// `syntax_color()` from renderer.rs v0.5. Conventions match the "Warm
 /// Terminal" direction (v0.8 §0.3) but each theme fills its own values.
+///
+/// v1.7.0-B: added `argument` (plain arguments get their own role, distinct
+/// from `default`). The visual hierarchy contract (V17 §2.4) requires
+/// `command` ≠ `argument` ≠ `default` in every built-in theme.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntaxColors {
     /// Command name (first word, or after `|` / `&&` / `;`).
@@ -32,8 +36,36 @@ pub struct SyntaxColors {
     pub operator: Color,
     /// A shell comment: `#` to end of line.
     pub comment: Color,
-    /// Anything else (arguments, values) — usually == theme.foreground.
+    /// v1.7.0-B: a plain argument (non-command-position word that is not a
+    /// flag/path/number/string/variable). Must be distinguishable from
+    /// `command` and `default` in every built-in theme.
+    pub argument: Color,
+    /// Anything else (rare fallback) — usually == theme.foreground.
     pub default: Color,
+}
+
+/// v1.7.0-B: Output semantic color roles for unstyled (no-ANSI) command
+/// output. The semantic fallback classifier (v1.7.0-C) maps tokens to these
+/// roles; they are also used directly for CWD, block metadata, and exit-code
+/// status rendering. All roles must be visually distinguishable from each
+/// other and from `SyntaxColors::command`/`argument`/`default` in every
+/// built-in theme (V17 §2.4 visual hierarchy contract).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputSemanticColors {
+    /// Plain output text with no semantic role and no ANSI styling. Must NOT
+    /// equal `cwd` (V17 §2.4: "普通结果不得等于 CWD 色").
+    pub output_default: Color,
+    /// CWD / execution time / exit code — weakened context color for
+    ///定位信息. Must be weaker (lower contrast or dimmer) than `command`.
+    pub cwd: Color,
+    /// Label / metadata key — secondary semantic color. Weaker than `command`
+    /// but distinguishable from `output_default`.
+    pub metadata: Color,
+    /// Success status (ok/ready/running/passed). Must not rely on color alone
+    /// — brightness/weight signal also required (V17 §2.4).
+    pub success: Color,
+    /// Failure status (error/failed/stopped). Must not rely on color alone.
+    pub failure: Color,
 }
 
 /// A fully-resolved theme: the colors the renderer paints with.
@@ -57,6 +89,8 @@ pub struct Theme {
     pub separator: Color,
     /// Syntax-highlight palette (replaces hardcoded syntax_color in renderer).
     pub syntax: SyntaxColors,
+    /// v1.7.0-B: output semantic color roles for unstyled command output.
+    pub output: OutputSemanticColors,
 }
 
 impl Theme {
@@ -117,7 +151,15 @@ impl Theme {
                 variable: Color::rgb(0xc4, 0xa0, 0xc8), // dusty purple
                 operator: Color::rgb(0xc8, 0x68, 0x58), // brick red
                 comment: Color::rgb(0x7a, 0x6a, 0x58),  // warm gray (== accent_dim)
+                argument: Color::rgb(0xc8, 0xa8, 0x88), // warm sand — distinct from olive command
                 default: Color::rgb(0xe0, 0xd4, 0xc4),  // == foreground
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xe0, 0xd4, 0xc4), // == syntax.default
+                cwd: Color::rgb(0x7a, 0x6a, 0x58),            // == accent_dim
+                metadata: Color::rgb(0xa8, 0x90, 0x70),       // muted amber
+                success: Color::rgb(0xb8, 0xc8, 0x78),        // ANSI 2 green (olive)
+                failure: Color::rgb(0xc8, 0x68, 0x58),        // ANSI 1 red (brick)
             },
         }
     }
@@ -164,7 +206,15 @@ impl Theme {
                 variable: Color::rgb(0x70, 0x50, 0x90), // dusty purple
                 operator: Color::rgb(0xa8, 0x48, 0x38), // brick red
                 comment: Color::rgb(0x8a, 0x78, 0x68),  // warm gray (== accent_dim)
+                argument: Color::rgb(0x80, 0x68, 0x50), // warm khaki — distinct from olive command
                 default: Color::rgb(0x3a, 0x32, 0x28),  // == foreground
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0x3a, 0x32, 0x28), // == syntax.default
+                cwd: Color::rgb(0x8a, 0x78, 0x68),            // == accent_dim
+                metadata: Color::rgb(0x70, 0x58, 0x40),       // muted brown
+                success: Color::rgb(0x6a, 0x80, 0x40),        // ANSI 2 green
+                failure: Color::rgb(0xa8, 0x48, 0x38),        // ANSI 1 red
             },
         }
     }
@@ -210,15 +260,23 @@ impl Theme {
             accent_dim: Color::rgb(0x7a, 0x4a, 0x3a), // dim coral
             separator: Color::rgb(0x2a, 0x2a, 0x40), // cool dark purple
             syntax: SyntaxColors {
-                command: Color::rgb(0xd9, 0xd9, 0xe3),  // == foreground
-                flag: Color::rgb(0xff, 0x5d, 0x38),     // coral (== accent)
-                path: Color::rgb(0x5a, 0xb9, 0xf8),     // sky blue
-                string: Color::rgb(0xc7, 0xa5, 0x5c),   // warm yellow
-                number: Color::rgb(0xff, 0xc7, 0x4a),   // bright yellow
+                command: Color::rgb(0xe8, 0xe8, 0xf0), // bright off-white — distinct from default fg
+                flag: Color::rgb(0xff, 0x5d, 0x38),    // coral (== accent)
+                path: Color::rgb(0x5a, 0xb9, 0xf8),    // sky blue
+                string: Color::rgb(0xc7, 0xa5, 0x5c),  // warm yellow
+                number: Color::rgb(0xff, 0xc7, 0x4a),  // bright yellow
                 variable: Color::rgb(0xb3, 0x87, 0xff), // lavender
                 operator: Color::rgb(0x7a, 0x7a, 0x90), // cool gray
-                comment: Color::rgb(0x5a, 0x5a, 0x72),  // muted purple-gray
+                comment: Color::rgb(0x5a, 0x5a, 0x72), // muted purple-gray
+                argument: Color::rgb(0x7a, 0xc4, 0xc8), // soft teal — distinct from foreground command
                 default: Color::rgb(0xd9, 0xd9, 0xe3),  // == foreground
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xd9, 0xd9, 0xe3), // == syntax.default
+                cwd: Color::rgb(0x7a, 0x4a, 0x3a),            // == accent_dim
+                metadata: Color::rgb(0xa8, 0x6a, 0x5a),       // muted coral
+                success: Color::rgb(0x3e, 0xd9, 0xa4),        // ANSI 2 green (mint)
+                failure: Color::rgb(0xff, 0x5d, 0x38),        // ANSI 1 red (coral)
             },
         }
     }
@@ -262,15 +320,23 @@ impl Theme {
             accent_dim: Color::rgb(0x62, 0x72, 0xa4), // comment color
             separator: Color::rgb(0x44, 0x47, 0x5a), // current line
             syntax: SyntaxColors {
-                command: Color::rgb(0xf8, 0xf8, 0xf2),  // == foreground
-                flag: Color::rgb(0xff, 0x79, 0xc6),     // pink
-                path: Color::rgb(0x8b, 0xe9, 0xfd),     // cyan
-                string: Color::rgb(0xf1, 0xfa, 0x8c),   // yellow
-                number: Color::rgb(0xbd, 0x93, 0xf9),   // purple
+                command: Color::rgb(0x50, 0xfa, 0x7b), // Dracula green — distinct from fg
+                flag: Color::rgb(0xff, 0x79, 0xc6),    // pink
+                path: Color::rgb(0x8b, 0xe9, 0xfd),    // cyan
+                string: Color::rgb(0xf1, 0xfa, 0x8c),  // yellow
+                number: Color::rgb(0xbd, 0x93, 0xf9),  // purple
                 variable: Color::rgb(0xff, 0xb8, 0x6c), // orange
                 operator: Color::rgb(0xff, 0x55, 0x55), // red
-                comment: Color::rgb(0x62, 0x72, 0xa4),  // comment
+                comment: Color::rgb(0x62, 0x72, 0xa4), // comment
+                argument: Color::rgb(0xa8, 0xc8, 0xe8), // soft blue — distinct from foreground command
                 default: Color::rgb(0xf8, 0xf8, 0xf2),  // == foreground
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xf8, 0xf8, 0xf2), // == syntax.default
+                cwd: Color::rgb(0x62, 0x72, 0xa4),            // == accent_dim
+                metadata: Color::rgb(0x8a, 0x7a, 0xc4),       // muted purple
+                success: Color::rgb(0x50, 0xfa, 0x7b),        // ANSI 2 green
+                failure: Color::rgb(0xff, 0x55, 0x55),        // ANSI 1 red
             },
         }
     }
@@ -314,15 +380,23 @@ impl Theme {
             accent_dim: Color::rgb(0x58, 0x6e, 0x75), // base01
             separator: Color::rgb(0x07, 0x36, 0x42), // base02
             syntax: SyntaxColors {
-                command: Color::rgb(0x93, 0xa1, 0xa1),  // base1
-                flag: Color::rgb(0x26, 0x8b, 0xd2),     // blue
-                path: Color::rgb(0x2a, 0xa1, 0x98),     // cyan
-                string: Color::rgb(0x85, 0x99, 0x00),   // green
-                number: Color::rgb(0xb5, 0x89, 0x00),   // yellow (magenta)
+                command: Color::rgb(0x85, 0x99, 0x00), // solarized green — distinct from fg
+                flag: Color::rgb(0x26, 0x8b, 0xd2),    // blue
+                path: Color::rgb(0x2a, 0xa1, 0x98),    // cyan
+                string: Color::rgb(0x85, 0x99, 0x00),  // green
+                number: Color::rgb(0xb5, 0x89, 0x00),  // yellow (magenta)
                 variable: Color::rgb(0x6c, 0x71, 0xc4), // violet
                 operator: Color::rgb(0xdc, 0x32, 0x2f), // red
-                comment: Color::rgb(0x58, 0x6e, 0x75),  // base01
-                default: Color::rgb(0x93, 0xa1, 0xa1),  // base1
+                comment: Color::rgb(0x58, 0x6e, 0x75), // base01
+                argument: Color::rgb(0x5a, 0x90, 0x88), // muted teal — distinct from base1 command
+                default: Color::rgb(0x93, 0xa1, 0xa1), // base1
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0x93, 0xa1, 0xa1), // == syntax.default
+                cwd: Color::rgb(0x58, 0x6e, 0x75),            // == accent_dim
+                metadata: Color::rgb(0x4a, 0x6a, 0x8a),       // muted blue
+                success: Color::rgb(0x85, 0x99, 0x00),        // ANSI 2 green
+                failure: Color::rgb(0xdc, 0x32, 0x2f),        // ANSI 1 red
             },
         }
     }
@@ -366,15 +440,23 @@ impl Theme {
             accent_dim: Color::rgb(0x92, 0x83, 0x74), // gray
             separator: Color::rgb(0x3c, 0x38, 0x36), // bg2
             syntax: SyntaxColors {
-                command: Color::rgb(0xeb, 0xdb, 0xb2),  // fg
-                flag: Color::rgb(0xfe, 0x80, 0x19),     // orange
-                path: Color::rgb(0x83, 0xa5, 0x98),     // blue
-                string: Color::rgb(0xb8, 0xbb, 0x26),   // green
-                number: Color::rgb(0xd3, 0x86, 0x9b),   // purple
+                command: Color::rgb(0xb8, 0xbb, 0x26), // gruvbox green — distinct from fg
+                flag: Color::rgb(0xfe, 0x80, 0x19),    // orange
+                path: Color::rgb(0x83, 0xa5, 0x98),    // blue
+                string: Color::rgb(0xb8, 0xbb, 0x26),  // green
+                number: Color::rgb(0xd3, 0x86, 0x9b),  // purple
                 variable: Color::rgb(0xfa, 0xbd, 0x2f), // yellow
                 operator: Color::rgb(0xfb, 0x49, 0x34), // red
-                comment: Color::rgb(0x92, 0x83, 0x74),  // gray
-                default: Color::rgb(0xeb, 0xdb, 0xb2),  // fg
+                comment: Color::rgb(0x92, 0x83, 0x74), // gray
+                argument: Color::rgb(0x6a, 0x9a, 0x8a), // muted teal — distinct from fg command
+                default: Color::rgb(0xeb, 0xdb, 0xb2), // fg
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xeb, 0xdb, 0xb2), // == syntax.default
+                cwd: Color::rgb(0x92, 0x83, 0x74),            // == accent_dim
+                metadata: Color::rgb(0xb5, 0x80, 0x40),       // muted orange
+                success: Color::rgb(0x98, 0x97, 0x1a),        // ANSI 2 green
+                failure: Color::rgb(0xcc, 0x24, 0x1d),        // ANSI 1 red
             },
         }
     }
@@ -418,15 +500,23 @@ impl Theme {
             accent_dim: Color::rgb(0x4c, 0x56, 0x6a), // nord3
             separator: Color::rgb(0x3b, 0x42, 0x52), // nord1
             syntax: SyntaxColors {
-                command: Color::rgb(0xd8, 0xde, 0xe9),  // nord4
-                flag: Color::rgb(0x88, 0xc0, 0xd0),     // nord8 cyan-blue
-                path: Color::rgb(0x81, 0xa1, 0xc1),     // nord9 frost
-                string: Color::rgb(0xa3, 0xbe, 0x8c),   // nord14 green
-                number: Color::rgb(0xeb, 0xcb, 0x8b),   // nord13 yellow
+                command: Color::rgb(0x88, 0xc0, 0xd0), // nord8 cyan — distinct from fg
+                flag: Color::rgb(0x88, 0xc0, 0xd0),    // nord8 cyan-blue
+                path: Color::rgb(0x81, 0xa1, 0xc1),    // nord9 frost
+                string: Color::rgb(0xa3, 0xbe, 0x8c),  // nord14 green
+                number: Color::rgb(0xeb, 0xcb, 0x8b),  // nord13 yellow
                 variable: Color::rgb(0xb4, 0x8e, 0xad), // nord15 purple
                 operator: Color::rgb(0xbf, 0x61, 0x6a), // nord11 red
-                comment: Color::rgb(0x61, 0x69, 0x80),  // nord3 dimmed
-                default: Color::rgb(0xd8, 0xde, 0xe9),  // nord4
+                comment: Color::rgb(0x61, 0x69, 0x80), // nord3 dimmed
+                argument: Color::rgb(0x7a, 0xa8, 0xa8), // muted teal — distinct from nord4 command
+                default: Color::rgb(0xd8, 0xde, 0xe9), // nord4
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xd8, 0xde, 0xe9), // == syntax.default
+                cwd: Color::rgb(0x4c, 0x56, 0x6a),            // == accent_dim
+                metadata: Color::rgb(0x6a, 0x88, 0x98),       // muted frost
+                success: Color::rgb(0xa3, 0xbe, 0x8c),        // ANSI 2 green (nord14)
+                failure: Color::rgb(0xbf, 0x61, 0x6a),        // ANSI 1 red (nord11)
             },
         }
     }
@@ -469,15 +559,23 @@ impl Theme {
             accent_dim: Color::rgb(0x56, 0x5f, 0x89), // comment
             separator: Color::rgb(0x16, 0x18, 0x2a),
             syntax: SyntaxColors {
-                command: Color::rgb(0xa9, 0xb1, 0xd6),  // fg
-                flag: Color::rgb(0x7a, 0xa2, 0xf7),     // blue
-                path: Color::rgb(0x7d, 0xcf, 0xff),     // cyan
-                string: Color::rgb(0x9e, 0xce, 0x6a),   // green
-                number: Color::rgb(0xff, 0x9e, 0x64),   // orange
+                command: Color::rgb(0x7a, 0xa2, 0xf7), // tokyo night blue — distinct from fg
+                flag: Color::rgb(0x7a, 0xa2, 0xf7),    // blue
+                path: Color::rgb(0x7d, 0xcf, 0xff),    // cyan
+                string: Color::rgb(0x9e, 0xce, 0x6a),  // green
+                number: Color::rgb(0xff, 0x9e, 0x64),  // orange
                 variable: Color::rgb(0xbb, 0x9a, 0xf7), // magenta
                 operator: Color::rgb(0xf7, 0x76, 0x8e), // red
-                comment: Color::rgb(0x56, 0x5f, 0x89),  // comment
-                default: Color::rgb(0xa9, 0xb1, 0xd6),  // fg
+                comment: Color::rgb(0x56, 0x5f, 0x89), // comment
+                argument: Color::rgb(0x7a, 0xc0, 0xc8), // muted teal — distinct from fg command
+                default: Color::rgb(0xa9, 0xb1, 0xd6), // fg
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xa9, 0xb1, 0xd6), // == syntax.default
+                cwd: Color::rgb(0x56, 0x5f, 0x89),            // == accent_dim
+                metadata: Color::rgb(0x6a, 0x7a, 0xa8),       // muted blue
+                success: Color::rgb(0x9e, 0xce, 0x6a),        // ANSI 2 green
+                failure: Color::rgb(0xf7, 0x76, 0x8e),        // ANSI 1 red
             },
         }
     }
@@ -520,15 +618,23 @@ impl Theme {
             accent_dim: Color::rgb(0x6c, 0x70, 0x86), // overlay0
             separator: Color::rgb(0x31, 0x32, 0x44),  // surface0
             syntax: SyntaxColors {
-                command: Color::rgb(0xcd, 0xd6, 0xf4),  // text
-                flag: Color::rgb(0xcb, 0xa6, 0xf7),     // mauve
-                path: Color::rgb(0x89, 0xb4, 0xfa),     // blue
-                string: Color::rgb(0xa6, 0xe3, 0xa1),   // green
-                number: Color::rgb(0xfa, 0xb3, 0x87),   // peach
+                command: Color::rgb(0xcb, 0xa6, 0xf7), // catppuccin mauve — distinct from fg
+                flag: Color::rgb(0xcb, 0xa6, 0xf7),    // mauve
+                path: Color::rgb(0x89, 0xb4, 0xfa),    // blue
+                string: Color::rgb(0xa6, 0xe3, 0xa1),  // green
+                number: Color::rgb(0xfa, 0xb3, 0x87),  // peach
                 variable: Color::rgb(0xf9, 0xe2, 0xaf), // yellow
                 operator: Color::rgb(0xf3, 0x8b, 0xa8), // red
-                comment: Color::rgb(0x6c, 0x70, 0x86),  // overlay0
-                default: Color::rgb(0xcd, 0xd6, 0xf4),  // text
+                comment: Color::rgb(0x6c, 0x70, 0x86), // overlay0
+                argument: Color::rgb(0x9a, 0xb8, 0xd8), // soft blue — distinct from text command
+                default: Color::rgb(0xcd, 0xd6, 0xf4), // text
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xcd, 0xd6, 0xf4), // == syntax.default
+                cwd: Color::rgb(0x6c, 0x70, 0x86),            // == accent_dim
+                metadata: Color::rgb(0x8a, 0x8a, 0xa8),       // muted mauve
+                success: Color::rgb(0xa6, 0xe3, 0xa1),        // ANSI 2 green
+                failure: Color::rgb(0xf3, 0x8b, 0xa8),        // ANSI 1 red
             },
         }
     }
@@ -570,15 +676,23 @@ impl Theme {
             accent_dim: Color::rgb(0x5c, 0x63, 0x70), // comment
             separator: Color::rgb(0x3e, 0x44, 0x51),
             syntax: SyntaxColors {
-                command: Color::rgb(0xab, 0xb2, 0xbf),  // fg
-                flag: Color::rgb(0xc6, 0x78, 0xdd),     // purple
-                path: Color::rgb(0x56, 0xb6, 0xc2),     // cyan
-                string: Color::rgb(0x98, 0xc3, 0x79),   // green
-                number: Color::rgb(0xd1, 0x9a, 0x66),   // orange
+                command: Color::rgb(0x61, 0xaf, 0xef), // one dark blue — distinct from fg
+                flag: Color::rgb(0xc6, 0x78, 0xdd),    // purple
+                path: Color::rgb(0x56, 0xb6, 0xc2),    // cyan
+                string: Color::rgb(0x98, 0xc3, 0x79),  // green
+                number: Color::rgb(0xd1, 0x9a, 0x66),  // orange
                 variable: Color::rgb(0xe5, 0xc0, 0x7b), // yellow
                 operator: Color::rgb(0xe0, 0x6c, 0x75), // red
-                comment: Color::rgb(0x5c, 0x63, 0x70),  // comment
-                default: Color::rgb(0xab, 0xb2, 0xbf),  // fg
+                comment: Color::rgb(0x5c, 0x63, 0x70), // comment
+                argument: Color::rgb(0x6a, 0xa8, 0xa0), // muted teal — distinct from fg command
+                default: Color::rgb(0xab, 0xb2, 0xbf), // fg
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xab, 0xb2, 0xbf), // == syntax.default
+                cwd: Color::rgb(0x5c, 0x63, 0x70),            // == accent_dim
+                metadata: Color::rgb(0x6a, 0x88, 0xa8),       // muted blue
+                success: Color::rgb(0x98, 0xc3, 0x79),        // ANSI 2 green
+                failure: Color::rgb(0xe0, 0x6c, 0x75),        // ANSI 1 red
             },
         }
     }
@@ -620,15 +734,23 @@ impl Theme {
             accent_dim: Color::rgb(0x72, 0x70, 0x72), // comment
             separator: Color::rgb(0x40, 0x3e, 0x41),
             syntax: SyntaxColors {
-                command: Color::rgb(0xfc, 0xfc, 0xfa),  // fg
-                flag: Color::rgb(0xff, 0x61, 0x88),     // red
-                path: Color::rgb(0x78, 0xdc, 0xe8),     // cyan
-                string: Color::rgb(0xa9, 0xdc, 0x76),   // green
-                number: Color::rgb(0xab, 0x9d, 0xf2),   // purple
+                command: Color::rgb(0xa9, 0xdc, 0x76), // monokai green — distinct from fg
+                flag: Color::rgb(0xff, 0x61, 0x88),    // red
+                path: Color::rgb(0x78, 0xdc, 0xe8),    // cyan
+                string: Color::rgb(0xa9, 0xdc, 0x76),  // green
+                number: Color::rgb(0xab, 0x9d, 0xf2),  // purple
                 variable: Color::rgb(0xab, 0x9d, 0xf2), // purple
                 operator: Color::rgb(0xff, 0x61, 0x88), // red
-                comment: Color::rgb(0x72, 0x70, 0x72),  // comment
-                default: Color::rgb(0xfc, 0xfc, 0xfa),  // fg
+                comment: Color::rgb(0x72, 0x70, 0x72), // comment
+                argument: Color::rgb(0x7a, 0xb8, 0xb0), // muted teal — distinct from fg command
+                default: Color::rgb(0xfc, 0xfc, 0xfa), // fg
+            },
+            output: OutputSemanticColors {
+                output_default: Color::rgb(0xfc, 0xfc, 0xfa), // == syntax.default
+                cwd: Color::rgb(0x72, 0x70, 0x72),            // == accent_dim
+                metadata: Color::rgb(0xa8, 0xa8, 0x70),       // muted yellow
+                success: Color::rgb(0xa9, 0xdc, 0x76),        // ANSI 2 green
+                failure: Color::rgb(0xff, 0x61, 0x88),        // ANSI 1 red
             },
         }
     }
@@ -733,8 +855,29 @@ impl Theme {
             if let Some(c) = syn.comment.as_deref().and_then(parse_hex) {
                 theme.syntax.comment = c;
             }
+            if let Some(c) = syn.argument.as_deref().and_then(parse_hex) {
+                theme.syntax.argument = c;
+            }
             if let Some(c) = syn.default.as_deref().and_then(parse_hex) {
                 theme.syntax.default = c;
+            }
+        }
+        // v1.7.0-B: apply output semantic color overrides.
+        if let Some(out) = cfg.output.as_ref() {
+            if let Some(c) = out.output_default.as_deref().and_then(parse_hex) {
+                theme.output.output_default = c;
+            }
+            if let Some(c) = out.cwd.as_deref().and_then(parse_hex) {
+                theme.output.cwd = c;
+            }
+            if let Some(c) = out.metadata.as_deref().and_then(parse_hex) {
+                theme.output.metadata = c;
+            }
+            if let Some(c) = out.success.as_deref().and_then(parse_hex) {
+                theme.output.success = c;
+            }
+            if let Some(c) = out.failure.as_deref().and_then(parse_hex) {
+                theme.output.failure = c;
             }
         }
         theme
