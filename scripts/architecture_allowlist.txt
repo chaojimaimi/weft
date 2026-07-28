@@ -4,7 +4,7 @@
 # The ceiling is the audited size. A listed file may shrink, but it may not
 # grow beyond its ceiling. New exceptions require an explicit review of this
 # file instead of a self-authorizing comment in the Rust source.
-crates/weft_app/src/app_runtime.rs|810|v1.3 Batch 5 added per-pane resize/PTY-routing glue alongside the existing event-loop entry; a focused split (probe + effect dispatch into app/) is a follow-up.
+crates/weft_app/src/app_runtime.rs|840|v1.3 Batch 5 added per-pane resize/PTY-routing glue; v1.6.3 added recovery snapshot write in TabsAutoSave handler + mark_clean_shutdown calls at 3 exit paths (CloseRequested, should_exit, PerformanceProbeFinish). The recovery hooks are 1-3 lines each and can't be extracted without breaking the event-loop ownership contract.
 crates/weft_app/src/app_state.rs|820|v1.3.2 added PaneDividerDragState struct + field to InteractionState alongside existing SidebarDragState/ScrollbarDragState; a focused split (drag states into a sub-module) is a follow-up.
 crates/weft_app/src/workspace_controller.rs|910|v1.6.2 added WorkspaceDocument bridge: capture (runtime→DTO) + restore (DTO→runtime) + interactive NSSavePanel/NSOpenPanel + recursive split-tree rebuild + 8 unit tests. The capture/restore/interactive paths share PanePayload/build_subtree helpers and the error types; splitting would scatter the tree-rebuild algorithm across modules.
 crates/weft_app/src/geometry_controller.rs|890|v1.6.1 added block_view_hyperlink_at_pixel + hyperlink_at_pixel RowExtras path for OSC 8 link resolution in both grid and block views; geometry/hit-test domain stays cohesive with the existing palette/settings targets.

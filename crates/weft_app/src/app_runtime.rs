@@ -202,12 +202,23 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::TabsAutoSave => {
                 self.save_changed_tabs();
+                // v1.6.3: Also write a recovery snapshot if the session
+                // state has changed. The debounce check inside the
+                // controller skips the write when nothing changed.
+                if let Some(ws) = self.capture_workspace("recovery".into()) {
+                    if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
+                        warn!(error = %e, "recovery snapshot write failed");
+                    }
+                }
             }
             AppEvent::PerformanceProbeStart => self.performance_probe.start(),
             AppEvent::PerformanceProbeFinish => {
                 if let Some(report) = self.performance_probe.finish() {
                     println!("{}", report.line());
                 }
+                // v1.6.3: Mark clean shutdown for the performance probe
+                // exit path (test mode).
+                self.recovery.mark_clean_shutdown();
                 event_loop.exit();
             }
             AppEvent::MenuAction(action) => {
@@ -225,6 +236,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
         }
         if self.should_exit {
+            // v1.6.3: Mark clean shutdown for the should_exit path (last
+            // tab closed, shell exit, etc.).
+            self.recovery.mark_clean_shutdown();
             event_loop.exit();
         }
     }
@@ -374,6 +388,12 @@ impl ApplicationHandler<AppEvent> for App {
             .block_store()
             .map(BlockStore::block_id_allocator);
 
+        // v1.6.3: Crash recovery detection. Check for an unclean shutdown
+        // and offer to restore from a recovery snapshot if one exists.
+        // This runs BEFORE the normal tab-snapshot restore so that a
+        // successful recovery replaces the normal restore path.
+        let recovery_restored = self.run_startup_recovery();
+
         // v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
         // session layout survives restarts. The first tab (spawned above by
         // spawn_pty) is replaced if saved snapshots exist; otherwise it stays
@@ -388,6 +408,11 @@ impl ApplicationHandler<AppEvent> for App {
         // stays clean. If the saved cwd equals the weft process's cwd (the
         // common case when launching from the same directory), no rebuild
         // is needed — the initial tab already has the right cwd.
+        //
+        // v1.6.3: Skip the normal tab-snapshot restore if a recovery
+        // snapshot was just restored — the recovery path already rebuilt
+        // the full session topology (tabs + panes + cwds + drafts).
+        if !recovery_restored {
         if let Some(store) = self.sessions.block_store() {
             let snaps_result = store.load_tabs();
             match snaps_result {
@@ -459,6 +484,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
         }
+        } // end if !recovery_restored
 
         // Restore history only after the tab topology is final. Hydrating the
         // initial terminal before cwd-based replacement discarded the loaded

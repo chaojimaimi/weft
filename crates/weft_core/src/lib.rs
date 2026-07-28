@@ -13,6 +13,7 @@ pub mod input;
 pub mod pane_layout;
 pub mod persistence;
 pub mod pty;
+pub mod recovery;
 pub mod secrets;
 pub mod selection;
 pub mod shell;

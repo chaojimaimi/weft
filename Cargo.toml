@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.6.2"
+version = "1.6.3"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -31,7 +31,7 @@ metal = "0.29"
 objc2 = "0.5"
 objc2-metal = "0.2"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry", "NSString"] }
-objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel"] }
+objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton"] }
 objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer"] }
 winit = "0.30"
 # `block` backs the `Block<...>` callback type used by Metal's

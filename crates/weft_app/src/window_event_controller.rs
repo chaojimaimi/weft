@@ -21,6 +21,18 @@ impl App {
                 }
                 effects.push(crate::effect::Effect::PersistTabs);
                 self.drain_effects(effects);
+                // v1.6.3: Write a final recovery snapshot (clean) and mark
+                // clean shutdown so the next launch doesn't show a recovery
+                // prompt.
+                if let Some(ws) = self.capture_workspace("recovery".into()) {
+                    if let Err(e) = self
+                        .recovery
+                        .write_snapshot_if_changed(&ws)
+                    {
+                        warn!(error = %e, "final recovery snapshot write failed");
+                    }
+                }
+                self.recovery.mark_clean_shutdown();
                 event_loop.exit();
             }
             WindowEvent::Resized(physical_size) => {

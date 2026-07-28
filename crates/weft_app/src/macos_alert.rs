@@ -1,0 +1,154 @@
+//! v1.6.3: Type-safe NSAlert wrapper for the crash recovery prompt.
+//!
+//! Shows a modal dialog when Weft detects an unclean shutdown and a
+//! recovery snapshot is available. The user can choose to:
+//!
+//! - **Restore** — rebuild the session from the snapshot.
+//! - **Ignore** — start fresh; the snapshot is kept for potential later recovery.
+//! - **Delete** — start fresh; the snapshot is permanently deleted.
+//!
+//! The prompt is modal (`runModal`) and must be invoked on the main thread
+//! (enforced via `MainThreadMarker`). Cancel (Esc / Cmd+.) is treated as
+//! "Ignore" — the user explicitly chose not to restore right now.
+
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSModalResponse};
+use objc2_foundation::{MainThreadMarker, NSString};
+
+/// The user's response to the recovery prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryPromptResponse {
+    /// Restore the session from the snapshot.
+    Restore,
+    /// Start fresh; keep the snapshot for potential later recovery.
+    Ignore,
+    /// Start fresh; permanently delete the snapshot.
+    Delete,
+}
+
+/// Errors raised by the alert wrapper.
+#[derive(Debug)]
+pub enum AlertError {
+    /// Not on the main thread. NSAlert is a UI API and must be invoked
+    /// from the main thread.
+    #[allow(dead_code)]
+    NotMainThread,
+}
+
+impl std::fmt::Display for AlertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotMainThread => write!(f, "alert must be invoked on the main thread"),
+        }
+    }
+}
+
+impl std::error::Error for AlertError {}
+
+/// Show the crash recovery prompt.
+///
+/// - `snapshot_age_secs` — age of the recovery snapshot in seconds (shown
+///   in the informative text to help the user decide).
+/// - `tab_count` — number of tabs in the snapshot (shown for context).
+///
+/// The alert has three buttons:
+///
+/// 1. **Restore** (default) — returns [`RecoveryPromptResponse::Restore`].
+/// 2. **Ignore** — returns [`RecoveryPromptResponse::Ignore`].
+/// 3. **Delete** — returns [`RecoveryPromptResponse::Delete`].
+///
+/// If the user dismisses the alert via Esc / Cmd+. (cancel), it's treated
+/// as **Ignore** — the snapshot is preserved in case they want to recover
+/// later.
+pub fn show_recovery_prompt(
+    mtm: MainThreadMarker,
+    snapshot_age_secs: u64,
+    tab_count: usize,
+) -> Result<RecoveryPromptResponse, AlertError> {
+    // SAFETY: NSAlert::new requires MainThreadMarker; we have it.
+    let alert = unsafe { NSAlert::new(mtm) };
+    unsafe {
+        // Title: "Weft Closed Unexpectedly"
+        let title = NSString::from_str("Weft Closed Unexpectedly");
+        alert.setMessageText(&title);
+
+        // Informative text with snapshot details.
+        let age_text = format_snapshot_age(snapshot_age_secs);
+        let info = NSString::from_str(&format!(
+            "A previous session ({}, {} tabs) is available. Would you like to restore it?\n\n\
+             Restoring will reopen your tabs and panes in their saved directories. \
+             Editor drafts are restored but never auto-executed.",
+            age_text, tab_count
+        ));
+        alert.setInformativeText(&info);
+
+        // Warning style (not critical — no data loss).
+        alert.setAlertStyle(NSAlertStyle::Warning);
+
+        // Button order (right-to-left on macOS, but we add left-to-right
+        // and let AppKit handle layout):
+        // 1. Restore (default) — first button is the default
+        let restore = NSString::from_str("Restore");
+        alert.addButtonWithTitle(&restore);
+
+        // 2. Ignore — keep snapshot, start fresh
+        let ignore = NSString::from_str("Ignore");
+        alert.addButtonWithTitle(&ignore);
+
+        // 3. Delete — permanently delete snapshot
+        let delete = NSString::from_str("Delete Snapshot");
+        alert.addButtonWithTitle(&delete);
+    }
+
+    // Run modally.
+    let response = unsafe { alert.runModal() };
+
+    // Map NSModalResponse to our enum.
+    // NSAlert uses NSModalResponse for button indices:
+    //   NSAlertFirstButtonReturn = 1000
+    //   NSAlertSecondButtonReturn = 1001
+    //   NSAlertThirdButtonReturn = 1002
+    //   NSAlertCancelReturn = (varies, but typically the Esc/Cancel action)
+    //
+    // For a 3-button alert:
+    //   First button (Restore)  → NSAlertFirstButtonReturn (1000)
+    //   Second button (Ignore)  → NSAlertSecondButtonReturn (1001)
+    //   Third button (Delete)   → NSAlertThirdButtonReturn (1002)
+    //   Esc / Cmd+.             → NSAlertSecondButtonReturn (1001) — the
+    //                            cancel button is the second one (Ignore)
+    //                            per AppKit's cancel-button heuristic.
+    //
+    // This means Esc = Ignore, which is the desired behavior (preserve
+    // the snapshot in case the user wants to recover later).
+    Ok(map_modal_response(response))
+}
+
+fn map_modal_response(response: NSModalResponse) -> RecoveryPromptResponse {
+    // NSAlertFirstButtonReturn = 1000
+    const NS_ALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
+    // NSAlertSecondButtonReturn = 1001
+    const NS_ALERT_SECOND_BUTTON_RETURN: NSModalResponse = 1001;
+    // NSAlertThirdButtonReturn = 1002
+    const NS_ALERT_THIRD_BUTTON_RETURN: NSModalResponse = 1002;
+
+    match response {
+        NS_ALERT_FIRST_BUTTON_RETURN => RecoveryPromptResponse::Restore,
+        NS_ALERT_SECOND_BUTTON_RETURN => RecoveryPromptResponse::Ignore,
+        NS_ALERT_THIRD_BUTTON_RETURN => RecoveryPromptResponse::Delete,
+        // Any other response (e.g. cancel) defaults to Ignore — the
+        // snapshot is preserved.
+        _ => RecoveryPromptResponse::Ignore,
+    }
+}
+
+/// Format a snapshot age in seconds as a human-readable string.
+fn format_snapshot_age(secs: u64) -> String {
+    if secs < 60 {
+        format!("from {} seconds ago", secs)
+    } else if secs < 3600 {
+        format!("from {} minutes ago", secs / 60)
+    } else if secs < 86400 {
+        format!("from {} hours ago", secs / 3600)
+    } else {
+        format!("from {} days ago", secs / 86400)
+    }
+}

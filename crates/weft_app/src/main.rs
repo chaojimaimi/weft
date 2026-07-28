@@ -34,6 +34,7 @@ mod ime_event_controller;
 mod input_router;
 mod layout;
 mod lifecycle_controller;
+mod macos_alert;
 mod macos_file_dialog;
 mod macos_system;
 mod macos_window;
@@ -53,6 +54,7 @@ mod panel_scrollbar;
 mod performance_probe;
 mod profiles_controller;
 mod redraw_controller;
+mod recovery_controller;
 mod renderer;
 mod scene;
 mod scroll_input;
@@ -192,6 +194,9 @@ struct App {
     /// v1.0 H4: set to true when the user closes the last tab — the main
     /// event loop checks this and calls `event_loop.exit()`.
     should_exit: bool,
+    /// v1.6.3: Crash recovery controller. Manages debounced snapshot
+    /// writes, clean-shutdown markers, and startup detection.
+    recovery: recovery_controller::RecoveryController,
 }
 
 /// Context menu item labels.
@@ -286,6 +291,9 @@ impl App {
             frame_trace_enabled,
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
+            recovery: recovery_controller::RecoveryController::new(
+                weft_cache_dir().as_deref(),
+            ),
         }
     }
 
