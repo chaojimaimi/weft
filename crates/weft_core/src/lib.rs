@@ -15,6 +15,7 @@ pub mod pane_layout;
 pub mod persistence;
 pub mod pty;
 pub mod recovery;
+pub mod runbook;
 pub mod search;
 pub mod secrets;
 pub mod selection;

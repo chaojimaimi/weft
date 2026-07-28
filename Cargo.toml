@@ -62,6 +62,10 @@ core-text = "20.1"
 core-foundation = "0.9"
 # Secret masking (v0.5 F8)
 regex = "1"
+# v1.7.3: Markdown parsing for local Runbook (fenced shell command extraction).
+# pulldown-cmark is a spec-compliant CommonMark parser — mature, no unsafe,
+# and used by rustdoc itself.
+pulldown-cmark = { version = "0.12", default-features = false }
 # Window icon (PNG decode for winit runtime icon)
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Persistence

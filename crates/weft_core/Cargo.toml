@@ -27,5 +27,6 @@ toml.workspace = true
 toml_edit.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
