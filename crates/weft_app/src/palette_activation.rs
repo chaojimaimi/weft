@@ -158,6 +158,19 @@ impl App {
                 }
                 self.request_redraw();
             }
+            PaletteEntry::SearchHit(hit) => {
+                // v1.7.1: Activating a history search hit fills the editor
+                // with the command (no auto-execution). Per V17 §3 step 5:
+                // "激活历史命令只填入 editor；Block 结果打开对应记录，不自动执行"
+                let cmd = hit.doc.title.clone();
+                if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                    terminal.editor_mut().buffer.set_text(&cmd);
+                    // Select all so the user can easily replace or edit.
+                    terminal.editor_mut().buffer.select_all();
+                }
+                self.close_palette();
+                self.request_redraw();
+            }
         }
     }
 

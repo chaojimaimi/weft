@@ -25,8 +25,10 @@ impl App {
         // FindInGrid debounce: when 150ms have elapsed since the last
         // keystroke, run the search and update `find_matches`.
         self.maybe_refresh_find_results();
-        // v0.9 U-P1: drain pending find-worker results (async grid search).
+        // v0.9 U-D1: drain pending find-worker results (async grid search).
         self.poll_find_worker_results();
+        // v1.7.1: drain palette search worker results (async FTS5 search).
+        self.poll_palette_search_results();
         // v0.9 U-D1: poll macOS system appearance (throttled to 1Hz).
         self.poll_system_appearance();
 
@@ -357,6 +359,12 @@ impl App {
                                 let label = format!("Switch Profile: {name}");
                                 let desc = if *active { "active" } else { "" };
                                 (label, desc.to_string(), "Profile")
+                            }
+                            // v1.7.1: Search hits show the document title
+                            // (command line for blocks) with the kind label
+                            // ("History", "Workflow", etc.).
+                            PaletteEntry::SearchHit(hit) => {
+                                (hit.doc.title.clone(), String::new(), hit.doc.kind.label())
                             }
                         })
                         .collect()

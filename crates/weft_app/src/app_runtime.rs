@@ -388,6 +388,23 @@ impl ApplicationHandler<AppEvent> for App {
             .block_store()
             .map(BlockStore::block_id_allocator);
 
+        // v1.7.1: Open the search index (sidecar to blocks.db) for main-thread
+        // upsert/delete. The background PaletteSearchWorker owns its own
+        // SearchIndex for queries. If the index is empty, rebuild from
+        // BlockStore so palette search has content on first launch.
+        self.search_index = crate::palette_search_worker::open_search_index(
+            weft_cache_dir().map(|c| c.join("blocks.db")),
+            self.sessions.block_store(),
+        );
+
+        // v1.7.1: Spawn the palette search worker on a background thread.
+        if let Some(cache) = weft_cache_dir() {
+            self.palette.search_worker = crate::palette_search_worker::spawn_worker(
+                cache.join("blocks.db"),
+                self.proxy.clone(),
+            );
+        }
+
         // v1.6.3: Crash recovery detection. Check for an unclean shutdown
         // and offer to restore from a recovery snapshot if one exists.
         // This runs BEFORE the normal tab-snapshot restore so that a
@@ -413,79 +430,8 @@ impl ApplicationHandler<AppEvent> for App {
         // snapshot was just restored — the recovery path already rebuilt
         // the full session topology (tabs + panes + cwds + drafts).
         if !recovery_restored {
-            if let Some(store) = self.sessions.block_store() {
-                let snaps_result = store.load_tabs();
-                match snaps_result {
-                    Ok(snaps) if !snaps.is_empty() => {
-                        info!(count = snaps.len(), "restoring saved tab snapshots");
-                        let (rows, cols) = self.current_size();
-                        let total = snaps.len();
-                        let home = std::env::var("HOME").unwrap_or_default();
-                        let weft_cwd = std::env::current_dir()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        for (i, snap) in snaps.iter().enumerate() {
-                            let saved_cwd = snap.cwd.clone();
-                            // Filter: only apply cwd if non-empty, != $HOME, and
-                            // != the weft process's current cwd (the last check
-                            // avoids a needless tab rebuild in the common case of
-                            // launching from the same directory).
-                            let cwd_to_apply = saved_cwd
-                                .as_deref()
-                                .filter(|c| !c.is_empty() && *c != home && *c != weft_cwd);
-                            if i == 0 {
-                                // First tab: rebuild with chdir only if a different
-                                // cwd is needed; otherwise reuse the existing tab
-                                // (already spawned with weft's cwd).
-                                if cwd_to_apply.is_some() {
-                                    let mut tab = Tab::new(
-                                        rows,
-                                        cols,
-                                        self.config_state.config.scrollback.lines,
-                                        &self.proxy,
-                                        cwd_to_apply,
-                                    );
-                                    if let Some(t) = &mut tab.terminal {
-                                        if let Some(r) = &self.renderer {
-                                            t.set_palette(r.theme().palette);
-                                        }
-                                    }
-                                    tab.restore_from_snapshot(snap);
-                                    self.sessions.replace_tab(0, tab);
-                                } else if let Some(t) = self.sessions.tab_mut(0) {
-                                    t.restore_from_snapshot(snap);
-                                }
-                            } else {
-                                let mut tab = Tab::new(
-                                    rows,
-                                    cols,
-                                    self.config_state.config.scrollback.lines,
-                                    &self.proxy,
-                                    cwd_to_apply,
-                                );
-                                tab.restore_from_snapshot(snap);
-                                if let Some(t) = &mut tab.terminal {
-                                    if let Some(r) = &self.renderer {
-                                        t.set_palette(r.theme().palette);
-                                    }
-                                }
-                                self.sessions.push_tab(tab);
-                            }
-                        }
-                        let active =
-                            weft_core::persistence::TabSnapshot::restored_active_index(&snaps);
-                        self.sessions.set_active(active);
-                        info!(restored = total, "tab snapshots restored");
-                    }
-                    Ok(_) => {
-                        // No saved tabs — fresh launch, keep the initial tab.
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "failed to load tab snapshots; starting fresh");
-                    }
-                }
-            }
-        } // end if !recovery_restored
+            self.restore_tab_snapshots();
+        }
 
         // Restore history only after the tab topology is final. Hydrating the
         // initial terminal before cwd-based replacement discarded the loaded

@@ -79,6 +79,71 @@ impl App {
         if self.palette.selection >= self.palette.results.len() {
             self.palette.selection = 0;
         }
+
+        // v1.7.1: Submit FTS5 search query to the background worker.
+        // Results arrive asynchronously and are merged in
+        // `poll_palette_search_results` (called from the redraw path).
+        if !self.palette.query.is_empty() {
+            if let Some(worker) = &self.palette.search_worker {
+                let cwd = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.cwd().map(|s| s.to_string()));
+                let gen = worker.submit(
+                    &self.palette.query,
+                    &[weft_core::search::SearchDocumentKind::Block],
+                    cwd.as_deref(),
+                    50,
+                );
+                self.palette.search_generation = gen;
+                self.palette.search_pending = true;
+            }
+        } else if let Some(worker) = &self.palette.search_worker {
+            // Query cleared — cancel any in-flight search so stale results
+            // don't merge into the now-empty results list.
+            worker.invalidate();
+            self.palette.search_generation = worker.current_generation();
+            self.palette.search_pending = false;
+        }
+    }
+
+    /// v1.7.1: Drain palette search worker results. Called from the redraw path.
+    /// Merges background FTS5 search hits into the palette results list,
+    /// prepending them so history results appear first.
+    pub(super) fn poll_palette_search_results(&mut self) {
+        if !self.palette.open {
+            return;
+        }
+        let Some(worker) = &self.palette.search_worker else {
+            return;
+        };
+        while let Some(result) = worker.try_recv_result() {
+            // Staleness filter: only process results matching the current generation.
+            if result.generation != self.palette.search_generation {
+                continue;
+            }
+            self.palette.search_pending = false;
+            // Remove old SearchHit entries first.
+            self.palette
+                .results
+                .retain(|e| !matches!(e, PaletteEntry::SearchHit(_)));
+            // Prepend new search hits (history results first).
+            let mut new_entries: Vec<PaletteEntry> = result
+                .hits
+                .into_iter()
+                .map(PaletteEntry::SearchHit)
+                .collect();
+            new_entries.append(&mut self.palette.results);
+            self.palette.results = new_entries;
+            // Clamp selection.
+            if self.palette.selection >= self.palette.results.len() {
+                self.palette.selection = 0;
+            }
+            self.request_redraw();
+            break; // Only process one result per frame.
+        }
     }
 
     /// Handle a key while the Command Palette is open. Returns true if consumed.

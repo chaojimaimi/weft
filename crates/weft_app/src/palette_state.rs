@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use weft_core::search::SearchHit;
 use weft_core::workflow::{Workflow, WorkflowStore};
 
 /// A single entry in the palette results list.
@@ -17,6 +18,10 @@ pub(crate) enum PaletteEntry {
         name: String,
         active: bool,
     },
+    /// v1.7.1: A search hit from the FTS5 index (history, workflow,
+    /// workspace, or bookmark). Activating a history hit fills the editor
+    /// with the command — no auto-execution.
+    SearchHit(SearchHit),
 }
 
 impl PaletteEntry {
@@ -31,6 +36,11 @@ impl PaletteEntry {
             // reserved name "base" is rejected by validate_profile_name
             // case-insensitively, so it never collides with a real profile).
             Self::Profile { name, .. } => format!("profile/{name}"),
+            // v1.7.1: Search hits use `search/<kind>/<stable_id>` so
+            // results from different kinds never collide.
+            Self::SearchHit(hit) => {
+                format!("search/{}/{}", hit.doc.kind as u8, hit.doc.stable_id)
+            }
         }
     }
 }
@@ -154,6 +164,12 @@ pub(crate) struct PaletteState {
     pub(crate) form: Option<WorkflowForm>,
     pub(crate) submode: PaletteSubMode,
     pub(crate) store: Option<WorkflowStore>,
+    /// v1.7.1: Background search worker. None when persistence is disabled.
+    pub(crate) search_worker: Option<crate::palette_search_worker::PaletteSearchWorker>,
+    /// v1.7.1: Generation of the last submitted search query.
+    pub(crate) search_generation: u64,
+    /// v1.7.1: True when a search query is in-flight (for "searching..." indicator).
+    pub(crate) search_pending: bool,
 }
 
 impl PaletteState {
@@ -167,6 +183,9 @@ impl PaletteState {
             form: None,
             submode: PaletteSubMode::Search,
             store: None,
+            search_worker: None,
+            search_generation: 0,
+            search_pending: false,
         }
     }
 
@@ -367,5 +386,44 @@ mod tests {
             active: false,
         };
         assert_ne!(a.accessibility_key(), b.accessibility_key());
+    }
+
+    // ── v1.7.1: PaletteEntry::SearchHit tests ───────────────────────
+
+    #[test]
+    fn search_hit_accessibility_key_uses_kind_and_stable_id() {
+        let hit = weft_core::search::SearchHit {
+            doc: weft_core::search::SearchDocument {
+                kind: weft_core::search::SearchDocumentKind::Block,
+                stable_id: "42".to_string(),
+                title: "cargo build".to_string(),
+                body: String::new(),
+                cwd: None,
+                updated_at: 0,
+            },
+            score: 1.0,
+        };
+        let entry = PaletteEntry::SearchHit(hit);
+        assert_eq!(entry.accessibility_key(), "search/0/42");
+    }
+
+    #[test]
+    fn search_hit_distinct_kinds_have_distinct_keys() {
+        let make = |kind, id: &str| {
+            PaletteEntry::SearchHit(weft_core::search::SearchHit {
+                doc: weft_core::search::SearchDocument {
+                    kind,
+                    stable_id: id.to_string(),
+                    title: String::new(),
+                    body: String::new(),
+                    cwd: None,
+                    updated_at: 0,
+                },
+                score: 0.0,
+            })
+        };
+        let block = make(weft_core::search::SearchDocumentKind::Block, "1");
+        let workflow = make(weft_core::search::SearchDocumentKind::Workflow, "1");
+        assert_ne!(block.accessibility_key(), workflow.accessibility_key());
     }
 }

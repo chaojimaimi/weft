@@ -53,6 +53,8 @@ impl App {
                     PaletteEntry::Profile { name, .. } => {
                         format!("Switch Profile: {name}")
                     }
+                    // v1.7.1: Search hits use the document title as label.
+                    PaletteEntry::SearchHit(hit) => hit.doc.title.clone(),
                 })
                 .collect(),
         };

@@ -48,6 +48,7 @@ mod palette_activation;
 mod palette_component;
 mod palette_controller;
 mod palette_form;
+mod palette_search_worker;
 mod palette_state;
 mod pane;
 mod panel_component;
@@ -199,6 +200,9 @@ struct App {
     /// v1.6.3: Crash recovery controller. Manages debounced snapshot
     /// writes, clean-shutdown markers, and startup detection.
     recovery: recovery_controller::RecoveryController,
+    /// v1.7.1: Main-thread search index for upsert/delete (index maintenance).
+    /// The background PaletteSearchWorker owns its own SearchIndex for queries.
+    search_index: Option<weft_core::search::SearchIndex>,
 }
 
 /// Context menu item labels.
@@ -294,6 +298,7 @@ impl App {
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
+            search_index: None,
         }
     }
 

@@ -646,4 +646,78 @@ impl App {
         self.recompute_layout();
         self.request_redraw();
     }
+
+    /// v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
+    /// session layout survives restarts. The PTY itself is NOT revived — each
+    /// restored tab gets a fresh shell, with the editor draft rehydrated.
+    ///
+    /// v1.0 fix: cwd is restored via `chdir` in the child process before
+    /// exec (Pty::spawn_with_args `cwd` param), NOT by sending a `cd`
+    /// command. Sending `cd` polluted the terminal, shell history, and
+    /// block tracker with a spurious `cd <cwd>` block.
+    pub(super) fn restore_tab_snapshots(&mut self) {
+        let Some(store) = self.sessions.block_store() else {
+            return;
+        };
+        let snaps_result = store.load_tabs();
+        match snaps_result {
+            Ok(snaps) if !snaps.is_empty() => {
+                info!(count = snaps.len(), "restoring saved tab snapshots");
+                let (rows, cols) = self.current_size();
+                let total = snaps.len();
+                let home = std::env::var("HOME").unwrap_or_default();
+                let weft_cwd = std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                for (i, snap) in snaps.iter().enumerate() {
+                    let saved_cwd = snap.cwd.clone();
+                    let cwd_to_apply = saved_cwd
+                        .as_deref()
+                        .filter(|c| !c.is_empty() && *c != home && *c != weft_cwd);
+                    if i == 0 {
+                        if cwd_to_apply.is_some() {
+                            let mut tab = Tab::new(
+                                rows,
+                                cols,
+                                self.config_state.config.scrollback.lines,
+                                &self.proxy,
+                                cwd_to_apply,
+                            );
+                            if let Some(t) = &mut tab.terminal {
+                                if let Some(r) = &self.renderer {
+                                    t.set_palette(r.theme().palette);
+                                }
+                            }
+                            tab.restore_from_snapshot(snap);
+                            self.sessions.replace_tab(0, tab);
+                        } else if let Some(t) = self.sessions.tab_mut(0) {
+                            t.restore_from_snapshot(snap);
+                        }
+                    } else {
+                        let mut tab = Tab::new(
+                            rows,
+                            cols,
+                            self.config_state.config.scrollback.lines,
+                            &self.proxy,
+                            cwd_to_apply,
+                        );
+                        tab.restore_from_snapshot(snap);
+                        if let Some(t) = &mut tab.terminal {
+                            if let Some(r) = &self.renderer {
+                                t.set_palette(r.theme().palette);
+                            }
+                        }
+                        self.sessions.push_tab(tab);
+                    }
+                }
+                let active = weft_core::persistence::TabSnapshot::restored_active_index(&snaps);
+                self.sessions.set_active(active);
+                info!(restored = total, "tab snapshots restored");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to load tab snapshots; starting fresh");
+            }
+        }
+    }
 }
