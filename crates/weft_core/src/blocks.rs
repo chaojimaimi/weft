@@ -28,9 +28,14 @@ mod continuation;
 mod output_capture;
 #[cfg(test)]
 mod screen_capture_tests;
+mod semantic;
 mod style;
 
 pub(crate) use output_capture::OutputCapture;
+pub use semantic::{
+    classify_block, classify_line, OutputSemanticRole, SemanticLine, SemanticOutput, SemanticSpan,
+    MAX_SEMANTIC_SPANS_PER_BLOCK, MAX_SEMANTIC_SPANS_PER_LINE,
+};
 pub use style::{
     AttributeSpan, CapturedStyle, CapturedStyleRun, ForegroundSpan, LinkSpan, StyledLine,
     StyledOutput, ANSI_ATTRIBUTE_MASK, MAX_STYLE_RUNS_PER_BLOCK, MAX_STYLE_RUNS_PER_LINE,
