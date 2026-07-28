@@ -408,9 +408,13 @@ impl ApplicationHandler<AppEvent> for App {
         // upsert/delete. The background PaletteSearchWorker owns its own
         // SearchIndex for queries. If the index is empty, rebuild from
         // BlockStore so palette search has content on first launch.
+        // v1.7.3-D: also pass AnnotationStore so bookmarked annotations
+        // (notes/tags) are indexed on cold start and become searchable via
+        // the Palette.
         self.search_index = crate::palette_search_worker::open_search_index(
             weft_cache_dir().map(|c| c.join("blocks.db")),
             self.sessions.block_store(),
+            self.sessions.annotation_store(),
         );
 
         // v1.7.1: Spawn the palette search worker on a background thread.

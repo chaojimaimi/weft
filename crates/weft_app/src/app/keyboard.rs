@@ -372,6 +372,9 @@ impl crate::App {
                 match store.set_note(bid, note) {
                     Ok(()) => {
                         info!(block_id = ?bid, note_len = buffer.len(), "note saved");
+                        // v1.7.3-D: sync the updated annotation to the search
+                        // index so the note text is searchable via Palette.
+                        self.sync_bookmark_to_search_index(bid);
                     }
                     Err(e) => warn!(error = %e, "failed to save note"),
                 }

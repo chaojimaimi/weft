@@ -132,10 +132,14 @@ impl PaletteSearchWorker {
 /// upsert/delete (index maintenance). If the index is empty, rebuild it
 /// from BlockStore so palette search has content on first launch.
 ///
+/// v1.7.3-D: Also indexes bookmarked annotations from `AnnotationStore` so
+/// bookmarks and notes enter unified search after restart.
+///
 /// Returns `None` when the DB can't be opened (palette search disabled).
 pub(crate) fn open_search_index(
     db_path: Option<PathBuf>,
     block_store: Option<&weft_core::persistence::BlockStore>,
+    annotation_store: Option<&weft_core::blocks::annotations::AnnotationStore>,
 ) -> Option<SearchIndex> {
     let path = db_path?;
     let conn = match rusqlite::Connection::open(&path) {
@@ -150,7 +154,7 @@ pub(crate) fn open_search_index(
     if index.count().unwrap_or(0) == 0 {
         if let Some(store) = block_store {
             if let Ok(blocks) = store.recent(10000) {
-                let docs: Vec<_> = blocks
+                let mut docs: Vec<_> = blocks
                     .iter()
                     .map(|b| {
                         let started_ms = b
@@ -167,6 +171,34 @@ pub(crate) fn open_search_index(
                         )
                     })
                     .collect();
+                // v1.7.3-D: append bookmark annotations so they enter
+                // unified search on cold start.
+                if let Some(ann_store) = annotation_store {
+                    if let Ok(bookmarks) = ann_store.bookmarked() {
+                        for ann in &bookmarks {
+                            // Look up the block for command + cwd.
+                            if let Ok(Some(block)) = store.get(ann.block_id) {
+                                let updated_ms = ann
+                                    .updated_at
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                docs.push(weft_core::search::SearchDocument::from_bookmark(
+                                    ann.block_id.0,
+                                    ann.note.as_deref(),
+                                    &block.command,
+                                    &ann.tags,
+                                    block.cwd.as_deref(),
+                                    updated_ms,
+                                ));
+                            }
+                        }
+                        tracing::info!(
+                            bookmark_count = bookmarks.len(),
+                            "bookmarks indexed on cold start"
+                        );
+                    }
+                }
                 if let Err(e) = index.rebuild(&docs) {
                     tracing::warn!(error = %e, "failed to rebuild search index");
                 } else {

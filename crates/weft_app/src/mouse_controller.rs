@@ -562,6 +562,7 @@ impl App {
                 match store.toggle_bookmark(bid) {
                     Ok(bookmarked) => {
                         info!(block_id = ?bid, bookmarked, "bookmark toggled");
+                        self.sync_bookmark_to_search_index(bid);
                         self.request_redraw();
                     }
                     Err(e) => warn!(error = %e, "failed to toggle bookmark"),
@@ -592,6 +593,62 @@ impl App {
                 self.write_block_export(&block.command, &markdown);
             }
             _ => {}
+        }
+    }
+
+    /// v1.7.3-D: Sync a bookmark annotation to the search index. After a
+    /// bookmark toggle or note save, this upserts (or deletes) the
+    /// `SearchDocumentKind::Bookmark` entry so the annotation is findable
+    /// via Palette search. Safe to call when the search index or block store
+    /// is unavailable (logs a warning and returns).
+    pub(crate) fn sync_bookmark_to_search_index(&self, block_id: weft_core::blocks::BlockId) {
+        let Some(index) = &self.search_index else {
+            return;
+        };
+        // Look up the annotation; if it was auto-deleted (no bookmark, no
+        // note, no tags), remove the search doc.
+        let annotation = self
+            .sessions
+            .annotation_store()
+            .and_then(|store| store.get(block_id).ok().flatten());
+        let Some(annotation) = annotation else {
+            // Annotation deleted → remove from search index.
+            if let Err(e) = index.delete(
+                weft_core::search::SearchDocumentKind::Bookmark,
+                &block_id.0.to_string(),
+            ) {
+                warn!(error = %e, "failed to delete bookmark from search index");
+            }
+            return;
+        };
+        // Look up the block to get command + cwd for the search doc.
+        let block = self
+            .sessions
+            .block_store()
+            .and_then(|store| store.get(block_id).ok().flatten());
+        let (command, cwd) = match block {
+            Some(b) => (b.command.clone(), b.cwd.clone()),
+            None => {
+                // Block not persisted yet (e.g. still running). Use a
+                // placeholder so the bookmark is still searchable by note/tags.
+                (String::new(), None)
+            }
+        };
+        let updated_ms = annotation
+            .updated_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let doc = weft_core::search::SearchDocument::from_bookmark(
+            block_id.0,
+            annotation.note.as_deref(),
+            &command,
+            &annotation.tags,
+            cwd.as_deref(),
+            updated_ms,
+        );
+        if let Err(e) = index.upsert(&doc) {
+            warn!(error = %e, "failed to upsert bookmark into search index");
         }
     }
 

@@ -836,4 +836,154 @@ mod tests {
         let hits = idx.search(&SearchQuery::new("ghost")).unwrap();
         assert!(hits.is_empty(), "ghost record survived rebuild");
     }
+
+    // ---- v1.7.3-D: Bookmark search integration acceptance tests ----
+
+    #[test]
+    fn bookmark_upsert_and_search_by_note() {
+        // Acceptance: a bookmark with a note is searchable by note text.
+        let idx = open_test_index();
+        let doc = SearchDocument::from_bookmark(
+            42,
+            Some("deploy script for production"),
+            "kubectl apply -f deploy.yaml",
+            &[],
+            Some("/repo"),
+            1_700_000_000,
+        );
+        idx.upsert(&doc).unwrap();
+        let hits = idx
+            .search(&SearchQuery {
+                query: "deploy",
+                kinds: &[SearchDocumentKind::Bookmark],
+                limit: 50,
+                cwd: None,
+            })
+            .unwrap();
+        assert!(!hits.is_empty(), "bookmark should be findable by note text");
+        assert_eq!(hits[0].doc.kind, SearchDocumentKind::Bookmark);
+        assert_eq!(hits[0].doc.stable_id, "42");
+    }
+
+    #[test]
+    fn bookmark_search_by_tag() {
+        // Acceptance: a bookmark's tags are searchable.
+        let idx = open_test_index();
+        let tags = vec!["production".to_string(), "critical".to_string()];
+        let doc = SearchDocument::from_bookmark(7, None, "git status", &tags, None, 0);
+        idx.upsert(&doc).unwrap();
+        let hits = idx.search(&SearchQuery::new("critical")).unwrap();
+        assert!(!hits.is_empty(), "bookmark should be findable by tag");
+        assert_eq!(hits[0].doc.stable_id, "7");
+    }
+
+    #[test]
+    fn bookmark_search_by_command_fallback() {
+        // Acceptance: when a bookmark has no note, the block command is
+        // used as the title and is searchable.
+        let idx = open_test_index();
+        let doc = SearchDocument::from_bookmark(99, None, "cargo build --release", &[], None, 0);
+        idx.upsert(&doc).unwrap();
+        let hits = idx.search(&SearchQuery::new("cargo")).unwrap();
+        assert!(!hits.is_empty(), "bookmark should be findable by command");
+        assert_eq!(hits[0].doc.title, "cargo build --release");
+    }
+
+    #[test]
+    fn bookmark_delete_removes_from_search() {
+        // Acceptance: deleting a bookmark removes it from the search index
+        // (no ghost records).
+        let idx = open_test_index();
+        let doc = SearchDocument::from_bookmark(
+            5,
+            Some("unique_note_text"),
+            "some_command",
+            &[],
+            None,
+            0,
+        );
+        idx.upsert(&doc).unwrap();
+        assert!(idx.count_kind(SearchDocumentKind::Bookmark).unwrap() == 1);
+        idx.delete(SearchDocumentKind::Bookmark, "5").unwrap();
+        assert!(idx.count_kind(SearchDocumentKind::Bookmark).unwrap() == 0);
+        let hits = idx.search(&SearchQuery::new("unique_note_text")).unwrap();
+        assert!(hits.is_empty(), "deleted bookmark should not be findable");
+    }
+
+    #[test]
+    fn bookmark_kind_filter_excludes_blocks() {
+        // Acceptance: filtering by Bookmark kind excludes Block documents.
+        let idx = open_test_index();
+        idx.upsert(&make_doc(
+            SearchDocumentKind::Block,
+            "1",
+            "shared_term",
+            "block output",
+        ))
+        .unwrap();
+        let bm = SearchDocument::from_bookmark(1, Some("shared_term note"), "cmd", &[], None, 0);
+        idx.upsert(&bm).unwrap();
+        let q = SearchQuery {
+            query: "shared_term",
+            kinds: &[SearchDocumentKind::Bookmark],
+            limit: 50,
+            cwd: None,
+        };
+        let hits = idx.search(&q).unwrap();
+        assert_eq!(hits.len(), 1, "only the bookmark should match");
+        assert_eq!(hits[0].doc.kind, SearchDocumentKind::Bookmark);
+    }
+
+    #[test]
+    fn bookmark_rebuild_includes_bookmarks() {
+        // Acceptance: rebuild preserves bookmark documents alongside blocks.
+        let idx = open_test_index();
+        let docs = vec![
+            SearchDocument::from_block(1, "ls", "output", None, 0),
+            SearchDocument::from_bookmark(
+                1,
+                Some("important note"),
+                "ls",
+                &["urgent".to_string()],
+                None,
+                0,
+            ),
+        ];
+        idx.rebuild(&docs).unwrap();
+        assert_eq!(idx.count().unwrap(), 2);
+        assert_eq!(idx.count_kind(SearchDocumentKind::Bookmark).unwrap(), 1);
+        let hits = idx.search(&SearchQuery::new("important")).unwrap();
+        assert!(!hits.is_empty());
+        let hits = idx.search(&SearchQuery::new("urgent")).unwrap();
+        assert!(!hits.is_empty());
+    }
+
+    #[test]
+    fn bookmark_upsert_replaces_existing() {
+        // Acceptance: upserting a bookmark with the same stable_id replaces
+        // the old content (note edit scenario).
+        let idx = open_test_index();
+        let old = SearchDocument::from_bookmark(10, Some("old note text"), "cmd", &[], None, 0);
+        idx.upsert(&old).unwrap();
+        let new = SearchDocument::from_bookmark(10, Some("updated note text"), "cmd", &[], None, 1);
+        idx.upsert(&new).unwrap();
+        assert_eq!(idx.count_kind(SearchDocumentKind::Bookmark).unwrap(), 1);
+        let hits = idx.search(&SearchQuery::new("updated")).unwrap();
+        assert!(!hits.is_empty(), "updated note should be findable");
+        let hits = idx.search(&SearchQuery::new("old note")).unwrap();
+        assert!(
+            hits.is_empty(),
+            "old note text should no longer be findable"
+        );
+    }
+
+    #[test]
+    fn bookmark_cjk_note_searchable() {
+        // Acceptance: CJK notes are searchable (FTS5 unicode61 tokenizer).
+        let idx = open_test_index();
+        let doc = SearchDocument::from_bookmark(1, Some("部署脚本"), "kubectl apply", &[], None, 0);
+        idx.upsert(&doc).unwrap();
+        let hits = idx.search(&SearchQuery::new("部署")).unwrap();
+        assert!(!hits.is_empty(), "CJK bookmark note should be searchable");
+    }
 }

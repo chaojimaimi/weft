@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::blocks::{Block, BlockId};
 use crate::persistence::migrations::{ensure_column, ensure_tabs_active_column};
@@ -139,6 +139,23 @@ impl BlockStore {
     pub fn clear(&self) -> Result<(), PersistenceError> {
         self.conn.execute("DELETE FROM blocks", [])?;
         Ok(())
+    }
+
+    /// v1.7.3-D: Fetch a single block by id. Returns `None` if not found.
+    /// Used by the search-index integration to look up a block's command
+    /// and cwd when indexing a bookmark annotation.
+    pub fn get(&self, block_id: BlockId) -> Result<Option<Block>, PersistenceError> {
+        self.conn
+            .query_row(
+                "SELECT id, command, cwd, output, \
+                        CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                        exit_code, started_ms, finished_ms, collapsed \
+                 FROM blocks WHERE id = ?1",
+                params![block_id.0 as i64],
+                row_to_block,
+            )
+            .optional()
+            .map_err(PersistenceError::from)
     }
 }
 
