@@ -46,9 +46,7 @@ pub(crate) enum StartupRecovery {
     NoSnapshot,
     /// Unclean shutdown detected and a valid snapshot is available.
     /// The caller should show a recovery prompt and decide what to do.
-    UncleanShutdown {
-        snapshot: RecoverySnapshot,
-    },
+    UncleanShutdown { snapshot: RecoverySnapshot },
 }
 
 /// Orchestrates crash recovery snapshot lifecycle.
@@ -61,6 +59,9 @@ pub(crate) struct RecoveryController {
     /// Hash of the YAML serialization of the last successfully-written
     /// snapshot. Used for content-equality debouncing.
     last_written_hash: Option<u64>,
+    /// v1.6.3 §6 step 5: cumulative count of snapshot write failures
+    /// since startup. Logged on each failure for diagnostics.
+    write_failure_count: u64,
 }
 
 impl RecoveryController {
@@ -76,6 +77,7 @@ impl RecoveryController {
         Self {
             paths,
             last_written_hash: None,
+            write_failure_count: 0,
         }
     }
 
@@ -114,7 +116,10 @@ impl RecoveryController {
             Ok(snapshot) => {
                 // Check if the snapshot is stale (older than 7 days).
                 if snapshot.is_stale() {
-                    info!(created_at = snapshot.created_at, "recovery snapshot is stale, deleting");
+                    info!(
+                        created_at = snapshot.created_at,
+                        "recovery snapshot is stale, deleting"
+                    );
                     if let Err(e) = self.paths.delete_snapshot() {
                         warn!(error = %e, "failed to delete stale recovery snapshot");
                     }
@@ -180,11 +185,20 @@ impl RecoveryController {
         // Build the full snapshot (with fresh timestamp) and write it.
         let snapshot = RecoverySnapshot::from_workspace(workspace.clone(), false);
         let start = std::time::Instant::now();
-        snapshot.save(&self.paths.snapshot_path())?;
+        if let Err(e) = snapshot.save(&self.paths.snapshot_path()) {
+            // v1.6.3 §6 step 5: track failure count for diagnostics.
+            self.write_failure_count += 1;
+            warn!(error = %e, failures = self.write_failure_count, "recovery snapshot write failed");
+            return Err(e);
+        }
         let elapsed = start.elapsed();
 
         self.last_written_hash = Some(hash);
-        info!(elapsed_ms = elapsed.as_millis() as u64, "recovery snapshot written");
+        info!(
+            elapsed_ms = elapsed.as_millis() as u64,
+            failures = self.write_failure_count,
+            "recovery snapshot written"
+        );
         Ok(true)
     }
 

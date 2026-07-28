@@ -404,7 +404,10 @@ mod tests {
     fn unknown_version_rejected() {
         let yaml = "version: 999\ncreated_at: 0\nclean_shutdown: false\nworkspace:\n  version: 1\n  name: x\n  window:\n    width: 1\n    height: 1\n  tabs: []\n  active_tab: 0\n";
         let result = RecoverySnapshot::from_yaml(yaml);
-        assert!(matches!(result, Err(RecoveryError::UnsupportedVersion { found: 999, .. })));
+        assert!(matches!(
+            result,
+            Err(RecoveryError::UnsupportedVersion { found: 999, .. })
+        ));
     }
 
     #[test]

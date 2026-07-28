@@ -53,8 +53,8 @@ mod panel_controller;
 mod panel_scrollbar;
 mod performance_probe;
 mod profiles_controller;
-mod redraw_controller;
 mod recovery_controller;
+mod redraw_controller;
 mod renderer;
 mod scene;
 mod scroll_input;
@@ -291,9 +291,7 @@ impl App {
             frame_trace_enabled,
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
-            recovery: recovery_controller::RecoveryController::new(
-                weft_cache_dir().as_deref(),
-            ),
+            recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
         }
     }
 

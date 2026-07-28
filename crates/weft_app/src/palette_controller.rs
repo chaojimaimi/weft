@@ -657,7 +657,9 @@ impl App {
                         };
                         match self.workspace_save_interactive(mtm) {
                             Ok(()) => info!("palette workspace save succeeded"),
-                            Err(crate::workspace_controller::WorkspaceInteractionError::Cancelled) => {}
+                            Err(
+                                crate::workspace_controller::WorkspaceInteractionError::Cancelled,
+                            ) => {}
                             Err(e) => warn!(error = %e, "palette workspace save failed"),
                         }
                         self.close_palette();
@@ -672,7 +674,9 @@ impl App {
                         };
                         match self.workspace_open_interactive(mtm) {
                             Ok(()) => info!("palette workspace open succeeded"),
-                            Err(crate::workspace_controller::WorkspaceInteractionError::Cancelled) => {}
+                            Err(
+                                crate::workspace_controller::WorkspaceInteractionError::Cancelled,
+                            ) => {}
                             Err(e) => warn!(error = %e, "palette workspace open failed"),
                         }
                         self.close_palette();

@@ -446,7 +446,11 @@ impl App {
         // mouse (opencode, claude, vim) — same escape hatch as Shift+drag.
         if button == winit::event::MouseButton::Left && self.interaction.mods.state().super_key() {
             if let Some(url) = self.hyperlink_at_pixel(x, y) {
-                open_url(&url);
+                // v1.6.1: surface open failures to the user via the status
+                // hint mechanism (exit criterion: "外部 URL 打开失败有可见错误").
+                if let Err(e) = open_url(&url) {
+                    self.surface_config_error(&e.to_string());
+                }
                 return;
             }
         }

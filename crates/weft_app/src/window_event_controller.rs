@@ -25,10 +25,7 @@ impl App {
                 // clean shutdown so the next launch doesn't show a recovery
                 // prompt.
                 if let Some(ws) = self.capture_workspace("recovery".into()) {
-                    if let Err(e) = self
-                        .recovery
-                        .write_snapshot_if_changed(&ws)
-                    {
+                    if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
                         warn!(error = %e, "final recovery snapshot write failed");
                     }
                 }

@@ -245,16 +245,17 @@ impl WorkspacePaneNode {
     pub fn draft_byte_size(&self) -> usize {
         match self {
             Self::Pane { draft, .. } => draft.len(),
-            Self::Split { first, second, .. } => {
-                first.draft_byte_size() + second.draft_byte_size()
-            }
+            Self::Split { first, second, .. } => first.draft_byte_size() + second.draft_byte_size(),
         }
     }
 
     /// Clamp all split ratios to `[0.1, 0.9]` in place.
     fn clamp_ratios(&mut self) {
         if let Self::Split {
-            ratio, first, second, ..
+            ratio,
+            first,
+            second,
+            ..
         } = self
         {
             *ratio = ratio.clamp(0.1, 0.9);
@@ -344,9 +345,7 @@ impl WorkspaceDocument {
         for (i, tab) in self.tabs.iter().enumerate() {
             let pane_count = tab.panes.pane_count();
             if pane_count == 0 {
-                return Err(WorkspaceError::Validation(format!(
-                    "tab {i} has no panes"
-                )));
+                return Err(WorkspaceError::Validation(format!("tab {i} has no panes")));
             }
             if pane_count > MAX_WORKSPACE_PANES_PER_TAB {
                 return Err(WorkspaceError::Validation(format!(
@@ -530,7 +529,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "weft-workspace-rt-{}-{}",
             std::process::id(),
-            std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("workspace.yaml");
@@ -650,7 +652,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "weft-workspace-bak-{}-{}",
             std::process::id(),
-            std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("workspace.yaml");

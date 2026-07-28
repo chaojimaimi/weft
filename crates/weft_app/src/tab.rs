@@ -280,7 +280,6 @@ impl Tab {
         Ok(new_pane_id)
     }
 
-
     /// Cycle focus to the next pane in declaration order (wraps around).
     /// Returns the new active pane id, or `None` if the tab has no panes
     /// (should never happen for a live tab — the tab is closed when its

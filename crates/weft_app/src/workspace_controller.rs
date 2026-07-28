@@ -53,13 +53,7 @@ use crate::App;
 /// when descending into a `Split` node's second child. The closure receives
 /// the leaf pane id to split, the split direction + ratio, and the new pane's
 /// cwd; it returns the new pane's id on success or `None` on spawn failure.
-type SplitFn<'a> = &'a mut dyn FnMut(
-    &mut Tab,
-    PaneId,
-    SplitDirection,
-    f32,
-    &str,
-) -> Option<PaneId>;
+type SplitFn<'a> = &'a mut dyn FnMut(&mut Tab, PaneId, SplitDirection, f32, &str) -> Option<PaneId>;
 
 /// Per-pane payload captured from the live session tree. The workspace
 /// controller walks the `SplitTree` and produces a `PaneTree<PanePayload>`
@@ -236,10 +230,8 @@ impl App {
 
         // Step 3: restore window size.
         if let Some(window) = self.window.as_ref() {
-            let new_size = winit::dpi::LogicalSize::new(
-                doc.window.width as f64,
-                doc.window.height as f64,
-            );
+            let new_size =
+                winit::dpi::LogicalSize::new(doc.window.width as f64, doc.window.height as f64);
             let _ = window.request_inner_size(new_size);
         }
 
@@ -250,7 +242,8 @@ impl App {
         }
 
         // Step 5: set active tab.
-        self.sessions.set_active(doc.active_tab.min(self.sessions.len().saturating_sub(1)));
+        self.sessions
+            .set_active(doc.active_tab.min(self.sessions.len().saturating_sub(1)));
 
         self.reset_ime_context("workspace restored");
         self.refresh_find_for_active_tab();
@@ -273,13 +266,9 @@ impl App {
         let root_draft = root_leaf_draft(panes);
 
         // Open the tab with the root leaf's cwd.
-        let tab_idx = self.sessions.open_tab(
-            rows,
-            cols,
-            scrollback,
-            &self.proxy,
-            root_cwd.as_deref(),
-        );
+        let tab_idx =
+            self.sessions
+                .open_tab(rows, cols, scrollback, &self.proxy, root_cwd.as_deref());
 
         // Apply block_id_allocator + palette (mirrors new_tab).
         if let Some(block_id_allocator) = self
@@ -297,7 +286,11 @@ impl App {
                     .use_shared_id_allocator(block_id_allocator);
             }
         }
-        if let Some(t) = self.sessions.tab_mut(tab_idx).and_then(|tab| tab.terminal.as_mut()) {
+        if let Some(t) = self
+            .sessions
+            .tab_mut(tab_idx)
+            .and_then(|tab| tab.terminal.as_mut())
+        {
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
             }
@@ -319,19 +312,16 @@ impl App {
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
             let initial_pane_id = tab.active_pane_id();
             let proxy = self.proxy.clone();
-            let mut split_fn = |tab: &mut Tab,
-                                leaf: PaneId,
-                                dir: SplitDirection,
-                                ratio: f32,
-                                cwd: &str| {
-                let new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
-                tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
-                    .map_err(|e| {
-                        warn!(?e, "workspace restore: split failed, skipping subtree");
-                        e
-                    })
-                    .ok()
-            };
+            let mut split_fn =
+                |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, cwd: &str| {
+                    let new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
+                    tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
+                        .map_err(|e| {
+                            warn!(?e, "workspace restore: split failed, skipping subtree");
+                            e
+                        })
+                        .ok()
+                };
             build_subtree(tab, panes, initial_pane_id, &mut split_fn);
         }
 
@@ -364,7 +354,8 @@ impl App {
         let Some(doc) = self.capture_workspace(name) else {
             return Err(WorkspaceInteractionError::NothingToSave);
         };
-        doc.save(&path).map_err(WorkspaceInteractionError::Workspace)?;
+        doc.save(&path)
+            .map_err(WorkspaceInteractionError::Workspace)?;
         info!(path = %path.display(), "workspace saved");
         Ok(())
     }
@@ -378,12 +369,11 @@ impl App {
         let path = crate::macos_file_dialog::pick_workspace_open_path(mtm)?
             .ok_or(WorkspaceInteractionError::Cancelled)?;
         let doc = WorkspaceDocument::load(&path).map_err(WorkspaceInteractionError::Workspace)?;
-        self.restore_workspace(&doc).map_err(|e| {
-            WorkspaceInteractionError::Restore {
+        self.restore_workspace(&doc)
+            .map_err(|e| WorkspaceInteractionError::Restore {
                 source: e,
                 path: path.clone(),
-            }
-        })?;
+            })?;
         info!(path = %path.display(), "workspace restored");
         Ok(())
     }
@@ -437,12 +427,7 @@ fn pane_tree_to_workspace_node(tree: PaneTree<PanePayload>) -> WorkspacePaneNode
 /// given `direction`, `ratio`, and `cwd`. In production, this spawns a
 /// real PTY via `Pane::spawn` + `Tab::split_pane_with_pane`. In tests,
 /// it injects a no-PTY pane via `Pane::with_terminal_only`.
-fn build_subtree(
-    tab: &mut Tab,
-    node: &WorkspacePaneNode,
-    pane_id: PaneId,
-    mut split_fn: SplitFn,
-) {
+fn build_subtree(tab: &mut Tab, node: &WorkspacePaneNode, pane_id: PaneId, mut split_fn: SplitFn) {
     match node {
         WorkspacePaneNode::Pane { cwd: _, draft } => {
             // Base case: set the draft on this pane. The pane already
@@ -554,9 +539,7 @@ pub enum WorkspaceRestoreError {
     NoTabs,
     /// The saved profile name doesn't exist in the current config.
     /// Restore continues with the base profile.
-    ProfileNotFound {
-        profile: String,
-    },
+    ProfileNotFound { profile: String },
 }
 
 impl std::fmt::Display for WorkspaceRestoreError {
@@ -598,7 +581,11 @@ impl std::fmt::Display for WorkspaceInteractionError {
             Self::FilePanel(e) => write!(f, "workspace file panel error: {e}"),
             Self::Workspace(e) => write!(f, "workspace error: {e}"),
             Self::Restore { source, path } => {
-                write!(f, "workspace restore failed for {}: {source}", path.display())
+                write!(
+                    f,
+                    "workspace restore failed for {}: {source}",
+                    path.display()
+                )
             }
         }
     }
@@ -740,10 +727,11 @@ mod tests {
             cwd: "/tmp".into(),
             draft: "hello".into(),
         };
-        let mut split_fn = |tab: &mut Tab, _leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
-            let new_pane = Pane::with_terminal_only(1000);
-            tab.split_pane_with_pane(_leaf, dir, ratio, new_pane).ok()
-        };
+        let mut split_fn =
+            |tab: &mut Tab, _leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
+                let new_pane = Pane::with_terminal_only(1000);
+                tab.split_pane_with_pane(_leaf, dir, ratio, new_pane).ok()
+            };
         build_subtree(&mut tab, &node, pane_id, &mut split_fn);
         // Tree should still have one pane.
         assert_eq!(tab.pane_count(), 1);
@@ -766,10 +754,11 @@ mod tests {
                 draft: "build".into(),
             }),
         };
-        let mut split_fn = |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
-            let new_pane = Pane::with_terminal_only(1000);
-            tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
-        };
+        let mut split_fn =
+            |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
+                let new_pane = Pane::with_terminal_only(1000);
+                tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
+            };
         build_subtree(&mut tab, &node, pane_id, &mut split_fn);
         assert_eq!(tab.pane_count(), 2);
         // The new pane should have the draft "build".
@@ -808,10 +797,11 @@ mod tests {
                 }),
             }),
         };
-        let mut split_fn = |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
-            let new_pane = Pane::with_terminal_only(1000);
-            tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
-        };
+        let mut split_fn =
+            |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
+                let new_pane = Pane::with_terminal_only(1000);
+                tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
+            };
         build_subtree(&mut tab, &node, pane_id, &mut split_fn);
         assert_eq!(tab.pane_count(), 3);
         // Verify drafts.
@@ -821,16 +811,10 @@ mod tests {
         // build_subtree. Skip checking it here.
         // Pane 1 is B — draft "build".
         let pane_b = tab.pane(panes[1]).unwrap();
-        assert_eq!(
-            pane_b.terminal.as_ref().unwrap().editor().text(),
-            "build"
-        );
+        assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
         // Pane 2 is C — draft "test".
         let pane_c = tab.pane(panes[2]).unwrap();
-        assert_eq!(
-            pane_c.terminal.as_ref().unwrap().editor().text(),
-            "test"
-        );
+        assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
     }
 
     #[test]
@@ -863,10 +847,11 @@ mod tests {
                 draft: "test".into(),
             }),
         };
-        let mut split_fn = |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
-            let new_pane = Pane::with_terminal_only(1000);
-            tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
-        };
+        let mut split_fn =
+            |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, _cwd: &str| {
+                let new_pane = Pane::with_terminal_only(1000);
+                tab.split_pane_with_pane(leaf, dir, ratio, new_pane).ok()
+            };
         build_subtree(&mut tab, &node, pane_id, &mut split_fn);
         assert_eq!(tab.pane_count(), 3);
         // Verify drafts: B should have "build", C should have "test".
@@ -874,15 +859,9 @@ mod tests {
         assert_eq!(panes.len(), 3);
         // Pane 0 is A (root), Pane 1 is B, Pane 2 is C.
         let pane_b = tab.pane(panes[1]).unwrap();
-        assert_eq!(
-            pane_b.terminal.as_ref().unwrap().editor().text(),
-            "build"
-        );
+        assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
         let pane_c = tab.pane(panes[2]).unwrap();
-        assert_eq!(
-            pane_c.terminal.as_ref().unwrap().editor().text(),
-            "test"
-        );
+        assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
     }
 
     #[test]

@@ -168,22 +168,54 @@ pub(super) fn clipboard_paste() -> Option<String> {
     }
 }
 
+/// Error returned by [`open_url`]. Carries enough context for the caller
+/// to surface a user-visible message via the status hint mechanism.
+#[derive(Debug)]
+pub struct OpenUrlError {
+    /// The URL that failed to open.
+    pub url: String,
+    /// Human-readable reason.
+    pub reason: String,
+}
+
+impl std::fmt::Display for OpenUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Failed to open {}: {}", self.url, self.reason)
+    }
+}
+
+impl std::error::Error for OpenUrlError {}
+
 /// Open `url` using the system default handler (macOS `open`).
-/// Used by OSC 8 Cmd+Click. Best-effort: errors are logged, not surfaced.
-pub(super) fn open_url(url: &str) {
+/// Used by OSC 8 Cmd+Click. Returns `Err` on failure so the caller can
+/// surface a user-visible error via the status hint mechanism.
+pub(super) fn open_url(url: &str) -> Result<(), OpenUrlError> {
     // Sanity-check the scheme before handing it to `open` — we don't want
     // `open file:///etc/passwd` surprises or arbitrary `open <path>` shells.
     let is_safe = url.starts_with("https://") || url.starts_with("http://");
     if !is_safe {
         tracing::warn!(url, "OSC 8 Cmd+Click refused non-http(s) URL");
-        return;
+        return Err(OpenUrlError {
+            url: url.to_string(),
+            reason: "Only http(s) URLs can be opened".into(),
+        });
     }
     match std::process::Command::new("open").arg(url).status() {
         Ok(status) if !status.success() => {
             tracing::warn!(?status, url, "open exited non-zero");
+            Err(OpenUrlError {
+                url: url.to_string(),
+                reason: format!("open command exited with status {}", status),
+            })
         }
-        Err(e) => tracing::warn!(error = %e, url, "open spawn failed"),
-        _ => {}
+        Err(e) => {
+            tracing::warn!(error = %e, url, "open spawn failed");
+            Err(OpenUrlError {
+                url: url.to_string(),
+                reason: format!("Failed to spawn open: {e}"),
+            })
+        }
+        Ok(_) => Ok(()),
     }
 }
 
