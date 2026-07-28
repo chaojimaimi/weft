@@ -222,6 +222,10 @@ pub struct SettingsDrawParams<'a> {
     /// the content area is hidden (narrow sidebar-only mode) — the toolbar
     /// is zero-sized and the renderer skips it.
     pub profiles: &'a [SettingsProfileView<'a>],
+    /// v1.7.0-D: Semantic output fallback classifier toggle (Appearance tab).
+    /// When true, unstyled output gets semantic role coloring; when false,
+    /// only ANSI-styled output is colored. Defaults to true.
+    pub semantic_output_enabled: bool,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -355,7 +359,7 @@ impl OverlayWarmup for OverlayContent<'_> {
                     "Settings Appearance Terminal Input Keybindings Window Advanced".chars(),
                 );
                 missing.extend(
-                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart"
+                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off"
                         .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
@@ -482,6 +486,7 @@ pub fn build_overlay_stack<'a>(
     settings_keybinding_conflict_count: usize,
     settings_field_errors: &'a [(String, String)],
     settings_profiles: &'a [SettingsProfileView<'a>],
+    settings_semantic_output_enabled: bool,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -631,6 +636,7 @@ pub fn build_overlay_stack<'a>(
                 keybinding_conflict_count: settings_keybinding_conflict_count,
                 field_errors: settings_field_errors,
                 profiles: settings_profiles,
+                semantic_output_enabled: settings_semantic_output_enabled,
             }),
         });
     }

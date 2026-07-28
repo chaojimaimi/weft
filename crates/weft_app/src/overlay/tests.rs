@@ -219,6 +219,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         keybinding_conflict_count: 0,
         field_errors: &[],
         profiles: &[],
+        semantic_output_enabled: true,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -269,6 +270,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                     keybinding_conflict_count: 0,
                     field_errors: &[],
                     profiles: &[],
+                    semantic_output_enabled: true,
                 }),
             },
         ],

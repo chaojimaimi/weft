@@ -81,9 +81,17 @@ pub struct SyntaxConfig {
 /// v1.7.0-B: TOML-facing output semantic color overrides. All fields
 /// optional; absent fields inherit from the resolved base theme. Mirrors
 /// the fields of [`OutputSemanticColors`].
+///
+/// v1.7.0-D: `enabled` controls the semantic fallback classifier. When
+/// `false`, the classifier is skipped and unstyled output uses
+/// `output_default` only. ANSI-styled output is NEVER affected by this
+/// toggle. Defaults to `true` (enabled).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct OutputSemanticConfig {
+    /// v1.7.0-D: Master toggle for semantic fallback classification.
+    /// `false` disables the classifier; ANSI styling is always preserved.
+    pub enabled: Option<bool>,
     pub output_default: Option<String>,
     pub cwd: Option<String>,
     pub metadata: Option<String>,
@@ -110,6 +118,17 @@ impl Default for ThemeConfig {
             syntax: None,
             output: None,
         }
+    }
+}
+
+impl ThemeConfig {
+    /// v1.7.0-D: Returns whether the semantic output fallback classifier is
+    /// enabled. Defaults to `true` when the `[theme.output]` section or
+    /// `enabled` field is absent. When `false`, the classifier is skipped
+    /// and unstyled output uses `output_default` only; ANSI styling is
+    /// NEVER affected by this toggle.
+    pub fn semantic_output_enabled(&self) -> bool {
+        self.output.as_ref().and_then(|o| o.enabled).unwrap_or(true)
     }
 }
 

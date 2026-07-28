@@ -613,8 +613,9 @@ impl MetalRenderer {
         accent: [f32; 4],
         _theme_bg: [f32; 4],
     ) {
-        // Reserve 5 rows for the adjustment fields after the theme list.
-        let theme_count = s.themes.len().min(max_rows.saturating_sub(5));
+        // Reserve 6 rows for the adjustment fields after the theme list
+        // (Variant, Font, Size, Line, Opacity, Semantic toggle).
+        let theme_count = s.themes.len().min(max_rows.saturating_sub(6));
 
         // Theme list with vector-drawn circles.
         for (i, theme) in s.themes.iter().take(theme_count).enumerate() {
@@ -683,8 +684,14 @@ impl MetalRenderer {
             );
         }
 
-        // Adjustment rows: Logo Variant, Font Family, Font Size, Line Height, Opacity.
-        let adj_rows: [(String, String, &str); 5] = [
+        // Adjustment rows: Logo Variant, Font Family, Font Size, Line Height,
+        // Opacity, Semantic Colors toggle.
+        let semantic_label = if s.semantic_output_enabled {
+            "On"
+        } else {
+            "Off"
+        };
+        let adj_rows: [(String, String, &str); 6] = [
             (
                 "Variant:".to_string(),
                 s.logo_variant.label().to_string(),
@@ -705,6 +712,11 @@ impl MetalRenderer {
                 "Opacity:".to_string(),
                 format!("{:.2}", s.window_opacity),
                 "Window Opacity",
+            ),
+            (
+                "Semantic:".to_string(),
+                semantic_label.to_string(),
+                "Semantic Output",
             ),
         ];
         for (i, (label, value, err_label)) in adj_rows.iter().enumerate() {

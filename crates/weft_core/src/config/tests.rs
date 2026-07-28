@@ -851,6 +851,7 @@ fn output_semantic_override_all_fields() {
     let cfg = ThemeConfig {
         name: "weft-warm".into(),
         output: Some(OutputSemanticConfig {
+            enabled: None,
             output_default: Some("#111111".into()),
             cwd: Some("#222222".into()),
             metadata: Some("#333333".into()),
@@ -865,6 +866,125 @@ fn output_semantic_override_all_fields() {
     assert_eq!(theme.output.metadata, Color::rgb(0x33, 0x33, 0x33));
     assert_eq!(theme.output.success, Color::rgb(0x44, 0x44, 0x44));
     assert_eq!(theme.output.failure, Color::rgb(0x55, 0x55, 0x55));
+}
+
+// ── v1.7.0-D: semantic_output_enabled toggle tests ────────────────
+
+#[test]
+fn semantic_output_enabled_defaults_to_true() {
+    let cfg = ThemeConfig::default();
+    assert!(cfg.semantic_output_enabled(), "default should be true");
+}
+
+#[test]
+fn semantic_output_enabled_explicit_false() {
+    let cfg = ThemeConfig {
+        output: Some(OutputSemanticConfig {
+            enabled: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(!cfg.semantic_output_enabled());
+}
+
+#[test]
+fn semantic_output_enabled_explicit_true() {
+    let cfg = ThemeConfig {
+        output: Some(OutputSemanticConfig {
+            enabled: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert!(cfg.semantic_output_enabled());
+}
+
+#[test]
+fn semantic_output_enabled_persists_through_save_load() {
+    let dir = unique_tmp_path("semantic-toggle");
+    let path = dir.join("config.toml");
+    let cfg = Config {
+        theme: ThemeConfig {
+            name: "weft-warm".into(),
+            output: Some(OutputSemanticConfig {
+                enabled: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        text.contains("enabled = false"),
+        "expected 'enabled = false' in saved config:\n{}",
+        text
+    );
+    // Reload and verify.
+    let loaded: Config = toml::from_str(&text).expect("parse");
+    assert!(
+        !loaded.theme.semantic_output_enabled(),
+        "reload should preserve enabled = false"
+    );
+}
+
+#[test]
+fn semantic_output_enabled_true_not_written_to_disk() {
+    // v1.7.0-D review fix: `enabled = true` is the default, so it should NOT
+    // be written to disk (minimal-write contract, matching `follow_system`).
+    let dir = unique_tmp_path("semantic-toggle-true");
+    let path = dir.join("config.toml");
+    let cfg = Config {
+        theme: ThemeConfig {
+            name: "weft-warm".into(),
+            output: Some(OutputSemanticConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save");
+    let text = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !text.contains("enabled"),
+        "expected 'enabled' to be absent from saved config (default true is implicit):\n{}",
+        text
+    );
+    // Reload still reports true (default).
+    let loaded: Config = toml::from_str(&text).expect("parse");
+    assert!(loaded.theme.semantic_output_enabled());
+}
+
+#[test]
+fn semantic_output_toggle_preserves_color_overrides() {
+    // v1.7.0-D review fix regression: toggling `enabled` must NOT wipe
+    // sibling color-override fields (output_default/cwd/metadata/success/
+    // failure). Simulates the settings_controller case-5 toggle path.
+    let mut output = OutputSemanticConfig {
+        enabled: Some(true),
+        output_default: Some("#aaaaaa".into()),
+        cwd: Some("#bbbbbb".into()),
+        metadata: Some("#cccccc".into()),
+        success: Some("#00ff00".into()),
+        failure: Some("#ff0000".into()),
+    };
+    // Toggle: flip enabled, preserve all other fields via struct-update.
+    let prev = std::mem::take(&mut output);
+    output = OutputSemanticConfig {
+        enabled: Some(!prev.enabled.unwrap_or(true)),
+        ..prev
+    };
+    // Assert siblings survived.
+    assert_eq!(output.enabled, Some(false));
+    assert_eq!(output.output_default.as_deref(), Some("#aaaaaa"));
+    assert_eq!(output.cwd.as_deref(), Some("#bbbbbb"));
+    assert_eq!(output.metadata.as_deref(), Some("#cccccc"));
+    assert_eq!(output.success.as_deref(), Some("#00ff00"));
+    assert_eq!(output.failure.as_deref(), Some("#ff0000"));
 }
 
 // ── v1.0 S2: Config::save() tests ──────────────────────────────────

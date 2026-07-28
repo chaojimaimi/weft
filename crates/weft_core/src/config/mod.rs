@@ -249,6 +249,26 @@ impl Config {
                 theme["syntax"] = syntax_table;
             }
         }
+        // v1.7.0-D: [theme.output] subsection — semantic output colors + toggle.
+        if let Some(out) = &self.theme.output {
+            let mut output_table = toml_edit::table();
+            let ot = output_table.as_table_mut().unwrap();
+            // enabled: only write when explicitly set to false (default is
+            // true). Writing `enabled = true` would be redundant and clutter
+            // the user's config file, so we omit it.
+            if out.enabled == Some(false) {
+                ot["enabled"] = toml_edit::value(false);
+            }
+            set_opt_string(ot, "output_default", &out.output_default);
+            set_opt_string(ot, "cwd", &out.cwd);
+            set_opt_string(ot, "metadata", &out.metadata);
+            set_opt_string(ot, "success", &out.success);
+            set_opt_string(ot, "failure", &out.failure);
+            // Only write the [theme.output] table if at least one field is set.
+            if ot.iter().count() > 0 {
+                theme["output"] = output_table;
+            }
+        }
 
         // [window] section.
         let default_window = WindowConfig::default();

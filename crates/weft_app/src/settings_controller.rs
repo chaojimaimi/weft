@@ -415,6 +415,23 @@ impl App {
                         self.settings
                             .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                     }
+                    5 => {
+                        // v1.7.0-D: Semantic output toggle. ←/→ flips
+                        // enabled true/false. Any delta (left or right)
+                        // toggles; default is enabled (true). Preserves
+                        // existing color overrides (output_default/cwd/
+                        // metadata/success/failure) via struct-update on the
+                        // prior value — only `enabled` is mutated.
+                        let current = self.settings.draft.theme.semantic_output_enabled();
+                        let prev = self.settings.draft.theme.output.take().unwrap_or_default();
+                        self.settings.draft.theme.output =
+                            Some(weft_core::config::OutputSemanticConfig {
+                                enabled: Some(!current),
+                                ..prev
+                            });
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
+                    }
                     _ => {}
                 }
             }
@@ -613,8 +630,8 @@ impl App {
         use crate::overlay::SettingsTab;
         match self.settings.tab {
             SettingsTab::Appearance => {
-                // Theme list + Logo Variant + Font Family + Font Size + Line Height + Opacity.
-                self.settings_theme_views().len() + 5
+                // Theme list + Variant + Font + Size + Line + Opacity + Semantic toggle.
+                self.settings_theme_views().len() + 6
             }
             SettingsTab::Terminal => 3, // Scrollback + Padding X + Padding Y.
             SettingsTab::Input => 1,    // Submit on Ctrl+Enter.

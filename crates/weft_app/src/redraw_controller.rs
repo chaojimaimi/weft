@@ -433,6 +433,7 @@ impl App {
                 settings_keybinding_conflict_count,
                 settings_field_errors,
                 &settings_profiles,
+                self.settings.draft.theme.semantic_output_enabled(),
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid
