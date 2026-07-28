@@ -329,7 +329,13 @@ impl App {
             _ => {}
         }
         // v1.0 H4: check should_exit flag (set by close_tab on last tab).
+        // v1.6.3 review M8: mark clean shutdown here too — the should_exit
+        // path fires when the last tab is closed or the shell exits. Without
+        // this, the next launch shows a false recovery prompt. (The same flag
+        // is also checked in dispatch_app_event, but a WindowEvent may arrive
+        // first; calling mark_clean_shutdown twice is harmless.)
         if self.should_exit {
+            self.recovery.mark_clean_shutdown();
             event_loop.exit();
         }
     }

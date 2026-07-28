@@ -460,8 +460,11 @@ impl Terminal {
                     // Hyperlinks are rare (OSC 8 active), so per-cell BTreeMap
                     // insert is acceptable here — the hot ASCII fast path below
                     // never touches extras.
+                    // v1.6.0 review C1: also clear orphaned grapheme extras for
+                    // the overwritten range (ASCII overwrites don't extend clusters).
                     {
                         let extras = &mut self.grid.viewport[row].extras;
+                        extras.clear_grapheme_range(col, col + count);
                         for i in 0..count {
                             extras.set_hyperlink(col + i, Some(id));
                         }
@@ -487,11 +490,14 @@ impl Terminal {
                         self.hyperlinks.unlink_cell(row, c);
                     }
                     // v1.6.1: clear extras for unlinked cells too.
+                    // v1.6.0 review C1: also clear orphaned grapheme extras
+                    // for the full overwritten range (not just unlinked cells).
                     {
                         let extras = &mut self.grid.viewport[row].extras;
                         for &c in to_unlink.iter().take(unlink_n) {
                             extras.set_hyperlink(c, None);
                         }
+                        extras.clear_grapheme_range(col, col + count);
                     }
                 } else {
                     // Fast path: no hyperlink logic at all.
@@ -502,6 +508,14 @@ impl Terminal {
                         cells[c].bg = bg;
                         cells[c].flags = base_flags;
                         cells[c].width = CellWidth::Half;
+                    }
+                    // v1.6.0 review C1: clear orphaned grapheme extras for the
+                    // overwritten range. Common case: extras is empty (no
+                    // multi-scalar clusters on this row) → single is_empty()
+                    // check, zero per-cell cost.
+                    let extras = &mut self.grid.viewport[row].extras;
+                    if !extras.is_empty() {
+                        extras.clear_grapheme_range(col, col + count);
                     }
                 }
             }

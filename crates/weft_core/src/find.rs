@@ -257,28 +257,37 @@ pub fn find_in_grid(
         }
 
         if let Some(re) = &re {
-            // Regex path: build the line string by concatenating tokens.
-            let line_str: String = tokens.iter().map(|(s, _, _)| s.as_str()).collect();
+            // Regex path (v1.6.0 review C2 fix): expand tokens into a per-char
+            // stream with back-pointers to (col, width), so byte offsets that
+            // fall inside a multi-scalar cluster token can be correctly mapped.
+            // Previously byte_pos jumped by token length and could skip past
+            // start_byte, producing col=0/len=0 bogus matches.
+            let mut line_chars: Vec<char> = Vec::with_capacity(tokens.len());
+            let mut char_to_cell: Vec<(usize, usize)> = Vec::with_capacity(tokens.len());
+            for (s, col, w) in &tokens {
+                for ch in s.chars() {
+                    line_chars.push(ch);
+                    char_to_cell.push((*col, *w));
+                }
+            }
+            let line_str: String = line_chars.iter().collect();
             for m in re.find_iter(&line_str) {
                 let start_byte = m.start();
                 let end_byte = m.end();
-                // Map byte offsets back to token indices, then to (col, width).
-                let mut byte_pos = 0;
-                let mut start_col = 0;
+                // Map byte offsets back to char indices, then to (col, width).
+                let start_char = line_str[..start_byte].chars().count();
+                let end_char = line_str[..end_byte].chars().count();
                 let mut len = 0;
-                let mut in_match = false;
-                for (s, col, w) in &tokens {
-                    if byte_pos == start_byte {
-                        start_col = *col;
-                        in_match = true;
+                let mut prev_col: Option<usize> = None;
+                let mut start_col = 0;
+                for (i, &(cell_col, cell_w)) in char_to_cell.iter().enumerate() {
+                    if i == start_char {
+                        start_col = cell_col;
                     }
-                    if in_match && byte_pos < end_byte {
-                        len += *w;
+                    if i >= start_char && i < end_char && prev_col != Some(cell_col) {
+                        len += cell_w;
+                        prev_col = Some(cell_col);
                     }
-                    if byte_pos + s.len() >= end_byte && in_match {
-                        in_match = false;
-                    }
-                    byte_pos += s.len();
                 }
                 matches.push(FindMatch {
                     row: unified_row,

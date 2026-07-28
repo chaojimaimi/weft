@@ -269,7 +269,17 @@ impl App {
             StartupRecovery::UncleanShutdown { snapshot } => {
                 // Unclean shutdown with a valid snapshot — show the
                 // recovery prompt.
-                let age_secs = snapshot.created_at;
+                //
+                // v1.6.3 review M7: compute the snapshot AGE (now -
+                // created_at), not the raw timestamp. `created_at` is a
+                // Unix epoch seconds value; passing it directly as
+                // `age_secs` would display "from 1753612345 seconds ago"
+                // instead of "from 5 minutes ago".
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let age_secs = now_secs.saturating_sub(snapshot.created_at);
                 let tab_count = snapshot.workspace.tabs.len();
                 if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
                     match crate::macos_alert::show_recovery_prompt(mtm, age_secs, tab_count) {

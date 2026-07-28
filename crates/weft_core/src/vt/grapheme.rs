@@ -90,6 +90,11 @@ impl Terminal {
             // Clear whatever was at col+1 first (could be a written char or
             // the cursor's current position).
             self.grid.viewport[row].clear_wide_pair_at(col + 1);
+            // v1.6.0 review M3: clear orphaned grapheme extras at col+1
+            // before overwriting with WIDE_SPACER. Without this, a previous
+            // multi-scalar cluster at col+1 leaves a stale entry that causes
+            // incorrect cluster strings when future combining marks arrive.
+            self.grid.viewport[row].extras.clear_grapheme(col + 1);
             {
                 let cell = &mut self.grid.viewport[row].cells[col];
                 cell.width = CellWidth::Full;

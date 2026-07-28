@@ -119,8 +119,13 @@ impl Scrollback {
     /// Keep historical rows compatible with dimension-only viewport rendering.
     pub(super) fn resize_cols(&mut self, new_cols: usize) {
         for row in &mut self.buffer {
+            let old_cols = row.cells.len();
             resize_row_cells(&mut row.cells, new_cols);
             row.repair_wide_pairs();
+            // v1.6.0 review M2: drop extras entries beyond the new width.
+            if new_cols < old_cols {
+                row.extras.truncate_cols(new_cols);
+            }
         }
     }
 

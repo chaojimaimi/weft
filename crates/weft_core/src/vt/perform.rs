@@ -132,6 +132,13 @@ impl vte::Perform for Terminal {
             self.include_primary_screen_viewport_row(new_row);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
+            // v1.6.0 review C1: clear orphaned grapheme extras for wide-char overwrite.
+            self.grid.viewport[new_row].extras.clear_grapheme(new_col);
+            if new_col + 1 < num_cols {
+                self.grid.viewport[new_row]
+                    .extras
+                    .clear_grapheme(new_col + 1);
+            }
             {
                 let cells = &mut self.grid.viewport[new_row].cells;
                 let cell = &mut cells[new_col];
@@ -209,6 +216,14 @@ impl vte::Perform for Terminal {
             self.grid.viewport[row].clear_wide_pair_at(col);
             if width == CellWidth::Full {
                 self.grid.viewport[row].clear_wide_pair_at(col + 1);
+            }
+            // v1.6.0 review C1: clear orphaned grapheme extras before overwriting.
+            // A non-combining scalar replaces the cell's content; any multi-scalar
+            // grapheme cluster stored in extras becomes stale and must be removed
+            // (preserving hyperlink_id, which is handled below).
+            self.grid.viewport[row].extras.clear_grapheme(col);
+            if width == CellWidth::Full {
+                self.grid.viewport[row].extras.clear_grapheme(col + 1);
             }
             // v1.0 fix (CJK splat): before writing a new char, clear any
             // existing wide-char pair that this write would bisect. Without

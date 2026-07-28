@@ -44,6 +44,14 @@ pub const MAX_WORKSPACE_PANES_PER_TAB: usize = 16;
 /// pathological files from loading megabytes of draft text into memory.
 pub const MAX_WORKSPACE_DRAFT_BYTES: usize = 1024 * 1024;
 
+/// Minimum window dimensions in logical pixels. Prevents degenerate
+/// workspace files from shrinking the window to near-zero.
+pub const MIN_WORKSPACE_WINDOW_DIM: u32 = 100;
+
+/// Maximum window dimensions in logical pixels. Prevents pathological
+/// workspace files from requesting a window larger than the display.
+pub const MAX_WORKSPACE_WINDOW_DIM: u32 = 16384;
+
 // ── DTO types ───────────────────────────────────────────────────────────
 
 /// Root workspace document. Serialized as YAML.
@@ -310,6 +318,8 @@ impl WorkspaceDocument {
     /// - `active_pane_index` must be in bounds for each tab.
     /// - Split ratios are clamped to `[0.1, 0.9]`.
     /// - Total draft text must be `<= MAX_WORKSPACE_DRAFT_BYTES`.
+    /// - Window dimensions must be within `[MIN_WORKSPACE_WINDOW_DIM,
+    ///   MAX_WORKSPACE_WINDOW_DIM]` (v1.6.2 review M6).
     pub fn validate(&self) -> Result<(), WorkspaceError> {
         if self.version > WORKSPACE_VERSION {
             return Err(WorkspaceError::UnsupportedVersion {
@@ -339,6 +349,31 @@ impl WorkspaceDocument {
                 "active_tab {} out of bounds (have {} tabs)",
                 self.active_tab,
                 self.tabs.len()
+            )));
+        }
+        // v1.6.2 review M6: validate window dimensions to prevent
+        // degenerate workspace files from shrinking or exploding the
+        // window on restore.
+        if self.window.width < MIN_WORKSPACE_WINDOW_DIM
+            || self.window.height < MIN_WORKSPACE_WINDOW_DIM
+        {
+            return Err(WorkspaceError::Validation(format!(
+                "window dimensions {}x{} below minimum {}x{}",
+                self.window.width,
+                self.window.height,
+                MIN_WORKSPACE_WINDOW_DIM,
+                MIN_WORKSPACE_WINDOW_DIM
+            )));
+        }
+        if self.window.width > MAX_WORKSPACE_WINDOW_DIM
+            || self.window.height > MAX_WORKSPACE_WINDOW_DIM
+        {
+            return Err(WorkspaceError::Validation(format!(
+                "window dimensions {}x{} exceed maximum {}x{}",
+                self.window.width,
+                self.window.height,
+                MAX_WORKSPACE_WINDOW_DIM,
+                MAX_WORKSPACE_WINDOW_DIM
             )));
         }
         let mut total_draft = 0usize;
@@ -547,7 +582,7 @@ mod tests {
 
     #[test]
     fn unknown_version_rejected() {
-        let yaml = "version: 999\nname: bad\nwindow:\n  width: 1\n  height: 1\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
+        let yaml = "version: 999\nname: bad\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
         let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
         assert!(matches!(
             err,
@@ -558,7 +593,7 @@ mod tests {
     #[test]
     fn missing_optional_fields_use_defaults() {
         // No `profile`, no `active_tab` — should default to None / 0.
-        let yaml = "version: 1\nname: minimal\nwindow:\n  width: 1\n  height: 1\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
+        let yaml = "version: 1\nname: minimal\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
         let doc = WorkspaceDocument::from_yaml(yaml).unwrap();
         assert_eq!(doc.profile, None);
         assert_eq!(doc.active_tab, 0);
@@ -566,21 +601,21 @@ mod tests {
 
     #[test]
     fn empty_tabs_rejected() {
-        let yaml = "version: 1\nname: empty\nwindow:\n  width: 1\n  height: 1\ntabs: []\n";
+        let yaml = "version: 1\nname: empty\nwindow:\n  width: 200\n  height: 200\ntabs: []\n";
         let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, WorkspaceError::Validation(_)));
     }
 
     #[test]
     fn active_tab_out_of_bounds_rejected() {
-        let yaml = "version: 1\nname: bad\nwindow:\n  width: 1\n  height: 1\nactive_tab: 5\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
+        let yaml = "version: 1\nname: bad\nwindow:\n  width: 200\n  height: 200\nactive_tab: 5\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
         let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, WorkspaceError::Validation(_)));
     }
 
     #[test]
     fn active_pane_index_out_of_bounds_rejected() {
-        let yaml = "version: 1\nname: bad\nwindow:\n  width: 1\n  height: 1\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 5\n";
+        let yaml = "version: 1\nname: bad\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 5\n";
         let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
         assert!(matches!(err, WorkspaceError::Validation(_)));
     }
@@ -628,7 +663,7 @@ mod tests {
 
     #[test]
     fn out_of_range_ratio_clamped_on_load() {
-        let yaml = "version: 1\nname: clamp\nwindow:\n  width: 1\n  height: 1\ntabs:\n  - panes:\n      kind: Split\n      direction: Vertical\n      ratio: 5.0\n      first:\n        kind: Pane\n        cwd: /a\n        draft: \"\"\n      second:\n        kind: Pane\n        cwd: /b\n        draft: \"\"\n    active_pane_index: 0\n";
+        let yaml = "version: 1\nname: clamp\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Split\n      direction: Vertical\n      ratio: 5.0\n      first:\n        kind: Pane\n        cwd: /a\n        draft: \"\"\n      second:\n        kind: Pane\n        cwd: /b\n        draft: \"\"\n    active_pane_index: 0\n";
         let doc = WorkspaceDocument::load_from_str(yaml).unwrap();
         // The ratio should be clamped to 0.9.
         match &doc.tabs[0].panes {
@@ -641,7 +676,7 @@ mod tests {
     fn draft_too_large_rejected() {
         let big = "x".repeat(MAX_WORKSPACE_DRAFT_BYTES + 1);
         let yaml = format!(
-            "version: 1\nname: big\nwindow:\n  width: 1\n  height: 1\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"{big}\"\n    active_pane_index: 0\n"
+            "version: 1\nname: big\nwindow:\n  width: 200\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"{big}\"\n    active_pane_index: 0\n"
         );
         let err = WorkspaceDocument::from_yaml(&yaml).unwrap_err();
         assert!(matches!(err, WorkspaceError::DraftTooLarge { .. }));
@@ -710,5 +745,19 @@ mod tests {
         let doc = sample_doc();
         let migrated = WorkspaceDocument::migrate(doc.clone()).unwrap();
         assert_eq!(doc, migrated);
+    }
+
+    #[test]
+    fn window_too_small_rejected() {
+        let yaml = "version: 1\nname: small\nwindow:\n  width: 50\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
+        let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Validation(_)));
+    }
+
+    #[test]
+    fn window_too_large_rejected() {
+        let yaml = "version: 1\nname: huge\nwindow:\n  width: 99999\n  height: 200\ntabs:\n  - panes:\n      kind: Pane\n      cwd: /tmp\n      draft: \"\"\n    active_pane_index: 0\n";
+        let err = WorkspaceDocument::from_yaml(yaml).unwrap_err();
+        assert!(matches!(err, WorkspaceError::Validation(_)));
     }
 }

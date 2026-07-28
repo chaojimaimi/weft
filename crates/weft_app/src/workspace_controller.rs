@@ -202,6 +202,13 @@ impl App {
 
         // Step 1: switch profile if specified. A missing profile falls
         // back to base with a diagnostic — the restore continues.
+        //
+        // v1.6.2 review C3: previously this returned early, aborting the
+        // entire restore (tabs not closed, window not resized, etc.)
+        // despite the doc comment saying "restore continues". Now we
+        // track the non-fatal error and return it at the end, after the
+        // full restore has completed.
+        let mut profile_warning: Option<WorkspaceRestoreError> = None;
         if let Some(profile) = &doc.profile {
             if !profile.is_empty() && self.active_profile_name() != Some(profile.as_str()) {
                 if self.profile_names_sorted().iter().any(|p| p == profile) {
@@ -213,8 +220,7 @@ impl App {
                         profile = %profile,
                         "workspace profile not found, falling back to base"
                     );
-                    // Surface as a non-fatal error — restore continues.
-                    return Err(WorkspaceRestoreError::ProfileNotFound {
+                    profile_warning = Some(WorkspaceRestoreError::ProfileNotFound {
                         profile: profile.clone(),
                     });
                 }
@@ -238,7 +244,11 @@ impl App {
         // Step 4: rebuild tabs. Each tab's split tree is rebuilt
         // recursively by splitting the initial pane.
         for (tab_idx, tab_doc) in doc.tabs.iter().enumerate() {
-            self.restore_tab(&tab_doc.panes, tab_idx == doc.active_tab);
+            self.restore_tab(
+                &tab_doc.panes,
+                tab_doc.active_pane_index,
+                tab_idx == doc.active_tab,
+            );
         }
 
         // Step 5: set active tab.
@@ -248,7 +258,13 @@ impl App {
         self.reset_ime_context("workspace restored");
         self.refresh_find_for_active_tab();
         self.request_redraw();
-        Ok(())
+
+        // Return the non-fatal profile warning (if any) after a successful
+        // restore. Ok(()) when the profile was found or unset.
+        match profile_warning {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Restore a single tab from a [`WorkspacePaneNode`] tree.
@@ -257,7 +273,16 @@ impl App {
     /// leaves are created by splitting panes in the saved directions and
     /// ratios. Editor drafts are inserted via `EditorBuffer::set_text`
     /// (NEVER auto-executed).
-    fn restore_tab(&mut self, panes: &WorkspacePaneNode, is_active: bool) {
+    ///
+    /// `active_pane_index` is the DFS index of the pane that should be
+    /// focused after restore (v1.6.2 review C4: previously captured but
+    /// never applied — the tab always ended with pane 0 active).
+    fn restore_tab(
+        &mut self,
+        panes: &WorkspacePaneNode,
+        active_pane_index: usize,
+        is_active: bool,
+    ) {
         let (rows, cols) = self.current_size();
         let scrollback = self.config_state.config.scrollback.lines;
 
@@ -307,6 +332,26 @@ impl App {
             }
         }
 
+        // v1.6.2 review M5: set the root pane's restored_snapshot so
+        // `terminal.cwd()` falls back to the saved cwd before OSC 7 is
+        // reported by the freshly-spawned shell. Non-root panes get their
+        // restored_snapshot set in `build_subtree` via `set_pane_cwd`.
+        if let Some(tab) = self.sessions.tab_mut(tab_idx) {
+            let root_pane_id = tab.active_pane_id();
+            if let Some(pane) = tab.pane_mut(root_pane_id) {
+                if pane.restored_snapshot.is_none() {
+                    pane.restored_snapshot = Some(weft_core::persistence::TabSnapshot {
+                        position: 0,
+                        active: false,
+                        cwd: root_cwd.clone(),
+                        block_scroll_offset: 0,
+                        editor_buffer: String::new(),
+                        shell_phase: "AtPrompt".to_string(),
+                    });
+                }
+            }
+        }
+
         // Recursively rebuild the split tree. The initial pane's id is
         // the tab's active pane id (just created).
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
@@ -325,12 +370,29 @@ impl App {
             build_subtree(tab, panes, initial_pane_id, &mut split_fn);
         }
 
+        // v1.6.2 review C4: restore the saved active pane. The DFS order
+        // of `split_tree().panes()` matches the order leaves were created
+        // by `build_subtree`, which matches the saved document's DFS order.
+        if active_pane_index > 0 {
+            if let Some(tab) = self.sessions.tab_mut(tab_idx) {
+                let panes_list = tab.split_tree().panes();
+                if active_pane_index < panes_list.len() {
+                    let target_id = panes_list[active_pane_index];
+                    if let Err(e) = tab.set_active_pane(target_id) {
+                        warn!(
+                            ?e,
+                            index = active_pane_index,
+                            "workspace restore: failed to set active pane"
+                        );
+                    }
+                }
+            }
+        }
+
         // Set active tab if this is the active one in the document.
         if is_active {
             self.sessions.set_active(tab_idx);
         }
-
-        let _ = is_active; // already handled above
     }
 
     // ── Interactive save / open ───────────────────────────────────────

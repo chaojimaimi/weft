@@ -342,8 +342,11 @@ pub(crate) fn build_row_instances(
             // multi-scalar grapheme cluster from RowExtras so the renderer
             // can rasterize it via the cluster atlas path. Falls back to
             // None for single-scalar cells (the common case — no alloc).
+            // v1.6.0 review M1: use grapheme_arc_at to clone the existing
+            // Arc<str> (refcount bump) instead of Arc::from(&str) (alloc +
+            // copy) on every frame for every EXTRA cell.
             let cluster: Option<std::sync::Arc<str>> = if cell.flags.contains(CellFlags::EXTRA) {
-                grid.grapheme_at(row, col).map(std::sync::Arc::<str>::from)
+                grid.grapheme_arc_at(row, col)
             } else {
                 None
             };

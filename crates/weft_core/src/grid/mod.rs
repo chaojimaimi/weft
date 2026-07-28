@@ -16,6 +16,8 @@ pub use row::Row;
 pub use row_extras::{CellExtra, RowExtras};
 pub use scrollback::Scrollback;
 
+use std::sync::Arc;
+
 #[cfg(test)]
 mod tests;
 
@@ -133,10 +135,33 @@ impl Grid {
         self.viewport.get(row)?.extras.grapheme_at(col)
     }
 
+    /// v1.6.0 review M1: Like [`grapheme_at`](Self::grapheme_at) but returns
+    /// a cloned `Arc<str>` instead of a borrowed `&str`. Use this on hot paths
+    /// that need to own the cluster string (e.g. `GlyphInstance::Text` in the
+    /// render path) to avoid re-allocating the Arc from a `&str` every frame.
+    pub fn grapheme_arc_at(&self, row: usize, col: usize) -> Option<Arc<str>> {
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        let extras = if offset > 0 {
+            let global = sb_len - offset + row;
+            if global < sb_len {
+                &self.scrollback.get(global)?.extras
+            } else {
+                &self.viewport.get(global - sb_len)?.extras
+            }
+        } else {
+            &self.viewport.get(row)?.extras
+        };
+        extras.grapheme_arc_at(col)
+    }
+
     /// v1.6.1: Look up the hyperlink id for `(row, col)` from `RowExtras`.
     ///
-    /// Returns `Some(id)` when the cell has a hyperlink tag in its extras,
-    /// `None` otherwise. The caller resolves `id` to a URL via
+    /// Returns `Some(id)` when the cell has a hyperlink tag in its extras
+    /// **and** the cell's `CellFlags::HYPERLINK` bit is set (v1.6.1 review M4:
+    /// the flag check prevents stale extras entries from resolving after the
+    /// ASCII fast path overwrites the cell and clears the flag). The caller
+    /// resolves `id` to a URL via
     /// [`HyperlinkRegistry::url`](crate::hyperlink::HyperlinkRegistry::url)
     /// (live viewport) or a Block's link span table (captured output).
     ///
@@ -147,21 +172,24 @@ impl Grid {
     pub fn hyperlink_id_at(&self, row: usize, col: usize) -> Option<u32> {
         let sb_len = self.scrollback.len();
         let offset = self.scroll_offset.min(sb_len);
-        if offset > 0 {
+        let (cells, extras) = if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
-                return self
-                    .scrollback
-                    .get(global)
-                    .and_then(|r| r.extras.hyperlink_id_at(col));
+                let r = self.scrollback.get(global)?;
+                (&r.cells, &r.extras)
+            } else {
+                let r = self.viewport.get(global - sb_len)?;
+                (&r.cells, &r.extras)
             }
-            return self
-                .viewport
-                .get(global - sb_len)?
-                .extras
-                .hyperlink_id_at(col);
+        } else {
+            let r = self.viewport.get(row)?;
+            (&r.cells, &r.extras)
+        };
+        let cell = cells.get(col)?;
+        if !cell.flags.contains(CellFlags::HYPERLINK) {
+            return None;
         }
-        self.viewport.get(row)?.extras.hyperlink_id_at(col)
+        extras.hyperlink_id_at(col)
     }
 
     /// Extract a single **live viewport** row's text — skipping wide-char
@@ -1024,6 +1052,12 @@ impl Grid {
             for row in &mut self.viewport {
                 resize_row_cells(&mut row.cells, new_cols);
                 row.repair_wide_pairs();
+                // v1.6.0 review M2: when narrowing, drop extras entries at
+                // columns that no longer exist so orphaned grapheme/hyperlink
+                // data doesn't accumulate across resize cycles.
+                if new_cols < old_cols {
+                    row.extras.truncate_cols(new_cols);
+                }
                 // Repaint the whole row after truncation or padding.
                 row.mark_dirty(new_cols.saturating_sub(1));
             }

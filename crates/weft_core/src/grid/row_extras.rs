@@ -117,6 +117,13 @@ impl RowExtras {
         self.cells.get(&col).and_then(|e| e.grapheme.as_deref())
     }
 
+    /// v1.6.0 review M1: Clone the `Arc<str>` for column `col` instead of
+    /// borrowing. Cheaper than `Arc::from(&str)` (refcount bump vs alloc +
+    /// copy). Use on hot paths that need ownership (render instances).
+    pub fn grapheme_arc_at(&self, col: usize) -> Option<Arc<str>> {
+        self.cells.get(&col).and_then(|e| e.grapheme.clone())
+    }
+
     /// v1.6.1: The hyperlink id for column `col`, if any. Resolved to a URL
     /// via [`HyperlinkRegistry`](crate::hyperlink::HyperlinkRegistry) (live
     /// viewport) or a Block's link span table (captured output).
@@ -184,6 +191,37 @@ impl RowExtras {
         self.cells.remove(&col);
     }
 
+    /// Clear only the grapheme field for column `col`, preserving any
+    /// hyperlink id. Removes the entry entirely if it becomes empty.
+    /// Called when a non-combining scalar overwrites a cell that previously
+    /// held a multi-scalar grapheme cluster (v1.6.0 review C1 fix).
+    pub fn clear_grapheme(&mut self, col: usize) {
+        if let Some(entry) = self.cells.get_mut(&col) {
+            entry.grapheme = None;
+            if entry.is_empty() {
+                self.cells.remove(&col);
+            }
+        }
+    }
+
+    /// Clear grapheme fields for all columns in `[start, end)`. Preserves
+    /// hyperlink ids. Used by the ASCII fast path to bulk-clean orphaned
+    /// grapheme entries when overwriting a run of cells (v1.6.0 review C1).
+    pub fn clear_grapheme_range(&mut self, start: usize, end: usize) {
+        if self.cells.is_empty() || start >= end {
+            return;
+        }
+        let keys: Vec<usize> = self.cells.range(start..end).map(|(k, _)| *k).collect();
+        for k in keys {
+            if let Some(entry) = self.cells.get_mut(&k) {
+                entry.grapheme = None;
+                if entry.is_empty() {
+                    self.cells.remove(&k);
+                }
+            }
+        }
+    }
+
     /// v1.6.1: Clear only the hyperlink on column `col`, preserving the
     /// grapheme if present. Called when OSC 8 close is followed by more
     /// print at the same cell (rare — usually OSC 8 close moves the cursor).
@@ -194,6 +232,18 @@ impl RowExtras {
     /// Drop every entry — called when the whole row is cleared.
     pub fn clear(&mut self) {
         self.cells.clear();
+    }
+
+    /// v1.6.0 review M2: Remove all entries at columns `>= cols`. Used when
+    /// the grid narrows so orphaned grapheme/hyperlink data doesn't accumulate.
+    pub fn truncate_cols(&mut self, cols: usize) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let keys: Vec<usize> = self.cells.range(cols..).map(|(k, _)| *k).collect();
+        for k in keys {
+            self.cells.remove(&k);
+        }
     }
 
     /// Shift entries right by `n` starting at `col`, dropping entries that
