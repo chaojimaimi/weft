@@ -205,3 +205,79 @@ pub fn pick_workspace_open_path(mtm: MainThreadMarker) -> FilePanelResult {
     }
     run_modal_open_panel(&panel)
 }
+
+/// v1.7.3-C: Show an NSSavePanel for exporting a block as Markdown.
+///
+/// Default file name is `weft-block.md`. The caller passes the block command
+/// so the default name can be derived from it (sanitized, truncated).
+/// Returns the same variants as [`pick_config_export_path`].
+pub fn pick_block_export_path(mtm: MainThreadMarker, command: &str) -> FilePanelResult {
+    let panel = unsafe { NSSavePanel::savePanel(mtm) };
+    unsafe {
+        let title = NSString::from_str("Export Block");
+        panel.setTitle(Some(&title));
+        let prompt = NSString::from_str("Export");
+        panel.setPrompt(Some(&prompt));
+        // Derive a safe default file name from the command (first token,
+        // alphanumeric + dash only, truncated to 40 chars).
+        let default_name = sanitize_export_filename(command);
+        panel.setNameFieldStringValue(&NSString::from_str(&default_name));
+        let md_type = NSString::from_str("md");
+        let types = NSArray::from_vec(vec![md_type]);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&types));
+    }
+    run_modal_save_panel(&panel)
+}
+
+/// v1.7.3-C: Build a safe filename from a command string. Takes the first
+/// whitespace-delimited token, keeps `[a-zA-Z0-9-]` only, lowercases, and
+/// truncates to 40 chars. Falls back to `weft-block` when empty.
+fn sanitize_export_filename(command: &str) -> String {
+    let first_token = command.split_whitespace().next().unwrap_or("weft-block");
+    let sanitized: String = first_token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .flat_map(|c| c.to_lowercase())
+        .take(40)
+        .collect();
+    if sanitized.is_empty() {
+        "weft-block".to_string()
+    } else {
+        sanitized
+    }
+}
+
+#[cfg(test)]
+mod export_filename_tests {
+    use super::sanitize_export_filename;
+
+    #[test]
+    fn sanitizes_command_to_filename() {
+        assert_eq!(sanitize_export_filename("git status"), "git");
+        assert_eq!(sanitize_export_filename("cargo build --release"), "cargo");
+        assert_eq!(sanitize_export_filename("docker compose up -d"), "docker");
+    }
+
+    #[test]
+    fn handles_special_chars() {
+        assert_eq!(sanitize_export_filename("echo 'hello'"), "echo");
+        assert_eq!(sanitize_export_filename("rm -rf /"), "rm");
+        assert_eq!(sanitize_export_filename("apt-get update"), "apt-get");
+    }
+
+    #[test]
+    fn falls_back_for_empty() {
+        assert_eq!(sanitize_export_filename(""), "weft-block");
+        assert_eq!(sanitize_export_filename("   "), "weft-block");
+        assert_eq!(sanitize_export_filename("!!!"), "weft-block");
+    }
+
+    #[test]
+    fn truncates_long_commands() {
+        let long = "abcdefghijklmnopqrstuvwxyz0123456789-very-long-command";
+        let result = sanitize_export_filename(long);
+        assert_eq!(result.len(), 40);
+        assert!(result.starts_with("abcdefghijklmnopqrstuvwxyz0123"));
+    }
+}

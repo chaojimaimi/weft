@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
+use weft_core::blocks::annotations::AnnotationStore;
 use weft_core::blocks::BlockId;
 use weft_core::config::{Config, ConfigSectionMask};
 use weft_core::find::{BlockMatch, FindMatch};
@@ -26,6 +27,10 @@ pub struct SessionManager {
     active_tab: usize,
     prev_drawn_tab: usize,
     block_store: Option<BlockStore>,
+    /// v1.7.3-C: Sidecar annotation store (bookmark/note/tags) sharing the
+    /// same `blocks.db` file. Opened alongside `BlockStore` so both see the
+    /// same schema state.
+    annotation_store: Option<AnnotationStore>,
 }
 
 impl SessionManager {
@@ -35,6 +40,7 @@ impl SessionManager {
             active_tab: 0,
             prev_drawn_tab: 0,
             block_store: None,
+            annotation_store: None,
         }
     }
 
@@ -74,6 +80,17 @@ impl SessionManager {
 
     pub fn set_block_store(&mut self, store: Option<BlockStore>) {
         self.block_store = store;
+    }
+
+    /// v1.7.3-C: Annotation store (bookmark/note/tags) — `None` when the DB
+    /// failed to open (persistence disabled). Safe to call every frame; the
+    /// controller treats `None` as a no-op for annotation actions.
+    pub fn annotation_store(&self) -> Option<&AnnotationStore> {
+        self.annotation_store.as_ref()
+    }
+
+    pub fn set_annotation_store(&mut self, store: Option<AnnotationStore>) {
+        self.annotation_store = store;
     }
 
     pub fn prev_drawn_tab(&self) -> usize {
@@ -448,6 +465,35 @@ impl PanelState {
         self.highlight_until = None;
         self.last_click = None;
         self.scroll_offset = 0;
+    }
+}
+
+/// v1.7.3-C: Inline note editor state. Opened from the block context menu
+/// ("Add Note"). When `open`, keyboard input is captured at the top of
+/// `handle_key_event` (before overlay routing) so the user can type a
+/// freeform note. Enter saves to `AnnotationStore::set_note`; Esc cancels.
+#[derive(Debug, Default)]
+pub struct NoteEditorState {
+    pub open: bool,
+    pub target_block_id: Option<BlockId>,
+    pub buffer: String,
+    /// Byte offset of the caret in `buffer`.
+    pub cursor: usize,
+}
+
+impl NoteEditorState {
+    pub fn open_for(&mut self, block_id: BlockId, existing: Option<&str>) {
+        self.open = true;
+        self.target_block_id = Some(block_id);
+        self.buffer = existing.unwrap_or("").to_string();
+        self.cursor = self.buffer.len();
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.target_block_id = None;
+        self.buffer.clear();
+        self.cursor = 0;
     }
 }
 

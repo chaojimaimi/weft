@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::glyph::GlyphAtlas;
 use crate::overlay::{OverlayContent, OverlayWarmup, PaletteDrawParams, SettingsDrawParams};
-use crate::paint::overlays::FindDrawState;
+use crate::paint::overlays::{FindDrawState, NoteEditorDrawState};
 use crate::paint::panel::PanelDrawParams;
 use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
@@ -29,6 +29,7 @@ impl MetalRenderer {
         atlas: &mut GlyphAtlas,
         viewport_h: f32,
         find_state: &Option<FindDrawState>,
+        note_editor_state: &Option<NoteEditorDrawState>,
         terminal: &Terminal,
         grid: &Grid,
         panel: Option<&PanelDrawParams<'_>>,
@@ -152,6 +153,13 @@ impl MetalRenderer {
                 missing.extend(err.chars());
             }
         }
+        // v1.7.3-C: Note editor — warm up "Note: " label, hint footer
+        // (⏎ save  ⎋ cancel) and the buffer text so CJK/IME input renders.
+        if let Some(note) = note_editor_state {
+            missing.extend("Note: ".chars());
+            missing.extend(note.buffer.chars());
+            missing.extend(['\u{23ce}', '\u{238b}']); // ⏎ ⎋
+        }
         // v0.9 fix: warm up the command palette (Cmd+P) query + banner
         // + submode input so CJK / other non-ASCII chars typed via IME
         // render instead of leaving blank cells (same rationale as the
@@ -181,6 +189,8 @@ impl MetalRenderer {
         }
         // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
         missing.extend("\u{25be} passthrough running".chars());
+        // v1.7.3-C: warm up the bookmark star (★) used in block headers.
+        missing.extend(['\u{2605}']);
         // F3-2: warm up the braille spinner glyphs (animated activity
         // indicator) and the static ● used under Reduce Motion.
         missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);

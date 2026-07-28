@@ -484,32 +484,30 @@ fn context_menu_basic_click() {
     let scale = 2.0;
     let layout = layout_context_menu(&ctx, x, y, scale);
 
-    // menu_w = 180 * 2 = 360; menu_h = 4 * (16.8*1.2) + 16.8*0.4
-    //                  = 4 * 20.16 + 6.72 = 80.64 + 6.72 = 87.36
+    // menu_w = 180 * 2 = 360; menu_h = 7 * (16.8*1.2) + 16.8*0.4
+    //                  = 7 * 20.16 + 6.72 = 141.12 + 6.72 = 147.84
     // 800 + 360 = 1160 ≤ 1600 - 4 → no clamp
     assert!((layout.menu_rect[0] - 800.0).abs() < 1e-3);
     assert!((layout.menu_rect[1] - 600.0).abs() < 1e-3);
     assert!((layout.menu_rect[2] - 1160.0).abs() < 1e-3);
-    assert!((layout.menu_rect[3] - 687.36).abs() < 1e-3);
-    // item_y[0] = 600 + 0.2*16.8 = 603.36
-    // item_y[1] = 603.36 + 20.16 = 623.52
-    // item_y[2] = 603.36 + 40.32 = 643.68
-    // item_y[3] = 603.36 + 60.48 = 663.84
+    assert!((layout.menu_rect[3] - 747.84).abs() < 1e-3);
+    // item_y[0] = 600 + 0.2*16.8 = 603.36; each subsequent +20.16
     assert!((layout.item_y[0] - 603.36).abs() < 1e-3);
     assert!((layout.item_y[1] - 623.52).abs() < 1e-3);
     assert!((layout.item_y[2] - 643.68).abs() < 1e-3);
     assert!((layout.item_y[3] - 663.84).abs() < 1e-3);
-    // separator_ys = [item_y[0]+20.16, item_y[1]+20.16, item_y[2]+20.16]
+    assert!((layout.item_y[6] - 724.32).abs() < 1e-3);
+    // separator_ys = item_y[i] + 20.16 for i in 0..6
     assert!((layout.separator_ys[0] - 623.52).abs() < 1e-3);
-    assert!((layout.separator_ys[1] - 643.68).abs() < 1e-3);
-    assert!((layout.separator_ys[2] - 663.84).abs() < 1e-3);
+    assert!((layout.separator_ys[5] - 724.32).abs() < 1e-3);
     // text_x = menu_x0 + 0.4*cw = 800 + 2.88 = 802.88
     assert!((layout.text_x - 802.88).abs() < 1e-3);
     assert_eq!(layout.item_at(900.0, 610.0), Some(0));
     assert_eq!(layout.item_at(900.0, 630.0), Some(1));
     assert_eq!(layout.item_at(900.0, 670.0), Some(3));
+    assert_eq!(layout.item_at(900.0, 730.0), Some(6));
     assert_eq!(layout.item_at(700.0, 610.0), None);
-    assert_eq!(layout.item_at(900.0, 690.0), None);
+    assert_eq!(layout.item_at(900.0, 750.0), None);
 }
 
 #[test]
@@ -553,11 +551,11 @@ fn context_menu_clamps_negative_x_to_zero() {
 #[test]
 fn context_menu_flips_upward_near_bottom() {
     let ctx = sample_ctx(); // vp_h = 1200
-    let scale = 2.0; // menu_h = 4 * (16.8*1.2) + 16.8*0.4 = 87.36
-                     // Click at y=1180 (near bottom): 1180 + 87.36 = 1267.36 > 1196 → flip.
+    let scale = 2.0; // menu_h = 7 * (16.8*1.2) + 16.8*0.4 = 147.84
+                     // Click at y=1180 (near bottom): 1180 + 147.84 = 1327.84 > 1196 → flip.
     let layout = layout_context_menu(&ctx, 100.0, 1180.0, scale);
-    // menu_y0 = 1180 - 87.36 = 1092.64
-    assert!((layout.menu_rect[1] - 1092.64).abs() < 1e-3);
+    // menu_y0 = 1180 - 147.84 = 1032.16
+    assert!((layout.menu_rect[1] - 1032.16).abs() < 1e-3);
     assert!(layout.menu_rect[3] <= 1200.0 - 4.0 + 1e-3);
 }
 
@@ -566,7 +564,7 @@ fn context_menu_flips_upward_near_bottom() {
 fn context_menu_opens_downward_with_space() {
     let ctx = sample_ctx();
     let scale = 2.0;
-    // Click at y=500: 500 + 87.36 = 587.36 < 1196 → no flip.
+    // Click at y=500: 500 + 147.84 = 647.84 < 1196 → no flip.
     let layout = layout_context_menu(&ctx, 100.0, 500.0, scale);
     assert!((layout.menu_rect[1] - 500.0).abs() < 1e-3);
 }

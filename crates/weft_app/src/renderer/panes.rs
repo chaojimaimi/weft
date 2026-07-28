@@ -58,12 +58,14 @@ impl MetalRenderer {
         tab_bar: &TabBarDrawState,
     ) {
         let no_find: Option<FindDrawState> = None;
+        let no_note: Option<crate::paint::overlays::NoteEditorDrawState> = None;
         for pane in panes {
             let prompt = background_prompt(pane);
             Self::warm_atlas(
                 atlas,
                 viewport_h,
                 &no_find,
+                &no_note,
                 pane.terminal,
                 pane.terminal.grid(),
                 None,

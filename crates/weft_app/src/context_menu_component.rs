@@ -54,7 +54,7 @@ pub(crate) fn context_menu_key_action(
 
 pub(crate) fn build_context_menu_scene(
     layout: ContextMenuLayout,
-    labels: &[(&str, &str); 4],
+    labels: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT],
 ) -> Scene<usize> {
     let mut scene = Scene::default();
     scene.semantics.push(SemanticNode {
@@ -103,11 +103,14 @@ mod tests {
     use crate::layout::{layout_context_menu, LayoutCtx};
     use weft_core::input::{KeyCode, Modifiers};
 
-    const ITEMS: &[(&str, &str); 4] = &[
+    const ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
         ("Copy Command", "copy_command"),
         ("Copy Output", "copy_output"),
         ("Toggle Fold", "toggle_fold"),
         ("Send to Input", "send_to_input"),
+        ("Toggle Bookmark", "toggle_bookmark"),
+        ("Add Note", "add_note"),
+        ("Export Block", "export_block"),
     ];
 
     #[test]
@@ -115,8 +118,11 @@ mod tests {
         let ctx = LayoutCtx::new((800.0, 600.0), 8.0, 18.0, 8.0, 8.0);
         let layout = layout_context_menu(&ctx, 100.0, 120.0, 1.0);
         let scene = build_context_menu_scene(layout, ITEMS);
-        assert_eq!(scene.hits.len(), 4);
-        assert_eq!(scene.semantics.len(), 5);
+        assert_eq!(scene.hits.len(), crate::layout::CONTEXT_MENU_ITEM_COUNT);
+        assert_eq!(
+            scene.semantics.len(),
+            crate::layout::CONTEXT_MENU_ITEM_COUNT + 1
+        );
         for (index, hit) in scene.hits.iter().enumerate() {
             assert_eq!(hit.bounds(), layout.item_rects[index]);
             assert_eq!(scene.semantics[index + 1].bounds, hit.bounds());
@@ -172,18 +178,18 @@ mod tests {
             ContextMenuKeyAction::Select(ITEMS.len() - 2)
         );
         assert_eq!(clamped_context_menu_selection(7, 0), None);
-        assert_eq!(clamped_context_menu_selection(7, ITEMS.len()), Some(3));
+        assert_eq!(clamped_context_menu_selection(7, ITEMS.len()), Some(6));
     }
 
     #[test]
     fn tab_and_page_keys_stay_owned_by_context_menu() {
         assert_eq!(
             context_menu_key_action(KeyCode::Tab, Modifiers::empty(), 3, ITEMS.len()),
-            ContextMenuKeyAction::Select(0)
+            ContextMenuKeyAction::Select(4)
         );
         assert_eq!(
             context_menu_key_action(KeyCode::Tab, Modifiers::SHIFT, 0, ITEMS.len()),
-            ContextMenuKeyAction::Select(3)
+            ContextMenuKeyAction::Select(6)
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageUp, Modifiers::empty(), 2, ITEMS.len()),
@@ -191,7 +197,7 @@ mod tests {
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageDown, Modifiers::empty(), 1, ITEMS.len()),
-            ContextMenuKeyAction::Select(3)
+            ContextMenuKeyAction::Select(6)
         );
     }
 }

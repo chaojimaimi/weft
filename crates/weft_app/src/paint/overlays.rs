@@ -51,6 +51,17 @@ pub struct FindDrawState {
     pub worker_busy: bool,
 }
 
+/// v1.7.3-C: Per-frame note editor draw state. Set by the app before
+/// `draw()` when the inline note editor is open. Renders a top-center
+/// card with "Note: [buffer|]" and a hint footer.
+#[derive(Clone, Debug, Default)]
+pub struct NoteEditorDrawState {
+    /// Current buffer text.
+    pub buffer: String,
+    /// Byte offset of the caret in `buffer`.
+    pub cursor: usize,
+}
+
 impl FindDrawState {
     fn surface_state(&self) -> crate::paint::command_surface::CommandSurfaceState {
         crate::paint::command_surface::find_surface_state(
@@ -88,6 +99,9 @@ impl MetalRenderer {
             "Copy Output",
             "Toggle Fold",
             "Send to Input",
+            "Toggle Bookmark",
+            "Add Note",
+            "Export Block",
         ];
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
@@ -106,6 +120,9 @@ impl MetalRenderer {
         // Items.
         let selected =
             crate::context_menu_component::clamped_context_menu_selection(selection, items.len());
+        // v1.7.3-C: last 3 items (Bookmark / Add Note / Export) in accent
+        // to set them apart from the original 4 editing actions.
+        let accent_start = items.len() - 3;
         for (i, label) in items.iter().enumerate() {
             let item_y = layout.item_y[i];
             if selected == Some(i) {
@@ -119,8 +136,8 @@ impl MetalRenderer {
             }
             let color = if selected == Some(i) {
                 selection_fg
-            } else if i >= items.len() - 2 {
-                prompt_c // "Toggle Fold" + "Send to Input" in accent
+            } else if i >= accent_start {
+                prompt_c
             } else {
                 fg
             };
@@ -454,6 +471,153 @@ impl MetalRenderer {
         }
 
         let _ = ch;
+        verts
+    }
+
+    /// v1.7.3-C: Build the inline note editor overlay — a top-center card
+    /// showing "Note: [buffer|]" with a caret and a hint footer. Uses the
+    /// same command-surface shell as Find/ContextMenu for visual consistency.
+    pub(crate) fn build_note_editor_vertices(&self, state: &NoteEditorDrawState) -> Vec<f32> {
+        use crate::paint::command_surface::{build_command_surface_shell, CommandSurfaceShell};
+
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let ctx = match &self.layout_ctx {
+            Some(c) => *c,
+            None => return Vec::new(),
+        };
+
+        // Layout: top-center card, 60% of viewport width (clamped to
+        // [40cw, 80cw]). Height = 1 input line + 1 hint line + padding.
+        let vp_w = ctx.viewport.0;
+        let target_w = (vp_w * 0.6).max(cw * 40.0).min(cw * 80.0);
+        let popup_x0 = (vp_w - target_w) * 0.5;
+        let popup_x1 = popup_x0 + target_w;
+        let popup_y0 = ctx.top() + 10.0;
+        let line_h = (ch * 1.75).max(ch + 16.0);
+        let hint_h = ch * 1.2;
+        let popup_y1 = popup_y0 + line_h + hint_h + ch * 0.3;
+
+        let mut verts = Vec::new();
+        let (su, sv, suw, svh) = self.space_uv();
+        let bg_uv = [su, sv + svh, su + suw, sv];
+
+        let theme_bg = color_to_normalized(self.theme.background);
+        let accent = color_to_normalized(self.theme.accent);
+        let fg = color_to_normalized(self.theme.foreground);
+        let sep = color_to_normalized(self.theme.separator);
+        let prompt_c = color_to_normalized(
+            crate::ui_tokens::UiColors::from_theme(&self.theme)
+                .with_increase_contrast(self.increase_contrast)
+                .text_secondary,
+        );
+
+        // Shell (shadow + bg + border).
+        build_command_surface_shell(
+            &mut verts,
+            CommandSurfaceShell::canonical(
+                [popup_x0, popup_y0, popup_x1, popup_y1],
+                2.0,
+                false,
+                theme_bg,
+                bg_uv,
+            ),
+        );
+
+        // Focus ring — the note editor captures keyboard input.
+        {
+            use crate::paint::primitives::{
+                build_focus_ring, focus_ring_alpha, focus_ring_thickness,
+            };
+            let ring_color = [
+                accent[0],
+                accent[1],
+                accent[2],
+                focus_ring_alpha(self.increase_contrast),
+            ];
+            build_focus_ring(
+                &mut verts,
+                [
+                    popup_x0 - 1.0,
+                    popup_y0 - 1.0,
+                    popup_x1 + 1.0,
+                    popup_y1 + 1.0,
+                ],
+                ring_color,
+                focus_ring_thickness(self.increase_contrast),
+            );
+        }
+
+        // Accent left stripe (3px) — branded accent.
+        push_quad(
+            &mut verts,
+            [popup_x0, popup_y0, popup_x0 + 3.0, popup_y1],
+            bg_uv,
+            [0.0; 4],
+            accent,
+        );
+
+        // Input line: "Note: " + buffer + caret.
+        let inner_pad = 8.0;
+        let text_x = popup_x0 + 3.0 + inner_pad;
+        let text_w = popup_x1 - popup_x0 - 3.0 - inner_pad * 2.0;
+        let line_y = popup_y0 + (line_h - ch) * 0.5;
+
+        let label = "Note: ";
+        let label_cells = label.len(); // ASCII
+        self.push_text(&mut verts, text_x, line_y, label, prompt_c, label_cells);
+
+        let buf_x = text_x + label_cells as f32 * cw;
+        let buf_max_cells = ((text_x + text_w - buf_x) / cw).floor() as usize;
+        // Convert byte-offset cursor to char offset so multi-byte CJK text
+        // positions the caret correctly.
+        let cursor_char_offset = state
+            .buffer
+            .char_indices()
+            .take_while(|(byte_idx, _)| *byte_idx < state.cursor)
+            .count();
+        let display_chars = buf_max_cells.saturating_sub(1);
+        let buf_display: String = state.buffer.chars().take(display_chars).collect();
+        if !buf_display.is_empty() {
+            self.push_text(&mut verts, buf_x, line_y, &buf_display, fg, buf_max_cells);
+        }
+
+        // Caret: blink-driven block cursor at the caret position (clamped
+        // to the visible display region so it doesn't overflow the popup).
+        let caret_char = cursor_char_offset.min(display_chars);
+        let caret_x = buf_x + caret_char as f32 * cw;
+        if self.cursor_blink_on {
+            push_quad(
+                &mut verts,
+                [caret_x, line_y, caret_x + cw * 0.5, line_y + ch],
+                bg_uv,
+                [0.0; 4],
+                fg,
+            );
+        }
+
+        // Separator between input and hint.
+        let sep_y = popup_y0 + line_h;
+        push_quad(
+            &mut verts,
+            [popup_x0 + 2.0, sep_y, popup_x1 - 2.0, sep_y + 1.0],
+            bg_uv,
+            [0.0; 4],
+            sep,
+        );
+
+        // Hint footer: "Enter to save · Esc to cancel"
+        let hint_y = sep_y + ch * 0.15;
+        let hint = "\u{23ce} save  \u{238b} cancel";
+        self.push_text(
+            &mut verts,
+            text_x,
+            hint_y,
+            hint,
+            prompt_c,
+            (text_w / cw * 0.9) as usize,
+        );
+
         verts
     }
 

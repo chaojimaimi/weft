@@ -215,6 +215,23 @@ impl AnnotationStore {
         Ok(out)
     }
 
+    /// Set of bookmarked block IDs. Cheaper than `bookmarked()` (no note/tags
+    /// decoding) and used by the renderer to draw ★ icons each frame.
+    pub fn bookmarked_ids(&self) -> Result<std::collections::HashSet<BlockId>, PersistenceError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT block_id FROM block_annotations WHERE bookmarked = 1")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            Ok(BlockId(id as u64))
+        })?;
+        let mut set = std::collections::HashSet::new();
+        for row in rows {
+            set.insert(row?);
+        }
+        Ok(set)
+    }
+
     /// Delete an annotation (e.g. when the underlying block is deleted).
     pub fn delete(&self, block_id: BlockId) -> Result<(), PersistenceError> {
         self.conn.execute(
@@ -450,6 +467,21 @@ mod tests {
         let bm = store.bookmarked().unwrap();
         assert_eq!(bm.len(), 2);
         assert!(bm.iter().all(|a| a.bookmarked));
+    }
+
+    #[test]
+    fn bookmarked_ids_returns_set() {
+        let store = AnnotationStore::open_in_memory().unwrap();
+        store.upsert(&ann(1, true, None, &[])).unwrap();
+        store.upsert(&ann(2, false, Some("note"), &[])).unwrap();
+        store
+            .upsert(&ann(3, true, Some("important"), &["prod"]))
+            .unwrap();
+        let ids = store.bookmarked_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&BlockId(1)));
+        assert!(ids.contains(&BlockId(3)));
+        assert!(!ids.contains(&BlockId(2)));
     }
 
     #[test]

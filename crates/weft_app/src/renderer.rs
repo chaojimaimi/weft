@@ -66,6 +66,10 @@ pub struct MetalRenderer {
     /// `None` when the find bar is closed. The renderer reads this to draw the
     /// top banner + highlight the current match.
     pub find_state: Option<FindDrawState>,
+    /// v1.7.3-C: Inline note editor draw state — set per-frame by the app.
+    /// `None` when the note editor is closed. The renderer reads this to draw
+    /// the top-center "Note: [buffer|]" card.
+    pub note_editor_state: Option<crate::paint::overlays::NoteEditorDrawState>,
     /// v0.9 H1: Last-rendered tab bar hit-test rects. Each entry is
     /// `(tab_rect, close_rect, tab_index)`. Populated by `draw_tab_bar`
     /// v0.9 W2: block currently highlighted in the terminal view (set from
@@ -76,6 +80,10 @@ pub struct MetalRenderer {
     /// from `InteractionState.block_hovered`). Drives inline copy/fold action
     /// buttons on the block header row.
     pub block_hovered: Option<BlockId>,
+    /// v1.7.3-C: Set of bookmarked block IDs (set per-frame by the app from
+    /// `AnnotationStore`). The block view draws a ★ glyph before the header
+    /// text of each bookmarked block.
+    pub bookmarked_blocks: std::collections::HashSet<BlockId>,
     /// F3-2: Spinner phase for the running-command activity indicator.
     /// Normalized to [0,1); the renderer maps it to a braille spinner glyph.
     /// Set to `-1.0` to disable (reduce-motion or no command running).
@@ -439,6 +447,7 @@ impl MetalRenderer {
             &mut self.atlas,
             self.viewport.1,
             &self.find_state,
+            &self.note_editor_state,
             terminal,
             grid,
             panel,
@@ -808,6 +817,12 @@ impl MetalRenderer {
         // last so it composites above all other overlays.
         if let Some(find) = &self.find_state.clone() {
             vertices.extend_from_slice(&self.build_find_vertices(find));
+        }
+
+        // v1.7.3-C: Inline note editor — top-center card with "Note: [buffer|]".
+        // Drawn after find so it composites above when both are open (rare).
+        if let Some(note) = &self.note_editor_state.clone() {
+            vertices.extend_from_slice(&self.build_note_editor_vertices(note));
         }
 
         // v0.9 H1: Tab bar — drawn at the top of the window. The content

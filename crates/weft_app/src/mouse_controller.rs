@@ -440,8 +440,17 @@ impl App {
     /// `block_id` is `None` for the in-flight (running) command.
     pub(super) fn run_context_action(&mut self, block_id: Option<BlockId>, action: &str) {
         let mut clipboard_text = None;
+        // v1.7.3-C: Block data cloned inside the terminal borrow for
+        // `export_block` — consumed after the borrow drops so the annotation
+        // store can be accessed without a borrow conflict.
+        let mut export_block_data: Option<weft_core::blocks::Block> = None;
         {
             let Some(terminal) = &mut self.sessions.active_mut().terminal else {
+                // Annotation-only actions (toggle_bookmark / add_note) don't
+                // need the terminal — fall through to the post-borrow block.
+                if matches!(action, "toggle_bookmark" | "add_note") {
+                    self.run_annotation_action(block_id, action);
+                }
                 return;
             };
 
@@ -499,13 +508,115 @@ impl App {
                         }
                     }
                 }
+                // v1.7.3-C: Clone block data for export. The actual markdown
+                // generation + file write happens after the terminal borrow
+                // drops (needs annotation store access).
+                "export_block" => {
+                    if let Some(bid) = block_id {
+                        if let Some(block) = terminal
+                            .block_tracker()
+                            .session_blocks()
+                            .iter()
+                            .find(|b| b.id == bid)
+                        {
+                            export_block_data = Some(block.clone());
+                        }
+                    }
+                }
                 _ => {}
             }
+        }
+        // Terminal borrow dropped — annotation/export actions run here.
+        if matches!(action, "toggle_bookmark" | "add_note" | "export_block") {
+            self.run_annotation_action_with_export(block_id, action, export_block_data);
         }
         if let Some(text) = clipboard_text.as_ref() {
             info!(len = text.len(), "context action copied to clipboard");
         }
         self.drain_effects(effect::context_clipboard_effects(clipboard_text));
+    }
+
+    /// v1.7.3-C: Handle annotation-only actions (toggle_bookmark / add_note)
+    /// when the terminal is not available. These only need `block_id` and
+    /// the annotation store.
+    fn run_annotation_action(&mut self, block_id: Option<BlockId>, action: &str) {
+        self.run_annotation_action_with_export(block_id, action, None);
+    }
+
+    /// v1.7.3-C: Unified annotation + export action handler. Called after
+    /// the terminal borrow drops so `self.sessions.annotation_store()` is
+    /// accessible. `export_block_data` is the cloned block for export_block.
+    fn run_annotation_action_with_export(
+        &mut self,
+        block_id: Option<BlockId>,
+        action: &str,
+        export_block_data: Option<weft_core::blocks::Block>,
+    ) {
+        match action {
+            "toggle_bookmark" => {
+                let Some(bid) = block_id else { return };
+                let Some(store) = self.sessions.annotation_store() else {
+                    warn!("annotation store unavailable; bookmark not toggled");
+                    return;
+                };
+                match store.toggle_bookmark(bid) {
+                    Ok(bookmarked) => {
+                        info!(block_id = ?bid, bookmarked, "bookmark toggled");
+                        self.request_redraw();
+                    }
+                    Err(e) => warn!(error = %e, "failed to toggle bookmark"),
+                }
+            }
+            "add_note" => {
+                let Some(bid) = block_id else { return };
+                let existing = self
+                    .sessions
+                    .annotation_store()
+                    .and_then(|store| store.get(bid).ok().flatten())
+                    .and_then(|a| a.note);
+                self.note_editor.open_for(bid, existing.as_deref());
+                self.request_redraw();
+            }
+            "export_block" => {
+                let Some(block) = export_block_data else {
+                    return;
+                };
+                let annotation = self
+                    .sessions
+                    .annotation_store()
+                    .and_then(|store| store.get(block.id).ok().flatten());
+                let markdown = weft_core::blocks::export::export_block_as_markdown(
+                    &block,
+                    annotation.as_ref(),
+                );
+                self.write_block_export(&block.command, &markdown);
+            }
+            _ => {}
+        }
+    }
+
+    /// v1.7.3-C: Write the exported markdown to a file chosen via NSSavePanel.
+    fn write_block_export(&self, command: &str, markdown: &str) {
+        let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
+            warn!("not on main thread; export cancelled");
+            return;
+        };
+        match crate::macos_file_dialog::pick_block_export_path(mtm, command) {
+            Ok(Some(path)) => {
+                if let Err(e) = std::fs::write(&path, markdown.as_bytes()) {
+                    warn!(error = %e, path = ?path, "failed to write export file");
+                } else {
+                    info!(path = ?path, bytes = markdown.len(), "block exported");
+                }
+            }
+            Ok(None) => {
+                // User cancelled the save panel.
+                tracing::debug!("export cancelled by user");
+            }
+            Err(e) => {
+                warn!(error = %e, "save panel error");
+            }
+        }
     }
 
     /// Handle scroll wheel.

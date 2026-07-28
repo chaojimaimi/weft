@@ -74,8 +74,8 @@ mod ui_tokens;
 mod window_event_controller;
 mod workspace_controller;
 use app_state::{
-    ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, PanelState,
-    SessionManager, SettingsState, TabBarState, WindowRuntimeState,
+    ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, NoteEditorState,
+    PanelState, SessionManager, SettingsState, TabBarState, WindowRuntimeState,
 };
 use block_component::block_content_metrics_with_cache;
 use effect::Effect;
@@ -203,16 +203,24 @@ struct App {
     /// v1.7.1: Main-thread search index for upsert/delete (index maintenance).
     /// The background PaletteSearchWorker owns its own SearchIndex for queries.
     search_index: Option<weft_core::search::SearchIndex>,
+    /// v1.7.3-C: Inline note editor for block annotations. When open,
+    /// keyboard input is captured before overlay routing.
+    note_editor: NoteEditorState,
 }
 
-/// Context menu item labels.
-const CONTEXT_MENU_ITEMS: &[(&str, &str); 4] = &[
+/// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
+/// Keep in sync with `CONTEXT_MENU_ITEM_COUNT` in `layout/surfaces.rs`.
+const CONTEXT_MENU_ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
     ("Copy Command", "copy_command"),
     ("Copy Output", "copy_output"),
     ("Toggle Fold", "toggle_fold"),
     // v0.9 W4: send the block's command to the input box for re-editing
     // (Warp-style "rerun" — user can tweak parameters before pressing Enter).
     ("Send to Input", "send_to_input"),
+    // v1.7.3-C: Block reuse actions — bookmark, note, export.
+    ("Toggle Bookmark", "toggle_bookmark"),
+    ("Add Note", "add_note"),
+    ("Export Block", "export_block"),
 ];
 
 /// Action triggered by clicking a button in the find popup. Produced by
@@ -299,6 +307,7 @@ impl App {
             should_exit: false,
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
             search_index: None,
+            note_editor: NoteEditorState::default(),
         }
     }
 

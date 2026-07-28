@@ -525,8 +525,11 @@ mod tests {
     // ── F7 context menu: hit-test geometry ───────────────────────────
 
     #[test]
-    fn context_menu_items_count_is_four() {
-        assert_eq!(crate::CONTEXT_MENU_ITEMS.len(), 4);
+    fn context_menu_items_count_matches_layout_const() {
+        assert_eq!(
+            crate::CONTEXT_MENU_ITEMS.len(),
+            crate::layout::CONTEXT_MENU_ITEM_COUNT
+        );
     }
 
     #[test]

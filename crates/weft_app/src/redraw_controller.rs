@@ -182,6 +182,14 @@ impl App {
                     current_field: form.current_field,
                 });
         let prev_drawn = self.sessions.prev_drawn_tab();
+        // v1.7.3-C: snapshot the bookmarked-block set before the mutable
+        // `tab` borrow below. `annotation_store()` borrows `self.sessions`
+        // immutably, which would conflict with `active_mut()`.
+        let bookmarked_blocks = self
+            .sessions
+            .annotation_store()
+            .and_then(|store| store.bookmarked_ids().ok())
+            .unwrap_or_default();
         let tab = self.sessions.active_mut();
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
@@ -549,6 +557,17 @@ impl App {
                 None
             };
             renderer.find_state = find_state;
+            // v1.7.3-C: Populate note editor overlay state before draw.
+            // `None` when the editor is closed so the renderer skips the
+            // overlay.
+            renderer.note_editor_state = if self.note_editor.open {
+                Some(crate::paint::overlays::NoteEditorDrawState {
+                    buffer: self.note_editor.buffer.clone(),
+                    cursor: self.note_editor.cursor,
+                })
+            } else {
+                None
+            };
             // v0.9 W2: expire panel highlight after 1.5s.
             if let Some(until) = self.panel.highlight_until {
                 if std::time::Instant::now() >= until {
@@ -558,6 +577,8 @@ impl App {
             }
             renderer.panel_highlight = self.panel.highlight;
             renderer.block_hovered = self.interaction.block_hovered;
+            // v1.7.3-C: assign the pre-computed bookmarked-block set.
+            renderer.bookmarked_blocks = bookmarked_blocks;
             renderer.reduce_motion = self.window_runtime.reduce_motion;
             renderer.increase_contrast = self.window_runtime.increase_contrast;
             // F3-2: compute spinner phase for the running-command indicator.

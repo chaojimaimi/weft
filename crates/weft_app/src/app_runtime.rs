@@ -388,6 +388,22 @@ impl ApplicationHandler<AppEvent> for App {
             .block_store()
             .map(BlockStore::block_id_allocator);
 
+        // v1.7.3-C: Open the annotation sidecar store (bookmark/note/tags)
+        // sharing the same `blocks.db` file. Best-effort — if it fails to
+        // open, annotation actions are silently disabled (treated as no-ops
+        // by the controller). Opened after BlockStore so the file exists.
+        let annotation_store = weft_cache_dir().and_then(|cache| {
+            let path = cache.join("blocks.db");
+            match weft_core::blocks::annotations::AnnotationStore::open(&path) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    warn!(error = %e, "failed to open annotation store; annotations disabled");
+                    None
+                }
+            }
+        });
+        self.sessions.set_annotation_store(annotation_store);
+
         // v1.7.1: Open the search index (sidecar to blocks.db) for main-thread
         // upsert/delete. The background PaletteSearchWorker owns its own
         // SearchIndex for queries. If the index is empty, rebuild from

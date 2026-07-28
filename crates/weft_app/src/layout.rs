@@ -271,7 +271,7 @@ pub use settings::{layout_settings, FooterButtonRects, SettingsLayout, SETTINGS_
 pub use surfaces::{
     completion_window, layout_completion, layout_context_menu, layout_find,
     layout_palette_form_rect, layout_palette_search, palette_popup_x_range, CompletionLayout,
-    ContextMenuLayout, FindLayout, PaletteSearchLayout,
+    ContextMenuLayout, FindLayout, PaletteSearchLayout, CONTEXT_MENU_ITEM_COUNT,
 };
 #[allow(unused_imports)]
 pub use terminal::{

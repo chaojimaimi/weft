@@ -7,6 +7,7 @@
 
 use crate::input_router::{OverlayInputContext, OverlayInputOwner};
 use crate::macos_system::clipboard_paste;
+use tracing::{info, warn};
 use weft_core::input::{KeyCode, Modifiers};
 use winit::event::Modifiers as WinitModifiers;
 use winit::keyboard::KeyCode as WinitKeyCode;
@@ -44,6 +45,14 @@ impl crate::App {
         }
         if mods.state().super_key() {
             m |= Modifiers::SUPER;
+        }
+
+        // v1.7.3-C: Note editor captures all keyboard input when open.
+        // Intercepts before keybinding lookup and overlay routing so the
+        // user's typing never leaks to the PTY or other overlays.
+        if self.note_editor.open {
+            self.handle_note_editor_key(key, m, text);
+            return;
         }
 
         let bound_action = self.config_state.keybindings.lookup(key, m);
@@ -218,5 +227,156 @@ impl crate::App {
             }
             _ => false,
         }
+    }
+
+    /// v1.7.3-C: Handle keyboard input for the inline note editor.
+    /// Called when `self.note_editor.open` is true — all keys are captured.
+    ///
+    /// - Enter saves the note to `AnnotationStore::set_note` and closes.
+    /// - Esc closes without saving.
+    /// - Backspace/Delete removes a char.
+    /// - Left/Right/Home/End move the caret.
+    /// - Cmd+V pastes from clipboard.
+    /// - Printable chars insert at the caret.
+    fn handle_note_editor_key(&mut self, key: KeyCode, mods: Modifiers, text: Option<&str>) {
+        // Cmd+V: paste from clipboard.
+        if mods.contains(Modifiers::SUPER) && key == KeyCode::Char('v') {
+            if let Some(pasted) = clipboard_paste() {
+                let ne = &mut self.note_editor;
+                let insert_pos = ne.cursor.min(ne.buffer.len());
+                ne.buffer.insert_str(insert_pos, &pasted);
+                ne.cursor = insert_pos + pasted.len();
+            }
+            self.request_redraw();
+            return;
+        }
+        // Let other cmd/ctrl/alt chords fall through (no-op).
+        if mods.intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT) {
+            return;
+        }
+
+        use crate::paint::command_surface::CommandSurfaceKeyAction;
+        match crate::paint::command_surface::resolve_command_surface_key(key, mods) {
+            CommandSurfaceKeyAction::Cancel => {
+                self.note_editor.close();
+                self.request_redraw();
+                return;
+            }
+            CommandSurfaceKeyAction::Accept => {
+                self.commit_note_editor();
+                return;
+            }
+            CommandSurfaceKeyAction::MoveUp | CommandSurfaceKeyAction::PageUp => {
+                // Home: move cursor to start.
+                self.note_editor.cursor = 0;
+                self.request_redraw();
+                return;
+            }
+            CommandSurfaceKeyAction::MoveDown | CommandSurfaceKeyAction::PageDown => {
+                // End: move cursor to end.
+                self.note_editor.cursor = self.note_editor.buffer.len();
+                self.request_redraw();
+                return;
+            }
+            _ => {}
+        }
+
+        match key {
+            KeyCode::Backspace => {
+                let ne = &mut self.note_editor;
+                if ne.cursor > 0 {
+                    // Walk back one char boundary (UTF-8 safe).
+                    let prev = ne.buffer[..ne.cursor].char_indices().last().map(|(i, _)| i);
+                    if let Some(prev) = prev {
+                        ne.buffer.replace_range(prev..ne.cursor, "");
+                        ne.cursor = prev;
+                    }
+                }
+                self.request_redraw();
+            }
+            KeyCode::Delete => {
+                let ne = &mut self.note_editor;
+                if ne.cursor < ne.buffer.len() {
+                    let next = ne.buffer[ne.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| ne.cursor + i)
+                        .unwrap_or(ne.buffer.len());
+                    ne.buffer.replace_range(ne.cursor..next, "");
+                }
+                self.request_redraw();
+            }
+            KeyCode::Left => {
+                let ne = &mut self.note_editor;
+                if ne.cursor > 0 {
+                    let prev = ne.buffer[..ne.cursor].char_indices().last().map(|(i, _)| i);
+                    if let Some(prev) = prev {
+                        ne.cursor = prev;
+                    }
+                }
+                self.request_redraw();
+            }
+            KeyCode::Right => {
+                let ne = &mut self.note_editor;
+                if ne.cursor < ne.buffer.len() {
+                    let next = ne.buffer[ne.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| ne.cursor + i)
+                        .unwrap_or(ne.buffer.len());
+                    ne.cursor = next;
+                }
+                self.request_redraw();
+            }
+            KeyCode::Home => {
+                self.note_editor.cursor = 0;
+                self.request_redraw();
+            }
+            KeyCode::End => {
+                self.note_editor.cursor = self.note_editor.buffer.len();
+                self.request_redraw();
+            }
+            _ => {
+                if let KeyCode::Char(c) = key {
+                    let resolved = crate::app::helpers::resolve_text_char(
+                        text,
+                        c,
+                        mods.contains(Modifiers::SHIFT),
+                    );
+                    if !resolved.is_control() {
+                        let ne = &mut self.note_editor;
+                        let pos = ne.cursor.min(ne.buffer.len());
+                        ne.buffer.insert(pos, resolved);
+                        ne.cursor = pos + resolved.len_utf8();
+                        self.request_redraw();
+                    }
+                }
+            }
+        }
+    }
+
+    /// v1.7.3-C: Save the note editor buffer to the annotation store and
+    /// close the editor. Called on Enter.
+    fn commit_note_editor(&mut self) {
+        let target = self.note_editor.target_block_id;
+        let buffer = std::mem::take(&mut self.note_editor.buffer);
+        self.note_editor.close();
+
+        if let Some(bid) = target {
+            if let Some(store) = self.sessions.annotation_store() {
+                let note = if buffer.trim().is_empty() {
+                    None
+                } else {
+                    Some(buffer.as_str())
+                };
+                match store.set_note(bid, note) {
+                    Ok(()) => {
+                        info!(block_id = ?bid, note_len = buffer.len(), "note saved");
+                    }
+                    Err(e) => warn!(error = %e, "failed to save note"),
+                }
+            }
+        }
+        self.request_redraw();
     }
 }

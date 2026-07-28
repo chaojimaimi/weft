@@ -229,24 +229,28 @@ pub fn layout_palette_form_rect(ctx: &LayoutCtx, n_fields: usize, popup_width_sc
 
 // ── Context menu ───────────────────────────────────────────────────────
 //
-// Right-click menu on a block. Fixed 3 items (Copy Command / Copy Output /
-// Toggle Fold). Mirrors `MetalRenderer::build_context_menu_vertices`
-// (renderer.rs:2027). The menu is anchored at the click point and
-// clamped to the viewport's right edge.
+// Right-click menu on a block. v1.7.3-C expanded from 4 to 7 items
+// (Copy Command / Copy Output / Toggle Fold / Send to Input / Toggle
+// Bookmark / Add Note / Export Block). The menu is anchored at the click
+// point and clamped to the viewport's right edge.
+
+/// v1.7.3-C: Number of items in the block context menu. Update this and
+/// `CONTEXT_MENU_ITEMS` in `main.rs` together.
+pub const CONTEXT_MENU_ITEM_COUNT: usize = 7;
 
 /// Layout for the block context menu.
 #[derive(Clone, Copy, Debug)]
 pub struct ContextMenuLayout {
     /// Outer menu rect `[x0, y0, x1, y1]`.
     pub menu_rect: Rect,
-    /// Per-item Y (top edge). Length = items.len().
-    pub item_y: [f32; 4],
-    /// Exact hit-test rectangles for the four actions.
-    pub item_rects: [Rect; 4],
+    /// Per-item Y (top edge). Length = [`CONTEXT_MENU_ITEM_COUNT`].
+    pub item_y: [f32; CONTEXT_MENU_ITEM_COUNT],
+    /// Exact hit-test rectangles for each action.
+    pub item_rects: [Rect; CONTEXT_MENU_ITEM_COUNT],
     /// X of the item label text.
     pub text_x: f32,
-    /// Y of the separator after item `i` (None for the last item).
-    pub separator_ys: [f32; 3],
+    /// Y of the separator after item `i` (no separator after the last item).
+    pub separator_ys: [f32; CONTEXT_MENU_ITEM_COUNT - 1],
 }
 
 /// Compute the context menu layout. `(x, y)` is the click anchor. The menu
@@ -259,7 +263,7 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
 
     let item_h = ch * 1.2;
     let menu_w = 180.0 * scale;
-    let menu_h = 4.0 * item_h + ch * 0.4;
+    let menu_h = CONTEXT_MENU_ITEM_COUNT as f32 * item_h + ch * 0.4;
 
     // Clamp so the right edge stays inside the viewport (with 4px gutter).
     let menu_x0 = x.min(vp_w - menu_w - 4.0).max(0.0);
@@ -273,13 +277,15 @@ pub fn layout_context_menu(ctx: &LayoutCtx, x: f32, y: f32, scale: f32) -> Conte
     let menu_x1 = menu_x0 + menu_w;
     let menu_y1 = menu_y0 + menu_h;
 
-    let item_y = [
-        menu_y0 + ch * 0.2,
-        menu_y0 + ch * 0.2 + item_h,
-        menu_y0 + ch * 0.2 + 2.0 * item_h,
-        menu_y0 + ch * 0.2 + 3.0 * item_h,
-    ];
-    let separator_ys = [item_y[0] + item_h, item_y[1] + item_h, item_y[2] + item_h];
+    let top_pad = ch * 0.2;
+    let mut item_y = [0.0f32; CONTEXT_MENU_ITEM_COUNT];
+    let mut separator_ys = [0.0f32; CONTEXT_MENU_ITEM_COUNT - 1];
+    for i in 0..CONTEXT_MENU_ITEM_COUNT {
+        item_y[i] = menu_y0 + top_pad + i as f32 * item_h;
+        if i < CONTEXT_MENU_ITEM_COUNT - 1 {
+            separator_ys[i] = item_y[i] + item_h;
+        }
+    }
     let text_x = menu_x0 + cw * 0.4;
     let item_rects = item_y.map(|item_top| [menu_x0, item_top, menu_x1, item_top + item_h]);
 

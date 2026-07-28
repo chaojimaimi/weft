@@ -578,8 +578,25 @@ impl MetalRenderer {
                         BlockTone::Warning => color_to_normalized(ui.warning),
                     };
                     let text_y = y + (header_height - pitch) * 0.5;
-                    let text_cols = block_header_text_cols(left, right, cw, self.scale).min(cols);
-                    self.push_text(&mut verts, left, text_y, text, color, text_cols);
+                    // v1.7.3-C: If the block is bookmarked, draw a ★ glyph
+                    // at the left edge and shift the header text right by
+                    // 2 cells (1 for the star + 1 gap) so it doesn't overlap.
+                    let bookmarked = self.bookmarked_blocks.contains(block_id);
+                    let (text_x, text_cols) = if bookmarked {
+                        let star_color = color_to_normalized(self.theme.accent);
+                        self.push_text(&mut verts, left, text_y, "★", star_color, 1);
+                        (
+                            left + 2.0 * cw,
+                            block_header_text_cols(left + 2.0 * cw, right, cw, self.scale)
+                                .min(cols.saturating_sub(2)),
+                        )
+                    } else {
+                        (
+                            left,
+                            block_header_text_cols(left, right, cw, self.scale).min(cols),
+                        )
+                    };
+                    self.push_text(&mut verts, text_x, text_y, text, color, text_cols);
 
                     push_block_header_actions(
                         self,
