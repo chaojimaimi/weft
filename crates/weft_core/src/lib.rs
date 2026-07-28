@@ -11,6 +11,7 @@ pub mod grapheme;
 pub mod grid;
 pub mod hyperlink;
 pub mod input;
+pub mod kitty_graphics;
 pub mod pane_layout;
 pub mod persistence;
 pub mod pty;

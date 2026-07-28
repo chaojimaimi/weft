@@ -199,3 +199,102 @@ fn fixture_primary_screen_tui_resize_survival() {
     );
     assert!(terminal.primary_screen_app_active());
 }
+
+/// Fixture 5 (v1.7.4 Phase A): Verify vte 0.13.1 safely handles APC sequences
+/// (ESC _ ... ST) without breaking OSC/DCS/UTF-8/print.
+///
+/// Kitty Graphics protocol uses `ESC _ G <payload> ESC \` (APC with 'G'
+/// identifier). vte 0.13.1 routes ESC _ into the `SosPmApcString` state,
+/// which uses `Ignore` action for all payload bytes — they are silently
+/// dropped, NOT dispatched to any handler. This fixture confirms:
+///
+/// 1. APC payload does not leak onto the grid as text
+/// 2. APC does not break subsequent OSC 133 / print / CSI sequences
+/// 3. APC does not corrupt CJK UTF-8 handling
+/// 4. BEL (0x07) does NOT terminate APC in vte 0.13.1 (only ST does)
+///
+/// This is the Phase A decision-gate test per V17_IMPLEMENTATION_PLAN §6.
+#[test]
+fn fixture_apc_kitty_graphics_safety() {
+    let mut t = Terminal::new(6, 40);
+
+    // --- Test 1: APC with Kitty-style payload, ST-terminated ---
+    // ESC _ G a=T,f=24,s=1,v=1;<base64-payload> ESC \
+    // The entire payload must be silently dropped — no text on grid.
+    t.process(b"\x1b_G a=T,f=24,s=1,v=1;iVBORw0KGgoAAAANS\x1b\\");
+    assert_eq!(
+        t.grid().row_text(0),
+        "",
+        "APC payload must not leak onto grid"
+    );
+    assert_eq!(t.grid().cursor.col, 0, "cursor unchanged by APC");
+
+    // --- Test 2: APC does not break subsequent OSC 133 ---
+    t.process(b"\x1b]133;A\x07echo hello\x1b]133;B\x07");
+    assert_eq!(t.grid().row_text(0), "echo hello");
+
+    // --- Test 3: APC does not break CJK UTF-8 ---
+    t.process(b"\x1b[2;1H");
+    t.process(b"\x1b_G q=1\x1b\\\xe6\xb5\x8b\xe8\xaf\x95");
+    assert_eq!(
+        t.grid().row_text(1),
+        "测试",
+        "CJK after APC renders correctly"
+    );
+    assert_no_orphaned_wide_cells(&t);
+
+    // --- Test 4: APC does not break CSI cursor movement ---
+    t.process(b"\x1b[3;1H");
+    t.process(b"\x1b_G t=d\x1b\\\x1b[5GABC");
+    assert_eq!(t.grid().row_text(2), "    ABC");
+
+    // --- Test 5: Multiple consecutive APCs are all dropped ---
+    t.process(b"\x1b[4;1H");
+    t.process(b"\x1b_G a=T\x1b\\\x1b_G a=T\x1b\\\x1b_G a=T\x1b\\text");
+    assert_eq!(t.grid().row_text(3), "text");
+
+    // --- Test 6: APC with BEL termination ---
+    // vte 0.13.1's SosPmApcString state treats 0x07 as Ignore, NOT as a
+    // terminator. So BEL does NOT end the APC — the payload continues
+    // until ST (ESC \). Verify this by checking that text after BEL-but-
+    // before-ST is still consumed by the APC state.
+    t.process(b"\x1b[5;1H");
+    t.process(b"\x1b_G payload\x07still-inside-apc\x1b\\visible");
+    assert_eq!(
+        t.grid().row_text(4),
+        "visible",
+        "BEL does not terminate APC; only ST does"
+    );
+
+    // --- Test 7: APC interspersed with DCS (ESC P) ---
+    // Both must be independently handled.
+    t.process(b"\x1b[6;1H");
+    t.process(b"\x1b_G apc_payload\x1b\\\x1bPdcs_payload\x1b\\after");
+    assert_eq!(t.grid().row_text(5), "after");
+}
+
+/// Fixture 6 (v1.7.4 Phase A): Verify APC with large payload (exceeding
+/// any reasonable limit) does not cause panic or unbounded memory growth
+/// in vte 0.13.1. Since vte uses `Ignore` action for APC bytes, no buffer
+/// accumulates — the payload is discarded byte-by-byte.
+#[test]
+fn fixture_apc_large_payload_no_panic() {
+    let mut t = Terminal::new(4, 40);
+
+    // Construct a 256 KiB APC payload — far larger than any real Kitty
+    // Graphics image chunk. vte should discard all bytes without panic.
+    let mut bytes = Vec::with_capacity(256 * 1024 + 4);
+    bytes.extend_from_slice(b"\x1b_G a=T;");
+    bytes.extend(std::iter::repeat(b'X').take(256 * 1024));
+    bytes.extend_from_slice(b"\x1b\\");
+    t.process(&bytes);
+
+    // Grid must be clean — no payload leaked.
+    for row in 0..4 {
+        assert_eq!(t.grid().row_text(row), "", "row {row} leaked APC payload");
+    }
+
+    // Subsequent output must work normally.
+    t.process(b"after-apc");
+    assert_eq!(t.grid().row_text(0), "after-apc");
+}
