@@ -404,11 +404,19 @@ impl vte::Perform for Terminal {
         match action {
             // Cursor movement
             'A' => {
-                self.grid.move_up(param(params, 0, 1) as usize);
+                let n = param(params, 0, 1) as usize;
+                self.grid.move_up(n);
+                if !self.capabilities.alt_active {
+                    self.block_tracker.on_move_cursor_rows(-(n as isize));
+                }
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'B' => {
-                self.grid.move_down(param(params, 0, 1) as usize);
+                let n = param(params, 0, 1) as usize;
+                self.grid.move_down(n);
+                if !self.capabilities.alt_active {
+                    self.block_tracker.on_move_cursor_rows(n as isize);
+                }
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'C' => {
@@ -427,12 +435,20 @@ impl vte::Perform for Terminal {
                 let n = param(params, 0, 1) as usize;
                 self.grid.move_down(n);
                 self.grid.carriage_return();
+                if !self.capabilities.alt_active {
+                    self.block_tracker.on_move_cursor_rows(n as isize);
+                    self.block_tracker.on_carriage_return();
+                }
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'F' => {
                 let n = param(params, 0, 1) as usize;
                 self.grid.move_up(n);
                 self.grid.carriage_return();
+                if !self.capabilities.alt_active {
+                    self.block_tracker.on_move_cursor_rows(-(n as isize));
+                    self.block_tracker.on_carriage_return();
+                }
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
 

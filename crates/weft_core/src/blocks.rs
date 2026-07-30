@@ -413,6 +413,15 @@ impl BlockTracker {
             self.output.erase_line(mode);
         }
     }
+
+    /// Mirror CSI A/B/E/F (cursor up/down) into the capture buffer so
+    /// multi-line progress bars (`ollama pull`, `brew upgrade`) repaint
+    /// in place instead of appending new rows on every update.
+    pub fn on_move_cursor_rows(&mut self, delta: isize) {
+        if self.is_capturing() {
+            self.output.move_cursor_rows(delta);
+        }
+    }
 }
 
 #[cfg(test)]

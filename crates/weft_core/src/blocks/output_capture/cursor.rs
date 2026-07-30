@@ -46,6 +46,51 @@ impl OutputCapture {
             self.char_cursor = self.char_cursor.saturating_sub(1);
         }
     }
+
+    /// Move the capture cursor by `delta` rows (negative = up, positive =
+    /// down). The cursor lands at the start of the target row.
+    ///
+    /// This is a simplified version of CSI A/B (cursor up/down) that moves
+    /// to the row start rather than preserving the column. Multi-line
+    /// progress bars like `ollama pull` and `brew upgrade` always follow
+    /// `\033[<N>A` with `\r` before repainting, so landing at column zero
+    /// matches the observed behaviour.
+    ///
+    /// Saturates at the first/last row boundary.
+    pub(crate) fn move_cursor_rows(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        let target = if delta < 0 {
+            let up = (-delta) as usize;
+            let mut current = self.line_start();
+            for _ in 0..up {
+                if current == 0 {
+                    break;
+                }
+                // `current - 1` is the trailing '\n' of the previous row
+                // (or a char inside it). Scan backwards for the '\n' that
+                // starts the row above.
+                current = self.text[..current - 1].rfind('\n').map_or(0, |i| i + 1);
+            }
+            current
+        } else {
+            let mut current = self.cursor;
+            for _ in 0..delta {
+                if current >= self.text.len() {
+                    break;
+                }
+                match self.text[current..].find('\n') {
+                    Some(offset) => current += offset + 1,
+                    None => break,
+                }
+            }
+            current
+        };
+        self.cursor = target;
+        self.char_cursor = self.text[..target].chars().count() as u32;
+        self.line_start_char = self.char_cursor;
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +159,132 @@ mod tests {
         output.move_cursor_columns(-100, MAX_OUTPUT_BYTES);
         output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
         assert_eq!(output.as_str(), "Xbc");
+    }
+
+    /// `move_cursor_rows(-n)` moves the cursor up n rows so a subsequent
+    /// CR + print overwrites that row in place instead of appending.
+    #[test]
+    fn move_cursor_rows_up_overwrites_target_row() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line3", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        // cursor at end of "line3". Move up 2 rows → "line1" row start.
+        output.move_cursor_rows(-2);
+        output.carriage_return();
+        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "LINE1\nline2\nline3");
+    }
+
+    /// Moving up and then down lands back on the original row, so the
+    /// print still overwrites in place.
+    #[test]
+    fn move_cursor_rows_down_returns_to_original_row() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.move_cursor_rows(-1);
+        output.move_cursor_rows(1);
+        output.carriage_return();
+        output.print_ascii(b"LINE2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "line1\nLINE2");
+    }
+
+    /// Moving up past the first row saturates at row 0 instead of
+    /// underflowing.
+    #[test]
+    fn move_cursor_rows_up_saturates_at_first_row() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.move_cursor_rows(-100);
+        output.carriage_return();
+        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "LINE1\nline2");
+    }
+
+    /// Moving down past the last row saturates at the text end so the
+    /// next print appends instead of overwriting.
+    #[test]
+    fn move_cursor_rows_down_saturates_at_last_row() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.move_cursor_rows(100);
+        output.print_ascii(b" appended", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "line1\nline2 appended");
+    }
+
+    /// Multi-line progress bar scenario: paint 3 rows (each followed by
+    /// `\n`), move up 3 rows, repaint all 3 rows, and verify the row count
+    /// stays at 3 (no growth). This is the `ollama pull` / `brew upgrade`
+    /// pattern: `\033[3A` + `\r` + new content + `\033[K` per row.
+    #[test]
+    fn move_cursor_rows_multiline_progress_repaint() {
+        let mut output = OutputCapture::default();
+        // Initial paint: 3 rows, each followed by \n.
+        output.print_ascii(b"a:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"b:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"c:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        // 3 newlines leave cursor on an empty row 4. Move up 3 rows to
+        // land on row 1 ("a:   0%").
+        output.move_cursor_rows(-3);
+        // Repaint row 1 (new content shorter → erase_line clears tail)
+        output.carriage_return();
+        output.print_ascii(b"a: 50%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.erase_line(0);
+        output.newline(MAX_OUTPUT_BYTES);
+        // Repaint row 2
+        output.carriage_return();
+        output.print_ascii(b"b: 30%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.erase_line(0);
+        output.newline(MAX_OUTPUT_BYTES);
+        // Repaint row 3
+        output.carriage_return();
+        output.print_ascii(b"c: 10%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.erase_line(0);
+
+        assert_eq!(
+            output.as_str(),
+            "a: 50%\nb: 30%\nc: 10%\n",
+            "progress repaint must not grow rows"
+        );
+    }
+
+    /// `move_cursor_rows` on an empty buffer is a no-op (cursor stays at 0).
+    #[test]
+    fn move_cursor_rows_empty_buffer_is_noop() {
+        let mut output = OutputCapture::default();
+        output.move_cursor_rows(-1);
+        output.move_cursor_rows(1);
+        output.move_cursor_rows(-100);
+        assert_eq!(output.as_str(), "");
+    }
+
+    /// `move_cursor_rows` when the cursor is in the middle of a row still
+    /// navigates by full rows (up from the current line start, not the
+    /// cursor column).
+    #[test]
+    fn move_cursor_rows_from_mid_row_uses_line_start() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        // cursor in the middle of "line2" (byte 7, after "li")
+        output.cursor = 8;
+        output.char_cursor = 9;
+        // move up 1 row → "line1" row start (byte 0)
+        output.move_cursor_rows(-1);
+        output.carriage_return();
+        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "LINE1\nline2");
     }
 }

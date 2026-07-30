@@ -1275,6 +1275,66 @@ fn horizontal_cursor_progress_rewrites_are_compacted_in_block_output() {
 }
 
 #[test]
+fn multiline_progress_bar_repaints_in_place_via_cursor_up() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07ollama pull\n\x1b]133;B\x07\x1b]133;C\x07");
+
+    // Initial 3-row progress paint (each row followed by \n).
+    t.process(b"pulling a:   0%\npulling b:   0%\npulling c:   0%\n");
+    // Repaint: cursor up 3 rows, then overwrite each row + erase tail.
+    t.process(b"\x1b[3A\rpulling a:  50%\x1b[K\n\rpulling b:  30%\x1b[K\n\rpulling c:  10%\x1b[K");
+    t.process(b"\n\x1b]133;D;0\x07");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        "pulling a:  50%\npulling b:  30%\npulling c:  10%\n",
+        "multi-line progress via CSI A must not grow rows"
+    );
+}
+
+#[test]
+fn multiline_progress_bar_repaints_in_place_via_cursor_up_during_in_flight() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07brew upgrade\n\x1b]133;B\x07\x1b]133;C\x07");
+
+    // Initial 2-row progress paint.
+    t.process(b"fetching: 0%\ndownloading: 0%\n");
+    // Repaint: cursor up 2 rows, overwrite each row.
+    t.process(b"\x1b[2A\rfetching: 100%\x1b[K\n\rdownloading:  50%\x1b[K");
+
+    // Command still in flight — verify the in-flight buffer hasn't grown.
+    let output = t.block_tracker().in_flight().unwrap().output;
+    let line_count = output.lines().count();
+    assert_eq!(
+        line_count, 2,
+        "in-flight progress repaint must not grow rows: {output:?}"
+    );
+    assert_eq!(output, "fetching: 100%\ndownloading:  50%\n");
+}
+
+#[test]
+fn multiline_progress_bar_repaints_via_cursor_down_e_and_up_f() {
+    // CSI E (cursor down + CR) and CSI F (cursor up + CR) are the
+    // CR-combining variants of CSI B/A. Verify they also compact rows.
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07cmd\n\x1b]133;B\x07\x1b]133;C\x07");
+
+    // Paint row 1, then use CSI E (down 1 + CR) to move to row 2.
+    t.process(b"row1: 0%\x1b[1Erow2: 0%\n");
+    // Repaint: CSI F (up 2 + CR) back to row 1, then CSI E to row 2.
+    t.process(b"\x1b[2Frow1: 50%\x1b[K\x1b[1Erow2: 30%\x1b[K");
+    t.process(b"\n\x1b]133;D;0\x07");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        "row1: 50%\nrow2: 30%\n",
+        "CSI E/F progress repaint must not grow rows"
+    );
+}
+
+#[test]
 fn horizontal_cursor_capture_uses_grid_clamped_columns() {
     for cursor_move in [b"\x1b[999C".as_slice(), b"\x1b[999G".as_slice()] {
         let mut t = Terminal::new(4, 10);
