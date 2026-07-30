@@ -135,7 +135,9 @@ impl GlyphAtlas {
         // Emoji (color bitmap glyphs like 📁📄) cannot be rasterized by font-kit
         // (it produces 0 pixels on A8). Use the CoreText/CG color path instead.
         if is_emoji_char(ch) {
-            if let Some(alpha) = rasterize_emoji_alpha(font, ch, glyph_w, cell_h) {
+            if let Some(alpha) =
+                rasterize_emoji_alpha(font, ch, scaled_size, glyph_w, cell_h, primary_descent_px)
+            {
                 return alpha;
             }
             // Fall through to font-kit if CoreText path fails.

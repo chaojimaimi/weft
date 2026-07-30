@@ -356,9 +356,7 @@ impl vte::Perform for Terminal {
         action: char,
     ) {
         self.suppress_joined_scalar = false;
-        // DECRQM private-mode query: CSI ? Ps $ p. OpenTUI probes mode 2026
-        // before using synchronized updates. Report it as supported and
-        // currently set/reset; unknown modes remain unsupported (0).
+        // DECRQM private-mode query; report DEC 2026 synchronized output.
         if action == 'p' && intermediates == [b'?', b'$'] {
             for sub in params.iter() {
                 if let &[mode] = sub {
@@ -385,7 +383,7 @@ impl vte::Perform for Terminal {
         }
 
         // Diagnostic: trace cursor-moving CSIs to pin down TUI cursor desync.
-        if matches!(action, 'H' | 'f' | 'G' | 'd') {
+        if super::capture_cursor::is_primary_screen_addressing(action, param(params, 0, 1)) {
             self.note_primary_screen_cursor_addressing();
         }
         if matches!(
@@ -414,11 +412,15 @@ impl vte::Perform for Terminal {
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'C' => {
-                self.grid.move_forward(param(params, 0, 1) as usize);
+                let amount = param(params, 0, 1) as usize;
+                self.grid.move_forward(amount);
+                self.capture_block_cursor_column(self.grid.cursor.col);
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'D' => {
-                self.grid.move_backward(param(params, 0, 1) as usize);
+                let amount = param(params, 0, 1) as usize;
+                self.grid.move_backward(amount);
+                self.capture_block_cursor_column(self.grid.cursor.col);
                 self.capture_primary_screen_interrupt_cursor_position(false);
             }
             'E' => {
@@ -452,6 +454,7 @@ impl vte::Perform for Terminal {
             'G' => {
                 let col = param(params, 0, 1) as usize;
                 self.grid.set_cursor_col(col.saturating_sub(1));
+                self.capture_block_cursor_column(self.grid.cursor.col);
                 self.capture_primary_screen_interrupt_cursor_position(col == 1);
             }
             'd' => {

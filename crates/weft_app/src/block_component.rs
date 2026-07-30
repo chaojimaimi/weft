@@ -46,7 +46,11 @@ pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPre
     if !duration.is_empty() {
         parts.push(duration);
     }
-    parts.push(status);
+    // Success is already conveyed by the normal block tone. Keep explicit
+    // status text for failures/interruption, where it is actionable.
+    if block.exit_code != Some(0) {
+        parts.push(status);
+    }
 
     BlockPresentation {
         label: parts.join(" · "),
@@ -91,7 +95,14 @@ pub(crate) fn block_prompt_lines(terminal: &Terminal) -> Option<usize> {
 
 /// Total/visible BlockView rows used by scrollbar and input geometry.
 pub(crate) fn completed_block_row_count(output_lines: usize, header_rows: usize) -> usize {
-    output_lines + header_rows.max(1) + 2 // command + accessible header band + gap
+    output_lines + command_output_gap_rows(output_lines) + header_rows.max(1) + 2
+    // command + accessible header band + separator
+}
+
+/// Warp-style breathing room between a command and its first output row.
+/// Empty/collapsed commands stay compact because there is no result to split.
+pub(crate) fn command_output_gap_rows(output_rows: usize) -> usize {
+    usize::from(output_rows > 0)
 }
 
 /// A successful shell `clear` leaves one terminal-sized blank screen between
@@ -128,8 +139,7 @@ pub(crate) fn completed_block_layout_rows(
     header_rows: usize,
     viewport_rows: usize,
 ) -> usize {
-    completed_block_output_rows(block, cols)
-        + completed_block_row_count(0, header_rows)
+    completed_block_row_count(completed_block_output_rows(block, cols), header_rows)
         + clear_block_spacer_rows(&block.command, viewport_rows)
 }
 
@@ -150,12 +160,12 @@ pub(crate) fn completed_block_match_row_from_bottom(
         .sum::<usize>();
     let lines = completed_block_visible_lines(block);
     if hit.is_command {
-        return hints
+        let output_rows = hints
             + lines
                 .iter()
                 .map(|line| block_line_chunks(line, cols).count())
-                .sum::<usize>()
-            + 1;
+                .sum::<usize>();
+        return output_rows + command_output_gap_rows(output_rows) + 1;
     }
 
     let line_index = hit.line.min(lines.len().saturating_sub(1));
@@ -179,6 +189,44 @@ pub(crate) fn completed_block_match_row_from_bottom(
         })
         .unwrap_or_else(|| chunks.len().saturating_sub(1));
     hints + rows_after + chunks.len().saturating_sub(chunk_index + 1) + 1
+}
+
+/// Convert a character-indexed find hit into wrapped visual-row ranges.
+/// Returned columns and lengths are terminal display columns, so CJK and
+/// other wide characters align with the glyphs painted by BlockView.
+pub(crate) fn block_match_visual_ranges(
+    line: &str,
+    hit_col: usize,
+    hit_len: usize,
+    cols: usize,
+) -> Vec<(usize, usize, usize)> {
+    let hit_end = hit_col.saturating_add(hit_len);
+    let mut source_col = 0usize;
+    let mut ranges = Vec::new();
+    for (chunk_index, chunk) in block_line_chunks(line, cols).enumerate() {
+        let chunk_len = chunk.chars().count();
+        let chunk_end = source_col + chunk_len;
+        let start = hit_col.max(source_col);
+        let end = hit_end.min(chunk_end);
+        if start < end {
+            let display_col = chunk
+                .chars()
+                .take(start - source_col)
+                .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum();
+            let display_len = chunk
+                .chars()
+                .skip(start - source_col)
+                .take(end - start)
+                .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum();
+            if display_len > 0 {
+                ranges.push((chunk_index, display_col, display_len));
+            }
+        }
+        source_col = chunk_end;
+    }
+    ranges
 }
 
 pub(crate) fn block_content_metrics(
@@ -223,8 +271,7 @@ pub(crate) fn block_content_metrics_with_cache(
                 }
             })
             .unwrap_or_else(|| completed_block_output_rows(block, cols));
-        total += output_rows
-            + completed_block_row_count(0, header_rows)
+        total += completed_block_row_count(output_rows, header_rows)
             + clear_block_spacer_rows(&block.command, viewport_rows);
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
@@ -233,11 +280,12 @@ pub(crate) fn block_content_metrics_with_cache(
             let start = lines
                 .len()
                 .saturating_sub(crate::paint::grid_cache::MAX_LAYOUT_LINES_LIVE);
-            total += lines[start..]
+            let output_rows = lines[start..]
                 .iter()
                 .map(|line| block_line_chunks(line, cols).count())
                 .sum::<usize>();
-            total += 2; // command + gap
+            total += output_rows + command_output_gap_rows(output_rows);
+            total += 2; // command + separator
             total += usize::from(live.cwd.or(terminal.cwd()).is_some());
         }
     }
@@ -338,7 +386,7 @@ mod tests {
     #[test]
     fn collapsed_block_uses_one_line_summary() {
         let presentation = block_presentation(&block(Some(0), true), 3);
-        assert_eq!(presentation.label, "3 lines · 1.2s · exit 0");
+        assert_eq!(presentation.label, "3 lines · 1.2s");
         assert_eq!(presentation.tone, BlockTone::Success);
     }
 
@@ -460,12 +508,19 @@ mod tests {
         let mut terminal = Terminal::new(24, 80);
         terminal.process(b"\x1b]133;A\x07opencode\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;130\x07");
 
-        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 5);
-        assert!(block_content_metrics(&terminal, 20, 1).0 > 5);
+        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 6);
+        assert!(block_content_metrics(&terminal, 20, 1).0 > 6);
         assert_eq!(
             block_content_metrics(&terminal, 80, 2).0,
             block_content_metrics(&terminal, 80, 1).0 + 1
         );
+    }
+
+    #[test]
+    fn command_output_gap_only_exists_when_a_result_is_visible() {
+        assert_eq!(command_output_gap_rows(0), 0);
+        assert_eq!(command_output_gap_rows(1), 1);
+        assert_eq!(command_output_gap_rows(2000), 1);
     }
 
     #[test]
@@ -481,7 +536,7 @@ mod tests {
         assert_eq!(clear_block_spacer_rows("printf clear", 6), 0);
 
         let total = block_content_metrics(&terminal, 80, 1).0;
-        assert_eq!(total, 13);
+        assert_eq!(total, 14);
         assert!(
             total.saturating_sub(terminal.grid().num_rows) >= terminal.grid().num_rows,
             "the block above clear must remain reachable: total={total}"
@@ -506,7 +561,19 @@ mod tests {
 
         // Both structural lines are clipped to one rendered row at 8 cols.
         // The block itself contributes command + header + gap.
-        assert_eq!(block_content_metrics(&terminal, 8, 1).0, 5);
+        assert_eq!(block_content_metrics(&terminal, 8, 1).0, 6);
+    }
+
+    #[test]
+    fn find_ranges_use_display_columns_for_cjk() {
+        let ranges = block_match_visual_ranges("中文测试：你好世界", 5, 2, 80);
+        assert_eq!(ranges, vec![(0, 10, 4)]);
+    }
+
+    #[test]
+    fn find_ranges_follow_wrapped_visual_chunk() {
+        let ranges = block_match_visual_ranges("abcd你好ef", 4, 2, 4);
+        assert_eq!(ranges, vec![(1, 0, 4)]);
     }
 
     #[test]
@@ -516,7 +583,7 @@ mod tests {
             b"\x1b]133;A\x07report\x1b]133;B\x07\x1b]133;C\x07output\r\n%\r\n$\r\n#\r\n\x1b]133;D;0\x07",
         );
 
-        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 4);
+        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 5);
     }
 
     #[test]
@@ -528,7 +595,7 @@ mod tests {
             .collect::<String>();
         terminal.process(output.as_bytes());
 
-        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 2002);
+        assert_eq!(block_content_metrics(&terminal, 80, 1).0, 2003);
     }
 
     #[test]
@@ -658,7 +725,11 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         cache.ensure_cached(&b, cols);
         let cached = cache.get(b.id.0);
-        let cached_rows: usize = cached.lines.iter().map(|l| l.chunks.len()).sum();
+        let cached_rows: usize = cached
+            .lines
+            .iter()
+            .map(|line| line.chunk_ranges.len())
+            .sum();
 
         // Direct path: completed_block_output_rows re-wraps.
         let direct_rows = completed_block_output_rows(&b, cols);

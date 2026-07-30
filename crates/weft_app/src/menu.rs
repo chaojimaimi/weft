@@ -108,6 +108,15 @@ declare_class!(
                 }
             }
         }
+
+        /// Route Quit through the Rust event loop so live PTYs can be
+        /// confirmed before AppKit terminates the process.
+        #[method(weftQuit:)]
+        fn weft_quit(&self, _sender: &AnyObject) {
+            if let Some(proxy) = MENU_PROXY.get() {
+                let _ = proxy.send_event(AppEvent::QuitRequested);
+            }
+        }
     }
 );
 
@@ -133,7 +142,7 @@ pub fn install(mtm: MainThreadMarker, proxy: EventLoopProxy<AppEvent>) {
     let menubar = NSMenu::new(mtm);
     // Weft (app) menu — re-create standard items so About/Services/Hide/Quit
     // keep working after we replace winit's default menu.
-    let app_menu = build_app_menu(mtm);
+    let app_menu = build_app_menu(mtm, &target);
     let app_item = NSMenuItem::new(mtm);
     app_item.setSubmenu(Some(&app_menu));
     menubar.addItem(&app_item);
@@ -322,9 +331,9 @@ pub fn install(mtm: MainThreadMarker, proxy: EventLoopProxy<AppEvent>) {
     app.setMainMenu(Some(&menubar));
 }
 
-/// Build the app (Weft) menu with standard macOS items wired to system
-/// selectors: About, Services, Hide, Hide Others, Show All, Quit.
-fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
+/// Build the app (Weft) menu. Non-destructive standard items use system
+/// selectors; Quit routes through `WeftMenuTarget` for live-process checks.
+fn build_app_menu(mtm: MainThreadMarker, target: &WeftMenuTarget) -> Retained<NSMenu> {
     let menu = NSMenu::new(mtm);
     menu.addItem(&stock_item(
         mtm,
@@ -359,12 +368,16 @@ fn build_app_menu(mtm: MainThreadMarker) -> Retained<NSMenu> {
         ns_string!(""),
     ));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&stock_item(
-        mtm,
-        ns_string!("Quit Weft"),
-        Some(sel!(terminate:)),
-        ns_string!("q"),
-    ));
+    let quit = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc(),
+            ns_string!("Quit Weft"),
+            Some(sel!(weftQuit:)),
+            ns_string!("q"),
+        )
+    };
+    unsafe { quit.setTarget(Some(target)) };
+    menu.addItem(&quit);
     // Register the Services submenu so macOS populates it with services.
     let app = NSApplication::sharedApplication(mtm);
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {

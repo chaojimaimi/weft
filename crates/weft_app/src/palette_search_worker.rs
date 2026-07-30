@@ -24,6 +24,7 @@ struct SearchRequest {
 pub(crate) struct PaletteSearchResult {
     pub generation: u64,
     pub hits: Vec<SearchHit>,
+    pub error: Option<String>,
 }
 
 pub(crate) struct PaletteSearchWorker {
@@ -39,7 +40,7 @@ impl PaletteSearchWorker {
     /// Spawn the worker. Returns None if the DB can't be opened.
     pub(crate) fn spawn(db_path: PathBuf, waker: SearchWaker) -> Option<Self> {
         let conn = rusqlite::Connection::open(&db_path).ok()?;
-        let index = SearchIndex::open(conn);
+        let index = SearchIndex::open(conn).ok()?;
         let (query_tx, query_rx) = bounded::<SearchRequest>(1);
         let (result_tx, result_rx) = bounded::<PaletteSearchResult>(8);
         let generation = Arc::new(AtomicU64::new(0));
@@ -73,10 +74,14 @@ impl PaletteSearchWorker {
                 limit: req.limit,
                 cwd: req.cwd.as_deref(),
             };
-            let hits = index.search(&q).unwrap_or_default();
+            let (hits, error) = match index.search(&q) {
+                Ok(hits) => (hits, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
             let _ = result_tx.send(PaletteSearchResult {
                 generation: req.generation,
                 hits,
+                error,
             });
             waker();
         }
@@ -149,65 +154,116 @@ pub(crate) fn open_search_index(
             return None;
         }
     };
-    let index = SearchIndex::open(conn);
-    // Rebuild index from BlockStore if empty.
-    if index.count().unwrap_or(0) == 0 {
-        if let Some(store) = block_store {
-            if let Ok(blocks) = store.recent(10000) {
-                let mut docs: Vec<_> = blocks
-                    .iter()
-                    .map(|b| {
-                        let started_ms = b
-                            .started_at
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
-                        weft_core::search::SearchDocument::from_block(
-                            b.id.0,
-                            &b.command,
-                            b.output.as_ref(),
-                            b.cwd.as_deref(),
-                            started_ms,
-                        )
-                    })
-                    .collect();
-                // v1.7.3-D: append bookmark annotations so they enter
-                // unified search on cold start.
-                if let Some(ann_store) = annotation_store {
-                    if let Ok(bookmarks) = ann_store.bookmarked() {
-                        for ann in &bookmarks {
-                            // Look up the block for command + cwd.
-                            if let Ok(Some(block)) = store.get(ann.block_id) {
-                                let updated_ms = ann
-                                    .updated_at
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as i64)
-                                    .unwrap_or(0);
-                                docs.push(weft_core::search::SearchDocument::from_bookmark(
-                                    ann.block_id.0,
-                                    ann.note.as_deref(),
-                                    &block.command,
-                                    &ann.tags,
-                                    block.cwd.as_deref(),
-                                    updated_ms,
-                                ));
-                            }
+    let index = match SearchIndex::open(conn) {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to initialize search index");
+            return None;
+        }
+    };
+    // Reconcile persisted blocks and annotations on every startup. The index
+    // is disposable, and older versions did not incrementally maintain every
+    // kind, so a total-count check would leave upgrades permanently stale.
+    if let Some(store) = block_store {
+        if let Ok(blocks) = store.recent(10000) {
+            let mut docs: Vec<_> = blocks
+                .iter()
+                .map(|b| {
+                    let started_ms = b
+                        .started_at
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    weft_core::search::SearchDocument::from_block(
+                        b.id.0,
+                        &b.command,
+                        b.output.as_ref(),
+                        b.cwd.as_deref(),
+                        started_ms,
+                    )
+                })
+                .collect();
+            if let Some(ann_store) = annotation_store {
+                if let Ok(annotations) = ann_store.load_all() {
+                    for ann in annotations.values() {
+                        // Look up the block for command + cwd.
+                        if let Ok(Some(block)) = store.get(ann.block_id) {
+                            let updated_ms = ann
+                                .updated_at
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            docs.push(weft_core::search::SearchDocument::from_bookmark(
+                                ann.block_id.0,
+                                ann.note.as_deref(),
+                                &block.command,
+                                &ann.tags,
+                                block.cwd.as_deref(),
+                                updated_ms,
+                            ));
                         }
-                        tracing::info!(
-                            bookmark_count = bookmarks.len(),
-                            "bookmarks indexed on cold start"
-                        );
                     }
+                    tracing::info!(
+                        annotation_count = annotations.len(),
+                        "annotations indexed on cold start"
+                    );
                 }
-                if let Err(e) = index.rebuild(&docs) {
-                    tracing::warn!(error = %e, "failed to rebuild search index");
-                } else {
-                    tracing::info!(count = docs.len(), "search index rebuilt");
-                }
+            }
+            if let Err(e) = index.replace_kinds(
+                &[SearchDocumentKind::Block, SearchDocumentKind::Bookmark],
+                &docs,
+            ) {
+                tracing::warn!(error = %e, "failed to reconcile search index");
+            } else {
+                tracing::info!(count = docs.len(), "search index reconciled");
             }
         }
     }
     Some(index)
+}
+
+pub(crate) fn sync_workflow_documents(
+    index: &SearchIndex,
+    store: &weft_core::workflow::WorkflowStore,
+) -> Result<(), String> {
+    index
+        .delete_kind(SearchDocumentKind::Workflow)
+        .map_err(|e| e.to_string())?;
+    for workflow in store.list().map_err(|e| e.to_string())? {
+        index
+            .upsert(&weft_core::search::SearchDocument::from_workflow(&workflow))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub(crate) fn upsert_workspace_document(
+    index: &SearchIndex,
+    path: &std::path::Path,
+    workspace: &weft_core::workspace::WorkspaceDocument,
+) -> rusqlite::Result<()> {
+    let updated_ms = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_else(weft_core::search::SearchDocument::now_ms);
+    index.upsert(&weft_core::search::SearchDocument::from_workspace(
+        &path.to_string_lossy(),
+        workspace,
+        updated_ms,
+    ))
+}
+
+pub(crate) fn index_workspace_document(
+    index: Option<&SearchIndex>,
+    path: &std::path::Path,
+    workspace: &weft_core::workspace::WorkspaceDocument,
+) {
+    let Some(index) = index else { return };
+    if let Err(error) = upsert_workspace_document(index, path, workspace) {
+        tracing::warn!(%error, path = %path.display(), "failed to index workspace");
+    }
 }
 
 /// v1.7.1: Spawn the palette search worker, wiring the waker to send

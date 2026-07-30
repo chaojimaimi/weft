@@ -2,10 +2,57 @@
 
 use std::collections::{HashMap, HashSet};
 
+use font_kit::family_name::FamilyName;
+use font_kit::properties::Properties;
+use font_kit::source::SystemSource;
 use weft_core::config::{Action, Config, FontConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
 use weft_core::input::{KeyCode, Modifiers};
 
 pub(crate) type FieldError = (String, String);
+
+const PROGRAMMING_FONT_FAMILIES: &[&str] = &[
+    "Menlo",
+    "Hack",
+    "JetBrains Mono",
+    "SF Mono",
+    "Monaco",
+    "Fira Code",
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Iosevka",
+    "Berkeley Mono",
+    "MesloLGS NF",
+    "Hack Nerd Font Mono",
+    "Source Code Pro",
+    "IBM Plex Mono",
+    "Ubuntu Mono",
+    "Courier New",
+];
+
+fn filtered_programming_fonts(
+    current: &str,
+    mut is_available: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    let mut families: Vec<String> = PROGRAMMING_FONT_FAMILIES
+        .iter()
+        .copied()
+        .filter(|family| *family == "Menlo" || *family == current || is_available(family))
+        .map(str::to_owned)
+        .collect();
+    if !current.is_empty() && !families.iter().any(|family| family == current) {
+        families.push(current.to_owned());
+    }
+    families
+}
+
+pub(crate) fn available_programming_fonts(current: &str) -> Vec<String> {
+    let source = SystemSource::new();
+    filtered_programming_fonts(current, |family| {
+        source
+            .select_best_match(&[FamilyName::Title(family.to_owned())], &Properties::new())
+            .is_ok()
+    })
+}
 
 pub(crate) fn runtime_font_config(config: &FontConfig) -> FontConfig {
     let defaults = FontConfig::default();
@@ -49,6 +96,14 @@ pub(crate) fn runtime_opacity(opacity: f32) -> f32 {
     }
 }
 
+pub(crate) fn runtime_minimum_contrast(minimum_contrast: f32) -> f32 {
+    if minimum_contrast.is_finite() {
+        minimum_contrast.clamp(1.0, 12.0)
+    } else {
+        weft_core::config::ThemeConfig::default().minimum_contrast
+    }
+}
+
 pub(crate) fn runtime_sidebar_width(width: Option<f32>) -> Option<f32> {
     width.filter(|value| (SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH).contains(value))
 }
@@ -67,6 +122,14 @@ pub(crate) fn adjust_finite_value(
         fallback
     };
     (base + delta as f32 * step).clamp(min, max)
+}
+
+pub(crate) fn directional_bool(current: bool, delta: i32) -> bool {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => current,
+    }
 }
 
 pub(crate) fn detect_keybinding_conflicts(
@@ -134,6 +197,13 @@ pub(crate) fn validate_settings(config: &Config) -> Vec<FieldError> {
         0.5,
         1.0,
     );
+    push_float_range(
+        &mut errors,
+        "Minimum Contrast",
+        config.theme.minimum_contrast,
+        1.0,
+        12.0,
+    );
     if !(1_000..=100_000).contains(&config.scrollback.lines) {
         errors.push(("Scrollback".into(), "Must be 1000–100000 lines".into()));
     }
@@ -176,6 +246,33 @@ mod tests {
     }
 
     #[test]
+    fn programming_font_catalog_filters_missing_and_preserves_custom_current() {
+        let installed = ["Hack", "Fira Code"];
+        let families = filtered_programming_fonts("My Mono", |family| installed.contains(&family));
+        assert_eq!(families[0], "Menlo");
+        assert!(families.iter().any(|family| family == "Hack"));
+        assert!(families.iter().any(|family| family == "Fira Code"));
+        assert!(families.iter().any(|family| family == "My Mono"));
+        assert!(!families.iter().any(|family| family == "JetBrains Mono"));
+    }
+
+    #[test]
+    fn directional_booleans_use_left_for_off_and_right_for_on() {
+        assert!(!directional_bool(true, -1));
+        assert!(!directional_bool(false, -1));
+        assert!(directional_bool(false, 1));
+        assert!(directional_bool(true, 1));
+        assert!(directional_bool(true, 0));
+        assert!(!directional_bool(false, 0));
+    }
+
+    #[test]
+    fn programming_font_catalog_keeps_unavailable_selected_candidate() {
+        let families = filtered_programming_fonts("JetBrains Mono", |_| false);
+        assert_eq!(families, ["Menlo", "JetBrains Mono"]);
+    }
+
+    #[test]
     fn display_conflicts_require_different_actions_on_the_same_label() {
         let views = [kb("Copy", "cmd+x"), kb("Paste", "cmd+x")];
         assert!(detect_keybinding_conflicts(&views).contains("cmd+x"));
@@ -202,6 +299,7 @@ mod tests {
         assert!(font.line_height.is_infinite());
         assert_eq!(runtime_opacity(f32::NAN), 1.0);
         assert_ne!(runtime_opacity(f32::NAN), runtime_opacity(0.95));
+        assert_eq!(runtime_minimum_contrast(f32::NAN), 7.0);
         assert_eq!(runtime_sidebar_width(Some(f32::NAN)), None);
     }
 
@@ -215,6 +313,7 @@ mod tests {
         assert_eq!(runtime_font_config(&font).size, 18.0);
         assert_eq!(runtime_font_config(&font).line_height, 1.4);
         assert_eq!(runtime_opacity(0.75), 0.75);
+        assert_eq!(runtime_minimum_contrast(5.5), 5.5);
         assert_eq!(runtime_sidebar_width(Some(300.0)), Some(300.0));
     }
 
@@ -238,6 +337,7 @@ mod tests {
         config.font.size = f32::NAN;
         config.font.line_height = f32::INFINITY;
         config.window.opacity = f32::NEG_INFINITY;
+        config.theme.minimum_contrast = f32::NAN;
         config.scrollback.lines = 100;
         config.window.padding_x = 21;
         config.window.padding_y = 21;
@@ -252,6 +352,7 @@ mod tests {
             "Font Size",
             "Line Height",
             "Window Opacity",
+            "Minimum Contrast",
             "Scrollback",
             "Padding X",
             "Padding Y",
@@ -269,6 +370,7 @@ mod tests {
         config.font.size = 8.0;
         config.font.line_height = 1.0;
         config.window.opacity = 0.5;
+        config.theme.minimum_contrast = 1.0;
         config.scrollback.lines = 1_000;
         config.window.padding_x = 20;
         config.window.padding_y = 20;
@@ -279,6 +381,7 @@ mod tests {
 
         config.font.size = 24.0;
         config.font.line_height = 1.5;
+        config.theme.minimum_contrast = 12.0;
         config.window.opacity = 1.0;
         config.scrollback.lines = 100_000;
         config.window.width = 4_000;

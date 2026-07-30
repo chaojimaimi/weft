@@ -104,29 +104,40 @@ impl MetalRenderer {
         }
     }
 
-    /// Lay out a line left-to-right, coloring each shell token by its kind
-    /// (syntax highlight). `default_fg` is used for Whitespace/Default tokens.
-    /// Wide-character aware: CJK chars occupy 2 columns. Glyphs must already
-    /// be in the atlas (warmed up by the caller).
-    pub(crate) fn push_line_tokenized(
+    pub(crate) fn push_line_tokenized_on_canvas(
         &self,
         vertices: &mut Vec<f32>,
-        x: f32,
-        y: f32,
+        origin: [f32; 2],
         line: &str,
         max_cols: usize,
+        canvas: [f32; 4],
+        selection: Option<(usize, usize, [f32; 4])>,
     ) {
         let cw = self.cell_width() as f32;
+        let [x, y] = origin;
         let mut col = 0usize;
         let mut px = x;
+        let mut char_index = 0usize;
         for token in syntax::tokenize(line) {
             if col >= max_cols {
                 break;
             }
-            let color = syntax_color(token.kind, &self.theme);
+            let source_color = syntax_color(token.kind, &self.theme);
             for grapheme in token.text.graphemes(true) {
+                let grapheme_end = char_index + grapheme.chars().count();
+                let background = crate::paint::primitives::text_background_for_range(
+                    canvas,
+                    selection,
+                    char_index..grapheme_end,
+                );
+                let color = crate::paint::primitives::ensure_minimum_text_contrast(
+                    source_color,
+                    background,
+                    self.minimum_contrast,
+                );
                 let w = weft_core::grid::terminal_text_width(grapheme);
                 if w == 0 {
+                    char_index = grapheme_end;
                     continue;
                 }
                 if col + w > max_cols {
@@ -147,6 +158,7 @@ impl MetalRenderer {
                     px += cell_w;
                 }
                 col += w;
+                char_index = grapheme_end;
             }
         }
     }

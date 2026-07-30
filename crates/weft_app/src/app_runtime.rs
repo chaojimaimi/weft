@@ -160,6 +160,8 @@ impl ApplicationHandler<AppEvent> for App {
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
+                self.poll_completion_results();
+                self.poll_runbook_results();
                 schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
                 if self.sessions.tabs().iter().any(|tab| {
                     tab.terminal
@@ -225,6 +227,9 @@ impl ApplicationHandler<AppEvent> for App {
                 // v1.1: native menu click → reuse the same dispatch as
                 // keybindings. execute_action redraws where needed.
                 self.execute_action(action);
+            }
+            AppEvent::QuitRequested => {
+                self.request_application_close(event_loop);
             }
             AppEvent::AccessibilityPress {
                 generation,
@@ -315,6 +320,8 @@ impl ApplicationHandler<AppEvent> for App {
             &window,
             self.config_state.config.font.clone(),
             startup_theme,
+            self.config_state.config.theme.minimum_contrast,
+            self.config_state.config.theme.semantic_output_enabled(),
             (win.padding_x, win.padding_y),
             win.opacity,
         );
@@ -403,6 +410,11 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
         self.sessions.set_annotation_store(annotation_store);
+        self.bookmarked_blocks = self
+            .sessions
+            .annotation_store()
+            .and_then(|store| store.bookmarked_ids().ok())
+            .unwrap_or_default();
 
         // v1.7.1: Open the search index (sidecar to blocks.db) for main-thread
         // upsert/delete. The background PaletteSearchWorker owns its own
@@ -486,6 +498,11 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
         });
+        if let (Some(index), Some(store)) = (&self.search_index, &self.palette.store) {
+            if let Err(e) = crate::palette_search_worker::sync_workflow_documents(index, store) {
+                warn!(error = %e, "failed to index workflows");
+            }
+        }
 
         // Cursor-blink timer: wake the loop ~2x/sec so the caret toggles
         // without a vsync busy-loop. Exits when the event loop drops the proxy.

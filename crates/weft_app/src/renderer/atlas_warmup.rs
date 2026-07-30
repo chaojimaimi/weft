@@ -7,6 +7,7 @@ use crate::glyph::GlyphAtlas;
 use crate::overlay::{OverlayContent, OverlayWarmup, PaletteDrawParams, SettingsDrawParams};
 use crate::paint::overlays::{FindDrawState, NoteEditorDrawState};
 use crate::paint::panel::PanelDrawParams;
+use crate::paint::preedit::TuiPreeditDrawParams;
 use crate::paint::prompt::PromptDrawParams;
 use crate::paint::tab_bar::TabBarDrawState;
 use crate::paint::ui_helpers::{block_duration_str, panel_display, visible_panel_rows};
@@ -34,6 +35,7 @@ impl MetalRenderer {
         grid: &Grid,
         panel: Option<&PanelDrawParams<'_>>,
         prompt: Option<&PromptDrawParams<'_>>,
+        tui_preedit: Option<TuiPreeditDrawParams<'_>>,
         completions: Option<(&[Match], usize)>,
         palette: Option<&PaletteDrawParams<'_>>,
         settings: Option<&SettingsDrawParams<'_>>,
@@ -97,6 +99,9 @@ impl MetalRenderer {
                     missing.extend(m.chars());
                 }
             }
+        }
+        if let Some(preedit) = tui_preedit {
+            missing.extend(preedit.text.chars());
         }
         // Completion popup warm-up: scan emoji icons + match labels.
         if let Some((completions, _)) = completions {

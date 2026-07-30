@@ -22,6 +22,7 @@ pub(crate) enum PaletteEntry {
     /// workspace, or bookmark). Activating a history hit fills the editor
     /// with the command — no auto-execution.
     SearchHit(SearchHit),
+    Runbook(weft_core::runbook::RunbookEntry),
 }
 
 impl PaletteEntry {
@@ -41,6 +42,7 @@ impl PaletteEntry {
             Self::SearchHit(hit) => {
                 format!("search/{}/{}", hit.doc.kind as u8, hit.doc.stable_id)
             }
+            Self::Runbook(entry) => format!("runbook/{}", entry.command),
         }
     }
 }
@@ -67,6 +69,7 @@ pub(crate) enum BuiltinCmd {
     /// the session tree. PTY processes are NOT restored — each leaf spawns
     /// a fresh shell in the saved cwd.
     OpenWorkspace,
+    ImportRunbook,
 }
 
 impl BuiltinCmd {
@@ -80,6 +83,7 @@ impl BuiltinCmd {
             Self::ExportConfig => "Export Config",
             Self::SaveWorkspace => "Save Workspace",
             Self::OpenWorkspace => "Open Workspace",
+            Self::ImportRunbook => "Open Runbook",
         }
     }
 
@@ -93,6 +97,7 @@ impl BuiltinCmd {
             Self::ExportConfig => "export-config",
             Self::SaveWorkspace => "save-workspace",
             Self::OpenWorkspace => "open-workspace",
+            Self::ImportRunbook => "import-runbook",
         }
     }
 }
@@ -170,6 +175,7 @@ pub(crate) struct PaletteState {
     pub(crate) search_generation: u64,
     /// v1.7.1: True when a search query is in-flight (for "searching..." indicator).
     pub(crate) search_pending: bool,
+    pub(crate) runbook_entries: Vec<weft_core::runbook::RunbookEntry>,
 }
 
 impl PaletteState {
@@ -186,6 +192,7 @@ impl PaletteState {
             search_worker: None,
             search_generation: 0,
             search_pending: false,
+            runbook_entries: Vec::new(),
         }
     }
 
@@ -226,6 +233,7 @@ impl PaletteState {
         self.results.clear();
         self.form = None;
         self.submode = PaletteSubMode::Search;
+        self.runbook_entries.clear();
     }
 }
 

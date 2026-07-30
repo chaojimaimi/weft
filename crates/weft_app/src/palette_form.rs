@@ -137,10 +137,22 @@ impl App {
                             last_used_ms: 0,
                         };
                         if let Some(store) = &self.palette.store {
-                            if let Err(e) = store.insert(&wf) {
-                                warn!(error = %e, "failed to save new workflow");
-                            } else {
-                                info!(name = %wf.name, "workflow created");
+                            match store.insert(&wf) {
+                                Err(e) => warn!(error = %e, "failed to save new workflow"),
+                                Ok(id) => {
+                                    let mut indexed = wf.clone();
+                                    indexed.id = id;
+                                    if let Some(index) = &self.search_index {
+                                        if let Err(e) = index.upsert(
+                                            &weft_core::search::SearchDocument::from_workflow(
+                                                &indexed,
+                                            ),
+                                        ) {
+                                            warn!(error = %e, "failed to index new workflow");
+                                        }
+                                    }
+                                    info!(name = %wf.name, "workflow created");
+                                }
                             }
                         }
 
@@ -215,6 +227,13 @@ impl App {
                         if let Err(e) = store.update(&wf) {
                             warn!(error = %e, "failed to update workflow");
                         } else {
+                            if let Some(index) = &self.search_index {
+                                if let Err(e) = index
+                                    .upsert(&weft_core::search::SearchDocument::from_workflow(&wf))
+                                {
+                                    warn!(error = %e, "failed to reindex workflow");
+                                }
+                            }
                             info!(name = %name, "workflow updated");
                         }
                     }
@@ -270,6 +289,14 @@ impl App {
                     if let Err(e) = store.delete(id) {
                         warn!(error = %e, "failed to delete workflow");
                     } else {
+                        if let Some(index) = &self.search_index {
+                            if let Err(e) = index.delete(
+                                weft_core::search::SearchDocumentKind::Workflow,
+                                &id.to_string(),
+                            ) {
+                                warn!(error = %e, "failed to remove workflow from search index");
+                            }
+                        }
                         info!(name = %name, "workflow deleted");
                     }
                 }

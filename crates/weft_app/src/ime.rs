@@ -7,7 +7,6 @@
 
 use objc2::rc::Retained;
 use objc2_app_kit::NSView;
-use unicode_width::UnicodeWidthChar;
 use weft_core::input::InputMode;
 use weft_core::input::{InputHandler, KeyCode, Modifiers};
 use weft_core::vt::Terminal;
@@ -15,7 +14,7 @@ use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
-use crate::layout::{layout_prompt, LayoutCtx};
+use crate::layout::LayoutCtx;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ImeCursorArea {
@@ -39,16 +38,10 @@ fn editor_cursor_area_from_buffer(
     ctx: LayoutCtx,
     lines: &[String],
     cursor: (usize, usize),
-    scroll_offset: usize,
+    _scroll_offset: usize,
 ) -> Option<ImeCursorArea> {
-    let (line_index, char_index) = cursor;
-    let line = lines.get(line_index)?;
-    let display_col = line
-        .chars()
-        .take(char_index)
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
-        .sum();
-    let prompt = layout_prompt(&ctx, lines.len(), line_index, display_col, scroll_offset);
+    lines.get(cursor.0)?;
+    let (_, prompt, _) = crate::paint::prompt::prompt_layout_for_buffer(&ctx, lines, cursor);
     Some(ImeCursorArea {
         x: prompt.cursor_x,
         y: prompt.cursor_y,
@@ -239,8 +232,9 @@ mod tests {
         let ctx = LayoutCtx::new((800.0, 600.0), 10.0, 20.0, 12.0, 8.0);
         let lines = vec!["A中B".to_string()];
         let area = editor_cursor_area_from_buffer(ctx, &lines, (0, 2), 0).unwrap();
-        // Prompt text begins after "❯ " (two cells); A + 中 occupy 3 cells.
-        assert_eq!(area.x, 12.0 + 5.0 * 10.0);
+        // Text has a 1.5-cell content gutter, then "> " (two cells);
+        // A + 中 occupy three more cells.
+        assert_eq!(area.x, 12.0 + 6.5 * 10.0);
         assert_eq!(area.y, 552.0);
         assert_eq!(area.width, 10.0);
         assert_eq!(area.height, 20.0);

@@ -117,7 +117,7 @@ impl crate::App {
                 true
             }
             Action::CloseTab => {
-                let effects = self.close_tab();
+                let effects = self.close_active_tab_with_confirmation();
                 self.drain_effects(effects);
                 true
             }
@@ -237,8 +237,11 @@ impl crate::App {
                 {
                     // Preserve the final pane's Terminal until close_tab()
                     // settles and persists any pending block output.
-                    let effects = self.close_tab();
+                    let effects = self.close_active_tab_with_confirmation();
                     self.drain_effects(effects);
+                    return true;
+                }
+                if !self.confirm_active_pane_close() {
                     return true;
                 }
                 match self.sessions.active_mut().close_active_pane() {

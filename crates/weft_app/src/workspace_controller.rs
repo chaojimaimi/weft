@@ -45,15 +45,15 @@ use tracing::{info, warn};
 use weft_core::pane_layout::{PaneId, PaneTree, SplitDirection};
 use weft_core::workspace::{WorkspaceDocument, WorkspaceError, WorkspacePaneNode, WorkspaceWindow};
 
+use crate::palette_search_worker::index_workspace_document;
 use crate::pane::Pane;
 use crate::tab::Tab;
 use crate::App;
 
 #[path = "workspace_profile.rs"]
 mod workspace_profile;
-use workspace_profile::{
-    profile_restore_target, ProfileRestoreTarget, WorkspaceRestoreOutcome, WorkspaceRestoreWarning,
-};
+pub(crate) use workspace_profile::WorkspaceRestoreOutcome;
+use workspace_profile::{profile_restore_target, ProfileRestoreTarget, WorkspaceRestoreWarning};
 
 /// Type alias for the closure used by [`build_subtree`] to create a new pane
 /// when descending into a `Split` node's second child. The closure receives
@@ -433,6 +433,7 @@ impl App {
         };
         doc.save(&path)
             .map_err(WorkspaceInteractionError::Workspace)?;
+        index_workspace_document(self.search_index.as_ref(), &path, &doc);
         info!(path = %path.display(), "workspace saved");
         Ok(())
     }
@@ -446,12 +447,14 @@ impl App {
         let path = crate::macos_file_dialog::pick_workspace_open_path(mtm)?
             .ok_or(WorkspaceInteractionError::Cancelled)?;
         let doc = WorkspaceDocument::load(&path).map_err(WorkspaceInteractionError::Workspace)?;
-        let outcome =
-            self.restore_workspace(&doc)
-                .map_err(|e| WorkspaceInteractionError::Restore {
-                    source: e,
-                    path: path.clone(),
-                })?;
+        let outcome = self
+            .restore_workspace_with_confirmation(&doc)
+            .map_err(|e| WorkspaceInteractionError::Restore {
+                source: e,
+                path: path.clone(),
+            })?
+            .ok_or(WorkspaceInteractionError::Cancelled)?;
+        index_workspace_document(self.search_index.as_ref(), &path, &doc);
         if let Some(warning) = outcome.warning() {
             warn!(warning = %warning, path = %path.display(), "workspace restored with warning");
             self.surface_config_error(&warning.to_string());

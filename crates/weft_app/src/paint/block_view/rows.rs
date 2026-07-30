@@ -57,6 +57,8 @@ impl MetalRenderer {
             block_scroll,
             viewport_rows,
             block_hovered: _,
+            block_selected: _,
+            block_action_hovered: _,
             spinner_phase: _,
             find_block_highlight: _,
             palette: _,
@@ -86,13 +88,7 @@ impl MetalRenderer {
         // resolve_styles=false: hit-testing doesn't need StyledLine lookups.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
-            for b in blocks.iter() {
-                cache.ensure_cached(b, cols);
-            }
-            // R2-2 (Batch 7): build prefix sum so the layout pass can
-            // binary-search the visible range. Must mirror the paint path
-            // (build_block_view_vertices) so hit-testing y-bands match.
-            cache.build_prefix_sum(blocks);
+            cache.sync_blocks(blocks, cols);
         }
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
@@ -118,7 +114,7 @@ impl MetalRenderer {
         };
 
         // Extract bv_rows from the layout output.
-        let scroll_px = (block_scroll as f32) * pitch;
+        let scroll_px = block_scroll * pitch;
         let mut bv_rows = Vec::new();
 
         for (i, &dist) in layout_out.rows.iter().enumerate() {

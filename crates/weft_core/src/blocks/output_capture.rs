@@ -12,6 +12,10 @@ use super::style::{
     build_styled_output_from_runs, CapturedStyle, CapturedStyleRun, MAX_STYLE_RUNS_PER_BLOCK,
 };
 
+#[cfg(test)]
+mod crlf_tests;
+mod cursor;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutputCapture {
     text: String,
@@ -135,7 +139,15 @@ impl OutputCapture {
         if self.truncated {
             return;
         }
+        let line_start = self.line_start();
         self.cursor = self.line_end();
+        // PTYs commonly translate LF to CRLF. The preceding CR leaves the
+        // capture cursor at column zero, so advance the parallel character
+        // cursor across the existing line before consuming/appending LF.
+        // Otherwise every following ANSI run is indexed near the start of
+        // the transcript even though the plain text remains correct.
+        self.char_cursor =
+            self.line_start_char + self.text[line_start..self.cursor].chars().count() as u32;
         if self.text.as_bytes().get(self.cursor) == Some(&b'\n') {
             self.cursor += 1;
             self.char_cursor += 1;
@@ -149,25 +161,6 @@ impl OutputCapture {
             self.line_start_char = self.char_cursor;
         } else {
             self.truncated = true;
-        }
-    }
-
-    pub(crate) fn carriage_return(&mut self) {
-        self.cursor = self.line_start();
-        self.char_cursor = self.line_start_char;
-    }
-
-    pub(crate) fn backspace(&mut self) {
-        let start = self.line_start();
-        if self.cursor > start {
-            self.cursor -= 1;
-            while !self.text.is_char_boundary(self.cursor) {
-                self.cursor -= 1;
-            }
-            // char_cursor tracks the previous char; decrement by 1 (the char
-            // we moved over). Style runs are unaffected — the backspace'd
-            // char retains its style until overwritten.
-            self.char_cursor = self.char_cursor.saturating_sub(1);
         }
     }
 
@@ -302,61 +295,49 @@ impl OutputCapture {
         if self.style_overflow || start >= end {
             return;
         }
-        // Partition: runs ending <= start stay; runs starting >= end stay.
-        let runs = std::mem::take(&mut self.style_runs);
-        let mut left = Vec::with_capacity(runs.len());
-        let mut right = Vec::with_capacity(runs.len());
-        for run in runs {
-            if run.end_char <= start {
-                left.push(run);
-            } else if run.start_char >= end {
-                right.push(run);
-            } else {
-                // Overlap: truncate the run to the non-overlapping portion(s).
-                if run.start_char < start {
-                    left.push(CapturedStyleRun {
-                        end_char: start,
-                        ..run
-                    });
-                }
-                if run.end_char > end {
-                    right.push(CapturedStyleRun {
-                        start_char: end,
-                        ..run
-                    });
-                }
-            }
+        let first = self.style_runs.partition_point(|run| run.end_char <= start);
+        let last = self.style_runs.partition_point(|run| run.start_char < end);
+        let mut replacement = Vec::with_capacity(3);
+        if first < self.style_runs.len() && self.style_runs[first].start_char < start {
+            replacement.push(CapturedStyleRun {
+                end_char: start,
+                ..self.style_runs[first]
+            });
         }
-        // Append the new run (if non-default) with neighbor coalescing.
         if !style.is_default() {
-            // Coalesce with the preceding run if same style + adjacent.
-            let coalesce_left = left
-                .last()
-                .is_some_and(|last| last.end_char == start && last.style == style);
-            if coalesce_left {
-                left.last_mut().unwrap().end_char = end;
+            replacement.push(CapturedStyleRun {
+                start_char: start,
+                end_char: end,
+                style,
+            });
+        }
+        if first < last && self.style_runs[last - 1].end_char > end {
+            replacement.push(CapturedStyleRun {
+                start_char: end,
+                ..self.style_runs[last - 1]
+            });
+        }
+        let replacement_len = replacement.len();
+        self.style_runs.splice(first..last, replacement);
+
+        // Only the replacement boundaries can have become coalescible.
+        let mut index = first.saturating_sub(1);
+        let merge_end = (first + replacement_len + 1).min(self.style_runs.len());
+        while index + 1 < self.style_runs.len() && index < merge_end {
+            let can_merge = self.style_runs[index].end_char
+                == self.style_runs[index + 1].start_char
+                && self.style_runs[index].style == self.style_runs[index + 1].style;
+            if can_merge {
+                let end_char = self.style_runs[index + 1].end_char;
+                self.style_runs[index].end_char = end_char;
+                self.style_runs.remove(index + 1);
             } else {
-                left.push(CapturedStyleRun {
-                    start_char: start,
-                    end_char: end,
-                    style,
-                });
-            }
-            // Coalesce with the following run if same style + adjacent.
-            let coalesce_right = right
-                .first()
-                .is_some_and(|first| first.start_char == end && first.style == style);
-            if coalesce_right {
-                let merged = right.remove(0);
-                left.last_mut().unwrap().end_char = merged.end_char;
+                index += 1;
             }
         }
-        left.extend(right);
-        if left.len() > MAX_STYLE_RUNS_PER_BLOCK {
+        if self.style_runs.len() > MAX_STYLE_RUNS_PER_BLOCK {
             self.style_overflow = true;
             self.style_runs.clear();
-        } else {
-            self.style_runs = left;
         }
     }
 
@@ -425,6 +406,27 @@ mod tests {
         output.carriage_return();
         output.print_ascii(b"Upgrading...", CapturedStyle::default(), 1024);
         assert_eq!(output.as_str(), "Upgrading...");
+    }
+
+    #[test]
+    fn horizontal_absolute_rewrites_spinner_frame_in_place() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"Upgrading.", CapturedStyle::default(), 1024);
+        output.set_cursor_column(0, 1024);
+        output.print_ascii(b"Upgrading..", CapturedStyle::default(), 1024);
+        output.set_cursor_column(0, 1024);
+        output.print_ascii(b"Upgrading...", CapturedStyle::default(), 1024);
+        output.erase_line(0);
+        assert_eq!(output.as_str(), "Upgrading...");
+    }
+
+    #[test]
+    fn relative_cursor_movement_rewrites_instead_of_appending() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"status old", CapturedStyle::default(), 1024);
+        output.move_cursor_columns(-3, 1024);
+        output.print_ascii(b"new", CapturedStyle::default(), 1024);
+        assert_eq!(output.as_str(), "status new");
     }
 
     #[test]

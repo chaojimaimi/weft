@@ -10,10 +10,13 @@
 //! The live in-flight block is NOT cached (its output streams every frame).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 
-use unicode_segmentation::UnicodeSegmentation;
 use weft_core::blocks::Block;
+
+mod wrapping;
+pub(crate) use wrapping::{block_line_chunk_ranges, block_line_chunks};
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
 
@@ -30,76 +33,6 @@ pub(crate) fn trimmed_output_line_count(lines: &[&str]) -> usize {
     len
 }
 
-/// Iterator yielding wrapped row chunks of `text` at `cols` columns. Each
-/// yielded `String` fits within `cols` columns (respecting wide-char widths).
-/// The first yielded chunk is the top row, subsequent chunks are continuation
-/// rows below it.
-pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
-    let mut chunks: Vec<String> = Vec::new();
-    if cols == 0 {
-        chunks.push(text.to_string());
-        return chunks.into_iter();
-    }
-    let mut current = String::new();
-    let mut col = 0usize;
-    for grapheme in text.graphemes(true) {
-        let w = weft_core::grid::terminal_text_width(grapheme);
-        if w == 0 {
-            continue;
-        }
-        if col + w > cols {
-            chunks.push(std::mem::take(&mut current));
-            col = 0;
-        }
-        current.push_str(grapheme);
-        col += w;
-    }
-    chunks.push(current);
-    chunks.into_iter()
-}
-
-/// Block history normally reflows prose, but terminal-drawn structure must
-/// retain its row identity. Wrapping a full-width rule produces several
-/// identical prompt dividers after a resize; wrapping a table row detaches
-/// cells from their border. Keep those rows atomic and clip them to the
-/// current viewport instead.
-pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
-    if !is_terminal_structure_line(text) || cols == 0 {
-        return wrap_line_chunks(text, cols).collect::<Vec<_>>().into_iter();
-    }
-
-    let mut clipped = String::new();
-    let mut col = 0usize;
-    for grapheme in text.graphemes(true) {
-        let width = weft_core::grid::terminal_text_width(grapheme);
-        if width == 0 {
-            continue;
-        }
-        if col + width > cols {
-            break;
-        }
-        clipped.push_str(grapheme);
-        col += width;
-    }
-    vec![clipped].into_iter()
-}
-
-fn is_terminal_structure_line(text: &str) -> bool {
-    let mut visible = 0usize;
-    let mut box_drawing = 0usize;
-    let mut vertical_separators = 0usize;
-    for ch in text.chars().filter(|ch| !ch.is_whitespace()) {
-        visible += 1;
-        if matches!(ch, '\u{2500}'..='\u{257f}') {
-            box_drawing += 1;
-        }
-        if matches!(ch, '│' | '┃' | '║' | '┆' | '┇' | '┊' | '┋') {
-            vertical_separators += 1;
-        }
-    }
-    (visible >= 8 && box_drawing == visible) || vertical_separators >= 2
-}
-
 /// Pre-computed wrapping data for a single output line of a block.
 #[derive(Clone)]
 pub(crate) struct CachedLine {
@@ -109,10 +42,10 @@ pub(crate) struct CachedLine {
     pub(crate) byte_start: usize,
     /// Byte offset of this line's end (exclusive) within `block.output`.
     pub(crate) byte_end: usize,
-    /// Pre-wrapped chunks (owned via `Rc` for cheap sharing between the
-    /// cache and the per-frame `LaidRow` entries). Usually 1 element;
-    /// more for lines that exceed `cols` columns.
-    pub(crate) chunks: Rc<[String]>,
+    /// Source-relative byte ranges for pre-wrapped chunks. The block's
+    /// immutable output remains the sole owner of text bytes; visible rows
+    /// materialize short strings only for the current frame.
+    pub(crate) chunk_ranges: Rc<[Range<usize>]>,
 }
 
 /// Cached layout for a single finished block.
@@ -177,9 +110,61 @@ pub(crate) struct BlockLayoutCache {
     /// miss), which may change a `base_row_count`. Cleared by
     /// `build_prefix_sum` after rebuild.
     prefix_sum_dirty: bool,
+    synced_cols: Option<usize>,
+    synced_len: usize,
+    synced_first_id: Option<u64>,
+    synced_last_id: Option<u64>,
+    dirty_ids: Vec<u64>,
 }
 
 impl BlockLayoutCache {
+    /// Synchronize the append-only block history incrementally. Scrolling
+    /// frames check only the newest block; append, resize and explicit
+    /// invalidation rebuild affected entries before refreshing the prefix sum.
+    pub(crate) fn sync_blocks(&mut self, blocks: &[Block], cols: usize) {
+        let first_id = blocks.first().map(|block| block.id.0);
+        let last_id = blocks.last().map(|block| block.id.0);
+        let append_only = self.synced_cols == Some(cols)
+            && blocks.len() >= self.synced_len
+            && self.synced_first_id == first_id
+            && (self.synced_len == 0
+                || blocks.get(self.synced_len - 1).map(|block| block.id.0) == self.synced_last_id);
+
+        if append_only {
+            for block in blocks.iter().skip(self.synced_len) {
+                self.ensure_cached(block, cols);
+            }
+            if blocks.len() == self.synced_len {
+                if let Some(block) = blocks.last() {
+                    self.ensure_cached(block, cols);
+                }
+            }
+        } else {
+            for block in blocks {
+                self.ensure_cached(block, cols);
+            }
+        }
+
+        for id in std::mem::take(&mut self.dirty_ids) {
+            if let Some(block) = blocks.iter().find(|block| block.id.0 == id) {
+                self.ensure_cached(block, cols);
+            }
+        }
+        self.synced_cols = Some(cols);
+        self.synced_len = blocks.len();
+        self.synced_first_id = first_id;
+        self.synced_last_id = last_id;
+        self.build_prefix_sum(blocks);
+    }
+
+    pub(crate) fn invalidate(&mut self, id: u64) {
+        self.entries.remove(&id);
+        if !self.dirty_ids.contains(&id) {
+            self.dirty_ids.push(id);
+        }
+        self.prefix_sum_dirty = true;
+    }
+
     /// Ensure `block` has a cached layout for `cols`. Recomputes only if
     /// the block is new, its output/command changed, `collapsed` was
     /// toggled, or `cols` changed (resize).
@@ -233,17 +218,15 @@ impl BlockLayoutCache {
     /// search. Must be called after all blocks have been `ensure_cached`
     /// and before `prefix_sum()` is read.
     ///
-    /// Rebuilds only when the block set changes (add/remove/reorder) or
-    /// any cache entry was rebuilt (base_row_count may have changed). When
-    /// neither condition holds, this is O(n) comparison + early return.
+    /// Rebuilds when the append-only block set changes or any cache entry was
+    /// rebuilt (base_row_count may have changed). Reordering an existing
+    /// history is outside this cache's contract; callers replacing history
+    /// must start with a fresh cache.
     pub(crate) fn build_prefix_sum(&mut self, blocks: &[Block]) {
         // Detect block set changes by comparing IDs (newest-to-oldest).
         let ids_changed = self.prefix_sum_block_ids.len() != blocks.len()
-            || blocks
-                .iter()
-                .rev()
-                .zip(self.prefix_sum_block_ids.iter())
-                .any(|(b, &old_id)| b.id.0 != old_id);
+            || self.prefix_sum_block_ids.first().copied() != blocks.last().map(|block| block.id.0)
+            || self.prefix_sum_block_ids.last().copied() != blocks.first().map(|block| block.id.0);
 
         // First call (prefix_sum never initialized) must build even when
         // blocks is empty, so the invariant prefix_sum.len() == n + 1 holds.
@@ -299,12 +282,12 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         .map(|(idx, line)| {
             let byte_start = line.as_ptr() as usize - block.output.as_ptr() as usize;
             let byte_end = byte_start + line.len();
-            let chunks: Rc<[String]> = Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
+            let chunk_ranges: Rc<[Range<usize>]> = Rc::from(block_line_chunk_ranges(line, cols));
             CachedLine {
                 idx,
                 byte_start,
                 byte_end,
-                chunks,
+                chunk_ranges,
             }
         })
         .collect();
@@ -323,13 +306,13 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
             .iter()
             .map(|hint| block_line_chunks(hint, cols).count())
             .sum();
-        let line_rows: usize = lines.iter().map(|l| l.chunks.len()).sum();
+        let line_rows: usize = lines.iter().map(|l| l.chunk_ranges.len()).sum();
         hint_rows + line_rows
     };
 
     // R2-2 (Batch 7): base_row_count for prefix-sum. Matches the
-    // layout_pass formula: (hint_rows + output_rows + 2) where the +2
-    // covers command + separator rows. clear_rows and header_height are
+    // layout_pass formula: hint/output rows + the conditional command/output
+    // breathing row + command + separator. clear_rows and header_height are
     // per-frame and excluded.
     let hint_rows_for_base = if block.collapsed {
         0
@@ -339,7 +322,9 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
             .map(|hint| block_line_chunks(hint, cols).count())
             .sum::<usize>()
     };
-    let base_row_count = hint_rows_for_base + output_rows + 2;
+    let content_rows = hint_rows_for_base + output_rows;
+    let base_row_count =
+        content_rows + crate::block_component::command_output_gap_rows(content_rows) + 2;
 
     CachedBlockLayout {
         output_len: block.output.len(),
@@ -435,37 +420,13 @@ mod tests {
         let layout = compute_block_layout(&block, 10);
         assert_eq!(layout.lines.len(), 1);
         assert_eq!(
-            layout.lines[0].chunks.len(),
+            layout.lines[0].chunk_ranges.len(),
             2,
             "20 chars at cols=10 → 2 chunks"
         );
-        assert_eq!(layout.lines[0].chunks[0], "0123456789");
-        assert_eq!(layout.lines[0].chunks[1], "abcdefghij");
-    }
-
-    #[test]
-    fn wrapping_keeps_emoji_grapheme_clusters_atomic() {
-        let chunks: Vec<_> = wrap_line_chunks("A👩‍🔬B", 3).collect();
-        assert_eq!(chunks, ["A👩‍🔬", "B"]);
-    }
-
-    #[test]
-    fn terminal_rule_is_clipped_instead_of_wrapped_after_resize() {
-        let chunks: Vec<_> = block_line_chunks("────────────────────", 8).collect();
-        assert_eq!(chunks, ["────────"]);
-    }
-
-    #[test]
-    fn unicode_table_row_is_clipped_instead_of_split_after_resize() {
-        let chunks: Vec<_> = block_line_chunks("│ 磁盘 │ Data 426G / 926G │ 充裕 │", 16).collect();
-        assert_eq!(chunks.len(), 1);
-        assert!(weft_core::grid::terminal_text_width(&chunks[0]) <= 16);
-    }
-
-    #[test]
-    fn prose_still_wraps_after_resize() {
-        let chunks: Vec<_> = block_line_chunks("ordinary terminal prose", 8).collect();
-        assert_eq!(chunks.len(), 3);
+        let line = &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end];
+        assert_eq!(&line[layout.lines[0].chunk_ranges[0].clone()], "0123456789");
+        assert_eq!(&line[layout.lines[0].chunk_ranges[1].clone()], "abcdefghij");
     }
 
     #[test]
@@ -530,7 +491,7 @@ mod tests {
         let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
         cache.ensure_cached(&block, 10);
         assert_eq!(
-            cache.get(1).lines[0].chunks.len(),
+            cache.get(1).lines[0].chunk_ranges.len(),
             2,
             "20 chars / cols=10 → 2 chunks"
         );
@@ -538,7 +499,7 @@ mod tests {
         // Resize to cols=20 → should rebuild with 1 chunk.
         cache.ensure_cached(&block, 20);
         assert_eq!(
-            cache.get(1).lines[0].chunks.len(),
+            cache.get(1).lines[0].chunk_ranges.len(),
             1,
             "20 chars / cols=20 → 1 chunk"
         );
@@ -561,6 +522,38 @@ mod tests {
     }
 
     #[test]
+    fn stable_history_sync_checks_only_newest_block() {
+        let blocks: Vec<_> = (1..=1000)
+            .map(|id| mk_block_with_output(id, "echo", "one line\n"))
+            .collect();
+        let mut cache = BlockLayoutCache::default();
+        cache.sync_blocks(&blocks, 80);
+        cache.take_hit_miss_counts();
+
+        cache.sync_blocks(&blocks, 80);
+        let (hits, misses) = cache.take_hit_miss_counts();
+        assert_eq!((hits, misses), (1, 0));
+    }
+
+    #[test]
+    fn explicit_invalidation_rebuilds_non_newest_block() {
+        let mut blocks = vec![
+            mk_block_with_output(1, "echo", "old\n"),
+            mk_block_with_output(2, "echo", "new\n"),
+        ];
+        let mut cache = BlockLayoutCache::default();
+        cache.sync_blocks(&blocks, 80);
+        cache.take_hit_miss_counts();
+
+        blocks[0].collapsed = true;
+        cache.invalidate(1);
+        cache.sync_blocks(&blocks, 80);
+        assert!(cache.get(1).collapsed);
+        let (_, misses) = cache.take_hit_miss_counts();
+        assert_eq!(misses, 1);
+    }
+
+    #[test]
     fn block_layout_cache_empty_output() {
         let block = mk_block_with_output(1, "true", "");
         let layout = compute_block_layout(&block, 80);
@@ -570,16 +563,14 @@ mod tests {
 
     // ── R2-2 (Batch 7): prefix sum tests ───────────────────────────────
 
-    /// `base_row_count` must equal `hint_rows + output_rows + 2` (command +
-    /// separator) for non-collapsed blocks, and `2` for collapsed blocks
-    /// (output_rows=0, hint_rows=0). This invariant is what makes the prefix
-    /// sum match the layout_pass height formula.
+    /// `base_row_count` includes one breathing row when output exists, plus
+    /// command + separator. Collapsed/empty-output blocks remain at `2`.
     #[test]
     fn base_row_count_matches_layout_formula() {
-        // 3 output lines, no resume hints → base = 0 + 3 + 2 = 5
+        // 3 output lines + breathing row + command + separator = 6.
         let block = mk_block_with_output(1, "echo", "a\nb\nc\n");
         let layout = compute_block_layout(&block, 80);
-        assert_eq!(layout.base_row_count, 5);
+        assert_eq!(layout.base_row_count, 6);
 
         // Collapsed → output_rows=0, hint_rows=0 → base = 2
         let mut collapsed = block;
@@ -603,11 +594,11 @@ mod tests {
     #[test]
     fn build_prefix_sum_single_block() {
         let mut cache = BlockLayoutCache::default();
-        let block = mk_block_with_output(1, "echo", "a\nb\nc\n"); // base=5
+        let block = mk_block_with_output(1, "echo", "a\nb\nc\n"); // base=6
         cache.ensure_cached(&block, 80);
         cache.build_prefix_sum(&[block]);
-        // prefix_sum[0]=0, prefix_sum[1]=5
-        assert_eq!(cache.prefix_sum(), &[0, 5]);
+        // prefix_sum[0]=0, prefix_sum[1]=6
+        assert_eq!(cache.prefix_sum(), &[0, 6]);
     }
 
     #[test]
@@ -617,16 +608,16 @@ mod tests {
         // .rev() so prefix_sum[1] = newest block's base, prefix_sum[2] =
         // newest + second-newest, etc.
         // blocks[0] = oldest (id=1, base=2: empty output)
-        // blocks[1] = newest (id=2, base=5: 3 lines)
+        // blocks[1] = newest (id=2, base=6: 3 lines + breathing row)
         let b1 = mk_block_with_output(1, "true", "");
         let b2 = mk_block_with_output(2, "echo", "a\nb\nc\n");
         let blocks = vec![b1, b2];
         cache.ensure_cached(&blocks[0], 80);
         cache.ensure_cached(&blocks[1], 80);
         cache.build_prefix_sum(&blocks);
-        // rev() walks b2 (base=5) then b1 (base=2).
-        // prefix_sum = [0, 5, 7]
-        assert_eq!(cache.prefix_sum(), &[0, 5, 7]);
+        // rev() walks b2 (base=6) then b1 (base=2).
+        // prefix_sum = [0, 6, 8]
+        assert_eq!(cache.prefix_sum(), &[0, 6, 8]);
     }
 
     /// Rebuild is skipped when neither block IDs nor any cache entry changed.
@@ -651,14 +642,14 @@ mod tests {
         let b1 = mk_block_with_output(1, "echo", "a\n");
         cache.ensure_cached(&b1, 80);
         cache.build_prefix_sum(std::slice::from_ref(&b1));
-        assert_eq!(cache.prefix_sum(), &[0, 3]); // base = 1 + 2 = 3
+        assert_eq!(cache.prefix_sum(), &[0, 4]); // output + breathing + structural = 4
 
         // Add a second block (older). blocks = [b2, b1] (b1 is newest).
         let b2 = mk_block_with_output(2, "echo", "x\ny\nz\n");
         cache.ensure_cached(&b2, 80);
         cache.build_prefix_sum(&[b2, b1.clone()]);
-        // rev() → b1 (base=3) then b2 (base=5). prefix_sum = [0, 3, 8]
-        assert_eq!(cache.prefix_sum(), &[0, 3, 8]);
+        // rev() → b1 (base=4) then b2 (base=6). prefix_sum = [0, 4, 10]
+        assert_eq!(cache.prefix_sum(), &[0, 4, 10]);
     }
 
     /// A cache miss (output change) sets prefix_sum_dirty, forcing rebuild
@@ -669,14 +660,14 @@ mod tests {
         let block = mk_block_with_output(1, "echo", "a\n");
         cache.ensure_cached(&block, 80);
         cache.build_prefix_sum(std::slice::from_ref(&block));
-        assert_eq!(cache.prefix_sum(), &[0, 3]);
+        assert_eq!(cache.prefix_sum(), &[0, 4]);
 
         // Output grows → ensure_cached triggers rebuild, sets dirty.
         let block2 = mk_block_with_output(1, "echo", "a\nb\nc\nd\n");
         cache.ensure_cached(&block2, 80);
         cache.build_prefix_sum(&[block2]);
-        // base = 4 + 2 = 6
-        assert_eq!(cache.prefix_sum(), &[0, 6]);
+        // base = 4 output + breathing + command + separator = 7
+        assert_eq!(cache.prefix_sum(), &[0, 7]);
     }
 
     /// Collapsed blocks contribute base_row_count=2 to the prefix sum,
@@ -687,12 +678,12 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let mut b1 = mk_block_with_output(1, "echo", "a\nb\nc\n");
         b1.collapsed = true; // base = 2
-        let b2 = mk_block_with_output(2, "echo", "x\n"); // base = 3
+        let b2 = mk_block_with_output(2, "echo", "x\n"); // base = 4
         let blocks = vec![b1, b2];
         cache.ensure_cached(&blocks[0], 80);
         cache.ensure_cached(&blocks[1], 80);
         cache.build_prefix_sum(&blocks);
-        // rev() → b2 (base=3) then b1 (base=2). prefix_sum = [0, 3, 5]
-        assert_eq!(cache.prefix_sum(), &[0, 3, 5]);
+        // rev() → b2 (base=4) then b1 (base=2). prefix_sum = [0, 4, 6]
+        assert_eq!(cache.prefix_sum(), &[0, 4, 6]);
     }
 }

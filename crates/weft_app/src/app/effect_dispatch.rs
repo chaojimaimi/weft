@@ -121,6 +121,24 @@ impl crate::App {
         for block in blocks {
             if let Err(e) = store.insert(block) {
                 warn!(error = %e, "failed to persist block");
+                continue;
+            }
+            if let Some(index) = &self.search_index {
+                let started_ms = block
+                    .started_at
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or(0);
+                let document = weft_core::search::SearchDocument::from_block(
+                    block.id.0,
+                    &block.command,
+                    block.output.as_ref(),
+                    block.cwd.as_deref(),
+                    started_ms,
+                );
+                if let Err(e) = index.upsert(&document) {
+                    warn!(error = %e, block_id = block.id.0, "failed to index persisted block");
+                }
             }
         }
     }

@@ -153,6 +153,59 @@ impl SearchDocument {
         }
     }
 
+    /// Construct a searchable document from a saved workflow.
+    pub fn from_workflow(workflow: &crate::workflow::Workflow) -> Self {
+        let mut body = workflow.description.clone();
+        for step in &workflow.steps {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&step.command);
+        }
+        Self {
+            kind: SearchDocumentKind::Workflow,
+            stable_id: workflow.id.to_string(),
+            title: workflow.name.clone(),
+            body,
+            cwd: None,
+            updated_at: workflow.last_used_ms,
+        }
+    }
+
+    /// Construct a searchable document from a saved workspace file.
+    pub fn from_workspace(
+        stable_path: &str,
+        workspace: &crate::workspace::WorkspaceDocument,
+        updated_ms: i64,
+    ) -> Self {
+        let mut body = String::new();
+        for tab in &workspace.tabs {
+            for (cwd, draft) in tab.panes.collect_panes() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&cwd.to_string_lossy());
+                if !draft.is_empty() {
+                    body.push(' ');
+                    body.push_str(draft);
+                }
+            }
+        }
+        Self {
+            kind: SearchDocumentKind::Workspace,
+            stable_id: stable_path.to_string(),
+            title: workspace.name.clone(),
+            body,
+            cwd: workspace.tabs.first().and_then(|tab| {
+                tab.panes
+                    .collect_panes()
+                    .first()
+                    .map(|(cwd, _)| cwd.to_string_lossy().into_owned())
+            }),
+            updated_at: updated_ms,
+        }
+    }
+
     /// Current time as milliseconds since Unix epoch. Convenience for
     /// documents without an explicit timestamp.
     pub fn now_ms() -> i64 {
@@ -282,5 +335,53 @@ mod tests {
         // Should be > 1.7 trillion (year 2023+) and < 2 trillion (year 2033).
         assert!(now > 1_700_000_000_000, "now_ms too small: {now}");
         assert!(now < 2_000_000_000_000, "now_ms too large: {now}");
+    }
+
+    #[test]
+    fn from_workflow_indexes_description_and_commands() {
+        let workflow = crate::workflow::Workflow {
+            id: 7,
+            name: "deploy".to_string(),
+            description: "Deploy the current service".to_string(),
+            steps: vec![crate::workflow::WorkflowStep {
+                command: "kubectl apply -f deploy.yaml".to_string(),
+            }],
+            variables: Vec::new(),
+            source: crate::workflow::WorkflowSource::Manual,
+            use_count: 3,
+            last_used_ms: 1234,
+        };
+        let doc = SearchDocument::from_workflow(&workflow);
+        assert_eq!(doc.kind, SearchDocumentKind::Workflow);
+        assert_eq!(doc.stable_id, "7");
+        assert_eq!(doc.title, "deploy");
+        assert!(doc.body.contains("Deploy the current service"));
+        assert!(doc.body.contains("kubectl apply"));
+    }
+
+    #[test]
+    fn from_workspace_indexes_name_cwds_and_drafts() {
+        let workspace = crate::workspace::WorkspaceDocument {
+            version: crate::workspace::WORKSPACE_VERSION,
+            name: "backend".to_string(),
+            profile: None,
+            window: crate::workspace::WorkspaceWindow {
+                width: 1200,
+                height: 800,
+            },
+            tabs: vec![crate::workspace::WorkspaceTab {
+                panes: crate::workspace::WorkspacePaneNode::Pane {
+                    cwd: std::path::PathBuf::from("/repo/backend"),
+                    draft: "cargo test".to_string(),
+                },
+                active_pane_index: 0,
+            }],
+            active_tab: 0,
+        };
+        let doc = SearchDocument::from_workspace("/tmp/backend.yaml", &workspace, 5678);
+        assert_eq!(doc.kind, SearchDocumentKind::Workspace);
+        assert_eq!(doc.stable_id, "/tmp/backend.yaml");
+        assert!(doc.body.contains("/repo/backend"));
+        assert!(doc.body.contains("cargo test"));
     }
 }

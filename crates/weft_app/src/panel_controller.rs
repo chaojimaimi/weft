@@ -208,6 +208,10 @@ impl App {
             Some(id) => id,
             None => return,
         };
+        self.scroll_to_block_id(block_id);
+    }
+
+    pub(super) fn scroll_to_block_id(&mut self, block_id: BlockId) {
         // Only meaningful in block view (grid view has no block layout).
         if !self.block_view_active() {
             return;
@@ -254,6 +258,37 @@ impl App {
         self.panel.highlight_until =
             Some(std::time::Instant::now() + std::time::Duration::from_millis(1500));
         self.request_redraw();
+    }
+
+    pub(super) fn navigate_to_block(&mut self, block_id: BlockId) -> bool {
+        let target = self
+            .sessions
+            .tabs()
+            .iter()
+            .enumerate()
+            .find_map(|(tab_index, tab)| {
+                tab.panes().find_map(|(pane_id, pane)| {
+                    pane.terminal
+                        .as_ref()
+                        .is_some_and(|terminal| {
+                            terminal
+                                .block_tracker()
+                                .session_blocks()
+                                .iter()
+                                .any(|block| block.id == block_id)
+                        })
+                        .then_some((tab_index, pane_id))
+                })
+            });
+        let Some((tab_index, pane_id)) = target else {
+            return false;
+        };
+        self.sessions.set_active(tab_index);
+        if self.sessions.active_mut().set_active_pane(pane_id).is_err() {
+            return false;
+        }
+        self.scroll_to_block_id(block_id);
+        true
     }
 
     /// Local scrollback navigation (page up/down, top, bottom).

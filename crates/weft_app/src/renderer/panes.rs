@@ -15,7 +15,7 @@ use weft_core::vt::Terminal;
 pub struct PaneRenderInfo<'a> {
     pub rect: crate::layout::Rect,
     pub terminal: &'a Terminal,
-    pub block_scroll: usize,
+    pub block_scroll: f32,
     pub submit_on_ctrl_enter: bool,
     /// v1.4.1: pane-scoped namespace for the styled-line vertex cache.
     pub pane_session_id: u64,
@@ -73,6 +73,7 @@ impl MetalRenderer {
                 None,
                 None,
                 None,
+                None,
                 tab_bar,
             );
         }
@@ -123,14 +124,9 @@ impl MetalRenderer {
                 let region_bottom_y = prompt.as_ref().map_or_else(
                     || ctx.bottom(),
                     |p| {
-                        crate::layout::layout_prompt(
-                            &ctx,
-                            p.lines.len(),
-                            p.cursor.0,
-                            0,
-                            p.scroll_offset,
-                        )
-                        .box_rect[1]
+                        crate::paint::prompt::prompt_layout_for_buffer(&ctx, p.lines, p.cursor)
+                            .1
+                            .box_rect[1]
                     },
                 );
                 let mut selection = SelectionHandler::new();
@@ -146,6 +142,8 @@ impl MetalRenderer {
                         block_scroll: pane.block_scroll,
                         viewport_rows: pane.terminal.grid().num_rows,
                         block_hovered: None,
+                        block_selected: None,
+                        block_action_hovered: None,
                         spinner_phase: -1.0,
                         find_block_highlight: None,
                         palette: pane.terminal.palette(),
@@ -237,7 +235,7 @@ mod tests {
         let pane = PaneRenderInfo {
             rect: [0.0, 0.0, 400.0, 300.0],
             terminal: &terminal,
-            block_scroll: 0,
+            block_scroll: 0.0,
             submit_on_ctrl_enter: true,
             pane_session_id: 1,
         };

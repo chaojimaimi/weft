@@ -19,6 +19,7 @@
 //!
 //! [theme]
 //! name = "weft-warm"            # weft-warm | weft-light (weft-dark = legacy alias for weft-warm)
+//! minimum_contrast = 7.0         # 1.0 = exact RGB; higher = paint-only readability boost
 //! foreground = "#e0d4c4"        # optional inline overrides
 //! accent = "#d4a574"            # v0.8: signature accent (amber)
 //! palette = ["#2a2420", "#c86858", ...]   # optional, overrides ANSI 0-15
@@ -202,6 +203,12 @@ impl Config {
         }
         let theme = theme_entry.as_table_mut().expect("theme is a table");
         set_string_if_diff(theme, "name", &self.theme.name, &default_theme.name);
+        set_f32_if_diff(
+            theme,
+            "minimum_contrast",
+            self.theme.minimum_contrast,
+            default_theme.minimum_contrast,
+        );
         set_opt_string(theme, "foreground", &self.theme.foreground);
         set_opt_string(theme, "background", &self.theme.background);
         set_opt_string(theme, "cursor", &self.theme.cursor);

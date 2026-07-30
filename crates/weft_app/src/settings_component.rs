@@ -16,6 +16,8 @@ pub(crate) enum SettingsTarget {
     SidebarCategory(SettingsTab),
     /// A theme row in the Appearance category (0-based screen-relative index).
     Theme(usize),
+    /// A non-theme content row. The index matches `SettingsState::selection`.
+    ContentRow(usize),
     /// Footer "⏎ apply" button.
     ApplyButton,
     /// Footer "esc close" button.
@@ -41,6 +43,39 @@ pub(crate) enum SettingsTarget {
     /// v1.5.2: Advanced → "Export Config:" row. Enter triggers the
     /// NSSavePanel flow (see `App::export_config_interactive`).
     AdvancedExport,
+}
+
+pub(crate) const APPEARANCE_ADJUSTMENT_ROWS: usize = 6;
+
+/// Appearance keeps all adjustment controls visible and gives the remaining
+/// rows to themes. Every settings layer uses this helper so the painted row,
+/// hit target, and keyboard selection cannot drift apart in short windows.
+pub(crate) fn visible_appearance_theme_count(theme_count: usize, max_rows: usize) -> usize {
+    theme_count.min(max_rows.saturating_sub(APPEARANCE_ADJUSTMENT_ROWS))
+}
+
+pub(crate) fn settings_scene_row_window(
+    tab: SettingsTab,
+    total_rows: usize,
+    total_themes: usize,
+    max_rows: usize,
+    scroll_offset: usize,
+) -> (usize, usize, usize) {
+    let theme_count = if tab == SettingsTab::Appearance {
+        visible_appearance_theme_count(total_themes, max_rows)
+    } else {
+        0
+    };
+    let start = if tab == SettingsTab::Keybindings {
+        scroll_offset.min(total_rows)
+    } else {
+        0
+    };
+    (
+        theme_count,
+        total_rows.saturating_sub(start).min(max_rows),
+        start,
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,10 +165,11 @@ pub(crate) fn build_settings_scene(
     layout: &SettingsLayout,
     tabs: &[SettingsTab],
     active_tab: SettingsTab,
-    theme_count: usize,
+    row_window: (usize, usize, usize),
     cell_h: f32,
     profile_count: usize,
 ) -> Scene<SettingsTarget> {
+    let (theme_count, content_row_count, content_row_start) = row_window;
     let mut scene = Scene::default();
     let [box_x0, _box_y0, _box_x1, _box_y1] = layout.box_rect;
 
@@ -239,6 +275,34 @@ pub(crate) fn build_settings_scene(
                 label: format!("Theme {}", i + 1),
                 bounds: row_rect,
                 focus: None,
+                state: String::new(),
+            });
+        }
+    }
+
+    // Standard rows share the keyboard selection index; keybindings may scroll.
+    if layout.show_content {
+        for visible_index in 0..content_row_count.min(layout.max_rows) {
+            let row = content_row_start + visible_index;
+            if active_tab == SettingsTab::Appearance && row < theme_count {
+                continue;
+            }
+            // Advanced's first two entries are non-config placeholders and
+            // rows 2/3 have dedicated action targets below.
+            if active_tab == SettingsTab::Advanced {
+                continue;
+            }
+            let row_y = layout.content_top + visible_index as f32 * cell_h;
+            let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+            scene.hits.push(HitRegion::from_rect(
+                row_rect,
+                SettingsTarget::ContentRow(row),
+            ));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::ListItem,
+                label: format!("Setting row {}", row + 1),
+                bounds: row_rect,
+                focus: Some(FocusId::Settings),
                 state: String::new(),
             });
         }
@@ -372,7 +436,14 @@ mod tests {
     fn sidebar_category_hit_returns_correct_variant() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 0, 0),
+            CELL_H,
+            0,
+        );
         // Row 1 (Terminal) starts at sidebar_top + 1*20 = 140 + 20 = 160
         assert_eq!(
             settings_target_at(&scene, 300.0, 165.0),
@@ -384,7 +455,14 @@ mod tests {
     fn active_sidebar_category_highlighted() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Keybindings, 0, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Keybindings,
+            (0, 0, 0),
+            CELL_H,
+            0,
+        );
         // Row 3 (Keybindings) starts at sidebar_top + 3*20 = 140 + 60 = 200
         assert_eq!(
             settings_target_at(&scene, 300.0, 205.0),
@@ -400,7 +478,7 @@ mod tests {
             &layout,
             &SettingsTab::ALL,
             SettingsTab::Appearance,
-            0,
+            (0, 0, 0),
             CELL_H,
             0,
         );
@@ -422,11 +500,43 @@ mod tests {
     fn theme_row_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (5, 11, 0),
+            CELL_H,
+            0,
+        );
         // Row 2 starts at content_top + 2*20 = 200 + 40 = 240
         assert_eq!(
             settings_target_at(&scene, 500.0, 245.0),
             Some(SettingsTarget::Theme(2)),
+        );
+    }
+
+    #[test]
+    fn appearance_row_budget_is_shared_by_themes_and_adjustments() {
+        assert_eq!(visible_appearance_theme_count(11, 16), 10);
+        assert_eq!(visible_appearance_theme_count(11, 6), 0);
+        assert_eq!(visible_appearance_theme_count(4, 20), 4);
+    }
+
+    #[test]
+    fn appearance_adjustment_rows_are_mouse_selectable() {
+        let layout = sample_layout();
+        let scene = build_settings_scene(
+            &layout,
+            &SettingsTab::ALL,
+            SettingsTab::Appearance,
+            (5, 11, 0),
+            CELL_H,
+            0,
+        );
+        let content_x = (layout.content_x0 + layout.content_x1) / 2.0;
+        assert_eq!(
+            settings_target_at(&scene, content_x, layout.content_top + CELL_H * 10.5),
+            Some(SettingsTarget::ContentRow(10)),
         );
     }
 
@@ -437,7 +547,14 @@ mod tests {
         let tabs = SettingsTab::ALL.to_vec();
         let mut layout = sample_layout();
         layout.show_content = false;
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 5, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (5, 11, 0),
+            CELL_H,
+            0,
+        );
         // Clicking where a theme row would be returns None (content hidden).
         assert_eq!(settings_target_at(&scene, 500.0, 245.0), None);
     }
@@ -446,7 +563,14 @@ mod tests {
     fn footer_button_hit() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            0,
+        );
         assert_eq!(
             settings_target_at(&scene, 250.0, 680.0),
             Some(SettingsTarget::ApplyButton),
@@ -460,7 +584,14 @@ mod tests {
         let tabs = SettingsTab::ALL.to_vec();
         let mut layout = sample_layout();
         layout.show_sidebar = false;
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            0,
+        );
         // Clicking where a sidebar row would be returns None (sidebar hidden).
         assert_eq!(settings_target_at(&scene, 300.0, 165.0), None);
     }
@@ -495,7 +626,14 @@ mod tests {
         // equally spaced across the entries area.
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 3);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            3,
+        );
 
         // Compute slot bounds to verify each entry is hit-testable.
         // Toolbar: [412.0, 180.0, 988.0, 200.0] → 576 wide.
@@ -522,7 +660,14 @@ mod tests {
     fn profile_create_and_delete_buttons_hit_testable() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 2);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            2,
+        );
 
         // "+" button at [938.0, 180.0, 958.0, 200.0]
         assert_eq!(
@@ -544,7 +689,14 @@ mod tests {
         let tabs = SettingsTab::ALL.to_vec();
         let mut layout = sample_layout();
         layout.show_content = false;
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 3);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            3,
+        );
         // Clicking where the toolbar would be returns None.
         assert_eq!(settings_target_at(&scene, 500.0, 190.0), None);
         assert_eq!(settings_target_at(&scene, 948.0, 190.0), None);
@@ -557,7 +709,14 @@ mod tests {
         // draws the "Base" label and buttons).
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Appearance, 0, CELL_H, 0);
+        let scene = build_settings_scene(
+            &layout,
+            &tabs,
+            SettingsTab::Appearance,
+            (0, 6, 0),
+            CELL_H,
+            0,
+        );
 
         // No ProfileEntry hits — clicking in the entries area returns None
         // (the toolbar draws the Base label but it's not clickable as a
@@ -588,7 +747,8 @@ mod tests {
     fn advanced_tab_registers_import_export_hit_regions() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Advanced, 0, CELL_H, 0);
+        let scene =
+            build_settings_scene(&layout, &tabs, SettingsTab::Advanced, (0, 4, 0), CELL_H, 0);
         // sample_layout() has content_top = 200, CELL_H = 20.
         // Row 0 (Debug Logging): y = 200 — no hit region.
         // Row 1 (Experimental): y = 220 — no hit region.
@@ -623,7 +783,8 @@ mod tests {
     fn non_advanced_tabs_do_not_register_import_export_hits() {
         let tabs = SettingsTab::ALL.to_vec();
         let layout = sample_layout();
-        let scene = build_settings_scene(&layout, &tabs, SettingsTab::Terminal, 0, CELL_H, 0);
+        let scene =
+            build_settings_scene(&layout, &tabs, SettingsTab::Terminal, (0, 4, 0), CELL_H, 0);
         let content_x = (layout.content_x0 + layout.content_x1) / 2.0;
         // Rows 2 and 3 in the Terminal tab are Padding X and Padding Y —
         // they must not be mapped to AdvancedImport / AdvancedExport.

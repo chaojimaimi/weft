@@ -1,23 +1,90 @@
 use std::sync::Arc;
 
-use crate::paint::primitives::{push_quad, resolve_cell_color};
+use crate::paint::primitives::{
+    color_to_normalized, ensure_minimum_text_contrast, push_quad, resolve_cell_color,
+};
 use crate::paint::styled_line_cache::{
     palette_fingerprint, translate_and_append_shifts_only_xy, StyledLineCache, StyledLineCacheKey,
 };
 use crate::renderer::MetalRenderer;
-use weft_core::blocks::StyledLine;
+use weft_core::blocks::{OutputSemanticRole, SemanticSpan, StyledLine};
+use weft_core::config::Theme;
 use weft_core::grid::{CellFlags, Color};
 
 pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) x: f32,
     pub(super) y: f32,
     pub(super) text: &'a str,
+    pub(super) semantic_text: &'a str,
     pub(super) style: Option<&'a StyledLine>,
     pub(super) char_offset: usize,
     pub(super) fallback: [f32; 4],
+    pub(super) canvas: [f32; 4],
+    pub(super) selection: Option<(usize, usize, [f32; 4])>,
     pub(super) max_cols: usize,
     pub(super) palette: &'a [Color; 256],
     pub(super) row_pitch: f32,
+}
+
+fn semantic_role_at(spans: &[SemanticSpan], index: usize) -> Option<OutputSemanticRole> {
+    let index = u32::try_from(index).ok()?;
+    let position = spans.partition_point(|span| span.end_char <= index);
+    spans
+        .get(position)
+        .filter(|span| span.start_char <= index && index < span.end_char)
+        .map(|span| span.role)
+}
+
+fn semantic_color(theme: &Theme, role: OutputSemanticRole) -> [f32; 4] {
+    let color = match role {
+        OutputSemanticRole::Label | OutputSemanticRole::Metadata => theme.output.metadata,
+        OutputSemanticRole::Path => theme.syntax.path,
+        OutputSemanticRole::Url | OutputSemanticRole::Address => theme.accent,
+        OutputSemanticRole::Number | OutputSemanticRole::Version => theme.syntax.number,
+        OutputSemanticRole::Success => theme.output.success,
+        OutputSemanticRole::Warning => theme.palette[3],
+        OutputSemanticRole::Failure => theme.output.failure,
+    };
+    color_to_normalized(color)
+}
+
+fn semantic_fallback_at(
+    theme: &Theme,
+    enabled: bool,
+    spans: &[SemanticSpan],
+    index: usize,
+    ansi_owned: bool,
+    fallback: [f32; 4],
+) -> [f32; 4] {
+    if !enabled || ansi_owned {
+        return fallback;
+    }
+    semantic_role_at(spans, index)
+        .map(|role| semantic_color(theme, role))
+        .unwrap_or(fallback)
+}
+
+fn reverse_colors(
+    foreground: [f32; 4],
+    background: Option<[f32; 4]>,
+    canvas: [f32; 4],
+) -> ([f32; 4], Option<[f32; 4]>) {
+    (background.unwrap_or(canvas), Some(foreground))
+}
+
+fn contrast_background(
+    explicit_background: Option<[f32; 4]>,
+    canvas: [f32; 4],
+    selection: Option<(usize, usize, [f32; 4])>,
+    source_index: usize,
+) -> [f32; 4] {
+    explicit_background.unwrap_or_else(|| {
+        crate::paint::primitives::text_background_for_range(
+            canvas,
+            selection,
+            source_index..source_index + 1,
+        )
+    })
 }
 
 /// v1.4.1: Inputs needed to build a `StyledLineCacheKey` and verify Arc
@@ -80,6 +147,12 @@ impl MetalRenderer {
         key_input: CacheKeyInput,
         cache: &std::cell::RefCell<StyledLineCache>,
     ) {
+        // Selection changes independently of immutable block content and its
+        // translucent background affects the final text contrast.
+        if paint.selection.is_some() {
+            self.push_block_output_text(vertices, paint);
+            return;
+        }
         // Live block bypass: no Arc source identity → can't cache safely.
         let Some(source) = key_input.source else {
             self.push_block_output_text(vertices, paint);
@@ -100,6 +173,12 @@ impl MetalRenderer {
                 paint.fallback[1].to_bits(),
                 paint.fallback[2].to_bits(),
                 paint.fallback[3].to_bits(),
+            ],
+            canvas: [
+                paint.canvas[0].to_bits(),
+                paint.canvas[1].to_bits(),
+                paint.canvas[2].to_bits(),
+                paint.canvas[3].to_bits(),
             ],
         };
 
@@ -122,9 +201,12 @@ impl MetalRenderer {
                 x: 0.0,
                 y: 0.0,
                 text: paint.text,
+                semantic_text: paint.semantic_text,
                 style: paint.style,
                 char_offset: paint.char_offset,
                 fallback: paint.fallback,
+                canvas: paint.canvas,
+                selection: paint.selection,
                 max_cols: paint.max_cols,
                 palette: paint.palette,
                 row_pitch: paint.row_pitch,
@@ -146,6 +228,11 @@ impl MetalRenderer {
         paint: BlockOutputTextPaint<'_>,
     ) {
         let cw = self.cell_width() as f32;
+        let semantic_spans = if self.semantic_output_enabled {
+            weft_core::blocks::classify_line(paint.semantic_text, &[])
+        } else {
+            Vec::new()
+        };
         let mut col = 0;
         let mut x = paint.x;
         for (index, ch) in paint.text.chars().enumerate() {
@@ -157,32 +244,47 @@ impl MetalRenderer {
                 break;
             }
 
-            // v1.7.0-A: Resolve ANSI attribute flags for this char.
+            let source_index = paint.char_offset + index;
             let flags = paint
                 .style
-                .map(|line| line.attributes_at(paint.char_offset + index))
+                .map(|line| line.attributes_at(source_index))
                 .unwrap_or(CellFlags::empty());
 
-            // Resolve foreground and background colors.
-            let fg = paint
+            let explicit_fg = paint
                 .style
-                .and_then(|line| line.foreground_at(paint.char_offset + index))
-                .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
-                .unwrap_or(paint.fallback);
+                .and_then(|line| line.foreground_at(source_index));
             let bg = paint
                 .style
-                .and_then(|line| line.background_at(paint.char_offset + index))
+                .and_then(|line| line.background_at(source_index))
                 .map(|origin| resolve_cell_color(origin, [0.0; 4], paint.palette));
+            let ansi_owned = explicit_fg.is_some() || bg.is_some() || !flags.is_empty();
+            let fg = explicit_fg
+                .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
+                .unwrap_or_else(|| {
+                    semantic_fallback_at(
+                        &self.theme,
+                        self.semantic_output_enabled,
+                        &semantic_spans,
+                        source_index,
+                        ansi_owned,
+                        paint.fallback,
+                    )
+                });
 
             // SGR reverse video: swap fg and bg before emitting quads.
             let (fg_final, bg_final) = if flags.contains(CellFlags::REVERSE) {
-                let bg_swapped = bg.unwrap_or([0.0, 0.0, 0.0, 0.0]);
-                (bg_swapped, Some(fg))
+                reverse_colors(fg, bg, paint.canvas)
             } else {
                 (fg, bg)
             };
 
-            // DIM: reduce foreground intensity by mixing with background.
+            let contrast_background =
+                contrast_background(bg_final, paint.canvas, paint.selection, source_index);
+            let fg_final =
+                ensure_minimum_text_contrast(fg_final, contrast_background, self.minimum_contrast);
+
+            // DIM remains an explicit application-owned hierarchy signal and
+            // is applied after the optional display contrast correction.
             let fg_final = if flags.contains(CellFlags::DIM) {
                 [
                     fg_final[0] * 0.5,
@@ -280,7 +382,11 @@ impl MetalRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::fills_terminal_cell_edges;
+    use super::{
+        contrast_background, fills_terminal_cell_edges, reverse_colors, semantic_fallback_at,
+    };
+    use crate::paint::primitives::color_to_normalized;
+    use weft_core::config::Theme;
 
     #[test]
     fn block_and_box_glyphs_bridge_block_view_row_leading() {
@@ -290,5 +396,49 @@ mod tests {
         for glyph in ['A', '中', '●'] {
             assert!(!fills_terminal_cell_edges(glyph), "glyph={glyph}");
         }
+    }
+
+    #[test]
+    fn reverse_without_explicit_background_uses_canvas_color() {
+        let foreground = [0.8, 0.7, 0.6, 1.0];
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let (reversed_fg, reversed_bg) = reverse_colors(foreground, None, canvas);
+        assert_eq!(reversed_fg, canvas);
+        assert_eq!(reversed_bg, Some(foreground));
+    }
+
+    #[test]
+    fn selection_background_is_used_unless_reverse_provides_an_explicit_background() {
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let selected = [0.4, 0.5, 0.6, 1.0];
+        let explicit = [0.7, 0.3, 0.2, 1.0];
+        let selection = Some((2, 5, selected));
+        assert_eq!(contrast_background(None, canvas, selection, 3), selected);
+        assert_eq!(
+            contrast_background(Some(explicit), canvas, selection, 3),
+            explicit
+        );
+        assert_eq!(contrast_background(None, canvas, selection, 7), canvas);
+    }
+
+    #[test]
+    fn semantic_toggle_colors_unstyled_status_without_overriding_ansi() {
+        let theme = Theme::weft_warm();
+        let fallback = color_to_normalized(theme.output.output_default);
+        let spans = weft_core::blocks::classify_line("Status: ok", &[]);
+        let success = color_to_normalized(theme.output.success);
+
+        assert_eq!(
+            semantic_fallback_at(&theme, true, &spans, 8, false, fallback),
+            success
+        );
+        assert_eq!(
+            semantic_fallback_at(&theme, false, &spans, 8, false, fallback),
+            fallback
+        );
+        assert_eq!(
+            semantic_fallback_at(&theme, true, &spans, 8, true, fallback),
+            fallback
+        );
     }
 }

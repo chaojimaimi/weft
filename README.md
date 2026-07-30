@@ -68,6 +68,7 @@ line_height = 1.2
 
 [theme]
 name = "weft-warm"           # 11 built-in themes + custom files
+minimum_contrast = 7.0        # 1.0 preserves exact ANSI/truecolor RGB
 follow_system = false        # auto-switch with macOS appearance
 
 [window]

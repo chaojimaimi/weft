@@ -180,6 +180,8 @@ impl App {
         }
         self.reset_ime_context("next tab");
         let (new, prev) = self.sessions.next();
+        self.interaction.block_selected = None;
+        self.interaction.block_action_hovered = None;
         info!(active = new, "switched to next tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();
@@ -200,6 +202,8 @@ impl App {
         }
         self.reset_ime_context("previous tab");
         let (new, prev) = self.sessions.prev();
+        self.interaction.block_selected = None;
+        self.interaction.block_action_hovered = None;
         info!(active = new, "switched to prev tab");
         self.refresh_find_for_active_tab();
         self.scroll_active_tab_into_view();

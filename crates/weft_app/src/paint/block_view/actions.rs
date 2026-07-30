@@ -72,6 +72,7 @@ pub(super) fn block_header_text_cols(left: f32, right: f32, cell_width: f32, sca
 pub(super) struct BlockHeaderActionPaint {
     pub(super) block_id: BlockId,
     pub(super) block_hovered: Option<BlockId>,
+    pub(super) action_hovered: Option<crate::block_component::BlockHeaderAction>,
     pub(super) y: f32,
     pub(super) pitch: f32,
     pub(super) right: f32,
@@ -90,6 +91,7 @@ pub(super) fn push_block_header_actions(
     let BlockHeaderActionPaint {
         block_id,
         block_hovered,
+        action_hovered,
         y,
         pitch,
         right,
@@ -101,6 +103,12 @@ pub(super) fn push_block_header_actions(
     // right side. Hit regions are always registered; fold remains faintly
     // visible as a discoverability cue and copy appears with the hover surface.
     let is_hovered = block_hovered == Some(block_id);
+    let copy_hovered =
+        action_hovered == Some(crate::block_component::BlockHeaderAction::Copy(block_id));
+    let fold_hovered = action_hovered
+        == Some(crate::block_component::BlockHeaderAction::ToggleFold(
+            block_id,
+        ));
     let geometry = block_header_action_geometry(right, y, pitch, cw, renderer.scale);
     let metrics = crate::ui_tokens::UiMetrics::for_scale(renderer.scale);
     let line_w = metrics.stroke * 1.5;
@@ -115,8 +123,8 @@ pub(super) fn push_block_header_actions(
     if is_hovered {
         let inset_x = metrics.stroke * 2.0;
         let inset_y = (pitch * 0.10).max(metrics.stroke);
-        let surface = [fg[0], fg[1], fg[2], 0.11];
-        for rect in [geometry.copy, geometry.fold] {
+        for (rect, exact_hover) in [(geometry.copy, copy_hovered), (geometry.fold, fold_hovered)] {
+            let surface = [fg[0], fg[1], fg[2], if exact_hover { 0.22 } else { 0.055 }];
             push_quad(
                 verts,
                 [
@@ -129,6 +137,24 @@ pub(super) fn push_block_header_actions(
                 [0.0; 4],
                 surface,
             );
+            if exact_hover {
+                let border = [fg[0], fg[1], fg[2], 0.34];
+                let [x0, y0, x1, y1] = [
+                    rect[0] + inset_x,
+                    rect[1] + inset_y,
+                    rect[2] - inset_x,
+                    rect[3] - inset_y,
+                ];
+                let stroke = metrics.stroke.max(1.0);
+                for edge in [
+                    [x0, y0, x1, y0 + stroke],
+                    [x0, y1 - stroke, x1, y1],
+                    [x0, y0, x0 + stroke, y1],
+                    [x1 - stroke, y0, x1, y1],
+                ] {
+                    push_quad(verts, edge, bg_uv, [0.0; 4], border);
+                }
+            }
         }
     }
 

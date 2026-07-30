@@ -63,17 +63,6 @@ pub struct CompletionCandidate {
     pub is_dir: bool,
 }
 
-impl CompletionCandidate {
-    pub fn new(label: String, insert: String, source: CompletionSource) -> Self {
-        Self {
-            label,
-            insert,
-            source,
-            is_dir: false,
-        }
-    }
-}
-
 /// v1.7.2: A completion request. Replaces `CompleteCtx` for provider code.
 pub struct CompletionRequest<'a> {
     pub prefix: &'a str,
@@ -127,13 +116,77 @@ pub fn complete_with_providers(
     request: &CompletionRequest,
     cancel: &CancelToken,
 ) -> Vec<CompletionCandidate> {
+    complete_with_providers_budgeted(providers, request, cancel, std::time::Duration::MAX)
+}
+
+/// Run providers until the shared wall-clock budget expires. Slow providers
+/// still run off the UI thread; the budget prevents subsequent providers from
+/// extending a stale request indefinitely.
+pub fn complete_with_providers_budgeted(
+    providers: &[&dyn CompletionProvider],
+    request: &CompletionRequest,
+    cancel: &CancelToken,
+    budget: std::time::Duration,
+) -> Vec<CompletionCandidate> {
+    let started = std::time::Instant::now();
     let mut all = Vec::new();
     for provider in providers {
-        if cancel.is_cancelled() {
+        if cancel.is_cancelled() || started.elapsed() >= budget {
             break;
         }
         all.extend(provider.complete(request, cancel));
     }
     sort_candidates(&mut all);
     dedupe_candidates(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::complete::CompletePosition;
+
+    #[test]
+    fn aggregator_sorts_dedupes_and_honors_cancellation() {
+        let history = vec!["cargo test".to_string()];
+        let path_bins = vec!["cargo".to_string(), "cat".to_string()];
+        let request = CompletionRequest {
+            prefix: "ca",
+            cwd: "/definitely/not/a/real/path",
+            history: &history,
+            path_bins: &path_bins,
+            position: CompletePosition::Command,
+        };
+        let history_provider = HistoryProvider;
+        let path_provider = PathExecutableProvider;
+        let providers: [&dyn CompletionProvider; 2] = [&path_provider, &history_provider];
+        let cancel = CancelToken::new();
+
+        let candidates = complete_with_providers(&providers, &request, &cancel);
+        assert_eq!(candidates[0].source, CompletionSource::History);
+        assert_eq!(candidates[0].label, "cargo test");
+        assert_eq!(candidates[1].label, "cargo");
+
+        cancel.cancel();
+        assert!(complete_with_providers(&providers, &request, &cancel).is_empty());
+    }
+
+    #[test]
+    fn zero_budget_does_not_run_any_provider() {
+        let request = CompletionRequest {
+            prefix: "c",
+            cwd: "/tmp",
+            history: &[],
+            path_bins: &["cargo".to_string()],
+            position: CompletePosition::Command,
+        };
+        let provider = PathExecutableProvider;
+        let providers: [&dyn CompletionProvider; 1] = [&provider];
+        assert!(complete_with_providers_budgeted(
+            &providers,
+            &request,
+            &CancelToken::new(),
+            std::time::Duration::ZERO,
+        )
+        .is_empty());
+    }
 }

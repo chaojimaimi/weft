@@ -149,14 +149,14 @@ pub fn layout_settings(
         (box_x1, box_x1)
     };
 
-    // v1.5.1: Profile toolbar occupies one row at the top of the content
-    // area. It pushes the form rows down by `ch` so they don't overlap.
+    // The profile toolbar is slightly taller than one text row so the active
+    // indicator has its own breathing room below the label.
     // The toolbar is only drawn when the content area is visible — in
     // narrow sidebar-only mode the toolbar is zero-sized.
     let (profile_toolbar_rect, profile_create_button, profile_delete_button, content_top) =
         if show_content {
             let toolbar_y0 = content_top_initial;
-            let toolbar_y1 = content_top_initial + ch;
+            let toolbar_y1 = content_top_initial + ch * 1.2;
             let toolbar = [content_x0, toolbar_y0, content_x1, toolbar_y1];
             // "+" and "-" buttons sit at the right edge of the toolbar.
             let btn_w = ch * 1.5;
@@ -227,4 +227,19 @@ pub fn layout_settings(
         profile_create_button,
         profile_delete_button,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_toolbar_reserves_space_below_one_text_row() {
+        let ch = 20.0;
+        let layout =
+            layout_settings(1200.0, 900.0, 10.0, ch, 2, false, &[80.0; 6], false, false).unwrap();
+        let toolbar = layout.profile_toolbar_rect;
+        assert_eq!(toolbar[3] - toolbar[1], ch * 1.2);
+        assert_eq!(layout.content_top, toolbar[3]);
+    }
 }

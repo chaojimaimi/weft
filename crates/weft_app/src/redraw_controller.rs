@@ -147,6 +147,7 @@ impl App {
         let settings_drill_down = self.settings.drill_down;
         let settings_keybinding_conflict_count =
             settings_keybindings.iter().filter(|v| v.conflict).count();
+        let terminal_owns_ime = self.overlay_input_owner().is_none();
         let settings_field_errors: &[(String, String)] = &self.settings.field_errors;
         // v1.5.1: Build profile views for the Settings toolbar. Index 0 is
         // always "Base" (is_active = no active profile); 1..N are sorted
@@ -185,11 +186,7 @@ impl App {
         // v1.7.3-C: snapshot the bookmarked-block set before the mutable
         // `tab` borrow below. `annotation_store()` borrows `self.sessions`
         // immutably, which would conflict with `active_mut()`.
-        let bookmarked_blocks = self
-            .sessions
-            .annotation_store()
-            .and_then(|store| store.bookmarked_ids().ok())
-            .unwrap_or_default();
+        let bookmarked_blocks = self.bookmarked_blocks.clone();
         let tab = self.sessions.active_mut();
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
@@ -256,21 +253,21 @@ impl App {
                         .find(|(id, _)| *id == active_id)
                         .map(|(_, rect)| *rect)
                         .unwrap_or(content_rect);
-                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, usize, u64)> =
-                        pane_layouts
-                            .iter()
-                            .filter(|(id, _)| *id != active_id)
-                            .filter_map(|(id, rect)| {
-                                let pane = tab.pane(*id)?;
-                                let terminal = pane.terminal.as_ref()?;
-                                Some((
-                                    *rect,
-                                    terminal as *const Terminal,
-                                    pane.block_scroll_anchor.offset_value(),
-                                    pane.pane_session_id,
-                                ))
-                            })
-                            .collect();
+                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, f32, u64)> = pane_layouts
+                        .iter()
+                        .filter(|(id, _)| *id != active_id)
+                        .filter_map(|(id, rect)| {
+                            let pane = tab.pane(*id)?;
+                            let terminal = pane.terminal.as_ref()?;
+                            Some((
+                                *rect,
+                                terminal as *const Terminal,
+                                pane.block_scroll_anchor.offset_value() as f32
+                                    + pane.block_scroll_fraction,
+                                pane.pane_session_id,
+                            ))
+                        })
+                        .collect();
                     tracing::debug!(
                         content_rect = ?content_rect,
                         active_id = ?active_id,
@@ -283,7 +280,7 @@ impl App {
                 }
                 None => (
                     [0.0, 0.0, 0.0, 0.0],
-                    Vec::<(crate::layout::Rect, *const Terminal, usize, u64)>::new(),
+                    Vec::<(crate::layout::Rect, *const Terminal, f32, u64)>::new(),
                     Vec::new(),
                     weft_core::pane_layout::PaneId(0),
                 ),
@@ -374,6 +371,9 @@ impl App {
                             PaletteEntry::SearchHit(hit) => {
                                 (hit.doc.title.clone(), String::new(), hit.doc.kind.label())
                             }
+                            PaletteEntry::Runbook(entry) => {
+                                (entry.command.clone(), entry.description.clone(), "Runbook")
+                            }
                         })
                         .collect()
                 };
@@ -415,6 +415,7 @@ impl App {
                 self.panel.scroll_offset,
                 &pane.ime_preedit,
                 pane.ime_preedit_cursor,
+                terminal_owns_ime,
                 self.palette.open,
                 &self.palette.query,
                 self.palette.selection,
@@ -437,6 +438,7 @@ impl App {
                 self.settings.draft.window.padding_x,
                 self.settings.draft.window.padding_y,
                 self.settings.draft.scrollback.lines,
+                self.settings.draft.theme.minimum_contrast,
                 self.settings.draft.window.width,
                 self.settings.draft.window.height,
                 self.settings.draft.window.sidebar_width,
@@ -577,6 +579,8 @@ impl App {
             }
             renderer.panel_highlight = self.panel.highlight;
             renderer.block_hovered = self.interaction.block_hovered;
+            renderer.block_selected = self.interaction.block_selected;
+            renderer.block_action_hovered = self.interaction.block_action_hovered;
             // v1.7.3-C: assign the pre-computed bookmarked-block set.
             renderer.bookmarked_blocks = bookmarked_blocks;
             renderer.reduce_motion = self.window_runtime.reduce_motion;
@@ -602,7 +606,8 @@ impl App {
             // `&mut pane.selection_handler` borrow below — `block_scroll()`
             // takes `&self` and would conflict with the mutable borrow through
             // the shared `pane` reference.
-            let block_scroll = pane.block_scroll_anchor.offset_value();
+            let block_scroll =
+                pane.block_scroll_anchor.offset_value() as f32 + pane.block_scroll_fraction;
             // R3 task 6: arm the per-frame trace recorder and stamp the frame
             // id on the renderer (read by the Metal command-buffer label so the
             // async GPU-completion handler can correlate). The recorder lives

@@ -414,7 +414,7 @@ impl App {
                 // action falls through to handle_mouse_press which hits the
                 // existing BlockActionCopy/BlockActionFold HitRegions.
                 let (copy_rect, fold_rect) = crate::paint::block_view::block_header_action_rects(
-                    layout.content.right as f32,
+                    crate::layout::block_content_x_bounds(&ctx).1,
                     layout.content.top as f32,
                     layout.cell_height as f32,
                     layout.cell_width as f32,
@@ -631,16 +631,20 @@ impl App {
             self.settings_is_narrow(),
             self.settings.drill_down,
         )?;
-        let theme_count = if self.settings.tab == crate::overlay::SettingsTab::Appearance {
-            self.settings_theme_views().len().min(layout.max_rows)
-        } else {
-            0
-        };
+        let total_rows = self.settings_tab_row_count();
+        let row_window = crate::settings_component::settings_scene_row_window(
+            self.settings.tab,
+            total_rows,
+            self.settings_theme_views().len(),
+            layout.max_rows,
+            self.settings.scroll_offset,
+        );
+        let theme_count = row_window.0;
         let mut scene = crate::settings_component::build_settings_scene(
             &layout,
             crate::overlay::SettingsTab::ALL.as_slice(),
             self.settings.tab,
-            theme_count,
+            row_window,
             ch,
             // v1.5.1: profile_count = number of profiles + 1 (for "Base").
             self.profile_names_sorted().len() + 1,
@@ -650,7 +654,9 @@ impl App {
             for (node, theme) in scene
                 .semantics
                 .iter_mut()
-                .filter(|node| node.role == SemanticRole::ListItem)
+                .filter(|node| {
+                    node.role == SemanticRole::ListItem && node.label.starts_with("Theme ")
+                })
                 .zip(themes.iter())
             {
                 node.label = theme.label.into();

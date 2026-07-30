@@ -26,6 +26,47 @@ fn atlas_cell_dimensions_never_reach_zero() {
 }
 
 #[test]
+fn modern_pictographs_use_the_color_emoji_path() {
+    for ch in ['🦞', '🧑', '🫠', '🪄'] {
+        assert!(is_emoji_char(ch), "{ch} must use Apple Color Emoji");
+    }
+    assert!(!is_emoji_char('中'));
+    assert!(!is_emoji_char('\u{1f650}'));
+    assert!(!is_emoji_char('\u{1f800}'));
+}
+
+#[test]
+fn lobster_rasterizes_with_visible_ink() {
+    let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
+    let pixels = GlyphAtlas::rasterize_glyph(&font, '🦞', 28.0, 28, 32, true, 6.0);
+    let (top, bottom) = ink_y_bbox(&pixels, 28, 32).expect("lobster emoji must have ink");
+    let ink_height = bottom - top + 1;
+    assert!(ink_height >= 20, "lobster ink is too small: {ink_height}px");
+}
+
+#[test]
+fn astral_emoji_discards_the_surrogate_placeholder_glyph() {
+    let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
+    let ct_font = font.native_font().clone_with_font_size(28.0);
+    let glyphs = super::font::drawable_glyphs_for_char(&ct_font, '🦞');
+    assert_eq!(glyphs.len(), 1);
+    assert_ne!(glyphs[0], 0);
+}
+
+#[test]
+fn color_emoji_rasterization_tracks_terminal_zoom() {
+    let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
+    let small = GlyphAtlas::rasterize_glyph(&font, '🦞', 16.0, 20, 22, true, 4.0);
+    let large = GlyphAtlas::rasterize_glyph(&font, '🦞', 28.0, 32, 36, true, 7.0);
+    let (small_top, small_bottom) = ink_y_bbox(&small, 20, 22).expect("small emoji ink");
+    let (large_top, large_bottom) = ink_y_bbox(&large, 32, 36).expect("large emoji ink");
+    assert!(
+        large_bottom - large_top > small_bottom - small_top,
+        "color emoji must grow when terminal zoom grows"
+    );
+}
+
+#[test]
 fn prewarm_path_uses_edge_to_edge_procedural_box_line() {
     let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
     let (width, height) = (8, 16);

@@ -561,6 +561,41 @@ fn primary_screen_exit_waits_for_late_resume_tail_before_freezing_block() {
 }
 
 #[test]
+fn colored_status_survives_spinner_cursor_rewrite() {
+    let mut terminal = Terminal::new(12, 100);
+    terminal.process(b"\x1b]133;A\x07openclaw gateway status\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(
+        b"\x1b[1m\x1b[38;2;255;90;45mOpenClaw\x1b[39m\x1b[22m\r\n\
+          \x1b[?25l\x1b[90m|\x1b[39m\r\n\
+          \x1b[1D\x1b[0K\x1b[32m<>\x1b[39m  \r\n\
+          \x1b[?25h\r\x1b[2K\x1b[38;2;139;127;119mService:\x1b[39m \
+          \x1b[38;2;255;90;45mLaunchAgent\x1b[39m (\x1b[32mloaded\x1b[39m)\r\n",
+    );
+    terminal.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+
+    let block = terminal.block_tracker().blocks().last().expect("block");
+    let service_line = block
+        .output
+        .lines()
+        .position(|line| line.starts_with("Service:"))
+        .expect("service line");
+    let styled = block.styled_output.as_ref().expect("styled output");
+    let line = styled.line(service_line).expect("styled service line");
+    assert_eq!(
+        line.foreground_at(0),
+        Some(crate::grid::CellColor::Rgb(crate::grid::Color::rgb(
+            139, 127, 119
+        )))
+    );
+    assert_eq!(
+        line.foreground_at("Service: ".chars().count()),
+        Some(crate::grid::CellColor::Rgb(crate::grid::Color::rgb(
+            255, 90, 45
+        )))
+    );
+}
+
+#[test]
 fn deferred_primary_screen_exit_replaces_stale_row_suffixes() {
     let mut terminal = Terminal::new(7, 72);
     terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
@@ -1226,6 +1261,39 @@ fn progress_rewrites_are_compacted_in_detached_block_output() {
 
     let block = t.block_tracker().blocks().last().unwrap();
     assert_eq!(block.output.as_ref(), "Upgrading...\nDone\n");
+}
+
+#[test]
+fn horizontal_cursor_progress_rewrites_are_compacted_in_block_output() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07upgrade\n\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"Upgrading.\x1b[1GUpgrading..\x1b[K\x1b[1GUpgrading...\x1b[K");
+    t.process(b"\nDone\n\x1b]133;D;0\x07");
+
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.output.as_ref(), "Upgrading...\nDone\n");
+}
+
+#[test]
+fn horizontal_cursor_capture_uses_grid_clamped_columns() {
+    for cursor_move in [b"\x1b[999C".as_slice(), b"\x1b[999G".as_slice()] {
+        let mut t = Terminal::new(4, 10);
+        t.process(b"\x1b]133;A\x07cmd\n\x1b]133;B\x07\x1b]133;C\x07foo");
+        t.process(cursor_move);
+        t.process(b"X\x1b]133;D;0\x07");
+
+        let output = &t.block_tracker().blocks().last().unwrap().output;
+        assert!(output.len() <= 10, "capture escaped grid width: {output:?}");
+        assert!(output.ends_with('X'));
+    }
+
+    let mut t = Terminal::new(4, 10);
+    t.process(b"\x1b]133;A\x07cmd\n\x1b]133;B\x07\x1b]133;C\x07foo\x1b[999DZ");
+    t.process(b"\x1b]133;D;0\x07");
+    assert_eq!(
+        t.block_tracker().blocks().last().unwrap().output.as_ref(),
+        "Zoo"
+    );
 }
 
 fn assert_no_orphaned_wide_cells(t: &Terminal, row: usize) {

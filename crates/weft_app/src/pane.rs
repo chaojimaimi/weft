@@ -68,6 +68,10 @@ pub struct Pane {
     /// Replaces the raw `usize` offset with a `BlockScrollAnchor` so the
     /// snap-to-bottom caller can tell follow-tail apart from detached-read.
     pub(crate) block_scroll_anchor: BlockScrollAnchor,
+    /// Fractional visual-row offset used for pixel-precise trackpad scrolling.
+    /// Persistence remains row-based; this transient fraction resets on
+    /// programmatic jumps and session restore.
+    pub(crate) block_scroll_fraction: f32,
     /// Original persisted state retained while a restored shell is starting.
     /// Until OSC 7 supplies an authoritative cwd, this prevents autosave
     /// from replacing the saved cwd with a transient `None`. It also
@@ -142,6 +146,7 @@ impl Pane {
             pending_pty_resize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
+            block_scroll_fraction: 0.0,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
@@ -167,6 +172,7 @@ impl Pane {
             pending_pty_resize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
+            block_scroll_fraction: 0.0,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
@@ -195,6 +201,7 @@ impl Pane {
             pending_pty_resize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
+            block_scroll_fraction: 0.0,
             restored_snapshot: None,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,

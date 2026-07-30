@@ -290,7 +290,7 @@ impl MetalRenderer {
                     );
                 }
                 SettingsTab::Terminal => {
-                    let rows: [(&str, String, &str); 3] = [
+                    let rows: [(&str, String, &str); 4] = [
                         (
                             "Scrollback:",
                             format!("{} lines", s.scrollback_lines),
@@ -305,6 +305,11 @@ impl MetalRenderer {
                             "Padding Y:",
                             format!("{} cells", s.window_padding_y),
                             "Padding Y",
+                        ),
+                        (
+                            "Contrast:",
+                            format!("{:.1}:1", s.minimum_contrast),
+                            "Minimum Contrast",
                         ),
                     ];
                     for (i, (label, value, err_label)) in rows.iter().enumerate() {
@@ -615,7 +620,8 @@ impl MetalRenderer {
     ) {
         // Reserve 6 rows for the adjustment fields after the theme list
         // (Variant, Font, Size, Line, Opacity, Semantic toggle).
-        let theme_count = s.themes.len().min(max_rows.saturating_sub(6));
+        let theme_count =
+            crate::settings_component::visible_appearance_theme_count(s.themes.len(), max_rows);
 
         // Theme list with vector-drawn circles.
         for (i, theme) in s.themes.iter().take(theme_count).enumerate() {

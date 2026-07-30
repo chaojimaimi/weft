@@ -14,6 +14,32 @@ pub(super) fn nonzero_cell_dimension(dimension: u32) -> u32 {
     dimension.max(1)
 }
 
+pub(super) fn drawable_glyphs_for_char(ct_font: &core_text::font::CTFont, ch: char) -> Vec<u16> {
+    use core_foundation::string::UniChar;
+
+    let mut utf16 = [0u16; 3];
+    let encoded = ch.encode_utf16(&mut utf16);
+    let chars: Vec<UniChar> = encoded.iter().map(|&unit| unit as UniChar).collect();
+    let mut glyphs = vec![0u16; chars.len()];
+    let mapped = unsafe {
+        ct_font.get_glyphs_for_characters(
+            chars.as_ptr(),
+            glyphs.as_mut_ptr(),
+            chars.len() as core_foundation::base::CFIndex,
+        )
+    };
+    if !mapped {
+        return Vec::new();
+    }
+
+    // Astral-plane scalars use a UTF-16 surrogate pair. CoreText maps that
+    // pair to `[real_glyph, 0]`; drawing the trailing missing glyph overlays
+    // a tofu rectangle around the emoji. Glyph 0 never carries drawable
+    // content here, so discard it before building parallel positions.
+    glyphs.retain(|glyph| *glyph != 0);
+    glyphs
+}
+
 /// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
 /// CoreGraphics. font-kit's `rasterize_glyph` cannot handle color bitmap fonts
 /// (Apple Color Emoji produces 0 pixels on A8/RGBA32 canvases). This bypasses
@@ -25,29 +51,24 @@ pub(super) fn nonzero_cell_dimension(dimension: u32) -> u32 {
 pub(super) fn rasterize_emoji_alpha(
     font: &Font,
     ch: char,
+    scaled_size: f32,
     glyph_w: u32,
     cell_h: u32,
+    primary_descent_px: f32,
 ) -> Option<Vec<u8>> {
-    use core_foundation::string::UniChar;
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
     use core_text::font::CTFont;
 
-    let ct_font: CTFont = font.native_font();
+    // font-kit loads CoreText fonts at a nominal 16pt. Unlike its own
+    // rasterizer, CTFontDrawGlyphs does not take a separate size, so drawing
+    // the native font directly made every color emoji stay near 16px even
+    // after terminal zoom. Clone it at the atlas's physical pixel size.
+    let ct_font: CTFont = font.native_font().clone_with_font_size(scaled_size as f64);
 
     // Map character → CGGlyph via UTF-16 (astral-plane chars need surrogate pair).
-    let mut utf16 = [0u16; 3];
-    let encoded = ch.encode_utf16(&mut utf16);
-    let chars: Vec<UniChar> = encoded.iter().map(|&u| u as UniChar).collect();
-    let mut glyphs = vec![0u16; chars.len()];
-    let got = unsafe {
-        ct_font.get_glyphs_for_characters(
-            chars.as_ptr(),
-            glyphs.as_mut_ptr(),
-            chars.len() as core_foundation::base::CFIndex,
-        )
-    };
-    if !got || glyphs.iter().all(|&g| g == 0) {
+    let glyphs = drawable_glyphs_for_char(&ct_font, ch);
+    if glyphs.is_empty() {
         return None;
     }
 
@@ -67,12 +88,11 @@ pub(super) fn rasterize_emoji_alpha(
     );
 
     // Draw glyph at bottom-left with descent offset (CG is Y-up).
-    // Provide one position per glyph (astral-plane chars may produce 2 glyphs
-    // from a surrogate pair — draw_glyphs asserts glyphs.len() == positions.len()).
-    let descent = ct_font.descent();
+    // Provide one position per drawable glyph; draw_glyphs requires parallel
+    // arrays and the UTF-16 mapping helper has removed surrogate placeholders.
     let positions: Vec<core_graphics_types::geometry::CGPoint> = glyphs
         .iter()
-        .map(|_| core_graphics_types::geometry::CGPoint::new(0.0, descent.abs()))
+        .map(|_| core_graphics_types::geometry::CGPoint::new(0.0, primary_descent_px as f64))
         .collect();
     ct_font.draw_glyphs(&glyphs, &positions, ctx.clone());
 
@@ -159,10 +179,11 @@ fn load_by_family(family: &str) -> Option<Font> {
 #[allow(dead_code)]
 pub(super) fn is_emoji_char(ch: char) -> bool {
     matches!(ch,
-        '\u{1F600}'..='\u{1F64F}' | // Emoticons
         '\u{1F300}'..='\u{1F5FF}' | // Misc Symbols and Pictographs
+        '\u{1F600}'..='\u{1F64F}' | // Emoticons
         '\u{1F680}'..='\u{1F6FF}' | // Transport and Map
         '\u{1F1E0}'..='\u{1F1FF}' | // Flags
+        '\u{1F900}'..='\u{1FAFF}' | // Supplemental Symbols and Extended-A
         '\u{2600}'..='\u{26FF}'   | // Misc symbols
         '\u{2700}'..='\u{27BF}'     // Dingbats
     )

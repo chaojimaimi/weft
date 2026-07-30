@@ -23,6 +23,25 @@ impl MetalRenderer {
         self.styled_line_cache.borrow_mut().bump_generation();
     }
 
+    pub fn set_minimum_contrast(&mut self, minimum_contrast: f32) {
+        let minimum_contrast =
+            crate::settings_validation::runtime_minimum_contrast(minimum_contrast);
+        if (self.minimum_contrast - minimum_contrast).abs() <= f32::EPSILON {
+            return;
+        }
+        self.minimum_contrast = minimum_contrast;
+        self.force_full_grid.set(true);
+        self.styled_line_cache.borrow_mut().bump_generation();
+    }
+
+    pub fn set_semantic_output_enabled(&mut self, enabled: bool) {
+        if self.semantic_output_enabled == enabled {
+            return;
+        }
+        self.semantic_output_enabled = enabled;
+        self.styled_line_cache.borrow_mut().bump_generation();
+    }
+
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
     /// tab switch, selection change, or any event that invalidates the
     /// per-row vertex cache. Takes `&self` (not `&mut self`) because it only

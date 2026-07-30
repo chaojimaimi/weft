@@ -368,6 +368,8 @@ pub struct InteractionState {
     /// F3-1: Block currently hovered by the mouse in the block view, if any.
     /// Drives the inline copy/fold action buttons rendered on the header row.
     pub block_hovered: Option<BlockId>,
+    pub block_selected: Option<BlockId>,
+    pub block_action_hovered: Option<crate::block_component::BlockHeaderAction>,
     /// F3-3: Active sidebar resize drag. Set on press at the sidebar's right
     /// edge; cleared on release (which persists the width to config).
     pub sidebar_drag: Option<SidebarDragState>,
@@ -405,6 +407,8 @@ impl InteractionState {
             modal_mouse_capture: crate::input_router::ModalMouseCapture::default(),
             context_menu: None,
             block_hovered: None,
+            block_selected: None,
+            block_action_hovered: None,
             sidebar_drag: None,
             pane_divider_drag: None,
             prev_focus: None,

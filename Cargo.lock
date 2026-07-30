@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "weft_app"
-version = "1.7.4"
+version = "1.7.8"
 dependencies = [
  "block",
  "core-foundation",
@@ -3111,6 +3111,7 @@ dependencies = [
  "font-kit",
  "image",
  "metal",
+ "nix",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -3134,7 +3135,7 @@ dependencies = [
 
 [[package]]
 name = "weft_core"
-version = "1.7.4"
+version = "1.7.8"
 dependencies = [
  "bitflags 2.13.0",
  "nix",

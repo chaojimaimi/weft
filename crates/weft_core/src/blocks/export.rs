@@ -70,7 +70,7 @@ fn env_patterns() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)(?P<name>(?:export\s+)?\S*(?:TOKEN|PASSWORD|PASSWD|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)\S*)\s*=\s*\S+",
+            r#"(?i)(?P<name>(?:export\s+)?\S*(?:TOKEN|PASSWORD|PASSWD|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)\S*)\s*=\s*(?:\$'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|'[^']*'|\S+)"#,
         )
         .expect("export env regex compiles")
     })
@@ -102,8 +102,9 @@ pub fn export_block_as_markdown(block: &Block, annotation: Option<&BlockAnnotati
     // Header + command.
     md.push_str("## Command\n\n");
     md.push_str("```sh\n");
-    md.push_str(&block.command);
-    if !block.command.ends_with('\n') {
+    let redacted_command = redact_for_export(&block.command);
+    md.push_str(&redacted_command);
+    if !redacted_command.ends_with('\n') {
         md.push('\n');
     }
     md.push_str("```\n\n");
@@ -196,6 +197,25 @@ mod tests {
     }
 
     #[test]
+    fn redact_quoted_secret_with_spaces() {
+        let s = "export API_TOKEN=\"secret value with spaces\"\nnext=line\n";
+        let r = redact_for_export(s);
+        assert_eq!(r, "export API_TOKEN=••••••••\nnext=line\n");
+        assert!(!r.contains("secret value with spaces"));
+    }
+
+    #[test]
+    fn redact_escaped_and_ansi_c_quoted_secrets() {
+        for text in [
+            "API_TOKEN=$'secret value' next\n",
+            "API_TOKEN=\"a\\\" b\" next\n",
+        ] {
+            let redacted = redact_for_export(text);
+            assert_eq!(redacted, "API_TOKEN=•••••••• next\n");
+        }
+    }
+
+    #[test]
     fn redact_authorization_bearer() {
         let s = "Authorization: Bearer my-secret-token\n";
         let r = redact_for_export(s);
@@ -280,6 +300,14 @@ mod tests {
         assert!(!md.contains("secret123"));
         // Non-secret env vars preserved.
         assert!(md.contains("PATH=/usr/bin"));
+    }
+
+    #[test]
+    fn export_redacts_secrets_in_command() {
+        let block = mk_block("API_TOKEN=secret123 deploy", "ok\n");
+        let md = export_block_as_markdown(&block, None);
+        assert!(md.contains("API_TOKEN=•••••••• deploy"));
+        assert!(!md.contains("secret123"));
     }
 
     #[test]

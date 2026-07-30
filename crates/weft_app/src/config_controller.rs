@@ -237,6 +237,8 @@ impl App {
         };
         if let Some(r) = &mut self.renderer {
             r.set_theme(theme.clone());
+            r.set_minimum_contrast(config.theme.minimum_contrast);
+            r.set_semantic_output_enabled(config.theme.semantic_output_enabled());
         }
         // v1.5.0: reseed palette on EVERY pane in EVERY tab, not just the
         // active one. A profile switch must recolor all panes so background

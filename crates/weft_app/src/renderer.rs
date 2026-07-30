@@ -1,12 +1,10 @@
-// MetalRenderer resource ownership and frame orchestration. Runtime geometry
-// and configuration methods live in renderer/runtime.rs.
+// MetalRenderer ownership; runtime configuration lives in renderer/runtime.rs.
 //! Metal GPU renderer for the terminal Grid.
 
 use metal::{Device, MetalLayer};
 use std::cell::{Cell, RefCell};
 
 use crate::glyph::GlyphAtlas;
-// A5: vertex primitives + color helpers live in paint::primitives.
 use crate::paint::grid_cache::BlockLayoutCache;
 use crate::paint::overlays::FindDrawState;
 use crate::paint::primitives::{color_to_normalized, push_quad};
@@ -37,6 +35,8 @@ pub struct MetalRenderer {
     /// Active theme (default fg/bg/cursor/selection). Per-frame, so a
     /// `set_theme` call recolors the screen on the next draw.
     pub(crate) theme: Theme,
+    pub(crate) minimum_contrast: f32,
+    pub(crate) semantic_output_enabled: bool,
     /// Content padding in **physical** pixels (logical config value × scale).
     /// Cells are positioned `pad_x + col·cw`, `pad_y + row·ch`; the usable
     /// area for row/col math is the viewport minus `2·pad`.
@@ -76,10 +76,10 @@ pub struct MetalRenderer {
     /// the history panel click). The renderer draws an accent border around
     /// this block in block view. Cleared by the app after 1.5s.
     pub panel_highlight: Option<BlockId>,
-    /// F3-1: Block currently hovered by the mouse (set per-frame by the app
-    /// from `InteractionState.block_hovered`). Drives inline copy/fold action
-    /// buttons on the block header row.
+    /// Block hover drives inline header actions.
     pub block_hovered: Option<BlockId>,
+    pub block_selected: Option<BlockId>,
+    pub block_action_hovered: Option<crate::block_component::BlockHeaderAction>,
     /// v1.7.3-C: Set of bookmarked block IDs (set per-frame by the app from
     /// `AnnotationStore`). The block view draws a ★ glyph before the header
     /// text of each bookmarked block.
@@ -214,6 +214,7 @@ pub struct MetalRenderer {
     /// v1.0 P1.5-B0: Capacity of each buffer in the ring (in bytes). When
     /// vertex data exceeds this, a new larger buffer is allocated.
     pub(crate) vertex_buffer_capacity: Cell<u64>,
+    pub(crate) upload_low_usage_frames: [crate::paint::metal_backend::LowUsageCounter; 2],
     /// v1.0 P1.5-B1: Instanced render pipeline for grid cells. Renders
     /// each cell as a single 64-byte instance (origin/size/uv/fg/bg) drawn
     /// against a static 4-vertex quad + 6-index buffer, replacing the
@@ -266,7 +267,7 @@ impl MetalRenderer {
         cursor_blink_on: bool,
         cursor_blink_phase: f32,
         overlays: &crate::overlay::OverlayStack<'_>,
-        block_scroll: usize,
+        block_scroll: f32,
         // v0.8 U6: block-content metrics (total_rows, visible_rows,
         // max_scroll) for the dynamic scrollbar thumb. None in grid view.
         scroll_metrics: Option<(usize, usize, usize)>,
@@ -402,6 +403,7 @@ impl MetalRenderer {
             }
             None
         });
+        let tui_preedit = overlays.tui_preedit();
         let completions = overlays.layers.iter().find_map(|l| {
             if l.kind == OverlayKind::Completion {
                 if let OverlayContent::Completion(c) = &l.content {
@@ -452,6 +454,7 @@ impl MetalRenderer {
             grid,
             panel,
             prompt,
+            tui_preedit,
             completions,
             palette,
             settings,
@@ -566,14 +569,9 @@ impl MetalRenderer {
                     .layout_ctx
                     .as_ref()
                     .expect("LayoutCtx built at draw() entry");
-                let box_top_y = crate::layout::layout_prompt(
-                    active_ctx,
-                    p.lines.len(),
-                    p.cursor.0,
-                    0,
-                    p.scroll_offset,
-                )
-                .box_rect[1];
+                let (_, prompt_layout, _) =
+                    crate::paint::prompt::prompt_layout_for_buffer(active_ctx, p.lines, p.cursor);
+                let box_top_y = prompt_layout.box_rect[1];
                 self.build_block_view_vertices(
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
@@ -584,6 +582,8 @@ impl MetalRenderer {
                         block_scroll,
                         viewport_rows: terminal.grid().num_rows,
                         block_hovered: self.block_hovered,
+                        block_selected: self.block_selected,
+                        block_action_hovered: self.block_action_hovered,
                         spinner_phase: self.spinner_phase,
                         find_block_highlight: self
                             .find_state
@@ -616,6 +616,8 @@ impl MetalRenderer {
                         block_scroll,
                         viewport_rows: terminal.grid().num_rows,
                         block_hovered: self.block_hovered,
+                        block_selected: self.block_selected,
+                        block_action_hovered: self.block_action_hovered,
                         spinner_phase: self.spinner_phase,
                         find_block_highlight: self
                             .find_state
@@ -667,7 +669,7 @@ impl MetalRenderer {
                 terminal.cursor_style,
                 terminal.cursor_visible,
                 cursor_blink_on,
-                prompt.is_some(),
+                prompt.is_some() || tui_preedit.is_some(),
             );
             let grid_build_start = std::time::Instant::now();
             let (grid_batch, grid_dirty_rows) = self.build_grid_instances(
@@ -731,7 +733,7 @@ impl MetalRenderer {
                     total,
                     visible,
                     max_scroll,
-                    block_scroll,
+                    block_scroll.floor() as usize,
                 ) {
                     // v1.0: label_c (70% fg + 30% bg) — was accent_dim.
                     let fg_v = color_to_normalized(self.theme.foreground);
@@ -760,6 +762,10 @@ impl MetalRenderer {
             vertices.extend_from_slice(&self.build_status_hint_vertices(terminal));
         }
 
+        if let Some(preedit) = tui_preedit {
+            vertices.extend_from_slice(&self.build_tui_preedit_for_grid(preedit, grid));
+        }
+
         // Overlay the editor input box at the bottom (Editor mode only).
         if let Some(p) = prompt {
             vertices.extend_from_slice(&self.build_prompt_vertices(
@@ -773,8 +779,18 @@ impl MetalRenderer {
         // Positioned above the prompt input box using the same geometry.
         if let Some((matches, selected)) = completions {
             if !matches.is_empty() {
-                let n_lines = prompt.map(|p| p.lines.len().max(1)).unwrap_or(1);
-                let cursor = prompt.map(|p| p.cursor).unwrap_or((0, 0));
+                let visual_prompt = prompt.map(|p| {
+                    let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+                    crate::paint::prompt::prompt_layout_for_buffer(&ctx, p.lines, p.cursor).0
+                });
+                let n_lines = visual_prompt
+                    .as_ref()
+                    .map(|visual| visual.rows.len())
+                    .unwrap_or(1);
+                let cursor = visual_prompt
+                    .as_ref()
+                    .map(|visual| (visual.cursor_row, visual.cursor_display_col))
+                    .unwrap_or((0, 0));
                 let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
                 if let Some(layout) = crate::completion_component::derive_completion_layout(
                     &ctx,

@@ -23,6 +23,7 @@ pub(crate) mod overlays;
 pub(crate) mod palette;
 pub(crate) mod pane_dividers;
 pub(crate) mod panel;
+pub(crate) mod preedit;
 pub(crate) mod primitives;
 pub(crate) mod prompt;
 pub(crate) mod settings;

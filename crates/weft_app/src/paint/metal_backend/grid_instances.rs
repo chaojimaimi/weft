@@ -14,7 +14,7 @@
 //! draw glyph range. Single-pane tabs take the fast path: one scissor (full
 //! viewport), two draw calls (bg + glyph).
 
-use metal::{MTLIndexType, MTLPrimitiveType, MTLResourceOptions};
+use metal::{MTLIndexType, MTLPrimitiveType};
 
 impl super::MetalRenderer {
     /// v1.0 P1.5-B1: Upload glyph-stream instance buffer via triple-buffered
@@ -27,38 +27,19 @@ impl super::MetalRenderer {
     pub(crate) fn upload_instance_ring(&self, instances: &[f32]) -> (usize, u64) {
         let instance_data_size = std::mem::size_of_val(instances) as u64;
         let mut instance_ring_idx: usize = 0;
-        if instance_data_size > 0 {
+        {
             let mut ring = self.instance_ring.borrow_mut();
+            super::buffer_capacity::resize_ring_for_usage(
+                &self.device,
+                &mut ring,
+                &self.instance_capacity,
+                &self.upload_low_usage_frames[1],
+                instance_data_size,
+            );
+        }
+        if instance_data_size > 0 {
+            let ring = self.instance_ring.borrow_mut();
             instance_ring_idx = self.instance_ring_idx.get();
-            let cur_capacity = self.instance_capacity.get();
-
-            if ring.is_empty() {
-                let new_capacity = (instance_data_size * 3 / 2).div_ceil(4096) * 4096;
-                for _ in 0..3 {
-                    ring.push(
-                        self.device.new_buffer(
-                            new_capacity,
-                            MTLResourceOptions::CPUCacheModeWriteCombined,
-                        ),
-                    );
-                }
-                self.instance_capacity.set(new_capacity);
-            } else if instance_data_size > cur_capacity {
-                let new_capacity = (instance_data_size * 3 / 2).div_ceil(4096) * 4096;
-                for buf in ring.iter_mut() {
-                    *buf = self
-                        .device
-                        .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-                }
-                self.instance_capacity.set(new_capacity);
-            }
-            while ring.len() < 3 {
-                let cap = self.instance_capacity.get().max(4096);
-                ring.push(
-                    self.device
-                        .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
-                );
-            }
 
             let buffer = &ring[instance_ring_idx];
             {
@@ -88,38 +69,19 @@ impl super::MetalRenderer {
     pub(crate) fn upload_bg_ring(&self, instances: &[f32]) -> (usize, u64) {
         let data_size = std::mem::size_of_val(instances) as u64;
         let mut ring_idx: usize = 0;
-        if data_size > 0 {
+        {
             let mut ring = self.bg_stream.ring.borrow_mut();
+            super::buffer_capacity::resize_ring_for_usage(
+                &self.device,
+                &mut ring,
+                &self.bg_stream.capacity,
+                &self.bg_stream.low_usage_frames,
+                data_size,
+            );
+        }
+        if data_size > 0 {
+            let ring = self.bg_stream.ring.borrow_mut();
             ring_idx = self.bg_stream.ring_idx.get();
-            let cur_capacity = self.bg_stream.capacity.get();
-
-            if ring.is_empty() {
-                let new_capacity = (data_size * 3 / 2).div_ceil(4096) * 4096;
-                for _ in 0..3 {
-                    ring.push(
-                        self.device.new_buffer(
-                            new_capacity,
-                            MTLResourceOptions::CPUCacheModeWriteCombined,
-                        ),
-                    );
-                }
-                self.bg_stream.capacity.set(new_capacity);
-            } else if data_size > cur_capacity {
-                let new_capacity = (data_size * 3 / 2).div_ceil(4096) * 4096;
-                for buf in ring.iter_mut() {
-                    *buf = self
-                        .device
-                        .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-                }
-                self.bg_stream.capacity.set(new_capacity);
-            }
-            while ring.len() < 3 {
-                let cap = self.bg_stream.capacity.get().max(4096);
-                ring.push(
-                    self.device
-                        .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
-                );
-            }
 
             let buffer = &ring[ring_idx];
             {
@@ -215,7 +177,7 @@ impl super::MetalRenderer {
                 let sw = (x1 - x0).max(0.0).min(self.viewport.0 - sx as f32) as u64;
                 let sh = (y1 - y0).max(0.0).min(self.viewport.1 - sy as f32) as u64;
                 if sw == 0 || sh == 0 {
-                    tracing::info!(segment = i, rect = ?rect, "skipping zero-area pane segment");
+                    tracing::trace!(segment = i, rect = ?rect, "skipping zero-area pane segment");
                     continue;
                 }
                 encoder.set_scissor_rect(metal::MTLScissorRect {
@@ -267,7 +229,7 @@ impl super::MetalRenderer {
                     );
                 }
 
-                tracing::info!(
+                tracing::trace!(
                     segment = i,
                     rect = ?rect,
                     scissor = ?[sx, sy, sw, sh],

@@ -310,6 +310,12 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
         if let Some(th) = &profile.theme {
             let default = super::ThemeConfig::default();
             set_string_if_diff(t, "name", &th.name, &default.name);
+            set_f32_if_diff(
+                t,
+                "minimum_contrast",
+                th.minimum_contrast,
+                default.minimum_contrast,
+            );
             set_opt_string(t, "foreground", &th.foreground);
             set_opt_string(t, "background", &th.background);
             set_opt_string(t, "cursor", &th.cursor);
@@ -337,6 +343,20 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
             if let Some(dn) = &th.dark_name {
                 t["dark_name"] = toml_edit::value(dn.as_str());
             }
+            write_profile_section(t, "output", th.output.is_some(), |ot| {
+                if let Some(output) = &th.output {
+                    if output.enabled == Some(false) {
+                        ot["enabled"] = toml_edit::value(false);
+                    } else {
+                        ot.remove("enabled");
+                    }
+                    set_opt_string(ot, "output_default", &output.output_default);
+                    set_opt_string(ot, "cwd", &output.cwd);
+                    set_opt_string(ot, "metadata", &output.metadata);
+                    set_opt_string(ot, "success", &output.success);
+                    set_opt_string(ot, "failure", &output.failure);
+                }
+            });
         }
     });
     write_profile_section(table, "window", profile.window.is_some(), |t| {

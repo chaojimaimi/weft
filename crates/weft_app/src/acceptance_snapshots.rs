@@ -254,7 +254,7 @@ fn layout_scene_snapshot() -> Value {
         &wide_settings,
         &settings_tabs,
         SettingsTab::Appearance,
-        11,
+        (11, 17, 0),
         18.0,
         // v1.5.1: profile_count = 0 for snapshot tests.
         0,
@@ -263,7 +263,7 @@ fn layout_scene_snapshot() -> Value {
         &narrow_sidebar,
         &settings_tabs,
         SettingsTab::Appearance,
-        0,
+        (0, 0, 0),
         18.0,
         0,
     );
@@ -271,7 +271,7 @@ fn layout_scene_snapshot() -> Value {
         &narrow_content,
         &settings_tabs,
         SettingsTab::Appearance,
-        11,
+        (11, 17, 0),
         18.0,
         0,
     );

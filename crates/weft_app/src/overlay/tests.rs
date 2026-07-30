@@ -119,6 +119,36 @@ fn overlay_warmup_prompt_collects_chars() {
 }
 
 #[test]
+fn overlay_warmup_tui_preedit_collects_marked_text() {
+    let mut missing = HashSet::new();
+    OverlayContent::TuiPreedit(TuiPreeditDrawParams {
+        text: "shen'ru",
+        cursor: Some((7, 7)),
+    })
+    .warm_chars(&mut missing);
+    assert!(missing.contains(&'s'));
+    assert!(missing.contains(&'\''));
+}
+
+#[test]
+fn tui_preedit_requires_passthrough_terminal_ime_ownership() {
+    use weft_core::input::InputMode;
+
+    assert!(should_show_tui_preedit(
+        InputMode::Passthrough,
+        "shen'ru",
+        true
+    ));
+    assert!(!should_show_tui_preedit(InputMode::Editor, "shen'ru", true));
+    assert!(!should_show_tui_preedit(InputMode::Passthrough, "", true));
+    assert!(!should_show_tui_preedit(
+        InputMode::Passthrough,
+        "shen'ru",
+        false
+    ));
+}
+
+#[test]
 fn overlay_warmup_palette_collects_query_and_entries() {
     let views: Vec<PaletteEntryView> = vec![PaletteEntryView {
         label: "git",
@@ -207,6 +237,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         window_padding_x: 0,
         window_padding_y: 0,
         scrollback_lines: 10_000,
+        minimum_contrast: 7.0,
         window_width: 800,
         window_height: 600,
         sidebar_width: None,
@@ -258,6 +289,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                     window_padding_x: 0,
                     window_padding_y: 0,
                     scrollback_lines: 10_000,
+                    minimum_contrast: 7.0,
                     window_width: 800,
                     window_height: 600,
                     sidebar_width: None,

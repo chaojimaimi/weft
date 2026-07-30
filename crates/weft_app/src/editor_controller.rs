@@ -284,6 +284,7 @@ impl App {
 
     pub(super) fn editor_start_completion(&mut self) {
         // Gather context under an immutable borrow, then mutate the editor.
+        let pane_session_id = self.sessions.active().pane_session_id;
         let (line_owned, col, cwd, history) = match self.sessions.active_mut().terminal.as_ref() {
             Some(t) => {
                 let line_idx = t.editor().buffer.cursor.0;
@@ -339,25 +340,76 @@ impl App {
         } else {
             Vec::new()
         };
-        let ctx = CompleteCtx {
-            cwd: &cwd,
-            history: &history,
-            path_bins: &path_bins,
-        };
-        let matches = complete(&prefix, &ctx, position);
-        if matches.is_empty() {
-            return;
-        }
-        let Some(t) = self.sessions.active_mut().terminal.as_mut() else {
-            return;
-        };
-        let e = t.editor_mut();
-        if matches.len() == 1 {
-            // Single candidate: accept immediately (replace the word).
-            e.start_completion(matches, ws, we);
-            e.completion_accept();
-        } else {
-            e.start_completion(matches, ws, we);
+        let workflows = self
+            .palette
+            .store
+            .as_ref()
+            .and_then(|store| store.list().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|workflow| {
+                workflow
+                    .steps
+                    .first()
+                    .map(|step| (workflow.name, step.command.clone()))
+            })
+            .collect();
+        let workspace_commands = self
+            .capture_workspace("active".to_string())
+            .into_iter()
+            .flat_map(|workspace| workspace.tabs)
+            .flat_map(|tab| {
+                tab.panes
+                    .collect_panes()
+                    .into_iter()
+                    .map(|(_, draft)| draft.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|draft| !draft.trim().is_empty())
+            .collect();
+        self.completion_worker
+            .submit(crate::completion_worker::CompletionSubmit {
+                pane_session_id,
+                line: line_str.to_string(),
+                cursor_col: col,
+                word_start: ws,
+                word_end: we,
+                prefix,
+                cwd,
+                history,
+                path_bins,
+                workflows,
+                workspace_commands,
+                position,
+            });
+    }
+
+    pub(super) fn poll_completion_results(&mut self) {
+        while let Some(result) = self.completion_worker.try_recv() {
+            if result.generation != self.completion_worker.current_generation()
+                || self.sessions.active().pane_session_id != result.pane_session_id
+            {
+                continue;
+            }
+            let Some(terminal) = self.sessions.active_mut().terminal.as_mut() else {
+                continue;
+            };
+            let editor = terminal.editor_mut();
+            let line_idx = editor.buffer.cursor.0;
+            let current_line = editor.buffer.lines.get(line_idx).map(String::as_str);
+            if current_line != Some(result.line.as_str())
+                || editor.buffer.cursor.1 != result.cursor_col
+                || result.matches.is_empty()
+            {
+                continue;
+            }
+            editor.start_completion(result.matches, result.word_start, result.word_end);
+            if editor
+                .completion_view()
+                .is_some_and(|(matches, _)| matches.len() == 1)
+            {
+                editor.completion_accept();
+            }
         }
     }
 

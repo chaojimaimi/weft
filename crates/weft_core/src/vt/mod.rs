@@ -4,6 +4,7 @@
 //! `vte::Perform` to translate escape sequences into Grid operations.
 mod attrs;
 mod capability;
+mod capture_cursor;
 mod grapheme;
 mod osc;
 mod perform;

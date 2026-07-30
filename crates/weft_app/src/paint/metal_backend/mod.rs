@@ -20,7 +20,9 @@ use crate::paint::grid_cache::BlockLayoutCache;
 use crate::renderer::MetalRenderer;
 use weft_core::config::{FontConfig, Theme};
 
+mod buffer_capacity;
 mod grid_instances;
+pub(crate) use buffer_capacity::LowUsageCounter;
 
 /// v1.4.2 Phase B3: Per-pane dual-stream ranges paired with the pane's
 /// scissor rect. The Metal backend iterates this list to issue per-pane
@@ -41,6 +43,7 @@ pub(crate) struct BgStream {
     pub ring: RefCell<Vec<metal::Buffer>>,
     pub ring_idx: Cell<usize>,
     pub capacity: Cell<u64>,
+    pub low_usage_frames: LowUsageCounter,
 }
 
 impl MetalRenderer {
@@ -48,6 +51,8 @@ impl MetalRenderer {
         window: &Window,
         font_config: FontConfig,
         theme: Theme,
+        minimum_contrast: f32,
+        semantic_output_enabled: bool,
         padding_logical: (u32, u32),
         opacity: f32,
     ) -> Self {
@@ -229,6 +234,10 @@ impl MetalRenderer {
             scale,
             font_config,
             theme,
+            minimum_contrast: crate::settings_validation::runtime_minimum_contrast(
+                minimum_contrast,
+            ),
+            semantic_output_enabled,
             padding_x,
             padding_y,
             opacity,
@@ -241,6 +250,8 @@ impl MetalRenderer {
             note_editor_state: None,
             panel_highlight: None,
             block_hovered: None,
+            block_selected: None,
+            block_action_hovered: None,
             bookmarked_blocks: std::collections::HashSet::new(),
             spinner_phase: -1.0,
             reduce_motion: false,
@@ -275,6 +286,7 @@ impl MetalRenderer {
             vertex_buffer_ring: RefCell::new(Vec::new()),
             vertex_buffer_ring_idx: Cell::new(0),
             vertex_buffer_capacity: Cell::new(0),
+            upload_low_usage_frames: [LowUsageCounter::new(), LowUsageCounter::new()],
             instanced_pipeline,
             index_buffer,
             instance_ring: RefCell::new(Vec::new()),
@@ -286,6 +298,7 @@ impl MetalRenderer {
                 ring: RefCell::new(Vec::new()),
                 ring_idx: Cell::new(0),
                 capacity: Cell::new(0),
+                low_usage_frames: LowUsageCounter::new(),
             },
             frame_trace: RefCell::new(crate::frame_trace::FrameTraceRecorder::disabled()),
             frame_id: Cell::new(0),
@@ -347,6 +360,40 @@ impl MetalRenderer {
         // overlays, `vertices` is empty but `instances` carries the cells.
         // v1.4.2 Phase B3: dual-stream — check both bg + glyph streams.
         if vertices.is_empty() && bg_instances.is_empty() && glyph_instances.is_empty() {
+            // Count fully idle frames toward low-water recovery too. Without
+            // this, switching away from a one-off huge BlockView frame could
+            // retain its upload rings forever because this fast path returns
+            // before the normal upload maintenance below.
+            {
+                let mut ring = self.vertex_buffer_ring.borrow_mut();
+                buffer_capacity::resize_ring_for_usage(
+                    &self.device,
+                    &mut ring,
+                    &self.vertex_buffer_capacity,
+                    &self.upload_low_usage_frames[0],
+                    0,
+                );
+            }
+            {
+                let mut ring = self.instance_ring.borrow_mut();
+                buffer_capacity::resize_ring_for_usage(
+                    &self.device,
+                    &mut ring,
+                    &self.instance_capacity,
+                    &self.upload_low_usage_frames[1],
+                    0,
+                );
+            }
+            {
+                let mut ring = self.bg_stream.ring.borrow_mut();
+                buffer_capacity::resize_ring_for_usage(
+                    &self.device,
+                    &mut ring,
+                    &self.bg_stream.capacity,
+                    &self.bg_stream.low_usage_frames,
+                    0,
+                );
+            }
             // v1.0 P1.5-B2: if instances didn't change this frame (no dirty
             // rows, no cursor toggle, no scroll) and the offscreen texture
             // is available, the previous frame's grid content is still valid
@@ -413,45 +460,19 @@ impl MetalRenderer {
         // no overlays); only the instance buffer is uploaded in that case.
         let vertex_data_size = std::mem::size_of_val(vertices) as u64;
         let mut ring_idx: usize = 0;
-        if vertex_data_size > 0 {
+        {
             let mut ring = self.vertex_buffer_ring.borrow_mut();
+            buffer_capacity::resize_ring_for_usage(
+                &self.device,
+                &mut ring,
+                &self.vertex_buffer_capacity,
+                &self.upload_low_usage_frames[0],
+                vertex_data_size,
+            );
+        }
+        if vertex_data_size > 0 {
+            let ring = self.vertex_buffer_ring.borrow_mut();
             ring_idx = self.vertex_buffer_ring_idx.get();
-            let cur_capacity = self.vertex_buffer_capacity.get();
-
-            // Grow the ring buffer if needed (or allocate on first frame).
-            if ring.is_empty() {
-                // First frame: allocate 3 buffers with initial capacity.
-                let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
-                for _ in 0..3 {
-                    ring.push(
-                        self.device.new_buffer(
-                            new_capacity,
-                            MTLResourceOptions::CPUCacheModeWriteCombined,
-                        ),
-                    );
-                }
-                self.vertex_buffer_capacity.set(new_capacity);
-            } else if vertex_data_size > cur_capacity {
-                // Grow: ALL buffers must be recreated at the new capacity.
-                // Only replacing ring[ring_idx] would leave the other two at
-                // the old (smaller) capacity, causing a buffer overflow when
-                // the ring rotates to them on subsequent frames.
-                let new_capacity = (vertex_data_size * 3 / 2).div_ceil(4096) * 4096;
-                for buf in ring.iter_mut() {
-                    *buf = self
-                        .device
-                        .new_buffer(new_capacity, MTLResourceOptions::CPUCacheModeWriteCombined);
-                }
-                self.vertex_buffer_capacity.set(new_capacity);
-            }
-            // Ensure ring has at least 3 buffers for triple-buffering.
-            while ring.len() < 3 {
-                let cap = self.vertex_buffer_capacity.get().max(4096);
-                ring.push(
-                    self.device
-                        .new_buffer(cap, MTLResourceOptions::CPUCacheModeWriteCombined),
-                );
-            }
 
             // Write vertex data into the current ring buffer.
             let buffer = &ring[ring_idx];

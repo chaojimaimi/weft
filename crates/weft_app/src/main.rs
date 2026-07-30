@@ -15,8 +15,11 @@ mod ai;
 mod app;
 mod app_runtime;
 mod app_state;
+mod block_actions;
 mod block_component;
+mod close_confirmation;
 mod completion_component;
+mod completion_worker;
 mod config_controller;
 mod config_state;
 mod context_menu_component;
@@ -59,6 +62,7 @@ mod profiles_controller;
 mod recovery_controller;
 mod redraw_controller;
 mod renderer;
+mod runbook_controller;
 mod scene;
 mod scroll_input;
 mod scrollbar_component;
@@ -95,7 +99,7 @@ use std::sync::atomic::Ordering;
 use tab::{Tab, TuiScrollResolution};
 use terminal_geometry::{dimensions_for_renderer, terminal_layout_for_renderer, TerminalLayout};
 use weft_core::blocks::{BlockId, ShellPhase};
-use weft_core::complete::{complete, CompleteCtx, CompletePosition};
+use weft_core::complete::CompletePosition;
 use weft_core::config::{Action, Config};
 use weft_core::input::{KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol};
 use weft_core::persistence::BlockStore;
@@ -140,6 +144,8 @@ pub(crate) enum AppEvent {
     /// v1.1: A native menu item was clicked — dispatch the action on the
     /// main thread (where `App` is borrowed during `user_event`).
     MenuAction(weft_core::config::Action),
+    /// Native Quit Weft / Cmd+Q requested a protected application exit.
+    QuitRequested,
     /// AppKit accessibility element invoked its default Press action.
     AccessibilityPress {
         generation: u64,
@@ -206,6 +212,9 @@ struct App {
     /// v1.7.3-C: Inline note editor for block annotations. When open,
     /// keyboard input is captured before overlay routing.
     note_editor: NoteEditorState,
+    completion_worker: completion_worker::CompletionWorker,
+    runbook_worker: runbook_controller::RunbookWorker,
+    bookmarked_blocks: std::collections::HashSet<BlockId>,
 }
 
 /// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
@@ -280,6 +289,8 @@ impl App {
         };
         let probe = performance_probe::PerformanceProbe::from_env();
         let frame_trace_enabled = probe.enabled();
+        let completion_proxy = proxy.clone();
+        let runbook_proxy = proxy.clone();
         Self {
             window: None,
             renderer: None,
@@ -308,6 +319,13 @@ impl App {
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
             search_index: None,
             note_editor: NoteEditorState::default(),
+            completion_worker: completion_worker::CompletionWorker::new(move || {
+                let _ = completion_proxy.send_event(AppEvent::Wake);
+            }),
+            runbook_worker: runbook_controller::RunbookWorker::new(move || {
+                let _ = runbook_proxy.send_event(AppEvent::Wake);
+            }),
+            bookmarked_blocks: std::collections::HashSet::new(),
         }
     }
 

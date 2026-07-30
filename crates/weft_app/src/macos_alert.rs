@@ -122,6 +122,75 @@ pub fn show_recovery_prompt(
     Ok(map_modal_response(response))
 }
 
+pub fn show_block_export_preview(mtm: MainThreadMarker, markdown: &str) -> bool {
+    let alert = unsafe { NSAlert::new(mtm) };
+    unsafe {
+        alert.setMessageText(&NSString::from_str("Export Redacted Block"));
+        alert.setInformativeText(&NSString::from_str(&export_preview_excerpt(markdown)));
+        alert.setAlertStyle(NSAlertStyle::Informational);
+        alert.addButtonWithTitle(&NSString::from_str("Continue"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    }
+    (unsafe { alert.runModal() }) == 1000
+}
+
+pub fn show_running_process_close_prompt(
+    mtm: MainThreadMarker,
+    title: &str,
+    commands: &[String],
+) -> bool {
+    let alert = unsafe { NSAlert::new(mtm) };
+    let info = running_process_prompt_text(commands);
+    unsafe {
+        alert.setMessageText(&NSString::from_str(title));
+        alert.setInformativeText(&NSString::from_str(&info));
+        alert.setAlertStyle(NSAlertStyle::Warning);
+        alert.addButtonWithTitle(&NSString::from_str("Close Anyway"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    }
+    close_prompt_response_allows_close(unsafe { alert.runModal() })
+}
+
+fn close_prompt_response_allows_close(response: NSModalResponse) -> bool {
+    response == 1000
+}
+
+fn running_process_prompt_text(commands: &[String]) -> String {
+    const MAX_COMMANDS: usize = 6;
+    let count = commands.len();
+    let noun = if count == 1 {
+        "command is"
+    } else {
+        "commands are"
+    };
+    let mut text = format!(
+        "{count} foreground {noun} still running. Closing will terminate {}.",
+        if count == 1 { "it" } else { "them" }
+    );
+    for command in commands.iter().take(MAX_COMMANDS) {
+        let command: String = command
+            .chars()
+            .take(120)
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        text.push_str("\n\n• ");
+        text.push_str(&command);
+    }
+    if count > MAX_COMMANDS {
+        text.push_str(&format!("\n\n…and {} more", count - MAX_COMMANDS));
+    }
+    text
+}
+
+fn export_preview_excerpt(markdown: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 1200;
+    let mut preview: String = markdown.chars().take(MAX_PREVIEW_CHARS).collect();
+    if markdown.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("\n\n[preview truncated]");
+    }
+    preview
+}
+
 fn map_modal_response(response: NSModalResponse) -> RecoveryPromptResponse {
     // NSAlertFirstButtonReturn = 1000
     const NS_ALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
@@ -150,5 +219,73 @@ fn format_snapshot_age(secs: u64) -> String {
         format!("from {} hours ago", secs / 3600)
     } else {
         format!("from {} days ago", secs / 86400)
+    }
+}
+
+#[cfg(test)]
+mod export_preview_tests {
+    use super::{
+        close_prompt_response_allows_close, export_preview_excerpt, running_process_prompt_text,
+    };
+
+    #[test]
+    fn preview_is_bounded_on_unicode_boundary() {
+        let markdown = "中".repeat(1300);
+        let preview = export_preview_excerpt(&markdown);
+        assert!(preview.ends_with("[preview truncated]"));
+        assert!(preview.starts_with(&"中".repeat(1200)));
+    }
+
+    #[test]
+    fn running_process_prompt_lists_and_bounds_commands() {
+        let commands = vec!["opencode upgrade".to_owned(), "中".repeat(200)];
+        let text = running_process_prompt_text(&commands);
+        assert!(text.starts_with("2 foreground commands are still running"));
+        assert!(text.contains("• opencode upgrade"));
+        assert!(!text.contains(&"中".repeat(121)));
+    }
+
+    #[test]
+    fn close_prompt_only_accepts_the_explicit_first_button() {
+        assert!(close_prompt_response_allows_close(1000));
+        assert!(!close_prompt_response_allows_close(1001));
+        assert!(!close_prompt_response_allows_close(-1000));
+        assert!(!close_prompt_response_allows_close(42));
+    }
+
+    #[test]
+    fn running_process_prompt_handles_count_boundaries() {
+        let empty = running_process_prompt_text(&[]);
+        assert!(empty.starts_with("0 foreground commands are"));
+
+        let one = running_process_prompt_text(&["sleep 5".to_owned()]);
+        assert!(one.starts_with("1 foreground command is"));
+
+        let six: Vec<String> = (1..=6).map(|index| format!("command-{index}")).collect();
+        let six_text = running_process_prompt_text(&six);
+        assert_eq!(six_text.matches("\n\n• ").count(), 6);
+        assert!(!six_text.contains("and 1 more"));
+
+        let mut seven = six;
+        seven.push("command-7".to_owned());
+        let seven_text = running_process_prompt_text(&seven);
+        assert_eq!(seven_text.matches("\n\n• ").count(), 6);
+        assert!(seven_text.contains("…and 1 more"));
+    }
+
+    #[test]
+    fn prompt_bounds_and_sanitizes_command_summaries() {
+        let exactly_120 = "a".repeat(120);
+        let over_120 = "b".repeat(121);
+        let text = running_process_prompt_text(&[
+            exactly_120.clone(),
+            over_120.clone(),
+            "line1\r\nline2\t\u{7}".to_owned(),
+        ]);
+        assert!(text.contains(&exactly_120));
+        assert!(!text.contains(&over_120));
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\t'));
+        assert!(!text.contains('\u{7}'));
     }
 }

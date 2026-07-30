@@ -26,8 +26,8 @@ pub(crate) fn derive_completion_layout(
     if matches.is_empty() {
         return None;
     }
-    let box_h = ctx.cell_h * (prompt_line_count.max(1) as f32 + 2.0);
-    let anchor_y = (ctx.viewport.1 - ctx.padding_y - box_h).max(0.0);
+    let anchor_y =
+        crate::layout::layout_prompt(ctx, prompt_line_count, cursor.0, cursor.1, 0).box_rect[1];
     let prompt_indent = usize::from(cursor.0 == 0) * 2;
     let box_x0 = (prompt_indent + cursor.1) as f32 * ctx.cell_w + ctx.padding_x + ctx.chrome_left;
     let (start, end, _) = completion_window(
@@ -177,5 +177,15 @@ mod tests {
             completion_target_at(&scene, right + RESIZE_HOT_ZONE, top + 10.0),
             None
         );
+    }
+
+    #[test]
+    fn long_visual_prompt_anchors_completion_above_clamped_box() {
+        let ctx = LayoutCtx::new((1000.0, 400.0), 10.0, 20.0, 8.0, 8.0);
+        let matches = [candidate("cargo")];
+        let layout = derive_completion_layout(&ctx, &matches, 0, 50, (49, 3), 8, 0.6).unwrap();
+        let prompt_top = crate::layout::layout_prompt(&ctx, 50, 49, 3, 44).box_rect[1];
+        assert_eq!(layout.popup_rect[3], prompt_top);
+        assert!(layout.popup_rect[3] > 0.0);
     }
 }

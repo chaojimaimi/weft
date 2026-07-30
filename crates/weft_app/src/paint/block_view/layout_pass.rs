@@ -12,7 +12,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::block_component::{
-    block_presentation, clear_block_spacer_rows, command_resume_hints, BlockTone,
+    block_presentation, clear_block_spacer_rows, command_output_gap_rows, command_resume_hints,
+    BlockTone,
 };
 use crate::paint::grid_cache::{block_line_chunks, BlockLayoutCache, MAX_LAYOUT_LINES_LIVE};
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
@@ -75,7 +76,7 @@ pub(super) struct LayoutPassInput<'a> {
     pub(super) live: Option<InFlightBlock<'a>>,
     pub(super) cwd: Option<&'a str>,
     pub(super) git_branch: Option<&'a str>,
-    pub(super) block_scroll: usize,
+    pub(super) block_scroll: f32,
     pub(super) viewport_rows: usize,
     pub(super) cols: usize,
     pub(super) pitch: f32,
@@ -103,9 +104,9 @@ pub(super) struct LayoutPassInput<'a> {
 /// this function (the caller does this in a separate mutable borrow).
 ///
 /// The returned `LayoutPassOutput` borrows from `blocks`/`live` (for text
-/// references) but NOT from `cache` — all cache-derived data (chunks) is
-/// cloned into `Rc<[String]>` before being stored. This lets the caller
-/// drop the cache borrow immediately after this call returns.
+/// references) but NOT from `cache`: source ranges are materialized only for
+/// visible rows into `Rc<[String]>`. This lets the caller drop the cache
+/// borrow immediately and keeps offscreen history from duplicating text.
 pub(super) fn compute_block_layout_pass<'a>(
     input: LayoutPassInput<'a>,
     cache: &BlockLayoutCache,
@@ -164,6 +165,11 @@ pub(super) fn compute_block_layout_pass<'a>(
                 },
             });
         }
+        if !live_lines.is_empty() {
+            cursor_dist += pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Blank);
+        }
         cursor_dist += pitch;
         rows.push(cursor_dist);
         row_data.push(LaidRow::LiveCommand {
@@ -191,7 +197,7 @@ pub(super) fn compute_block_layout_pass<'a>(
     // `sync_rows` (selection.rs:409) already handles rows scrolling out
     // of the visible set by remapping to the closest y-center, so
     // omitting offscreen blocks from rows/row_data is safe.
-    let scroll_px = (block_scroll as f32) * pitch;
+    let scroll_px = block_scroll * pitch;
     let overscan = header_height + pitch * 2.0;
     let live_cursor_dist = cursor_dist;
 
@@ -252,7 +258,9 @@ pub(super) fn compute_block_layout_pass<'a>(
         };
         let output_rows = if b.collapsed { 0 } else { cached.output_rows };
         let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
+        let output_gap_rows = command_output_gap_rows(hint_rows + output_rows);
         let block_total_height = (hint_rows + output_rows) as f32 * pitch
+            + output_gap_rows as f32 * pitch
             + pitch // command
             + header_height
             + pitch // separator
@@ -283,12 +291,17 @@ pub(super) fn compute_block_layout_pass<'a>(
             }
             for line in cached.lines.iter().rev() {
                 let text = &b.output[line.byte_start..line.byte_end];
-                let vis_rows = line.chunks.len();
+                let vis_rows = line.chunk_ranges.len();
                 cursor_dist += vis_rows as f32 * pitch;
                 rows.push(cursor_dist);
                 row_data.push(LaidRow::Output {
                     text,
-                    chunks: Rc::clone(&line.chunks),
+                    chunks: Rc::from(
+                        line.chunk_ranges
+                            .iter()
+                            .map(|range| text[range.clone()].to_string())
+                            .collect::<Vec<_>>(),
+                    ),
                     block_id: Some(b.id),
                     line: line.idx,
                     style: if resolve_styles {
@@ -303,6 +316,11 @@ pub(super) fn compute_block_layout_pass<'a>(
             }
         } else {
             cursor_dist += (hint_rows + output_rows) as f32 * pitch;
+        }
+        if output_gap_rows > 0 {
+            cursor_dist += output_gap_rows as f32 * pitch;
+            rows.push(cursor_dist);
+            row_data.push(LaidRow::Blank);
         }
         cursor_dist += pitch;
         rows.push(cursor_dist);
@@ -384,6 +402,10 @@ fn upper_bound_height(
 }
 
 #[cfg(test)]
+#[path = "layout_pass/gap_tests.rs"]
+mod gap_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -399,7 +421,7 @@ mod tests {
             live: None,
             cwd: None,
             git_branch: None,
-            block_scroll: 0,
+            block_scroll: 0.0,
             viewport_rows: 0,
             cols: 80,
             pitch: 20.0,
@@ -415,6 +437,45 @@ mod tests {
         assert!(out.rows.is_empty());
         assert!(out.row_data.is_empty());
         assert_eq!(out.expanded_block_count, 0);
+    }
+
+    #[test]
+    fn live_output_keeps_newest_row_complete_at_viewport_bottom() {
+        let output = (0..20)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        let input = LayoutPassInput {
+            blocks: &[],
+            live: Some(InFlightBlock {
+                command: "long-running-command",
+                cwd: Some("/tmp"),
+                output: &output,
+                styled_output: None,
+            }),
+            cwd: None,
+            git_branch: None,
+            block_scroll: 0.0,
+            viewport_rows: 6,
+            cols: 80,
+            pitch: 20.0,
+            header_height: 24.0,
+            content_bottom_y: 120.0,
+            clip_top: 0.0,
+            clip_bottom: 120.0,
+            resolve_styles: false,
+            styled_lookup_counter: None,
+        };
+        let out = compute_block_layout_pass(input, &BlockLayoutCache::default());
+        let newest = out
+            .row_data
+            .iter()
+            .position(|row| matches!(row, LaidRow::Output { text, .. } if *text == "line-19"))
+            .expect("newest live row");
+        let newest_top = 120.0 - out.rows[newest];
+
+        assert_eq!(newest_top, 100.0);
+        assert_eq!(newest_top + 20.0, 120.0);
+        assert!(out.rows.iter().any(|distance| 120.0 - distance < 0.0));
     }
 
     // ── R2-2 (Batch 7): binary search helpers ─────────────────────────
@@ -582,7 +643,7 @@ mod tests {
                         live: None,
                         cwd: None,
                         git_branch: None,
-                        block_scroll: 0,
+                        block_scroll: 0.0,
                         viewport_rows: 40,
                         cols: 80,
                         pitch: 20.0,
@@ -608,7 +669,7 @@ mod tests {
                         live: None,
                         cwd: None,
                         git_branch: None,
-                        block_scroll: 0,
+                        block_scroll: 0.0,
                         viewport_rows: 40,
                         cols: 80,
                         pitch: 20.0,

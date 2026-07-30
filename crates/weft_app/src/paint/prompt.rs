@@ -1,16 +1,158 @@
-//! Prompt input box painter — the bottom editor area with ❯ prompt,
+//! Prompt input box painter — the bottom editor area with a `>` prompt,
 //! editor buffer lines, cursor bar, IME preedit, and Ctrl+R search UI.
 //!
 //! Extracted from `renderer.rs` (M2) to keep the main file focused on
 //! GPU pipeline + frame orchestration. Still `impl MetalRenderer` because
 //! it needs glyph atlas access via `push_text` / `push_line_tokenized`.
 
-use crate::paint::primitives::{color_to_normalized, push_quad};
+use crate::paint::primitives::{
+    color_to_normalized, composite_color_over, push_quad, scale_color_alpha,
+};
 use crate::renderer::MetalRenderer;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptVisualRow {
+    pub(crate) source_line: usize,
+    pub(crate) char_start: usize,
+    pub(crate) char_end: usize,
+    pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PromptVisualLayout {
+    pub(crate) rows: Vec<PromptVisualRow>,
+    pub(crate) cursor_row: usize,
+    pub(crate) cursor_display_col: usize,
+}
+
+/// Soft-wrap editor lines for display without inserting newlines into the
+/// command sent to the shell. The first visual row reserves two columns for
+/// the prompt glyph; continuation rows use the pane's full width.
+pub(crate) fn prompt_visual_layout(
+    lines: &[String],
+    cursor: (usize, usize),
+    box_cols: usize,
+) -> PromptVisualLayout {
+    let mut rows = Vec::new();
+    let source_lines: &[String] = if lines.is_empty() { &[] } else { lines };
+    if source_lines.is_empty() {
+        rows.push(PromptVisualRow {
+            source_line: 0,
+            char_start: 0,
+            char_end: 0,
+            text: String::new(),
+        });
+    }
+    for (line_index, line) in source_lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = 0usize;
+        let mut width = 0usize;
+        let mut capacity = if line_index == 0 {
+            box_cols.saturating_sub(2).max(1)
+        } else {
+            box_cols.max(1)
+        };
+        for (index, ch) in chars.iter().copied().enumerate() {
+            let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if index > start && width + char_width > capacity {
+                rows.push(PromptVisualRow {
+                    source_line: line_index,
+                    char_start: start,
+                    char_end: index,
+                    text: chars[start..index].iter().collect(),
+                });
+                start = index;
+                width = 0;
+                capacity = box_cols.max(1);
+            }
+            width += char_width;
+        }
+        rows.push(PromptVisualRow {
+            source_line: line_index,
+            char_start: start,
+            char_end: chars.len(),
+            text: chars[start..].iter().collect(),
+        });
+        let cursor_at_final_line_end = line_index + 1 == source_lines.len()
+            && cursor.0 == line_index
+            && cursor.1 == chars.len();
+        if !chars.is_empty() && width == capacity && cursor_at_final_line_end {
+            rows.push(PromptVisualRow {
+                source_line: line_index,
+                char_start: chars.len(),
+                char_end: chars.len(),
+                text: String::new(),
+            });
+        }
+    }
+
+    let cursor_line = cursor.0.min(source_lines.len().saturating_sub(1));
+    let cursor_char = cursor.1.min(
+        source_lines
+            .get(cursor_line)
+            .map(|line| line.chars().count())
+            .unwrap_or(0),
+    );
+    let cursor_row = rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| {
+            row.source_line == cursor_line
+                && row.char_start <= cursor_char
+                && cursor_char <= row.char_end
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let cursor_display_col = rows
+        .get(cursor_row)
+        .and_then(|row| source_lines.get(row.source_line).map(|line| (row, line)))
+        .map(|(row, line)| {
+            line.chars()
+                .skip(row.char_start)
+                .take(cursor_char.saturating_sub(row.char_start))
+                .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    PromptVisualLayout {
+        rows,
+        cursor_row,
+        cursor_display_col,
+    }
+}
+
+pub(crate) fn prompt_layout_for_buffer(
+    ctx: &crate::layout::LayoutCtx,
+    lines: &[String],
+    cursor: (usize, usize),
+) -> (PromptVisualLayout, crate::layout::PromptLayout, usize) {
+    let box_cols = crate::layout::prompt_content_cols(ctx);
+    let visual = prompt_visual_layout(lines, cursor, box_cols);
+    let initial = crate::layout::layout_prompt(
+        ctx,
+        visual.rows.len(),
+        visual.cursor_row,
+        visual.cursor_display_col,
+        0,
+    );
+    let scroll = visual
+        .cursor_row
+        .saturating_add(1)
+        .saturating_sub(initial.visible_rows);
+    let layout = crate::layout::layout_prompt(
+        ctx,
+        visual.rows.len(),
+        visual.cursor_row,
+        visual.cursor_display_col,
+        scroll,
+    );
+    (visual, layout, scroll)
+}
 
 impl MetalRenderer {
     /// Build vertices for the bottom editor input box (v0.5 editor takeover):
-    /// a translucent panel pinned to the bottom, a `❯ <cwd>` prompt, the editor
+    /// a translucent panel pinned to the bottom, a `>` prompt, the editor
     /// buffer lines, a cursor bar, and the Ctrl+R search UI when active. Drawn
     /// after the grid so it composites on top via the enabled alpha blend.
     pub(crate) fn build_prompt_vertices(
@@ -28,32 +170,30 @@ impl MetalRenderer {
             return verts;
         }
 
-        // v0.8: cursor X must use the DISPLAY width of chars before the cursor,
-        // not the char count — CJK chars occupy 2 columns each, so `cc × cw`
-        // leaves the caret stranded mid-cell for input like "Weft项目设计.md".
-        // Sum the actual rendered columns of the first `cc` chars on this line.
-        let (cl, cc) = p.cursor;
-        let cursor_offset_cols = p
-            .lines
-            .get(cl)
-            .map(|line| {
-                line.chars()
-                    .take(cc)
-                    .map(Self::char_col_width)
-                    .sum::<usize>()
-            })
-            .unwrap_or(cc);
-
         // v0.8 stage 4: layout (box rect, text_y0, cursor X/Y, bar_w) is
         // computed by the pure function in `layout.rs`. The renderer keeps
         // responsibility for vertex building, theming, and text rasterization.
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");
+        let box_cols = crate::layout::prompt_content_cols(&ctx);
+        let visual = prompt_visual_layout(p.lines, p.cursor, box_cols);
+        let initial_layout = crate::layout::layout_prompt(
+            &ctx,
+            visual.rows.len(),
+            visual.cursor_row,
+            visual.cursor_display_col,
+            0,
+        );
+        let visual_scroll = visual
+            .cursor_row
+            .saturating_add(1)
+            .saturating_sub(initial_layout.visible_rows);
+        let _source_scroll_offset = p.scroll_offset;
         let layout = crate::layout::layout_prompt(
             &ctx,
-            p.lines.len(),
-            cl,
-            cursor_offset_cols,
-            p.scroll_offset,
+            visual.rows.len(),
+            visual.cursor_row,
+            visual.cursor_display_col,
+            visual_scroll,
         );
         let text_y0 = layout.text_y0;
         let left = layout.left;
@@ -63,12 +203,12 @@ impl MetalRenderer {
         let cy = layout.cursor_y;
         let bar_w = layout.bar_w;
         let visible_rows = layout.visible_rows;
-        let scroll_offset = p.scroll_offset;
+        let scroll_offset = visual_scroll;
 
-        let theme_bg = color_to_normalized(self.theme.background);
+        let theme_bg = scale_color_alpha(color_to_normalized(self.theme.background), self.opacity);
         // The input area uses the SAME background as the window (Warp style —
-        // no distinct input panel). Still opaque so it cleanly covers the grid
-        // rows behind it (the shell's blank prompt sits under the box).
+        // no distinct input panel). Its alpha follows the window opacity so
+        // the prompt does not mask transparency applied by the Metal clear.
         let box_bg = theme_bg;
         let fg = color_to_normalized(self.theme.foreground);
         let accent = color_to_normalized(self.theme.cursor);
@@ -93,10 +233,12 @@ impl MetalRenderer {
 
         // Prompt glyph only — cwd lives in the block history, not the input
         // box (Warp style), so the typed command never runs into the path.
-        // v1.0 fix: use accent (not accent_dim) for the prompt marker ❯ —
-        // accent_dim is invisible in Nord/Warp themes. The prompt ❯ is a
+        // Use accent (not accent_dim) for the prompt marker. It is a
         // primary UI element, not dim chrome, so accent is appropriate.
-        let prompt_str = "❯ ";
+        // Keep the marker in the configured monospace font. The previous
+        // heavy-angle glyph commonly fell back to a symbol font whose visual
+        // baseline sat below the first command row.
+        let prompt_str = "> ";
         let prompt_chars = 2;
         let prompt_c = color_to_normalized(self.theme.accent);
         if scroll_offset == 0 {
@@ -123,14 +265,23 @@ impl MetalRenderer {
                 0.60,
             ]
         };
+        let selection_canvas = composite_color_over(sel_bg, box_bg);
+        let mut visual_selection_ranges = vec![None; visual.rows.len()];
         if let Some(((sl, sc), (el, ec))) = p.selection {
             // F2 P0-1: only render selection highlight for visible lines,
             // adjusting Y by scroll_offset.
-            let vis_end = (scroll_offset + visible_rows).min(p.lines.len());
-            for i in (sl.max(scroll_offset))..=(el.min(vis_end.saturating_sub(1))) {
-                let Some(line) = p.lines.get(i) else {
+            let vis_end = (scroll_offset + visible_rows).min(visual.rows.len());
+            for (i, selection_range) in visual_selection_ranges
+                .iter_mut()
+                .enumerate()
+                .take(vis_end)
+                .skip(scroll_offset)
+            {
+                let row = &visual.rows[i];
+                if row.source_line < sl || row.source_line > el {
                     continue;
-                };
+                }
+                let line = &row.text;
                 let y = text_y0 + (i - scroll_offset) as f32 * ch;
                 let (line_start_x, max_chars) = if i == 0 {
                     let avail = box_cols.saturating_sub(prompt_chars).max(1);
@@ -139,11 +290,18 @@ impl MetalRenderer {
                     (left, box_cols)
                 };
                 // Char column range within this line.
-                let col_start = if i == sl { sc } else { 0 };
-                let col_end = if i == el { ec } else { line.chars().count() };
+                let source_start = if row.source_line == sl { sc } else { 0 };
+                let source_end = if row.source_line == el {
+                    ec
+                } else {
+                    usize::MAX
+                };
+                let col_start = source_start.max(row.char_start) - row.char_start;
+                let col_end = source_end.min(row.char_end).saturating_sub(row.char_start);
                 if col_start >= col_end {
                     continue;
                 }
+                *selection_range = Some((col_start, col_end));
                 // Convert char columns → display columns (CJK = 2 cells).
                 let chars: Vec<char> = line.chars().collect();
                 let disp_start: usize = chars
@@ -172,9 +330,14 @@ impl MetalRenderer {
         }
         // F2 P0-1: only render the visible window [scroll_offset, scroll_offset +
         // visible_rows), adjusting each line's Y by scroll_offset.
-        let vis_end = (scroll_offset + visible_rows).min(p.lines.len());
-        for i in scroll_offset..vis_end {
-            let line = &p.lines[i];
+        let vis_end = (scroll_offset + visible_rows).min(visual.rows.len());
+        for (i, selection_range) in visual_selection_ranges
+            .iter()
+            .enumerate()
+            .take(vis_end)
+            .skip(scroll_offset)
+        {
+            let line = &visual.rows[i].text;
             let y = text_y0 + (i - scroll_offset) as f32 * ch;
             let (start_x, max_chars) = if i == 0 {
                 let avail = box_cols.saturating_sub(prompt_chars).max(1);
@@ -182,7 +345,15 @@ impl MetalRenderer {
             } else {
                 (left, box_cols)
             };
-            self.push_line_tokenized(&mut verts, start_x, y, line, max_chars);
+            let selection = selection_range.map(|(start, end)| (start, end, selection_canvas));
+            self.push_line_tokenized_on_canvas(
+                &mut verts,
+                [start_x, y],
+                line,
+                max_chars,
+                box_bg,
+                selection,
+            );
         }
 
         // ── v0.8 signature: warm cursor breath + amber glow ─────────────
@@ -344,7 +515,7 @@ pub struct PromptDrawParams<'a> {
     /// Whether this pane owns keyboard focus. Background panes retain their
     /// editor contents but do not paint a caret.
     pub focused: bool,
-    /// Current working directory (from OSC 7) shown after the `❯` glyph.
+    /// Current working directory (from OSC 7); rendered in the history band.
     pub cwd: Option<&'a str>,
     /// Editor buffer lines (line 0 follows the prompt).
     pub lines: &'a [String],
@@ -383,7 +554,7 @@ fn prompt_hint_text(submit_on_ctrl_enter: bool, line_count: usize) -> Option<&'s
     }
 }
 
-fn normalize_preedit_range(text: &str, start: usize, end: usize) -> (usize, usize) {
+pub(crate) fn normalize_preedit_range(text: &str, start: usize, end: usize) -> (usize, usize) {
     fn floor_boundary(text: &str, offset: usize) -> usize {
         let mut offset = offset.min(text.len());
         while offset > 0 && !text.is_char_boundary(offset) {
@@ -413,5 +584,46 @@ mod tests {
         assert_eq!(prompt_hint_text(false, 1), None);
         assert_eq!(prompt_hint_text(false, 2), Some("⏎ Run · ⇧⏎ New line"));
         assert_eq!(prompt_hint_text(true, 1), Some("⌃⏎ Run · ⏎ New line"));
+    }
+
+    #[test]
+    fn long_single_line_soft_wraps_without_changing_source() {
+        let lines = vec!["abcdefghij".to_string()];
+        let visual = prompt_visual_layout(&lines, (0, 10), 6);
+        let texts: Vec<_> = visual.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["abcd", "efghij", ""]);
+        assert_eq!(visual.cursor_row, 2);
+        assert_eq!(visual.cursor_display_col, 0);
+        assert_eq!(lines, vec!["abcdefghij"]);
+    }
+
+    #[test]
+    fn soft_wrap_counts_cjk_display_columns() {
+        let lines = vec!["ab你好cd".to_string()];
+        let visual = prompt_visual_layout(&lines, (0, 4), 6);
+        let texts: Vec<_> = visual.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["ab你", "好cd"]);
+        assert_eq!(visual.cursor_row, 1);
+        assert_eq!(visual.cursor_display_col, 2);
+    }
+
+    #[test]
+    fn full_logical_line_before_newline_does_not_add_blank_visual_row() {
+        let lines = vec!["abcd".to_string(), "next".to_string()];
+        let visual = prompt_visual_layout(&lines, (1, 4), 6);
+        let texts: Vec<_> = visual.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(texts, vec!["abcd", "next"]);
+    }
+
+    #[test]
+    fn exact_capacity_final_cursor_keeps_prompt_box_geometry_consistent() {
+        let ctx = crate::layout::LayoutCtx::new((60.0, 400.0), 10.0, 20.0, 0.0, 0.0);
+        let lines = vec!["abcd".to_string()];
+        let (visual, layout, _) = prompt_layout_for_buffer(&ctx, &lines, (0, 4));
+        assert_eq!(visual.rows.len(), 2);
+        assert_eq!(
+            layout.box_rect,
+            crate::layout::layout_prompt(&ctx, visual.rows.len(), 1, 0, 0).box_rect
+        );
     }
 }

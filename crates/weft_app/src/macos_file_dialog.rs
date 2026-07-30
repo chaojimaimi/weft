@@ -230,11 +230,32 @@ pub fn pick_block_export_path(mtm: MainThreadMarker, command: &str) -> FilePanel
     run_modal_save_panel(&panel)
 }
 
+pub fn pick_runbook_open_path(mtm: MainThreadMarker) -> FilePanelResult {
+    let panel = unsafe { NSOpenPanel::openPanel(mtm) };
+    unsafe {
+        panel.setTitle(Some(&NSString::from_str("Open Runbook")));
+        panel.setPrompt(Some(&NSString::from_str("Open")));
+        let types = NSArray::from_vec(vec![
+            NSString::from_str("md"),
+            NSString::from_str("markdown"),
+        ]);
+        #[allow(deprecated)]
+        panel.setAllowedFileTypes(Some(&types));
+        let tmp = NSString::from_str("/tmp");
+        let tmp_url = NSURL::fileURLWithPath(&tmp);
+        panel.setDirectoryURL(Some(&tmp_url));
+    }
+    run_modal_open_panel(&panel)
+}
+
 /// v1.7.3-C: Build a safe filename from a command string. Takes the first
 /// whitespace-delimited token, keeps `[a-zA-Z0-9-]` only, lowercases, and
 /// truncates to 40 chars. Falls back to `weft-block` when empty.
 fn sanitize_export_filename(command: &str) -> String {
-    let first_token = command.split_whitespace().next().unwrap_or("weft-block");
+    let first_token = command
+        .split_whitespace()
+        .find(|token| !token.contains('='))
+        .unwrap_or("weft-block");
     let sanitized: String = first_token
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
@@ -257,6 +278,14 @@ mod export_filename_tests {
         assert_eq!(sanitize_export_filename("git status"), "git");
         assert_eq!(sanitize_export_filename("cargo build --release"), "cargo");
         assert_eq!(sanitize_export_filename("docker compose up -d"), "docker");
+    }
+
+    #[test]
+    fn export_filename_skips_secret_env_assignment() {
+        assert_eq!(
+            sanitize_export_filename("API_TOKEN=secret123 deploy --prod"),
+            "deploy"
+        );
     }
 
     #[test]

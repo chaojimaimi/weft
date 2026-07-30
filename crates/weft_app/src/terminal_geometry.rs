@@ -325,6 +325,12 @@ mod tests {
     }
 
     #[test]
+    fn app_owned_tui_preedit_suppresses_the_grid_cursor_until_cleared() {
+        assert!(!grid_cursor_visible(CursorStyle::Bar, true, true, true));
+        assert!(grid_cursor_visible(CursorStyle::Bar, true, true, false));
+    }
+
+    #[test]
     fn equivalent_logical_geometry_is_stable_across_scale_factors() {
         let one_x = geometry();
         let two_x = GridGeometry {

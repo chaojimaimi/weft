@@ -26,6 +26,10 @@ impl Default for FontConfig {
 #[serde(default)]
 pub struct ThemeConfig {
     pub name: String,
+    /// Minimum contrast ratio applied to terminal text at paint time.
+    /// `1.0` preserves the resolved ANSI/truecolor RGB exactly; higher values
+    /// adjust only display lightness while stored color origins stay intact.
+    pub minimum_contrast: f32,
     pub foreground: Option<String>,
     pub background: Option<String>,
     pub cursor: Option<String>,
@@ -104,6 +108,7 @@ impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "weft-warm".into(),
+            minimum_contrast: 7.0,
             foreground: None,
             background: None,
             cursor: None,

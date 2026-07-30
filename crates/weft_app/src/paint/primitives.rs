@@ -159,6 +159,11 @@ pub(crate) fn color_to_normalized(color: Color) -> [f32; 4] {
     ]
 }
 
+pub(crate) fn scale_color_alpha(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
+    color[3] *= opacity.clamp(0.0, 1.0);
+    color
+}
+
 /// Resolve a cell's color-origin against the current palette / theme default.
 /// `Default` → theme default; `Palette(i)` → palette slot; `Rgb` → as-is.
 /// Because this runs per-frame, changing the palette (theme switch or OSC)
@@ -173,6 +178,88 @@ pub(crate) fn resolve_cell_color(
         CellColor::Palette(i) => color_to_normalized(palette[i as usize]),
         CellColor::Rgb(c) => color_to_normalized(c),
     }
+}
+
+fn srgb_relative_luminance(color: [f32; 4]) -> f32 {
+    let linear = |channel: f32| {
+        let channel = channel.clamp(0.0, 1.0);
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
+}
+
+pub(crate) fn text_contrast_ratio(foreground: [f32; 4], background: [f32; 4]) -> f32 {
+    let foreground = srgb_relative_luminance(foreground);
+    let background = srgb_relative_luminance(background);
+    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+}
+
+pub(crate) fn composite_color_over(foreground: [f32; 4], background: [f32; 4]) -> [f32; 4] {
+    let alpha = foreground[3].clamp(0.0, 1.0);
+    [
+        foreground[0] * alpha + background[0] * (1.0 - alpha),
+        foreground[1] * alpha + background[1] * (1.0 - alpha),
+        foreground[2] * alpha + background[2] * (1.0 - alpha),
+        1.0,
+    ]
+}
+
+pub(crate) fn text_background_for_range(
+    canvas: [f32; 4],
+    selection: Option<(usize, usize, [f32; 4])>,
+    range: std::ops::Range<usize>,
+) -> [f32; 4] {
+    selection
+        .filter(|(start, end, _)| range.start < *end && range.end > *start)
+        .map(|(_, _, background)| background)
+        .unwrap_or(canvas)
+}
+
+/// Raise text to a minimum contrast without changing its stored color origin.
+/// Mixing toward white or black preserves the RGB channel ordering and hue;
+/// a binary search finds the smallest display-only lightness adjustment.
+pub(crate) fn ensure_minimum_text_contrast(
+    foreground: [f32; 4],
+    background: [f32; 4],
+    minimum_ratio: f32,
+) -> [f32; 4] {
+    let minimum_ratio = minimum_ratio.clamp(1.0, 21.0);
+    if text_contrast_ratio(foreground, background) >= minimum_ratio {
+        return foreground;
+    }
+
+    let black = [0.0, 0.0, 0.0, foreground[3]];
+    let white = [1.0, 1.0, 1.0, foreground[3]];
+    let target = if text_contrast_ratio(white, background) >= text_contrast_ratio(black, background)
+    {
+        white
+    } else {
+        black
+    };
+    let mix = |amount: f32| {
+        [
+            foreground[0] + (target[0] - foreground[0]) * amount,
+            foreground[1] + (target[1] - foreground[1]) * amount,
+            foreground[2] + (target[2] - foreground[2]) * amount,
+            foreground[3],
+        ]
+    };
+
+    let mut low = 0.0;
+    let mut high = 1.0;
+    for _ in 0..12 {
+        let middle = (low + high) * 0.5;
+        if text_contrast_ratio(mix(middle), background) >= minimum_ratio {
+            high = middle;
+        } else {
+            low = middle;
+        }
+    }
+    mix(high)
 }
 
 /// Map a syntax-highlight token kind to its theme color (normalized RGBA).
@@ -306,6 +393,86 @@ pub(crate) fn snap_physical_rect(start: f32, end: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scaled_alpha_clamps_opacity_without_changing_rgb() {
+        assert_eq!(
+            scale_color_alpha([0.1, 0.2, 0.3, 0.8], 0.5),
+            [0.1, 0.2, 0.3, 0.4]
+        );
+        assert_eq!(scale_color_alpha([0.1, 0.2, 0.3, 0.8], 2.0)[3], 0.8);
+    }
+
+    #[test]
+    fn minimum_contrast_leaves_already_readable_color_exactly_unchanged() {
+        let foreground = [0.9, 0.7, 0.2, 0.8];
+        let background = [0.02, 0.03, 0.04, 1.0];
+        assert_eq!(
+            ensure_minimum_text_contrast(foreground, background, 4.5),
+            foreground
+        );
+    }
+
+    #[test]
+    fn minimum_contrast_brightens_dark_canvas_without_changing_channel_order() {
+        let foreground = [0.35, 0.18, 0.08, 0.75];
+        let background = [0.02, 0.03, 0.04, 1.0];
+        let adjusted = ensure_minimum_text_contrast(foreground, background, 7.0);
+        assert!(text_contrast_ratio(adjusted, background) >= 6.99);
+        assert!(adjusted[0] > adjusted[1] && adjusted[1] > adjusted[2]);
+        assert_eq!(adjusted[3], foreground[3]);
+    }
+
+    #[test]
+    fn minimum_contrast_darkens_on_light_canvas_and_one_is_identity() {
+        let foreground = [0.75, 0.55, 0.35, 1.0];
+        let background = [0.98, 0.97, 0.94, 1.0];
+        assert_eq!(
+            ensure_minimum_text_contrast(foreground, background, 1.0),
+            foreground
+        );
+        let adjusted = ensure_minimum_text_contrast(foreground, background, 7.0);
+        assert!(text_contrast_ratio(adjusted, background) >= 6.99);
+        assert!(adjusted[0] < foreground[0]);
+    }
+
+    #[test]
+    fn translucent_selection_is_composited_before_contrast_measurement() {
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let selection = [0.8, 0.4, 0.2, 0.6];
+        let composite = composite_color_over(selection, canvas);
+        for (actual, expected) in composite.into_iter().zip([0.52, 0.32, 0.24, 1.0]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn text_range_uses_selection_background_only_when_ranges_overlap() {
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let selected = [0.4, 0.5, 0.6, 1.0];
+        let selection = Some((2, 5, selected));
+        assert_eq!(text_background_for_range(canvas, selection, 1..2), canvas);
+        assert_eq!(text_background_for_range(canvas, selection, 2..3), selected);
+        assert_eq!(text_background_for_range(canvas, selection, 4..6), selected);
+        assert_eq!(text_background_for_range(canvas, selection, 5..6), canvas);
+    }
+
+    #[test]
+    fn selected_text_is_corrected_against_the_composited_selection() {
+        let canvas = color_to_normalized(weft_core::config::Theme::weft_warm().background);
+        let accent = color_to_normalized(weft_core::config::Theme::weft_warm().accent);
+        let selection = [
+            accent[0] * 0.35 + canvas[0] * 0.65,
+            accent[1] * 0.35 + canvas[1] * 0.65,
+            accent[2] * 0.35 + canvas[2] * 0.65,
+            0.60,
+        ];
+        let selected_canvas = composite_color_over(selection, canvas);
+        let failure = color_to_normalized(weft_core::config::Theme::weft_warm().output.failure);
+        let adjusted = ensure_minimum_text_contrast(failure, selected_canvas, 7.0);
+        assert!(text_contrast_ratio(adjusted, selected_canvas) >= 6.99);
+        assert_eq!(adjusted[3], failure[3]);
+    }
 
     #[test]
     fn syntax_color_distinct_and_default_fallback() {

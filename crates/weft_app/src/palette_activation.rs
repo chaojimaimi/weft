@@ -126,6 +126,16 @@ impl App {
                         }
                         self.close_palette();
                     }
+                    BuiltinCmd::ImportRunbook => match self.import_runbook_interactive() {
+                        Ok(()) => info!("runbook load scheduled"),
+                        Err(crate::runbook_controller::RunbookInteractionError::Cancelled) => {
+                            self.close_palette();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "runbook import failed");
+                            self.close_palette();
+                        }
+                    },
                 }
                 self.request_redraw();
             }
@@ -159,13 +169,57 @@ impl App {
                 self.request_redraw();
             }
             PaletteEntry::SearchHit(hit) => {
-                // v1.7.1: Activating a history search hit fills the editor
-                // with the command (no auto-execution). Per V17 §3 step 5:
-                // "激活历史命令只填入 editor；Block 结果打开对应记录，不自动执行"
-                let cmd = hit.doc.title.clone();
+                use weft_core::search::SearchDocumentKind;
+                match hit.doc.kind {
+                    SearchDocumentKind::Block | SearchDocumentKind::Bookmark => {
+                        if let Ok(id) = hit.doc.stable_id.parse::<u64>() {
+                            if self.navigate_to_block(weft_core::blocks::BlockId(id)) {
+                                self.close_palette();
+                            } else {
+                                warn!(block_id = id, "search hit is not loaded in any pane");
+                            }
+                        }
+                    }
+                    SearchDocumentKind::Workflow => {
+                        let command = self
+                            .palette
+                            .store
+                            .as_ref()
+                            .and_then(|store| store.find_by_name(&hit.doc.title).ok().flatten())
+                            .and_then(|workflow| {
+                                workflow.steps.first().map(|step| step.command.clone())
+                            });
+                        if let Some(command) = command {
+                            if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                                terminal.editor_mut().buffer.set_text(&command);
+                                terminal.editor_mut().buffer.select_all();
+                            }
+                            self.close_palette();
+                        }
+                    }
+                    SearchDocumentKind::Workspace => {
+                        let path = std::path::PathBuf::from(&hit.doc.stable_id);
+                        match weft_core::workspace::WorkspaceDocument::load(&path) {
+                            Ok(workspace) => {
+                                match self.restore_workspace_with_confirmation(&workspace) {
+                                    Ok(Some(_)) => self.close_palette(),
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        warn!(error = %e, path = %path.display(), "failed to restore workspace search hit")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, path = %path.display(), "failed to load workspace search hit")
+                            }
+                        }
+                    }
+                }
+                self.request_redraw();
+            }
+            PaletteEntry::Runbook(entry) => {
                 if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
-                    terminal.editor_mut().buffer.set_text(&cmd);
-                    // Select all so the user can easily replace or edit.
+                    terminal.editor_mut().buffer.set_text(&entry.command);
                     terminal.editor_mut().buffer.select_all();
                 }
                 self.close_palette();

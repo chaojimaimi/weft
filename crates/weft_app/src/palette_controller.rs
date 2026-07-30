@@ -5,6 +5,26 @@ use super::*;
 impl App {
     /// Refresh the palette search results from the workflow store + builtin commands.
     pub(super) fn refresh_palette_results(&mut self) {
+        if !self.palette.runbook_entries.is_empty() {
+            let query = self.palette.query.to_lowercase();
+            self.palette.results = self
+                .palette
+                .runbook_entries
+                .iter()
+                .filter(|entry| {
+                    query.is_empty()
+                        || entry.command.to_lowercase().contains(&query)
+                        || entry.description.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .map(PaletteEntry::Runbook)
+                .collect();
+            self.palette.selection = self
+                .palette
+                .selection
+                .min(self.palette.results.len().saturating_sub(1));
+            return;
+        }
         let mut results = Vec::new();
 
         // Workflows from the store.
@@ -29,6 +49,7 @@ impl App {
             BuiltinCmd::ExportConfig,
             BuiltinCmd::SaveWorkspace,
             BuiltinCmd::OpenWorkspace,
+            BuiltinCmd::ImportRunbook,
         ];
         for b in &builtins {
             let label = b.label();
@@ -91,12 +112,7 @@ impl App {
                     .terminal
                     .as_ref()
                     .and_then(|t| t.cwd().map(|s| s.to_string()));
-                let gen = worker.submit(
-                    &self.palette.query,
-                    &[weft_core::search::SearchDocumentKind::Block],
-                    cwd.as_deref(),
-                    50,
-                );
+                let gen = worker.submit(&self.palette.query, &[], cwd.as_deref(), 50);
                 self.palette.search_generation = gen;
                 self.palette.search_pending = true;
             }
@@ -125,6 +141,10 @@ impl App {
                 continue;
             }
             self.palette.search_pending = false;
+            if let Some(error) = result.error {
+                warn!(%error, "palette search failed");
+                continue;
+            }
             // Remove old SearchHit entries first.
             self.palette
                 .results

@@ -596,6 +596,7 @@ impl GlyphAtlas {
         let pixels = cluster::rasterize_cluster_alpha(
             font,
             cluster,
+            self.scaled_size,
             glyph_w,
             self.cell_height,
             self.primary_descent_px,

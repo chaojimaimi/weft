@@ -138,7 +138,13 @@ fn fill_rect(width: u32, height: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> Vec
 
 fn draw_box(width: u32, height: u32, segments: u8, heavy: bool) -> Vec<u8> {
     let mut pixels = vec![0; width as usize * height as usize];
-    let thickness = if heavy { 2 } else { 1 }.min(width).min(height);
+    // The atlas is built in physical pixels. A fixed one-pixel stroke becomes
+    // only half a logical pixel on Retina and nearly disappears for dim ANSI
+    // box lines. Scale the light stroke from the cell width; heavy lines keep
+    // a 2x relationship. At the common 1x 8px cell this remains 1px, while a
+    // 2x 16px cell becomes 2px.
+    let light = (width / 8).max(1);
+    let thickness = if heavy { light * 2 } else { light }.min(width).min(height);
     let cx = width / 2;
     let cy = height / 2;
     let half = thickness / 2;
@@ -182,6 +188,40 @@ mod tests {
         assert!(pixels
             .chunks_exact(width as usize)
             .any(|row| { row.first() == Some(&u8::MAX) && row.last() == Some(&u8::MAX) }));
+    }
+
+    #[test]
+    fn retina_vertical_box_line_keeps_one_logical_pixel_weight() {
+        let width = 16;
+        let height = 32;
+        let pixels = rasterize('│', width, height).unwrap();
+        let center_row = &pixels
+            [(height as usize / 2) * width as usize..(height as usize / 2 + 1) * width as usize];
+        assert_eq!(
+            center_row.iter().filter(|pixel| **pixel == u8::MAX).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn light_and_heavy_box_strokes_scale_consistently_at_1x_and_2x() {
+        for (width, height, light, heavy) in [(8, 16, 1), (16, 32, 2)]
+            .map(|(width, height, light)| (width, height, light, light * 2))
+        {
+            for (ch, expected) in [('│', light), ('┃', heavy)] {
+                let pixels = rasterize(ch, width, height).unwrap();
+                let row = &pixels[(height as usize / 2) * width as usize
+                    ..(height as usize / 2 + 1) * width as usize];
+                assert_eq!(row.iter().filter(|pixel| **pixel > 0).count(), expected);
+            }
+            for (ch, expected) in [('─', light), ('━', heavy)] {
+                let pixels = rasterize(ch, width, height).unwrap();
+                let column_ink = (0..height as usize)
+                    .filter(|row| pixels[row * width as usize + width as usize / 2] > 0)
+                    .count();
+                assert_eq!(column_ink, expected);
+            }
+        }
     }
 
     #[test]

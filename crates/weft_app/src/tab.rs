@@ -123,6 +123,10 @@ impl Tab {
         self.panes.values_mut()
     }
 
+    pub(crate) fn panes(&self) -> impl Iterator<Item = (PaneId, &Pane)> {
+        self.panes.iter().map(|(id, pane)| (*id, pane))
+    }
+
     /// Id of the currently focused pane.
     #[allow(dead_code)] // v1.3 Batch 4+: consumed by split/focus/close handlers
     pub(crate) fn active_pane_id(&self) -> PaneId {

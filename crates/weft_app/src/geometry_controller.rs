@@ -55,6 +55,7 @@ impl App {
                     }
                     // v1.7.1: Search hits use the document title as label.
                     PaletteEntry::SearchHit(hit) => hit.doc.title.clone(),
+                    PaletteEntry::Runbook(entry) => entry.command.clone(),
                 })
                 .collect(),
         };
@@ -84,12 +85,17 @@ impl App {
         }
         let editor = terminal.editor();
         let (matches, selected) = editor.completion_view()?;
+        let (visual, _, _) = crate::paint::prompt::prompt_layout_for_buffer(
+            &ctx,
+            &editor.buffer.lines,
+            editor.buffer.cursor,
+        );
         let layout = crate::completion_component::derive_completion_layout(
             &ctx,
             matches,
             selected,
-            editor.buffer.lines.len(),
-            editor.buffer.cursor,
+            visual.rows.len(),
+            (visual.cursor_row, visual.cursor_display_col),
             self.interaction.popup_max_rows,
             self.interaction.popup_width_scale,
         )?;
@@ -419,7 +425,8 @@ impl App {
         // A click in the right half of a double-width cell rounds to that
         // cell's index (so dragging across it selects the whole CJK char).
         let mut col_cursor = 0usize; // column units consumed so far
-        let target_col = ctx.col_at_x(x as f32);
+        let (content_left, _) = crate::layout::block_content_x_bounds(&ctx);
+        let target_col = ((x as f32 - content_left) / ctx.cell_w).max(0.0) as usize;
         for (ci, c) in row.text.chars().enumerate() {
             let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
             if w == 0 {
@@ -449,10 +456,6 @@ impl App {
     /// editor buffer position `(line, char_col)`. Returns None when the
     /// renderer/prompt isn't available or the click is outside the box.
     ///
-    /// The prompt box layout (from `layout_prompt`):
-    ///   - line 0 starts at `first_line_text_x` (after the "❯ " glyph)
-    ///   - lines 1+ start at `left` (= `box_x0`)
-    ///   - each line is `cell_h` tall, starting at `text_y0`
     pub(super) fn pixel_to_editor_pos(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         use unicode_width::UnicodeWidthChar;
         let renderer = self.renderer.as_ref()?;
@@ -472,9 +475,11 @@ impl App {
         if lines.is_empty() {
             return None;
         }
-        let n_lines = lines.len().max(1);
-        let scroll_offset = terminal.editor().buffer.scroll_offset;
-        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0, scroll_offset);
+        let (visual, layout, scroll_offset) = crate::paint::prompt::prompt_layout_for_buffer(
+            &ctx,
+            lines,
+            terminal.editor().buffer.cursor,
+        );
         if x < layout.box_rect[0] as f64
             || x > layout.box_rect[2] as f64
             || y < layout.box_rect[1] as f64
@@ -482,9 +487,11 @@ impl App {
         {
             return None;
         }
-        let line = crate::layout::prompt_line_at_y(&layout, y as f32, scroll_offset, n_lines);
+        let visual_row =
+            crate::layout::prompt_line_at_y(&layout, y as f32, scroll_offset, visual.rows.len());
+        let row = visual.rows.get(visual_row)?;
         // X origin for this line.
-        let text_x = if line == 0 {
+        let text_x = if visual_row == 0 {
             layout.first_line_text_x as f64
         } else {
             layout.left as f64
@@ -493,7 +500,7 @@ impl App {
         let disp_col = ((x - text_x) / cw).max(0.0) as usize;
         // Walk the line's chars, accumulating display widths, to find the
         // char index whose cumulative width first exceeds disp_col.
-        let line_str = &lines[line];
+        let line_str = &row.text;
         let mut col_cursor = 0usize;
         for (ci, c) in line_str.chars().enumerate() {
             let w = UnicodeWidthChar::width(c).unwrap_or(0);
@@ -504,17 +511,14 @@ impl App {
                 // For double-width chars, clicking the right half advances
                 // past the char (so drag-select lands after it).
                 let char_idx = if disp_col > col_cursor { ci + 1 } else { ci };
-                return Some((line, char_idx));
+                return Some((row.source_line, row.char_start + char_idx));
             }
             col_cursor += w;
         }
-        // Past the last char: clamp to end of line.
-        Some((line, line_str.chars().count()))
+        Some((row.source_line, row.char_end))
     }
 
-    /// Compute the prompt input box rect on-demand from the layout function,
-    /// instead of reading the renderer's previous-frame cache. Returns None
-    /// when not in block view or the terminal/editor isn't available.
+    /// Current prompt box, when the block editor is available.
     pub(super) fn prompt_box_rect(&self) -> Option<[f32; 4]> {
         let renderer = self.renderer.as_ref()?;
         let ctx = renderer.layout_ctx?;
@@ -522,9 +526,11 @@ impl App {
         if !terminal.show_block_view() {
             return None;
         }
-        let n_lines = terminal.editor().buffer.lines.len();
-        // box_rect only depends on ctx + n_lines; cursor position doesn't affect the box bounds.
-        let layout = crate::layout::layout_prompt(&ctx, n_lines, 0, 0, 0);
+        let (_, layout, _) = crate::paint::prompt::prompt_layout_for_buffer(
+            &ctx,
+            &terminal.editor().buffer.lines,
+            terminal.editor().buffer.cursor,
+        );
         Some(layout.box_rect)
     }
 
@@ -548,14 +554,12 @@ impl App {
             let Some(ctx) = renderer.layout_ctx else {
                 return Vec::new();
             };
-            crate::layout::layout_prompt(
+            let (_, prompt, _) = crate::paint::prompt::prompt_layout_for_buffer(
                 &ctx,
-                terminal.editor().buffer.lines.len(),
-                0,
-                0,
-                terminal.editor().buffer.scroll_offset,
-            )
-            .box_rect[1]
+                &terminal.editor().buffer.lines,
+                terminal.editor().buffer.cursor,
+            );
+            prompt.box_rect[1]
         } else {
             let Some(ctx) = renderer.layout_ctx else {
                 return Vec::new();
@@ -570,9 +574,11 @@ impl App {
             live: (!editor_mode)
                 .then(|| terminal.block_tracker().in_flight())
                 .flatten(),
-            block_scroll: self.sessions.active().block_scroll(),
+            block_scroll: self.sessions.active().block_scroll_position(),
             viewport_rows: terminal.grid().num_rows,
             block_hovered: self.interaction.block_hovered,
+            block_selected: self.interaction.block_selected,
+            block_action_hovered: self.interaction.block_action_hovered,
             spinner_phase: -1.0,
             find_block_highlight: renderer
                 .find_state
@@ -801,84 +807,5 @@ impl App {
             self.panel.scroll_offset,
             renderer.cell_height() as f32 * 0.8,
         )
-    }
-
-    /// Resolve a physical-pixel point in the settings panel to a target.
-    /// Rebuilds the settings layout from renderer geometry + current settings
-    /// state. Returns `None` when the panel is closed, the renderer is absent,
-    /// or the point misses every target.
-    pub(super) fn settings_target_at(
-        &self,
-        x: f32,
-        y: f32,
-    ) -> Option<crate::settings_component::SettingsTarget> {
-        if !self.settings.open {
-            return None;
-        }
-        let renderer = self.renderer.as_ref()?;
-        let cw = renderer.cell_width() as f32;
-        let ch = renderer.cell_height() as f32;
-        let (vp_w, vp_h) = renderer.viewport();
-
-        let footer_pair_widths = crate::settings_component::settings_footer_widths(cw);
-
-        let layout = crate::layout::layout_settings(
-            vp_w,
-            vp_h,
-            cw,
-            ch,
-            crate::overlay::SettingsTab::ALL.len(),
-            self.settings.error.is_some(),
-            &footer_pair_widths,
-            self.settings_is_narrow(),
-            self.settings.drill_down,
-        )?;
-
-        let theme_count = if self.settings.tab == crate::overlay::SettingsTab::Appearance {
-            self.settings_theme_views().len().min(layout.max_rows)
-        } else {
-            0
-        };
-
-        let scene = crate::settings_component::build_settings_scene(
-            &layout,
-            crate::overlay::SettingsTab::ALL.as_slice(),
-            self.settings.tab,
-            theme_count,
-            ch,
-            self.profile_names_sorted().len() + 1, // v1.5.1: +1 for "Base"
-        );
-        crate::settings_component::settings_target_at(&scene, x, y)
-    }
-
-    /// Check whether a point falls inside the settings panel bounding box
-    /// (without requiring a hit target). Used to consume clicks that land on
-    /// the panel background but miss every interactive element.
-    pub(super) fn point_inside_settings_box(&self, x: f32, y: f32) -> bool {
-        if !self.settings.open {
-            return false;
-        }
-        let Some(renderer) = &self.renderer else {
-            return false;
-        };
-        let cw = renderer.cell_width() as f32;
-        let ch = renderer.cell_height() as f32;
-        let (vp_w, vp_h) = renderer.viewport();
-        crate::layout::layout_settings(
-            vp_w,
-            vp_h,
-            cw,
-            ch,
-            crate::overlay::SettingsTab::ALL.len(),
-            self.settings.error.is_some(),
-            &[0.0; 6],
-            self.settings_is_narrow(),
-            self.settings.drill_down,
-        )
-        .map(|layout| {
-            let [bx0, by0, bx1, by1] = layout.box_rect;
-            x >= bx0 && x < bx1 && y >= by0 && y < by1
-        })
-        .unwrap_or(false)
     }
 }

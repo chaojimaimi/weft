@@ -181,9 +181,12 @@ impl App {
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Close(idx)) => {
                             if idx == self.sessions.active_idx() {
-                                let effects = self.close_tab();
+                                let effects = self.close_active_tab_with_confirmation();
                                 self.drain_effects(effects);
                             } else {
+                                if !self.confirm_background_tab_close(idx) {
+                                    return;
+                                }
                                 // Close a background tab — remove and adjust index.
                                 let blocks = self
                                     .sessions
@@ -210,6 +213,8 @@ impl App {
                             }
                             self.tab_bar.hovered_tab = None;
                             self.interaction.block_hovered = None;
+                            self.interaction.block_selected = None;
+                            self.interaction.block_action_hovered = None;
                             self.scroll_active_tab_into_view();
                             self.request_redraw();
                             return;
@@ -430,6 +435,9 @@ impl App {
                             if let Some(bid) = row.block_id {
                                 if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
                                     term.block_tracker_mut().toggle_collapse(bid);
+                                    if let Some(renderer) = &self.renderer {
+                                        renderer.block_layout_cache.borrow_mut().invalidate(bid.0);
+                                    }
                                     self.request_redraw();
                                 }
                             }
@@ -550,6 +558,14 @@ impl App {
 
         let selecting = !self.mouse_reporting_active();
         let block_view = self.block_view_active();
+
+        if button == winit::event::MouseButton::Left && block_view {
+            let selected = self.block_at(y as f32).flatten();
+            if selected != self.interaction.block_selected {
+                self.interaction.block_selected = selected;
+                self.request_redraw();
+            }
+        }
 
         // Host chrome is not a clamped alias for Grid row 0. Consume presses
         // there before selection, paste, context-menu or PTY mouse routing.

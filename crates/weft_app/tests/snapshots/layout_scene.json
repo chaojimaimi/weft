@@ -2,12 +2,12 @@
   "block_sidebar": {
     "block": {
       "bounds": [
-        248.0,
+        261.5,
         44.0,
-        792.0,
+        778.5,
         504.0
       ],
-      "cols": 60,
+      "cols": 57,
       "fixed_cwd_y": 522.0,
       "pitch": 18.0
     },
@@ -449,7 +449,7 @@
         430.0,
         623.0
       ],
-      "content_top": 158.0,
+      "content_top": 161.6,
       "content_x": [
         83.5,
         416.5
@@ -457,14 +457,14 @@
       "footer_y": 596.0,
       "max_rows": 23,
       "scene": {
-        "hit_count": 14,
+        "hit_count": 20,
         "hits": [
           {
             "bounds": [
               353.5,
               140.0,
               380.5,
-              158.0
+              161.6
             ],
             "target": "ProfileCreate"
           },
@@ -473,108 +473,162 @@
               389.5,
               140.0,
               416.5,
-              158.0
+              161.6
             ],
             "target": "ProfileDelete"
           },
           {
             "bounds": [
               83.5,
-              158.0,
+              161.6,
               416.5,
-              176.0
+              179.6
             ],
             "target": "Theme(0)"
           },
           {
             "bounds": [
               83.5,
-              176.0,
+              179.6,
               416.5,
-              194.0
+              197.6
             ],
             "target": "Theme(1)"
           },
           {
             "bounds": [
               83.5,
-              194.0,
+              197.6,
               416.5,
-              212.0
+              215.6
             ],
             "target": "Theme(2)"
           },
           {
             "bounds": [
               83.5,
-              212.0,
+              215.6,
               416.5,
-              230.0
+              233.6
             ],
             "target": "Theme(3)"
           },
           {
             "bounds": [
               83.5,
-              230.0,
+              233.6,
               416.5,
-              248.0
+              251.6
             ],
             "target": "Theme(4)"
           },
           {
             "bounds": [
               83.5,
-              248.0,
+              251.6,
               416.5,
-              266.0
+              269.6
             ],
             "target": "Theme(5)"
           },
           {
             "bounds": [
               83.5,
-              266.0,
+              269.6,
               416.5,
-              284.0
+              287.6
             ],
             "target": "Theme(6)"
           },
           {
             "bounds": [
               83.5,
-              284.0,
+              287.6,
               416.5,
-              302.0
+              305.6
             ],
             "target": "Theme(7)"
           },
           {
             "bounds": [
               83.5,
-              302.0,
+              305.6,
               416.5,
-              320.0
+              323.6
             ],
             "target": "Theme(8)"
           },
           {
             "bounds": [
               83.5,
-              320.0,
+              323.6,
               416.5,
-              338.0
+              341.6
             ],
             "target": "Theme(9)"
           },
           {
             "bounds": [
               83.5,
-              338.0,
+              341.6,
               416.5,
-              356.0
+              359.6
             ],
             "target": "Theme(10)"
+          },
+          {
+            "bounds": [
+              83.5,
+              359.6,
+              416.5,
+              377.6
+            ],
+            "target": "ContentRow(11)"
+          },
+          {
+            "bounds": [
+              83.5,
+              377.6,
+              416.5,
+              395.6
+            ],
+            "target": "ContentRow(12)"
+          },
+          {
+            "bounds": [
+              83.5,
+              395.6,
+              416.5,
+              413.6
+            ],
+            "target": "ContentRow(13)"
+          },
+          {
+            "bounds": [
+              83.5,
+              413.6,
+              416.5,
+              431.6
+            ],
+            "target": "ContentRow(14)"
+          },
+          {
+            "bounds": [
+              83.5,
+              431.6,
+              416.5,
+              449.6
+            ],
+            "target": "ContentRow(15)"
+          },
+          {
+            "bounds": [
+              83.5,
+              449.6,
+              416.5,
+              467.6
+            ],
+            "target": "ContentRow(16)"
           },
           {
             "bounds": [
@@ -586,7 +640,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 14,
+        "semantic_count": 20,
         "semantics": [
           {
             "bounds": [
@@ -605,7 +659,7 @@
               83.5,
               140.0,
               416.5,
-              158.0
+              161.6
             ],
             "focus": "Settings",
             "label": "Profile selector",
@@ -615,9 +669,9 @@
           {
             "bounds": [
               83.5,
-              158.0,
+              161.6,
               416.5,
-              176.0
+              179.6
             ],
             "focus": null,
             "label": "Theme 1",
@@ -627,9 +681,9 @@
           {
             "bounds": [
               83.5,
-              176.0,
+              179.6,
               416.5,
-              194.0
+              197.6
             ],
             "focus": null,
             "label": "Theme 2",
@@ -639,9 +693,9 @@
           {
             "bounds": [
               83.5,
-              194.0,
+              197.6,
               416.5,
-              212.0
+              215.6
             ],
             "focus": null,
             "label": "Theme 3",
@@ -651,9 +705,9 @@
           {
             "bounds": [
               83.5,
-              212.0,
+              215.6,
               416.5,
-              230.0
+              233.6
             ],
             "focus": null,
             "label": "Theme 4",
@@ -663,9 +717,9 @@
           {
             "bounds": [
               83.5,
-              230.0,
+              233.6,
               416.5,
-              248.0
+              251.6
             ],
             "focus": null,
             "label": "Theme 5",
@@ -675,9 +729,9 @@
           {
             "bounds": [
               83.5,
-              248.0,
+              251.6,
               416.5,
-              266.0
+              269.6
             ],
             "focus": null,
             "label": "Theme 6",
@@ -687,9 +741,9 @@
           {
             "bounds": [
               83.5,
-              266.0,
+              269.6,
               416.5,
-              284.0
+              287.6
             ],
             "focus": null,
             "label": "Theme 7",
@@ -699,9 +753,9 @@
           {
             "bounds": [
               83.5,
-              284.0,
+              287.6,
               416.5,
-              302.0
+              305.6
             ],
             "focus": null,
             "label": "Theme 8",
@@ -711,9 +765,9 @@
           {
             "bounds": [
               83.5,
-              302.0,
+              305.6,
               416.5,
-              320.0
+              323.6
             ],
             "focus": null,
             "label": "Theme 9",
@@ -723,9 +777,9 @@
           {
             "bounds": [
               83.5,
-              320.0,
+              323.6,
               416.5,
-              338.0
+              341.6
             ],
             "focus": null,
             "label": "Theme 10",
@@ -735,12 +789,84 @@
           {
             "bounds": [
               83.5,
-              338.0,
+              341.6,
               416.5,
-              356.0
+              359.6
             ],
             "focus": null,
             "label": "Theme 11",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              359.6,
+              416.5,
+              377.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 12",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              377.6,
+              416.5,
+              395.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 13",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              395.6,
+              416.5,
+              413.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 14",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              413.6,
+              416.5,
+              431.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 15",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              431.6,
+              416.5,
+              449.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 16",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              83.5,
+              449.6,
+              416.5,
+              467.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 17",
             "role": "ListItem",
             "state": ""
           },
@@ -964,7 +1090,7 @@
         1238.4,
         801.0
       ],
-      "content_top": 162.0,
+      "content_top": 165.6,
       "content_x": [
         496.404,
         1224.9
@@ -972,7 +1098,7 @@
       "footer_y": 774.0,
       "max_rows": 33,
       "scene": {
-        "hit_count": 22,
+        "hit_count": 28,
         "hits": [
           {
             "bounds": [
@@ -1033,7 +1159,7 @@
               1161.9,
               144.0,
               1188.9,
-              162.0
+              165.6
             ],
             "target": "ProfileCreate"
           },
@@ -1042,108 +1168,162 @@
               1197.9,
               144.0,
               1224.9,
-              162.0
+              165.6
             ],
             "target": "ProfileDelete"
           },
           {
             "bounds": [
               496.404,
-              162.0,
+              165.6,
               1224.9,
-              180.0
+              183.6
             ],
             "target": "Theme(0)"
           },
           {
             "bounds": [
               496.404,
-              180.0,
+              183.6,
               1224.9,
-              198.0
+              201.6
             ],
             "target": "Theme(1)"
           },
           {
             "bounds": [
               496.404,
-              198.0,
+              201.6,
               1224.9,
-              216.0
+              219.6
             ],
             "target": "Theme(2)"
           },
           {
             "bounds": [
               496.404,
-              216.0,
+              219.6,
               1224.9,
-              234.0
+              237.6
             ],
             "target": "Theme(3)"
           },
           {
             "bounds": [
               496.404,
-              234.0,
+              237.6,
               1224.9,
-              252.0
+              255.6
             ],
             "target": "Theme(4)"
           },
           {
             "bounds": [
               496.404,
-              252.0,
+              255.6,
               1224.9,
-              270.0
+              273.6
             ],
             "target": "Theme(5)"
           },
           {
             "bounds": [
               496.404,
-              270.0,
+              273.6,
               1224.9,
-              288.0
+              291.6
             ],
             "target": "Theme(6)"
           },
           {
             "bounds": [
               496.404,
-              288.0,
+              291.6,
               1224.9,
-              306.0
+              309.6
             ],
             "target": "Theme(7)"
           },
           {
             "bounds": [
               496.404,
-              306.0,
+              309.6,
               1224.9,
-              324.0
+              327.6
             ],
             "target": "Theme(8)"
           },
           {
             "bounds": [
               496.404,
-              324.0,
+              327.6,
               1224.9,
-              342.0
+              345.6
             ],
             "target": "Theme(9)"
           },
           {
             "bounds": [
               496.404,
-              342.0,
+              345.6,
               1224.9,
-              360.0
+              363.6
             ],
             "target": "Theme(10)"
+          },
+          {
+            "bounds": [
+              496.404,
+              363.6,
+              1224.9,
+              381.6
+            ],
+            "target": "ContentRow(11)"
+          },
+          {
+            "bounds": [
+              496.404,
+              381.6,
+              1224.9,
+              399.6
+            ],
+            "target": "ContentRow(12)"
+          },
+          {
+            "bounds": [
+              496.404,
+              399.6,
+              1224.9,
+              417.6
+            ],
+            "target": "ContentRow(13)"
+          },
+          {
+            "bounds": [
+              496.404,
+              417.6,
+              1224.9,
+              435.6
+            ],
+            "target": "ContentRow(14)"
+          },
+          {
+            "bounds": [
+              496.404,
+              435.6,
+              1224.9,
+              453.6
+            ],
+            "target": "ContentRow(15)"
+          },
+          {
+            "bounds": [
+              496.404,
+              453.6,
+              1224.9,
+              471.6
+            ],
+            "target": "ContentRow(16)"
           },
           {
             "bounds": [
@@ -1173,7 +1353,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 22,
+        "semantic_count": 28,
         "semantics": [
           {
             "bounds": [
@@ -1264,7 +1444,7 @@
               496.404,
               144.0,
               1224.9,
-              162.0
+              165.6
             ],
             "focus": "Settings",
             "label": "Profile selector",
@@ -1274,9 +1454,9 @@
           {
             "bounds": [
               496.404,
-              162.0,
+              165.6,
               1224.9,
-              180.0
+              183.6
             ],
             "focus": null,
             "label": "Theme 1",
@@ -1286,9 +1466,9 @@
           {
             "bounds": [
               496.404,
-              180.0,
+              183.6,
               1224.9,
-              198.0
+              201.6
             ],
             "focus": null,
             "label": "Theme 2",
@@ -1298,9 +1478,9 @@
           {
             "bounds": [
               496.404,
-              198.0,
+              201.6,
               1224.9,
-              216.0
+              219.6
             ],
             "focus": null,
             "label": "Theme 3",
@@ -1310,9 +1490,9 @@
           {
             "bounds": [
               496.404,
-              216.0,
+              219.6,
               1224.9,
-              234.0
+              237.6
             ],
             "focus": null,
             "label": "Theme 4",
@@ -1322,9 +1502,9 @@
           {
             "bounds": [
               496.404,
-              234.0,
+              237.6,
               1224.9,
-              252.0
+              255.6
             ],
             "focus": null,
             "label": "Theme 5",
@@ -1334,9 +1514,9 @@
           {
             "bounds": [
               496.404,
-              252.0,
+              255.6,
               1224.9,
-              270.0
+              273.6
             ],
             "focus": null,
             "label": "Theme 6",
@@ -1346,9 +1526,9 @@
           {
             "bounds": [
               496.404,
-              270.0,
+              273.6,
               1224.9,
-              288.0
+              291.6
             ],
             "focus": null,
             "label": "Theme 7",
@@ -1358,9 +1538,9 @@
           {
             "bounds": [
               496.404,
-              288.0,
+              291.6,
               1224.9,
-              306.0
+              309.6
             ],
             "focus": null,
             "label": "Theme 8",
@@ -1370,9 +1550,9 @@
           {
             "bounds": [
               496.404,
-              306.0,
+              309.6,
               1224.9,
-              324.0
+              327.6
             ],
             "focus": null,
             "label": "Theme 9",
@@ -1382,9 +1562,9 @@
           {
             "bounds": [
               496.404,
-              324.0,
+              327.6,
               1224.9,
-              342.0
+              345.6
             ],
             "focus": null,
             "label": "Theme 10",
@@ -1394,12 +1574,84 @@
           {
             "bounds": [
               496.404,
-              342.0,
+              345.6,
               1224.9,
-              360.0
+              363.6
             ],
             "focus": null,
             "label": "Theme 11",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              363.6,
+              1224.9,
+              381.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 12",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              381.6,
+              1224.9,
+              399.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 13",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              399.6,
+              1224.9,
+              417.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 14",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              417.6,
+              1224.9,
+              435.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 15",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              435.6,
+              1224.9,
+              453.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 16",
+            "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              496.404,
+              453.6,
+              1224.9,
+              471.6
+            ],
+            "focus": "Settings",
+            "label": "Setting row 17",
             "role": "ListItem",
             "state": ""
           },

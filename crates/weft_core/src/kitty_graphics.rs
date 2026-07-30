@@ -15,7 +15,6 @@
 //! | `MAX_IMAGE_WIDTH` | 4096 px | Single-image width cap |
 //! | `MAX_IMAGE_HEIGHT` | 4096 px | Single-image height cap |
 //! | `MAX_TOTAL_DECODED_BYTES` | 64 MiB | Total decoded RGBA memory across all images |
-//! | `MAX_PAYLOAD_DIMENSION` | 4096 | Width/height in payload key validation |
 //!
 //! ## Phase A findings (see `docs/V17_IMPLEMENTATION_PLAN.md` §6)
 //!
@@ -279,7 +278,7 @@ fn parse_u32_key(
 /// CollectApc ──ESC \──> PassThrough (APC complete, dispatch)
 /// CollectApc ──ESC(other)──> CollectApc (ESC stored, continue collecting)
 /// CollectApc ──byte──> CollectApc (byte stored)
-/// CollectApc ──overflow──> PassThrough (payload discarded)
+/// CollectApc ──overflow──> CollectApc (excess bytes dropped until ST)
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApcPreParserState {

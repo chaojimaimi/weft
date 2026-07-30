@@ -91,6 +91,7 @@ fn with_weft_config<F: FnOnce()>(
 fn defaults_are_dark_menlo_10000() {
     let c = Config::default();
     assert_eq!(c.theme.name, "weft-warm");
+    assert_eq!(c.theme.minimum_contrast, 7.0);
     assert_eq!(c.font.family, "Menlo");
     assert_eq!(c.font.size, 14.0);
     assert_eq!(c.scrollback.lines, 10_000);
@@ -121,6 +122,7 @@ name = "weft-light"
     assert_eq!(c.font.size, 18.0);
     assert_eq!(c.font.family, "Menlo"); // default retained
     assert_eq!(c.theme.name, "weft-light");
+    assert_eq!(c.theme.minimum_contrast, 7.0);
     assert_eq!(c.scrollback.lines, 10_000); // default retained
 }
 
@@ -1415,6 +1417,24 @@ fn save_theme_name_change() {
 }
 
 #[test]
+fn save_minimum_contrast_change() {
+    let path = unique_tmp_path("minimum-contrast");
+    let cfg = Config {
+        theme: ThemeConfig {
+            minimum_contrast: 5.5,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("minimum_contrast = 5.5"));
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert!((reloaded.theme.minimum_contrast - 5.5).abs() < 1e-6);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
 fn save_scrollback_lines_change() {
     let path = unique_tmp_path("scrollback");
     let cfg = Config {
@@ -1460,6 +1480,52 @@ fn save_preserves_other_fields_when_one_changes() {
     assert_eq!(reloaded.font.size, 16.0);
     assert_eq!(reloaded.theme.name, "nord");
     assert_eq!(reloaded.scrollback.lines, 50_000);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn settings_editable_fields_survive_one_save_reload_cycle() {
+    let path = unique_tmp_path("settings-editable-audit");
+    let mut cfg = Config::default();
+    cfg.font.family = "Monaco".into();
+    cfg.font.size = 17.5;
+    cfg.font.line_height = 1.35;
+    cfg.theme.name = "nord".into();
+    cfg.theme.follow_system = false;
+    cfg.theme.minimum_contrast = 6.5;
+    cfg.theme.output = Some(OutputSemanticConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    cfg.window.width = 1_180;
+    cfg.window.height = 820;
+    cfg.window.opacity = 0.65;
+    cfg.window.padding_x = 3;
+    cfg.window.padding_y = 4;
+    cfg.window.sidebar_width = Some(310.0);
+    cfg.scrollback.lines = 42_000;
+    cfg.editor.submit_on_ctrl_enter = true;
+    cfg.logo.variant = LogoVariant::Light;
+
+    cfg.save_to_path(&path).expect("settings audit save");
+    let reloaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+    assert_eq!(reloaded.font.family, "Monaco");
+    assert!((reloaded.font.size - 17.5).abs() < 1e-6);
+    assert!((reloaded.font.line_height - 1.35).abs() < 1e-6);
+    assert_eq!(reloaded.theme.name, "nord");
+    assert!(!reloaded.theme.follow_system);
+    assert!((reloaded.theme.minimum_contrast - 6.5).abs() < 1e-6);
+    assert!(!reloaded.theme.semantic_output_enabled());
+    assert_eq!(reloaded.window.width, 1_180);
+    assert_eq!(reloaded.window.height, 820);
+    assert!((reloaded.window.opacity - 0.65).abs() < 1e-6);
+    assert_eq!(reloaded.window.padding_x, 3);
+    assert_eq!(reloaded.window.padding_y, 4);
+    assert_eq!(reloaded.window.sidebar_width, Some(310.0));
+    assert_eq!(reloaded.scrollback.lines, 42_000);
+    assert!(reloaded.editor.submit_on_ctrl_enter);
+    assert_eq!(reloaded.logo.variant, LogoVariant::Light);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
@@ -1584,6 +1650,111 @@ fn logo_variant_save_cool_clears_stale_non_default() {
 // that unit tests on the in-memory structs can't. The pure-logic coverage
 // (apply_overrides, name validation, resolve_active_profile) lives next to
 // the impl files; this file owns the persistence semantics.
+
+fn semantic_profile(enabled: bool) -> Config {
+    let mut source = Config {
+        active_profile: Some("work".into()),
+        ..Config::default()
+    };
+    source.profiles.insert(
+        "work".into(),
+        ProfileConfig {
+            theme: Some(ThemeConfig {
+                output: Some(OutputSemanticConfig {
+                    enabled: Some(enabled),
+                    ..OutputSemanticConfig::default()
+                }),
+                ..ThemeConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    source
+}
+
+#[test]
+fn active_profile_semantic_off_survives_save_and_reload() {
+    let path = unique_tmp_path("profile-semantic-off").join("config.toml");
+    semantic_profile(false).save_to_path(&path).unwrap();
+    let loaded = load_resolved_from_path(&path).unwrap();
+    assert!(!loaded.effective.theme.semantic_output_enabled());
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("enabled = false"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn active_profile_semantic_on_removes_stale_false() {
+    let path = unique_tmp_path("profile-semantic-stale").join("config.toml");
+    let mut source = semantic_profile(false);
+    source.save_to_path(&path).unwrap();
+    source
+        .profiles
+        .get_mut("work")
+        .unwrap()
+        .theme
+        .as_mut()
+        .unwrap()
+        .output
+        .as_mut()
+        .unwrap()
+        .enabled = Some(true);
+    source.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("enabled = false"), "stale toggle: {text}");
+    assert!(load_resolved_from_path(&path)
+        .unwrap()
+        .effective
+        .theme
+        .semantic_output_enabled());
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn active_profile_semantic_toggle_preserves_color_overrides() {
+    let path = unique_tmp_path("profile-semantic-colors").join("config.toml");
+    let mut source = semantic_profile(false);
+    {
+        let output = source
+            .profiles
+            .get_mut("work")
+            .unwrap()
+            .theme
+            .as_mut()
+            .unwrap()
+            .output
+            .as_mut()
+            .unwrap();
+        output.success = Some("#12ab34".into());
+        output.failure = Some("#ef4567".into());
+    }
+    source.save_to_path(&path).unwrap();
+    source
+        .profiles
+        .get_mut("work")
+        .unwrap()
+        .theme
+        .as_mut()
+        .unwrap()
+        .output
+        .as_mut()
+        .unwrap()
+        .enabled = Some(true);
+    source.save_to_path(&path).unwrap();
+
+    let loaded = load_resolved_from_path(&path).unwrap();
+    let output = loaded.source.profiles["work"]
+        .theme
+        .as_ref()
+        .unwrap()
+        .output
+        .as_ref()
+        .unwrap();
+    assert_eq!(output.success.as_deref(), Some("#12ab34"));
+    assert_eq!(output.failure.as_deref(), Some("#ef4567"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
 
 /// Profile `[keybindings]` is a full-section override: a profile that
 /// specifies keybindings replaces the base keybindings entirely, not a

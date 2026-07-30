@@ -1,13 +1,11 @@
-//! Settings overlay controller extracted from the application shell.
-//!
-//! F5: Updated for split sidebar layout with 6 categories (Appearance,
-//! Terminal, Input, Keybindings, Window, Advanced). Logo and Font merged
-//! into Appearance. Adds keybinding conflict detection, field-level
-//! validation, and narrow-window drill-down navigation.
+//! Settings overlay controller, validation, and narrow-window navigation.
+
+#[path = "settings_geometry.rs"]
+mod settings_geometry;
 
 use super::*;
 use crate::settings_validation::{
-    adjust_finite_value, detect_keybinding_conflicts, validate_settings,
+    adjust_finite_value, detect_keybinding_conflicts, directional_bool, validate_settings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +58,10 @@ impl App {
             Some(SettingsTarget::Theme(i)) => {
                 self.settings.selection = i;
                 self.apply_settings_selection();
+                self.request_redraw();
+            }
+            Some(SettingsTarget::ContentRow(row)) => {
+                self.settings.selection = row.min(self.settings_tab_row_count().saturating_sub(1));
                 self.request_redraw();
             }
             Some(SettingsTarget::CloseButton) => {
@@ -338,7 +340,7 @@ impl App {
         use crate::overlay::SettingsTab;
         match self.settings.tab {
             SettingsTab::Appearance => {
-                let theme_count = self.settings_theme_views().len();
+                let theme_count = self.settings_appearance_theme_count();
                 let row = self.settings.selection;
                 // Rows 0..theme_count are the theme pick-list (←/→ no-op).
                 if row < theme_count {
@@ -359,20 +361,18 @@ impl App {
                             .mark_dirty(weft_core::config::ConfigSectionMask::LOGO);
                     }
                     1 => {
-                        // Font Family: cycle Menlo → Monaco → SF Mono → Courier New.
-                        // v1.2.11 fix: 原列表含 "System"，但 font_kit 的
-                        // `FamilyName::Title("System")` 在 macOS 上无法解析（系统字体
-                        // 通过 CTFontDescriptorCreateWithTextStyle API 访问，不在
-                        // 家族名索引中），会回退到 Menlo，看起来"字体没变"。换成
-                        // Courier New —— 它是 macOS 内置的经典等宽字体，能被 font_kit
-                        // 正确解析，且与 Menlo/Monaco 视觉差异明显，便于用户感知变化。
-                        const FAMILIES: &[&str] = &["Menlo", "Monaco", "SF Mono", "Courier New"];
-                        let cur = FAMILIES
+                        // Only cycle installed programming fonts. A custom
+                        // current family stays selectable even if Core Text
+                        // cannot resolve it yet (for example before install).
+                        let families = crate::settings_validation::available_programming_fonts(
+                            &self.settings.draft.font.family,
+                        );
+                        let cur = families
                             .iter()
-                            .position(|f| *f == self.settings.draft.font.family)
+                            .position(|family| family == &self.settings.draft.font.family)
                             .unwrap_or(0);
-                        let next = (cur as i32 + delta).rem_euclid(FAMILIES.len() as i32) as usize;
-                        self.settings.draft.font.family = FAMILIES[next].to_string();
+                        let next = (cur as i32 + delta).rem_euclid(families.len() as i32) as usize;
+                        self.settings.draft.font.family = families[next].clone();
                         self.settings
                             .mark_dirty(weft_core::config::ConfigSectionMask::FONT);
                     }
@@ -416,21 +416,19 @@ impl App {
                             .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                     }
                     5 => {
-                        // v1.7.0-D: Semantic output toggle. ←/→ flips
-                        // enabled true/false. Any delta (left or right)
-                        // toggles; default is enabled (true). Preserves
-                        // existing color overrides (output_default/cwd/
-                        // metadata/success/failure) via struct-update on the
-                        // prior value — only `enabled` is mutated.
+                        // Directional toggle preserves semantic color overrides.
                         let current = self.settings.draft.theme.semantic_output_enabled();
-                        let prev = self.settings.draft.theme.output.take().unwrap_or_default();
-                        self.settings.draft.theme.output =
-                            Some(weft_core::config::OutputSemanticConfig {
-                                enabled: Some(!current),
-                                ..prev
-                            });
-                        self.settings
-                            .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
+                        let next = directional_bool(current, delta);
+                        if next != current {
+                            let prev = self.settings.draft.theme.output.take().unwrap_or_default();
+                            self.settings.draft.theme.output =
+                                Some(weft_core::config::OutputSemanticConfig {
+                                    enabled: Some(next),
+                                    ..prev
+                                });
+                            self.settings
+                                .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
+                        }
                     }
                     _ => {}
                 }
@@ -461,15 +459,23 @@ impl App {
                     self.settings
                         .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
                 }
+                3 => {
+                    let value = &mut self.settings.draft.theme.minimum_contrast;
+                    *value = adjust_finite_value(*value, delta, 0.5, 1.0, 12.0, 7.0);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
+                }
                 _ => {}
             },
             SettingsTab::Input => {
                 if self.settings.selection == 0 {
-                    // Submit on Ctrl+Enter: toggle.
-                    self.settings.draft.editor.submit_on_ctrl_enter =
-                        !self.settings.draft.editor.submit_on_ctrl_enter;
-                    self.settings
-                        .mark_dirty(weft_core::config::ConfigSectionMask::EDITOR);
+                    let current = self.settings.draft.editor.submit_on_ctrl_enter;
+                    let next = directional_bool(current, delta);
+                    if next != current {
+                        self.settings.draft.editor.submit_on_ctrl_enter = next;
+                        self.settings
+                            .mark_dirty(weft_core::config::ConfigSectionMask::EDITOR);
+                    }
                 }
             }
             SettingsTab::Keybindings => {
@@ -549,6 +555,8 @@ impl App {
         let draft_padding_x = self.settings.draft.window.padding_x;
         let draft_padding_y = self.settings.draft.window.padding_y;
         let draft_sidebar_width = self.settings.draft.window.sidebar_width;
+        let draft_minimum_contrast = self.settings.draft.theme.minimum_contrast;
+        let draft_semantic_output = self.settings.draft.theme.semantic_output_enabled();
 
         // Font — always rebuild atlas with draft values.
         if let Some(r) = &mut self.renderer {
@@ -578,6 +586,8 @@ impl App {
         // Sidebar width — always update renderer override.
         if let Some(r) = &mut self.renderer {
             r.set_sidebar_width(draft_sidebar_width);
+            r.set_minimum_contrast(draft_minimum_contrast);
+            r.set_semantic_output_enabled(draft_semantic_output);
         }
 
         self.request_redraw();
@@ -620,6 +630,8 @@ impl App {
         // Sidebar width — restore renderer override.
         if let Some(r) = &mut self.renderer {
             r.set_sidebar_width(config.window.sidebar_width);
+            r.set_minimum_contrast(config.theme.minimum_contrast);
+            r.set_semantic_output_enabled(config.theme.semantic_output_enabled());
         }
 
         self.request_redraw();
@@ -631,14 +643,22 @@ impl App {
         match self.settings.tab {
             SettingsTab::Appearance => {
                 // Theme list + Variant + Font + Size + Line + Opacity + Semantic toggle.
-                self.settings_theme_views().len() + 6
+                self.settings_appearance_theme_count()
+                    + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS
             }
-            SettingsTab::Terminal => 3, // Scrollback + Padding X + Padding Y.
+            SettingsTab::Terminal => 4, // Scrollback + padding + minimum contrast.
             SettingsTab::Input => 1,    // Submit on Ctrl+Enter.
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
             SettingsTab::Window => 3,   // Width + Height + Sidebar Width.
             SettingsTab::Advanced => 4, // Debug Logging + Experimental + Import + Export (v1.5.2).
         }
+    }
+
+    fn settings_appearance_theme_count(&self) -> usize {
+        crate::settings_component::visible_appearance_theme_count(
+            self.settings_theme_views().len(),
+            self.settings_max_visible_rows(),
+        )
     }
 
     /// F5: Apply the currently-selected row in the active category to the
@@ -648,7 +668,7 @@ impl App {
         use crate::overlay::SettingsTab;
         match self.settings.tab {
             SettingsTab::Appearance => {
-                let theme_count = self.settings_theme_views().len();
+                let theme_count = self.settings_appearance_theme_count();
                 if self.settings.selection < theme_count {
                     if let Some(view) = self
                         .settings_theme_views()
@@ -791,22 +811,5 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{settings_enter_action, SettingsEnterAction};
-
-    #[test]
-    fn enter_drills_only_from_narrow_sidebar() {
-        assert_eq!(
-            settings_enter_action(true, false),
-            SettingsEnterAction::DrillDown
-        );
-        assert_eq!(
-            settings_enter_action(true, true),
-            SettingsEnterAction::Apply
-        );
-        assert_eq!(
-            settings_enter_action(false, false),
-            SettingsEnterAction::Apply
-        );
-    }
-}
+#[path = "settings_controller_tests.rs"]
+mod tests;

@@ -33,6 +33,8 @@ impl App {
                 }
                 self.tab_bar.hovered_tab = None;
                 self.interaction.block_hovered = None;
+                self.interaction.block_selected = None;
+                self.interaction.block_action_hovered = None;
                 self.scroll_active_tab_into_view();
                 self.request_redraw();
             }

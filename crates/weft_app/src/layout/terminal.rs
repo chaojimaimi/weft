@@ -2,11 +2,36 @@
 
 use super::{LayoutCtx, Rect};
 
+/// Horizontal breathing room for terminal-owned chrome. This stays relative
+/// to the active font so BlockView and the editor keep the same rhythm at
+/// every font size without depending on a user's window-padding preference.
+fn terminal_content_gutter(ctx: &LayoutCtx) -> f32 {
+    ctx.cell_w * 1.5
+}
+
+fn inset_left(ctx: &LayoutCtx) -> f32 {
+    let available_gutter = (ctx.right() - ctx.left() - ctx.cell_w).max(0.0);
+    ctx.left() + terminal_content_gutter(ctx).min(available_gutter)
+}
+
+pub fn prompt_content_cols(ctx: &LayoutCtx) -> usize {
+    let left = inset_left(ctx);
+    (((ctx.right() - left) / ctx.cell_w).max(1.0)) as usize
+}
+
+pub fn block_content_x_bounds(ctx: &LayoutCtx) -> (f32, f32) {
+    let frame_left = ctx.left();
+    let frame_right = ctx.right();
+    let available_gutter = ((frame_right - frame_left - ctx.cell_w).max(0.0) * 0.5).max(0.0);
+    let gutter = terminal_content_gutter(ctx).min(available_gutter);
+    (frame_left + gutter, frame_right - gutter)
+}
+
 // ── Prompt (editor input box) ─────────────────────────────────────────
 //
 // The input box sits at the bottom of the viewport. Its height grows with
 // the number of editor lines (1 pad row + N text rows + 1 pad row). The
-// prompt glyph "❯ " occupies 2 columns on line 0 only — subsequent lines
+// prompt marker "> " occupies 2 columns on line 0 only — subsequent lines
 // start at `left`. The caret X depends on the cumulative display width of
 // the chars before the cursor (CJK chars are 2 cols wide), so the renderer
 // computes `cursor_offset_cols` and passes it in.
@@ -19,11 +44,11 @@ pub struct PromptLayout {
     pub box_rect: Rect,
     /// Y of the first text row (one pad row below `box_y0`).
     pub text_y0: f32,
-    /// X of the box's left edge (also where line 1+ starts).
+    /// X of the inset text edge (also where line 1+ starts).
     pub left: f32,
     /// Box width in character columns.
     pub box_cols: usize,
-    /// X where line 0's text starts (after "❯ ", = `left + 2*cw`).
+    /// X where line 0's text starts (after "> ", = `left + 2*cw`).
     pub first_line_text_x: f32,
     /// Caret X (top-left of the bar).
     pub cursor_x: f32,
@@ -78,10 +103,10 @@ pub fn layout_prompt(
     let box_x1 = ctx.right();
 
     let text_y0 = box_y0 + ch;
-    let left = box_x0;
-    let box_cols = (((box_x1 - left) / cw).max(1.0)) as usize;
+    let left = inset_left(ctx);
+    let box_cols = prompt_content_cols(ctx);
 
-    let prompt_chars = 2usize; // "❯ "
+    let prompt_chars = 2usize; // "> "
     let first_line_text_x = left + prompt_chars as f32 * cw;
 
     // F2 P0-1: cursor Y accounts for the scroll offset so the caret lands
@@ -168,6 +193,10 @@ pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
 /// (renderer.rs:2126).
 #[derive(Clone, Copy, Debug)]
 pub struct BlockViewLayout {
+    /// Outer left edge used by block surfaces, rails, and separators.
+    pub frame_left: f32,
+    /// Outer right edge used by block surfaces, rails, and separators.
+    pub frame_right: f32,
     /// Row pitch in physical pixels (= ch), shared with the live Grid view.
     pub pitch: f32,
     /// Left edge of the content area (= padding_x).
@@ -202,11 +231,12 @@ pub fn layout_block_view(
     // opened. Sharing the exact row pitch keeps the same transcript from
     // changing density and apparent glyph weight during that transition.
     let pitch = ch;
-    let left = ctx.left();
+    let frame_left = ctx.left();
     // v1.3 multi-pane: honor the pane's clip rect / pane_origin via ctx.right()
     // instead of the full-viewport \`vp_w - padding_x\` (which would extend across
     // background panes). ctx.right() clamps to clip.x1 and adds pane_origin.0.
-    let right = ctx.right();
+    let frame_right = ctx.right();
+    let (left, right) = block_content_x_bounds(ctx);
     let cols = (((right - left) / cw).max(1.0)) as usize;
 
     // v0.9 H1: clip_top must include chrome_top (tab bar height) so the
@@ -227,6 +257,8 @@ pub fn layout_block_view(
 
     BlockViewLayout {
         pitch,
+        frame_left,
+        frame_right,
         left,
         right,
         cols,

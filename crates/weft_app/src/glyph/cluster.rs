@@ -61,11 +61,15 @@ use font_kit::loaders::core_text::Font;
 pub(super) fn rasterize_cluster_alpha(
     font: &Font,
     cluster: &str,
+    scaled_size: f32,
     glyph_w: u32,
     cell_h: u32,
     primary_descent_px: f32,
 ) -> Option<Vec<u8>> {
-    let ct_font: CTFont = font.native_font();
+    // CoreText draws at the CTFont's embedded size. Clone the font at the
+    // atlas pixel size so ZWJ/flag/variation clusters scale with zoom just
+    // like single-scalar glyphs.
+    let ct_font: CTFont = font.native_font().clone_with_font_size(scaled_size as f64);
 
     // Build CFAttributedString{ cluster_str, [NSFont: ct_font] }. The
     // `core_foundation::attributed_string::CFAttributedString::new` wrapper
@@ -165,13 +169,28 @@ mod tests {
         m.descent.abs() * (scaled_size / m.units_per_em as f32)
     }
 
+    fn ink_y_bounds(pixels: &[u8], width: u32, height: u32) -> Option<(u32, u32)> {
+        let mut top = height;
+        let mut bottom = 0;
+        let mut any = false;
+        for y in 0..height {
+            let row = &pixels[(y * width) as usize..((y + 1) * width) as usize];
+            if row.iter().any(|pixel| *pixel > 0) {
+                any = true;
+                top = top.min(y);
+                bottom = bottom.max(y);
+            }
+        }
+        any.then_some((top, bottom))
+    }
+
     /// Sanity: a single ASCII char "e" shaped via CTLine must produce ink.
     /// This validates the CTLine path itself before we test multi-scalar
     /// clusters.
     #[test]
     fn ctline_shapes_single_ascii_with_ink() {
         let font = menlo();
-        let px = rasterize_cluster_alpha(&font, "e", 14, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, "e", 28.0, 14, 28, descent_px(&font, 28.0));
         let px = px.expect("e must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 20, "e via CTLine must have ink, got {ink}");
@@ -184,7 +203,7 @@ mod tests {
     fn combining_mark_cluster_has_ink() {
         let font = menlo();
         let cluster = "e\u{0301}";
-        let px = rasterize_cluster_alpha(&font, cluster, 14, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 14, 28, descent_px(&font, 28.0));
         let px = px.expect("e+combining acute must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 20, "e+combining acute must have ink, got {ink}");
@@ -197,8 +216,8 @@ mod tests {
     fn combining_mark_adds_ink_on_top_of_base() {
         let font = menlo();
         let d = descent_px(&font, 28.0);
-        let base = rasterize_cluster_alpha(&font, "e", 14, 28, d).unwrap();
-        let combined = rasterize_cluster_alpha(&font, "e\u{0301}", 14, 28, d).unwrap();
+        let base = rasterize_cluster_alpha(&font, "e", 28.0, 14, 28, d).unwrap();
+        let combined = rasterize_cluster_alpha(&font, "e\u{0301}", 28.0, 14, 28, d).unwrap();
         let base_ink = base.iter().filter(|p| **p > 0).count();
         let combined_ink = combined.iter().filter(|p| **p > 0).count();
         // The combined cluster must have at least as much ink, and typically
@@ -220,10 +239,25 @@ mod tests {
         let font = emoji_font();
         let cluster = "👩\u{200d}🔬";
         // Emoji is double-width; slot is 2 * cell_w.
-        let px = rasterize_cluster_alpha(&font, cluster, 28, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 28, 28, descent_px(&font, 28.0));
         let px = px.expect("ZWJ woman+microscope must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "ZWJ emoji sequence must have ink, got {ink}");
+    }
+
+    #[test]
+    fn zwj_emoji_cluster_tracks_zoom_without_vertical_clipping() {
+        let font = emoji_font();
+        let cluster = "👩\u{200d}🔬";
+        let small = rasterize_cluster_alpha(&font, cluster, 16.0, 24, 24, descent_px(&font, 16.0))
+            .expect("small ZWJ cluster");
+        let large = rasterize_cluster_alpha(&font, cluster, 28.0, 40, 40, descent_px(&font, 28.0))
+            .expect("large ZWJ cluster");
+        let (small_top, small_bottom) = ink_y_bounds(&small, 24, 24).unwrap();
+        let (large_top, large_bottom) = ink_y_bounds(&large, 40, 40).unwrap();
+        assert!(large_bottom - large_top > small_bottom - small_top);
+        assert!(large_top > 0, "large cluster is clipped at the top");
+        assert!(large_bottom < 39, "large cluster is clipped at the bottom");
     }
 
     /// Regional indicator pair 🇨🇳 (RI C + RI N) must rasterize. Each RI is
@@ -233,7 +267,7 @@ mod tests {
     fn regional_indicator_pair_has_ink() {
         let font = emoji_font();
         let cluster = "🇨🇳";
-        let px = rasterize_cluster_alpha(&font, cluster, 28, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 28, 28, descent_px(&font, 28.0));
         let px = px.expect("flag CN must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "flag pair must have ink, got {ink}");
@@ -245,7 +279,7 @@ mod tests {
     fn skin_tone_modifier_cluster_has_ink() {
         let font = emoji_font();
         let cluster = "👩🏽";
-        let px = rasterize_cluster_alpha(&font, cluster, 28, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 28, 28, descent_px(&font, 28.0));
         let px = px.expect("woman+skin tone must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 50, "skin tone cluster must have ink, got {ink}");
@@ -258,7 +292,7 @@ mod tests {
     fn variation_selector_cluster_has_ink() {
         let font = menlo();
         let cluster = "*\u{FE0F}";
-        let px = rasterize_cluster_alpha(&font, cluster, 28, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 28, 28, descent_px(&font, 28.0));
         let px = px.expect("*+VS16 must rasterize via CTLine");
         let ink = px.iter().filter(|p| **p > 0).count();
         assert!(ink > 10, "VS16 cluster must have ink, got {ink}");
@@ -268,7 +302,7 @@ mod tests {
     #[test]
     fn empty_cluster_returns_none() {
         let font = menlo();
-        let px = rasterize_cluster_alpha(&font, "", 14, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, "", 28.0, 14, 28, descent_px(&font, 28.0));
         assert!(px.is_none(), "empty cluster must not produce ink");
     }
 
@@ -280,7 +314,7 @@ mod tests {
         let cluster = "👩\u{200d}🔬";
         // Intentionally narrow slot; CTLine will draw but pixels outside the
         // slot width are clipped by the CGContext bounds.
-        let px = rasterize_cluster_alpha(&font, cluster, 14, 28, descent_px(&font, 28.0));
+        let px = rasterize_cluster_alpha(&font, cluster, 28.0, 14, 28, descent_px(&font, 28.0));
         // We don't assert ink here — clipping may remove everything — but
         // the call must not panic.
         let _ = px;

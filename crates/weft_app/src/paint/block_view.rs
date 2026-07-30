@@ -1,35 +1,25 @@
 // arch-gate: allow-over-800
-// BlockView vertex builder: layout/cache/selection algorithms for the
-// block view. Already extracted from renderer.rs; remaining size is the
-// interdependent build_block_view_vertices + wrap + selection geometry.
-//! BlockView vertex builder extracted from renderer.rs (A5).
-//!
-//! Layout/cache/selection algorithms; immutable frame inputs in
-//! BlockViewPaintModel, SelectionHandler explicitly mutable.
-
 use crate::block_component::{spinner_char_for_phase, BlockTone};
 use crate::paint::block_view::actions::{
     block_header_band_height, block_header_text_cols, push_block_header_actions,
     BlockHeaderActionPaint,
 };
 use crate::paint::block_view_model::BlockViewPaintModel;
-use crate::paint::primitives::{color_to_normalized, push_quad, snap_physical_rect};
+use crate::paint::primitives::{
+    color_to_normalized, composite_color_over, push_quad, scale_color_alpha, snap_physical_rect,
+};
 use crate::paint::ui_helpers::{abbreviate_path, strip_prompt_prefix};
 use crate::renderer::MetalRenderer;
 
 mod actions;
+mod find;
 mod layout_pass;
 mod rows;
 mod style;
-use style::BlockOutputTextPaint;
+mod surfaces;
 
-// R2-3: re-export so accessibility.rs can compute the sticky block id without
-// duplicating the geometric invariant (command row scrolled above clip_top).
-pub(crate) use rows::sticky_block_id;
-// Batch 5 Step 3: re-export so accessibility.rs can compute copy/fold button
-// bounds for Button-level semantic nodes on the sticky header.
 pub(crate) use actions::block_header_action_rects;
-
+pub(crate) use rows::sticky_block_id;
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
         &self,
@@ -49,6 +39,8 @@ impl MetalRenderer {
             block_scroll,
             viewport_rows,
             block_hovered,
+            block_selected,
+            block_action_hovered,
             spinner_phase,
             find_block_highlight,
             palette,
@@ -65,16 +57,15 @@ impl MetalRenderer {
             return (verts, hit_regions, bv_rows);
         }
 
-        let theme_bg = color_to_normalized(self.theme.background);
+        let theme_bg = scale_color_alpha(color_to_normalized(self.theme.background), self.opacity);
         let fg = color_to_normalized(self.theme.foreground);
+        let output_fg = color_to_normalized(self.theme.output.output_default);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
             fg[1] * 0.70 + theme_bg[1] * 0.30,
             fg[2] * 0.70 + theme_bg[2] * 0.30,
             1.0,
         ];
-        // v1.7.0-B: dedicated CWD color (was `dim`/`accent_dim` — now a
-        // distinct output semantic role so CWD ≠ output_default).
         let cwd_c = color_to_normalized(self.theme.output.cwd);
         let separator = color_to_normalized(self.theme.separator);
         let (su, sv, suw, svh) = self.space_uv();
@@ -87,14 +78,18 @@ impl MetalRenderer {
         let header_height = block_header_band_height(pitch, self.scale);
         let left = layout.left;
         let right = layout.right;
+        let (frame_left, frame_right) = (layout.frame_left, layout.frame_right);
         let cols = layout.cols;
         let content_bottom_y = layout.clip_bottom;
 
         push_quad(
             &mut verts,
-            // v1.3 multi-pane: confine bg to pane's [left..right] ×
-            // [clip_top..region_bottom_y] rect so it doesn't cover bg panes.
-            [left, layout.clip_top, right, region_bottom_y.max(0.0)],
+            [
+                frame_left,
+                layout.clip_top,
+                frame_right,
+                region_bottom_y.max(0.0),
+            ],
             bg_uv,
             [0.0; 4],
             theme_bg,
@@ -103,15 +98,10 @@ impl MetalRenderer {
         if cwd_header_active {
             let cwd = cwd.expect("active fixed CWD has text");
             let fixed_y = layout.fixed_cwd_y;
-            // v1.4.0: snap both edges of the separator to integer physical
-            // pixels. The visible thickness stays ≈2px (design token), but
-            // the far edge no longer lands on a sub-pixel boundary at 1×
-            // scale. Previously `[left, fixed_y, right, fixed_y + 2.0]` with
-            // `fixed_y` derived from a fractional layout pitch.
             let (sep_y0, sep_y1) = snap_physical_rect(fixed_y, fixed_y + 2.0);
             push_quad(
                 &mut verts,
-                [left, sep_y0, right, sep_y1],
+                [frame_left, sep_y0, frame_right, sep_y1],
                 bg_uv,
                 [0.0; 4],
                 separator,
@@ -129,25 +119,12 @@ impl MetalRenderer {
 
         use layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput, LayoutPassOutput};
 
-        // Shared layout pass: single source of truth for row geometry.
-        // Both this function (paint) and compute_block_view_rows (hit-testing)
-        // call this, then walk the output to emit vertices or extract bv_rows.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
-            for b in blocks.iter() {
-                cache.ensure_cached(b, cols);
-            }
-            // R2-2 (Batch 7): build prefix sum so compute_block_layout_pass
-            // can binary-search the visible block range (O(log n)) instead
-            // of iterating all blocks (O(n)). No-op when nothing changed.
-            cache.build_prefix_sum(blocks);
+            cache.sync_blocks(blocks, cols);
         }
-        // Batch 6 Step 1: reset styled lookup counter before the pass.
         self.styled_lookup_counter.set(0);
-        // Batch 7 Step 4: reset styled paint timer before the pass.
         self.styled_paint_us_counter.set(0);
-        // v1.4.1: palette fingerprint + render generation — embedded in every
-        // StyledLineCacheKey so cached vertices invalidate on OSC 4/104 or bump.
         let palette_fp = self.block_palette_fingerprint(palette);
         let render_generation = self.styled_cache_generation();
         let layout_out = {
@@ -177,10 +154,9 @@ impl MetalRenderer {
             row_data,
             expanded_block_count,
         } = layout_out;
-        // Batch 6 Step 1: stash for frame_trace visible_block_count.
         self.last_expanded_block_count.set(expanded_block_count);
 
-        let scroll_px = (block_scroll as f32) * pitch;
+        let scroll_px = block_scroll * pitch;
         let clip_top = layout.clip_top;
         let clip_bottom = content_bottom_y;
 
@@ -299,13 +275,17 @@ impl MetalRenderer {
             sel.sync_rows(bv_rows.clone());
         }
         let sel_bv = selection.block_view_selection.as_ref();
-        // F3-5: find match highlight color from the semantic token (was
-        // hardcoded [0.95, 0.78, 0.20, 0.50]).
         let find_hl_bg = {
             let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
                 .with_increase_contrast(self.increase_contrast);
             let fm = color_to_normalized(ui.find_match);
             [fm[0], fm[1], fm[2], 0.50]
+        };
+        let find_canvas = find::FindHighlightCanvas {
+            cell_width: cw,
+            cell_height: ch,
+            background_uv: bg_uv,
+            color: find_hl_bg,
         };
         let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
             let s = sel_bv?;
@@ -349,6 +329,20 @@ impl MetalRenderer {
             snap_idx >= bottom && snap_idx <= top
         };
 
+        let block_canvases = surfaces::push_block_surfaces(
+            self,
+            &mut verts,
+            &rows,
+            &row_data,
+            &layout,
+            surfaces::BlockSurfaceState {
+                scroll_px,
+                header_height,
+                hovered: block_hovered,
+                selected: block_selected,
+            },
+        );
+
         for (i, &dist) in rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
             let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
@@ -372,8 +366,11 @@ impl MetalRenderer {
                     line,
                     style,
                 } => {
+                    let canvas = surfaces::canvas_for(&block_canvases, *block_id, theme_bg);
+                    let selection_canvas = composite_color_over(selection_bg, canvas);
                     if chunks.len() <= 1 {
-                        if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                        let selection_range = sel_range_for_y(y + pitch * 0.5);
+                        if let Some((cs, ce)) = selection_range {
                             self.push_block_view_highlight(
                                 &mut verts,
                                 left,
@@ -389,32 +386,33 @@ impl MetalRenderer {
                         if let Some(bh) = find_block_highlight {
                             if bh.0 == block_id.map(|b| b.0).unwrap_or(0) && bh.1 == *line && !bh.2
                             {
-                                let hx0 = left + bh.3 as f32 * cw;
-                                let hx1 = hx0 + bh.4 as f32 * cw;
-                                let hl_bg = find_hl_bg;
-                                push_quad(
+                                find::push_find_highlight(
                                     &mut verts,
-                                    [hx0, y, hx1, y + ch],
-                                    bg_uv,
-                                    [0.0; 4],
-                                    hl_bg,
+                                    find_canvas,
+                                    text,
+                                    (bh.3, bh.4),
+                                    cols,
+                                    0,
+                                    [left, y],
                                 );
                             }
                         }
                         let t0 = std::time::Instant::now();
                         let (source, styled) = style::block_arc_identity(blocks, *block_id);
-                        // v1.4.1: resume hints (`line == usize::MAX`) bypass cache —
-                        // multiple hints from one block share block_id + Arc identity.
                         let source = (*line != usize::MAX).then_some(source).flatten();
                         self.push_block_output_text_cached(
                             &mut verts,
-                            BlockOutputTextPaint {
+                            style::BlockOutputTextPaint {
                                 x: left,
                                 y,
                                 text,
+                                semantic_text: text,
                                 style: *style,
                                 char_offset: 0,
-                                fallback: fg,
+                                fallback: output_fg,
+                                canvas,
+                                selection: selection_range
+                                    .map(|(start, end)| (start, end, selection_canvas)),
                                 max_cols: cols,
                                 palette,
                                 row_pitch: pitch,
@@ -439,7 +437,8 @@ impl MetalRenderer {
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             if cy + ch > clip_top && cy < clip_bottom {
-                                if let Some((cs, ce)) = sel_range_for_y(cy + pitch * 0.5) {
+                                let selection_range = sel_range_for_y(cy + pitch * 0.5);
+                                if let Some((cs, ce)) = selection_range {
                                     self.push_block_view_highlight(
                                         &mut verts,
                                         left,
@@ -452,36 +451,42 @@ impl MetalRenderer {
                                         bg_uv,
                                     );
                                 }
-                                if ci == 0 {
-                                    if let Some(bh) = find_block_highlight {
-                                        if bh.0 == block_id.map(|b| b.0).unwrap_or(0)
-                                            && bh.1 == *line
-                                            && !bh.2
-                                        {
-                                            let hx0 = left + bh.3 as f32 * cw;
-                                            let hx1 = hx0 + bh.4 as f32 * cw;
-                                            let hl_bg = find_hl_bg;
-                                            push_quad(
-                                                &mut verts,
-                                                [hx0, cy, hx1, cy + ch],
-                                                bg_uv,
-                                                [0.0; 4],
-                                                hl_bg,
-                                            );
-                                        }
+                                if let Some(bh) = find_block_highlight {
+                                    if bh.0 == block_id.map(|b| b.0).unwrap_or(0)
+                                        && bh.1 == *line
+                                        && !bh.2
+                                    {
+                                        find::push_find_highlight(
+                                            &mut verts,
+                                            find_canvas,
+                                            text,
+                                            (bh.3, bh.4),
+                                            cols,
+                                            ci,
+                                            [left, cy],
+                                        );
                                     }
                                 }
                                 let t0 = std::time::Instant::now();
                                 let (source, styled) = style::block_arc_identity(blocks, *block_id);
                                 self.push_block_output_text_cached(
                                     &mut verts,
-                                    BlockOutputTextPaint {
+                                    style::BlockOutputTextPaint {
                                         x: left,
                                         y: cy,
                                         text: chunk,
+                                        semantic_text: text,
                                         style: *style,
                                         char_offset,
-                                        fallback: fg,
+                                        fallback: output_fg,
+                                        canvas,
+                                        selection: selection_range.map(|(start, end)| {
+                                            (
+                                                char_offset + start,
+                                                char_offset + end,
+                                                selection_canvas,
+                                            )
+                                        }),
                                         max_cols: cols,
                                         palette,
                                         row_pitch: pitch,
@@ -513,6 +518,8 @@ impl MetalRenderer {
                     foldable,
                     block_id,
                 } => {
+                    let canvas = block_canvases.get(block_id).copied().unwrap_or(theme_bg);
+                    let selection_canvas = composite_color_over(selection_bg, canvas);
                     let (chev_w, avail_sub) = if *foldable {
                         let chev = if *collapsed { "▸" } else { "▾" };
                         self.push_text(&mut verts, left, y, chev, prompt_c, cols);
@@ -520,10 +527,11 @@ impl MetalRenderer {
                     } else {
                         (0.0, 2)
                     };
-                    self.push_text(&mut verts, left + chev_w, y, "❯ ", prompt_c, cols);
+                    self.push_text(&mut verts, left + chev_w, y, "> ", prompt_c, cols);
                     let cmd_x = left + chev_w + 2.0 * cw;
                     let avail = cols.saturating_sub(avail_sub).max(1);
-                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                    let selection_range = sel_range_for_y(y + pitch * 0.5);
+                    if let Some((cs, ce)) = selection_range {
                         self.push_block_view_highlight(
                             &mut verts,
                             cmd_x,
@@ -538,14 +546,26 @@ impl MetalRenderer {
                     }
                     if let Some(bh) = find_block_highlight {
                         if bh.0 == block_id.0 && bh.2 {
-                            let hx0 = cmd_x + bh.3 as f32 * cw;
-                            let hx1 = hx0 + bh.4 as f32 * cw;
-                            let hl_bg = find_hl_bg;
-                            push_quad(&mut verts, [hx0, y, hx1, y + ch], bg_uv, [0.0; 4], hl_bg);
+                            find::push_find_highlight(
+                                &mut verts,
+                                find_canvas,
+                                command,
+                                (bh.3, bh.4),
+                                usize::MAX,
+                                0,
+                                [cmd_x, y],
+                            );
                         }
                     }
                     let cleaned_cmd = strip_prompt_prefix(command);
-                    self.push_line_tokenized(&mut verts, cmd_x, y, &cleaned_cmd, avail);
+                    self.push_line_tokenized_on_canvas(
+                        &mut verts,
+                        [cmd_x, y],
+                        &cleaned_cmd,
+                        avail,
+                        canvas,
+                        selection_range.map(|(start, end)| (start, end, selection_canvas)),
+                    );
                     if *foldable {
                         hit_regions.push(crate::overlay::HitRegion {
                             x0: left,
@@ -578,9 +598,6 @@ impl MetalRenderer {
                         BlockTone::Warning => color_to_normalized(ui.warning),
                     };
                     let text_y = y + (header_height - pitch) * 0.5;
-                    // v1.7.3-C: If the block is bookmarked, draw a ★ glyph
-                    // at the left edge and shift the header text right by
-                    // 2 cells (1 for the star + 1 gap) so it doesn't overlap.
                     let bookmarked = self.bookmarked_blocks.contains(block_id);
                     let (text_x, text_cols) = if bookmarked {
                         let star_color = color_to_normalized(self.theme.accent);
@@ -606,6 +623,7 @@ impl MetalRenderer {
                         BlockHeaderActionPaint {
                             block_id: *block_id,
                             block_hovered,
+                            action_hovered: block_action_hovered,
                             y,
                             pitch,
                             right,
@@ -637,27 +655,23 @@ impl MetalRenderer {
                             selection_bg,
                         );
                     }
-                    // v1.4.0: snap both edges of the 1.5px separator so it
-                    // lands on integer physical pixels. `ly` derives from
-                    // `y + pitch * 0.5` and is typically fractional; the far
-                    // edge `ly + 1.5` would otherwise smear across two pixels
-                    // on 1× Retina. The snapped width is 1 or 2px — invisible
-                    // difference, but both edges become crisp.
                     let ly = y + pitch * 0.5;
                     let (sep_y0, sep_y1) = snap_physical_rect(ly, ly + 1.5);
                     push_quad(
                         &mut verts,
-                        [left, sep_y0, right, sep_y1],
+                        [frame_left, sep_y0, frame_right, sep_y1],
                         bg_uv,
                         [0.0; 4],
                         separator,
                     );
                 }
                 LaidRow::LiveCommand { command } => {
-                    self.push_text(&mut verts, left, y, "❯ ", prompt_c, cols);
+                    let selection_canvas = composite_color_over(selection_bg, theme_bg);
+                    self.push_text(&mut verts, left, y, "> ", prompt_c, cols);
                     let cmd_x = left + 2.0 * cw;
                     let avail = cols.saturating_sub(2).max(1);
-                    if let Some((cs, ce)) = sel_range_for_y(y + pitch * 0.5) {
+                    let selection_range = sel_range_for_y(y + pitch * 0.5);
+                    if let Some((cs, ce)) = selection_range {
                         self.push_block_view_highlight(
                             &mut verts,
                             cmd_x,
@@ -670,12 +684,15 @@ impl MetalRenderer {
                             bg_uv,
                         );
                     }
-                    self.push_line_tokenized(&mut verts, cmd_x, y, command, avail);
+                    self.push_line_tokenized_on_canvas(
+                        &mut verts,
+                        [cmd_x, y],
+                        command,
+                        avail,
+                        theme_bg,
+                        selection_range.map(|(start, end)| (start, end, selection_canvas)),
+                    );
 
-                    // F3-2: Running-command activity indicator (braille spinner
-                    // or static ● under Reduce Motion). Rendered at the right
-                    // edge of the LiveCommand row so it doesn't overlap the
-                    // command text.
                     if spinner_phase >= 0.0 {
                         let spinner_char =
                             spinner_char_for_phase(spinner_phase, self.reduce_motion);
@@ -716,23 +733,16 @@ impl MetalRenderer {
             ];
             push_quad(
                 &mut verts,
-                // v1.3 multi-pane: confine sticky header bg to [left..right].
-                [left, sticky_y, right, sticky_bottom],
+                [frame_left, sticky_y, frame_right, sticky_bottom],
                 bg_uv,
                 [0.0; 4],
                 sticky_bg,
             );
             push_quad(
                 &mut verts,
-                // v1.3 multi-pane: confine sticky separator to [left..right].
-                // v1.4.0: snap both edges to integer physical pixels. The
-                // 1.0px separator was previously drawn at fractional `sticky_bottom`
-                // (derived from `clip_top + header_rows * pitch`); the far
-                // edge `sticky_bottom + 1.0` could land on a sub-pixel and
-                // smear on 1× Retina.
                 {
                     let (y0, y1) = snap_physical_rect(sticky_bottom, sticky_bottom + 1.0);
-                    [left, y0, right, y1]
+                    [frame_left, y0, frame_right, y1]
                 },
                 bg_uv,
                 [0.0; 4],
@@ -744,16 +754,18 @@ impl MetalRenderer {
                 self.push_text(&mut verts, left, sticky_y, &block_cwd, cwd_c, cols);
                 sticky_y + pitch
             };
-            self.push_text(&mut verts, left, command_y, "❯ ", prompt_c, cols);
+            self.push_text(&mut verts, left, command_y, "> ", prompt_c, cols);
             let cmd_x = left + 2.0 * cw;
             let avail = cols.saturating_sub(2).max(1);
-            self.push_line_tokenized(&mut verts, cmd_x, command_y, cmd, avail);
+            self.push_line_tokenized_on_canvas(
+                &mut verts,
+                [cmd_x, command_y],
+                cmd,
+                avail,
+                sticky_bg,
+                None,
+            );
 
-            // R2-3 Phase 1: sticky header is no longer a dead paint band —
-            // register copy/fold buttons + hit regions by reusing the same
-            // path as the in-flow header. The geometry is naturally
-            // disjoint: sticky buttons sit at y = clip_top, in-flow buttons
-            // sit at y < clip_top (the in-flow header has scrolled off).
             push_block_header_actions(
                 self,
                 &mut verts,
@@ -762,6 +774,7 @@ impl MetalRenderer {
                 BlockHeaderActionPaint {
                     block_id: block.id,
                     block_hovered,
+                    action_hovered: block_action_hovered,
                     y: sticky_y,
                     pitch,
                     right,
@@ -832,7 +845,6 @@ impl MetalRenderer {
                 }
             }
         }
-
         (verts, hit_regions, bv_rows)
     }
 }

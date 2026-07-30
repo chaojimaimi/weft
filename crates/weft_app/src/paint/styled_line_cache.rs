@@ -18,7 +18,7 @@ pub(crate) const MAX_CACHE_ENTRIES: usize = 512;
 
 /// Identity key for a single styled line chunk. Two keys match only when
 /// every field is identical — pane, block, line position, wrap chunk,
-/// geometry, render generation, palette, and fallback color all agree.
+/// geometry, render generation, palette, fallback color, and canvas agree.
 ///
 /// `pane_session_id` uses `Pane::pane_session_id` (global, monotonic) so
 /// entries from a closed pane are naturally evicted by namespace mismatch
@@ -35,6 +35,8 @@ pub(crate) struct StyledLineCacheKey {
     pub(crate) palette_fingerprint: u64,
     /// `f32::to_bits()` for each of the 4 fallback color channels.
     pub(crate) fallback_fg: [u32; 4],
+    /// Final block surface used by paint-time contrast adjustment.
+    pub(crate) canvas: [u32; 4],
 }
 
 /// A cached vertex slice plus the Arc identities it was built from. The Arcs
@@ -322,6 +324,7 @@ mod tests {
             render_generation: 1,
             palette_fingerprint: 0,
             fallback_fg: [0; 4],
+            canvas: [0; 4],
         }
     }
 
@@ -430,6 +433,17 @@ mod tests {
         cache.insert(k, Arc::clone(&s), None, vec![1.0; 12]);
         k.fallback_fg[0] = 1;
         assert!(cache.lookup(&k, &s, None).is_none());
+    }
+
+    #[test]
+    fn canvas_change_is_miss() {
+        let mut cache = StyledLineCache::new();
+        let source: Arc<str> = Arc::from("line");
+        let k = key(1, 1, 0, 0);
+        cache.insert(k, source.clone(), None, vec![1.0]);
+        let mut changed = k;
+        changed.canvas[0] = 1;
+        assert!(cache.lookup(&changed, &source, None).is_none());
     }
 
     #[test]

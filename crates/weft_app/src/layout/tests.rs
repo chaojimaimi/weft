@@ -572,12 +572,12 @@ fn context_menu_opens_downward_with_space() {
 // ── Prompt layout (stage 4 — U2) ────────────────────────────────────
 
 /// Single-line input: box hugs the bottom of the viewport, the prompt
-/// glyph sits at `left`, and the caret sits right after "❯ " when the
+/// glyph sits at `left`, and the caret sits right after "> " when the
 /// cursor is at col 0 line 0.
 #[test]
 fn prompt_single_line_caret_after_prompt_glyph() {
     let ctx = sample_ctx(); // vp 1600×1200, cw 7.2, ch 16.8, pad 16
-                            // 1 line, cursor at (0, 0) — caret right after "❯ ".
+                            // 1 line, cursor at (0, 0) — caret right after "> ".
     let layout = layout_prompt(&ctx, 1, 0, 0, 0);
 
     // box_h = ch * (1 + 2) = 50.4; box_y1 = 1200 - 16 = 1184;
@@ -588,14 +588,12 @@ fn prompt_single_line_caret_after_prompt_glyph() {
     assert_eq!(layout.box_rect[2], 1600.0 - 16.0);
     // text_y0 = box_y0 + ch = 1133.6 + 16.8 = 1150.4
     assert!((layout.text_y0 - 1150.4).abs() < 1e-3);
-    // left = padding_x = 16
-    assert_eq!(layout.left, 16.0);
-    // box_cols = (1584 - 16) / 7.2 = 1568 / 7.2 = 217.77... → 217
-    assert_eq!(layout.box_cols, 217);
-    // first_line_text_x = left + 2*cw = 16 + 14.4 = 30.4
-    assert!((layout.first_line_text_x - 30.4).abs() < 1e-3);
+    // Text begins after a 1.5-cell gutter inside the outer box.
+    assert!((layout.left - 26.8).abs() < 1e-3);
+    assert_eq!(layout.box_cols, 216);
+    assert!((layout.first_line_text_x - 41.2).abs() < 1e-3);
     // cursor at (0, 0) → cursor_offset_cols = 0; cx = first_line_text_x
-    assert!((layout.cursor_x - 30.4).abs() < 1e-3);
+    assert!((layout.cursor_x - 41.2).abs() < 1e-3);
     // cursor_y = text_y0 + 0*ch = 1150.4
     assert!((layout.cursor_y - 1150.4).abs() < 1e-3);
     // bar_w = max(7.2 * 0.12, 2.0) = max(0.864, 2.0) = 2.0
@@ -618,8 +616,8 @@ fn prompt_multi_line_cursor_on_last_line() {
     // cursor_y = text_y0 + 4*ch = 1083.2 + 67.2 = 1150.4
     assert!((layout.cursor_y - 1150.4).abs() < 1e-3);
     // cursor_line != 0 → text_start_x = left; cursor_offset_cols = 0
-    // → cx = left = 16
-    assert!((layout.cursor_x - 16.0).abs() < 1e-3);
+    // → cx = inset left = 26.8
+    assert!((layout.cursor_x - 26.8).abs() < 1e-3);
 }
 
 /// CJK input: cursor after "Weft项目" (5 chars, but 项目 = 4 cols) must
@@ -632,8 +630,8 @@ fn prompt_cjk_input_uses_display_col_width() {
     // "Weft项目" = 4 ASCII (4 cols) + 2 CJK (4 cols) = 8 display cols.
     let cursor_offset_cols = 8;
     let layout = layout_prompt(&ctx, 1, 0, cursor_offset_cols, 0);
-    // cx = first_line_text_x + 8 * cw = 30.4 + 57.6 = 88.0
-    assert!((layout.cursor_x - 88.0).abs() < 1e-3);
+    // cx = first_line_text_x + 8 * cw = 41.2 + 57.6 = 98.8
+    assert!((layout.cursor_x - 98.8).abs() < 1e-3);
 }
 
 /// M1: `box_rect` must be invariant to cursor position — the prompt
@@ -709,13 +707,13 @@ fn prompt_respects_clip_rect() {
     );
 
     // Width in columns is derived from the pane width, not full viewport.
-    let expected_cols = ((1600.0_f32 - 16.0 - 808.0) / 7.2).floor() as usize;
+    let expected_cols = ((1600.0_f32 - 16.0 - (808.0 + 1.5 * 7.2)) / 7.2).floor() as usize;
     assert_eq!(layout.box_cols, expected_cols);
 
     // Prompt glyph and caret are positioned relative to the pane left edge.
-    assert!((layout.left - 808.0).abs() < 1e-3);
-    assert!((layout.first_line_text_x - (808.0 + 2.0 * 7.2)).abs() < 1e-3);
-    assert!((layout.cursor_x - (808.0 + 2.0 * 7.2)).abs() < 1e-3);
+    assert!((layout.left - (808.0 + 1.5 * 7.2)).abs() < 1e-3);
+    assert!((layout.first_line_text_x - (808.0 + 3.5 * 7.2)).abs() < 1e-3);
+    assert!((layout.cursor_x - (808.0 + 3.5 * 7.2)).abs() < 1e-3);
 }
 
 #[test]
@@ -755,11 +753,12 @@ fn block_view_editor_mode_reserves_cwd_band() {
     let layout = layout_block_view(&ctx, region_bottom_y, true);
 
     assert!((layout.pitch - 16.8).abs() < 1e-3);
-    // left = padding_x = 16; right = vp_w - 16 = 1584
-    assert_eq!(layout.left, 16.0);
-    assert_eq!(layout.right, 1584.0);
-    // cols = (1584 - 16) / 7.2 = 217
-    assert_eq!(layout.cols, 217);
+    // Block surfaces keep the frame bounds while content has 1.5-cell gutters.
+    assert_eq!(layout.frame_left, 16.0);
+    assert_eq!(layout.frame_right, 1584.0);
+    assert!((layout.left - 26.8).abs() < 1e-3);
+    assert!((layout.right - 1573.2).abs() < 1e-3);
+    assert_eq!(layout.cols, 214);
     // clip_top = padding_y = 16
     assert_eq!(layout.clip_top, 16.0);
     // content_bottom_y = 1100 - 2*16.8 = 1066.4
@@ -790,9 +789,9 @@ fn block_view_respects_pane_origin_and_clip() {
 
     // left = padding_x + chrome_left + pane_origin.0 = 16 + 0 + (808-16-0) = 808.
     assert!(
-        (layout.left - 808.0).abs() < 1e-3,
+        (layout.frame_left - 808.0).abs() < 1e-3,
         "left must be pane-local: got {}",
-        layout.left
+        layout.frame_left
     );
     // right = ctx.right() = clip.x1 - padding_x = 1600 - 16 = 1584 (clip clamps
     // the inner edge; pane_origin is added on top by ctx.left, not ctx.right).
@@ -800,12 +799,12 @@ fn block_view_respects_pane_origin_and_clip() {
     // happened to end at the viewport right edge. The test pins the contract:
     // right comes from ctx.right() (clip-aware), not vp_w.
     assert!(
-        (layout.right - 1584.0).abs() < 1e-3,
+        (layout.frame_right - 1584.0).abs() < 1e-3,
         "right must be clip-aware: got {}",
-        layout.right
+        layout.frame_right
     );
     // cols derived from the pane-local [left..right], not the full viewport.
-    let expected_cols = (((1584.0_f32 - 808.0) / 7.2).max(1.0)) as usize;
+    let expected_cols = (((1584.0_f32 - 808.0 - 3.0 * 7.2) / 7.2).max(1.0)) as usize;
     assert_eq!(
         layout.cols, expected_cols,
         "cols must derive from pane width"
@@ -850,6 +849,21 @@ fn block_view_sticky_y_anchors_to_clip_top() {
     let layout = layout_block_view(&ctx, 1100.0, true);
     // The renderer's sticky header draws at y = layout.clip_top (= pad_y).
     assert_eq!(layout.clip_top, 16.0);
+}
+
+#[test]
+fn terminal_content_gutters_clamp_inside_an_extremely_narrow_pane() {
+    let ctx = LayoutCtx::new((18.0, 200.0), 10.0, 20.0, 4.0, 4.0);
+    let prompt = layout_prompt(&ctx, 1, 0, 0, 0);
+    let block = layout_block_view(&ctx, 120.0, false);
+
+    assert!(prompt.left >= prompt.box_rect[0]);
+    assert!(prompt.left <= prompt.box_rect[2]);
+    assert!(block.left >= block.frame_left);
+    assert!(block.right <= block.frame_right);
+    assert!(block.right >= block.left);
+    assert_eq!(prompt.box_cols, 1);
+    assert_eq!(block.cols, 1);
 }
 
 #[test]

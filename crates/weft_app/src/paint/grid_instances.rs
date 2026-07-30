@@ -22,6 +22,9 @@ use crate::paint::primitives::{push_cell_instance, resolve_cell_color};
 use weft_core::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use weft_core::selection::SelectionHandler;
 
+#[cfg(test)]
+mod contrast_tests;
+
 // ── Data structures ───────────────────────────────────────────────────
 
 /// Background-stream instance: one per run of same-bg cells.
@@ -229,6 +232,7 @@ pub(crate) fn build_row_instances(
     show_cursor: bool,
     selection: &SelectionHandler,
     opacity: f32,
+    minimum_contrast: f32,
     cw: f32,
     ch: f32,
     origin_x: f32,
@@ -295,7 +299,7 @@ pub(crate) fn build_row_instances(
                 cursor_color
             }
         } else {
-            fg
+            crate::paint::primitives::ensure_minimum_text_contrast(fg, final_bg, minimum_contrast)
         };
 
         // ── Cell render width ──────────────────────────────────────
@@ -425,8 +429,8 @@ mod tests {
     ) -> GridRowInstances {
         let palette = Color::standard_palette();
         build_row_instances(
-            grid, &palette, 0, FG, BG, CURSOR, SELECTION, cursor, style, show, sel, opacity, CW,
-            CH, 0.0, 0.0,
+            grid, &palette, 0, FG, BG, CURSOR, SELECTION, cursor, style, show, sel, opacity, 1.0,
+            CW, CH, 0.0, 0.0,
         )
     }
 

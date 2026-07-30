@@ -17,6 +17,7 @@ use weft_core::complete::Match;
 use weft_core::vt::Terminal;
 
 use crate::paint::panel::PanelDrawParams;
+use crate::paint::preedit::TuiPreeditDrawParams;
 use crate::paint::prompt::PromptDrawParams;
 
 // ── Z-order ───────────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ pub enum OverlayInputPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayKind {
     HistoryPanel,
+    TuiPreedit,
     Prompt,
     Completion,
     CommandPalette,
@@ -73,6 +75,7 @@ pub enum OverlayKind {
 /// flows into the renderer — only how it's packaged.
 pub enum OverlayContent<'a> {
     HistoryPanel(PanelDrawParams<'a>),
+    TuiPreedit(TuiPreeditDrawParams<'a>),
     Prompt(PromptDrawParams<'a>),
     Completion(CompletionDrawParams<'a>),
     CommandPalette(PaletteDrawParams<'a>),
@@ -188,6 +191,8 @@ pub struct SettingsDrawParams<'a> {
     pub window_padding_y: u32,
     /// Scrollback buffer size (lines).
     pub scrollback_lines: usize,
+    /// Paint-time minimum contrast for terminal command/output text.
+    pub minimum_contrast: f32,
     /// F5: Window width (px) — Window category.
     pub window_width: u32,
     /// F5: Window height (px) — Window category.
@@ -300,6 +305,13 @@ impl<'a> OverlayStack<'a> {
             .filter(|l| l.input_policy == OverlayInputPolicy::Modal)
             .max_by_key(|l| l.z)
     }
+
+    pub(crate) fn tui_preedit(&self) -> Option<TuiPreeditDrawParams<'a>> {
+        self.layers.iter().find_map(|layer| match &layer.content {
+            OverlayContent::TuiPreedit(params) => Some(*params),
+            _ => None,
+        })
+    }
 }
 
 // ── Warm-up trait ─────────────────────────────────────────────────────
@@ -317,6 +329,9 @@ impl OverlayWarmup for OverlayContent<'_> {
             OverlayContent::HistoryPanel(p) => {
                 missing.extend("Search:".chars());
                 missing.extend(p.query.chars());
+            }
+            OverlayContent::TuiPreedit(p) => {
+                missing.extend(p.text.chars());
             }
             OverlayContent::Prompt(p) => {
                 missing.extend("❯ ".chars());
@@ -452,6 +467,7 @@ pub fn build_overlay_stack<'a>(
     panel_scroll_offset: usize,
     ime_preedit: &'a str,
     ime_preedit_cursor: Option<(usize, usize)>,
+    terminal_owns_ime: bool,
     palette_open: bool,
     palette_query: &'a str,
     palette_selection: usize,
@@ -474,6 +490,7 @@ pub fn build_overlay_stack<'a>(
     settings_window_padding_x: u32,
     settings_window_padding_y: u32,
     settings_scrollback_lines: usize,
+    settings_minimum_contrast: f32,
     settings_window_width: u32,
     settings_window_height: u32,
     settings_sidebar_width: Option<f32>,
@@ -504,6 +521,26 @@ pub fn build_overlay_stack<'a>(
                 expanded_id: panel_expanded,
                 search_focused: panel_search_focused,
                 scroll_offset: panel_scroll_offset,
+            }),
+        });
+    }
+
+    // Passthrough programs own the terminal grid, but macOS still sends
+    // marked text to Weft until the IME commits it. Paint that marked text at
+    // the TUI cursor so applications such as OpenCode, vim and less get the
+    // same inline composition feedback as the native editor.
+    if should_show_tui_preedit(
+        terminal.effective_input_mode(),
+        ime_preedit,
+        terminal_owns_ime,
+    ) {
+        layers.push(OverlayLayer {
+            kind: OverlayKind::TuiPreedit,
+            z: OverlayZ::Prompt,
+            input_policy: OverlayInputPolicy::Passive,
+            content: OverlayContent::TuiPreedit(TuiPreeditDrawParams {
+                text: ime_preedit,
+                cursor: ime_preedit_cursor,
             }),
         });
     }
@@ -624,6 +661,7 @@ pub fn build_overlay_stack<'a>(
                 window_padding_x: settings_window_padding_x,
                 window_padding_y: settings_window_padding_y,
                 scrollback_lines: settings_scrollback_lines,
+                minimum_contrast: settings_minimum_contrast,
                 window_width: settings_window_width,
                 window_height: settings_window_height,
                 sidebar_width: settings_sidebar_width,
@@ -642,6 +680,14 @@ pub fn build_overlay_stack<'a>(
     }
 
     OverlayStack { layers }
+}
+
+fn should_show_tui_preedit(
+    mode: weft_core::input::InputMode,
+    text: &str,
+    terminal_owns_ime: bool,
+) -> bool {
+    terminal_owns_ime && mode == weft_core::input::InputMode::Passthrough && !text.is_empty()
 }
 
 #[cfg(test)]

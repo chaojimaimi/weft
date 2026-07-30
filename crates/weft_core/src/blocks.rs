@@ -26,6 +26,7 @@ use std::time::SystemTime;
 
 pub mod annotations;
 mod continuation;
+mod cursor_capture;
 pub mod export;
 mod output_capture;
 

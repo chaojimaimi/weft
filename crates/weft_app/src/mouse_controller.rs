@@ -302,6 +302,17 @@ impl App {
             self.interaction.block_hovered = new_block_hovered;
             self.request_redraw();
         }
+        let new_action_hovered = self.renderer.as_ref().and_then(|renderer| {
+            crate::block_component::block_header_action_at(
+                &renderer.hit_regions,
+                x as f32,
+                y as f32,
+            )
+        });
+        if new_action_hovered != self.interaction.block_action_hovered {
+            self.interaction.block_action_hovered = new_action_hovered;
+            self.request_redraw();
+        }
 
         // v0.9: extend editor drag-selection inside the prompt box.
         if self.interaction.prompt_dragging {
@@ -527,6 +538,11 @@ impl App {
             }
         }
         // Terminal borrow dropped — annotation/export actions run here.
+        if action == "toggle_fold" {
+            if let (Some(renderer), Some(id)) = (&self.renderer, block_id) {
+                renderer.block_layout_cache.borrow_mut().invalidate(id.0);
+            }
+        }
         if matches!(action, "toggle_bookmark" | "add_note" | "export_block") {
             self.run_annotation_action_with_export(block_id, action, export_block_data);
         }
@@ -534,146 +550,6 @@ impl App {
             info!(len = text.len(), "context action copied to clipboard");
         }
         self.drain_effects(effect::context_clipboard_effects(clipboard_text));
-    }
-
-    /// v1.7.3-C: Handle annotation-only actions (toggle_bookmark / add_note)
-    /// when the terminal is not available. These only need `block_id` and
-    /// the annotation store.
-    fn run_annotation_action(&mut self, block_id: Option<BlockId>, action: &str) {
-        self.run_annotation_action_with_export(block_id, action, None);
-    }
-
-    /// v1.7.3-C: Unified annotation + export action handler. Called after
-    /// the terminal borrow drops so `self.sessions.annotation_store()` is
-    /// accessible. `export_block_data` is the cloned block for export_block.
-    fn run_annotation_action_with_export(
-        &mut self,
-        block_id: Option<BlockId>,
-        action: &str,
-        export_block_data: Option<weft_core::blocks::Block>,
-    ) {
-        match action {
-            "toggle_bookmark" => {
-                let Some(bid) = block_id else { return };
-                let Some(store) = self.sessions.annotation_store() else {
-                    warn!("annotation store unavailable; bookmark not toggled");
-                    return;
-                };
-                match store.toggle_bookmark(bid) {
-                    Ok(bookmarked) => {
-                        info!(block_id = ?bid, bookmarked, "bookmark toggled");
-                        self.sync_bookmark_to_search_index(bid);
-                        self.request_redraw();
-                    }
-                    Err(e) => warn!(error = %e, "failed to toggle bookmark"),
-                }
-            }
-            "add_note" => {
-                let Some(bid) = block_id else { return };
-                let existing = self
-                    .sessions
-                    .annotation_store()
-                    .and_then(|store| store.get(bid).ok().flatten())
-                    .and_then(|a| a.note);
-                self.note_editor.open_for(bid, existing.as_deref());
-                self.request_redraw();
-            }
-            "export_block" => {
-                let Some(block) = export_block_data else {
-                    return;
-                };
-                let annotation = self
-                    .sessions
-                    .annotation_store()
-                    .and_then(|store| store.get(block.id).ok().flatten());
-                let markdown = weft_core::blocks::export::export_block_as_markdown(
-                    &block,
-                    annotation.as_ref(),
-                );
-                self.write_block_export(&block.command, &markdown);
-            }
-            _ => {}
-        }
-    }
-
-    /// v1.7.3-D: Sync a bookmark annotation to the search index. After a
-    /// bookmark toggle or note save, this upserts (or deletes) the
-    /// `SearchDocumentKind::Bookmark` entry so the annotation is findable
-    /// via Palette search. Safe to call when the search index or block store
-    /// is unavailable (logs a warning and returns).
-    pub(crate) fn sync_bookmark_to_search_index(&self, block_id: weft_core::blocks::BlockId) {
-        let Some(index) = &self.search_index else {
-            return;
-        };
-        // Look up the annotation; if it was auto-deleted (no bookmark, no
-        // note, no tags), remove the search doc.
-        let annotation = self
-            .sessions
-            .annotation_store()
-            .and_then(|store| store.get(block_id).ok().flatten());
-        let Some(annotation) = annotation else {
-            // Annotation deleted → remove from search index.
-            if let Err(e) = index.delete(
-                weft_core::search::SearchDocumentKind::Bookmark,
-                &block_id.0.to_string(),
-            ) {
-                warn!(error = %e, "failed to delete bookmark from search index");
-            }
-            return;
-        };
-        // Look up the block to get command + cwd for the search doc.
-        let block = self
-            .sessions
-            .block_store()
-            .and_then(|store| store.get(block_id).ok().flatten());
-        let (command, cwd) = match block {
-            Some(b) => (b.command.clone(), b.cwd.clone()),
-            None => {
-                // Block not persisted yet (e.g. still running). Use a
-                // placeholder so the bookmark is still searchable by note/tags.
-                (String::new(), None)
-            }
-        };
-        let updated_ms = annotation
-            .updated_at
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let doc = weft_core::search::SearchDocument::from_bookmark(
-            block_id.0,
-            annotation.note.as_deref(),
-            &command,
-            &annotation.tags,
-            cwd.as_deref(),
-            updated_ms,
-        );
-        if let Err(e) = index.upsert(&doc) {
-            warn!(error = %e, "failed to upsert bookmark into search index");
-        }
-    }
-
-    /// v1.7.3-C: Write the exported markdown to a file chosen via NSSavePanel.
-    fn write_block_export(&self, command: &str, markdown: &str) {
-        let Some(mtm) = objc2_foundation::MainThreadMarker::new() else {
-            warn!("not on main thread; export cancelled");
-            return;
-        };
-        match crate::macos_file_dialog::pick_block_export_path(mtm, command) {
-            Ok(Some(path)) => {
-                if let Err(e) = std::fs::write(&path, markdown.as_bytes()) {
-                    warn!(error = %e, path = ?path, "failed to write export file");
-                } else {
-                    info!(path = ?path, bytes = markdown.len(), "block exported");
-                }
-            }
-            Ok(None) => {
-                // User cancelled the save panel.
-                tracing::debug!("export cancelled by user");
-            }
-            Err(e) => {
-                warn!(error = %e, "save panel error");
-            }
-        }
     }
 
     /// Handle scroll wheel.
@@ -779,6 +655,30 @@ impl App {
             .renderer
             .as_ref()
             .map_or(40.0, |renderer| renderer.cell_height() as f64);
+        let block_view = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .is_some_and(Terminal::show_block_view);
+        if block_view {
+            if let winit::event::MouseScrollDelta::PixelDelta(pos) = delta {
+                if phase == winit::event::TouchPhase::Cancelled {
+                    return;
+                }
+                let max_scroll = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|renderer| renderer.cached_scroll_metrics.get())
+                    .map(|(_, _, max)| max)
+                    .unwrap_or(0);
+                self.sessions
+                    .active_mut()
+                    .scroll_block_fractional((pos.y / cell_height.max(1.0)) as f32, max_scroll);
+                self.request_redraw();
+                return;
+            }
+        }
         let rows = crate::scroll_input::terminal_scroll_rows(
             delta,
             phase,
@@ -940,44 +840,19 @@ impl App {
             .terminal
             .as_ref()
             .is_some_and(Terminal::show_block_view);
-
         if block_view {
-            let scroll_lines = lines.min(1);
-            let (total, prompt_lines) = {
-                let Some(t) = self.sessions.active().terminal.as_ref() else {
-                    return;
-                };
-                let cols = t.grid().num_cols;
-                let header_rows = self.renderer.as_ref().map_or(1, |r| r.block_header_rows());
-                let cache = self
-                    .renderer
-                    .as_ref()
-                    .map(|r| r.block_layout_cache.borrow());
-                let (total, _) =
-                    block_content_metrics_with_cache(t, cols, header_rows, cache.as_deref());
-                (total, crate::block_component::block_prompt_lines(t))
-            };
-            let visible = self
+            let max_scroll = self
                 .renderer
                 .as_ref()
-                .map(|r| {
-                    let terminal = self.sessions.active().terminal.as_ref();
-                    let cwd_header = terminal.is_some_and(|t| {
-                        crate::layout::block_cwd_header_active(
-                            t.effective_input_mode() == weft_core::input::InputMode::Editor,
-                            t.cwd().is_some(),
-                        )
-                    });
-                    r.block_visible_rows(prompt_lines, cwd_header)
-                })
-                .unwrap_or(1);
-            let max_scroll = total.saturating_sub(visible);
+                .and_then(|renderer| renderer.cached_scroll_metrics.get())
+                .map(|(_, _, max)| max)
+                .unwrap_or(0);
             if up {
                 let tab = self.sessions.active_mut();
-                tab.scroll_up_by(scroll_lines);
+                tab.scroll_up_by(lines);
                 tab.clamp_block_scroll(max_scroll);
             } else {
-                self.sessions.active_mut().scroll_down_by(scroll_lines);
+                self.sessions.active_mut().scroll_down_by(lines);
             }
         } else {
             // Grid view scroll — needs mutable terminal.

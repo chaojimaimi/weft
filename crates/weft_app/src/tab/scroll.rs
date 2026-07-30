@@ -43,6 +43,10 @@ impl Tab {
         self.block_scroll_anchor.offset_value()
     }
 
+    pub(crate) fn block_scroll_position(&self) -> f32 {
+        self.block_scroll_anchor.offset_value() as f32 + self.block_scroll_fraction
+    }
+
     pub(crate) fn block_scroll_anchor(&self) -> BlockScrollAnchor {
         self.block_scroll_anchor
     }
@@ -71,11 +75,25 @@ impl Tab {
 
     pub fn set_block_scroll(&mut self, offset: usize) {
         self.block_scroll_anchor = BlockScrollAnchor::from_offset(offset);
+        self.block_scroll_fraction = 0.0;
+        self.sync_primary_history_view();
+    }
+
+    pub(crate) fn scroll_block_fractional(&mut self, delta_rows: f32, max_scroll: usize) {
+        let position = (self.block_scroll_position() + delta_rows).clamp(0.0, max_scroll as f32);
+        let whole = position.floor() as usize;
+        self.block_scroll_fraction = position - whole as f32;
+        self.block_scroll_anchor = if position <= f32::EPSILON {
+            BlockScrollAnchor::FollowBottom
+        } else {
+            BlockScrollAnchor::FixedDocumentRow(whole)
+        };
         self.sync_primary_history_view();
     }
 
     pub fn snap_to_bottom(&mut self) {
         self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
+        self.block_scroll_fraction = 0.0;
         let changed = self.terminal.as_mut().is_some_and(|terminal| {
             let changed = terminal.primary_history_view();
             terminal.set_primary_history_view(false);
@@ -104,7 +122,7 @@ impl Tab {
         // `block_scroll_anchor` and `terminal` are both on the active pane;
         // reading the offset first releases the immutable pane borrow before
         // `&mut pane.terminal` is taken.
-        let anchor_offset = self.block_scroll_anchor.offset_value();
+        let detached = !matches!(self.block_scroll_anchor, BlockScrollAnchor::FollowBottom);
         let pane = self.active_mut();
         let changed = if let Some(terminal) = &mut pane.terminal {
             // Reaching the history tail is still a history position. Keep the
@@ -113,7 +131,7 @@ impl Tab {
             // to jump. Explicit input / ScrollToBottom calls `snap_to_bottom`
             // and is the sole boundary that leaves history browsing.
             let browsing = terminal.primary_screen_app_active()
-                && (anchor_offset > 0 || terminal.primary_history_view());
+                && (detached || terminal.primary_history_view());
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
             changed
@@ -183,6 +201,22 @@ mod tests {
         tab.scroll_up_by(4);
         tab.scroll_down_by(4);
         assert_eq!(tab.block_scroll_anchor(), BlockScrollAnchor::FollowBottom);
+    }
+
+    #[test]
+    fn fractional_scroll_preserves_sub_row_motion_and_anchor_state() {
+        let mut tab = Tab::empty();
+        tab.scroll_block_fractional(0.25, 10);
+        assert_eq!(tab.block_scroll(), 0);
+        assert!((tab.block_scroll_position() - 0.25).abs() < f32::EPSILON);
+        assert!(matches!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FixedDocumentRow(0)
+        ));
+
+        tab.scroll_block_fractional(-0.25, 10);
+        assert_eq!(tab.block_scroll_anchor(), BlockScrollAnchor::FollowBottom);
+        assert_eq!(tab.block_scroll_position(), 0.0);
     }
 
     /// R2-1 bug scenario: even when `should_follow_running_output` would

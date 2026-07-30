@@ -21,6 +21,11 @@ use crate::overlay::SettingsProfileView;
 use crate::paint::primitives::push_quad;
 use crate::renderer::MetalRenderer;
 
+fn toolbar_rule_rect(x0: f32, x1: f32, bottom: f32) -> Rect {
+    let y1 = bottom.round();
+    [x0, y1 - 1.0, x1, y1]
+}
+
 impl MetalRenderer {
     /// v1.5.1: Draw the profile selector toolbar at the top of the Settings
     /// content area. The toolbar is a single row of clickable entries
@@ -68,7 +73,7 @@ impl MetalRenderer {
         // Bottom separator line.
         push_quad(
             verts,
-            [tx0, ty1 - 1.0, tx1, ty1],
+            toolbar_rule_rect(tx0, tx1, ty1),
             bg_uv,
             [0.0; 4],
             separator,
@@ -88,10 +93,9 @@ impl MetalRenderer {
 
             // Active entry: accent underline at the bottom of the slot.
             if profile.is_active {
-                let underline_h = (3.0 * self.scale as f32).max(1.0);
                 push_quad(
                     verts,
-                    [slot_x0, ty1 - underline_h, slot_x1, ty1],
+                    toolbar_rule_rect(slot_x0, slot_x1, ty1),
                     bg_uv,
                     [0.0; 4],
                     accent,
@@ -130,5 +134,16 @@ impl MetalRenderer {
             let text_x = btn_cx - cw * 0.5;
             self.push_text(verts, text_x, ty0, "\u{2212}", fg, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toolbar_rule_is_one_aligned_physical_pixel() {
+        let rect = toolbar_rule_rect(10.25, 90.75, 42.6);
+        assert_eq!(rect, [10.25, 42.0, 90.75, 43.0]);
     }
 }

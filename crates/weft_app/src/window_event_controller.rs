@@ -10,27 +10,7 @@ impl App {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                info!("Window closed");
-                let blocks = self.finish_all_pending_blocks();
-                // v1.0 H4: persist tab state so the session restores on
-                // next launch. Goes through drain_effects so all persist
-                // paths share the Effect::PersistTabs entry point.
-                let mut effects = Vec::new();
-                if !blocks.is_empty() {
-                    effects.push(crate::effect::Effect::PersistBlocks { blocks });
-                }
-                effects.push(crate::effect::Effect::PersistTabs);
-                self.drain_effects(effects);
-                // v1.6.3: Write a final recovery snapshot (clean) and mark
-                // clean shutdown so the next launch doesn't show a recovery
-                // prompt.
-                if let Some(ws) = self.capture_workspace("recovery".into()) {
-                    if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
-                        warn!(error = %e, "final recovery snapshot write failed");
-                    }
-                }
-                self.recovery.mark_clean_shutdown();
-                event_loop.exit();
+                self.request_application_close(event_loop);
             }
             WindowEvent::Resized(physical_size) => {
                 // Grid/PTY tracks the renderer's visible terminal content

@@ -180,6 +180,9 @@ impl App {
                         if let Some(b) = block {
                             if b.collapsed {
                                 term.block_tracker_mut().toggle_collapse(b.id);
+                                if let Some(renderer) = &self.renderer {
+                                    renderer.block_layout_cache.borrow_mut().invalidate(b.id.0);
+                                }
                             }
                         }
                     }
@@ -478,18 +481,18 @@ mod tests {
         };
         assert_eq!(
             block_find_scroll_target(&blocks, &hit, 1, 80, 24, 6, 100),
-            Some(4)
+            Some(5)
         );
         assert_eq!(
             block_find_scroll_target(&blocks, &hit, 2, 80, 24, 6, 100),
-            Some(5)
+            Some(6)
         );
 
         let mut blocks_with_clear = blocks;
         blocks_with_clear[1].command = "clear".into();
         assert_eq!(
             block_find_scroll_target(&blocks_with_clear, &hit, 1, 80, 24, 6, 100),
-            Some(28)
+            Some(29)
         );
     }
 
@@ -510,7 +513,7 @@ mod tests {
         hit.is_command = true;
         assert_eq!(
             block_find_scroll_target(&blocks, &hit, 2, 80, 24, 3, 100),
-            Some(2)
+            Some(3)
         );
     }
 
