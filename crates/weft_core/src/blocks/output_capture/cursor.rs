@@ -47,3 +47,72 @@ impl OutputCapture {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blocks::MAX_OUTPUT_BYTES;
+
+    /// `set_cursor_column` past the end of the line pads with spaces so a
+    /// subsequent print lands at the requested column.
+    #[test]
+    fn set_cursor_column_pads_to_column_with_spaces() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.set_cursor_column(6, MAX_OUTPUT_BYTES);
+        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "abc   X");
+    }
+
+    /// A wide CJK char (display width 2) whose second column is the target:
+    /// the cursor lands at the char start, then a space is emitted so the
+    /// wide char is pushed right and overwritten by the next print.
+    #[test]
+    fn set_cursor_column_into_wide_char_emits_space_and_overwrites() {
+        let mut output = OutputCapture::default();
+        output.print('你', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.set_cursor_column(1, MAX_OUTPUT_BYTES);
+        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), " X");
+    }
+
+    /// `backspace` only rewinds within the current line; it stops at the
+    /// line start rather than crossing into the previous line.
+    #[test]
+    fn backspace_stops_at_line_start() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"def", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        // Three backspaces reach line start (column 0 of "def"); a fourth
+        // is a no-op.
+        for _ in 0..4 {
+            output.backspace();
+        }
+        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "abc\nXef");
+    }
+
+    /// `backspace` retreats across all bytes of a multibyte char, not just
+    /// one byte, so a subsequent print overwrites the whole char.
+    #[test]
+    fn backspace_across_multibyte_char() {
+        let mut output = OutputCapture::default();
+        output.print('你', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print('好', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.backspace();
+        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "你X");
+    }
+
+    /// `move_cursor_columns` with a negative delta larger than the current
+    /// column saturates to column 0 rather than underflowing.
+    #[test]
+    fn move_cursor_columns_negative_saturates_to_zero() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.move_cursor_columns(-100, MAX_OUTPUT_BYTES);
+        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        assert_eq!(output.as_str(), "Xbc");
+    }
+}

@@ -1,5 +1,7 @@
 use crate::{App, BlockId};
 use tracing::{info, warn};
+use weft_core::blocks::annotations::BlockAnnotation;
+use weft_core::blocks::Block;
 
 impl App {
     pub(super) fn run_annotation_action(&mut self, block_id: Option<BlockId>, action: &str) {
@@ -36,9 +38,7 @@ impl App {
             "add_note" => {
                 let Some(block_id) = block_id else { return };
                 let existing = self
-                    .sessions
-                    .annotation_store()
-                    .and_then(|store| store.get(block_id).ok().flatten())
+                    .get_annotation(block_id)
                     .and_then(|annotation| annotation.note);
                 self.note_editor.open_for(block_id, existing.as_deref());
                 self.request_redraw();
@@ -47,10 +47,7 @@ impl App {
                 let Some(block) = export_block_data else {
                     return;
                 };
-                let annotation = self
-                    .sessions
-                    .annotation_store()
-                    .and_then(|store| store.get(block.id).ok().flatten());
+                let annotation = self.get_annotation(block.id);
                 let markdown = weft_core::blocks::export::export_block_as_markdown(
                     &block,
                     annotation.as_ref(),
@@ -65,10 +62,7 @@ impl App {
         let Some(index) = &self.search_index else {
             return;
         };
-        let annotation = self
-            .sessions
-            .annotation_store()
-            .and_then(|store| store.get(block_id).ok().flatten());
+        let annotation = self.get_annotation(block_id);
         let Some(annotation) = annotation else {
             if let Err(error) = index.delete(
                 weft_core::search::SearchDocumentKind::Bookmark,
@@ -78,10 +72,7 @@ impl App {
             }
             return;
         };
-        let block = self
-            .sessions
-            .block_store()
-            .and_then(|store| store.get(block_id).ok().flatten());
+        let block = self.get_block(block_id);
         let (command, cwd) = block
             .map(|block| (block.command.clone(), block.cwd.clone()))
             .unwrap_or_default();
@@ -100,6 +91,34 @@ impl App {
         );
         if let Err(error) = index.upsert(&document) {
             warn!(%error, "failed to upsert bookmark into search index");
+        }
+    }
+
+    /// Fetch a block annotation, logging I/O errors instead of silently
+    /// swallowing them. Returns `None` when the store is unavailable, the
+    /// block has no annotation, or the read failed (after logging).
+    fn get_annotation(&self, block_id: BlockId) -> Option<BlockAnnotation> {
+        let store = self.sessions.annotation_store()?;
+        match store.get(block_id) {
+            Ok(opt) => opt,
+            Err(error) => {
+                warn!(%error, ?block_id, "failed to read annotation");
+                None
+            }
+        }
+    }
+
+    /// Fetch a block, logging I/O errors instead of silently swallowing
+    /// them. Returns `None` when the store is unavailable, the block does
+    /// not exist, or the read failed (after logging).
+    fn get_block(&self, block_id: BlockId) -> Option<Block> {
+        let store = self.sessions.block_store()?;
+        match store.get(block_id) {
+            Ok(opt) => opt,
+            Err(error) => {
+                warn!(%error, ?block_id, "failed to read block");
+                None
+            }
         }
     }
 
