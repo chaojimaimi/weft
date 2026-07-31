@@ -160,19 +160,18 @@ pub(super) fn set_usize_if_diff(
     table.insert(key, toml_edit::value(i64::try_from(new).unwrap_or(0)));
 }
 
-/// v1.6 AI integration: write the `[ai]` section to a `toml_edit` document.
+/// v1.8 AI integration: write the `[ai]` section to a `toml_edit` document.
 ///
 /// Only persists non-default values — an entirely-default `[ai]` section is
-/// removed so the file stays clean when AI is unconfigured. The plaintext
-/// `api_key` is written only when set (Settings UI prefers Keychain, but
-/// we keep the toml path for tests / quick local setups).
+/// removed so the file stays clean when AI is unconfigured. v1.8 removes the
+/// `api_key` field entirely (no cloud providers); if an old config has a
+/// stale `api_key` line, it's removed on next save.
 ///
 /// Kept in `save.rs` (rather than `mod.rs`) so the parent file's line count
 /// stays within its architecture-gate budget.
 pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiConfig) {
     let default_ai = super::AiConfig::default();
     let ai_dirty = ai.provider != default_ai.provider
-        || ai.api_key != default_ai.api_key
         || ai.base_url != default_ai.base_url
         || ai.model != default_ai.model
         || ai.max_tokens != default_ai.max_tokens
@@ -186,7 +185,10 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
         }
         let table = ai_entry.as_table_mut().expect("ai is a table");
         set_opt_string(table, "provider", &ai.provider);
-        set_opt_string(table, "api_key", &ai.api_key);
+        // v1.8: api_key is never written. Remove any stale value from old configs.
+        if table.contains_key("api_key") {
+            table.remove("api_key");
+        }
         set_opt_string(table, "base_url", &ai.base_url);
         set_opt_string(table, "model", &ai.model);
         if let Some(mt) = ai.max_tokens {
@@ -212,7 +214,7 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
         }
     } else if let Some(ai_entry) = doc.get_mut("ai") {
         // Whole section is at defaults — drop it so reload doesn't keep
-        // stale overrides (e.g. a previous api_key).
+        // stale overrides.
         if ai_entry.as_table().is_some_and(|t| t.iter().count() == 0) {
             doc.remove("ai");
         } else {

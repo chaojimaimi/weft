@@ -176,6 +176,7 @@ impl ApplicationHandler<AppEvent> for App {
                 self.process_messages();
                 self.poll_completion_results();
                 self.poll_runbook_results();
+                self.poll_ai_results();
                 schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
                 if self.sessions.tabs().iter().any(|tab| {
                     tab.terminal

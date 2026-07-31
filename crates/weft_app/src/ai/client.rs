@@ -1,90 +1,132 @@
-//! v1.3 AI integration — HTTP client abstraction + provider implementations.
+//! v1.8 AI integration — Ollama-only HTTP client.
 //!
-//! The trait [`AiBackend`] is the single surface the rest of the app talks
-//! to. It is `async` and takes a `&self`, so implementations must be
-//! cheaply cloneable (we wrap a `reqwest::Client` in an `Arc`).
+//! v1.3 carried scaffolding for OpenAI / Anthropic / custom OpenAI-compatible
+//! backends. v1.8 collapses that to a single, local-only Ollama client per
+//! `docs/V18_IMPLEMENTATION_PLAN.md` §1: no API keys, no public endpoints,
+//! no cloud providers. The `AiBackend` trait is now `async` and accepts a
+//! `CancellationToken`-style flag so callers can abort an in-flight stream
+//! when the user closes the palette or switches blocks.
 //!
-//! Three providers are supported out of the box:
+//! Endpoints (both POST to `{base_url}/api/...`):
 //!
-//! | Provider   | Endpoint                          | Auth           |
-//! |------------|-----------------------------------|----------------|
-//! | `ollama`   | `http://localhost:11434/api/chat` | none           |
-//! | `openai`   | `https://api.openai.com/v1/chat/completions` | Bearer key |
-//! | `anthropic`| `https://api.anthropic.com/v1/messages`       | `x-api-key`  |
+//! | Endpoint     | Purpose              | Schema                                  |
+//! |--------------|----------------------|-----------------------------------------|
+//! | `/api/tags`  | list installed models| `{"models": [{"name","size","modified_at"}, ...]}` |
+//! | `/api/chat`  | streaming chat       | NDJSON, one `{"message":{"content":Δ}}` per line, final `{"done":true}` |
 //!
-//! Plus a `custom` provider that points at a user-supplied base URL and
-//! speaks the OpenAI chat-completions schema (corporate proxies, LiteLLM,
-//! etc.). All HTTP calls go through `reqwest` with `rustls-tls` so we don't
-//! link OpenSSL into the macOS .app bundle.
-//!
-//! Errors are flattened into [`AiError`] so callers don't need to match on
-//! reqwest / serde / std::io individually.
+//! All HTTP goes through `reqwest` with `rustls-tls` so the macOS .app bundle
+//! doesn't link OpenSSL. `base_url` is validated to be loopback at config
+//! load time (`AiConfig::base_url`); this module additionally asserts it on
+//! every call as defence in depth.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client as HttpClient;
 
-use super::prompt::{ChatMessage, ChatRole};
+use super::prompt::ChatMessage;
+
+/// Hard ceiling on the response body size we'll accumulate from a single
+/// `/api/chat` stream. 64 KiB is generous for shell commands + short
+/// explanations and prevents a runaway model from filling memory.
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Hard ceiling on a single NDJSON line. Ollama chunks are small, but a
+/// malformed/malicious server could emit huge lines.
+const MAX_LINE_BYTES: usize = 16 * 1024;
 
 /// Errors returned by [`AiBackend::complete`]. Flattened for ergonomic
-/// `match` at call sites — the variant carries enough context to produce a
-/// user-facing message without re-parsing.
+/// `match` at call sites.
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
-    /// The configured provider id is unknown to Weft. Caller should suggest
-    /// fixing the `[ai] provider = "..."` line in config.toml.
-    #[error("unknown AI provider: {0}")]
+    /// The configured provider id is unknown. v1.8 only accepts `"ollama"`.
+    #[error("unknown AI provider: {0} (v1.8 supports only 'ollama')")]
     UnknownProvider(String),
     /// The HTTP request failed at the transport level (DNS, TLS, connect,
-    /// read timeout, …). The underlying `reqwest::Error` is preserved so the
-    /// caller can distinguish `is_connect()` / `is_timeout()` if desired.
+    /// read timeout, …).
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
-    /// The provider returned a non-2xx response. The body is included when
-    /// available because most providers put a useful error message in it
-    /// (e.g. `{"error": {"message": "invalid_api_key"}}`).
+    /// The provider returned a non-2xx response.
     #[error("provider returned status {status}: {body}")]
     Status { status: u16, body: String },
     /// The response body couldn't be parsed as the expected JSON shape.
-    /// Usually means the provider changed their API or returned an HTML
-    /// error page.
     #[error("failed to parse provider response: {0}")]
     Parse(String),
-    /// No API key was configured for a provider that requires one.
-    #[error("missing API key for provider {0}")]
-    MissingApiKey(&'static str),
-    /// No model was configured. Providers require this, so we fail fast
-    /// rather than letting the request go out and 400.
+    /// No model was configured. Ollama requires this.
     #[error("no model configured for provider {0}")]
     MissingModel(&'static str),
-    /// The provider returned an empty completion. Distinct from a parse
-    /// error because the JSON was valid, just empty.
+    /// The configured `base_url` is not a loopback endpoint. v1.8 refuses
+    /// to talk to anything other than `127.0.0.1` / `localhost` / `::1`.
+    #[error("non-loopback AI endpoint rejected: {0}")]
+    NonLoopbackEndpoint(String),
+    /// The provider returned an empty completion.
     #[error("provider returned an empty completion")]
     Empty,
+    /// The response stream exceeded [`MAX_RESPONSE_BYTES`].
+    #[error("response exceeded {0} byte limit")]
+    ResponseTooLarge(usize),
+    /// The caller cancelled the request via the cancel flag.
+    #[error("request cancelled")]
+    Cancelled,
 }
 
 /// Result alias for [`AiBackend::complete`].
-pub type AiResult = Result<String, AiError>;
+pub type AiResult<T> = Result<T, AiError>;
 
-/// The single shape every AI backend implements. The `complete` method
-/// takes the chat messages built by [`super::prompt`] and returns the
-/// assistant's text response.
-///
-/// Implementations are expected to be cheaply cloneable — `Arc<HttpClient>`
-/// inside — so the trait is `Clone + Send + Sync`. The `async` method
-/// makes the trait object-safe via `async-trait`-style desugaring if we
-/// ever need `Box<dyn AiBackend>`; for now we use generics.
-pub trait AiBackend: Send + Sync {
-    /// Provider id (`"ollama"`, `"openai"`, …). Used in error messages.
-    fn provider_id(&self) -> &'static str;
-
-    /// Send `messages` to the model and return the assistant's reply.
-    fn complete(&self, messages: &[ChatMessage]) -> AiResult;
+/// A lightweight cancellation token. The background task checks `is_cancelled()`
+/// between stream chunks; setting it to `true` causes the task to return
+/// `Err(AiError::Cancelled)` at the next chunk boundary. Cheaper than
+/// `tokio_util::sync::CancellationToken` and sufficient for our needs
+/// (the v1.8 plan §3 step 4 explicitly allows this pattern).
+#[derive(Clone, Default)]
+pub struct CancelFlag {
+    inner: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Shared builder for the [`reqwest::Client`] used by all providers.
-/// Honours the `[ai] timeout_secs` setting.
+impl CancelFlag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn cancel(&self) {
+        self.inner.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// The single shape every AI backend implements. v1.8 has one impl
+/// ([`OllamaBackend`]); the trait is kept so the test suite can substitute
+/// a `MockBackend` without going through HTTP.
+///
+/// The method is `async` (no `block_on`), so the caller must be running on
+/// a tokio runtime. The main `App` spawns requests via `tokio::spawn` on
+/// its multi-thread runtime and drains results through a `crossbeam-channel`.
+pub trait AiBackend: Send + Sync {
+    /// Provider id (`"ollama"`). Used in error messages.
+    fn provider_id(&self) -> &'static str;
+
+    /// Send `messages` to the model and return the assistant's full reply.
+    /// The caller passes a [`CancelFlag`] so it can abort mid-stream.
+    fn complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        cancel: CancelFlag,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<String>> + Send + '_>>;
+}
+
+/// A discovered model from `/api/tags`.
+#[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+pub struct TagModel {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub modified_at: String,
+}
+
+/// Shared builder for the [`reqwest::Client`]. Honours the `[ai] timeout_secs`
+/// setting.
 fn build_http_client(timeout: Duration) -> Result<HttpClient, AiError> {
     HttpClient::builder()
         .timeout(timeout)
@@ -93,30 +135,46 @@ fn build_http_client(timeout: Duration) -> Result<HttpClient, AiError> {
 }
 
 /// Build the concrete backend from the user's [`AiConfig`]. Returns
-/// `Ok(None)` when AI is not configured (`provider = None` or insufficient
-/// credentials) so the caller can decide whether to surface a hint in the UI
-/// or just hide the "✨ Ask AI" entry.
+/// `Ok(None)` when AI is not configured (`provider = None`).
+///
+/// v1.8: only `"ollama"` is accepted. Any other provider id returns
+/// `Err(AiError::UnknownProvider)`.
 pub fn build_backend(
     cfg: &weft_core::config::AiConfig,
 ) -> Result<Option<Box<dyn AiBackend>>, AiError> {
     let Some(kind) = cfg.provider_kind() else {
         return Ok(None);
     };
+    if kind != "ollama" {
+        return Err(AiError::UnknownProvider(kind.to_string()));
+    }
     let timeout = Duration::from_secs(cfg.effective_timeout_secs());
     let http = Arc::new(build_http_client(timeout)?);
-    let backend: Box<dyn AiBackend> = match kind {
-        "ollama" => Box::new(OllamaBackend::new(http, cfg.clone())?),
-        "openai" => Box::new(OpenAiBackend::new(http, cfg.clone())?),
-        "anthropic" => Box::new(AnthropicBackend::new(http, cfg.clone())?),
-        "custom" => Box::new(CustomBackend::new(http, cfg.clone())?),
-        other => return Err(AiError::UnknownProvider(other.to_string())),
+    let backend = OllamaBackend::new(http, cfg.clone())?;
+    Ok(Some(Box::new(backend)))
+}
+
+/// Validate that `base_url` points at loopback. Used at construction time
+/// and re-checked per request as defence in depth.
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
     };
-    Ok(Some(backend))
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    match parsed.host_str() {
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1") => true,
+        _ => false,
+    }
 }
 
 // ── Ollama ────────────────────────────────────────────────────────────
 
-/// Ollama local backend. Default endpoint `http://localhost:11434`. The
+/// Ollama local backend. Default endpoint `http://127.0.0.1:11434`. The
 /// model field is required (e.g. `"llama3.1"`). No auth.
 pub struct OllamaBackend {
     http: Arc<HttpClient>,
@@ -125,7 +183,10 @@ pub struct OllamaBackend {
 }
 
 impl OllamaBackend {
-    pub fn new(http: Arc<HttpClient>, cfg: weft_core::config::AiConfig) -> Result<Self, AiError> {
+    pub fn new(
+        http: Arc<HttpClient>,
+        cfg: weft_core::config::AiConfig,
+    ) -> Result<Self, AiError> {
         let model = cfg
             .model
             .clone()
@@ -135,25 +196,50 @@ impl OllamaBackend {
             .base_url
             .clone()
             .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
+            .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+        if !is_loopback_url(&base_url) {
+            return Err(AiError::NonLoopbackEndpoint(base_url));
+        }
         Ok(Self {
             http,
             base_url,
             model,
         })
     }
-}
 
-impl AiBackend for OllamaBackend {
-    fn provider_id(&self) -> &'static str {
-        "ollama"
+    /// `/api/tags` — list installed models. Used by the Settings AI panel.
+    /// Not part of the `AiBackend` trait because it's a discovery call, not
+    /// a completion call.
+    pub async fn list_models(&self) -> AiResult<Vec<TagModel>> {
+        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
+        let resp = self.http.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AiError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let parsed: serde_json::Value = resp.json().await?;
+        let models = parsed
+            .get("models")
+            .and_then(|m| m.as_array())
+            .ok_or_else(|| AiError::Parse("missing 'models' array".into()))?;
+        let out: Vec<TagModel> = models
+            .iter()
+            .filter_map(|m| serde_json::from_value(m.clone()).ok())
+            .collect();
+        Ok(out)
     }
 
-    fn complete(&self, messages: &[ChatMessage]) -> AiResult {
-        // Ollama /api/chat takes `messages: [{role, content}]` and returns
-        // `{"message": {"role": "assistant", "content": "..."}}`. We use
-        // the non-streaming endpoint for simplicity; the main loop already
-        // shows the result asynchronously via a channel.
+    /// `/api/chat` with `stream: true`. Returns the accumulated assistant
+    /// content. Reads `bytes_stream()` and splits on newlines (NDJSON).
+    async fn stream_chat(
+        &self,
+        messages: Vec<ChatMessage>,
+        cancel: CancelFlag,
+    ) -> AiResult<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -163,338 +249,105 @@ impl AiBackend for OllamaBackend {
                     "content": m.content,
                 })
             }).collect::<Vec<_>>(),
-            "stream": false,
+            "stream": true,
         });
 
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| AiError::Parse(format!("no tokio runtime: {e}")))?;
-        let outcome: Result<String, AiError> = runtime.block_on(async {
-            let resp = self.http.post(&url).json(&body).send().await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(AiError::Status {
-                    status: status.as_u16(),
-                    body,
-                });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AiError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        use futures_util::StreamExt as _;
+
+        let mut byte_stream = resp.bytes_stream();
+        let mut acc = String::new();
+        let mut total_bytes = 0usize;
+        // Per-call line buffer for NDJSON fragments that span chunk boundaries.
+        let mut line_buf = String::new();
+
+        while let Some(chunk_res) = byte_stream.next().await {
+            if cancel.is_cancelled() {
+                return Err(AiError::Cancelled);
             }
-            let parsed: serde_json::Value = resp.json().await?;
-            let content = parsed
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| AiError::Parse("missing message.content".into()))?;
-            if content.is_empty() {
-                return Err(AiError::Empty);
+            let chunk = chunk_res?;
+            total_bytes = total_bytes.saturating_add(chunk.len());
+            if total_bytes > MAX_RESPONSE_BYTES {
+                return Err(AiError::ResponseTooLarge(MAX_RESPONSE_BYTES));
             }
-            Ok(content.to_string())
-        });
-        outcome
-    }
-}
-
-// ── OpenAI ────────────────────────────────────────────────────────────
-
-/// OpenAI chat-completions backend. Endpoint
-/// `https://api.openai.com/v1/chat/completions`, `Authorization: Bearer
-/// <key>`. Required config: `api_key`, `model`.
-pub struct OpenAiBackend {
-    http: Arc<HttpClient>,
-    endpoint: String,
-    api_key: String,
-    model: String,
-    max_tokens: u32,
-}
-
-impl OpenAiBackend {
-    pub fn new(http: Arc<HttpClient>, cfg: weft_core::config::AiConfig) -> Result<Self, AiError> {
-        let api_key = cfg
-            .api_key
-            .clone()
-            .filter(|k| !k.trim().is_empty())
-            .ok_or(AiError::MissingApiKey("openai"))?;
-        let model = cfg
-            .model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .ok_or(AiError::MissingModel("openai"))?;
-        let endpoint = cfg
-            .base_url
-            .clone()
-            .filter(|u| !u.trim().is_empty())
-            .map(|u| format!("{}/chat/completions", u.trim_end_matches('/')))
-            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string());
-        Ok(Self {
-            http,
-            endpoint,
-            api_key,
-            model,
-            max_tokens: cfg.effective_max_tokens(),
-        })
-    }
-}
-
-impl AiBackend for OpenAiBackend {
-    fn provider_id(&self) -> &'static str {
-        "openai"
-    }
-
-    fn complete(&self, messages: &[ChatMessage]) -> AiResult {
-        let url = self.endpoint.clone();
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages.iter().map(|m| {
-                serde_json::json!({
-                    "role": m.role.as_str(),
-                    "content": m.content,
-                })
-            }).collect::<Vec<_>>(),
-            "max_tokens": self.max_tokens,
-            "stream": false,
-        });
-        let api_key = self.api_key.clone();
-
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| AiError::Parse(format!("no tokio runtime: {e}")))?;
-        let outcome: Result<String, AiError> = runtime.block_on(async move {
-            let resp = self
-                .http
-                .post(&url)
-                .bearer_auth(&api_key)
-                .json(&body)
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(AiError::Status {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            let parsed: serde_json::Value = resp.json().await?;
-            // OpenAI: choices[0].message.content
-            let content = parsed
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| AiError::Parse("missing choices[0].message.content".into()))?;
-            if content.is_empty() {
-                return Err(AiError::Empty);
-            }
-            Ok(content.to_string())
-        });
-        outcome
-    }
-}
-
-// ── Anthropic ─────────────────────────────────────────────────────────
-
-/// Anthropic Messages API backend. Endpoint
-/// `https://api.anthropic.com/v1/messages`, header `x-api-key: <key>`.
-/// Required config: `api_key`, `model`. The Anthropic schema separates the
-/// system prompt from the message list — we lift the first `system` message
-/// out of `messages` and pass it as the top-level `system` field.
-pub struct AnthropicBackend {
-    http: Arc<HttpClient>,
-    endpoint: String,
-    api_key: String,
-    model: String,
-    max_tokens: u32,
-}
-
-impl AnthropicBackend {
-    pub fn new(http: Arc<HttpClient>, cfg: weft_core::config::AiConfig) -> Result<Self, AiError> {
-        let api_key = cfg
-            .api_key
-            .clone()
-            .filter(|k| !k.trim().is_empty())
-            .ok_or(AiError::MissingApiKey("anthropic"))?;
-        let model = cfg
-            .model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .ok_or(AiError::MissingModel("anthropic"))?;
-        let endpoint = cfg
-            .base_url
-            .clone()
-            .filter(|u| !u.trim().is_empty())
-            .map(|u| format!("{}/messages", u.trim_end_matches('/')))
-            .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".to_string());
-        Ok(Self {
-            http,
-            endpoint,
-            api_key,
-            model,
-            max_tokens: cfg.effective_max_tokens(),
-        })
-    }
-}
-
-impl AiBackend for AnthropicBackend {
-    fn provider_id(&self) -> &'static str {
-        "anthropic"
-    }
-
-    fn complete(&self, messages: &[ChatMessage]) -> AiResult {
-        // Anthropic expects `system` as a top-level string, with the
-        // `messages` array containing only `user`/`assistant` turns.
-        let mut system_text = String::new();
-        let mut turns: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
-        for m in messages {
-            match m.role {
-                ChatRole::System => {
-                    if !system_text.is_empty() {
-                        system_text.push('\n');
-                    }
-                    system_text.push_str(&m.content);
+            // Append chunk to line buffer, then split out complete lines.
+            line_buf.push_str(std::str::from_utf8(&chunk).map_err(|e| {
+                AiError::Parse(format!("non-utf8 chunk in stream: {e}"))
+            })?);
+            while let Some(nl) = line_buf.find('\n') {
+                let line: String = line_buf.drain(..=nl).collect();
+                let line = line.trim_end_matches('\r').trim_end_matches('\n');
+                if line.is_empty() {
+                    continue;
                 }
-                ChatRole::User | ChatRole::Assistant => {
-                    turns.push(serde_json::json!({
-                        "role": m.role.as_str(),
-                        "content": m.content,
-                    }));
+                if line.len() > MAX_LINE_BYTES {
+                    return Err(AiError::Parse(format!(
+                        "NDJSON line too long: {} bytes",
+                        line.len()
+                    )));
+                }
+                let parsed: serde_json::Value = serde_json::from_str(line)
+                    .map_err(|e| AiError::Parse(format!("invalid NDJSON line: {e}")))?;
+                // Check for error object.
+                if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+                    return Err(AiError::Status {
+                        status: 500,
+                        body: err.to_string(),
+                    });
+                }
+                // Extract content delta.
+                if let Some(content) = parsed
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    acc.push_str(content);
+                }
+                // `done: true` marks the final chunk.
+                if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                    if acc.trim().is_empty() {
+                        return Err(AiError::Empty);
+                    }
+                    return Ok(acc);
                 }
             }
         }
-
-        let body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "system": system_text,
-            "messages": turns,
-        });
-        let endpoint = self.endpoint.clone();
-        let api_key = self.api_key.clone();
-
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| AiError::Parse(format!("no tokio runtime: {e}")))?;
-        let outcome: Result<String, AiError> = runtime.block_on(async move {
-            let resp = self
-                .http
-                .post(&endpoint)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(AiError::Status {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            let parsed: serde_json::Value = resp.json().await?;
-            // Anthropic: content[0].text (array of content blocks)
-            let content = parsed
-                .get("content")
-                .and_then(|c| c.get(0))
-                .and_then(|b| b.get("text"))
-                .and_then(|t| t.as_str())
-                .ok_or_else(|| AiError::Parse("missing content[0].text".into()))?;
-            if content.is_empty() {
-                return Err(AiError::Empty);
-            }
-            Ok(content.to_string())
-        });
-        outcome
+        // Stream ended without an explicit `done` — return what we have if
+        // non-empty, else error.
+        if acc.trim().is_empty() {
+            Err(AiError::Empty)
+        } else {
+            Ok(acc)
+        }
     }
 }
 
-// ── Custom (OpenAI-compatible) ────────────────────────────────────────
-
-/// Generic OpenAI-compatible backend pointed at a user-supplied base URL.
-/// Used for LiteLLM, corporate proxies, Azure OpenAI (when configured with
-/// a custom deployment URL), etc. Speaks the OpenAI chat-completions
-/// schema verbatim.
-pub struct CustomBackend {
-    http: Arc<HttpClient>,
-    endpoint: String,
-    api_key: Option<String>,
-    model: String,
-    max_tokens: u32,
-}
-
-impl CustomBackend {
-    pub fn new(http: Arc<HttpClient>, cfg: weft_core::config::AiConfig) -> Result<Self, AiError> {
-        let base = cfg
-            .base_url
-            .clone()
-            .filter(|u| !u.trim().is_empty())
-            .ok_or(AiError::MissingModel("custom (base_url)"))?;
-        let model = cfg
-            .model
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .ok_or(AiError::MissingModel("custom"))?;
-        let endpoint = format!("{}/chat/completions", base.trim_end_matches('/'));
-        Ok(Self {
-            http,
-            endpoint,
-            api_key: cfg.api_key.clone().filter(|k| !k.trim().is_empty()),
-            model,
-            max_tokens: cfg.effective_max_tokens(),
-        })
-    }
-}
-
-impl AiBackend for CustomBackend {
+impl AiBackend for OllamaBackend {
     fn provider_id(&self) -> &'static str {
-        "custom"
+        "ollama"
     }
 
-    fn complete(&self, messages: &[ChatMessage]) -> AiResult {
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages.iter().map(|m| {
-                serde_json::json!({
-                    "role": m.role.as_str(),
-                    "content": m.content,
-                })
-            }).collect::<Vec<_>>(),
-            "max_tokens": self.max_tokens,
-            "stream": false,
-        });
-        let endpoint = self.endpoint.clone();
-        let api_key = self.api_key.clone();
-
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|e| AiError::Parse(format!("no tokio runtime: {e}")))?;
-        let outcome: Result<String, AiError> = runtime.block_on(async move {
-            let req = self.http.post(&endpoint).json(&body);
-            let req = match &api_key {
-                Some(k) => req.bearer_auth(k),
-                None => req,
-            };
-            let resp = req.send().await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                return Err(AiError::Status {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-            let parsed: serde_json::Value = resp.json().await?;
-            let content = parsed
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| AiError::Parse("missing choices[0].message.content".into()))?;
-            if content.is_empty() {
-                return Err(AiError::Empty);
-            }
-            Ok(content.to_string())
-        });
-        outcome
+    fn complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        cancel: CancelFlag,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AiResult<String>> + Send + '_>> {
+        Box::pin(async move { self.stream_chat(messages, cancel).await })
     }
 }
+
+// `futures_util::StreamExt` is used above to drive `resp.bytes_stream()`.
+// It's a transitive dependency of reqwest 0.12 with the `stream` feature;
+// declared explicitly in weft_app's Cargo.toml.
 
 #[cfg(test)]
 mod tests {
@@ -505,21 +358,19 @@ mod tests {
     fn build_backend_returns_none_when_no_provider() {
         let cfg = AiConfig::default();
         let backend = build_backend(&cfg).expect("no error for default config");
-        assert!(
-            backend.is_none(),
-            "default config should produce no backend"
-        );
+        assert!(backend.is_none());
     }
 
     #[test]
-    fn build_backend_unknown_provider_errors() {
+    fn build_backend_rejects_non_ollama_provider() {
         let cfg = AiConfig {
-            provider: Some("magic".into()),
+            provider: Some("openai".into()),
+            api_key: Some("sk-test".into()),
+            model: Some("gpt-4o-mini".into()),
             ..Default::default()
         };
-        // `expect_err` requires `T: Debug`; `Box<dyn AiBackend>` isn't Debug.
         match build_backend(&cfg) {
-            Err(AiError::UnknownProvider(name)) => assert_eq!(name, "magic"),
+            Err(AiError::UnknownProvider(name)) => assert_eq!(name, "openai"),
             Err(other) => panic!("expected UnknownProvider, got {other:?}"),
             Ok(_) => panic!("expected UnknownProvider error, got a backend"),
         }
@@ -531,53 +382,11 @@ mod tests {
             provider: Some("ollama".into()),
             ..Default::default()
         };
-        // `expect_err` needs `T: Debug`; `Box<dyn AiBackend>` isn't Debug, so
-        // we match on the Ok variant and route the test that way.
         match build_backend(&cfg) {
             Err(AiError::MissingModel(p)) => assert_eq!(p, "ollama"),
             Err(other) => panic!("expected MissingModel, got {other:?}"),
             Ok(_) => panic!("expected MissingModel error, got a backend"),
         }
-    }
-
-    #[test]
-    fn build_backend_openai_without_api_key_errors() {
-        let cfg = AiConfig {
-            provider: Some("openai".into()),
-            model: Some("gpt-4o-mini".into()),
-            ..Default::default()
-        };
-        match build_backend(&cfg) {
-            Err(AiError::MissingApiKey(p)) => assert_eq!(p, "openai"),
-            Err(other) => panic!("expected MissingApiKey, got {other:?}"),
-            Ok(_) => panic!("expected MissingApiKey error, got a backend"),
-        }
-    }
-
-    #[test]
-    fn build_backend_openai_with_key_and_model_succeeds() {
-        let cfg = AiConfig {
-            provider: Some("openai".into()),
-            api_key: Some("sk-test".into()),
-            model: Some("gpt-4o-mini".into()),
-            ..Default::default()
-        };
-        let backend = build_backend(&cfg).expect("valid config should produce a backend");
-        assert!(backend.is_some());
-        assert_eq!(backend.unwrap().provider_id(), "openai");
-    }
-
-    #[test]
-    fn build_backend_anthropic_with_key_and_model_succeeds() {
-        let cfg = AiConfig {
-            provider: Some("anthropic".into()),
-            api_key: Some("sk-ant-test".into()),
-            model: Some("claude-3-5-sonnet".into()),
-            ..Default::default()
-        };
-        let backend = build_backend(&cfg).expect("valid config should produce a backend");
-        assert!(backend.is_some());
-        assert_eq!(backend.unwrap().provider_id(), "anthropic");
     }
 
     #[test]
@@ -593,29 +402,65 @@ mod tests {
     }
 
     #[test]
-    fn build_backend_custom_requires_base_url() {
+    fn build_backend_rejects_non_loopback_base_url() {
         let cfg = AiConfig {
-            provider: Some("custom".into()),
-            model: Some("gpt-4o".into()),
+            provider: Some("ollama".into()),
+            model: Some("llama3.1".into()),
+            base_url: Some("https://api.openai.com".into()),
             ..Default::default()
         };
         match build_backend(&cfg) {
-            Err(AiError::MissingModel(p)) => assert_eq!(p, "custom (base_url)"),
-            Err(other) => panic!("expected MissingModel for custom base_url, got {other:?}"),
-            Ok(_) => panic!("expected MissingModel error, got a backend"),
+            Err(AiError::NonLoopbackEndpoint(u)) => assert_eq!(u, "https://api.openai.com"),
+            Err(other) => panic!("expected NonLoopbackEndpoint, got {other:?}"),
+            Ok(_) => panic!("expected NonLoopbackEndpoint error, got a backend"),
         }
     }
 
     #[test]
-    fn build_backend_custom_with_base_url_succeeds() {
-        let cfg = AiConfig {
-            provider: Some("custom".into()),
-            base_url: Some("https://internal.example.com/v1".into()),
-            model: Some("gpt-4o".into()),
-            ..Default::default()
-        };
-        let backend = build_backend(&cfg).expect("custom with base_url should build");
-        assert!(backend.is_some());
-        assert_eq!(backend.unwrap().provider_id(), "custom");
+    fn build_backend_accepts_loopback_variants() {
+        for url in [
+            "http://127.0.0.1:11434",
+            "http://localhost:11434",
+            "http://[::1]:11434",
+        ] {
+            assert!(is_loopback_url(url), "should accept {url}");
+        }
+    }
+
+    #[test]
+    fn build_backend_rejects_https_scheme() {
+        assert!(!is_loopback_url("https://127.0.0.1:11434"));
+    }
+
+    #[test]
+    fn build_backend_rejects_userinfo() {
+        assert!(!is_loopback_url("http://user:pass@127.0.0.1:11434"));
+    }
+
+    #[test]
+    fn build_backend_rejects_lan_host() {
+        assert!(!is_loopback_url("http://192.168.1.5:11434"));
+        assert!(!is_loopback_url("http://my-server.local:11434"));
+    }
+
+    #[test]
+    fn cancel_flag_default_is_false() {
+        let f = CancelFlag::new();
+        assert!(!f.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_flag_round_trip() {
+        let f = CancelFlag::new();
+        f.cancel();
+        assert!(f.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_flag_clone_shares_state() {
+        let f = CancelFlag::new();
+        let g = f.clone();
+        f.cancel();
+        assert!(g.is_cancelled());
     }
 }

@@ -413,6 +413,18 @@ impl App {
         }
     }
 
+    /// v1.8: Drain completed AI request results from the background tokio
+    /// tasks. The events are stored on `self.ai_state` (no UI surface yet
+    /// in v1.8.0 — the palette and block view consume them in v1.8.1 /
+    /// v1.8.2). This call just keeps the channel drained so the
+    /// "thinking…" indicator (`in_flight`) clears correctly.
+    pub(super) fn poll_ai_results(&mut self) {
+        let _events = self.ai_state.poll();
+        // v1.8.0: events are dropped here. v1.8.1 will route CommandGen
+        // results to the palette; v1.8.2 will route Diagnose results to
+        // the block view.
+    }
+
     pub(super) fn editor_completion_next(&mut self) {
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.editor_mut().completion_next();

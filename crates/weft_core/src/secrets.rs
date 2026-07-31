@@ -40,6 +40,61 @@ pub fn mask(text: &str) -> String {
     out
 }
 
+/// Compiled redaction patterns (v1.8 AI integration). Broader than `mask`:
+/// catches inline credentials that would leak via AI prompts (Bearer tokens,
+/// `password=`, `api_key=`, URL userinfo, env assignments). Cached after
+/// first use.
+fn redaction_patterns() -> &'static [Regex] {
+    static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        let mut v = patterns().to_vec();
+        // Bearer / Token Authorization headers.
+        v.push(Regex::new(r"(?i)Bearer\s+[A-Za-z0-9._\-]+").unwrap());
+        v.push(Regex::new(r"(?i)token[=:]\s*[A-Za-z0-9._\-]{8,}").unwrap());
+        // `api_key=...` / `api-key: ...` / `apikey=...` (8+ chars value).
+        v.push(Regex::new(r"(?i)api[_-]?key[=:]\s*[A-Za-z0-9._\-]{8,}").unwrap());
+        // `password=...` / `password: ...` (any non-whitespace value ≥ 4).
+        v.push(Regex::new(r"(?i)password[=:]\s*\S{4,}").unwrap());
+        // URL userinfo: `https://user:pass@host/...`
+        v.push(Regex::new(r"(?i)(https?://[^/\s:]+:[^@/\s]+)@").unwrap());
+        // `export VAR=value` where VAR looks sensitive (PW/PASSWD/SECRET/TOKEN/KEY).
+        v.push(
+            Regex::new(r"(?i)(export\s+(?:[A-Z0-9_]*(?:PW|PASSWD|PASSWORD|SECRET|TOKEN|KEY)[A-Z0-9_]*)=\S+)")
+                .unwrap(),
+        );
+        v
+    })
+}
+
+/// Broader redaction for AI-bound text. Applies [`mask`] first (known token
+/// formats), then the broader inline-credential patterns. Used by
+/// `ai::redact::redact_secrets` (v1.8) before sending any user context to
+/// the local Ollama model.
+pub fn redact_for_ai(text: &str) -> String {
+    let mut out = mask(text);
+    for re in redaction_patterns() {
+        // For URL userinfo we keep the host visible but mask the credentials.
+        if re.as_str().contains("https?://") {
+            out = re
+                .replace_all(&out, |caps: &regex::Captures| {
+                    let full = &caps[0];
+                    // Replace the `user:pass@` part with `••••••••@`.
+                    if let Some(at_pos) = full.rfind('@') {
+                        let scheme_host = &full[..full.find("://").map(|i| i + 3).unwrap_or(0)];
+                        let _ = scheme_host;
+                        format!("••••••••@{}", &full[at_pos + 1..])
+                    } else {
+                        MASK.to_string()
+                    }
+                })
+                .into_owned();
+        } else {
+            out = re.replace_all(&out, MASK).into_owned();
+        }
+    }
+    out
+}
+
 /// True if `s` contains any known secret pattern.
 pub fn is_secret(s: &str) -> bool {
     patterns().iter().any(|re| re.is_match(s))
@@ -102,5 +157,85 @@ mod tests {
         // too short to be a real key — left alone (avoids false positives)
         let s = "see sk-abc for details";
         assert!(!is_secret(s));
+    }
+
+    // ── v1.8 redact_for_ai tests ──────────────────────────────────────
+
+    #[test]
+    fn redact_bearer_token() {
+        let s = "curl -H 'Authorization: Bearer abc123def456' https://api.example.com";
+        let r = redact_for_ai(s);
+        assert!(r.contains("••••••••"));
+        assert!(!r.contains("abc123def456"));
+        // host is preserved
+        assert!(r.contains("api.example.com"));
+    }
+
+    #[test]
+    fn redact_password_assignment() {
+        let s = "PGPASSWORD=secret123 psql -h db";
+        let r = redact_for_ai(s);
+        assert!(!r.contains("secret123"));
+    }
+
+    #[test]
+    fn redact_api_key_assignment() {
+        let s = "api_key=sk-test-1234567890abcdef call";
+        let r = redact_for_ai(s);
+        assert!(!r.contains("sk-test-1234567890abcdef"));
+    }
+
+    #[test]
+    fn redact_url_userinfo() {
+        let s = "git clone https://alice:hunter2@github.com/org/repo.git";
+        let r = redact_for_ai(s);
+        assert!(!r.contains("alice:hunter2"));
+        assert!(!r.contains("hunter2"));
+        // host + path preserved
+        assert!(r.contains("github.com/org/repo.git"));
+    }
+
+    #[test]
+    fn redact_export_secret_env() {
+        let s = "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let r = redact_for_ai(s);
+        assert!(!r.contains("wJalrXUtnFEMI"));
+        // export keyword may remain, value masked
+    }
+
+    #[test]
+    fn redact_preserves_normal_commands() {
+        let s = "ls -la /tmp\ngit status\necho hello world";
+        let r = redact_for_ai(s);
+        assert_eq!(r, s);
+    }
+
+    #[test]
+    fn redact_preserves_cjk_text() {
+        let s = "查找文件 列出当前目录的文件";
+        let r = redact_for_ai(s);
+        assert_eq!(r, s);
+    }
+
+    #[test]
+    fn redact_empty_string() {
+        assert_eq!(redact_for_ai(""), "");
+    }
+
+    #[test]
+    fn redact_still_applies_known_token_patterns() {
+        // mask() runs first, so sk- keys are still caught.
+        let s = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890abcd";
+        let r = redact_for_ai(s);
+        assert!(!r.contains("sk-abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn redact_does_not_touch_short_password_lookalikes() {
+        // `password=abc` is 3 chars, below the 4-char threshold.
+        let s = "password=abc";
+        let r = redact_for_ai(s);
+        // value preserved (too short to look like a real secret)
+        assert!(r.contains("password=abc"));
     }
 }

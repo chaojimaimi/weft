@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.7.8"
+version = "1.8.0"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -74,5 +74,11 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # Pulled in by `crates/weft_app/src/ai/`; the module is scaffolding-only in
 # v1.3 and not wired into the app shell (see ROADMAP DC-8).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+# v1.8 AI integration: StreamExt for driving reqwest's `bytes_stream()`.
+# Transitive dependency of reqwest 0.12 with the `stream` feature; declared
+# explicitly so weft_app can call `.next()` on the stream.
+futures-util = "0.3"
+# v1.8 AI integration: mock HTTP server for offline integration tests.
+wiremock = "0.6"
 # Benchmarking (Batch 6 Step 3)
 criterion = { version = "0.5", default-features = false }

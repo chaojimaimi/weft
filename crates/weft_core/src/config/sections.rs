@@ -278,29 +278,32 @@ impl Default for LogoConfig {
     }
 }
 
-/// v1.6 AI integration: configuration for the AI backend.
+/// v1.8 AI integration: configuration for the local Ollama backend.
 ///
-/// All fields are optional — when `provider` is `None` the AI features are
-/// disabled. API keys are *not* stored here in plaintext by default; the
-/// field exists for compatibility / quick setup, but the Settings UI will
-/// prefer the macOS Keychain (Batch 4-2). The TOML writer (config/save.rs)
-/// only persists non-default values, so an empty `[ai]` section stays empty.
+/// v1.3 carried an `api_key` field and supported OpenAI / Anthropic / custom
+/// backends. v1.8 collapses to a single local Ollama provider per
+/// `docs/V18_IMPLEMENTATION_PLAN.md` §1: no API keys, no public endpoints.
+/// The `api_key` field is removed; the `base_url` is validated to be
+/// loopback at construction time. The TOML writer (config/save.rs) only
+/// persists non-default values, so an empty `[ai]` section stays empty.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
-    /// Provider id: `"openai"` | `"anthropic"` | `"ollama"` | `"custom"`.
-    /// `None` ⇒ AI features disabled.
+    /// Provider id. v1.8 only accepts `"ollama"`; any other value is
+    /// rejected at backend construction. `None` ⇒ AI features disabled.
     pub provider: Option<String>,
-    /// Plaintext API key (optional). For OpenAI/Anthropic. ⚠️ sensitive —
-    /// prefer the Keychain path when available. Kept here only for tests
-    /// and quick local setups.
+    /// v1.8 REMOVED: `api_key` is no longer supported. The field is kept
+    /// for TOML deserialization backwards-compat (ignored if present in
+    /// old config files) so v1.7 configs don't fail to load on upgrade.
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
-    /// Custom endpoint base URL (e.g. `"http://localhost:11434"` for Ollama,
-    /// or a corporate proxy). When `None`, the provider's default URL is used.
+    /// Ollama base URL. Must be loopback (`http://127.0.0.1:11434`,
+    /// `http://localhost:11434`, or `http://[::1]:11434`). When `None`,
+    /// defaults to `http://127.0.0.1:11434`.
     pub base_url: Option<String>,
-    /// Model id, e.g. `"gpt-4o-mini"`, `"claude-3-5-sonnet"`, `"llama3.1"`.
+    /// Model id, e.g. `"llama3.1"`, `"qwen2.5"`.
     pub model: Option<String>,
-    /// Max output tokens for a single completion. `None` ⇒ provider default.
+    /// Max output tokens for a single completion. `None` ⇒ 1024.
     pub max_tokens: Option<u32>,
     /// Request timeout in seconds. `None` ⇒ 30.
     pub timeout_secs: Option<u32>,
@@ -330,18 +333,14 @@ impl Default for AiConfig {
 }
 
 impl AiConfig {
-    /// True when the AI features can be considered "configured" — a provider
-    /// is set, and either an API key is set (for OpenAI/Anthropic) or the
-    /// provider doesn't need one (Ollama / custom endpoint).
+    /// True when the AI features can be considered "configured". v1.8 only
+    /// accepts `"ollama"`; old provider values (`openai`/`anthropic`/`custom`)
+    /// are treated as unconfigured so the user sees a hint to switch.
     pub fn is_configured(&self) -> bool {
         match self.provider.as_deref() {
             None => false,
             Some("ollama") => true,
-            Some("custom") => true,
-            Some(_) => self
-                .api_key
-                .as_deref()
-                .is_some_and(|k| !k.trim().is_empty()),
+            _ => false,
         }
     }
 
@@ -389,38 +388,48 @@ mod ai_config_tests {
     }
 
     #[test]
-    fn openai_requires_api_key() {
-        let cfg = AiConfig {
-            provider: Some("openai".into()),
-            ..Default::default()
-        };
-        assert!(!cfg.is_configured());
+    fn openai_no_longer_configured_in_v18() {
+        // v1.8: only "ollama" is accepted. Old configs with "openai" /
+        // "anthropic" / "custom" should be treated as unconfigured so the
+        // user sees a hint to switch rather than a silent breakage.
         let cfg = AiConfig {
             provider: Some("openai".into()),
             api_key: Some("sk-test".into()),
             ..Default::default()
         };
-        assert!(cfg.is_configured());
+        assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn anthropic_no_longer_configured_in_v18() {
+        let cfg = AiConfig {
+            provider: Some("anthropic".into()),
+            api_key: Some("sk-ant-test".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.is_configured());
+    }
+
+    #[test]
+    fn custom_no_longer_configured_in_v18() {
+        let cfg = AiConfig {
+            provider: Some("custom".into()),
+            base_url: Some("https://internal.example.com/v1".into()),
+            ..Default::default()
+        };
+        assert!(!cfg.is_configured());
     }
 
     #[test]
     fn empty_api_key_treated_as_unset() {
+        // v1.8: api_key is ignored entirely, but the field is kept for
+        // backwards-compat deserialization. Any value is "unset".
         let cfg = AiConfig {
             provider: Some("anthropic".into()),
             api_key: Some("   ".into()),
             ..Default::default()
         };
         assert!(!cfg.is_configured());
-    }
-
-    #[test]
-    fn custom_provider_configured_without_api_key() {
-        let cfg = AiConfig {
-            provider: Some("custom".into()),
-            base_url: Some("https://internal.example.com/v1".into()),
-            ..Default::default()
-        };
-        assert!(cfg.is_configured());
     }
 
     #[test]

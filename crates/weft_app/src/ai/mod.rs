@@ -1,32 +1,26 @@
-//! AI integration scaffolding — **deferred to v1.6** (kept here as the
-//! implementation base for that release).
+//! v1.8 AI integration — local Ollama only.
 //!
-//! ## Status (v1.3.0 cut, 2026-07-25)
+//! ## Status (v1.8.0 cut, 2026-07-31)
 //!
-//! ROADMAP decision DC-8 redirected v1.3 from AI integration to **Split Pane**.
-//! v1.4–v1.5 follow with WARP R3 deep items and config-system enhancements.
-//! AI integration is now scheduled for **v1.6+**. This module is therefore
-//! **not wired into the app shell** in v1.3: `AiState::new` / `spawn_command_gen`
-//! / `poll` are scaffolding only, no UI surface invokes them, and several
-//! helpers intentionally remain unused (gated by narrow `#[allow(dead_code)]`)
-//! until v1.6 consumes them. The code is retained so v1.6 can build on a
-//! reviewed baseline rather than starting from scratch.
+//! v1.3 carried scaffolding for OpenAI / Anthropic / custom backends and
+//! was never wired into the app shell. v1.8 collapses to a single local
+//! Ollama backend per `docs/V18_IMPLEMENTATION_PLAN.md` §1: no API keys,
+//! no public endpoints, no cloud providers. The `AiBackend` trait is now
+//! `async` and accepts a [`CancelFlag`] so callers can abort an in-flight
+//! stream when the user closes the palette or switches blocks.
 //!
-//! ## Module layout (frozen as the v1.6 base)
+//! ## Module layout
 //!
 //! - [`prompt`] — pure-logic prompt builders (fully unit-tested).
-//! - [`client`] — `AiBackend` trait + Ollama / OpenAI / Anthropic / custom
-//!   implementations.
-//! - [`AiState`] — the main-thread state that holds pending requests and
-//!   completed results. Background `tokio` tasks communicate with `AiState`
-//!   via a `crossbeam-channel`, matching the existing `FindWorker` pattern.
-//!
-//! When v1.6 lands, wire `AiState` into the palette / block view via the
-//! `spawn_command_gen` + `poll` entry points; the internals should need no
-//! change.
+//! - [`client`] — `AiBackend` trait + the single Ollama implementation.
+//! - [`redact`] — secret redaction wrapper around `weft_core::secrets`.
+//! - [`AiState`] — main-thread state. Background `tokio` tasks communicate
+//!   with it via a `crossbeam-channel`, matching the existing `FindWorker`
+//!   pattern.
 
 pub mod client;
 pub mod prompt;
+pub mod redact;
 
 use std::sync::Arc;
 
@@ -35,7 +29,7 @@ use tracing::warn;
 
 use weft_core::config::AiConfig;
 
-use client::{build_backend, AiBackend, AiError, AiResult};
+use client::{build_backend, AiBackend, AiError, CancelFlag};
 
 pub use prompt::{
     build_command_gen_messages, build_diagnose_messages, clean_command_output, CommandGenPrompt,
@@ -43,9 +37,9 @@ pub use prompt::{
 };
 
 // Re-export the byte/history caps so the Settings UI / palette can hint at
-// the limits without depending on `prompt` directly. v1.6 consumers will
-// reach these via `ai::MAX_*`; today nothing imports them (module is
-// scaffolding-only), hence the allow.
+// the limits without depending on `prompt` directly. Currently unused at
+// runtime (v1.8.0 doesn't surface them in the UI yet); gated by `allow`
+// until v1.8.1 consumes them from the palette.
 #[allow(unused_imports)]
 pub use prompt::{MAX_HISTORY_ENTRIES, MAX_OUTPUT_BYTES};
 
@@ -79,6 +73,9 @@ pub enum AiResultEvent {
     /// A request failed. The error string is suitable for direct display
     /// in the UI (palette status line / block diagnostic panel).
     Error { id: u64, message: String },
+    /// A request was cancelled (either the user issued a new one or closed
+    /// the UI). The caller should clear any "thinking…" indicator for `id`.
+    Cancelled { id: u64 },
 }
 
 /// Main-thread AI state. Holds the config snapshot, the optional backend,
@@ -89,10 +86,10 @@ pub enum AiResultEvent {
 /// without indirection.
 pub struct AiState {
     /// Snapshot of the `[ai]` config at construction time. The Settings UI
-    /// rebuilds `AiState` when the user changes provider / key / model.
+    /// rebuilds `AiState` when the user changes provider / model.
     config: AiConfig,
-    /// `None` when AI is not configured (`provider = None` or insufficient
-    /// credentials). Callers should hide the "✨ Ask AI" UI in that case.
+    /// `None` when AI is not configured (`provider = None` or construction
+    /// failed). Callers should hide the "✨ Ask AI" UI in that case.
     backend: Option<Arc<dyn AiBackend>>,
     /// Result channel from background tasks → main thread.
     rx: Receiver<AiResultEvent>,
@@ -105,6 +102,10 @@ pub struct AiState {
     /// True when at least one request is in flight. Used by the redraw
     /// loop to keep the palette "thinking…" indicator alive.
     in_flight: usize,
+    /// Cancel flags for in-flight requests, keyed by request id. When a
+    /// new request supersedes an old one (or the user closes the UI), the
+    /// old flag is flipped to `true` and the entry removed.
+    cancellations: std::collections::HashMap<u64, CancelFlag>,
 }
 
 impl AiState {
@@ -127,6 +128,7 @@ impl AiState {
             tx,
             next_id: 1,
             in_flight: 0,
+            cancellations: std::collections::HashMap::new(),
         }
     }
 
@@ -147,25 +149,49 @@ impl AiState {
         self.in_flight
     }
 
+    /// Cancel all in-flight requests. Called when the user closes the
+    /// palette or switches blocks. The background tasks will return
+    /// `Err(AiError::Cancelled)` at the next stream chunk boundary.
+    pub fn cancel_all(&mut self) {
+        for (_id, flag) in self.cancellations.drain() {
+            flag.cancel();
+        }
+    }
+
+    /// Cancel a specific request by id. Returns `true` if the request
+    /// was found and cancelled.
+    pub fn cancel(&mut self, id: u64) -> bool {
+        if let Some(flag) = self.cancellations.remove(&id) {
+            flag.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Spawn a command-generation request. Returns the assigned id so the
     /// caller can store it on the palette entry and match it against the
     /// eventual `AiResultEvent::CommandGen { id, .. }`.
     ///
     /// Returns `None` when AI is not configured — the caller should hide
     /// the entry or show a "configure AI in Settings" hint.
+    ///
+    /// Any previous in-flight request is cancelled first (new query
+    /// supersedes old).
     pub fn spawn_command_gen(&mut self, request: CommandGenPrompt) -> Option<u64> {
         let backend = self.backend.clone()?;
+        // Cancel any in-flight command-gen requests (new supersedes old).
+        self.cancel_all();
         let id = self.next_id;
         self.next_id += 1;
         self.in_flight += 1;
         let tx = self.tx.clone();
+        let cancel = CancelFlag::new();
+        self.cancellations.insert(id, cancel.clone());
         let messages = build_command_gen_messages(&request);
 
-        // Spawn on the current tokio runtime. The runtime is owned by the
-        // App (see AppRuntime) and is multi-threaded, so a slow HTTP call
-        // doesn't block the winit event loop.
         tokio::spawn(async move {
-            let result = run_completion(&backend, &messages).await;
+            let result = backend.complete(messages, cancel).await;
             let event = match result {
                 Ok(raw) => {
                     let command = clean_command_output(&raw);
@@ -178,6 +204,7 @@ impl AiState {
                         AiResultEvent::CommandGen { id, command }
                     }
                 }
+                Err(AiError::Cancelled) => AiResultEvent::Cancelled { id },
                 Err(e) => AiResultEvent::Error {
                     id,
                     message: e.to_string(),
@@ -198,12 +225,15 @@ impl AiState {
         self.next_id += 1;
         self.in_flight += 1;
         let tx = self.tx.clone();
+        let cancel = CancelFlag::new();
+        self.cancellations.insert(id, cancel.clone());
         let messages = build_diagnose_messages(&request);
 
         tokio::spawn(async move {
-            let result = run_completion(&backend, &messages).await;
+            let result = backend.complete(messages, cancel).await;
             let event = match result {
                 Ok(explanation) => AiResultEvent::Diagnose { id, explanation },
+                Err(AiError::Cancelled) => AiResultEvent::Cancelled { id },
                 Err(e) => AiResultEvent::Error {
                     id,
                     message: e.to_string(),
@@ -222,26 +252,18 @@ impl AiState {
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
             self.in_flight = self.in_flight.saturating_sub(1);
+            // Clean up the cancellation map entry if present.
+            let id = match &event {
+                AiResultEvent::CommandGen { id, .. }
+                | AiResultEvent::Diagnose { id, .. }
+                | AiResultEvent::Error { id, .. }
+                | AiResultEvent::Cancelled { id } => *id,
+            };
+            self.cancellations.remove(&id);
             events.push(event);
         }
         events
     }
-}
-
-/// Shared runner that calls the backend. Kept as a free function so it can
-/// be reused by both spawn paths and tested with a mock backend.
-async fn run_completion(
-    backend: &Arc<dyn AiBackend>,
-    messages: &[prompt::ChatMessage],
-) -> AiResult {
-    // The trait method is sync (it blocks on the tokio runtime internally
-    // via `Handle::try_current()` + `block_on`). To avoid blocking the
-    // async runtime's worker thread, we offload to `tokio::task::spawn_blocking`.
-    let backend = backend.clone();
-    let messages: Vec<_> = messages.to_vec();
-    tokio::task::spawn_blocking(move || backend.complete(&messages))
-        .await
-        .map_err(|e| AiError::Parse(format!("background task panicked: {e}")))?
 }
 
 #[cfg(test)]
@@ -259,8 +281,14 @@ mod tests {
         fn provider_id(&self) -> &'static str {
             "mock"
         }
-        fn complete(&self, _messages: &[prompt::ChatMessage]) -> AiResult {
-            Ok(self.response.clone())
+        fn complete(
+            &self,
+            _messages: Vec<prompt::ChatMessage>,
+            _cancel: CancelFlag,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = client::AiResult<String>> + Send>>
+        {
+            let resp = self.response.clone();
+            Box::pin(async move { Ok(resp) })
         }
     }
 
@@ -327,7 +355,7 @@ mod tests {
         assert!(id2 > id1, "ids must be monotonic: {id1:?} {id2:?}");
         // Drain.
         for _ in 0..50 {
-            if state.poll().len() >= 2 {
+            if !state.poll().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -449,5 +477,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("timeout");
+    }
+
+    #[test]
+    fn cancel_all_cancels_in_flight_requests() {
+        let mut state = state_with_mock("ls");
+        let cancel = CancelFlag::new();
+        state.cancellations.insert(1, cancel.clone());
+        state.cancel_all();
+        assert!(cancel.is_cancelled());
+        assert!(state.cancellations.is_empty());
+    }
+
+    #[test]
+    fn cancel_by_id_removes_entry() {
+        let mut state = state_with_mock("ls");
+        let cancel = CancelFlag::new();
+        state.cancellations.insert(5, cancel.clone());
+        assert!(state.cancel(5));
+        assert!(cancel.is_cancelled());
+        assert!(!state.cancel(5)); // already removed
     }
 }

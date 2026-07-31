@@ -8,9 +8,8 @@ mod acceptance_snapshots;
 mod accessibility;
 mod accessibility_actions;
 mod accessibility_model;
-// v1.6 AI integration — scaffolding only, not wired into the app shell in
-// v1.3. See `ai/mod.rs` header for the deferral rationale and DC-8.
-#[allow(dead_code)]
+// v1.8 AI integration — local Ollama only. Wired into the app shell in
+// v1.8.0 (App holds an `AiState`, drained via `poll_ai_results`).
 mod ai;
 mod app;
 mod app_runtime;
@@ -215,6 +214,10 @@ struct App {
     completion_worker: completion_worker::CompletionWorker,
     runbook_worker: runbook_controller::RunbookWorker,
     bookmarked_blocks: std::collections::HashSet<BlockId>,
+    /// v1.8: Local AI state (Ollama-only). Holds the config snapshot,
+    /// optional backend, and result channel. Background tokio tasks
+    /// communicate via crossbeam-channel; drained in `poll_ai_results`.
+    ai_state: ai::AiState,
 }
 
 /// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
@@ -291,6 +294,10 @@ impl App {
         let frame_trace_enabled = probe.enabled();
         let completion_proxy = proxy.clone();
         let runbook_proxy = proxy.clone();
+        // v1.8: Snapshot the AI config before `config_state` is moved into
+        // the struct initializer below. `AiState` owns its own copy so it can
+        // keep driving requests even while the user edits other settings.
+        let ai_config_snapshot = config_state.config.ai.clone();
         Self {
             window: None,
             renderer: None,
@@ -326,6 +333,7 @@ impl App {
                 let _ = runbook_proxy.send_event(AppEvent::Wake);
             }),
             bookmarked_blocks: std::collections::HashSet::new(),
+            ai_state: ai::AiState::new(ai_config_snapshot),
         }
     }
 

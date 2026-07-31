@@ -22,7 +22,7 @@ path = "src/main.rs"
 name = "Weft"
 identifier = "dev.weft.terminal"
 icon = ["../../assets/icon.icns"]
-version = "1.7.8"
+version = "1.8.0"
 copyright = "Copyright (c) 2026 Weft Contributors. MIT License."
 short_description = "Modern macOS terminal"
 long_description = "Weft is a block-based terminal emulator with command history, AI integration, and a Warp-inspired UI."
@@ -62,7 +62,11 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+# v1.8 AI integration: StreamExt for driving reqwest's `bytes_stream()`.
+futures-util = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true
 criterion.workspace = true
+# v1.8 AI integration: mock HTTP server for offline Ollama integration tests.
+wiremock = { workspace = true }

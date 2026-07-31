@@ -16,6 +16,8 @@
 
 use weft_core::secrets;
 
+use super::redact::redact_secrets;
+
 /// Cap the amount of block output we send to the LLM. 4 KiB matches the
 /// plan in `docs/V13_IMPLEMENTATION_PLAN.md` §4.4 — enough for typical
 /// error messages + a stack-frame or two, without bloating the request.
@@ -81,6 +83,14 @@ pub fn mask_secrets(text: &str) -> String {
     secrets::mask(text)
 }
 
+/// v1.8: Broader redaction for AI-bound text. Use this (not `mask_secrets`)
+/// when building prompts that will be sent to the local Ollama model. Catches
+/// Bearer tokens, `password=`, `api_key=`, URL userinfo, and export SECRET=
+/// in addition to the known token formats.
+pub fn redact_for_prompt(text: &str) -> String {
+    redact_secrets(text)
+}
+
 /// Truncate `text` to at most `max_bytes` bytes, ending on a UTF-8 char
 /// boundary. Appends a `"…[truncated]"` marker when truncation occurs.
 pub fn truncate_bytes(text: &str, max_bytes: usize) -> String {
@@ -115,11 +125,11 @@ Prefer portable macOS/BSD tooling (grep -E instead of GNU grep -P, find over fd)
 If the request is dangerous or destructive, reply with: # refused: <reason>. \
 If the request is unclear, reply with: # ambiguous: <one short clarifying question>.";
 
-    let masked_cwd = mask_secrets(&prompt.cwd);
+    let masked_cwd = redact_for_prompt(&prompt.cwd);
     let masked_history: Vec<String> = prompt
         .recent_history
         .iter()
-        .map(|h| mask_secrets(h))
+        .map(|h| redact_for_prompt(h))
         .collect();
 
     let mut user = String::new();
@@ -165,9 +175,9 @@ Keep the answer under 200 words. Do not restate the command verbatim. \
 Do not use markdown headings. If the failure is secret-related (e.g. auth token), \
 point that out without echoing the secret.";
 
-    let masked_cmd = mask_secrets(&prompt.command);
-    let masked_out = mask_secrets(&truncate_bytes(&prompt.output, MAX_OUTPUT_BYTES));
-    let masked_cwd = mask_secrets(&prompt.cwd);
+    let masked_cmd = redact_for_prompt(&prompt.command);
+    let masked_out = redact_for_prompt(&truncate_bytes(&prompt.output, MAX_OUTPUT_BYTES));
+    let masked_cwd = redact_for_prompt(&prompt.cwd);
 
     let mut user = String::new();
     user.push_str("command: ");
