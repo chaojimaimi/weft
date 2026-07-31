@@ -5,6 +5,7 @@
 //! action variant to its handler (copy/paste/scroll/tabs/modals/theme/zoom).
 
 use crate::effect::Effect;
+use crate::palette_state::{PaletteEntry, PaletteSubMode};
 use weft_core::config::Action;
 use weft_core::pane_layout::{FocusDirection, SplitDirection};
 
@@ -282,6 +283,46 @@ impl crate::App {
             Action::FocusPaneDown => self.focus_direction_pane(FocusDirection::Down),
             Action::FocusPaneLeft => self.focus_direction_pane(FocusDirection::Left),
             Action::FocusPaneRight => self.focus_direction_pane(FocusDirection::Right),
+            // v1.8.1: Open palette in AI mode.
+            Action::GenerateCommand => {
+                if self.ai_state.is_configured() {
+                    self.reset_ime_context("AI palette opened");
+                    self.close_find();
+                    self.close_settings();
+                    self.save_focus_for_modal(crate::scene::FocusId::PaletteQuery);
+                    self.palette.open = true;
+                    self.palette.submode = PaletteSubMode::AiCommand {
+                        buffer: String::new(),
+                        pending_id: None,
+                    };
+                    self.palette.results.clear();
+                    self.palette.selection = 0;
+                    self.palette.query.clear();
+                    self.request_redraw();
+                } else {
+                    tracing::debug!("AI not configured; GenerateCommand ignored");
+                }
+                true
+            }
+            // v1.8.1: Insert the currently-selected AI suggestion.
+            Action::InsertAiSuggestion => {
+                if let Some(entry) = self.palette.results.get(self.palette.selection).cloned() {
+                    self.activate_palette_entry(entry);
+                }
+                true
+            }
+            // v1.8.1: Cancel any in-flight AI request.
+            Action::CancelAiRequest => {
+                self.ai_state.cancel_all();
+                if let PaletteSubMode::AiCommand { pending_id, .. } = &mut self.palette.submode {
+                    *pending_id = None;
+                }
+                self.palette
+                    .results
+                    .retain(|e| !matches!(e, PaletteEntry::AiSuggestion { .. }));
+                self.request_redraw();
+                true
+            }
         }
     }
 }

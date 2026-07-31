@@ -235,6 +235,93 @@ pub fn clean_command_output(raw: &str) -> String {
     inner.trim().to_string()
 }
 
+/// v1.8.1: Risk level for an AI-generated command. Used by the palette to
+/// display a warning badge and by `activate_palette_entry` to decide whether
+/// to insert directly or require explicit confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiRiskLevel {
+    /// No destructive patterns detected.
+    Safe,
+    /// Privilege escalation or system modification — display a caution badge.
+    Caution,
+    /// Catastrophic/irreversible patterns — display a danger badge and warn.
+    Dangerous,
+}
+
+impl AiRiskLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Safe => "AI",
+            Self::Caution => "AI ⚠",
+            Self::Dangerous => "AI ⚠⚠",
+        }
+    }
+}
+
+/// v1.8.1: Classify a generated command's risk level by pattern matching.
+/// Pure function — no side effects, fully testable.
+///
+/// Patterns (case-insensitive, word-boundary aware where practical):
+/// - **Dangerous**: `rm -rf /`, `dd of=/dev/`, `mkfs`, `> /dev/sd`, `chmod 777 /`
+/// - **Caution**: `sudo`, `chmod`, `chown`, `kill -9`, `shutdown`, `reboot`
+/// - **Safe**: everything else
+pub fn classify_command_risk(command: &str) -> AiRiskLevel {
+    let lower = command.to_lowercase();
+    let trimmed = lower.trim();
+
+    // Dangerous patterns — irreversible system damage.
+    let dangerous_patterns: &[&str] = &[
+        "rm -rf /",
+        "rm -rf /*",
+        "rm -rf ~",
+        "rm -rf $home",
+        "of=/dev/",  // dd/mkfs writing to a block device
+        "mkfs",
+        "> /dev/sd",
+        "chmod 777 /",
+        "chmod -r 777 /",
+        ":(){:|:&};:",
+        "fork bomb",
+    ];
+    for pat in dangerous_patterns {
+        if trimmed.contains(pat) {
+            return AiRiskLevel::Dangerous;
+        }
+    }
+    // `rm -rf` with any path starting at root or home is dangerous.
+    if trimmed.contains("rm -rf") {
+        // Check if it targets root, home, or wildcard
+        if trimmed.contains("rm -rf /")
+            || trimmed.contains("rm -rf ~")
+            || trimmed.contains("rm -rf *")
+            || trimmed.contains("rm -rf .")
+        {
+            return AiRiskLevel::Dangerous;
+        }
+    }
+
+    // Caution patterns — privilege escalation or system modification.
+    let caution_patterns: &[&str] = &[
+        "sudo",
+        "chmod ",
+        "chown ",
+        "kill -9",
+        "killall",
+        "shutdown",
+        "reboot",
+        "halt",
+        "launchctl",
+        "nvram",
+    ];
+    for pat in caution_patterns {
+        if trimmed.contains(pat) {
+            return AiRiskLevel::Caution;
+        }
+    }
+
+    AiRiskLevel::Safe
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +459,61 @@ mod tests {
         };
         let msgs = build_diagnose_messages(&p);
         assert!(!msgs[1].content.contains("cwd:"));
+    }
+
+    // ── v1.8.1 classify_command_risk tests ──────────────────────────
+
+    #[test]
+    fn risk_safe_for_normal_commands() {
+        assert_eq!(classify_command_risk("ls -la"), AiRiskLevel::Safe);
+        assert_eq!(classify_command_risk("git status"), AiRiskLevel::Safe);
+        assert_eq!(classify_command_risk("echo hello"), AiRiskLevel::Safe);
+        assert_eq!(classify_command_risk("find . -name '*.ts'"), AiRiskLevel::Safe);
+    }
+
+    #[test]
+    fn risk_dangerous_for_rm_rf_root() {
+        assert_eq!(classify_command_risk("rm -rf /"), AiRiskLevel::Dangerous);
+        assert_eq!(classify_command_risk("rm -rf /*"), AiRiskLevel::Dangerous);
+        assert_eq!(classify_command_risk("rm -rf ~"), AiRiskLevel::Dangerous);
+        assert_eq!(classify_command_risk("rm -rf *"), AiRiskLevel::Dangerous);
+    }
+
+    #[test]
+    fn risk_dangerous_for_dd_to_device() {
+        assert_eq!(classify_command_risk("dd if=image.iso of=/dev/disk4"), AiRiskLevel::Dangerous);
+    }
+
+    #[test]
+    fn risk_dangerous_for_mkfs() {
+        assert_eq!(classify_command_risk("mkfs.ext4 /dev/sda1"), AiRiskLevel::Dangerous);
+    }
+
+    #[test]
+    fn risk_caution_for_sudo() {
+        assert_eq!(classify_command_risk("sudo apt update"), AiRiskLevel::Caution);
+        assert_eq!(classify_command_risk("sudo brew install ffmpeg"), AiRiskLevel::Caution);
+    }
+
+    #[test]
+    fn risk_caution_for_chmod() {
+        assert_eq!(classify_command_risk("chmod +x script.sh"), AiRiskLevel::Caution);
+    }
+
+    #[test]
+    fn risk_caution_for_kill() {
+        assert_eq!(classify_command_risk("kill -9 12345"), AiRiskLevel::Caution);
+        assert_eq!(classify_command_risk("killall node"), AiRiskLevel::Caution);
+    }
+
+    #[test]
+    fn risk_dangerous_for_chmod_777_root() {
+        assert_eq!(classify_command_risk("chmod 777 /"), AiRiskLevel::Dangerous);
+    }
+
+    #[test]
+    fn risk_case_insensitive() {
+        assert_eq!(classify_command_risk("SUDO ls"), AiRiskLevel::Caution);
+        assert_eq!(classify_command_risk("RM -RF /"), AiRiskLevel::Dangerous);
     }
 }

@@ -374,6 +374,11 @@ impl App {
                             PaletteEntry::Runbook(entry) => {
                                 (entry.command.clone(), entry.description.clone(), "Runbook")
                             }
+                            // v1.8.1: AI suggestions show the command with
+                            // a risk badge as the kind label.
+                            PaletteEntry::AiSuggestion { command, risk } => {
+                                (command.clone(), String::new(), risk.label())
+                            }
                         })
                         .collect()
                 };
@@ -397,6 +402,15 @@ impl App {
                 }
                 PaletteSubMode::SelectTheme { buffer, .. } => {
                     ("Select theme:".to_string(), buffer.clone())
+                }
+                // v1.8.1: AI command generation mode.
+                PaletteSubMode::AiCommand { buffer, pending_id } => {
+                    let banner = if pending_id.is_some() {
+                        "✨ Generating…".to_string()
+                    } else {
+                        "✨ Ask AI (describe command):".to_string()
+                    };
+                    (banner, buffer.clone())
                 }
             };
 

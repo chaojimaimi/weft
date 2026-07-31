@@ -790,6 +790,9 @@ impl App {
                 weft_core::config::Action::FocusPaneDown => "Focus Pane Down",
                 weft_core::config::Action::FocusPaneLeft => "Focus Pane Left",
                 weft_core::config::Action::FocusPaneRight => "Focus Pane Right",
+                weft_core::config::Action::GenerateCommand => "Generate Command (AI)",
+                weft_core::config::Action::InsertAiSuggestion => "Insert AI Suggestion",
+                weft_core::config::Action::CancelAiRequest => "Cancel AI Request",
             };
             views.push(SettingsKeybindingView {
                 action: label.to_string(),

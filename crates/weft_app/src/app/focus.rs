@@ -20,10 +20,13 @@ impl crate::App {
 
     /// v0.9: close the command palette and reset its state. Used when
     /// another modal (find bar, …) opens so only one owns keyboard input.
+    /// v1.8.1: also cancels any in-flight AI request so the background
+    /// task doesn't try to write into a closed palette.
     pub(crate) fn close_palette(&mut self) {
         if !self.palette.open {
             return;
         }
+        self.ai_state.cancel_all();
         self.reset_ime_context("palette closed");
         self.palette.close();
         self.clear_prev_focus_if_no_modal();

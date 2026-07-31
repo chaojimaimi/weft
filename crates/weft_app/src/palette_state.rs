@@ -23,6 +23,13 @@ pub(crate) enum PaletteEntry {
     /// with the command — no auto-execution.
     SearchHit(SearchHit),
     Runbook(weft_core::runbook::RunbookEntry),
+    /// v1.8.1: An AI-generated command suggestion. Activating inserts the
+    /// command into the editor (no auto-execution). `risk` drives the
+    /// badge colour and whether a confirmation warning is shown.
+    AiSuggestion {
+        command: String,
+        risk: crate::ai::AiRiskLevel,
+    },
 }
 
 impl PaletteEntry {
@@ -43,6 +50,11 @@ impl PaletteEntry {
                 format!("search/{}/{}", hit.doc.kind as u8, hit.doc.stable_id)
             }
             Self::Runbook(entry) => format!("runbook/{}", entry.command),
+            // v1.8.1: AI suggestions use a content hash so re-generating
+            // the same command replaces the old entry instead of stacking.
+            Self::AiSuggestion { command, .. } => {
+                format!("ai/{}", fxhash_seed(command))
+            }
         }
     }
 }
@@ -151,6 +163,13 @@ pub(crate) enum PaletteSubMode {
         buffer: String,
         themes: Vec<String>,
     },
+    /// v1.8.1: Natural-language → shell-command generation via local Ollama.
+    /// `buffer` collects the user's query; `pending_id` tracks the async
+    /// request (cleared when the result arrives via `poll_ai_results`).
+    AiCommand {
+        buffer: String,
+        pending_id: Option<u64>,
+    },
 }
 
 #[derive(PartialEq, Eq)]
@@ -211,7 +230,8 @@ impl PaletteState {
             PaletteSubMode::Search => &self.query,
             PaletteSubMode::CreateWorkflow { buffer, .. }
             | PaletteSubMode::EditWorkflow { buffer, .. }
-            | PaletteSubMode::SelectTheme { buffer, .. } => buffer,
+            | PaletteSubMode::SelectTheme { buffer, .. }
+            | PaletteSubMode::AiCommand { buffer, .. } => buffer,
             PaletteSubMode::ConfirmDelete { .. } => "",
         }
     }
@@ -239,6 +259,17 @@ impl PaletteState {
 
 pub(crate) fn theme_name_is_dark(name: &str) -> bool {
     !matches!(name, "weft-light" | "solarized-light" | "gruvbox-light")
+}
+
+/// v1.8.1: Simple FNV-1a hash for AI suggestion accessibility keys.
+/// No cryptographic strength needed — just a stable identifier.
+fn fxhash_seed(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]

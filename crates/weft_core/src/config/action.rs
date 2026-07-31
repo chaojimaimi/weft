@@ -119,9 +119,22 @@ pub enum Action {
     /// v1.3.3: Move focus to the nearest pane to the right of the active
     /// pane (Cmd+Alt+Right). Replaces the v1.3.0 cyclic `FocusNextPane`
     /// binding on Cmd+Alt+Right — cyclic focus is still reachable via
-    /// Cmd+Alt+RightBracket.
+    /// Cmd+Alt+Right Bracket.
     #[serde(rename = "focus_pane_right")]
     FocusPaneRight,
+    /// v1.8.1: Open the command palette in AI mode (natural-language →
+    /// shell command). Requires a configured local Ollama backend.
+    #[serde(rename = "generate_command")]
+    GenerateCommand,
+    /// v1.8.1: Insert the currently-selected AI suggestion into the editor.
+    /// Equivalent to pressing Enter on an AiSuggestion palette entry, but
+    /// bindable as a dedicated key.
+    #[serde(rename = "insert_ai_suggestion")]
+    InsertAiSuggestion,
+    /// v1.8.1: Cancel any in-flight AI request and clear the palette's AI
+    /// suggestions. Does not close the palette.
+    #[serde(rename = "cancel_ai_request")]
+    CancelAiRequest,
 }
 
 /// v1.5.0: Canonical string form of an [`Action`], matching the serde
@@ -161,5 +174,8 @@ pub fn action_to_str(action: &Action) -> &'static str {
         Action::FocusPaneDown => "focus_pane_down",
         Action::FocusPaneLeft => "focus_pane_left",
         Action::FocusPaneRight => "focus_pane_right",
+        Action::GenerateCommand => "generate_command",
+        Action::InsertAiSuggestion => "insert_ai_suggestion",
+        Action::CancelAiRequest => "cancel_ai_request",
     }
 }

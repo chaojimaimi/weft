@@ -225,6 +225,16 @@ impl App {
                 self.close_palette();
                 self.request_redraw();
             }
+            // v1.8.1: Insert the AI-generated command into the editor.
+            // No auto-execution — the user reviews and presses Enter.
+            PaletteEntry::AiSuggestion { command, risk: _ } => {
+                if let Some(terminal) = self.sessions.active_mut().terminal.as_mut() {
+                    terminal.editor_mut().buffer.set_text(&command);
+                    terminal.editor_mut().buffer.select_all();
+                }
+                self.close_palette();
+                self.request_redraw();
+            }
         }
     }
 

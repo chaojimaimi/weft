@@ -197,6 +197,10 @@ impl App {
             PaletteSubMode::SelectTheme { .. } => {
                 return self.handle_palette_select_theme_key(key, mods, text);
             }
+            // v1.8.1: AI command generation mode.
+            PaletteSubMode::AiCommand { .. } => {
+                return self.handle_palette_ai_key(key, mods, text);
+            }
             PaletteSubMode::Search => {}
         }
 
@@ -287,6 +291,8 @@ impl App {
                         'e' | 'E' => Some("edit"),
                         'd' | 'D' => Some("delete"),
                         'x' | 'X' => Some("export"),
+                        // v1.8.1: 'a' enters AI command-generation mode.
+                        'a' | 'A' => Some("ai"),
                         _ => None,
                     };
                     if let Some(act) = action {

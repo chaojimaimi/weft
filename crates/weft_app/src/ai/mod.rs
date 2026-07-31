@@ -32,8 +32,8 @@ use weft_core::config::AiConfig;
 use client::{build_backend, AiBackend, AiError, CancelFlag};
 
 pub use prompt::{
-    build_command_gen_messages, build_diagnose_messages, clean_command_output, CommandGenPrompt,
-    DiagnosePrompt,
+    build_command_gen_messages, build_diagnose_messages, clean_command_output, classify_command_risk,
+    AiRiskLevel, CommandGenPrompt, DiagnosePrompt,
 };
 
 // Re-export the byte/history caps so the Settings UI / palette can hint at

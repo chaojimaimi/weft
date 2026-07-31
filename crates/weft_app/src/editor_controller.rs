@@ -414,15 +414,72 @@ impl App {
     }
 
     /// v1.8: Drain completed AI request results from the background tokio
-    /// tasks. The events are stored on `self.ai_state` (no UI surface yet
-    /// in v1.8.0 — the palette and block view consume them in v1.8.1 /
-    /// v1.8.2). This call just keeps the channel drained so the
-    /// "thinking…" indicator (`in_flight`) clears correctly.
+    /// tasks. Routes `CommandGen` results to the palette as
+    /// `PaletteEntry::AiSuggestion` entries; `Diagnose` results are dropped
+    /// here (v1.8.2 will route them to the block view).
     pub(super) fn poll_ai_results(&mut self) {
-        let _events = self.ai_state.poll();
-        // v1.8.0: events are dropped here. v1.8.1 will route CommandGen
-        // results to the palette; v1.8.2 will route Diagnose results to
-        // the block view.
+        let events = self.ai_state.poll();
+        if events.is_empty() {
+            return;
+        }
+
+        for event in events {
+            match event {
+                crate::ai::AiResultEvent::CommandGen { id, command } => {
+                    // Only accept if the palette is in AiCommand mode and
+                    // the id matches the pending request.
+                    if let PaletteSubMode::AiCommand { pending_id, .. } =
+                        &mut self.palette.submode
+                    {
+                        if *pending_id == Some(id) {
+                            *pending_id = None;
+                            let risk = crate::ai::classify_command_risk(&command);
+                            // Clear old AI suggestions and prepend the new one.
+                            self.palette
+                                .results
+                                .retain(|e| !matches!(e, PaletteEntry::AiSuggestion { .. }));
+                            self.palette.results.insert(
+                                0,
+                                PaletteEntry::AiSuggestion { command, risk },
+                            );
+                            self.palette.selection = 0;
+                            self.request_redraw();
+                        }
+                    }
+                }
+                crate::ai::AiResultEvent::Error { id, message } => {
+                    // Show error in the palette if it's the pending request.
+                    if let PaletteSubMode::AiCommand { pending_id, buffer } =
+                        &mut self.palette.submode
+                    {
+                        if *pending_id == Some(id) {
+                            *pending_id = None;
+                            tracing::warn!(error = %message, "AI command generation failed");
+                            // Put the query back so the user can retry.
+                            if buffer.is_empty() {
+                                // Can't recover the original query; just clear.
+                                self.palette.results.clear();
+                            }
+                            self.request_redraw();
+                        }
+                    }
+                }
+                crate::ai::AiResultEvent::Cancelled { id } => {
+                    // Clear the pending marker if this was our request.
+                    if let PaletteSubMode::AiCommand { pending_id, .. } =
+                        &mut self.palette.submode
+                    {
+                        if *pending_id == Some(id) {
+                            *pending_id = None;
+                            self.request_redraw();
+                        }
+                    }
+                }
+                crate::ai::AiResultEvent::Diagnose { .. } => {
+                    // v1.8.2: route to block view.
+                }
+            }
+        }
     }
 
     pub(super) fn editor_completion_next(&mut self) {

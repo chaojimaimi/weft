@@ -78,6 +78,23 @@ impl App {
                 // Export doesn't change mode — stay in search.
                 false
             }
+            // v1.8.1: Enter AI command-generation mode. Only available when
+            // the local Ollama backend is configured.
+            "ai" => {
+                if self.ai_state.is_configured() {
+                    self.palette.submode = PaletteSubMode::AiCommand {
+                        buffer: String::new(),
+                        pending_id: None,
+                    };
+                    self.palette.results.clear();
+                    self.palette.selection = 0;
+                    self.request_redraw();
+                    true
+                } else {
+                    tracing::debug!("AI not configured; ignoring 'ai' palette shortcut");
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -367,6 +384,147 @@ impl App {
                 }
                 false
             }
+        }
+    }
+
+    // ── v1.8.1: AI command-generation sub-mode ────────────────────────
+
+    /// Handle keys while in `PaletteSubMode::AiCommand`.
+    ///
+    /// - **Enter**: If a query is typed and no request is pending, spawn
+    ///   `ai_state.spawn_command_gen`. If results exist, activate the
+    ///   selected suggestion (insert into editor).
+    /// - **Escape**: Cancel any pending request and return to Search mode.
+    /// - **Backspace**: Delete from the buffer.
+    /// - **Char**: Append to the buffer.
+    /// - **Up/Down**: Navigate results (when present).
+    pub(super) fn handle_palette_ai_key(
+        &mut self,
+        key: KeyCode,
+        mods: Modifiers,
+        text: Option<&str>,
+    ) -> bool {
+        use crate::paint::command_surface::CommandSurfaceKeyAction;
+
+        // Cancel on Escape.
+        if key == KeyCode::Escape {
+            self.ai_state.cancel_all();
+            self.palette.submode = PaletteSubMode::Search;
+            self.palette.query.clear();
+            self.refresh_palette_results();
+            self.request_redraw();
+            return true;
+        }
+
+        // Navigate results with Up/Down when results exist.
+        let has_results = !self.palette.results.is_empty();
+        if has_results {
+            let protocol = crate::paint::command_surface::resolve_command_surface_key(key, mods);
+            match protocol {
+                CommandSurfaceKeyAction::MoveUp | CommandSurfaceKeyAction::PageUp => {
+                    if self.palette.selection > 0 {
+                        self.palette.selection -= 1;
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+                CommandSurfaceKeyAction::MoveDown | CommandSurfaceKeyAction::PageDown => {
+                    if self.palette.selection + 1 < self.palette.results.len() {
+                        self.palette.selection += 1;
+                    }
+                    self.request_redraw();
+                    return true;
+                }
+                CommandSurfaceKeyAction::Accept => {
+                    // Activate the selected AI suggestion.
+                    if let Some(entry) =
+                        self.palette.results.get(self.palette.selection).cloned()
+                    {
+                        self.activate_palette_entry(entry);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        match key {
+            KeyCode::Enter => {
+                // Submit the query to the AI backend.
+                let PaletteSubMode::AiCommand { buffer, pending_id } =
+                    &mut self.palette.submode
+                else {
+                    return false;
+                };
+                if pending_id.is_some() {
+                    // Already waiting — ignore.
+                    return true;
+                }
+                if buffer.trim().is_empty() {
+                    return true;
+                }
+                let query = std::mem::take(buffer);
+                let cwd = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .and_then(|t| t.cwd().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                // Gather recent history (most-recent first, capped).
+                let recent_history: Vec<String> = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .map(|t| t.editor().history().to_vec())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .rev()
+                    .take(crate::ai::MAX_HISTORY_ENTRIES)
+                    .collect();
+                let prompt = crate::ai::CommandGenPrompt {
+                    user_query: query,
+                    cwd,
+                    recent_history,
+                };
+                if let Some(id) = self.ai_state.spawn_command_gen(prompt) {
+                    *pending_id = Some(id);
+                    // Clear old results while waiting.
+                    self.palette.results.clear();
+                    self.palette.selection = 0;
+                    self.request_redraw();
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if let PaletteSubMode::AiCommand { buffer, pending_id } =
+                    &mut self.palette.submode
+                {
+                    if pending_id.is_none() {
+                        buffer.pop();
+                        self.request_redraw();
+                    }
+                }
+                true
+            }
+            KeyCode::Char(c) => {
+                let PaletteSubMode::AiCommand { buffer, pending_id } =
+                    &mut self.palette.submode
+                else {
+                    return false;
+                };
+                if pending_id.is_some() {
+                    return true;
+                }
+                let ch = resolve_text_char(text, c, mods.contains(Modifiers::SHIFT));
+                if ch != '\0' && !ch.is_control() {
+                    buffer.push(ch);
+                    self.request_redraw();
+                }
+                true
+            }
+            _ => true, // consume all other keys in AI mode
         }
     }
 }

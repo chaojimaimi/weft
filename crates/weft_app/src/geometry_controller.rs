@@ -56,6 +56,8 @@ impl App {
                     // v1.7.1: Search hits use the document title as label.
                     PaletteEntry::SearchHit(hit) => hit.doc.title.clone(),
                     PaletteEntry::Runbook(entry) => entry.command.clone(),
+                    // v1.8.1: AI suggestions use the generated command as label.
+                    PaletteEntry::AiSuggestion { command, .. } => command.clone(),
                 })
                 .collect(),
         };
