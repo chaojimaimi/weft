@@ -123,21 +123,35 @@ fn schedule_primary_history_refresh_wakes(
     }
 }
 
+/// v1.7.6: Hydrate a terminal with persisted history. The editor's ↑-key
+/// recall gets the GLOBAL command list (all tabs, so ↑ can recall any
+/// previous command). The block tracker gets ONLY this tab's blocks
+/// (filtered by `tab_block_ids`) so the block view shows per-tab history
+/// instead of mixing all tabs' history together.
 fn hydrate_persisted_history(
     terminal: &mut Terminal,
-    newest_first: &[weft_core::blocks::Block],
+    global_newest_first: &[weft_core::blocks::Block],
+    tab_block_ids: &[u64],
     block_id_allocator: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    // SQLite returns newest→oldest. Both BlockTracker and Editor::load_history
-    // accept chronological input; the editor reverses it internally for Up.
-    let oldest_first: Vec<_> = newest_first.iter().rev().cloned().collect();
-    let commands = oldest_first
+    // Editor ↑-key recall: global command history (across all tabs).
+    let commands = global_newest_first
         .iter()
+        .rev()
         .map(|block| strip_prompt_prefix(&block.command))
         .filter(|command| !command.trim().is_empty())
         .collect();
     terminal.editor_mut().load_history(commands);
-    terminal.block_tracker_mut().load_blocks(oldest_first);
+
+    // Block tracker: only this tab's blocks (per-tab isolation).
+    // SQLite returns newest→oldest; BlockTracker expects chronological.
+    let tab_blocks: Vec<_> = global_newest_first
+        .iter()
+        .rev()
+        .filter(|b| tab_block_ids.contains(&b.id.0))
+        .cloned()
+        .collect();
+    terminal.block_tracker_mut().load_blocks(tab_blocks);
     terminal
         .block_tracker_mut()
         .use_shared_id_allocator(block_id_allocator);
@@ -468,12 +482,24 @@ impl ApplicationHandler<AppEvent> for App {
         // Restore history only after the tab topology is final. Hydrating the
         // initial terminal before cwd-based replacement discarded the loaded
         // history, and additional restored tabs never received it at all.
+        //
+        // v1.7.6: Per-tab isolation — each tab's block tracker receives ONLY
+        // the blocks it produced last session (from its TabSnapshot's
+        // `block_ids`). The editor's ↑-key recall still gets the full global
+        // history. This prevents all tabs from showing the same mixed history.
         if let Some(block_id_allocator) = block_id_allocator {
             for tab in self.sessions.tabs_mut() {
+                // Clone first to avoid borrow conflict with terminal.as_mut().
+                let tab_block_ids: Vec<u64> = tab
+                    .restored_snapshot
+                    .as_ref()
+                    .map(|snap| snap.block_ids.clone())
+                    .unwrap_or_default();
                 if let Some(terminal) = tab.terminal.as_mut() {
                     hydrate_persisted_history(
                         terminal,
                         &persisted_history,
+                        &tab_block_ids,
                         block_id_allocator.clone(),
                     );
                 }
@@ -794,26 +820,54 @@ mod tests {
     }
 
     #[test]
-    fn restored_history_is_chronological_and_shares_output_across_tabs() {
+    fn hydrate_gives_editor_global_history_but_tracker_only_tab_blocks() {
+        // v1.7.6: editor ↑-key recall is global; block tracker is per-tab.
         let mut newest_first = vec![block(2, "❯ echo newest"), block(1, "❯ echo oldest")];
         newest_first[0].output = "large persisted output".repeat(1024).into();
         let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
-        let mut terminal = Terminal::new(24, 80);
-        let mut second_terminal = Terminal::new(24, 80);
-        hydrate_persisted_history(&mut terminal, &newest_first, allocator.clone());
-        hydrate_persisted_history(&mut second_terminal, &newest_first, allocator);
+        let mut terminal_a = Terminal::new(24, 80);
+        let mut terminal_b = Terminal::new(24, 80);
 
-        assert_eq!(terminal.editor().history(), ["echo newest", "echo oldest"]);
-        let ids: Vec<_> = terminal
+        // Tab A produced blocks [1, 2]; tab B produced only block [1].
+        hydrate_persisted_history(&mut terminal_a, &newest_first, &[1, 2], allocator.clone());
+        hydrate_persisted_history(&mut terminal_b, &newest_first, &[1], allocator);
+
+        // Both editors see the full global command history (↑-key recall).
+        assert_eq!(terminal_a.editor().history(), ["echo newest", "echo oldest"]);
+        assert_eq!(terminal_b.editor().history(), ["echo newest", "echo oldest"]);
+
+        // Block trackers are per-tab isolated.
+        let ids_a: Vec<_> = terminal_a
             .block_tracker()
             .blocks()
             .iter()
-            .map(|block| block.id.0)
+            .map(|b| b.id.0)
             .collect();
-        assert_eq!(ids, [1, 2]);
+        let ids_b: Vec<_> = terminal_b
+            .block_tracker()
+            .blocks()
+            .iter()
+            .map(|b| b.id.0)
+            .collect();
+        assert_eq!(ids_a, [1, 2]);
+        assert_eq!(ids_b, [1]);
+
+        // Shared Arc<str> output (no clone of the large string).
         assert!(std::sync::Arc::ptr_eq(
-            &terminal.block_tracker().blocks()[1].output,
-            &second_terminal.block_tracker().blocks()[1].output,
+            &terminal_a.block_tracker().blocks()[0].output,
+            &terminal_b.block_tracker().blocks()[0].output,
         ));
+    }
+
+    #[test]
+    fn hydrate_with_empty_block_ids_loads_nothing_into_tracker() {
+        // v1.7.6: legacy snapshots (no block_ids) → block tracker stays empty,
+        // but editor still gets global ↑-key history.
+        let newest_first = vec![block(1, "❯ ls"), block(2, "❯ echo hi")];
+        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let mut terminal = Terminal::new(24, 80);
+        hydrate_persisted_history(&mut terminal, &newest_first, &[], allocator);
+        assert!(terminal.block_tracker().blocks().is_empty());
+        assert_eq!(terminal.editor().history().len(), 2);
     }
 }

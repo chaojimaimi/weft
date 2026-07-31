@@ -962,6 +962,216 @@ fn semantic_output_enabled_true_not_written_to_disk() {
 }
 
 #[test]
+fn semantic_output_toggle_off_then_on_clears_false_from_disk() {
+    // v1.7.5 regression: 用户通过 Settings 把 Semantic 从 on 切到 off 再切回 on，
+    // 磁盘上仍残留 `enabled = false`，导致 reload 后仍为 false。
+    // 根因：save_to_path 只在 `enabled == Some(false)` 时写入该键，切回 on 时
+    // 既不写 `enabled = true` 也不删除已有的 `enabled = false`，toml_edit 增量
+    // 编辑保留了旧键。
+    let dir = unique_tmp_path("semantic-toggle-roundtrip");
+    // unique_tmp_path 返回的是 config.toml 路径，其父目录已创建
+    let path = &dir;
+    // 初始文件：无 enabled 键（默认 true）
+    std::fs::write(path, "[theme]\nname = \"weft-warm\"\n").unwrap();
+
+    // off: load → set enabled = Some(false) → save
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.output = Some(OutputSemanticConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    cfg.save_to_path(path).unwrap();
+    let after_off = std::fs::read_to_string(path).unwrap();
+    assert!(after_off.contains("enabled = false"));
+
+    // on: load → set enabled = Some(true) → save
+    let mut cfg: Config = toml::from_str(&after_off).unwrap();
+    cfg.theme.output = Some(OutputSemanticConfig {
+        enabled: Some(true),
+        ..Default::default()
+    });
+    cfg.save_to_path(path).unwrap();
+    let after_on = std::fs::read_to_string(path).unwrap();
+
+    // 关键断言：磁盘上不应残留 enabled = false
+    assert!(
+        !after_on.contains("enabled = false"),
+        "BUG: 'enabled = false' still on disk after toggle to ON:\n{}",
+        after_on
+    );
+    // reload 后应为 true
+    let reloaded: Config = toml::from_str(&after_on).unwrap();
+    assert!(
+        reloaded.theme.semantic_output_enabled(),
+        "after toggle ON, reload should report true; disk:\n{}",
+        after_on
+    );
+}
+
+#[test]
+fn syntax_overrides_cleared_from_disk_when_all_fields_become_none() {
+    // 举一反三：[theme.syntax] 也有"创建新表+仅非空写入"的反模式。
+    // 当所有 syntax 字段从 Some 切回 None 时，磁盘上的旧值应被清除。
+    let dir = unique_tmp_path("syntax-clear-roundtrip");
+    let path = &dir;
+    // Step 1: 写入有 syntax 覆盖的配置
+    std::fs::write(
+        path,
+        "[theme]\nname = \"weft-warm\"\n[theme.syntax]\ncommand = \"#ff0000\"\nflag = \"#00ff00\"\n",
+    )
+    .unwrap();
+
+    // Step 2: load → 清空所有 syntax 字段 → save
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.syntax = Some(crate::config::SyntaxConfig {
+        command: None,
+        flag: None,
+        argument: None,
+        path: None,
+        string: None,
+        number: None,
+        variable: None,
+        operator: None,
+        comment: None,
+        default: None,
+    });
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+
+    // 关键断言：磁盘上不应残留 syntax 覆盖
+    assert!(
+        !after.contains("command ="),
+        "BUG: syntax.command still on disk after clearing:\n{}",
+        after
+    );
+    assert!(
+        !after.contains("[theme.syntax]"),
+        "BUG: [theme.syntax] table still on disk after clearing (should be removed):\n{}",
+        after
+    );
+}
+
+#[test]
+fn palette_cleared_from_disk_when_emptied() {
+    // 举一反三：theme.palette 清空时也应从磁盘删除旧值。
+    let dir = unique_tmp_path("palette-clear-roundtrip");
+    let path = &dir;
+    std::fs::write(
+        path,
+        "[theme]\nname = \"weft-warm\"\npalette = [\"#1f1f1f\", \"#ff0000\"]\n",
+    )
+    .unwrap();
+
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.palette.clear();
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+
+    assert!(
+        !after.contains("palette"),
+        "BUG: palette still on disk after clearing:\n{}",
+        after
+    );
+}
+
+#[test]
+fn syntax_argument_field_round_trips_through_save_load() {
+    // v1.7.0-B 回归：SyntaxConfig.argument 字段在 save_to_path 中漏序列化，
+    // 用户在 Settings 中配置的 argument 颜色 save 后会丢失。本测试验证修复后
+    // argument 字段能正确 round-trip。
+    let dir = unique_tmp_path("syntax-argument-roundtrip");
+    let path = &dir;
+    std::fs::write(path, "[theme]\nname = \"weft-warm\"\n").unwrap();
+
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.syntax = Some(crate::config::SyntaxConfig {
+        argument: Some("#ff8800".to_string()),
+        command: None,
+        flag: None,
+        path: None,
+        string: None,
+        number: None,
+        variable: None,
+        operator: None,
+        comment: None,
+        default: None,
+    });
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+
+    // 磁盘上应有 argument = "#ff8800"
+    assert!(
+        after.contains("argument = \"#ff8800\""),
+        "BUG: argument field not written to disk:\n{}",
+        after
+    );
+
+    // reload 后 argument 字段应为 Some("#ff8800")
+    let reloaded: Config = toml::from_str(&after).unwrap();
+    assert_eq!(
+        reloaded.theme.syntax.as_ref().unwrap().argument.as_deref(),
+        Some("#ff8800"),
+        "argument field must round-trip through save/load"
+    );
+}
+
+#[test]
+fn syntax_section_removed_from_disk_when_set_to_none() {
+    // 审查建议：cfg.theme.syntax = None 时应删除磁盘上的整个 [theme.syntax] 表。
+    let dir = unique_tmp_path("syntax-none-clear");
+    let path = &dir;
+    std::fs::write(
+        path,
+        "[theme]\nname = \"weft-warm\"\n[theme.syntax]\ncommand = \"#ff0000\"\n",
+    )
+    .unwrap();
+
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.syntax = None;
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+
+    assert!(
+        !after.contains("[theme.syntax]"),
+        "BUG: [theme.syntax] still on disk after setting to None:\n{}",
+        after
+    );
+    assert!(
+        !after.contains("command ="),
+        "BUG: syntax.command still on disk after setting to None:\n{}",
+        after
+    );
+}
+
+#[test]
+fn output_section_removed_from_disk_when_set_to_none() {
+    // 审查建议：cfg.theme.output = None 时应删除磁盘上的整个 [theme.output] 表。
+    let dir = unique_tmp_path("output-none-clear");
+    let path = &dir;
+    std::fs::write(
+        path,
+        "[theme]\nname = \"weft-warm\"\n[theme.output]\nenabled = false\n",
+    )
+    .unwrap();
+
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.output = None;
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+
+    assert!(
+        !after.contains("[theme.output]"),
+        "BUG: [theme.output] still on disk after setting to None:\n{}",
+        after
+    );
+    assert!(
+        !after.contains("enabled = false"),
+        "BUG: enabled=false still on disk after setting output to None:\n{}",
+        after
+    );
+}
+
+#[test]
 fn semantic_output_toggle_preserves_color_overrides() {
     // v1.7.0-D review fix regression: toggling `enabled` must NOT wipe
     // sibling color-override fields (output_default/cwd/metadata/success/

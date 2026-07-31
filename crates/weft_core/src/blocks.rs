@@ -147,10 +147,18 @@ pub struct BlockTracker {
     screen_owned_blocks: HashSet<u64>,
     continuation_candidate: Option<BlockId>,
     continuation_base: Option<Block>,
-    /// Index in `blocks` where the current session's blocks begin. Blocks
-    /// before this were loaded from SQLite on startup (history search only —
-    /// NOT shown in the main block view, which is session-scoped).
+    /// v1.7.5: Kept at 0 (never advanced after init). Previously this marked
+    /// where the current session's blocks begin so `session_blocks()` could
+    /// exclude startup-hydrated SQLite history. Restore now shows that history
+    /// in the main view (Warp parity), so the field is effectively unused;
+    /// `screen_owned_blocks` is the new authority for continuation scoping.
     session_start: usize,
+    /// v1.7.6: IDs of blocks loaded via [`load_blocks`] (startup/Restore).
+    /// Used by [`session_produced_block_ids`] to distinguish blocks produced
+    /// THIS session (eligible for per-tab snapshot persistence) from loaded
+    /// history. Without this, saving a tab would re-persist all loaded
+    /// global history into the tab's `block_ids`, breaking per-tab isolation.
+    loaded_ids: HashSet<u64>,
     /// v1.0 P0-b Layer 2: Block ids whose rendering-relevant state changed
     /// (new block, collapse toggle) since the last [`take_dirty_blocks`].
     /// The renderer can skip unchanged blocks when rebuilding vertices.
@@ -182,6 +190,7 @@ impl BlockTracker {
             continuation_candidate: None,
             continuation_base: None,
             session_start: 0,
+            loaded_ids: HashSet::new(),
             dirty_blocks: HashSet::new(),
         }
     }
@@ -226,9 +235,11 @@ impl BlockTracker {
         &self.blocks
     }
 
-    /// Blocks created THIS session only (excludes the startup-hydrated SQLite
-    /// history). The main Warp-style block view reads this so it doesn't show
-    /// phantom pre-session history; the panel still uses [`blocks`].
+    /// All blocks visible in the main Warp-style block view. v1.7.5: this now
+    /// includes blocks loaded from SQLite on startup/Restore (so users see
+    /// their previous session's history), plus blocks created this session.
+    /// `screen_owned_blocks` distinguishes the two for continuation logic;
+    /// the panel / search use [`blocks`] directly.
     pub fn session_blocks(&self) -> &[Block] {
         let start = self.session_start.min(self.blocks.len());
         &self.blocks[start..]
@@ -293,15 +304,34 @@ impl BlockTracker {
     /// Load previously-persisted blocks (e.g. on startup from SQLite). They go
     /// straight into the history list (already persisted, so NOT into
     /// `unpersisted`), and `next_id` is advanced past the highest loaded id.
+    ///
+    /// v1.7.5: 加载的历史 block 现在也通过 `session_blocks()` 暴露给主视图，
+    /// 这样启动/Restore 后用户能看到上次的命令记录（与 Warp 行为一致）。
+    /// `session_start` 保持为 0，让 `session_blocks()` 返回全部 blocks。
+    /// `screen_owned_blocks` 集合保证 continuation 逻辑只匹配本会话产生的 block，
+    /// 不会误判加载的历史 block。
     pub fn load_blocks(&mut self, blocks: Vec<Block>) {
         for b in &blocks {
             self.ids.observe(b.id.0);
             self.dirty_blocks.insert(b.id.0);
+            self.loaded_ids.insert(b.id.0);
         }
         self.blocks.extend(blocks);
-        // Everything loaded so far is pre-session history; session blocks
-        // (appended after this) begin at the new length.
-        self.session_start = self.blocks.len();
+        // session_start 保持为初始值 0，让 session_blocks() 包含加载的历史。
+        // 之前这里设为 self.blocks.len() 是为了"避免显示 phantom pre-session
+        // history"，但用户期望 Restore 后能看到历史命令记录。
+    }
+
+    /// v1.7.6: IDs of blocks produced THIS session only (excludes blocks
+    /// loaded via [`load_blocks`] on startup/Restore). Used by the app-layer
+    /// `Tab::to_snapshot` to persist per-tab block ownership so each tab
+    /// can restore only its own history on next launch.
+    pub fn session_produced_block_ids(&self) -> Vec<u64> {
+        self.blocks
+            .iter()
+            .filter(|b| !self.loaded_ids.contains(&b.id.0))
+            .map(|b| b.id.0)
+            .collect()
     }
 
     /// Share persisted IDs across tabs; isolated trackers remain local.
@@ -633,7 +663,9 @@ mod tests {
     }
 
     #[test]
-    fn session_blocks_exclude_loaded_history() {
+    fn session_blocks_include_loaded_history_for_restore() {
+        // v1.7.5: 启动/Restore 后主视图应显示上次会话的命令记录（与 Warp 一致）。
+        // load_blocks 加载的历史 block 现在通过 session_blocks() 暴露给主视图。
         let mut t = BlockTracker::new();
         // Pre-session blocks loaded from SQLite on startup.
         t.load_blocks(vec![Block {
@@ -648,14 +680,16 @@ mod tests {
             collapsed: false,
         }]);
         assert_eq!(t.blocks().len(), 1);
-        // The main block view is session-scoped: loaded history is excluded.
-        assert!(t.session_blocks().is_empty());
+        // v1.7.5: session_blocks() 现在包含加载的历史（之前会排除）。
+        assert_eq!(t.session_blocks().len(), 1);
+        assert_eq!(t.session_blocks()[0].command, "old");
 
-        // A command run this session becomes a session block.
+        // A command run this session is appended after loaded history.
         run_one(&mut t, "ls", "", 0);
         assert_eq!(t.blocks().len(), 2);
-        assert_eq!(t.session_blocks().len(), 1);
-        assert_eq!(t.session_blocks()[0].command, "ls");
+        assert_eq!(t.session_blocks().len(), 2);
+        assert_eq!(t.session_blocks()[0].command, "old");
+        assert_eq!(t.session_blocks()[1].command, "ls");
     }
 
     #[test]

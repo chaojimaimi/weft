@@ -1,0 +1,66 @@
+# v1.7.8: Unsigned release builder for Weft.app
+#
+# Triggers on:
+#   - Push of version tags (v1.0.0, v1.7.8, ...)
+#
+# Produces:
+#   - Unsigned Weft.app + Weft-<version>.dmg
+#   - Attached to a draft GitHub Release
+#
+# Unlike release.yml, this skips Apple signing/notarization. Use for
+# internal/distribution builds where code signature is not required.
+# For public distribution, use release.yml with Apple secrets configured.
+
+name: Build (unsigned)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: Weft
+  VERSION: "1.7.8"
+
+jobs:
+  build-macos-unsigned:
+    name: Build macOS .app + .dmg (unsigned)
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Assemble .app bundle
+        run: ./scripts/build-app.sh
+
+      - name: Create distributable DMG
+        run: ./scripts/build-dmg.sh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/osx/Weft-*.dmg
+          draft: true
+          generate_release_notes: true
+          name: Weft ${{ github.ref_name }}

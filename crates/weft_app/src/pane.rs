@@ -246,6 +246,7 @@ impl Pane {
             block_scroll_offset: 0,
             editor_buffer: String::new(),
             shell_phase: "AtPrompt".to_string(),
+            block_ids: Vec::new(),
         });
     }
 

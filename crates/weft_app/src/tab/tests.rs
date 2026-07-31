@@ -218,6 +218,7 @@ fn restore_from_invalid_editor_buffer_keeps_empty() {
         block_scroll_offset: 3,
         editor_buffer: "{not valid json".to_string(),
         shell_phase: "AtPrompt".to_string(),
+        block_ids: Vec::new(),
     };
     assert!(!t.restore_from_snapshot(&snap));
     // scroll offset still applied even if editor restore failed.

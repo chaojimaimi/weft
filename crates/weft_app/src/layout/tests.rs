@@ -877,3 +877,40 @@ fn tab_tooltip_clamps_at_both_viewport_edges() {
     assert_eq!(right[2], 592.0);
     assert!(right[1] >= 32.0);
 }
+
+#[test]
+fn terminal_content_cols_matches_block_view_cols_across_widths() {
+    // terminal_content_cols must produce the same value that layout_block_view
+    // uses internally, so PTY-reported cols == BlockView displayable cols.
+    let cell_w = 12.0;
+    let cell_h = 24.0;
+    let pad = 10.0;
+    for viewport_w in [120.0, 400.0, 800.0, 1200.0, 1920.0, 2560.0] {
+        let ctx = LayoutCtx::new((viewport_w, 600.0), cell_w, cell_h, pad, pad);
+        let block = layout_block_view(&ctx, 400.0, false);
+        let frame_width = ctx.right() - ctx.left();
+        let computed = super::terminal::terminal_content_cols(frame_width, cell_w);
+        assert_eq!(
+            computed, block.cols,
+            "viewport_w={viewport_w}, frame_width={frame_width}: terminal_content_cols must match BlockView cols"
+        );
+    }
+}
+
+#[test]
+fn terminal_content_cols_subtracts_gutter_from_raw_cols() {
+    // pane_width=1200, cell_w=12 → raw cols=100, gutter=3 cols → 97
+    let raw = (1200.0 / 12.0) as usize;
+    let with_gutter = super::terminal::terminal_content_cols(1200.0, 12.0);
+    assert!(with_gutter < raw, "gutter must reduce cols");
+    assert_eq!(raw - with_gutter, 3, "gutter is 1.5*2 = 3 cols");
+}
+
+#[test]
+fn terminal_content_cols_safe_on_degenerate_inputs() {
+    assert_eq!(super::terminal::terminal_content_cols(0.0, 12.0), 1);
+    assert_eq!(super::terminal::terminal_content_cols(1200.0, 0.0), 1);
+    assert_eq!(super::terminal::terminal_content_cols(-10.0, 12.0), 1);
+    // Extremely narrow pane collapses to 1 col.
+    assert_eq!(super::terminal::terminal_content_cols(5.0, 12.0), 1);
+}

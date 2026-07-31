@@ -276,7 +276,8 @@ pub use surfaces::{
 #[allow(unused_imports)]
 pub use terminal::{
     block_content_x_bounds, block_cwd_header_active, block_visible_rows, layout_block_view,
-    layout_prompt, prompt_content_cols, prompt_line_at_y, BlockViewLayout, PromptLayout,
+    layout_prompt, prompt_content_cols, prompt_line_at_y, terminal_content_cols, BlockViewLayout,
+    PromptLayout,
 };
 
 #[cfg(test)]

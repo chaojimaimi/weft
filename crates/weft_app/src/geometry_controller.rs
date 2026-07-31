@@ -371,8 +371,8 @@ impl App {
         // in-flight block (block_id is None for live rows).
         let styled_line = if let Some(block_id) = row.block_id {
             // Finalized block: search session_blocks by id. Linear scan is
-            // fine — click events are infrequent and session_blocks is small
-            // (typically <100 blocks).
+            // fine — click events are infrequent. session_blocks may hold
+            // 1000+ blocks after Restore, but a per-click scan is still cheap.
             tracker
                 .session_blocks()
                 .iter()

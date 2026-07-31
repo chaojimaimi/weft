@@ -27,6 +27,21 @@ pub fn block_content_x_bounds(ctx: &LayoutCtx) -> (f32, f32) {
     (frame_left + gutter, frame_right - gutter)
 }
 
+/// Effective terminal content columns for a pane of width `pane_width`
+/// with the given cell width. Accounts for the horizontal gutter that
+/// BlockView reserves on each side, so PTY-reported cols match what
+/// BlockView can actually display — preventing progress bars from wrapping
+/// at the last few columns.
+pub fn terminal_content_cols(pane_width: f32, cell_w: f32) -> usize {
+    if cell_w <= 0.0 || pane_width <= 0.0 {
+        return 1;
+    }
+    let available_gutter = ((pane_width - cell_w).max(0.0) * 0.5).max(0.0);
+    let gutter = (cell_w * 1.5).min(available_gutter);
+    let content_width = (pane_width - 2.0 * gutter).max(cell_w);
+    ((content_width / cell_w).max(1.0)) as usize
+}
+
 // ── Prompt (editor input box) ─────────────────────────────────────────
 //
 // The input box sits at the bottom of the viewport. Its height grows with

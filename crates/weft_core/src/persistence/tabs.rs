@@ -30,6 +30,13 @@ pub struct TabSnapshot {
     /// Shell phase as a string: "NotIntegrated" / "AtPrompt" /
     /// "CommandExecuting".
     pub shell_phase: String,
+    /// v1.7.6: IDs of blocks produced in this tab's last session. On
+    /// Restore, each tab hydrates only its own blocks (filtered from the
+    /// global SQLite history by these IDs), preventing all tabs from
+    /// showing the same mixed global history. Empty for legacy snapshots
+    /// predating v1.7.6 (tab starts with no restored block-view content).
+    #[serde(default)]
+    pub block_ids: Vec<u64>,
 }
 
 impl TabSnapshot {
@@ -66,9 +73,10 @@ impl BlockStore {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM tabs", [])?;
         for snap in snapshots {
+            let block_ids_json = serde_json::to_string(&snap.block_ids).unwrap_or_else(|_| "[]".into());
             tx.execute(
-                "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase) \
-                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids) \
+                 VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     snap.position as i64,
                     snap.active as i64,
@@ -76,6 +84,7 @@ impl BlockStore {
                     snap.block_scroll_offset as i64,
                     &snap.editor_buffer,
                     &snap.shell_phase,
+                    &block_ids_json,
                 ],
             )?;
         }
@@ -88,7 +97,7 @@ impl BlockStore {
     /// or after [`BlockStore::clear_tabs`]).
     pub fn load_tabs(&self) -> Result<Vec<TabSnapshot>, PersistenceError> {
         let mut stmt = self.conn.prepare(
-            "SELECT position, active, cwd, block_scroll_offset, editor_buffer, shell_phase \
+            "SELECT position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids \
              FROM tabs ORDER BY position ASC",
         )?;
         let rows = stmt.query_map([], row_to_tab_snapshot)?;
@@ -121,6 +130,11 @@ pub(crate) fn row_to_tab_snapshot(row: &Row) -> rusqlite::Result<TabSnapshot> {
     let block_scroll_offset: i64 = row.get(3)?;
     let editor_buffer: String = row.get(4)?;
     let shell_phase: String = row.get(5)?;
+    let block_ids_json: Option<String> = row.get(6).ok();
+    let block_ids: Vec<u64> = block_ids_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
     Ok(TabSnapshot {
         position: position as usize,
         active,
@@ -128,6 +142,7 @@ pub(crate) fn row_to_tab_snapshot(row: &Row) -> rusqlite::Result<TabSnapshot> {
         block_scroll_offset: block_scroll_offset as usize,
         editor_buffer,
         shell_phase,
+        block_ids,
     })
 }
 
@@ -168,6 +183,7 @@ mod tests {
             editor_buffer: r#"{"lines":["ls -la"],"cursor":[0,7],"selection_anchor":null}"#
                 .to_string(),
             shell_phase: phase.to_string(),
+            block_ids: Vec::new(),
         }
     }
 
@@ -190,6 +206,18 @@ mod tests {
         assert!(loaded[1].active);
         assert_eq!(loaded[1].cwd.as_deref(), Some("/tmp"));
         assert_eq!(loaded[1].shell_phase, "CommandExecuting");
+    }
+
+    #[test]
+    fn block_ids_roundtrip_through_sqlite() {
+        // v1.7.6: per-tab block IDs must survive save→load as JSON TEXT.
+        let store = temp_store();
+        let mut snap = snapshot(0, "/work", 0, "AtPrompt");
+        snap.block_ids = vec![7, 42, 100, 9999];
+        store.save_tabs(&[snap]).unwrap();
+        let loaded = store.load_tabs().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].block_ids, vec![7, 42, 100, 9999]);
     }
 
     #[test]
@@ -359,6 +387,7 @@ mod tests {
             block_scroll_offset: 2,
             editor_buffer: TabSnapshot::encode_editor_buffer(&buf),
             shell_phase: "AtPrompt".to_string(),
+            block_ids: Vec::new(),
         };
         store.save_tabs(&[snap]).unwrap();
         let loaded = store.load_tabs().unwrap();

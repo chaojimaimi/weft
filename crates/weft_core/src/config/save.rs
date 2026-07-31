@@ -108,6 +108,29 @@ pub(super) fn set_opt_string(table: &mut toml_edit::Table, key: &str, new: &Opti
     }
 }
 
+/// Set an optional string field with "clear on None" semantics.
+/// Unlike [`set_opt_string`], when `new` is `None` this forcibly removes
+/// any existing disk entry. Use this for override fields where `None`
+/// means "clear the override and fall back to default" (e.g. syntax
+/// colors, output colors) — leaving a stale disk value would silently
+/// override the default.
+pub(super) fn set_opt_string_clear(
+    table: &mut toml_edit::Table,
+    key: &str,
+    new: &Option<String>,
+) {
+    match new {
+        Some(s) => {
+            table.insert(key, toml_edit::value(s.as_str()));
+        }
+        None => {
+            if table.contains_key(key) {
+                table.remove(key);
+            }
+        }
+    }
+}
+
 pub(super) fn set_f32_if_diff(table: &mut toml_edit::Table, key: &str, new: f32, default: f32) {
     if (new - default).abs() < f32::EPSILON {
         table.remove(key);

@@ -27,6 +27,7 @@ mod tests {
             block_scroll_offset: scroll,
             editor_buffer: "{}".to_string(),
             shell_phase: "AtPrompt".to_string(),
+            block_ids: Vec::new(),
         }
     }
 

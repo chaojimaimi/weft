@@ -35,6 +35,7 @@ fn snapshot(cwd: &str, editor: &EditorBuffer) -> TabSnapshot {
         block_scroll_offset: 0,
         editor_buffer: TabSnapshot::encode_editor_buffer(editor),
         shell_phase: "AtPrompt".to_string(),
+        block_ids: Vec::new(),
     }
 }
 

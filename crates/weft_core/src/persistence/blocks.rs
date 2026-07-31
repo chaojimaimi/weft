@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS tabs (\
     cwd                 TEXT,\
     block_scroll_offset INTEGER NOT NULL DEFAULT 0,\
     editor_buffer       TEXT,\
-    shell_phase         TEXT\
+    shell_phase         TEXT,\
+    block_ids           TEXT\
 );\
 CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);";
 
@@ -64,6 +65,7 @@ impl BlockStore {
         ensure_tabs_active_column(&conn)?;
         ensure_column(&conn, "blocks", "cwd", "TEXT")?;
         ensure_column(&conn, "blocks", "styled_output", "TEXT")?;
+        ensure_column(&conn, "tabs", "block_ids", "TEXT")?;
         let next_block_id =
             conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM blocks", [], |row| {
                 row.get::<_, u64>(0)

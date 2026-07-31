@@ -79,8 +79,8 @@ pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
 
 use self::save::{
-    parse_existing, set_f32_if_diff, set_opt_string, set_string_if_diff, set_u32_if_diff,
-    set_usize_if_diff,
+    parse_existing, set_f32_if_diff, set_opt_string, set_opt_string_clear, set_string_if_diff,
+    set_u32_if_diff, set_usize_if_diff,
 };
 
 // ── Config (deserialized from TOML) ────────────────────────────────────
@@ -216,13 +216,16 @@ impl Config {
         set_opt_string(theme, "accent", &self.theme.accent);
         set_opt_string(theme, "accent_dim", &self.theme.accent_dim);
         set_opt_string(theme, "separator", &self.theme.separator);
-        // palette: only write if non-empty (non-default).
+        // palette: only write if non-empty (non-default). 清空时显式删除磁盘
+        // 旧值，避免残留（与 set_string_if_diff 同哲学）。
         if !self.theme.palette.is_empty() {
             let mut arr = toml_edit::Array::new();
             for hex in &self.theme.palette {
                 arr.push(hex.as_str());
             }
             theme["palette"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+        } else if theme.contains_key("palette") {
+            theme.remove("palette");
         }
         // follow_system: only write if non-default (true).
         if self.theme.follow_system {
@@ -238,43 +241,70 @@ impl Config {
             theme["dark_name"] = toml_edit::value(dn.as_str());
         }
         // [theme.syntax] subsection.
+        // 操作现有表（若存在）而非每次创建新表，避免清空所有字段时旧表残留。
         if let Some(syn) = &self.theme.syntax {
-            let mut syntax_table = toml_edit::table();
-            let st = syntax_table.as_table_mut().unwrap();
-            set_opt_string(st, "command", &syn.command);
-            set_opt_string(st, "flag", &syn.flag);
-            set_opt_string(st, "path", &syn.path);
-            set_opt_string(st, "string", &syn.string);
-            set_opt_string(st, "number", &syn.number);
-            set_opt_string(st, "variable", &syn.variable);
-            set_opt_string(st, "operator", &syn.operator);
-            set_opt_string(st, "comment", &syn.comment);
-            set_opt_string(st, "default", &syn.default);
-            // Only write the [theme.syntax] table if at least one field is
-            // set (avoid emitting an empty `[theme.syntax]` section).
-            if st.iter().count() > 0 {
-                theme["syntax"] = syntax_table;
+            let syntax_entry = theme.entry("syntax").or_insert_with(toml_edit::table);
+            if syntax_entry.is_none() {
+                *syntax_entry = toml_edit::table();
             }
+            let st = syntax_entry.as_table_mut().expect("syntax is a table");
+            set_opt_string_clear(st, "command", &syn.command);
+            set_opt_string_clear(st, "flag", &syn.flag);
+            set_opt_string_clear(st, "argument", &syn.argument);
+            set_opt_string_clear(st, "path", &syn.path);
+            set_opt_string_clear(st, "string", &syn.string);
+            set_opt_string_clear(st, "number", &syn.number);
+            set_opt_string_clear(st, "variable", &syn.variable);
+            set_opt_string_clear(st, "operator", &syn.operator);
+            set_opt_string_clear(st, "comment", &syn.comment);
+            set_opt_string_clear(st, "default", &syn.default);
+            // 若表为空（所有字段都是 None），删除整个 [theme.syntax] 表。
+            if st.iter().count() == 0 {
+                theme.remove("syntax");
+            }
+        } else if theme.contains_key("syntax") {
+            // cfg.theme.syntax = None：用户清除了整个 syntax override，删除磁盘表。
+            theme.remove("syntax");
         }
         // v1.7.0-D: [theme.output] subsection — semantic output colors + toggle.
+        // 操作现有表（若存在）而非每次创建新表，避免 toml_edit 增量编辑时
+        // 旧键残留。修复 v1.7.5 回归：用户 on→off→on 切换时，`enabled = false`
+        // 因新表为空（iter().count()==0）未被替换，残留磁盘导致 reload 仍为 false。
         if let Some(out) = &self.theme.output {
-            let mut output_table = toml_edit::table();
-            let ot = output_table.as_table_mut().unwrap();
-            // enabled: only write when explicitly set to false (default is
-            // true). Writing `enabled = true` would be redundant and clutter
-            // the user's config file, so we omit it.
-            if out.enabled == Some(false) {
-                ot["enabled"] = toml_edit::value(false);
+            // 确保 [theme.output] 表存在（不存在则创建）。
+            let output_entry = theme.entry("output").or_insert_with(toml_edit::table);
+            if output_entry.is_none() {
+                *output_entry = toml_edit::table();
             }
-            set_opt_string(ot, "output_default", &out.output_default);
-            set_opt_string(ot, "cwd", &out.cwd);
-            set_opt_string(ot, "metadata", &out.metadata);
-            set_opt_string(ot, "success", &out.success);
-            set_opt_string(ot, "failure", &out.failure);
-            // Only write the [theme.output] table if at least one field is set.
-            if ot.iter().count() > 0 {
-                theme["output"] = output_table;
+            let ot = output_entry.as_table_mut().expect("output is a table");
+            // enabled: 三态处理。
+            //   Some(false) → 写入 `enabled = false`（关闭语义着色）。
+            //   Some(true)  → 显式删除磁盘上的 enabled 键（默认 true，避免残留 false）。
+            //   None        → 不动（保持磁盘原值）。
+            match out.enabled {
+                Some(false) => {
+                    ot["enabled"] = toml_edit::value(false);
+                }
+                Some(true) => {
+                    if ot.contains_key("enabled") {
+                        ot.remove("enabled");
+                    }
+                }
+                None => {}
             }
+            set_opt_string_clear(ot, "output_default", &out.output_default);
+            set_opt_string_clear(ot, "cwd", &out.cwd);
+            set_opt_string_clear(ot, "metadata", &out.metadata);
+            set_opt_string_clear(ot, "success", &out.success);
+            set_opt_string_clear(ot, "failure", &out.failure);
+            // 若表为空（所有字段都是默认值/None），删除整个 [theme.output] 表
+            // 保持配置文件整洁。
+            if ot.iter().count() == 0 {
+                theme.remove("output");
+            }
+        } else if theme.contains_key("output") {
+            // cfg.theme.output = None：用户清除了整个 output override，删除磁盘表。
+            theme.remove("output");
         }
 
         // [window] section.

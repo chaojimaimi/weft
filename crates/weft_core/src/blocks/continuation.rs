@@ -13,7 +13,9 @@ impl BlockTracker {
         self.continuation_candidate = self
             .blocks
             .last()
-            .filter(|_| self.blocks.len() > self.session_start)
+            // v1.7.5: session_start 不再可靠（load_blocks 不再重置它），
+            // 改用 screen_owned_blocks 判断是否为本会话产生的 block。
+            // 加载的历史 block 不会进入 screen_owned_blocks，所以这里等价。
             .filter(|block| self.screen_owned_blocks.contains(&block.id.0))
             .filter(|block| output_links_resume_command(&block.output, command))
             .map(|block| block.id);
@@ -327,5 +329,45 @@ mod tests {
                 .and_then(|line| line.foreground_at(1)),
             Some(CellColor::Palette(2))
         );
+    }
+
+    /// v1.7.5 regression: a block loaded from SQLite on startup/Restore must
+    /// NOT be picked as a continuation candidate, even when its output
+    /// contains a "Resume this session with: tool --resume id" link that
+    /// matches the command the user runs this session. Only screen-owned
+    /// blocks (produced THIS session) are eligible. Otherwise the loaded
+    /// history would be popped/merged and the restored history would silently
+    /// disappear.
+    #[test]
+    fn loaded_history_block_is_not_picked_as_continuation() {
+        let mut tracker = BlockTracker::new();
+        let original = format!("{REPLAY}\nResume this session with:\ntool --resume id");
+        let loaded = Block {
+            id: BlockId(1),
+            command: "tool".to_string(),
+            cwd: None,
+            output: std::sync::Arc::from(original.as_str()),
+            styled_output: None,
+            exit_code: Some(0),
+            started_at: std::time::SystemTime::now(),
+            finished_at: Some(std::time::SystemTime::now()),
+            collapsed: false,
+        };
+        tracker.load_blocks(vec![loaded]);
+        let loaded_id = tracker.blocks()[0].id;
+        assert_eq!(tracker.blocks().len(), 1);
+
+        // Running the resume command this session must not consume the loaded
+        // block: continuation_candidate stays None.
+        tracker.on_command_start("tool --resume id".to_string());
+        assert_eq!(tracker.continuation_candidate, None);
+        tracker.begin_screen_owned_output(10);
+        tracker.replace_screen_output(&original);
+        tracker.on_command_end(0);
+
+        // Loaded history is preserved; a separate new block was appended.
+        assert_eq!(tracker.blocks().len(), 2);
+        assert_eq!(tracker.blocks()[0].id, loaded_id);
+        assert_eq!(tracker.blocks()[1].command, "tool --resume id");
     }
 }

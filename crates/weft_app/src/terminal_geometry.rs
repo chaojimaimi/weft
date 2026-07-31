@@ -135,12 +135,18 @@ impl GridGeometry {
             right: self.chrome_left,
             bottom: self.viewport_height.max(self.chrome_top),
         });
-        let (rows, cols) = if self.cell_width <= 0.0 || self.cell_height <= 0.0 {
+        let (rows, cols) = if self.cell_width <= 0.0
+            || self.cell_height <= 0.0
+            || content.width() <= 0.0
+        {
             (0, 0)
         } else {
             (
                 (content.height() / self.cell_height).floor() as usize,
-                (content.width() / self.cell_width).floor() as usize,
+                crate::layout::terminal_content_cols(
+                    content.width() as f32,
+                    self.cell_width as f32,
+                ),
             )
         };
         TerminalLayout {
@@ -233,7 +239,8 @@ mod tests {
     #[test]
     fn terminal_rows_exclude_top_chrome_and_both_paddings() {
         let geometry = geometry();
-        assert_eq!(geometry.dimensions(), (36, 98));
+        // cols = terminal_content_cols(1180, 12) = 95 (raw 98 minus 3 gutter)
+        assert_eq!(geometry.dimensions(), (36, 95));
         assert!(geometry.layout().last_row_bottom().unwrap() <= 790.0);
 
         // The old full-window formula advertised 39 rows. Metal then drew
@@ -267,8 +274,9 @@ mod tests {
             chrome_left: 240.0,
             ..base
         };
-        assert_eq!(base.dimensions(), (36, 98));
-        assert_eq!(with_sidebar.dimensions(), (36, 78));
+        // cols = terminal_content_cols(content_width, 12) — gutter subtracts 3 cols
+        assert_eq!(base.dimensions(), (36, 95));
+        assert_eq!(with_sidebar.dimensions(), (36, 75));
         assert_eq!(
             with_sidebar.layout().sidebar,
             Some(PhysicalRect {

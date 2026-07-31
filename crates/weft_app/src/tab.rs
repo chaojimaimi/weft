@@ -199,7 +199,7 @@ impl Tab {
                     let [x0, y0, x1, y1] = rect;
                     let w = (x1 - x0).max(0.0);
                     let h = (y1 - y0).max(0.0);
-                    let cols = (w / geo.cell_w).floor() as usize;
+                    let cols = crate::layout::terminal_content_cols(w, geo.cell_w);
                     let rows = (h / geo.cell_h).floor() as usize;
                     if rows > 0 && cols > 0 {
                         Some((rows, cols))
@@ -514,7 +514,13 @@ impl Tab {
         let mut active_resized = false;
         for (pane_id, rect) in layouts {
             let [x0, y0, x1, y1] = rect;
-            let cols = ((x1 - x0).max(0.0) / cell_w).floor() as usize;
+            // Use content cols (with BlockView gutter subtracted) so PTY
+            // reports the same width BlockView can actually display.
+            // Without this, progress bars (ollama pull, brew upgrade) wrap
+            // their last 2-3 chars to the next line because the program
+            // emits PTY-cols-wide lines but BlockView renders fewer cols.
+            let pane_width = (x1 - x0).max(0.0);
+            let cols = crate::layout::terminal_content_cols(pane_width, cell_w);
             let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
             if rows == 0 || cols == 0 {
                 continue;
@@ -736,6 +742,11 @@ impl Tab {
             weft_core::blocks::ShellPhase::AtPrompt => "AtPrompt",
             weft_core::blocks::ShellPhase::CommandExecuting => "CommandExecuting",
         };
+        // v1.7.6: persist the IDs of blocks produced THIS session so each
+        // tab can restore only its own history on next launch (per-tab
+        // isolation). Loaded history (from a previous Restore) is excluded
+        // via `loaded_ids` inside the tracker.
+        let block_ids = terminal.block_tracker().session_produced_block_ids();
         Some(TabSnapshot {
             position,
             active,
@@ -743,6 +754,7 @@ impl Tab {
             block_scroll_offset: self.block_scroll(),
             editor_buffer,
             shell_phase: shell_phase.to_string(),
+            block_ids,
         })
     }
 
