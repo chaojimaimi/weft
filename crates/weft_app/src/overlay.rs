@@ -431,6 +431,13 @@ pub enum HitTarget {
     BlockActionCopy(BlockId),
     /// F3-1: Block header hover-action "toggle fold" button.
     BlockActionFold(BlockId),
+    /// v1.8.2: Block header hover-action "diagnose failure" button.
+    /// Only rendered for failed blocks (exit_code != 0) when AI is configured.
+    BlockActionDiagnose(BlockId),
+    /// v1.8.2: Close button on the AI diagnose panel rendered below a
+    /// failed block's output. Clicking it clears `block_diagnose_state`
+    /// for that block and removes the panel.
+    BlockDiagnoseClose(BlockId),
     /// A completion popup row (click accepts candidate).
     CompletionItem(usize),
     /// Completion popup right border (drag to resize width) — v0.7 W2b.

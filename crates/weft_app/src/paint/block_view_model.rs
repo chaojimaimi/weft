@@ -1,7 +1,11 @@
 //! Immutable per-frame inputs for BlockView painting.
 
+use std::collections::HashMap;
+
 use weft_core::blocks::{Block, BlockId, InFlightBlock};
 use weft_core::grid::Color;
+
+use crate::app_state::BlockDiagnoseState;
 
 pub(crate) struct BlockViewPaintModel<'a> {
     pub(crate) blocks: &'a [Block],
@@ -28,4 +32,12 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// Uses `Pane::pane_session_id` (global, monotonic) so entries from a
     /// closed pane naturally miss without explicit invalidation.
     pub(crate) cache_namespace: u64,
+    /// v1.8.2: Per-block AI diagnose state. An entry exists when a diagnose
+    /// request is in flight or a result is being displayed. The renderer
+    /// injects extra rows below the block's output to show the panel.
+    pub(crate) block_diagnose_state: &'a HashMap<BlockId, BlockDiagnoseState>,
+    /// v1.8.2: Whether the local Ollama backend is configured. When false,
+    /// the diagnose button is not rendered on block headers and the
+    /// `Action::DiagnoseBlock` keybinding is a no-op.
+    pub(crate) ai_configured: bool,
 }

@@ -104,6 +104,7 @@ impl CancelFlag {
 /// its multi-thread runtime and drains results through a `crossbeam-channel`.
 pub trait AiBackend: Send + Sync {
     /// Provider id (`"ollama"`). Used in error messages.
+    #[allow(dead_code)]
     fn provider_id(&self) -> &'static str;
 
     /// Send `messages` to the model and return the assistant's full reply.
@@ -117,6 +118,7 @@ pub trait AiBackend: Send + Sync {
 
 /// A discovered model from `/api/tags`.
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct TagModel {
     pub name: String,
     #[serde(default)]
@@ -166,10 +168,10 @@ pub fn is_loopback_url(url: &str) -> bool {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return false;
     }
-    match parsed.host_str() {
-        Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1") => true,
-        _ => false,
-    }
+    matches!(
+        parsed.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1")
+    )
 }
 
 // ── Ollama ────────────────────────────────────────────────────────────
@@ -210,6 +212,7 @@ impl OllamaBackend {
     /// `/api/tags` — list installed models. Used by the Settings AI panel.
     /// Not part of the `AiBackend` trait because it's a discovery call, not
     /// a completion call.
+    #[allow(dead_code)]
     pub async fn list_models(&self) -> AiResult<Vec<TagModel>> {
         let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
         let resp = self.http.get(&url).send().await?;

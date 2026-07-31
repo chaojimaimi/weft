@@ -501,6 +501,31 @@ impl NoteEditorState {
     }
 }
 
+/// v1.8.2: Per-block AI diagnose state. Stored in a `HashMap<BlockId, DiagnoseState>`
+/// on `App`. When `pending_id` is `Some`, the block's header shows a "thinking…"
+/// indicator; when `result` is `Some`, an inline panel is rendered below the
+/// block's output showing the model's explanation.
+#[derive(Debug, Clone)]
+pub struct BlockDiagnoseState {
+    /// The `AiState` request id currently in flight for this block, if any.
+    /// Used to correlate with `AiResultEvent::Diagnose { id, .. }`.
+    pub pending_id: Option<u64>,
+    /// The last completed diagnose result (plain-text explanation). Cleared
+    /// when the user closes the panel or triggers a new diagnose.
+    pub result: Option<Result<String, String>>,
+}
+
+impl BlockDiagnoseState {
+    pub fn is_thinking(&self) -> bool {
+        self.pending_id.is_some()
+    }
+
+    #[allow(dead_code)]
+    pub fn has_panel(&self) -> bool {
+        self.result.is_some() || self.is_thinking()
+    }
+}
+
 pub struct FindState {
     pub open: bool,
     pub query: String,

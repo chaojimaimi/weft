@@ -45,6 +45,8 @@ impl MetalRenderer {
             find_block_highlight,
             palette,
             cache_namespace,
+            block_diagnose_state,
+            ai_configured,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -145,6 +147,7 @@ impl MetalRenderer {
                     clip_bottom: content_bottom_y,
                     resolve_styles: true,
                     styled_lookup_counter: Some(&self.styled_lookup_counter),
+                    block_diagnose_state,
                 },
                 &cache,
             )
@@ -262,6 +265,17 @@ impl MetalRenderer {
                         kind: weft_core::selection::BlockViewRowKind::LiveCommand,
                         text: command.to_string(),
                         block_id: None,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
+                    });
+                }
+                LaidRow::DiagnosePanel { text, block_id, .. } => {
+                    bv_rows.push(weft_core::selection::BlockViewRow {
+                        kind: weft_core::selection::BlockViewRowKind::DiagnosePanel,
+                        text: text.clone(),
+                        block_id: Some(*block_id),
                         y_top: y,
                         y_bottom: y + pitch,
                         line: None,
@@ -604,13 +618,13 @@ impl MetalRenderer {
                         self.push_text(&mut verts, left, text_y, "★", star_color, 1);
                         (
                             left + 2.0 * cw,
-                            block_header_text_cols(left + 2.0 * cw, right, cw, self.scale)
+                            block_header_text_cols(left + 2.0 * cw, right, cw, self.scale, ai_configured)
                                 .min(cols.saturating_sub(2)),
                         )
                     } else {
                         (
                             left,
-                            block_header_text_cols(left, right, cw, self.scale).min(cols),
+                            block_header_text_cols(left, right, cw, self.scale, ai_configured).min(cols),
                         )
                     };
                     self.push_text(&mut verts, text_x, text_y, text, color, text_cols);
@@ -630,6 +644,7 @@ impl MetalRenderer {
                             cell_width: cw,
                             cell_height: ch,
                             foreground: fg,
+                            ai_configured,
                         },
                     );
                 }
@@ -711,6 +726,64 @@ impl MetalRenderer {
                     }
                 }
                 LaidRow::Blank => {}
+                LaidRow::DiagnosePanel {
+                    text,
+                    block_id,
+                    is_first,
+                    is_last,
+                    is_error,
+                } => {
+                    // v1.8.2: Render the AI diagnose panel below block output.
+                    // Background tinted to distinguish from regular output.
+                    let panel_bg = if *is_error {
+                        // Error: reddish tint.
+                        let err = color_to_normalized(self.theme.output.failure);
+                        [err[0] * 0.15 + theme_bg[0] * 0.85, err[1] * 0.15 + theme_bg[1] * 0.85, err[2] * 0.15 + theme_bg[2] * 0.85, 1.0]
+                    } else {
+                        // Success/info: accent-tinted.
+                        let acc = color_to_normalized(self.theme.accent);
+                        [acc[0] * 0.12 + theme_bg[0] * 0.88, acc[1] * 0.12 + theme_bg[1] * 0.88, acc[2] * 0.12 + theme_bg[2] * 0.88, 1.0]
+                    };
+                    push_quad(
+                        &mut verts,
+                        [frame_left, y, frame_right, y + pitch],
+                        bg_uv,
+                        [0.0; 4],
+                        panel_bg,
+                    );
+                    // Panel text with a 1-cell left indent for visual hierarchy.
+                    let text_color = if *is_error {
+                        color_to_normalized(self.theme.output.failure)
+                    } else {
+                        fg
+                    };
+                    let avail_cols = cols.saturating_sub(2).max(1);
+                    self.push_text(&mut verts, left + cw, y, text, text_color, avail_cols);
+                    // Close button (×) on the first row, right-aligned.
+                    if *is_first {
+                        let close_x = right - cw * 1.5;
+                        let close_color = [fg[0], fg[1], fg[2], fg[3] * 0.6];
+                        self.push_text(&mut verts, close_x, y, "×", close_color, 1);
+                        hit_regions.push(crate::overlay::HitRegion {
+                            x0: close_x,
+                            y0: y,
+                            x1: close_x + cw * 1.5,
+                            y1: y + pitch,
+                            target: crate::overlay::HitTarget::BlockDiagnoseClose(*block_id),
+                        });
+                    }
+                    // Bottom border on the last row.
+                    if *is_last {
+                        let (by0, by1) = snap_physical_rect(y + pitch - 1.0, y + pitch);
+                        push_quad(
+                            &mut verts,
+                            [frame_left, by0, frame_right, by1],
+                            bg_uv,
+                            [0.0; 4],
+                            separator,
+                        );
+                    }
+                }
             }
         }
 
@@ -781,6 +854,7 @@ impl MetalRenderer {
                     cell_width: cw,
                     cell_height: ch,
                     foreground: fg,
+                    ai_configured,
                 },
             );
         }

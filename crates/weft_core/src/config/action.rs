@@ -135,6 +135,11 @@ pub enum Action {
     /// suggestions. Does not close the palette.
     #[serde(rename = "cancel_ai_request")]
     CancelAiRequest,
+    /// v1.8.2: Diagnose the currently hovered/selected failed block via
+    /// the local Ollama backend. No-op when AI is not configured or the
+    /// block has no exit code (still running or succeeded).
+    #[serde(rename = "diagnose_block")]
+    DiagnoseBlock,
 }
 
 /// v1.5.0: Canonical string form of an [`Action`], matching the serde
@@ -177,5 +182,6 @@ pub fn action_to_str(action: &Action) -> &'static str {
         Action::GenerateCommand => "generate_command",
         Action::InsertAiSuggestion => "insert_ai_suggestion",
         Action::CancelAiRequest => "cancel_ai_request",
+        Action::DiagnoseBlock => "diagnose_block",
     }
 }

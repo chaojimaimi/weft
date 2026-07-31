@@ -546,6 +546,12 @@ impl App {
         if matches!(action, "toggle_bookmark" | "add_note" | "export_block") {
             self.run_annotation_action_with_export(block_id, action, export_block_data);
         }
+        // v1.8.2: AI diagnose — trigger after terminal borrow drops.
+        if action == "diagnose" {
+            if let Some(block_id) = block_id {
+                self.spawn_block_diagnose(block_id);
+            }
+        }
         if let Some(text) = clipboard_text.as_ref() {
             info!(len = text.len(), "context action copied to clipboard");
         }

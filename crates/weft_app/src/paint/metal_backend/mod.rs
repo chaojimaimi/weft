@@ -253,6 +253,8 @@ impl MetalRenderer {
             block_selected: None,
             block_action_hovered: None,
             bookmarked_blocks: std::collections::HashSet::new(),
+            block_diagnose_state: std::collections::HashMap::new(),
+            ai_configured: false,
             spinner_phase: -1.0,
             reduce_motion: false,
             increase_contrast: false,

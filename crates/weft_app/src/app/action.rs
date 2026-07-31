@@ -323,6 +323,11 @@ impl crate::App {
                 self.request_redraw();
                 true
             }
+            // v1.8.2: Diagnose the hovered/selected failed block.
+            Action::DiagnoseBlock => {
+                self.spawn_block_diagnose_from_hover();
+                true
+            }
         }
     }
 }

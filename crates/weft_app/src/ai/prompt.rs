@@ -64,6 +64,7 @@ pub struct ChatMessage {
 pub enum ChatRole {
     System,
     User,
+    #[allow(dead_code)]
     Assistant,
 }
 
@@ -79,6 +80,7 @@ impl ChatRole {
 
 /// Mask any secret patterns in `text`. Thin wrapper around `weft_core::secrets`
 /// so prompt builders don't pull in the regex crate directly.
+#[allow(dead_code)]
 pub fn mask_secrets(text: &str) -> String {
     secrets::mask(text)
 }

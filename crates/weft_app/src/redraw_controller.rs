@@ -597,6 +597,10 @@ impl App {
             renderer.block_action_hovered = self.interaction.block_action_hovered;
             // v1.7.3-C: assign the pre-computed bookmarked-block set.
             renderer.bookmarked_blocks = bookmarked_blocks;
+            // v1.8.2: assign per-block AI diagnose state for inline panel rendering.
+            renderer.block_diagnose_state = self.block_diagnose_state.clone();
+            // v1.8.2: mirror AI configured flag for header button rendering.
+            renderer.ai_configured = self.ai_state.is_configured();
             renderer.reduce_motion = self.window_runtime.reduce_motion;
             renderer.increase_contrast = self.window_runtime.increase_contrast;
             // F3-2: compute spinner phase for the running-command indicator.

@@ -396,14 +396,24 @@ impl App {
                 let hit =
                     crate::block_component::block_header_action_at(&renderer.hit_regions, xf, yf);
                 if let Some(hit) = hit {
-                    let (block_id, action) = match hit {
-                        crate::block_component::BlockHeaderAction::Copy(id) => (id, "copy_command"),
-                        crate::block_component::BlockHeaderAction::ToggleFold(id) => {
-                            (id, "toggle_fold")
+                    match hit {
+                        crate::block_component::BlockHeaderAction::Copy(id) => {
+                            self.run_context_action(Some(id), "copy_command");
+                            self.request_redraw();
                         }
-                    };
-                    self.run_context_action(Some(block_id), action);
-                    self.request_redraw();
+                        crate::block_component::BlockHeaderAction::ToggleFold(id) => {
+                            self.run_context_action(Some(id), "toggle_fold");
+                            self.request_redraw();
+                        }
+                        crate::block_component::BlockHeaderAction::Diagnose(id) => {
+                            // v1.8.2: Trigger AI diagnose for this failed block.
+                            self.spawn_block_diagnose(id);
+                        }
+                        crate::block_component::BlockHeaderAction::CloseDiagnose(id) => {
+                            // v1.8.2: Close the diagnose panel for this block.
+                            self.close_block_diagnose(id);
+                        }
+                    }
                     return;
                 }
             }

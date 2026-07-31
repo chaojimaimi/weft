@@ -63,6 +63,8 @@ impl MetalRenderer {
             find_block_highlight: _,
             palette: _,
             cache_namespace: _,
+            block_diagnose_state,
+            ai_configured: _,
         } = model;
 
         let cw = self.cell_width() as f32;
@@ -108,6 +110,7 @@ impl MetalRenderer {
                     clip_bottom: content_bottom_y,
                     resolve_styles: false,
                     styled_lookup_counter: None,
+                    block_diagnose_state,
                 },
                 &cache,
             )
@@ -213,6 +216,20 @@ impl MetalRenderer {
                         kind: BlockViewRowKind::LiveCommand,
                         text: command.to_string(),
                         block_id: None,
+                        y_top: row_top_y,
+                        y_bottom: row_top_y + pitch,
+                        line: None,
+                        chunk_char_offset: 0,
+                    });
+                }
+                LaidRow::DiagnosePanel { text, block_id, .. } => {
+                    // v1.8.2: include the panel's y-band in hit-testing so
+                    // clicks on the panel don't fall through to whatever is
+                    // below. Non-selectable.
+                    bv_rows.push(BlockViewRow {
+                        kind: BlockViewRowKind::DiagnosePanel,
+                        text: text.clone(),
+                        block_id: Some(*block_id),
                         y_top: row_top_y,
                         y_bottom: row_top_y + pitch,
                         line: None,

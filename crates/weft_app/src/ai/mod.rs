@@ -47,12 +47,14 @@ pub use prompt::{MAX_HISTORY_ENTRIES, MAX_OUTPUT_BYTES};
 /// results with the UI entry that issued them (so a stale palette entry
 /// doesn't pick up a newer result).
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AiRequest {
     pub id: u64,
     pub kind: AiRequestKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum AiRequestKind {
     /// Natural-language → shell command. Issued from the palette.
     CommandGen,
@@ -87,6 +89,7 @@ pub enum AiResultEvent {
 pub struct AiState {
     /// Snapshot of the `[ai]` config at construction time. The Settings UI
     /// rebuilds `AiState` when the user changes provider / model.
+    #[allow(dead_code)]
     config: AiConfig,
     /// `None` when AI is not configured (`provider = None` or construction
     /// failed). Callers should hide the "✨ Ask AI" UI in that case.
@@ -140,11 +143,13 @@ impl AiState {
 
     /// Reference to the active config snapshot (for the Settings UI to
     /// display the current provider/model without re-parsing the file).
+    #[allow(dead_code)]
     pub fn config(&self) -> &AiConfig {
         &self.config
     }
 
     /// Number of requests currently awaiting a response.
+    #[allow(dead_code)]
     pub fn in_flight(&self) -> usize {
         self.in_flight
     }

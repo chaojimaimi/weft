@@ -84,6 +84,14 @@ pub struct MetalRenderer {
     /// `AnnotationStore`). The block view draws a ★ glyph before the header
     /// text of each bookmarked block.
     pub bookmarked_blocks: std::collections::HashSet<BlockId>,
+    /// v1.8.2: Per-block AI diagnose state (set per-frame by the app).
+    /// The block view renders an inline panel below the output of blocks
+    /// that have a diagnose result or a pending request.
+    pub block_diagnose_state: std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    /// v1.8.2: Whether the local Ollama backend is configured. Mirrors
+    /// `App::ai_state.is_configured()`; the renderer uses this to decide
+    /// whether to draw the diagnose button on failed block headers.
+    pub ai_configured: bool,
     /// F3-2: Spinner phase for the running-command activity indicator.
     /// Normalized to [0,1); the renderer maps it to a braille spinner glyph.
     /// Set to `-1.0` to disable (reduce-motion or no command running).
@@ -591,6 +599,8 @@ impl MetalRenderer {
                             .and_then(|find| find.block_highlight),
                         palette: terminal.palette(),
                         cache_namespace: active_pane_session_id,
+                        block_diagnose_state: &self.block_diagnose_state,
+                        ai_configured: self.ai_configured,
                     },
                     selection,
                 )
@@ -625,6 +635,8 @@ impl MetalRenderer {
                             .and_then(|find| find.block_highlight),
                         palette: terminal.palette(),
                         cache_namespace: active_pane_session_id,
+                        block_diagnose_state: &self.block_diagnose_state,
+                        ai_configured: self.ai_configured,
                     },
                     selection,
                 )

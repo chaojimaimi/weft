@@ -11,6 +11,10 @@ use weft_core::selection::BlockViewRowKind;
 pub(crate) enum BlockHeaderAction {
     Copy(BlockId),
     ToggleFold(BlockId),
+    /// v1.8.2: Diagnose a failed block via local Ollama.
+    Diagnose(BlockId),
+    /// v1.8.2: Close the diagnose panel for this block.
+    CloseDiagnose(BlockId),
 }
 
 /// Resolve the finalized block that owns a rendered row for hover purposes.
@@ -23,6 +27,9 @@ pub(crate) fn hovered_block_for_row(
 ) -> Option<BlockId> {
     match kind {
         BlockViewRowKind::Header | BlockViewRowKind::Command | BlockViewRowKind::Output => block_id,
+        // v1.8.2: Diagnose panel rows belong to their block so hover stays
+        // active while the mouse is over the panel (the close button needs it).
+        BlockViewRowKind::DiagnosePanel => block_id,
         BlockViewRowKind::Separator | BlockViewRowKind::LiveCommand => None,
     }
 }
@@ -44,7 +51,13 @@ pub(crate) fn block_header_action_at(
             crate::overlay::HitTarget::BlockActionFold(id) => {
                 Some(BlockHeaderAction::ToggleFold(id))
             }
-            _ => None,
+            crate::overlay::HitTarget::BlockActionDiagnose(id) => {
+                Some(BlockHeaderAction::Diagnose(id))
+            }
+            crate::overlay::HitTarget::BlockDiagnoseClose(id) => {
+                Some(BlockHeaderAction::CloseDiagnose(id))
+            }
+            _ => None
         }
     })
 }
@@ -117,5 +130,20 @@ mod tests {
             target: HitTarget::BlockFold(BlockId(1)),
         }];
         assert_eq!(block_header_action_at(&regions, 10.0, 10.0), None);
+    }
+
+    #[test]
+    fn block_header_action_resolver_handles_diagnose() {
+        let regions = vec![HitRegion {
+            x0: 50.0,
+            y0: 0.0,
+            x1: 70.0,
+            y1: 20.0,
+            target: HitTarget::BlockActionDiagnose(BlockId(3)),
+        }];
+        assert_eq!(
+            block_header_action_at(&regions, 60.0, 10.0),
+            Some(BlockHeaderAction::Diagnose(BlockId(3)))
+        );
     }
 }

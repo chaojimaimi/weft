@@ -793,6 +793,7 @@ impl App {
                 weft_core::config::Action::GenerateCommand => "Generate Command (AI)",
                 weft_core::config::Action::InsertAiSuggestion => "Insert AI Suggestion",
                 weft_core::config::Action::CancelAiRequest => "Cancel AI Request",
+                weft_core::config::Action::DiagnoseBlock => "Diagnose Block (AI)",
             };
             views.push(SettingsKeybindingView {
                 action: label.to_string(),

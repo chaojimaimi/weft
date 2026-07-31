@@ -588,6 +588,8 @@ impl App {
                 .and_then(|find| find.block_highlight),
             palette: terminal.palette(),
             cache_namespace: self.sessions.active().pane_session_id,
+            block_diagnose_state: &self.block_diagnose_state,
+            ai_configured: self.ai_state.is_configured(),
         })
     }
 

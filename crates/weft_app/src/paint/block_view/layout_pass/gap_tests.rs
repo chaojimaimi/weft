@@ -15,6 +15,7 @@ fn finished_block(id: u64, output: &str, collapsed: bool) -> Block {
 }
 
 fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> LayoutPassOutput<'a> {
+    let empty_map = std::collections::HashMap::new();
     compute_block_layout_pass(
         LayoutPassInput {
             blocks,
@@ -31,6 +32,7 @@ fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> Layout
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            block_diagnose_state: &empty_map,
         },
         cache,
     )
@@ -76,6 +78,7 @@ fn command_output_gap_is_a_shared_structural_row_for_live_and_completed_blocks()
 }
 
 fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
+    let empty_map = std::collections::HashMap::new();
     compute_block_layout_pass(
         LayoutPassInput {
             blocks: &[],
@@ -97,6 +100,7 @@ fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            block_diagnose_state: &empty_map,
         },
         &BlockLayoutCache::default(),
     )

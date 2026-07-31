@@ -52,6 +52,16 @@ pub(super) enum LaidRow<'a> {
         text: String,
     },
     Blank,
+    /// v1.8.2: A line of the AI diagnose panel rendered below a block's output.
+    /// `text` is a single wrapped line. `is_first` marks the top line (for
+    /// background + close button hit region). `is_error` tints the background.
+    DiagnosePanel {
+        text: String,
+        block_id: BlockId,
+        is_first: bool,
+        is_last: bool,
+        is_error: bool,
+    },
 }
 
 /// Output of a shared layout pass: cumulative y-distances + row metadata.
@@ -71,7 +81,7 @@ pub(super) struct LayoutPassOutput<'a> {
 /// Parameters for the shared layout pass. Extracted from `BlockViewPaintModel`
 /// so the pass function doesn't need the full model (some fields like
 /// `palette`/`spinner_phase`/`block_hovered` are paint-only).
-pub(super) struct LayoutPassInput<'a> {
+pub(super) struct LayoutPassInput<'a, 'b> {
     pub(super) blocks: &'a [Block],
     pub(super) live: Option<InFlightBlock<'a>>,
     pub(super) cwd: Option<&'a str>,
@@ -91,6 +101,11 @@ pub(super) struct LayoutPassInput<'a> {
     /// lookup performed. Paint passes `Some(&Cell)` to collect data for the
     /// styled-line caching decision; hit-testing passes `None`.
     pub(super) styled_lookup_counter: Option<&'a Cell<usize>>,
+    /// v1.8.2: Per-block AI diagnose state. When a block has an entry, extra
+    /// rows are injected after its output to render the diagnose panel.
+    /// Uses a separate lifetime `'b` because the output (`LayoutPassOutput<'a>`)
+    /// does not borrow from this field — `DiagnosePanel` rows own their text.
+    pub(super) block_diagnose_state: &'b std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
@@ -107,8 +122,8 @@ pub(super) struct LayoutPassInput<'a> {
 /// references) but NOT from `cache`: source ranges are materialized only for
 /// visible rows into `Rc<[String]>`. This lets the caller drop the cache
 /// borrow immediately and keeps offscreen history from duplicating text.
-pub(super) fn compute_block_layout_pass<'a>(
-    input: LayoutPassInput<'a>,
+pub(super) fn compute_block_layout_pass<'a, 'b>(
+    input: LayoutPassInput<'a, 'b>,
     cache: &BlockLayoutCache,
 ) -> LayoutPassOutput<'a> {
     let LayoutPassInput {
@@ -126,6 +141,7 @@ pub(super) fn compute_block_layout_pass<'a>(
         clip_bottom,
         resolve_styles,
         styled_lookup_counter,
+        block_diagnose_state,
     } = input;
 
     let mut rows: Vec<f32> = Vec::new();
@@ -246,6 +262,33 @@ pub(super) fn compute_block_layout_pass<'a>(
         let b = &blocks[n - 1 - idx];
         let cached = cache.get(b.id.0);
 
+        // v1.8.2: Compute diagnose panel lines for this block (if any).
+        // This must happen before block_total_height so the panel's rows
+        // are accounted for in the visibility culling math.
+        let diagnose_lines: Vec<String> = if let Some(ds) = block_diagnose_state.get(&b.id) {
+            if ds.is_thinking() {
+                vec!["Diagnosing…".to_string()]
+            } else if let Some(result) = &ds.result {
+                let text = match result {
+                    Ok(explanation) => format!("AI: {}", explanation),
+                    Err(err) => format!("AI error: {}", err),
+                };
+                text.lines()
+                    .flat_map(|line| block_line_chunks(line, cols.saturating_sub(2)).collect::<Vec<_>>())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let diagnose_rows = if b.collapsed { 0 } else { diagnose_lines.len() };
+        let is_diagnose_error = block_diagnose_state
+            .get(&b.id)
+            .and_then(|ds| ds.result.as_ref())
+            .map(|r| r.is_err())
+            .unwrap_or(false);
+
         // Compute this block's total height without expanding internal
         // lines. Uses cached.output_rows (O(1)) for the output portion.
         let hint_rows: usize = if b.collapsed {
@@ -261,6 +304,7 @@ pub(super) fn compute_block_layout_pass<'a>(
         let output_gap_rows = command_output_gap_rows(hint_rows + output_rows);
         let block_total_height = (hint_rows + output_rows) as f32 * pitch
             + output_gap_rows as f32 * pitch
+            + diagnose_rows as f32 * pitch
             + pitch // command
             + header_height
             + pitch // separator
@@ -314,8 +358,22 @@ pub(super) fn compute_block_layout_pass<'a>(
                     },
                 });
             }
+            // v1.8.2: Inject diagnose panel rows after output (before gap).
+            // Lines are in reading order (top to bottom); the layout walks
+            // bottom-to-top, so we iterate in reverse.
+            for (i, line) in diagnose_lines.iter().enumerate().rev() {
+                cursor_dist += pitch;
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::DiagnosePanel {
+                    text: line.clone(),
+                    block_id: b.id,
+                    is_first: i == 0,
+                    is_last: i == diagnose_lines.len() - 1,
+                    is_error: is_diagnose_error,
+                });
+            }
         } else {
-            cursor_dist += (hint_rows + output_rows) as f32 * pitch;
+            cursor_dist += (hint_rows + output_rows + diagnose_rows) as f32 * pitch;
         }
         if output_gap_rows > 0 {
             cursor_dist += output_gap_rows as f32 * pitch;
@@ -431,6 +489,7 @@ mod tests {
             clip_bottom: 800.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            block_diagnose_state: &std::collections::HashMap::new(),
         };
         let cache = BlockLayoutCache::default();
         let out = compute_block_layout_pass(input, &cache);
@@ -464,6 +523,7 @@ mod tests {
             clip_bottom: 120.0,
             resolve_styles: false,
             styled_lookup_counter: None,
+            block_diagnose_state: &std::collections::HashMap::new(),
         };
         let out = compute_block_layout_pass(input, &BlockLayoutCache::default());
         let newest = out
@@ -653,6 +713,7 @@ mod tests {
                         clip_bottom: 1e9,
                         resolve_styles: true,
                         styled_lookup_counter: None,
+                        block_diagnose_state: &std::collections::HashMap::new(),
                     };
                     let out = compute_block_layout_pass(input, &cache);
                     black_box(out.expanded_block_count);
@@ -679,6 +740,7 @@ mod tests {
                         clip_bottom: 800.0,
                         resolve_styles: true,
                         styled_lookup_counter: None,
+                        block_diagnose_state: &std::collections::HashMap::new(),
                     };
                     let out = compute_block_layout_pass(input, &cache);
                     black_box(out.expanded_block_count);

@@ -148,6 +148,8 @@ impl MetalRenderer {
                         find_block_highlight: None,
                         palette: pane.terminal.palette(),
                         cache_namespace: pane.pane_session_id,
+                        block_diagnose_state: &std::collections::HashMap::new(),
+                        ai_configured: false,
                     },
                     &mut selection,
                 );

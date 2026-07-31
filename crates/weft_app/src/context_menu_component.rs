@@ -111,6 +111,7 @@ mod tests {
         ("Toggle Bookmark", "toggle_bookmark"),
         ("Add Note", "add_note"),
         ("Export Block", "export_block"),
+        ("Diagnose with AI", "diagnose"),
     ];
 
     #[test]
@@ -178,7 +179,7 @@ mod tests {
             ContextMenuKeyAction::Select(ITEMS.len() - 2)
         );
         assert_eq!(clamped_context_menu_selection(7, 0), None);
-        assert_eq!(clamped_context_menu_selection(7, ITEMS.len()), Some(6));
+        assert_eq!(clamped_context_menu_selection(7, ITEMS.len()), Some(7));
     }
 
     #[test]
@@ -189,7 +190,7 @@ mod tests {
         );
         assert_eq!(
             context_menu_key_action(KeyCode::Tab, Modifiers::SHIFT, 0, ITEMS.len()),
-            ContextMenuKeyAction::Select(6)
+            ContextMenuKeyAction::Select(7)
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageUp, Modifiers::empty(), 2, ITEMS.len()),
@@ -197,7 +198,7 @@ mod tests {
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageDown, Modifiers::empty(), 1, ITEMS.len()),
-            ContextMenuKeyAction::Select(6)
+            ContextMenuKeyAction::Select(7)
         );
     }
 }

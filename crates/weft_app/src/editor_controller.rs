@@ -463,6 +463,21 @@ impl App {
                             self.request_redraw();
                         }
                     }
+                    // v1.8.2: Also check block diagnose state.
+                    let mut matched_block = None;
+                    for (&block_id, state) in &self.block_diagnose_state {
+                        if state.pending_id == Some(id) {
+                            matched_block = Some(block_id);
+                            break;
+                        }
+                    }
+                    if let Some(block_id) = matched_block {
+                        if let Some(state) = self.block_diagnose_state.get_mut(&block_id) {
+                            state.pending_id = None;
+                            state.result = Some(Err(message));
+                        }
+                        self.request_redraw();
+                    }
                 }
                 crate::ai::AiResultEvent::Cancelled { id } => {
                     // Clear the pending marker if this was our request.
@@ -474,9 +489,44 @@ impl App {
                             self.request_redraw();
                         }
                     }
+                    // v1.8.2: Also clear block diagnose pending state.
+                    let mut matched_block = None;
+                    for (&block_id, state) in &self.block_diagnose_state {
+                        if state.pending_id == Some(id) {
+                            matched_block = Some(block_id);
+                            break;
+                        }
+                    }
+                    if let Some(block_id) = matched_block {
+                        if let Some(state) = self.block_diagnose_state.get_mut(&block_id) {
+                            state.pending_id = None;
+                            // Keep existing result if any; just clear the
+                            // "thinking" indicator. If there was no prior
+                            // result, remove the entry so the panel disappears.
+                            if state.result.is_none() {
+                                self.block_diagnose_state.remove(&block_id);
+                            }
+                        }
+                        self.request_redraw();
+                    }
                 }
-                crate::ai::AiResultEvent::Diagnose { .. } => {
-                    // v1.8.2: route to block view.
+                crate::ai::AiResultEvent::Diagnose { id, explanation } => {
+                    // v1.8.2: Route to the block that issued the request.
+                    // Find the block_id whose pending_id matches.
+                    let mut matched_block = None;
+                    for (&block_id, state) in &self.block_diagnose_state {
+                        if state.pending_id == Some(id) {
+                            matched_block = Some(block_id);
+                            break;
+                        }
+                    }
+                    if let Some(block_id) = matched_block {
+                        if let Some(state) = self.block_diagnose_state.get_mut(&block_id) {
+                            state.pending_id = None;
+                            state.result = Some(Ok(explanation));
+                        }
+                        self.request_redraw();
+                    }
                 }
             }
         }

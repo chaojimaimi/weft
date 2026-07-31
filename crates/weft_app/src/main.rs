@@ -11,6 +11,8 @@ mod accessibility_model;
 // v1.8 AI integration — local Ollama only. Wired into the app shell in
 // v1.8.0 (App holds an `AiState`, drained via `poll_ai_results`).
 mod ai;
+// v1.8.2: Block diagnose controller — bridges block view ↔ AiState::spawn_diagnose.
+mod ai_block_controller;
 mod app;
 mod app_runtime;
 mod app_state;
@@ -218,6 +220,11 @@ struct App {
     /// optional backend, and result channel. Background tokio tasks
     /// communicate via crossbeam-channel; drained in `poll_ai_results`.
     ai_state: ai::AiState,
+    /// v1.8.2: Per-block AI diagnose state. Keyed by BlockId. An entry
+    /// exists when a diagnose request is in flight or a result is being
+    /// shown. Removed when the user closes the panel or the block is
+    /// deleted.
+    block_diagnose_state: std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
 }
 
 /// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
@@ -233,6 +240,8 @@ const CONTEXT_MENU_ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT
     ("Toggle Bookmark", "toggle_bookmark"),
     ("Add Note", "add_note"),
     ("Export Block", "export_block"),
+    // v1.8.2: AI diagnose for failed blocks (no-op on success/when AI off).
+    ("Diagnose with AI", "diagnose"),
 ];
 
 /// Action triggered by clicking a button in the find popup. Produced by
@@ -334,6 +343,7 @@ impl App {
             }),
             bookmarked_blocks: std::collections::HashSet::new(),
             ai_state: ai::AiState::new(ai_config_snapshot),
+            block_diagnose_state: std::collections::HashMap::new(),
         }
     }
 

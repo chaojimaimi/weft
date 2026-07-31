@@ -291,6 +291,9 @@ pub enum BlockViewRowKind {
     Header,
     Separator,
     LiveCommand,
+    /// v1.8.2: AI diagnose panel row (rendered below a failed block's output).
+    /// Non-selectable; carries `block_id` so hit-testing can route clicks.
+    DiagnosePanel,
 }
 
 /// A single rendered row in the block view, captured at layout time. The y
