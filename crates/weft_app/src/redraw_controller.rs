@@ -167,6 +167,67 @@ impl App {
                 is_active: active_profile == Some(name.as_str()),
             });
         }
+        // v1.8.3: Build the LocalAi tab view from the draft AI config +
+        // cached model list + connection status. Borrowed lifetimes tie back
+        // to `self` so this must be built before the mutable `tab` borrow.
+        let settings_ai_model_names: Vec<String> = self
+            .ai_models
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let settings_ai_connection_label = self.ai_connection_status.label();
+        let settings_ai_base_url =
+            crate::ai::client::effective_base_url(&self.settings.draft.ai);
+        // v1.8.3: Observability summary — pre-formatted so the renderer only
+        // pushes one text run. Empty when no requests have been made (so the
+        // row is hidden on a fresh launch). Only aggregate counts + p95
+        // latency; no prompt/response text.
+        let metrics_snap = self.ai_state.metrics_snapshot();
+        let settings_ai_observability = if metrics_snap.requests_total == 0 {
+            String::new()
+        } else {
+            // v1.8.3: Surface truncations when non-zero — they indicate the
+            // prompt budget was hit (history/output clipped before sending).
+            if metrics_snap.truncations_total > 0 {
+                format!(
+                    "{} req · {} ok · {} err · {} canc · {} trunc · p95 {}ms",
+                    metrics_snap.requests_total,
+                    metrics_snap.successes_total,
+                    metrics_snap.errors_total,
+                    metrics_snap.cancellations_total,
+                    metrics_snap.truncations_total,
+                    metrics_snap.p95_latency_ms,
+                )
+            } else {
+                format!(
+                    "{} req · {} ok · {} err · {} canc · p95 {}ms",
+                    metrics_snap.requests_total,
+                    metrics_snap.successes_total,
+                    metrics_snap.errors_total,
+                    metrics_snap.cancellations_total,
+                    metrics_snap.p95_latency_ms,
+                )
+            }
+        };
+        let settings_ai = crate::overlay::AiSettingsView {
+            enabled: self.settings.draft.ai.is_configured(),
+            model: self
+                .settings
+                .draft
+                .ai
+                .model
+                .as_deref()
+                .unwrap_or(""),
+            base_url: &settings_ai_base_url,
+            max_tokens: self.settings.draft.ai.effective_max_tokens(),
+            timeout_secs: self.settings.draft.ai.effective_timeout_secs() as u32,
+            enable_command_generation: self.settings.draft.ai.enable_command_generation,
+            enable_error_diagnosis: self.settings.draft.ai.enable_error_diagnosis,
+            models: &settings_ai_model_names,
+            connection_status: &settings_ai_connection_label,
+            testing: self.ai_connection_status.is_testing(),
+            observability: &settings_ai_observability,
+        };
         let palette_form_fields = self
             .palette
             .form
@@ -466,6 +527,7 @@ impl App {
                 settings_field_errors,
                 &settings_profiles,
                 self.settings.draft.theme.semantic_output_enabled(),
+                settings_ai,
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid

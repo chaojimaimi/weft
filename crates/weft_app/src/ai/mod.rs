@@ -19,18 +19,21 @@
 //!   pattern.
 
 pub mod client;
+pub mod metrics;
 pub mod prompt;
 pub mod redact;
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use weft_core::config::AiConfig;
 
-use client::{build_backend, AiBackend, AiError, CancelFlag};
+use client::{build_backend, effective_base_url, fetch_ollama_models, is_loopback_url, AiBackend, AiError, CancelFlag, TagModel};
 
+pub use metrics::{AiMetrics, AiMetricsSnapshot};
 pub use prompt::{
     build_command_gen_messages, build_diagnose_messages, clean_command_output, classify_command_risk,
     AiRiskLevel, CommandGenPrompt, DiagnosePrompt,
@@ -72,6 +75,13 @@ pub enum AiResultEvent {
     /// A diagnosis request finished. The string is the model's plain-text
     /// explanation. The caller should attach it to the corresponding block.
     Diagnose { id: u64, explanation: String },
+    /// v1.8.3: A `/api/tags` model-list refresh finished. The result is the
+    /// list of installed models (on success) or an error message (on failure).
+    /// The caller updates the Settings AI panel's model dropdown + status.
+    ModelsRefreshed {
+        id: u64,
+        result: Result<Vec<TagModel>, String>,
+    },
     /// A request failed. The error string is suitable for direct display
     /// in the UI (palette status line / block diagnostic panel).
     Error { id: u64, message: String },
@@ -109,6 +119,12 @@ pub struct AiState {
     /// new request supersedes an old one (or the user closes the UI), the
     /// old flag is flipped to `true` and the entry removed.
     cancellations: std::collections::HashMap<u64, CancelFlag>,
+    /// v1.8.3: Start timestamps for in-flight requests, used to compute
+    /// latency on completion. Removed in `poll()` when the result arrives.
+    start_times: std::collections::HashMap<u64, Instant>,
+    /// v1.8.3: Observability counters (requests / errors / cancellations /
+    /// latencies). No prompt or response text is recorded.
+    metrics: AiMetrics,
 }
 
 impl AiState {
@@ -132,6 +148,8 @@ impl AiState {
             next_id: 1,
             in_flight: 0,
             cancellations: std::collections::HashMap::new(),
+            start_times: std::collections::HashMap::new(),
+            metrics: AiMetrics::new(),
         }
     }
 
@@ -161,6 +179,9 @@ impl AiState {
         for (_id, flag) in self.cancellations.drain() {
             flag.cancel();
         }
+        // v1.8.3: start_times is drained by `poll()` when the Cancelled
+        // event arrives; no need to clear it here. Keeping the entry lets
+        // `poll()` compute latency for the cancellation log line.
     }
 
     /// Cancel a specific request by id. Returns `true` if the request
@@ -190,6 +211,8 @@ impl AiState {
         let id = self.next_id;
         self.next_id += 1;
         self.in_flight += 1;
+        self.metrics.record_request();
+        self.start_times.insert(id, Instant::now());
         let tx = self.tx.clone();
         let cancel = CancelFlag::new();
         self.cancellations.insert(id, cancel.clone());
@@ -229,6 +252,8 @@ impl AiState {
         let id = self.next_id;
         self.next_id += 1;
         self.in_flight += 1;
+        self.metrics.record_request();
+        self.start_times.insert(id, Instant::now());
         let tx = self.tx.clone();
         let cancel = CancelFlag::new();
         self.cancellations.insert(id, cancel.clone());
@@ -250,9 +275,59 @@ impl AiState {
         Some(id)
     }
 
+    /// v1.8.3: Spawn a `/api/tags` model-list refresh. Builds a temporary
+    /// HTTP client from `config` (not `self.backend`) so the Settings panel
+    /// can test a draft config before saving it — and crucially, without
+    /// requiring a `model` field to be set (the user may not have picked
+    /// one yet). Returns the assigned id so the caller can match the
+    /// eventual `AiResultEvent::ModelsRefreshed { id }`.
+    ///
+    /// Returns `None` when `config.provider` is not `"ollama"` or the
+    /// `base_url` fails loopback validation. The caller should surface the
+    /// reason directly — no async result is coming.
+    pub fn spawn_list_models(&mut self, config: &AiConfig) -> Option<u64> {
+        // Only attempt discovery when the draft is configured for Ollama.
+        if !config.is_configured() {
+            return None;
+        }
+        let base_url = effective_base_url(config);
+        if !is_loopback_url(&base_url) {
+            return None;
+        }
+        let timeout = std::time::Duration::from_secs(config.effective_timeout_secs());
+        let http = match reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        let id = self.next_id;
+        self.next_id += 1;
+        self.in_flight += 1;
+        self.metrics.record_request();
+        self.start_times.insert(id, Instant::now());
+        let tx = self.tx.clone();
+
+        tokio::spawn(async move {
+            let result = fetch_ollama_models(&http, &base_url).await;
+            let event = AiResultEvent::ModelsRefreshed {
+                id,
+                result: result.map_err(|e| e.to_string()),
+            };
+            let _ = tx.send(event);
+        });
+
+        Some(id)
+    }
+
     /// Drain any completed results from the channel. Called by the redraw
     /// loop each frame (matching the FindWorker pattern). Decrements
     /// `in_flight` for each result so the "thinking…" indicator clears.
+    /// v1.8.3: also records observability metrics (success/error/cancelled
+    /// and latency) and emits a debug log line per completion. No prompt or
+    /// response text is logged — only counts, durations, and error category.
     pub fn poll(&mut self) -> Vec<AiResultEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
@@ -261,13 +336,52 @@ impl AiState {
             let id = match &event {
                 AiResultEvent::CommandGen { id, .. }
                 | AiResultEvent::Diagnose { id, .. }
+                | AiResultEvent::ModelsRefreshed { id, .. }
                 | AiResultEvent::Error { id, .. }
                 | AiResultEvent::Cancelled { id } => *id,
             };
             self.cancellations.remove(&id);
+            // v1.8.3: record metrics + emit a body-free debug log.
+            let started = self.start_times.remove(&id);
+            let latency = started.map(|t| t.elapsed()).unwrap_or_default();
+            match &event {
+                AiResultEvent::CommandGen { .. }
+                | AiResultEvent::Diagnose { .. }
+                | AiResultEvent::ModelsRefreshed { result: Ok(_), .. } => {
+                    self.metrics.record_success(latency);
+                }
+                AiResultEvent::ModelsRefreshed { result: Err(_), .. }
+                | AiResultEvent::Error { .. } => {
+                    self.metrics.record_error(latency);
+                }
+                AiResultEvent::Cancelled { .. } => {
+                    self.metrics.record_cancellation();
+                }
+            }
+            let kind = match &event {
+                AiResultEvent::CommandGen { .. } => "command_gen",
+                AiResultEvent::Diagnose { .. } => "diagnose",
+                AiResultEvent::ModelsRefreshed { .. } => "models_refresh",
+                AiResultEvent::Error { .. } => "error",
+                AiResultEvent::Cancelled { .. } => "cancelled",
+            };
+            let ok = !matches!(
+                event,
+                AiResultEvent::Error { .. }
+                    | AiResultEvent::Cancelled { .. }
+                    | AiResultEvent::ModelsRefreshed { result: Err(_), .. }
+            );
+            debug!(kind = kind, ok = ok, latency_ms = latency.as_millis() as u64, "ai_request_completed");
             events.push(event);
         }
         events
+    }
+
+    /// v1.8.3: Read-only metrics snapshot for the Settings AI panel's
+    /// observability row and for debug logging. Contains no prompt/response
+    /// text — only aggregate counts and a p95 latency.
+    pub fn metrics_snapshot(&self) -> AiMetricsSnapshot {
+        self.metrics.snapshot()
     }
 }
 
@@ -502,5 +616,60 @@ mod tests {
         assert!(state.cancel(5));
         assert!(cancel.is_cancelled());
         assert!(!state.cancel(5)); // already removed
+    }
+
+    // v1.8.3: Settings "Test Connection" → spawn_list_models.
+    #[test]
+    fn spawn_list_models_returns_none_when_not_configured() {
+        let mut state = AiState::new(AiConfig::default());
+        assert!(state.spawn_list_models(&AiConfig::default()).is_none());
+    }
+
+    #[test]
+    fn spawn_list_models_returns_none_for_non_loopback_url() {
+        let mut cfg = AiConfig::default();
+        cfg.provider = Some("ollama".into());
+        // Public HTTPS endpoint — must be rejected before any network call.
+        cfg.base_url = Some("https://example.com".into());
+        let mut state = AiState::new(cfg.clone());
+        assert!(state.spawn_list_models(&cfg).is_none());
+    }
+
+    #[test]
+    fn spawn_list_models_returns_none_for_http_on_public_host() {
+        let mut cfg = AiConfig::default();
+        cfg.provider = Some("ollama".into());
+        cfg.base_url = Some("http://192.168.1.5:11434".into());
+        let mut state = AiState::new(cfg.clone());
+        assert!(state.spawn_list_models(&cfg).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_list_models_assigns_id_for_loopback_url() {
+        // The request will fail (no Ollama running in CI), but the id
+        // assignment happens before the network call — we only verify
+        // that Some(id) is returned and in_flight is incremented.
+        let mut cfg = AiConfig::default();
+        cfg.provider = Some("ollama".into());
+        cfg.base_url = Some("http://127.0.0.1:11434".into());
+        cfg.timeout_secs = Some(1); // fail fast
+        let mut state = AiState::new(cfg.clone());
+        let id = state.spawn_list_models(&cfg);
+        assert!(id.is_some(), "loopback URL should be accepted");
+        assert_eq!(state.in_flight(), 1);
+        // Drain the eventual error event so the tokio task completes.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = state.poll();
+        assert_eq!(state.in_flight(), 0);
+    }
+
+    #[test]
+    fn metrics_snapshot_starts_zero() {
+        let state = AiState::new(AiConfig::default());
+        let snap = state.metrics_snapshot();
+        assert_eq!(snap.requests_total, 0);
+        assert_eq!(snap.successes_total, 0);
+        assert_eq!(snap.errors_total, 0);
+        assert_eq!(snap.p95_latency_ms, 0);
     }
 }

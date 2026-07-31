@@ -1,5 +1,24 @@
 use super::*;
 
+/// v1.8.3: Minimal `AiSettingsView` for tests — all fields empty/zero so the
+/// renderer's LocalAi branch has well-defined inputs when a test exercises
+/// `warm_chars` or the modal-z assertion with `SettingsTab::LocalAi`.
+fn test_ai_view() -> AiSettingsView<'static> {
+    AiSettingsView {
+        enabled: false,
+        model: "",
+        base_url: "",
+        max_tokens: 1024,
+        timeout_secs: 30,
+        enable_command_generation: false,
+        enable_error_diagnosis: false,
+        models: &[],
+        connection_status: "",
+        testing: false,
+        observability: "",
+    }
+}
+
 fn make_layer(z: OverlayZ, policy: OverlayInputPolicy) -> OverlayLayer<'static> {
     OverlayLayer {
         kind: OverlayKind::Prompt,
@@ -185,16 +204,18 @@ fn settings_tab_labels_are_distinct() {
 }
 
 #[test]
-fn settings_tab_all_has_six_categories() {
+fn settings_tab_all_has_seven_categories() {
     // F5: Logo merged into Appearance; Font merged into Appearance.
-    // New categories: Appearance, Terminal, Input, Keybindings, Window, Advanced.
-    assert_eq!(SettingsTab::ALL.len(), 6);
+    // v1.8.3: LocalAi added as the 7th category (between Window and Advanced).
+    // Categories: Appearance, Terminal, Input, Keybindings, Window, LocalAi, Advanced.
+    assert_eq!(SettingsTab::ALL.len(), 7);
     assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
     assert_eq!(SettingsTab::ALL[1], SettingsTab::Terminal);
     assert_eq!(SettingsTab::ALL[2], SettingsTab::Input);
     assert_eq!(SettingsTab::ALL[3], SettingsTab::Keybindings);
     assert_eq!(SettingsTab::ALL[4], SettingsTab::Window);
-    assert_eq!(SettingsTab::ALL[5], SettingsTab::Advanced);
+    assert_eq!(SettingsTab::ALL[5], SettingsTab::LocalAi);
+    assert_eq!(SettingsTab::ALL[6], SettingsTab::Advanced);
 }
 
 #[test]
@@ -251,6 +272,7 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         field_errors: &[],
         profiles: &[],
         semantic_output_enabled: true,
+        ai: test_ai_view(),
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -303,6 +325,7 @@ fn settings_overlay_is_modal_and_highest_z() {
                     field_errors: &[],
                     profiles: &[],
                     semantic_output_enabled: true,
+                    ai: test_ai_view(),
                 }),
             },
         ],

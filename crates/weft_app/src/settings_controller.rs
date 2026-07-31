@@ -110,6 +110,14 @@ impl App {
                 }
                 self.request_redraw();
             }
+            // v1.8.3: LocalAi → "Test Connection" action row. Click selects
+            // row 7 and spawns a `/api/tags` refresh against the draft
+            // config (without saving first). Same flow as Enter on row 7.
+            Some(SettingsTarget::LocalAiTestConnection) => {
+                self.settings.selection = 7;
+                self.test_ai_connection_from_draft();
+                self.request_redraw();
+            }
             None if !self.point_inside_settings_box(x, y) => {
                 self.close_settings();
                 self.request_redraw();
@@ -260,6 +268,14 @@ impl App {
                                     self.save_settings_draft(false);
                                 }
                             }
+                        } else if self.settings.tab == SettingsTab::LocalAi
+                            && self.settings.selection == 7
+                        {
+                            // v1.8.3: LocalAi row 7 — "Test Connection" action
+                            // button. Spawns a `/api/tags` refresh against the
+                            // draft config (without saving first, so the user
+                            // can test before committing).
+                            self.test_ai_connection_from_draft();
                         } else {
                             self.apply_settings_selection();
                             self.save_settings_draft(false);
@@ -514,6 +530,80 @@ impl App {
                 }
                 _ => {}
             },
+            // v1.8.3: LocalAi — enable toggle, model cycle, max_tokens,
+            // timeout, cmd-generation toggle, error-diagnosis toggle. Row 7
+            // (Test Connection) is an action button, not a ←/→ adjustment.
+            SettingsTab::LocalAi => match self.settings.selection {
+                0 => {
+                    // Enabled: toggle provider between Some("ollama") and None.
+                    let next = if self.settings.draft.ai.is_configured() {
+                        None
+                    } else {
+                        Some("ollama".to_string())
+                    };
+                    self.settings.draft.ai.provider = next;
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                1 => {
+                    // Model: cycle through cached model names. If the current
+                    // model isn't in the list, ←/→ jumps to the first entry.
+                    let models: Vec<String> = self
+                        .ai_models
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect();
+                    if models.is_empty() {
+                        return; // no models to cycle; user should Test Connection first
+                    }
+                    let cur = self.settings.draft.ai.model.as_deref();
+                    let idx = models
+                        .iter()
+                        .position(|m| Some(m.as_str()) == cur)
+                        .unwrap_or(0);
+                    let next = (idx as i32 + delta).rem_euclid(models.len() as i32) as usize;
+                    self.settings.draft.ai.model = Some(models[next].clone());
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                2 => {
+                    // URL: read-only display (loopback-only, edit via config.toml).
+                    // ←/→ is a no-op.
+                }
+                3 => {
+                    // Max Tokens: ±256, clamped to [256, 8192]. None → 1024.
+                    let cur = self.settings.draft.ai.effective_max_tokens() as i32;
+                    let next = (cur + delta * 256).clamp(256, 8192) as u32;
+                    self.settings.draft.ai.max_tokens = Some(next);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                4 => {
+                    // Timeout: ±5s, clamped to [5, 120]. None → 30.
+                    let cur = self.settings.draft.ai.effective_timeout_secs() as i32;
+                    let next = (cur + delta * 5).clamp(5, 120) as u32;
+                    self.settings.draft.ai.timeout_secs = Some(next);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                5 => {
+                    // Cmd Generation: toggle on/off.
+                    self.settings.draft.ai.enable_command_generation =
+                        directional_bool(self.settings.draft.ai.enable_command_generation, delta);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                6 => {
+                    // Error Diagnosis: toggle on/off.
+                    self.settings.draft.ai.enable_error_diagnosis =
+                        directional_bool(self.settings.draft.ai.enable_error_diagnosis, delta);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::AI);
+                }
+                // Row 7 (Test Connection) is an action button — Enter/click
+                // triggers it, ←/→ is a no-op.
+                _ => {}
+            },
             SettingsTab::Advanced => {
                 // Placeholder rows — no real config backing yet.
             }
@@ -650,6 +740,9 @@ impl App {
             SettingsTab::Input => 1,    // Submit on Ctrl+Enter.
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
             SettingsTab::Window => 3,   // Width + Height + Sidebar Width.
+            // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
+            // Cmd Generation + Error Diagnosis + Test Connection.
+            SettingsTab::LocalAi => 8,
             SettingsTab::Advanced => 4, // Debug Logging + Experimental + Import + Export (v1.5.2).
         }
     }
@@ -693,8 +786,70 @@ impl App {
             | SettingsTab::Input
             | SettingsTab::Keybindings
             | SettingsTab::Window
+            | SettingsTab::LocalAi
             | SettingsTab::Advanced => {
-                // ←/→ handles adjustments; Enter is a no-op.
+                // ←/→ handles adjustments; Enter is a no-op for standard rows.
+                // (LocalAi row 7 / Advanced rows 2-3 are action buttons —
+                // handled in `handle_settings_key`'s Enter branch.)
+            }
+        }
+    }
+
+    /// v1.8.3: Spawn a `/api/tags` model-list refresh against the draft AI
+    /// config (without saving it first — the user can test before committing).
+    /// Sets the connection status to `Testing` and records the in-flight id so
+    /// `poll_ai_results` can route the eventual `ModelsRefreshed` event back
+    /// here. If the draft is not configured for Ollama, or the base URL fails
+    /// loopback validation, the status is set to `Failed` immediately with a
+    /// descriptive message — no async result is coming.
+    pub(super) fn test_ai_connection_from_draft(&mut self) {
+        // Reject re-entrancy: if a refresh is already in flight, ignore
+        // additional clicks until it resolves. The button is also visually
+        // disabled while `Testing`, but keyboard Enter bypasses the visual
+        // gate so this is the authoritative guard.
+        if self
+            .ai_connection_status
+            .is_testing()
+        {
+            return;
+        }
+
+        let draft_ai = &self.settings.draft.ai;
+        if !draft_ai.is_configured() {
+            self.ai_connection_status =
+                crate::app_state::AiConnectionStatus::Failed(
+                    "Enable Local AI (provider = ollama) first".into(),
+                );
+            return;
+        }
+
+        let base_url = crate::ai::client::effective_base_url(draft_ai);
+        if !crate::ai::client::is_loopback_url(&base_url) {
+            self.ai_connection_status =
+                crate::app_state::AiConnectionStatus::Failed(format!(
+                    "Refusing non-loopback URL: {base_url}"
+                ));
+            return;
+        }
+
+        // `spawn_list_models` builds a temporary HTTP client from the draft
+        // config (NOT `self.ai_state.backend`) so the user can test a draft
+        // base_url / timeout before saving. Returns the assigned request id.
+        match self.ai_state.spawn_list_models(draft_ai) {
+            Some(id) => {
+                self.ai_models_request_id = Some(id);
+                self.ai_connection_status =
+                    crate::app_state::AiConnectionStatus::Testing;
+            }
+            None => {
+                // spawn_list_models only returns None after the
+                // is_configured + loopback checks above, so reaching here
+                // means the HTTP client builder failed (e.g. TLS backend
+                // init error). Surface a generic failure.
+                self.ai_connection_status =
+                    crate::app_state::AiConnectionStatus::Failed(
+                        "Failed to build HTTP client".into(),
+                    );
             }
         }
     }

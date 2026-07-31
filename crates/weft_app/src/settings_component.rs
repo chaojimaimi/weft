@@ -43,6 +43,9 @@ pub(crate) enum SettingsTarget {
     /// v1.5.2: Advanced → "Export Config:" row. Enter triggers the
     /// NSSavePanel flow (see `App::export_config_interactive`).
     AdvancedExport,
+    /// v1.8.3: LocalAi → "Test Connection:" row. Enter/click spawns a
+    /// `/api/tags` refresh and updates the connection status line.
+    LocalAiTestConnection,
 }
 
 pub(crate) const APPEARANCE_ADJUSTMENT_ROWS: usize = 6;
@@ -292,6 +295,12 @@ pub(crate) fn build_settings_scene(
             if active_tab == SettingsTab::Advanced {
                 continue;
             }
+            // v1.8.3: LocalAi row 7 is the "Test Connection" action button —
+            // it gets a dedicated `LocalAiTestConnection` hit target below,
+            // so skip the generic ContentRow registration for it.
+            if active_tab == SettingsTab::LocalAi && row == 7 {
+                continue;
+            }
             let row_y = layout.content_top + visible_index as f32 * cell_h;
             let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
             scene.hits.push(HitRegion::from_rect(
@@ -301,6 +310,24 @@ pub(crate) fn build_settings_scene(
             scene.semantics.push(SemanticNode {
                 role: SemanticRole::ListItem,
                 label: format!("Setting row {}", row + 1),
+                bounds: row_rect,
+                focus: Some(FocusId::Settings),
+                state: String::new(),
+            });
+        }
+    }
+
+    // v1.8.3: LocalAi → "Test Connection" action row (row 7). Enter/click
+    // spawns a `/api/tags` refresh; the status line below shows the result.
+    if layout.show_content && active_tab == SettingsTab::LocalAi {
+        let row_idx = 7;
+        if row_idx < layout.max_rows {
+            let row_y = layout.content_top + row_idx as f32 * cell_h;
+            let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+            scene.hits.push(HitRegion::from_rect(row_rect, SettingsTarget::LocalAiTestConnection));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::Button,
+                label: "Test AI connection".into(),
                 bounds: row_rect,
                 focus: Some(FocusId::Settings),
                 state: String::new(),

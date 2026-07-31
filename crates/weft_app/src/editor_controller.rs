@@ -528,6 +528,26 @@ impl App {
                         self.request_redraw();
                     }
                 }
+                crate::ai::AiResultEvent::ModelsRefreshed { id, result } => {
+                    // v1.8.3: Route to the Settings LocalAi tab. Only accept
+                    // if the id matches the in-flight models request.
+                    if self.ai_models_request_id == Some(id) {
+                        self.ai_models_request_id = None;
+                        match result {
+                            Ok(models) => {
+                                let n = models.len();
+                                self.ai_models = models;
+                                self.ai_connection_status =
+                                    crate::app_state::AiConnectionStatus::Ok(n);
+                            }
+                            Err(msg) => {
+                                self.ai_connection_status =
+                                    crate::app_state::AiConnectionStatus::Failed(msg);
+                            }
+                        }
+                        self.request_redraw();
+                    }
+                }
             }
         }
     }

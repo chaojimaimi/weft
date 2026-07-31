@@ -225,6 +225,17 @@ struct App {
     /// shown. Removed when the user closes the panel or the block is
     /// deleted.
     block_diagnose_state: std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    /// v1.8.3: Cached Ollama model list from the last `/api/tags` refresh.
+    /// Empty until the user clicks "Test Connection" in Settings. Drives
+    /// the LocalAi tab's model dropdown.
+    ai_models: Vec<ai::client::TagModel>,
+    /// v1.8.3: Connection status for the Settings LocalAi tab. Updated by
+    /// `poll_ai_results` when a `ModelsRefreshed` event arrives.
+    ai_connection_status: crate::app_state::AiConnectionStatus,
+    /// v1.8.3: In-flight `/api/tags` request id, if any. Used to correlate
+    /// `AiResultEvent::ModelsRefreshed` with the Settings "Test Connection"
+    /// button. `None` when no refresh is pending.
+    ai_models_request_id: Option<u64>,
 }
 
 /// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
@@ -344,6 +355,9 @@ impl App {
             bookmarked_blocks: std::collections::HashSet::new(),
             ai_state: ai::AiState::new(ai_config_snapshot),
             block_diagnose_state: std::collections::HashMap::new(),
+            ai_models: Vec::new(),
+            ai_connection_status: crate::app_state::AiConnectionStatus::Idle,
+            ai_models_request_id: None,
         }
     }
 

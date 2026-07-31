@@ -908,7 +908,7 @@
       "footer_y": 596.0,
       "max_rows": 25,
       "scene": {
-        "hit_count": 7,
+        "hit_count": 8,
         "hits": [
           {
             "bounds": [
@@ -962,6 +962,15 @@
               430.0,
               230.0
             ],
+            "target": "SidebarCategory(LocalAi)"
+          },
+          {
+            "bounds": [
+              70.0,
+              230.0,
+              430.0,
+              248.0
+            ],
             "target": "SidebarCategory(Advanced)"
           },
           {
@@ -974,7 +983,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 8,
+        "semantic_count": 9,
         "semantics": [
           {
             "bounds": [
@@ -1056,6 +1065,18 @@
               230.0
             ],
             "focus": "Settings",
+            "label": "Local AI",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              230.0,
+              430.0,
+              248.0
+            ],
+            "focus": "Settings",
             "label": "Advanced",
             "role": "Tab",
             "state": ""
@@ -1098,7 +1119,7 @@
       "footer_y": 774.0,
       "max_rows": 33,
       "scene": {
-        "hit_count": 28,
+        "hit_count": 29,
         "hits": [
           {
             "bounds": [
@@ -1151,6 +1172,15 @@
               234.0,
               491.904,
               252.0
+            ],
+            "target": "SidebarCategory(LocalAi)"
+          },
+          {
+            "bounds": [
+              201.6,
+              252.0,
+              491.904,
+              270.0
             ],
             "target": "SidebarCategory(Advanced)"
           },
@@ -1353,7 +1383,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 28,
+        "semantic_count": 29,
         "semantics": [
           {
             "bounds": [
@@ -1433,6 +1463,18 @@
               234.0,
               491.904,
               252.0
+            ],
+            "focus": "Settings",
+            "label": "Local AI",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              252.0,
+              491.904,
+              270.0
             ],
             "focus": "Settings",
             "label": "Advanced",

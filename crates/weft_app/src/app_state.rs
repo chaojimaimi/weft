@@ -526,6 +526,40 @@ impl BlockDiagnoseState {
     }
 }
 
+/// v1.8.3: Settings LocalAi tab connection status. Updated by
+/// `poll_ai_results` when a `ModelsRefreshed` event arrives, and rendered
+/// as a status line below the "Test Connection" button.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AiConnectionStatus {
+    /// No test has been run yet.
+    #[default]
+    Idle,
+    /// A `/api/tags` request is in flight.
+    Testing,
+    /// Connection succeeded — `n` models were discovered.
+    Ok(usize),
+    /// Connection failed — the string is a user-facing error message
+    /// (e.g. "connection refused", "non-loopback endpoint", "timeout").
+    Failed(String),
+}
+
+impl AiConnectionStatus {
+    /// Human-readable summary for the Settings status line.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Idle => "Not tested".into(),
+            Self::Testing => "Testing…".into(),
+            Self::Ok(n) => format!("Connected ({} models)", n),
+            Self::Failed(msg) => format!("Failed: {}", msg),
+        }
+    }
+
+    /// True when a refresh is in flight (used to disable the button).
+    pub fn is_testing(&self) -> bool {
+        matches!(self, Self::Testing)
+    }
+}
+
 pub struct FindState {
     pub open: bool,
     pub query: String,

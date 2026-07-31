@@ -85,7 +85,7 @@ pub enum OverlayContent<'a> {
 
 /// F5: Which category of the Settings panel is active. The old v1.0 tab
 /// bar (Appearance / Font / Keybindings / Window / Logo) has been replaced
-/// by a 6-entry split sidebar. Logo and Font merged into Appearance.
+/// by a 7-entry split sidebar. Logo and Font merged into Appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     /// Theme list, logo variant, font family/size/line-height, window opacity.
@@ -98,18 +98,22 @@ pub enum SettingsTab {
     Keybindings,
     /// Window size, sidebar width, tab bar.
     Window,
+    /// v1.8.3: Local Ollama AI integration (enable, model, test connection,
+    /// data-range toggles, max_tokens, timeout). AI config is global only.
+    LocalAi,
     /// Debug logging, experimental features (restart-required badges).
     Advanced,
 }
 
 impl SettingsTab {
     /// All categories in sidebar display order.
-    pub const ALL: [SettingsTab; 6] = [
+    pub const ALL: [SettingsTab; 7] = [
         SettingsTab::Appearance,
         SettingsTab::Terminal,
         SettingsTab::Input,
         SettingsTab::Keybindings,
         SettingsTab::Window,
+        SettingsTab::LocalAi,
         SettingsTab::Advanced,
     ];
 
@@ -121,6 +125,7 @@ impl SettingsTab {
             SettingsTab::Input => "Input",
             SettingsTab::Keybindings => "Keybindings",
             SettingsTab::Window => "Window",
+            SettingsTab::LocalAi => "Local AI",
             SettingsTab::Advanced => "Advanced",
         }
     }
@@ -159,6 +164,38 @@ pub struct SettingsProfileView<'a> {
     /// True when this entry is the currently-active profile (or Base when
     /// no profile is active). The renderer highlights it.
     pub is_active: bool,
+}
+
+/// v1.8.3: Settings LocalAi tab rendering parameters. Bundled into a single
+/// struct so `SettingsDrawParams` and `build_overlay_stack` only grow by one
+/// parameter instead of one per AI field. All data is borrowed from `App`'s
+/// AI-related fields (`settings.draft.ai`, `ai_models`, `ai_connection_status`).
+#[derive(Debug, Clone, Copy)]
+pub struct AiSettingsView<'a> {
+    /// True when `provider = Some("ollama")` in the draft config.
+    pub enabled: bool,
+    /// Current model name (empty string when `None`).
+    pub model: &'a str,
+    /// Effective base URL (defaults to `http://127.0.0.1:11434`).
+    pub base_url: &'a str,
+    /// Effective max_tokens (defaults to 1024).
+    pub max_tokens: u32,
+    /// Effective timeout in seconds (defaults to 30).
+    pub timeout_secs: u32,
+    /// Whether natural-language command generation is enabled.
+    pub enable_command_generation: bool,
+    /// Whether failed-block diagnosis is enabled.
+    pub enable_error_diagnosis: bool,
+    /// Cached model names from the last `/api/tags` refresh (for the dropdown).
+    pub models: &'a [String],
+    /// Human-readable connection status (e.g. "Connected (3 models)").
+    pub connection_status: &'a str,
+    /// True when a `/api/tags` refresh is in flight (disables the button).
+    pub testing: bool,
+    /// v1.8.3: Observability summary line (e.g. "12 req · 10 ok · 2 err ·
+    /// p95 240ms"). Pre-formatted by the controller so the renderer just
+    /// pushes one text run. Empty when no requests have been made.
+    pub observability: &'a str,
 }
 
 /// F5: Settings panel rendering parameters. The renderer reads these to lay
@@ -231,6 +268,9 @@ pub struct SettingsDrawParams<'a> {
     /// When true, unstyled output gets semantic role coloring; when false,
     /// only ANSI-styled output is colored. Defaults to true.
     pub semantic_output_enabled: bool,
+    /// v1.8.3: LocalAi tab parameters. Always provided; the renderer only
+    /// reads it when `active_tab == SettingsTab::LocalAi`.
+    pub ai: AiSettingsView<'a>,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -371,10 +411,10 @@ impl OverlayWarmup for OverlayContent<'_> {
             OverlayContent::Settings(s) => {
                 // F5: sidebar category labels + status text + theme names + keybinding strings.
                 missing.extend(
-                    "Settings Appearance Terminal Input Keybindings Window Advanced".chars(),
+                    "Settings Appearance Terminal Input Keybindings Window Local AI Advanced".chars(),
                 );
                 missing.extend(
-                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off"
+                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing"
                         .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
@@ -411,6 +451,14 @@ impl OverlayWarmup for OverlayContent<'_> {
                 missing.insert('\u{2212}'); // − minus sign for delete button
                 for p in s.profiles {
                     missing.extend(p.name.chars());
+                }
+                // v1.8.3: LocalAi tab — warm dynamic strings (model name,
+                // base URL, connection status, discovered model names).
+                missing.extend(s.ai.model.chars());
+                missing.extend(s.ai.base_url.chars());
+                missing.extend(s.ai.connection_status.chars());
+                for m in s.ai.models {
+                    missing.extend(m.chars());
                 }
             }
         }
@@ -511,6 +559,7 @@ pub fn build_overlay_stack<'a>(
     settings_field_errors: &'a [(String, String)],
     settings_profiles: &'a [SettingsProfileView<'a>],
     settings_semantic_output_enabled: bool,
+    settings_ai: AiSettingsView<'a>,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -682,6 +731,7 @@ pub fn build_overlay_stack<'a>(
                 field_errors: settings_field_errors,
                 profiles: settings_profiles,
                 semantic_output_enabled: settings_semantic_output_enabled,
+                ai: settings_ai,
             }),
         });
     }

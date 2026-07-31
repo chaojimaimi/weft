@@ -208,6 +208,13 @@ pub(super) fn merge_settings_draft(
         }
     }
 
+    // v1.8.3: AI config is global only — never written into a profile.
+    // `ProfileConfig` has no `ai` field, so we always write to the base
+    // config on `candidate` regardless of whether a profile is active.
+    if dirty.contains(weft_core::config::ConfigSectionMask::AI) {
+        candidate.ai = draft.ai.clone();
+    }
+
     candidate
         .resolve_active_profile()
         .map_err(ProfileTransactionError::Resolve)?;

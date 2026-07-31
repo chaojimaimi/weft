@@ -174,6 +174,46 @@ pub fn is_loopback_url(url: &str) -> bool {
     )
 }
 
+/// v1.8.3: Resolve the effective Ollama base URL from an [`AiConfig`].
+/// Falls back to `http://127.0.0.1:11434` when `base_url` is `None` or empty.
+/// Does NOT validate loopback — the caller (Settings "Test Connection")
+/// validates before sending a request.
+pub fn effective_base_url(cfg: &weft_core::config::AiConfig) -> String {
+    cfg.base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string())
+}
+
+/// v1.8.3: `/api/tags` — list installed models from a given base URL. This
+/// is a free function so the Settings "Test Connection" flow can query
+/// `/api/tags` without constructing a full [`OllamaBackend`] (which requires
+/// a `model` field — the user may not have picked one yet).
+pub async fn fetch_ollama_models(http: &HttpClient, base_url: &str) -> AiResult<Vec<TagModel>> {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let resp = http.get(&url).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AiError::Status {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    let parsed: serde_json::Value = resp.json().await?;
+    let models = parsed
+        .get("models")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| AiError::Parse("missing 'models' array".into()))?;
+    let out: Vec<TagModel> = models
+        .iter()
+        .filter_map(|m| serde_json::from_value(m.clone()).ok())
+        .collect();
+    Ok(out)
+}
+
 // ── Ollama ────────────────────────────────────────────────────────────
 
 /// Ollama local backend. Default endpoint `http://127.0.0.1:11434`. The
@@ -211,29 +251,16 @@ impl OllamaBackend {
 
     /// `/api/tags` — list installed models. Used by the Settings AI panel.
     /// Not part of the `AiBackend` trait because it's a discovery call, not
-    /// a completion call.
+    /// a completion call. Delegates to [`fetch_ollama_models`].
+    ///
+    /// v1.8.3: Currently unused — the Settings "Test Connection" flow calls
+    /// `fetch_ollama_models` directly (via `AiState::spawn_list_models`) so
+    /// it can build a temporary HTTP client from a draft config without
+    /// constructing a full `OllamaBackend`. Retained as a convenience method
+    /// for future callers that already hold a backend handle.
     #[allow(dead_code)]
     pub async fn list_models(&self) -> AiResult<Vec<TagModel>> {
-        let url = format!("{}/api/tags", self.base_url.trim_end_matches('/'));
-        let resp = self.http.get(&url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(AiError::Status {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        let parsed: serde_json::Value = resp.json().await?;
-        let models = parsed
-            .get("models")
-            .and_then(|m| m.as_array())
-            .ok_or_else(|| AiError::Parse("missing 'models' array".into()))?;
-        let out: Vec<TagModel> = models
-            .iter()
-            .filter_map(|m| serde_json::from_value(m.clone()).ok())
-            .collect();
-        Ok(out)
+        fetch_ollama_models(&self.http, &self.base_url).await
     }
 
     /// `/api/chat` with `stream: true`. Returns the accumulated assistant

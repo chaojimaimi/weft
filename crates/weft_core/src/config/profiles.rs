@@ -80,6 +80,10 @@ bitflags! {
         const EDITOR       = 1 << 4;
         const LOGO         = 1 << 5;
         const KEYBINDINGS  = 1 << 6;
+        /// v1.8.3: AI config is global only (never written into a profile).
+        /// The merge writes `draft.ai` directly to the base config regardless
+        /// of whether a profile is active (ProfileConfig has no `ai` field).
+        const AI           = 1 << 7;
     }
 }
 
