@@ -2,6 +2,7 @@
 #
 # Triggers on:
 #   - Push of version tags (v1.0.0, v1.7.8, ...)
+#   - Manual dispatch via Actions UI (Run workflow → 输入 tag/branch)
 #
 # Produces:
 #   - Unsigned Weft.app + Weft-<version>.dmg
@@ -17,13 +18,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or branch to build (e.g. v1.7.8)"
+        required: true
+        type: string
 
 permissions:
   contents: write
-
-env:
-  APP_NAME: Weft
-  VERSION: "1.7.8"
 
 jobs:
   build-macos-unsigned:
@@ -34,6 +37,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve build version
+        id: version
+        run: |
+          # inputs.ref 形如 "v1.7.8" 或 "refs/tags/v1.7.8"；提取 tag 名作为版本号
+          REF="${{ inputs.ref || github.ref }}"
+          TAG="${REF##*/}"
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${TAG}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -55,6 +69,8 @@ jobs:
 
       - name: Create distributable DMG
         run: ./scripts/build-dmg.sh
+        env:
+          DMG_VERSION: ${{ steps.version.outputs.version }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -63,4 +79,5 @@ jobs:
             target/release/osx/Weft-*.dmg
           draft: true
           generate_release_notes: true
-          name: Weft ${{ github.ref_name }}
+          name: Weft ${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.version.outputs.version }}

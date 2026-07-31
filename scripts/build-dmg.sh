@@ -14,7 +14,8 @@ set -e
 cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
-VERSION="1.7.8"
+# 允许通过环境变量覆盖版本号（CI 手动触发不同 tag 时使用）
+VERSION="${DMG_VERSION:-1.7.8}"
 RELEASE_DIR="target/release"
 OSX_DIR="${RELEASE_DIR}/osx"
 APP_DIR="${OSX_DIR}/${APP_NAME}.app"
