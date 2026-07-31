@@ -99,23 +99,55 @@ impl crate::App {
                 return;
             }
         }
+        // v1.8.6: When the Palette is open, intercept Cmd+V so paste targets
+        // the palette input (query or submode buffer), not the shell PTY.
+        // Without this, bound_action(Action::Paste) fires first and sends
+        // bracketed-paste bytes to the PTY, bypassing the palette entirely.
+        if self.palette.open && m.contains(Modifiers::SUPER) && key == KeyCode::Char('v') {
+            if let Some(text) = clipboard_paste() {
+                match &mut self.palette.submode {
+                    crate::palette_state::PaletteSubMode::Search => {
+                        self.palette.query.push_str(&text);
+                        self.palette.selection = 0;
+                        self.refresh_palette_results();
+                    }
+                    crate::palette_state::PaletteSubMode::AiCommand { buffer, .. }
+                    | crate::palette_state::PaletteSubMode::CreateWorkflow { buffer, .. }
+                    | crate::palette_state::PaletteSubMode::EditWorkflow { buffer, .. }
+                    | crate::palette_state::PaletteSubMode::SelectTheme { buffer, .. } => {
+                        buffer.push_str(&text);
+                    }
+                    crate::palette_state::PaletteSubMode::ConfirmDelete { .. } => {}
+                }
+                self.request_redraw();
+            }
+            return;
+        }
+        // v1.8.8: When an overlay (Palette/Settings/Find/ContextMenu/
+        // PanelSearch) is open, route to the overlay handler FIRST. This
+        // prevents user-configured keybindings (e.g. `esc = "cancel_ai_request"`)
+        // from intercepting keys the overlay needs (like Esc to close).
+        // If the overlay doesn't consume the key, fall through to keybindings.
+        let overlay_owner = self.overlay_input_owner();
+        if let Some(owner) = overlay_owner {
+            let overlay_consumed = match owner {
+                OverlayInputOwner::Palette => self.handle_palette_key(key, m, text),
+                OverlayInputOwner::Settings => self.handle_settings_key(key, m, text),
+                OverlayInputOwner::Find => self.handle_find_key(key, m, text),
+                OverlayInputOwner::ContextMenu => self.handle_context_menu_key(key, m),
+                OverlayInputOwner::PanelSearch => self.handle_panel_key(key, m),
+            };
+            if overlay_consumed {
+                return;
+            }
+            // Overlay didn't consume (e.g. modifier chord it ignores) —
+            // fall through to keybinding dispatch.
+        }
+
         if let Some(action) = bound_action {
             if self.execute_action(action) {
                 return;
             }
-        }
-
-        let overlay_owner = self.overlay_input_owner();
-        let overlay_consumed = match overlay_owner {
-            Some(OverlayInputOwner::Palette) => self.handle_palette_key(key, m, text),
-            Some(OverlayInputOwner::Settings) => self.handle_settings_key(key, m, text),
-            Some(OverlayInputOwner::Find) => self.handle_find_key(key, m, text),
-            Some(OverlayInputOwner::ContextMenu) => self.handle_context_menu_key(key, m),
-            Some(OverlayInputOwner::PanelSearch) => self.handle_panel_key(key, m),
-            None => false,
-        };
-        if overlay_consumed {
-            return;
         }
 
         // Editor takeover: at the prompt with integration ready, keys drive the

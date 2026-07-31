@@ -176,6 +176,10 @@ impl MetalRenderer {
                 missing.extend(p.banner.chars());
             }
             missing.extend(p.submode_input.chars());
+            // v1.8.4: warm up IME preedit chars for the palette input.
+            if !p.ime_preedit.is_empty() {
+                missing.extend(p.ime_preedit.chars());
+            }
         }
         // v1.0 S1: warm up the Settings panel (Cmd+,) — tab labels,
         // status text, theme names, font family, keybinding strings.

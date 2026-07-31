@@ -13,7 +13,12 @@ cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
 BUNDLE_ID="dev.weft.terminal"
-VERSION="1.7.8"
+# v1.8.3: read version from workspace Cargo.toml so the bundle stays in sync
+# without manual edits. Falls back to a hardcoded version if parsing fails.
+VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
+if [[ -z "${VERSION}" ]]; then
+    VERSION="1.8.3"
+fi
 MIN_OS="12.0"
 
 # Paths

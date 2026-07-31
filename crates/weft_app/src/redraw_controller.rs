@@ -170,14 +170,10 @@ impl App {
         // v1.8.3: Build the LocalAi tab view from the draft AI config +
         // cached model list + connection status. Borrowed lifetimes tie back
         // to `self` so this must be built before the mutable `tab` borrow.
-        let settings_ai_model_names: Vec<String> = self
-            .ai_models
-            .iter()
-            .map(|m| m.name.clone())
-            .collect();
+        let settings_ai_model_names: Vec<String> =
+            self.ai_models.iter().map(|m| m.name.clone()).collect();
         let settings_ai_connection_label = self.ai_connection_status.label();
-        let settings_ai_base_url =
-            crate::ai::client::effective_base_url(&self.settings.draft.ai);
+        let settings_ai_base_url = crate::ai::client::effective_base_url(&self.settings.draft.ai);
         // v1.8.3: Observability summary — pre-formatted so the renderer only
         // pushes one text run. Empty when no requests have been made (so the
         // row is hidden on a fresh launch). Only aggregate counts + p95
@@ -211,13 +207,7 @@ impl App {
         };
         let settings_ai = crate::overlay::AiSettingsView {
             enabled: self.settings.draft.ai.is_configured(),
-            model: self
-                .settings
-                .draft
-                .ai
-                .model
-                .as_deref()
-                .unwrap_or(""),
+            model: self.settings.draft.ai.model.as_deref().unwrap_or(""),
             base_url: &settings_ai_base_url,
             max_tokens: self.settings.draft.ai.effective_max_tokens(),
             timeout_secs: self.settings.draft.ai.effective_timeout_secs() as u32,
@@ -248,6 +238,16 @@ impl App {
         // `tab` borrow below. `annotation_store()` borrows `self.sessions`
         // immutably, which would conflict with `active_mut()`.
         let bookmarked_blocks = self.bookmarked_blocks.clone();
+        // v1.8.5: compute the palette IME cursor area before the mutable
+        // `tab` borrow below. `palette_ime_cursor_area` reads from
+        // `self.palette` and `self.interaction`, which would conflict
+        // with `self.sessions.active_mut()`.
+        let palette_ime_area = self
+            .renderer
+            .as_ref()
+            .and_then(|r| r.layout_ctx)
+            .filter(|_| self.palette.open)
+            .and_then(|ctx| self.palette_ime_cursor_area(ctx));
         let tab = self.sessions.active_mut();
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
@@ -465,9 +465,19 @@ impl App {
                     ("Select theme:".to_string(), buffer.clone())
                 }
                 // v1.8.1: AI command generation mode.
-                PaletteSubMode::AiCommand { buffer, pending_id } => {
+                PaletteSubMode::AiCommand {
+                    buffer,
+                    pending_id,
+                    error,
+                    ..
+                } => {
                     let banner = if pending_id.is_some() {
                         "✨ Generating…".to_string()
+                    } else if let Some(msg) = error {
+                        // v1.8.7: Surface the error inline so the user knows
+                        // why generation failed and can retry with the
+                        // restored query.
+                        format!("✨ AI error: {msg}")
                     } else {
                         "✨ Ask AI (describe command):".to_string()
                     };
@@ -497,6 +507,8 @@ impl App {
                 &palette_entries,
                 &palette_banner,
                 &palette_submode_input,
+                &self.palette.ime_preedit,
+                self.palette.ime_preedit_cursor,
                 palette_form_view.as_ref(),
                 terminal.editor().buffer.selection_range(),
                 self.config_state.config.editor.submit_on_ctrl_enter,
@@ -740,7 +752,12 @@ impl App {
                 recorder.finish(&self.gpu_completion_rx);
             }
             if let (Some(window), Some(ctx)) = (self.window.as_ref(), renderer.layout_ctx) {
-                crate::ime::update_cursor_area(window, ctx, terminal);
+                // v1.8.5: When the Palette is open, anchor the macOS IME
+                // candidate window at the palette input box — not the
+                // terminal cursor (which is hidden behind the popup).
+                // Without this, CJK IME candidates render off-screen and
+                // users can't complete character composition.
+                crate::ime::update_cursor_area(window, ctx, terminal, palette_ime_area);
             }
             // Flicker fix (Step 2): update the shared flag so the blink
             // timer thread knows whether to keep waking the loop. In
@@ -788,5 +805,39 @@ impl App {
         // cursor-blink timer wake the loop via `AppEvent::Wake`
         // whenever there is work (see `user_event`). This lets the CPU
         // idle instead of spinning at vsync.
+    }
+
+    /// v1.8.5: Compute the IME cursor area for the Palette input box.
+    /// Called every frame when the Palette is open so the macOS candidate
+    /// window stays anchored to the palette input (not the terminal cursor
+    /// hidden behind the popup).
+    fn palette_ime_cursor_area(
+        &self,
+        ctx: crate::layout::LayoutCtx,
+    ) -> Option<crate::ime::ImeCursorArea> {
+        use crate::palette_component::derive_palette_layout;
+
+        let layout = derive_palette_layout(
+            &ctx,
+            self.palette.results.len(),
+            self.palette.selection,
+            self.palette.form.as_ref().map(|f| f.var_names.len()),
+            self.interaction.popup_max_rows,
+            self.interaction.popup_width_scale,
+        );
+        let search = match layout {
+            crate::palette_component::PaletteLayout::Search(s) => s,
+            _ => return None,
+        };
+        // The input text starts at query_x. In sub-modes with a banner,
+        // the actual input begins after the banner text, but for IME
+        // cursor positioning the query_x is close enough — the candidate
+        // window just needs to be visible near the palette.
+        Some(crate::ime::ImeCursorArea {
+            x: search.query_x,
+            y: search.query_y,
+            width: ctx.cell_w,
+            height: ctx.cell_h,
+        })
     }
 }

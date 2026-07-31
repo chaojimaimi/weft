@@ -294,6 +294,8 @@ impl crate::App {
                     self.palette.submode = PaletteSubMode::AiCommand {
                         buffer: String::new(),
                         pending_id: None,
+                        last_query: String::new(),
+                        error: None,
                     };
                     self.palette.results.clear();
                     self.palette.selection = 0;

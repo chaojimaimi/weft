@@ -69,10 +69,16 @@ pub(crate) fn route_ime_input(input: ImeInput, context: ImeRouteContext) -> Vec<
     match input {
         ImeInput::Enabled => Vec::new(),
         ImeInput::Preedit { text, cursor } => {
-            if context.owner.is_some() {
-                vec![ImeRoutingAction::ClearActivePreedit]
-            } else {
-                vec![ImeRoutingAction::SetActivePreedit { text, cursor }]
+            // v1.8.4: Palette (Search + AiCommand) supports inline preedit
+            // so CJK IME works. Find/PanelSearch still commit via IME but
+            // don't render inline preedit (no preedit field). Settings/
+            // ContextMenu consume (clear) — they're not text-entry surfaces.
+            match context.owner {
+                Some(OverlayInputOwner::Palette) => {
+                    vec![ImeRoutingAction::SetActivePreedit { text, cursor }]
+                }
+                Some(_) => vec![ImeRoutingAction::ClearActivePreedit],
+                None => vec![ImeRoutingAction::SetActivePreedit { text, cursor }],
             }
         }
         ImeInput::Commit(text) => {
@@ -702,5 +708,46 @@ mod tests {
                 bytes: vec![0x7f],
             }]
         );
+    }
+
+    #[test]
+    fn palette_preedit_routes_set_active_while_find_and_panel_clear() {
+        // v1.8.4: Palette owns inline preedit; Find/PanelSearch don't have
+        // preedit fields so they get ClearActivePreedit (commit still works).
+        let ctx_palette = ImeRouteContext {
+            owner: Some(OverlayInputOwner::Palette),
+            input_mode: InputMode::Editor,
+            active_tab: 0,
+        };
+        let actions = route_ime_input(
+            ImeInput::Preedit {
+                text: "你好".into(),
+                cursor: Some((0, 3)),
+            },
+            ctx_palette,
+        );
+        assert!(matches!(
+            actions.as_slice(),
+            [ImeRoutingAction::SetActivePreedit { .. }]
+        ));
+
+        for owner in [OverlayInputOwner::Find, OverlayInputOwner::PanelSearch] {
+            let ctx = ImeRouteContext {
+                owner: Some(owner),
+                input_mode: InputMode::Editor,
+                active_tab: 0,
+            };
+            let actions = route_ime_input(
+                ImeInput::Preedit {
+                    text: "x".into(),
+                    cursor: None,
+                },
+                ctx,
+            );
+            assert!(
+                matches!(actions.as_slice(), [ImeRoutingAction::ClearActivePreedit]),
+                "owner={owner:?}"
+            );
+        }
     }
 }

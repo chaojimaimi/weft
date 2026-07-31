@@ -51,19 +51,50 @@ impl App {
         for action in event_replay::route_ime_input(input, context) {
             match action {
                 event_replay::ImeRoutingAction::ClearActivePreedit => {
-                    if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                    // v1.8.4: when the Palette owns IME, clear the palette's
+                    // preedit (not the tab's). Find/PanelSearch don't have
+                    // preedit fields, so they clear the tab's (no-op visual).
+                    // v1.8.7: always discard native marked text for ANY overlay
+                    // owner (Palette/Settings/Find/ContextMenu/PanelSearch), not
+                    // just Palette. Without this, macOS IME intercepts Esc to
+                    // dismiss residual marked text, preventing Settings/Find
+                    // from closing on Esc (issue #3).
+                    if context.owner == Some(crate::input_router::OverlayInputOwner::Palette) {
+                        let had_preedit = !self.palette.ime_preedit.is_empty();
+                        self.palette.ime_preedit.clear();
+                        self.palette.ime_preedit_cursor = None;
+                        if had_preedit {
+                            if let Some(window) = &self.window {
+                                crate::ime::discard_marked_text(window);
+                            }
+                        }
+                    } else if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                        let had_preedit = !tab.ime_preedit.is_empty();
                         tab.ime_preedit.clear();
                         tab.ime_preedit_cursor = None;
+                        // v1.8.7: discard native marked text for non-Palette
+                        // overlays too, so Esc isn't intercepted.
+                        if had_preedit && context.owner.is_some() {
+                            if let Some(window) = &self.window {
+                                crate::ime::discard_marked_text(window);
+                            }
+                        }
                     }
                 }
                 event_replay::ImeRoutingAction::SetActivePreedit { text, cursor } => {
-                    if let Some(tab) = self.sessions.tab_mut(active_tab) {
+                    if context.owner == Some(crate::input_router::OverlayInputOwner::Palette) {
+                        self.palette.ime_preedit = text;
+                        self.palette.ime_preedit_cursor = cursor;
+                    } else if let Some(tab) = self.sessions.tab_mut(active_tab) {
                         tab.ime_preedit = text;
                         tab.ime_preedit_cursor = cursor;
                     }
                 }
                 event_replay::ImeRoutingAction::ClearAllPreedit => {
                     event_replay::clear_all_preedit(self.sessions.tabs_mut());
+                    // v1.8.4: also clear palette preedit on full reset.
+                    self.palette.ime_preedit.clear();
+                    self.palette.ime_preedit_cursor = None;
                 }
                 event_replay::ImeRoutingAction::Commit { target, text } => {
                     tracing::debug!(
@@ -74,9 +105,37 @@ impl App {
                     );
                     match target {
                         event_replay::ImeCommitTarget::Palette => {
-                            self.palette.query.push_str(&text);
-                            self.palette.selection = 0;
-                            self.refresh_palette_results();
+                            // v1.8.4: route commit to the correct buffer
+                            // based on the active submode. AiCommand and
+                            // other banner submodes have their own buffer;
+                            // Search writes to the query.
+                            match &mut self.palette.submode {
+                                crate::palette_state::PaletteSubMode::AiCommand {
+                                    buffer, ..
+                                }
+                                | crate::palette_state::PaletteSubMode::CreateWorkflow {
+                                    buffer,
+                                    ..
+                                }
+                                | crate::palette_state::PaletteSubMode::EditWorkflow {
+                                    buffer,
+                                    ..
+                                }
+                                | crate::palette_state::PaletteSubMode::SelectTheme {
+                                    buffer,
+                                    ..
+                                } => {
+                                    buffer.push_str(&text);
+                                }
+                                crate::palette_state::PaletteSubMode::Search => {
+                                    self.palette.query.push_str(&text);
+                                    self.palette.selection = 0;
+                                    self.refresh_palette_results();
+                                }
+                                crate::palette_state::PaletteSubMode::ConfirmDelete { .. } => {}
+                            }
+                            self.palette.ime_preedit.clear();
+                            self.palette.ime_preedit_cursor = None;
                             self.request_redraw();
                         }
                         event_replay::ImeCommitTarget::SettingsConsumed => {

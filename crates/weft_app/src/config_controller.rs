@@ -343,6 +343,24 @@ impl App {
             }
         }
 
+        // v1.8.4: rebuild ai_state when AI config changes so the Enable
+        // toggle, model, and parameter adjustments take effect immediately
+        // after save (Cmd+Enter / Apply). Without this, the running ai_state
+        // keeps the old backend and `is_configured()` never flips.
+        if config.ai != self.config_state.config.ai {
+            self.ai_state.cancel_all();
+            // v1.8.7: preserve the waker when rebuilding ai_state so
+            // background tasks still wake the event loop after results.
+            let proxy = self.proxy.clone();
+            self.ai_state = crate::ai::AiState::new_with_waker(
+                config.ai.clone(),
+                Some(std::sync::Arc::new(move || {
+                    let _ = proxy.send_event(crate::AppEvent::Wake);
+                })),
+            );
+            tracing::info!("ai_state rebuilt after config change");
+        }
+
         self.config_state.config = config;
         self.request_redraw();
     }

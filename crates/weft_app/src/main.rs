@@ -314,6 +314,10 @@ impl App {
         let frame_trace_enabled = probe.enabled();
         let completion_proxy = proxy.clone();
         let runbook_proxy = proxy.clone();
+        // v1.8.7: AI waker — wakes the event loop when background AI tasks
+        // send a result, so poll_ai_results runs promptly. Without this,
+        // results sit in the channel until the next unrelated event.
+        let ai_proxy = proxy.clone();
         // v1.8: Snapshot the AI config before `config_state` is moved into
         // the struct initializer below. `AiState` owns its own copy so it can
         // keep driving requests even while the user edits other settings.
@@ -353,7 +357,12 @@ impl App {
                 let _ = runbook_proxy.send_event(AppEvent::Wake);
             }),
             bookmarked_blocks: std::collections::HashSet::new(),
-            ai_state: ai::AiState::new(ai_config_snapshot),
+            ai_state: ai::AiState::new_with_waker(
+                ai_config_snapshot,
+                Some(std::sync::Arc::new(move || {
+                    let _ = ai_proxy.send_event(AppEvent::Wake);
+                })),
+            ),
             block_diagnose_state: std::collections::HashMap::new(),
             ai_models: Vec::new(),
             ai_connection_status: crate::app_state::AiConnectionStatus::Idle,

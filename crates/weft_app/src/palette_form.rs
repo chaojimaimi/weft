@@ -85,6 +85,8 @@ impl App {
                     self.palette.submode = PaletteSubMode::AiCommand {
                         buffer: String::new(),
                         pending_id: None,
+                        last_query: String::new(),
+                        error: None,
                     };
                     self.palette.results.clear();
                     self.palette.selection = 0;
@@ -408,10 +410,11 @@ impl App {
 
         // Cancel on Escape.
         if key == KeyCode::Escape {
-            self.ai_state.cancel_all();
-            self.palette.submode = PaletteSubMode::Search;
-            self.palette.query.clear();
-            self.refresh_palette_results();
+            // v1.8.4 fix: AiCommand 是通过 Cmd+Shift+A 直接打开的（非从
+            // Search 进入），Esc 应直接关闭整个 Palette popup，与 Search
+            // 模式行为对齐。之前只切回 Search 子模式但 popup 仍 open，
+            // 用户感知为 "Esc 失灵"。
+            self.close_palette();
             self.request_redraw();
             return true;
         }
@@ -437,9 +440,7 @@ impl App {
                 }
                 CommandSurfaceKeyAction::Accept => {
                     // Activate the selected AI suggestion.
-                    if let Some(entry) =
-                        self.palette.results.get(self.palette.selection).cloned()
-                    {
+                    if let Some(entry) = self.palette.results.get(self.palette.selection).cloned() {
                         self.activate_palette_entry(entry);
                     }
                     return true;
@@ -451,8 +452,12 @@ impl App {
         match key {
             KeyCode::Enter => {
                 // Submit the query to the AI backend.
-                let PaletteSubMode::AiCommand { buffer, pending_id } =
-                    &mut self.palette.submode
+                let PaletteSubMode::AiCommand {
+                    buffer,
+                    pending_id,
+                    last_query,
+                    error,
+                } = &mut self.palette.submode
                 else {
                     return false;
                 };
@@ -463,7 +468,11 @@ impl App {
                 if buffer.trim().is_empty() {
                     return true;
                 }
+                // v1.8.7: Save the query before taking the buffer so we can
+                // restore it if generation fails. Clear any prior error.
                 let query = std::mem::take(buffer);
+                *last_query = query.clone();
+                *error = None;
                 let cwd = self
                     .sessions
                     .active()
@@ -498,8 +507,9 @@ impl App {
                 true
             }
             KeyCode::Backspace => {
-                if let PaletteSubMode::AiCommand { buffer, pending_id } =
-                    &mut self.palette.submode
+                if let PaletteSubMode::AiCommand {
+                    buffer, pending_id, ..
+                } = &mut self.palette.submode
                 {
                     if pending_id.is_none() {
                         buffer.pop();
@@ -509,8 +519,9 @@ impl App {
                 true
             }
             KeyCode::Char(c) => {
-                let PaletteSubMode::AiCommand { buffer, pending_id } =
-                    &mut self.palette.submode
+                let PaletteSubMode::AiCommand {
+                    buffer, pending_id, ..
+                } = &mut self.palette.submode
                 else {
                     return false;
                 };

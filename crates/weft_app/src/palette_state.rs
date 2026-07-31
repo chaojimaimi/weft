@@ -166,9 +166,15 @@ pub(crate) enum PaletteSubMode {
     /// v1.8.1: Natural-language → shell-command generation via local Ollama.
     /// `buffer` collects the user's query; `pending_id` tracks the async
     /// request (cleared when the result arrives via `poll_ai_results`).
+    /// v1.8.7: `last_query` preserves the most recent submitted query so it
+    /// can be restored into `buffer` if generation fails (the Enter handler
+    /// `std::mem::take`s the buffer, so without this the query is lost on
+    /// error). `error` holds the last error message for banner display.
     AiCommand {
         buffer: String,
         pending_id: Option<u64>,
+        last_query: String,
+        error: Option<String>,
     },
 }
 
@@ -195,6 +201,12 @@ pub(crate) struct PaletteState {
     /// v1.7.1: True when a search query is in-flight (for "searching..." indicator).
     pub(crate) search_pending: bool,
     pub(crate) runbook_entries: Vec<weft_core::runbook::RunbookEntry>,
+    /// v1.8.4: IME preedit text for the palette input (both Search and
+    /// AiCommand submodes). Set by `route_ime_input` when the user types
+    /// CJK via an IME; cleared on commit/dismiss. Rendered inline after the
+    /// current input buffer so the candidate window stays visually attached.
+    pub(crate) ime_preedit: String,
+    pub(crate) ime_preedit_cursor: Option<(usize, usize)>,
 }
 
 impl PaletteState {
@@ -212,6 +224,8 @@ impl PaletteState {
             search_generation: 0,
             search_pending: false,
             runbook_entries: Vec::new(),
+            ime_preedit: String::new(),
+            ime_preedit_cursor: None,
         }
     }
 
@@ -254,6 +268,8 @@ impl PaletteState {
         self.form = None;
         self.submode = PaletteSubMode::Search;
         self.runbook_entries.clear();
+        self.ime_preedit.clear();
+        self.ime_preedit_cursor = None;
     }
 }
 

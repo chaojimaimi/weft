@@ -31,12 +31,15 @@ use tracing::{debug, warn};
 
 use weft_core::config::AiConfig;
 
-use client::{build_backend, effective_base_url, fetch_ollama_models, is_loopback_url, AiBackend, AiError, CancelFlag, TagModel};
+use client::{
+    build_backend, effective_base_url, fetch_ollama_models, is_loopback_url, AiBackend, AiError,
+    CancelFlag, TagModel,
+};
 
 pub use metrics::{AiMetrics, AiMetricsSnapshot};
 pub use prompt::{
-    build_command_gen_messages, build_diagnose_messages, clean_command_output, classify_command_risk,
-    AiRiskLevel, CommandGenPrompt, DiagnosePrompt,
+    build_command_gen_messages, build_diagnose_messages, classify_command_risk,
+    clean_command_output, clean_diagnose_output, AiRiskLevel, CommandGenPrompt, DiagnosePrompt,
 };
 
 // Re-export the byte/history caps so the Settings UI / palette can hint at
@@ -125,13 +128,30 @@ pub struct AiState {
     /// v1.8.3: Observability counters (requests / errors / cancellations /
     /// latencies). No prompt or response text is recorded.
     metrics: AiMetrics,
+    /// v1.8.7: Optional wake callback invoked after each result is sent.
+    /// When set, background tasks call this to wake the main event loop so
+    /// `poll_ai_results` runs promptly — without it, results sit in the
+    /// channel until the next unrelated event (key/mouse/timer) triggers
+    /// the loop, causing the palette to show an empty result.
+    waker: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
 impl AiState {
     /// Build a new state from the current config. Returns a state with
     /// `backend = None` when AI is not configured (no error surfaced —
     /// the caller checks `is_configured()` to decide whether to show AI UI).
+    #[allow(dead_code)]
     pub fn new(config: AiConfig) -> Self {
+        Self::new_with_waker(config, None)
+    }
+
+    /// v1.8.7: Like `new` but with a wake callback that background tasks
+    /// invoke after sending a result. The waker should trigger an
+    /// `AppEvent::Wake` so `poll_ai_results` runs promptly.
+    pub fn new_with_waker(
+        config: AiConfig,
+        waker: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) -> Self {
         let backend = match build_backend(&config) {
             Ok(b) => b.map(Arc::<dyn AiBackend>::from),
             Err(e) => {
@@ -150,6 +170,7 @@ impl AiState {
             cancellations: std::collections::HashMap::new(),
             start_times: std::collections::HashMap::new(),
             metrics: AiMetrics::new(),
+            waker,
         }
     }
 
@@ -217,6 +238,8 @@ impl AiState {
         let cancel = CancelFlag::new();
         self.cancellations.insert(id, cancel.clone());
         let messages = build_command_gen_messages(&request);
+        // v1.8.7: clone the waker so the task can wake the main loop.
+        let waker = self.waker.clone();
 
         tokio::spawn(async move {
             let result = backend.complete(messages, cancel).await;
@@ -239,6 +262,10 @@ impl AiState {
                 },
             };
             let _ = tx.send(event);
+            // v1.8.7: wake the main event loop so poll_ai_results runs now.
+            if let Some(waker) = &waker {
+                waker();
+            }
         });
 
         Some(id)
@@ -258,11 +285,27 @@ impl AiState {
         let cancel = CancelFlag::new();
         self.cancellations.insert(id, cancel.clone());
         let messages = build_diagnose_messages(&request);
+        // v1.8.7: clone the waker so the task can wake the main loop.
+        let waker = self.waker.clone();
 
         tokio::spawn(async move {
             let result = backend.complete(messages, cancel).await;
             let event = match result {
-                Ok(explanation) => AiResultEvent::Diagnose { id, explanation },
+                Ok(raw) => {
+                    // v1.8.8: Clean up the diagnosis output — small models
+                    // like gemma4:e4b can produce excessive whitespace or
+                    // scattered fragments. This normalises presentation
+                    // without altering semantic content.
+                    let explanation = clean_diagnose_output(&raw);
+                    if explanation.is_empty() {
+                        AiResultEvent::Error {
+                            id,
+                            message: "AI returned an empty diagnosis".into(),
+                        }
+                    } else {
+                        AiResultEvent::Diagnose { id, explanation }
+                    }
+                }
                 Err(AiError::Cancelled) => AiResultEvent::Cancelled { id },
                 Err(e) => AiResultEvent::Error {
                     id,
@@ -270,6 +313,10 @@ impl AiState {
                 },
             };
             let _ = tx.send(event);
+            // v1.8.7: wake the main event loop so poll_ai_results runs now.
+            if let Some(waker) = &waker {
+                waker();
+            }
         });
 
         Some(id)
@@ -294,8 +341,12 @@ impl AiState {
         if !is_loopback_url(&base_url) {
             return None;
         }
+        // v1.8.8: connect_timeout only — /api/tags is a fast local call,
+        // but keep the configured timeout as a fallback for the total
+        // request (not streaming, so overall timeout is fine here).
         let timeout = std::time::Duration::from_secs(config.effective_timeout_secs());
         let http = match reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(timeout)
             .build()
         {
@@ -309,6 +360,8 @@ impl AiState {
         self.metrics.record_request();
         self.start_times.insert(id, Instant::now());
         let tx = self.tx.clone();
+        // v1.8.7: clone the waker so the task can wake the main loop.
+        let waker = self.waker.clone();
 
         tokio::spawn(async move {
             let result = fetch_ollama_models(&http, &base_url).await;
@@ -317,6 +370,10 @@ impl AiState {
                 result: result.map_err(|e| e.to_string()),
             };
             let _ = tx.send(event);
+            // v1.8.7: wake the main event loop so poll_ai_results runs now.
+            if let Some(waker) = &waker {
+                waker();
+            }
         });
 
         Some(id)
@@ -371,7 +428,12 @@ impl AiState {
                     | AiResultEvent::Cancelled { .. }
                     | AiResultEvent::ModelsRefreshed { result: Err(_), .. }
             );
-            debug!(kind = kind, ok = ok, latency_ms = latency.as_millis() as u64, "ai_request_completed");
+            debug!(
+                kind = kind,
+                ok = ok,
+                latency_ms = latency.as_millis() as u64,
+                "ai_request_completed"
+            );
             events.push(event);
         }
         events
@@ -627,19 +689,23 @@ mod tests {
 
     #[test]
     fn spawn_list_models_returns_none_for_non_loopback_url() {
-        let mut cfg = AiConfig::default();
-        cfg.provider = Some("ollama".into());
         // Public HTTPS endpoint — must be rejected before any network call.
-        cfg.base_url = Some("https://example.com".into());
+        let cfg = AiConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("https://example.com".into()),
+            ..Default::default()
+        };
         let mut state = AiState::new(cfg.clone());
         assert!(state.spawn_list_models(&cfg).is_none());
     }
 
     #[test]
     fn spawn_list_models_returns_none_for_http_on_public_host() {
-        let mut cfg = AiConfig::default();
-        cfg.provider = Some("ollama".into());
-        cfg.base_url = Some("http://192.168.1.5:11434".into());
+        let cfg = AiConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("http://192.168.1.5:11434".into()),
+            ..Default::default()
+        };
         let mut state = AiState::new(cfg.clone());
         assert!(state.spawn_list_models(&cfg).is_none());
     }
@@ -649,10 +715,12 @@ mod tests {
         // The request will fail (no Ollama running in CI), but the id
         // assignment happens before the network call — we only verify
         // that Some(id) is returned and in_flight is incremented.
-        let mut cfg = AiConfig::default();
-        cfg.provider = Some("ollama".into());
-        cfg.base_url = Some("http://127.0.0.1:11434".into());
-        cfg.timeout_secs = Some(1); // fail fast
+        let cfg = AiConfig {
+            provider: Some("ollama".into()),
+            base_url: Some("http://127.0.0.1:11434".into()),
+            timeout_secs: Some(1), // fail fast
+            ..Default::default()
+        };
         let mut state = AiState::new(cfg.clone());
         let id = state.spawn_list_models(&cfg);
         assert!(id.is_some(), "loopback URL should be accepted");

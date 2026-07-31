@@ -285,6 +285,10 @@ pub struct PaletteDrawParams<'a> {
     pub banner: &'a str,
     /// Input buffer content for sub-modes (create/edit).
     pub submode_input: &'a str,
+    /// v1.8.4: IME preedit text for the palette input (both Search and
+    /// banner submodes). Rendered inline after the input buffer.
+    pub ime_preedit: &'a str,
+    pub ime_preedit_cursor: Option<(usize, usize)>,
 }
 
 /// A palette entry, rendered in the dropdown.
@@ -407,11 +411,20 @@ impl OverlayWarmup for OverlayContent<'_> {
                     missing.extend(e.kind_label.chars());
                 }
                 missing.extend("Workflow Builtin — 填写参数 Enter 下一项 Esc".chars());
+                // v1.8.4: warm up preedit + submode input chars.
+                if !p.banner.is_empty() {
+                    missing.extend(p.banner.chars());
+                }
+                missing.extend(p.submode_input.chars());
+                if !p.ime_preedit.is_empty() {
+                    missing.extend(p.ime_preedit.chars());
+                }
             }
             OverlayContent::Settings(s) => {
                 // F5: sidebar category labels + status text + theme names + keybinding strings.
                 missing.extend(
-                    "Settings Appearance Terminal Input Keybindings Window Local AI Advanced".chars(),
+                    "Settings Appearance Terminal Input Keybindings Window Local AI Advanced"
+                        .chars(),
                 );
                 missing.extend(
                     "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing"
@@ -529,6 +542,8 @@ pub fn build_overlay_stack<'a>(
     palette_entries: &'a [(String, String, &'a str)],
     palette_banner: &'a str,
     palette_submode_input: &'a str,
+    palette_ime_preedit: &'a str,
+    palette_ime_preedit_cursor: Option<(usize, usize)>,
     palette_form: Option<&'a PaletteFormView<'a>>,
     prompt_selection: Option<((usize, usize), (usize, usize))>,
     submit_on_ctrl_enter: bool,
@@ -694,6 +709,8 @@ pub fn build_overlay_stack<'a>(
                 form: palette_form,
                 banner: palette_banner,
                 submode_input: palette_submode_input,
+                ime_preedit: palette_ime_preedit,
+                ime_preedit_cursor: palette_ime_preedit_cursor,
             }),
         });
     }

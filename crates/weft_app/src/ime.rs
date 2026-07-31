@@ -17,11 +17,11 @@ use winit::window::Window;
 use crate::layout::LayoutCtx;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ImeCursorArea {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+pub struct ImeCursorArea {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 fn grid_cursor_area(ctx: LayoutCtx, row: usize, col: usize) -> Option<ImeCursorArea> {
@@ -58,12 +58,27 @@ fn editor_cursor_area(ctx: LayoutCtx, terminal: &Terminal) -> Option<ImeCursorAr
 /// Keep the native macOS candidate window attached to Weft's GPU caret.
 /// winit converts this physical top-left rectangle into AppKit's text-input
 /// coordinate system and invalidates the current character coordinates.
-pub fn update_cursor_area(window: &Window, ctx: LayoutCtx, terminal: &Terminal) {
-    let area = match terminal.effective_input_mode() {
-        InputMode::Editor => editor_cursor_area(ctx, terminal),
-        InputMode::Passthrough => {
-            let cursor = &terminal.grid().cursor;
-            grid_cursor_area(ctx, cursor.row, cursor.col)
+///
+/// v1.8.5: When an overlay (Palette/Find/PanelSearch) owns IME input,
+/// `overlay_area` takes precedence over the terminal caret. Without this,
+/// the macOS candidate window stays anchored to the terminal cursor (which
+/// is hidden behind the centered Palette popup), making CJK IME unusable
+/// in the palette input box.
+pub fn update_cursor_area(
+    window: &Window,
+    ctx: LayoutCtx,
+    terminal: &Terminal,
+    overlay_area: Option<ImeCursorArea>,
+) {
+    let area = if let Some(oa) = overlay_area {
+        Some(oa)
+    } else {
+        match terminal.effective_input_mode() {
+            InputMode::Editor => editor_cursor_area(ctx, terminal),
+            InputMode::Passthrough => {
+                let cursor = &terminal.grid().cursor;
+                grid_cursor_area(ctx, cursor.row, cursor.col)
+            }
         }
     };
     let Some(area) = area else { return };

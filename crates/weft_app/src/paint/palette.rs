@@ -9,6 +9,28 @@
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::renderer::MetalRenderer;
 
+/// v1.8.4: Return the tail of `s` that fits within `max_cols` display
+/// columns. When the text is shorter than `max_cols`, returns `s` as-is.
+/// Used for single-line inputs that should scroll horizontally (show the
+/// most recent typing) rather than truncate from the right.
+fn tail_str(s: &str, max_cols: usize) -> &str {
+    let total = MetalRenderer::text_col_width(s);
+    if total <= max_cols {
+        return s;
+    }
+    let mut remaining = max_cols;
+    let mut byte_start = s.len();
+    for (idx, c) in s.char_indices().rev() {
+        let w = MetalRenderer::char_col_width(c);
+        if w > remaining {
+            break;
+        }
+        remaining -= w;
+        byte_start = idx;
+    }
+    &s[byte_start..]
+}
+
 impl MetalRenderer {
     /// Build the Command Palette as a centered floating window. Renders a
     /// search box at the top, a scrollable results list, and an optional
@@ -110,19 +132,76 @@ impl MetalRenderer {
             let banner_cols = Self::text_col_width(p.banner);
             let input_x = query_x + (banner_cols + 1) as f32 * cw;
             let avail = (((popup_x1 - input_x) / cw).max(1.0)) as usize;
-            self.push_text(&mut verts, input_x, query_y, p.submode_input, fg, avail);
+            // v1.8.4: show tail of input when it exceeds avail, so the
+            // cursor and recent typing stay visible (horizontal scroll).
+            let input_visible = tail_str(p.submode_input, avail);
+            self.push_text(&mut verts, input_x, query_y, input_visible, fg, avail);
+            let input_cols = Self::text_col_width(input_visible).min(avail);
+
+            // v1.8.4: render IME preedit inline after the input buffer.
+            let preedit_x = input_x + input_cols as f32 * cw;
+            let preedit_avail = avail.saturating_sub(input_cols);
+            if !p.ime_preedit.is_empty() && preedit_avail > 0 {
+                self.push_text(
+                    &mut verts,
+                    preedit_x,
+                    query_y,
+                    p.ime_preedit,
+                    accent,
+                    preedit_avail,
+                );
+            }
+
+            // v1.8.4 fix: banner 分支补齐闪烁光标，与 Search 分支一致。
+            if self.cursor_blink_on {
+                let cx = if !p.ime_preedit.is_empty() && preedit_avail > 0 {
+                    let preedit_cols = Self::text_col_width(p.ime_preedit).min(preedit_avail);
+                    preedit_x + preedit_cols as f32 * cw
+                } else {
+                    preedit_x
+                };
+                push_quad(
+                    &mut verts,
+                    [cx, query_y, cx + cw * 0.15, query_y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    accent,
+                );
+            }
         } else {
             // Normal search mode.
             let query_label = "> ";
             self.push_text(&mut verts, query_x, query_y, query_label, prompt_c, cols);
             let qx = query_x + query_label.chars().count() as f32 * cw;
             let avail = (((popup_x1 - qx) / cw).max(1.0)) as usize;
-            self.push_text(&mut verts, qx, query_y, p.query, fg, avail);
+            // v1.8.4: show tail of query when it exceeds avail.
+            let query_visible = tail_str(p.query, avail);
+            self.push_text(&mut verts, qx, query_y, query_visible, fg, avail);
+            let qcols = Self::text_col_width(query_visible).min(avail);
+
+            // v1.8.4: render IME preedit inline after the query.
+            let preedit_x = qx + qcols as f32 * cw;
+            let preedit_avail = avail.saturating_sub(qcols);
+            if !p.ime_preedit.is_empty() && preedit_avail > 0 {
+                self.push_text(
+                    &mut verts,
+                    preedit_x,
+                    query_y,
+                    p.ime_preedit,
+                    accent,
+                    preedit_avail,
+                );
+            }
+
             // v0.9 fix: blinking caret at end of query so the user sees the
             // input focus (matches the find bar + panel search box behavior).
             if self.cursor_blink_on {
-                let qcols = Self::text_col_width(p.query);
-                let cx = qx + qcols as f32 * cw;
+                let cx = if !p.ime_preedit.is_empty() && preedit_avail > 0 {
+                    let preedit_cols = Self::text_col_width(p.ime_preedit).min(preedit_avail);
+                    preedit_x + preedit_cols as f32 * cw
+                } else {
+                    preedit_x
+                };
                 push_quad(
                     &mut verts,
                     [cx, query_y, cx + cw * 0.15, query_y + ch],
@@ -312,5 +391,36 @@ impl MetalRenderer {
         self.push_text(&mut verts, popup_x0 + cw * 0.5, hint_y, hint, dim, 40);
 
         verts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_str;
+
+    #[test]
+    fn tail_str_returns_full_string_when_within_budget() {
+        assert_eq!(tail_str("hello", 10), "hello");
+        assert_eq!(tail_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn tail_str_returns_tail_when_exceeding_budget() {
+        assert_eq!(tail_str("hello world", 5), "world");
+        assert_eq!(tail_str("abcdef", 3), "def");
+    }
+
+    #[test]
+    fn tail_str_handles_cjk_full_width_chars() {
+        // Each CJK char occupies 2 columns. "你好世界" = 8 cols.
+        // Budget 4 → last 2 chars "世界".
+        assert_eq!(tail_str("你好世界", 4), "世界");
+        // Budget 2 → last 1 char "界".
+        assert_eq!(tail_str("你好世界", 2), "界");
+    }
+
+    #[test]
+    fn tail_str_empty_string_returns_empty() {
+        assert_eq!(tail_str("", 10), "");
     }
 }

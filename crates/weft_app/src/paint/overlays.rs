@@ -102,6 +102,7 @@ impl MetalRenderer {
             "Toggle Bookmark",
             "Add Note",
             "Export Block",
+            "Diagnose with AI",
         ];
 
         let ctx = self.layout_ctx.expect("LayoutCtx built at draw() entry");

@@ -27,9 +27,13 @@ use reqwest::Client as HttpClient;
 use super::prompt::ChatMessage;
 
 /// Hard ceiling on the response body size we'll accumulate from a single
-/// `/api/chat` stream. 64 KiB is generous for shell commands + short
-/// explanations and prevents a runaway model from filling memory.
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// `/api/chat` stream. v1.8.6: raised from 64 KiB to 512 KiB because
+/// Ollama's NDJSON streaming wraps each token in a ~120-180 byte JSON
+/// object, so the raw HTTP byte count is ~20x the actual model output.
+/// 64 KiB only allowed ~3 KiB of real content, which caused qwen3.5:9b
+/// (and other "chatty" models with thinking chains) to hit the limit.
+/// 512 KiB comfortably covers 200-word Chinese diagnoses + JSON overhead.
+pub const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
 /// Hard ceiling on a single NDJSON line. Ollama chunks are small, but a
 /// malformed/malicious server could emit huge lines.
@@ -127,11 +131,15 @@ pub struct TagModel {
     pub modified_at: String,
 }
 
-/// Shared builder for the [`reqwest::Client`]. Honours the `[ai] timeout_secs`
-/// setting.
-fn build_http_client(timeout: Duration) -> Result<HttpClient, AiError> {
+/// Shared builder for the [`reqwest::Client`]. v1.8.8: use
+/// `connect_timeout` (short, for connection establishment) instead of
+/// `timeout` (which covers the *entire* streaming response). Large models
+/// like qwen3.5:9b can take >30s to generate, and the overall timeout
+/// fires mid-stream, causing reqwest to abort with
+/// "error decoding response body".
+fn build_http_client(connect_timeout: Duration) -> Result<HttpClient, AiError> {
     HttpClient::builder()
-        .timeout(timeout)
+        .connect_timeout(connect_timeout)
         .build()
         .map_err(AiError::Network)
 }
@@ -150,8 +158,11 @@ pub fn build_backend(
     if kind != "ollama" {
         return Err(AiError::UnknownProvider(kind.to_string()));
     }
-    let timeout = Duration::from_secs(cfg.effective_timeout_secs());
-    let http = Arc::new(build_http_client(timeout)?);
+    // v1.8.8: connect_timeout only — the generation phase can take much
+    // longer than the configured timeout for large models. Cap at 10s
+    // (loopback Ollama should connect instantly).
+    let connect_timeout = Duration::from_secs(10);
+    let http = Arc::new(build_http_client(connect_timeout)?);
     let backend = OllamaBackend::new(http, cfg.clone())?;
     Ok(Some(Box::new(backend)))
 }
@@ -222,13 +233,14 @@ pub struct OllamaBackend {
     http: Arc<HttpClient>,
     base_url: String,
     model: String,
+    /// v1.8.8: Max output tokens, passed to Ollama as `num_predict`. Limits
+    /// response length to avoid long generation times that can cause
+    /// connection drops with large models (qwen3.5:9b, gemma4:12b).
+    max_tokens: u32,
 }
 
 impl OllamaBackend {
-    pub fn new(
-        http: Arc<HttpClient>,
-        cfg: weft_core::config::AiConfig,
-    ) -> Result<Self, AiError> {
+    pub fn new(http: Arc<HttpClient>, cfg: weft_core::config::AiConfig) -> Result<Self, AiError> {
         let model = cfg
             .model
             .clone()
@@ -246,6 +258,7 @@ impl OllamaBackend {
             http,
             base_url,
             model,
+            max_tokens: cfg.effective_max_tokens(),
         })
     }
 
@@ -265,12 +278,45 @@ impl OllamaBackend {
 
     /// `/api/chat` with `stream: true`. Returns the accumulated assistant
     /// content. Reads `bytes_stream()` and splits on newlines (NDJSON).
+    ///
+    /// v1.8.8: Wraps `stream_chat_once` with a single retry on network
+    /// error. Large models (qwen3.5:9b, gemma4:12b) can cause Ollama to
+    /// drop the connection mid-stream — especially during the initial
+    /// model-load phase — resulting in "error decoding response body".
+    /// Retrying once handles the transient case where Ollama's model
+    /// cache was cold on the first attempt.
     async fn stream_chat(
         &self,
         messages: Vec<ChatMessage>,
         cancel: CancelFlag,
     ) -> AiResult<String> {
+        match self
+            .stream_chat_once(messages.clone(), cancel.clone())
+            .await
+        {
+            Ok(s) => Ok(s),
+            Err(AiError::Network(e)) => {
+                tracing::warn!(error = %e, "first stream attempt failed; retrying once");
+                self.stream_chat_once(messages, cancel).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Single attempt at `/api/chat` streaming. See [`stream_chat`] for the
+    /// retry wrapper.
+    async fn stream_chat_once(
+        &self,
+        messages: Vec<ChatMessage>,
+        cancel: CancelFlag,
+    ) -> AiResult<String> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
+        // v1.8.8: Pass `num_predict` (max tokens) and `keep_alive` to
+        // Ollama. `num_predict` caps the generation length, preventing
+        // long-running streams that are more likely to be interrupted by
+        // connection drops. `keep_alive` keeps the model loaded in memory
+        // for 5 minutes between requests, avoiding cold-start delays that
+        // can cause the first token to take >30s on large models.
         let body = serde_json::json!({
             "model": self.model,
             "messages": messages.iter().map(|m| {
@@ -280,6 +326,10 @@ impl OllamaBackend {
                 })
             }).collect::<Vec<_>>(),
             "stream": true,
+            "options": {
+                "num_predict": self.max_tokens,
+            },
+            "keep_alive": "5m",
         });
 
         let resp = self.http.post(&url).json(&body).send().await?;
@@ -297,36 +347,73 @@ impl OllamaBackend {
         let mut byte_stream = resp.bytes_stream();
         let mut acc = String::new();
         let mut total_bytes = 0usize;
-        // Per-call line buffer for NDJSON fragments that span chunk boundaries.
-        let mut line_buf = String::new();
+        // v1.8.7: Use a byte buffer (not String) for line accumulation so
+        // multi-byte UTF-8 characters split across chunks don't cause
+        // "non-utf8 chunk in stream" errors. We only convert to String
+        // after a complete line (delimited by \n, which is a single byte
+        // and never part of a multi-byte sequence).
+        let mut line_buf: Vec<u8> = Vec::new();
 
         while let Some(chunk_res) = byte_stream.next().await {
             if cancel.is_cancelled() {
                 return Err(AiError::Cancelled);
             }
-            let chunk = chunk_res?;
+            // v1.8.8: If a stream chunk fails (connection drop, reqwest
+            // decode error, etc.) but we already have partial content,
+            // return it instead of failing. This handles the case where
+            // Ollama closes the connection after sending the full response
+            // but before the final `done: true` chunk.
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    if !acc.trim().is_empty() {
+                        tracing::warn!(error = %e, "stream chunk error; returning partial result");
+                        return Ok(acc);
+                    }
+                    return Err(AiError::Network(e));
+                }
+            };
             total_bytes = total_bytes.saturating_add(chunk.len());
             if total_bytes > MAX_RESPONSE_BYTES {
                 return Err(AiError::ResponseTooLarge(MAX_RESPONSE_BYTES));
             }
-            // Append chunk to line buffer, then split out complete lines.
-            line_buf.push_str(std::str::from_utf8(&chunk).map_err(|e| {
-                AiError::Parse(format!("non-utf8 chunk in stream: {e}"))
-            })?);
-            while let Some(nl) = line_buf.find('\n') {
-                let line: String = line_buf.drain(..=nl).collect();
-                let line = line.trim_end_matches('\r').trim_end_matches('\n');
-                if line.is_empty() {
+            line_buf.extend_from_slice(&chunk);
+            while let Some(nl) = line_buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = line_buf.drain(..=nl).collect();
+                // Strip trailing \r and \n.
+                let line_bytes = line_bytes
+                    .iter()
+                    .copied()
+                    .filter(|&b| b != b'\r' && b != b'\n')
+                    .collect::<Vec<_>>();
+                if line_bytes.is_empty() {
                     continue;
                 }
-                if line.len() > MAX_LINE_BYTES {
+                if line_bytes.len() > MAX_LINE_BYTES {
                     return Err(AiError::Parse(format!(
                         "NDJSON line too long: {} bytes",
-                        line.len()
+                        line_bytes.len()
                     )));
                 }
-                let parsed: serde_json::Value = serde_json::from_str(line)
-                    .map_err(|e| AiError::Parse(format!("invalid NDJSON line: {e}")))?;
+                // Convert complete line to String — safe because \n is a
+                // single-byte ASCII character and never splits a multi-byte
+                // UTF-8 sequence.
+                let line = match std::str::from_utf8(&line_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(AiError::Parse(format!("non-utf8 NDJSON line: {e}")));
+                    }
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // v1.8.7: Skip malformed JSON lines instead of
+                        // aborting the entire stream. Some models emit
+                        // non-JSON progress/diagnostic lines.
+                        tracing::warn!(line = %line, err = %e, "skipping malformed NDJSON line");
+                        continue;
+                    }
+                };
                 // Check for error object.
                 if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
                     return Err(AiError::Status {
@@ -343,7 +430,11 @@ impl OllamaBackend {
                     acc.push_str(content);
                 }
                 // `done: true` marks the final chunk.
-                if parsed.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+                if parsed
+                    .get("done")
+                    .and_then(|d| d.as_bool())
+                    .unwrap_or(false)
+                {
                     if acc.trim().is_empty() {
                         return Err(AiError::Empty);
                     }

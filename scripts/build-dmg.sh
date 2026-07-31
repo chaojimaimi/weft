@@ -14,8 +14,16 @@ set -e
 cd "$(dirname "$0")/.."
 
 APP_NAME="Weft"
-# 允许通过环境变量覆盖版本号（CI 手动触发不同 tag 时使用）
-VERSION="${DMG_VERSION:-1.7.8}"
+# v1.8.3: 默认从 workspace Cargo.toml 读取版本号，保持与 bundle 一致。
+# 仍允许通过 DMG_VERSION 环境变量覆盖（CI 手动触发不同 tag 时使用）。
+if [[ -z "${DMG_VERSION:-}" ]]; then
+    VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
+    if [[ -z "${VERSION}" ]]; then
+        VERSION="1.8.3"
+    fi
+else
+    VERSION="${DMG_VERSION}"
+fi
 RELEASE_DIR="target/release"
 OSX_DIR="${RELEASE_DIR}/osx"
 APP_DIR="${OSX_DIR}/${APP_NAME}.app"

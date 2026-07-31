@@ -323,6 +323,14 @@ impl App {
     pub(super) fn save_settings_draft(&mut self, close: bool) {
         self.refresh_settings_validation();
         if !self.settings.field_errors.is_empty() {
+            // v1.8.5 fix: previously this silently returned with no feedback,
+            // so Cmd+Enter appeared to do nothing. Now surface a visible
+            // error so the user knows why the save was blocked.
+            let count = self.settings.field_errors.len();
+            self.settings.error = Some(format!(
+                "Cannot save: {count} field(s) need attention. Fix them or press Esc to discard."
+            ));
+            self.request_redraw();
             return;
         }
 
@@ -535,24 +543,24 @@ impl App {
             // (Test Connection) is an action button, not a ←/→ adjustment.
             SettingsTab::LocalAi => match self.settings.selection {
                 0 => {
-                    // Enabled: toggle provider between Some("ollama") and None.
-                    let next = if self.settings.draft.ai.is_configured() {
-                        None
-                    } else {
+                    // v1.8.4 fix: use directional_bool (← = off, → = on)
+                    // instead of a toggle, for consistency with rows 5/6
+                    // and predictability. Previously both ← and → toggled,
+                    // which confused users trying to turn it off.
+                    let want_on = directional_bool(self.settings.draft.ai.is_configured(), delta);
+                    self.settings.draft.ai.provider = if want_on {
                         Some("ollama".to_string())
+                    } else {
+                        None
                     };
-                    self.settings.draft.ai.provider = next;
                     self.settings
                         .mark_dirty(weft_core::config::ConfigSectionMask::AI);
                 }
                 1 => {
                     // Model: cycle through cached model names. If the current
                     // model isn't in the list, ←/→ jumps to the first entry.
-                    let models: Vec<String> = self
-                        .ai_models
-                        .iter()
-                        .map(|m| m.name.clone())
-                        .collect();
+                    let models: Vec<String> =
+                        self.ai_models.iter().map(|m| m.name.clone()).collect();
                     if models.is_empty() {
                         return; // no models to cycle; user should Test Connection first
                     }
@@ -739,7 +747,7 @@ impl App {
             SettingsTab::Terminal => 4, // Scrollback + padding + minimum contrast.
             SettingsTab::Input => 1,    // Submit on Ctrl+Enter.
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
-            SettingsTab::Window => 3,   // Width + Height + Sidebar Width.
+            SettingsTab::Window => 3, // Width + Height + Sidebar Width.
             // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
             // Cmd Generation + Error Diagnosis + Test Connection.
             SettingsTab::LocalAi => 8,
@@ -807,28 +815,23 @@ impl App {
         // additional clicks until it resolves. The button is also visually
         // disabled while `Testing`, but keyboard Enter bypasses the visual
         // gate so this is the authoritative guard.
-        if self
-            .ai_connection_status
-            .is_testing()
-        {
+        if self.ai_connection_status.is_testing() {
             return;
         }
 
         let draft_ai = &self.settings.draft.ai;
         if !draft_ai.is_configured() {
-            self.ai_connection_status =
-                crate::app_state::AiConnectionStatus::Failed(
-                    "Enable Local AI (provider = ollama) first".into(),
-                );
+            self.ai_connection_status = crate::app_state::AiConnectionStatus::Failed(
+                "Enable Local AI (provider = ollama) first".into(),
+            );
             return;
         }
 
         let base_url = crate::ai::client::effective_base_url(draft_ai);
         if !crate::ai::client::is_loopback_url(&base_url) {
-            self.ai_connection_status =
-                crate::app_state::AiConnectionStatus::Failed(format!(
-                    "Refusing non-loopback URL: {base_url}"
-                ));
+            self.ai_connection_status = crate::app_state::AiConnectionStatus::Failed(format!(
+                "Refusing non-loopback URL: {base_url}"
+            ));
             return;
         }
 
@@ -838,18 +841,16 @@ impl App {
         match self.ai_state.spawn_list_models(draft_ai) {
             Some(id) => {
                 self.ai_models_request_id = Some(id);
-                self.ai_connection_status =
-                    crate::app_state::AiConnectionStatus::Testing;
+                self.ai_connection_status = crate::app_state::AiConnectionStatus::Testing;
             }
             None => {
                 // spawn_list_models only returns None after the
                 // is_configured + loopback checks above, so reaching here
                 // means the HTTP client builder failed (e.g. TLS backend
                 // init error). Surface a generic failure.
-                self.ai_connection_status =
-                    crate::app_state::AiConnectionStatus::Failed(
-                        "Failed to build HTTP client".into(),
-                    );
+                self.ai_connection_status = crate::app_state::AiConnectionStatus::Failed(
+                    "Failed to build HTTP client".into(),
+                );
             }
         }
     }

@@ -181,6 +181,8 @@ fn overlay_warmup_palette_collects_query_and_entries() {
         form: None,
         banner: "",
         submode_input: "",
+        ime_preedit: "",
+        ime_preedit_cursor: None,
     };
     let mut missing = HashSet::new();
     OverlayContent::CommandPalette(p).warm_chars(&mut missing);

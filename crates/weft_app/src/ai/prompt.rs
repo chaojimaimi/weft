@@ -120,12 +120,12 @@ pub fn truncate_bytes(text: &str, max_bytes: usize) -> String {
 ///
 /// Secrets in the cwd / history are masked before being sent.
 pub fn build_command_gen_messages(prompt: &CommandGenPrompt) -> Vec<ChatMessage> {
-    let system = "You are a shell-command generator for the Weft terminal emulator on macOS. \
-Convert the user's natural-language request into a single POSIX shell command. \
-Reply with ONLY the command — no markdown fences, no explanation, no leading $ prompt. \
-Prefer portable macOS/BSD tooling (grep -E instead of GNU grep -P, find over fd). \
-If the request is dangerous or destructive, reply with: # refused: <reason>. \
-If the request is unclear, reply with: # ambiguous: <one short clarifying question>.";
+    let system = "你是 macOS 终端模拟器 Weft 的 shell 命令生成器。\
+将用户的自然语言请求转换为单条 POSIX shell 命令。\
+只回复命令本身——不要 markdown 代码围栏、不要解释、不要 $ 前缀。\
+优先使用 macOS/BSD 可移植工具（用 grep -E 而非 GNU grep -P，用 find 而非 fd）。\
+如果请求危险或具破坏性，回复：# refused: <原因>。\
+如果请求不明确，回复：# ambiguous: <一个简短的澄清问题>。";
 
     let masked_cwd = redact_for_prompt(&prompt.cwd);
     let masked_history: Vec<String> = prompt
@@ -170,12 +170,12 @@ If the request is unclear, reply with: # ambiguous: <one short clarifying questi
 /// next step. Output is plain text (no JSON), kept under ~200 words so the
 /// result fits comfortably inside a block-view diagnostic panel.
 pub fn build_diagnose_messages(prompt: &DiagnosePrompt) -> Vec<ChatMessage> {
-    let system = "You are a shell-error diagnostician for the Weft terminal emulator. \
-The user ran a command that exited with a non-zero status. Explain in plain English: \
-(1) the most likely cause, and (2) a concrete fix or next diagnostic step. \
-Keep the answer under 200 words. Do not restate the command verbatim. \
-Do not use markdown headings. If the failure is secret-related (e.g. auth token), \
-point that out without echoing the secret.";
+    let system = "你是终端模拟器 Weft 的 shell 错误诊断专家。\
+用户执行了一条以非零状态码退出的命令。请用中文简明扼要地解释：\
+(1) 最可能的原因，(2) 具体的修复方法或下一步诊断建议。\
+回答控制在 200 字以内。不要逐字重复命令本身。\
+不要使用 markdown 标题。如果失败与密钥/凭证相关（如 auth token），\
+请指出这一点但不要回显密钥本身。";
 
     let masked_cmd = redact_for_prompt(&prompt.command);
     let masked_out = redact_for_prompt(&truncate_bytes(&prompt.output, MAX_OUTPUT_BYTES));
@@ -206,6 +206,44 @@ point that out without echoing the secret.";
             content: user,
         },
     ]
+}
+
+/// v1.8.8: Clean up a diagnosis explanation from the model. Small models
+/// (e.g. gemma4:e4b) sometimes produce output with excessive whitespace,
+/// scattered punctuation, or incomplete fragments. This function:
+///   - Strips markdown fences if present
+///   - Collapses runs of whitespace (spaces/tabs) into a single space
+///   - Removes lines that are empty or whitespace-only
+///   - Trims leading/trailing whitespace from each line and the overall result
+///
+/// Does NOT alter the semantic content — just normalises presentation.
+pub fn clean_diagnose_output(raw: &str) -> String {
+    let trimmed = raw.trim();
+    // Strip markdown fences if the model wrapped its answer.
+    let inner = if let Some(after_open) = trimmed.strip_prefix("```") {
+        let after_lang = match after_open.find('\n') {
+            Some(idx) => &after_open[idx + 1..],
+            None => after_open,
+        };
+        after_lang.trim_end()
+    } else {
+        trimmed
+    };
+    let inner = inner.strip_suffix("```").unwrap_or(inner);
+
+    let mut out = String::with_capacity(inner.len());
+    for line in inner.lines() {
+        // Collapse runs of whitespace within each line to a single space.
+        let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&collapsed);
+    }
+    out
 }
 
 /// Strip a leading `$` / `>` prompt and surrounding markdown fences from an
@@ -277,7 +315,7 @@ pub fn classify_command_risk(command: &str) -> AiRiskLevel {
         "rm -rf /*",
         "rm -rf ~",
         "rm -rf $home",
-        "of=/dev/",  // dd/mkfs writing to a block device
+        "of=/dev/", // dd/mkfs writing to a block device
         "mkfs",
         "> /dev/sd",
         "chmod 777 /",
@@ -434,6 +472,44 @@ mod tests {
     }
 
     #[test]
+    fn clean_diagnose_output_collapses_whitespace() {
+        // v1.8.8: gemma4:e4b produces output like this — scattered
+        // fragments with excessive spaces. The function should collapse
+        // runs of whitespace into single spaces.
+        let raw = "AI:             :grep           。        Linux         ，        ";
+        let cleaned = clean_diagnose_output(raw);
+        assert_eq!(cleaned, "AI: :grep 。 Linux ，");
+    }
+
+    #[test]
+    fn clean_diagnose_output_strips_fences() {
+        let raw = "```\n这是诊断结果。\n```";
+        let cleaned = clean_diagnose_output(raw);
+        assert_eq!(cleaned, "这是诊断结果。");
+    }
+
+    #[test]
+    fn clean_diagnose_output_removes_empty_lines() {
+        let raw = "第一行\n\n\n第二行\n   \n第三行";
+        let cleaned = clean_diagnose_output(raw);
+        assert_eq!(cleaned, "第一行\n第二行\n第三行");
+    }
+
+    #[test]
+    fn clean_diagnose_output_preserves_normal_text() {
+        let raw = "命令失败的原因是路径不存在。\n建议使用 ls 检查目录。";
+        let cleaned = clean_diagnose_output(raw);
+        assert_eq!(cleaned, raw);
+    }
+
+    #[test]
+    fn clean_diagnose_output_trims_outer_whitespace() {
+        let raw = "  \n  诊断内容  \n  ";
+        let cleaned = clean_diagnose_output(raw);
+        assert_eq!(cleaned, "诊断内容");
+    }
+
+    #[test]
     fn clean_command_output_preserves_complex_commands() {
         let cmd = "find . -name '*.ts' -mtime -1 | xargs grep 'TODO'";
         assert_eq!(clean_command_output(cmd), cmd);
@@ -470,7 +546,10 @@ mod tests {
         assert_eq!(classify_command_risk("ls -la"), AiRiskLevel::Safe);
         assert_eq!(classify_command_risk("git status"), AiRiskLevel::Safe);
         assert_eq!(classify_command_risk("echo hello"), AiRiskLevel::Safe);
-        assert_eq!(classify_command_risk("find . -name '*.ts'"), AiRiskLevel::Safe);
+        assert_eq!(
+            classify_command_risk("find . -name '*.ts'"),
+            AiRiskLevel::Safe
+        );
     }
 
     #[test]
@@ -483,23 +562,38 @@ mod tests {
 
     #[test]
     fn risk_dangerous_for_dd_to_device() {
-        assert_eq!(classify_command_risk("dd if=image.iso of=/dev/disk4"), AiRiskLevel::Dangerous);
+        assert_eq!(
+            classify_command_risk("dd if=image.iso of=/dev/disk4"),
+            AiRiskLevel::Dangerous
+        );
     }
 
     #[test]
     fn risk_dangerous_for_mkfs() {
-        assert_eq!(classify_command_risk("mkfs.ext4 /dev/sda1"), AiRiskLevel::Dangerous);
+        assert_eq!(
+            classify_command_risk("mkfs.ext4 /dev/sda1"),
+            AiRiskLevel::Dangerous
+        );
     }
 
     #[test]
     fn risk_caution_for_sudo() {
-        assert_eq!(classify_command_risk("sudo apt update"), AiRiskLevel::Caution);
-        assert_eq!(classify_command_risk("sudo brew install ffmpeg"), AiRiskLevel::Caution);
+        assert_eq!(
+            classify_command_risk("sudo apt update"),
+            AiRiskLevel::Caution
+        );
+        assert_eq!(
+            classify_command_risk("sudo brew install ffmpeg"),
+            AiRiskLevel::Caution
+        );
     }
 
     #[test]
     fn risk_caution_for_chmod() {
-        assert_eq!(classify_command_risk("chmod +x script.sh"), AiRiskLevel::Caution);
+        assert_eq!(
+            classify_command_risk("chmod +x script.sh"),
+            AiRiskLevel::Caution
+        );
     }
 
     #[test]

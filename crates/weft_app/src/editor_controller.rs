@@ -423,25 +423,40 @@ impl App {
             return;
         }
 
+        // v1.8.7: Discard any residual native marked text when AI results
+        // arrive. The user typed a query (possibly via CJK IME) and the
+        // composition was committed, but macOS may still hold marked-text
+        // state that intercepts the next Esc keypress, preventing the
+        // palette from closing (issue #2: "再次按Esc时Palette窗口并没有关闭").
+        if let Some(window) = &self.window {
+            crate::ime::discard_marked_text(window);
+        }
+
         for event in events {
             match event {
                 crate::ai::AiResultEvent::CommandGen { id, command } => {
                     // Only accept if the palette is in AiCommand mode and
                     // the id matches the pending request.
-                    if let PaletteSubMode::AiCommand { pending_id, .. } =
-                        &mut self.palette.submode
+                    if let PaletteSubMode::AiCommand {
+                        pending_id,
+                        last_query,
+                        error,
+                        ..
+                    } = &mut self.palette.submode
                     {
                         if *pending_id == Some(id) {
                             *pending_id = None;
+                            // v1.8.7: Clear the saved query + error on success.
+                            last_query.clear();
+                            *error = None;
                             let risk = crate::ai::classify_command_risk(&command);
                             // Clear old AI suggestions and prepend the new one.
                             self.palette
                                 .results
                                 .retain(|e| !matches!(e, PaletteEntry::AiSuggestion { .. }));
-                            self.palette.results.insert(
-                                0,
-                                PaletteEntry::AiSuggestion { command, risk },
-                            );
+                            self.palette
+                                .results
+                                .insert(0, PaletteEntry::AiSuggestion { command, risk });
                             self.palette.selection = 0;
                             self.request_redraw();
                         }
@@ -449,17 +464,26 @@ impl App {
                 }
                 crate::ai::AiResultEvent::Error { id, message } => {
                     // Show error in the palette if it's the pending request.
-                    if let PaletteSubMode::AiCommand { pending_id, buffer } =
-                        &mut self.palette.submode
+                    if let PaletteSubMode::AiCommand {
+                        pending_id,
+                        buffer,
+                        last_query,
+                        error,
+                    } = &mut self.palette.submode
                     {
                         if *pending_id == Some(id) {
                             *pending_id = None;
                             tracing::warn!(error = %message, "AI command generation failed");
-                            // Put the query back so the user can retry.
-                            if buffer.is_empty() {
-                                // Can't recover the original query; just clear.
-                                self.palette.results.clear();
+                            // v1.8.7: Restore the user's query so they can
+                            // edit/retry, and surface the error in the banner.
+                            if buffer.is_empty() && !last_query.is_empty() {
+                                *buffer = std::mem::take(last_query);
                             }
+                            *error = Some(message.clone());
+                            self.palette
+                                .results
+                                .retain(|e| !matches!(e, PaletteEntry::AiSuggestion { .. }));
+                            self.palette.selection = 0;
                             self.request_redraw();
                         }
                     }
@@ -481,8 +505,7 @@ impl App {
                 }
                 crate::ai::AiResultEvent::Cancelled { id } => {
                     // Clear the pending marker if this was our request.
-                    if let PaletteSubMode::AiCommand { pending_id, .. } =
-                        &mut self.palette.submode
+                    if let PaletteSubMode::AiCommand { pending_id, .. } = &mut self.palette.submode
                     {
                         if *pending_id == Some(id) {
                             *pending_id = None;

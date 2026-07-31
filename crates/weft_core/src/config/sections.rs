@@ -286,7 +286,7 @@ impl Default for LogoConfig {
 /// The `api_key` field is removed; the `base_url` is validated to be
 /// loopback at construction time. The TOML writer (config/save.rs) only
 /// persists non-default values, so an empty `[ai]` section stays empty.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AiConfig {
     /// Provider id. v1.8 only accepts `"ollama"`; any other value is
