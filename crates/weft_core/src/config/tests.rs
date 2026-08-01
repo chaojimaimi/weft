@@ -625,6 +625,14 @@ fn editor_submit_on_ctrl_enter_parses() {
 }
 
 #[test]
+fn editor_smart_select_defaults_on_and_parses_off() {
+    let defaults: Config = toml::from_str("").unwrap();
+    assert!(defaults.editor.smart_select);
+    let disabled: Config = toml::from_str("[editor]\nsmart_select = false\n").unwrap();
+    assert!(!disabled.editor.smart_select);
+}
+
+#[test]
 fn zoom_actions_have_default_keybindings() {
     let kb = KeyBindings::default();
     // Cmd+= → ZoomIn, Cmd+- → ZoomOut, Cmd+0 → ZoomReset.
@@ -1715,6 +1723,7 @@ fn settings_editable_fields_survive_one_save_reload_cycle() {
     cfg.window.sidebar_width = Some(310.0);
     cfg.scrollback.lines = 42_000;
     cfg.editor.submit_on_ctrl_enter = true;
+    cfg.editor.smart_select = false;
     cfg.logo.variant = LogoVariant::Light;
 
     cfg.save_to_path(&path).expect("settings audit save");
@@ -1735,6 +1744,7 @@ fn settings_editable_fields_survive_one_save_reload_cycle() {
     assert_eq!(reloaded.window.sidebar_width, Some(310.0));
     assert_eq!(reloaded.scrollback.lines, 42_000);
     assert!(reloaded.editor.submit_on_ctrl_enter);
+    assert!(!reloaded.editor.smart_select);
     assert_eq!(reloaded.logo.variant, LogoVariant::Light);
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

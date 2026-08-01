@@ -2,6 +2,8 @@
 
 use crate::grid::{CellFlags, Grid};
 
+mod block_view;
+
 /// A point in the grid (row, col), 0-based.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridPos {
@@ -375,6 +377,9 @@ impl BlockViewSelection {
     /// or a newline (the newline is added only between two selectable rows
     /// that both contribute text).
     pub fn text(&self) -> String {
+        if let Some(text) = block_view::wrapped_source_text(self) {
+            return text;
+        }
         if self.rows.is_empty() {
             return String::new();
         }

@@ -425,6 +425,11 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
             } else if t.contains_key("submit_on_ctrl_enter") {
                 t.remove("submit_on_ctrl_enter");
             }
+            if e.smart_select != super::EditorConfig::default().smart_select {
+                t["smart_select"] = toml_edit::value(e.smart_select);
+            } else if t.contains_key("smart_select") {
+                t.remove("smart_select");
+            }
         }
     });
     write_profile_section(table, "logo", profile.logo.is_some(), |t| {

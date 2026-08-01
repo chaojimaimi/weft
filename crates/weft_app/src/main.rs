@@ -70,6 +70,7 @@ mod scrollbar_component;
 mod settings_component;
 mod settings_controller;
 mod settings_validation;
+mod smart_select_controller;
 mod snapshot_persistence;
 mod tab;
 mod tab_bar_component;
@@ -85,8 +86,9 @@ use app_state::{
 use block_component::block_content_metrics_with_cache;
 use effect::Effect;
 use macos_system::{
-    clipboard_copy, clipboard_paste, load_window_icon, open_url, scan_path_bins, set_dock_icon,
-    system_appearance_is_dark, system_increase_contrast, system_reduce_motion,
+    clipboard_copy, clipboard_paste, load_window_icon, open_url, reveal_path_in_finder,
+    scan_path_bins, set_dock_icon, system_appearance_is_dark, system_increase_contrast,
+    system_reduce_motion,
 };
 use macos_window::configure_titlebar;
 use paint::overlays::FindDrawState;
@@ -472,6 +474,7 @@ impl App {
 }
 
 fn main() {
+    performance_probe::start_startup_clock();
     app_runtime::install_runtime_diagnostics();
     info!("Starting Weft v1.0 \"Weave\"");
 

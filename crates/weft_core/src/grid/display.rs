@@ -1,6 +1,32 @@
 use super::{CellFlags, Grid};
 
 impl Grid {
+    /// Whether the displayed row continues onto the following physical row.
+    /// Honors scrollback offset exactly like [`Grid::cell`].
+    pub fn displayed_row_wrapped(&self, row: usize) -> bool {
+        if row >= self.num_rows {
+            return false;
+        }
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        if offset > 0 {
+            let global = sb_len - offset + row;
+            if global < sb_len {
+                return self
+                    .scrollback
+                    .get(global)
+                    .is_some_and(|history| history.wrapped);
+            }
+            return self
+                .viewport
+                .get(global - sb_len)
+                .is_some_and(|visible| visible.wrapped);
+        }
+        self.viewport
+            .get(row)
+            .is_some_and(|visible| visible.wrapped)
+    }
+
     /// Extract text from the row currently displayed after applying the
     /// scrollback offset. Accessibility and other viewport consumers must use
     /// this instead of [`row_text`](Self::row_text), which intentionally reads

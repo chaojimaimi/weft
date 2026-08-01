@@ -185,13 +185,25 @@ impl Default for ScrollbackConfig {
 }
 
 /// Editor (input-box) options.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct EditorConfig {
     /// If true, `Ctrl+Enter` submits and plain `Enter` inserts a newline
     /// (Warp default). If false (default), `Enter` submits and `Shift+Enter`
     /// inserts a newline.
     pub submit_on_ctrl_enter: bool,
+    /// Enable semantic target selection with Cmd+Shift+Click. Safe external
+    /// opening is a separate explicit Cmd+Option+Click gesture.
+    pub smart_select: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            submit_on_ctrl_enter: false,
+            smart_select: true,
+        }
+    }
 }
 
 /// v1.0 Logo variant — the app icon shown in the Dock / app switcher.

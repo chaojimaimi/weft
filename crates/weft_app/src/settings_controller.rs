@@ -492,11 +492,16 @@ impl App {
                 _ => {}
             },
             SettingsTab::Input => {
-                if self.settings.selection == 0 {
-                    let current = self.settings.draft.editor.submit_on_ctrl_enter;
+                let value = match self.settings.selection {
+                    0 => Some(&mut self.settings.draft.editor.submit_on_ctrl_enter),
+                    1 => Some(&mut self.settings.draft.editor.smart_select),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    let current = *value;
                     let next = directional_bool(current, delta);
                     if next != current {
-                        self.settings.draft.editor.submit_on_ctrl_enter = next;
+                        *value = next;
                         self.settings
                             .mark_dirty(weft_core::config::ConfigSectionMask::EDITOR);
                     }
@@ -745,7 +750,7 @@ impl App {
                     + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS
             }
             SettingsTab::Terminal => 4, // Scrollback + padding + minimum contrast.
-            SettingsTab::Input => 1,    // Submit on Ctrl+Enter.
+            SettingsTab::Input => 2,    // Submit on Ctrl+Enter + Smart Select.
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
             SettingsTab::Window => 3, // Width + Height + Sidebar Width.
             // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +

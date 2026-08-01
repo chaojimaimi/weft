@@ -458,6 +458,19 @@ impl App {
             }
         }
 
+        // v1.10 Smart Select: Cmd+Shift+Click selects a semantic target;
+        // Cmd+Option+Click explicitly opens a safe URL or reveals a path.
+        if button == winit::event::MouseButton::Left
+            && self.interaction.mods.state().super_key()
+            && (self.interaction.mods.state().shift_key()
+                || self.interaction.mods.state().alt_key())
+            && self.config_state.config.editor.smart_select
+        {
+            let open = self.interaction.mods.state().alt_key();
+            self.handle_smart_select_click(x, y, open);
+            return;
+        }
+
         // OSC 8 hyperlink Cmd+Click: open the URL tagged on the clicked cell
         // via the registry's side-map. Bypasses normal selection / PTY mouse
         // reporting so Cmd+Click works even inside TUI apps that captured the

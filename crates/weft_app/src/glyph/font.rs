@@ -179,12 +179,34 @@ fn load_by_family(family: &str) -> Option<Font> {
 #[allow(dead_code)]
 pub(super) fn is_emoji_char(ch: char) -> bool {
     matches!(ch,
+        '\u{231A}'..='\u{231B}' | '\u{23E9}'..='\u{23EC}' | '\u{23F0}' | '\u{23F3}' |
+        '\u{25FD}'..='\u{25FE}' | '\u{2614}'..='\u{2615}' | '\u{2648}'..='\u{2653}' |
+        '\u{267F}' | '\u{2693}' | '\u{26A1}' | '\u{26AA}'..='\u{26AB}' |
+        '\u{26BD}'..='\u{26BE}' | '\u{26C4}'..='\u{26C5}' | '\u{26CE}' | '\u{26D4}' |
+        '\u{26EA}' | '\u{26F2}'..='\u{26F3}' | '\u{26F5}' | '\u{26FA}' | '\u{26FD}' |
+        '\u{2705}' | '\u{270A}'..='\u{270B}' | '\u{2728}' | '\u{274C}' | '\u{274E}' |
+        '\u{2753}'..='\u{2755}' | '\u{2757}' | '\u{2795}'..='\u{2797}' |
+        '\u{27B0}' | '\u{27BF}' |
         '\u{1F300}'..='\u{1F5FF}' | // Misc Symbols and Pictographs
         '\u{1F600}'..='\u{1F64F}' | // Emoticons
         '\u{1F680}'..='\u{1F6FF}' | // Transport and Map
         '\u{1F1E0}'..='\u{1F1FF}' | // Flags
-        '\u{1F900}'..='\u{1FAFF}' | // Supplemental Symbols and Extended-A
-        '\u{2600}'..='\u{26FF}'   | // Misc symbols
-        '\u{2700}'..='\u{27BF}'     // Dingbats
+        '\u{1F900}'..='\u{1FAFF}'   // Supplemental Symbols and Extended-A
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_emoji_char;
+
+    #[test]
+    fn default_emoji_presentation_symbols_use_the_emoji_font() {
+        for ch in ['✅', '☕', '⚽'] {
+            assert!(is_emoji_char(ch), "{ch} must use Apple Color Emoji");
+        }
+        assert!(
+            !is_emoji_char('★'),
+            "text-presentation star stays in symbol font"
+        );
+    }
 }

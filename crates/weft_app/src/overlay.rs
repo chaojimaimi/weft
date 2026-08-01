@@ -238,6 +238,8 @@ pub struct SettingsDrawParams<'a> {
     pub sidebar_width: Option<f32>,
     /// F5: Submit-on-Ctrl+Enter toggle — Input category.
     pub submit_on_ctrl_enter: bool,
+    /// v1.10: Semantic target selection/opening gestures.
+    pub smart_select: bool,
     /// Keybindings to display (with F5 conflict flag).
     pub keybindings: &'a [SettingsKeybindingView],
     /// v1.0 Logo: currently-applied Dock icon variant (Appearance category
@@ -565,6 +567,7 @@ pub fn build_overlay_stack<'a>(
     settings_window_height: u32,
     settings_sidebar_width: Option<f32>,
     settings_submit_on_ctrl_enter: bool,
+    settings_smart_select: bool,
     settings_keybindings: &'a [SettingsKeybindingView],
     settings_logo_variant: weft_core::config::LogoVariant,
     settings_error: Option<&'a str>,
@@ -739,6 +742,7 @@ pub fn build_overlay_stack<'a>(
                 window_height: settings_window_height,
                 sidebar_width: settings_sidebar_width,
                 submit_on_ctrl_enter: settings_submit_on_ctrl_enter,
+                smart_select: settings_smart_select,
                 keybindings: settings_keybindings,
                 logo_variant: settings_logo_variant,
                 error: settings_error,

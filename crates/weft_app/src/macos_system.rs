@@ -192,7 +192,12 @@ impl std::error::Error for OpenUrlError {}
 pub(super) fn open_url(url: &str) -> Result<(), OpenUrlError> {
     // Sanity-check the scheme before handing it to `open` — we don't want
     // `open file:///etc/passwd` surprises or arbitrary `open <path>` shells.
-    let is_safe = url.starts_with("https://") || url.starts_with("http://");
+    let is_safe = url
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        || url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
     if !is_safe {
         tracing::warn!(url, "OSC 8 Cmd+Click refused non-http(s) URL");
         return Err(OpenUrlError {
@@ -216,6 +221,31 @@ pub(super) fn open_url(url: &str) -> Result<(), OpenUrlError> {
             })
         }
         Ok(_) => Ok(()),
+    }
+}
+
+/// Reveal an existing local path in Finder without invoking a shell.
+pub(super) fn reveal_path_in_finder(path: &std::path::Path) -> Result<(), OpenUrlError> {
+    if !path.is_absolute() || !path.exists() {
+        return Err(OpenUrlError {
+            url: path.display().to_string(),
+            reason: "Path must be absolute and exist".into(),
+        });
+    }
+    match std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(OpenUrlError {
+            url: path.display().to_string(),
+            reason: format!("Finder reveal exited with status {status}"),
+        }),
+        Err(error) => Err(OpenUrlError {
+            url: path.display().to_string(),
+            reason: format!("Failed to spawn Finder reveal: {error}"),
+        }),
     }
 }
 

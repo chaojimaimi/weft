@@ -337,35 +337,42 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Input => {
-                    let value = if s.submit_on_ctrl_enter { "On" } else { "Off" };
-                    let row_y = content_top;
-                    self.push_settings_row(
-                        &mut verts,
-                        row_y,
-                        "Submit on Ctrl+Enter:",
-                        value,
-                        s.selection == 0,
-                        content_x0,
-                        content_x1,
-                        value_x,
-                        cw,
-                        ch,
-                        content_cols,
-                        bg_uv,
-                        selection_bg,
-                        fg,
-                        label_c,
-                        accent,
-                        None,
-                    );
+                    let rows = [
+                        (
+                            "Submit on Ctrl+Enter:",
+                            if s.submit_on_ctrl_enter { "On" } else { "Off" },
+                        ),
+                        ("Smart Select:", if s.smart_select { "On" } else { "Off" }),
+                    ];
+                    for (i, (label, value)) in rows.iter().enumerate() {
+                        self.push_settings_row(
+                            &mut verts,
+                            content_top + i as f32 * ch,
+                            label,
+                            value,
+                            s.selection == i,
+                            content_x0,
+                            content_x1,
+                            value_x,
+                            cw,
+                            ch,
+                            content_cols,
+                            bg_uv,
+                            selection_bg,
+                            fg,
+                            label_c,
+                            accent,
+                            None,
+                        );
+                    }
                     // Help text.
-                    let help_y = row_y + ch;
+                    let help_y = content_top + rows.len() as f32 * ch;
                     if help_y + ch < layout.footer_y {
                         self.push_text(
                             &mut verts,
                             content_x0,
                             help_y,
-                            "When on, Ctrl+Enter submits and Enter inserts a newline.",
+                            "Cmd+Shift+Click selects; Cmd+Option+Click safely opens.",
                             label_c,
                             content_cols,
                         );

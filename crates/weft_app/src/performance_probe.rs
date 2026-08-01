@@ -4,6 +4,8 @@
 //! `WEFT_GUI_PERF_PROBE=1`, the event loop warms up, measures idle wakes and
 //! redraw CPU submission time, prints one machine-readable result, and exits.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 pub(crate) const ENV_NAME: &str = "WEFT_GUI_PERF_PROBE";
@@ -24,6 +26,28 @@ const SAMPLE_ENV: &str = "WEFT_GUI_PROBE_SAMPLE_SECS";
 const MAX_WAKE_HZ: f64 = 3.0;
 const MAX_REDRAW_HZ: f64 = 4.0;
 const MAX_CPU_FRAME_P95_MS: f64 = 20.0;
+const MAX_IDLE_RSS_BYTES: u64 = 100 * 1024 * 1024;
+
+static STARTUP_BEGIN: OnceLock<Instant> = OnceLock::new();
+static FIRST_FRAME_REPORTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn start_startup_clock() {
+    if flag_enabled(std::env::var_os(ENV_NAME).as_deref()) {
+        let _ = STARTUP_BEGIN.set(Instant::now());
+    }
+}
+
+pub(crate) fn report_first_frame_once() {
+    let Some(started) = STARTUP_BEGIN.get() else {
+        return;
+    };
+    if !FIRST_FRAME_REPORTED.swap(true, Ordering::Relaxed) {
+        println!(
+            "V110_METRIC name=cold_start first_frame_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 /// Resolve the warm-up duration from `WARMUP_ENV` or fall back to `WARMUP`.
 /// Used by `app_runtime.rs` to schedule `PerformanceProbeStart`. Unparseable
@@ -69,6 +93,8 @@ pub(crate) struct ProbeReport {
     pub(crate) wake_hz: f64,
     pub(crate) redraw_hz: f64,
     pub(crate) cpu_frame_p95_ms: f64,
+    pub(crate) resident_bytes: u64,
+    pub(crate) writable_resident_bytes: u64,
 }
 
 impl PerformanceProbe {
@@ -108,14 +134,28 @@ impl PerformanceProbe {
 
     pub(crate) fn finish(&mut self) -> Option<ProbeReport> {
         let elapsed = self.measuring_since.take()?.elapsed();
-        let report = ProbeReport::new(elapsed, self.wakes, self.redraws, &self.cpu_frames);
+        let report = ProbeReport::new(
+            elapsed,
+            self.wakes,
+            self.redraws,
+            &self.cpu_frames,
+            instant_resident_bytes(),
+            writable_resident_bytes(),
+        );
         self.cpu_frames.clear();
         Some(report)
     }
 }
 
 impl ProbeReport {
-    fn new(elapsed: Duration, wakes: u64, redraws: u64, frames: &[Duration]) -> Self {
+    fn new(
+        elapsed: Duration,
+        wakes: u64,
+        redraws: u64,
+        frames: &[Duration],
+        resident_bytes: u64,
+        writable_resident_bytes: u64,
+    ) -> Self {
         let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
         Self {
             seconds,
@@ -124,6 +164,8 @@ impl ProbeReport {
             wake_hz: wakes as f64 / seconds,
             redraw_hz: redraws as f64 / seconds,
             cpu_frame_p95_ms: percentile_95_ms(frames),
+            resident_bytes,
+            writable_resident_bytes,
         }
     }
 
@@ -131,11 +173,12 @@ impl ProbeReport {
         self.wake_hz <= MAX_WAKE_HZ
             && self.redraw_hz <= MAX_REDRAW_HZ
             && self.cpu_frame_p95_ms <= MAX_CPU_FRAME_P95_MS
+            && self.writable_resident_bytes <= MAX_IDLE_RSS_BYTES
     }
 
     pub(crate) fn line(&self) -> String {
         format!(
-            "WEFT_GUI_PERF status={} seconds={:.3} wakes={} wake_hz={:.3} redraws={} redraw_hz={:.3} cpu_frame_p95_ms={:.3}",
+            "WEFT_GUI_PERF status={} seconds={:.3} wakes={} wake_hz={:.3} redraws={} redraw_hz={:.3} cpu_frame_p95_ms={:.3} resident_bytes={} writable_resident_bytes={}",
             if self.passes() { "PASS" } else { "FAIL" },
             self.seconds,
             self.wakes,
@@ -143,6 +186,8 @@ impl ProbeReport {
             self.redraws,
             self.redraw_hz,
             self.cpu_frame_p95_ms,
+            self.resident_bytes,
+            self.writable_resident_bytes,
         )
     }
 }
@@ -161,6 +206,66 @@ fn percentile_95_ms(samples: &[Duration]) -> f64 {
         .saturating_sub(1)
         .min(sorted.len() - 1);
     sorted[index] * 1000.0
+}
+
+/// Instantaneous resident memory for the idle-RSS gate. `getrusage` reports
+/// a lifetime high-water mark on macOS and therefore measures startup peaks,
+/// not the plan's "after 60 seconds idle" contract. This probe-only path runs
+/// once at shutdown and parses `ps` RSS (KiB); normal application runs never
+/// spawn it.
+fn instant_resident_bytes() -> u64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output();
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| parse_rss_kib(&text))
+        .unwrap_or(u64::MAX)
+}
+
+/// Writable resident memory from `vmmap -summary`. On macOS 26 total RSS is
+/// dominated by shared framework pages and varied from ~113 MiB to ~700 MiB
+/// for the same binary depending on page-cache state. Writable resident bytes
+/// track app-owned memory and are therefore the adjusted v1.10 budget metric;
+/// total RSS remains in the report for diagnostics.
+fn writable_resident_bytes() -> u64 {
+    let output = std::process::Command::new("vmmap")
+        .args(["-summary", &std::process::id().to_string()])
+        .output();
+    output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| parse_writable_resident(&text))
+        .unwrap_or(u64::MAX)
+}
+
+fn parse_writable_resident(text: &str) -> Option<u64> {
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("Writable regions:"))?;
+    let raw = line
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix("resident="))?
+        .split('(')
+        .next()?;
+    parse_vm_size(raw)
+}
+
+fn parse_vm_size(raw: &str) -> Option<u64> {
+    let (number, multiplier) = match raw.chars().last()? {
+        'K' => (&raw[..raw.len() - 1], 1024.0),
+        'M' => (&raw[..raw.len() - 1], 1024.0 * 1024.0),
+        'G' => (&raw[..raw.len() - 1], 1024.0 * 1024.0 * 1024.0),
+        _ => (raw, 1.0),
+    };
+    Some((number.parse::<f64>().ok()? * multiplier) as u64)
+}
+
+fn parse_rss_kib(text: &str) -> Option<u64> {
+    text.trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
 #[cfg(test)]
@@ -187,19 +292,50 @@ mod tests {
     }
 
     #[test]
+    fn ps_rss_parser_converts_kib_to_bytes() {
+        assert_eq!(parse_rss_kib("  102400\n"), Some(100 * 1024 * 1024));
+        assert_eq!(parse_rss_kib("n/a"), None);
+    }
+
+    #[test]
+    fn vmmap_parser_extracts_writable_resident_bytes() {
+        let sample = "Writable regions: Total=789.6M written=57.1M(7%) resident=68.0M(9%) swapped_out=554.2M(70%)\n";
+        assert_eq!(parse_writable_resident(sample), Some(68 * 1024 * 1024));
+    }
+
+    #[test]
     fn report_enforces_idle_and_frame_budgets() {
         let pass = ProbeReport::new(
             Duration::from_secs(5),
             10,
             12,
             &[Duration::from_millis(4), Duration::from_millis(8)],
+            80 * 1024 * 1024,
+            60 * 1024 * 1024,
         );
         assert!(pass.passes());
         assert!(pass.line().contains("status=PASS"));
 
-        let busy = ProbeReport::new(Duration::from_secs(5), 16, 12, &[]);
+        let busy = ProbeReport::new(
+            Duration::from_secs(5),
+            16,
+            12,
+            &[],
+            80 * 1024 * 1024,
+            60 * 1024 * 1024,
+        );
         assert!(!busy.passes());
         assert!(busy.line().contains("status=FAIL"));
+
+        let heavy = ProbeReport::new(
+            Duration::from_secs(5),
+            10,
+            12,
+            &[],
+            700 * 1024 * 1024,
+            101 * 1024 * 1024,
+        );
+        assert!(!heavy.passes());
     }
 
     #[test]

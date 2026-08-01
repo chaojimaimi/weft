@@ -482,4 +482,44 @@ mod tests {
             "10k history filtering/virtualization took {elapsed:?}, budget <100ms"
         );
     }
+
+    /// v1.10 scale gate: locating an unfiltered visible window must remain
+    /// interactive at 10k/50k/100k blocks. Construction is excluded.
+    #[test]
+    #[ignore]
+    fn perf_panel_v110_scale_visible_window() {
+        for size in [10_000usize, 50_000, 100_000] {
+            let blocks: Vec<Block> = (0..size)
+                .map(|i| Block {
+                    id: BlockId(i as u64),
+                    command: format!("command-{i}"),
+                    cwd: None,
+                    output: String::new().into(),
+                    styled_output: None,
+                    exit_code: Some(0),
+                    started_at: std::time::SystemTime::UNIX_EPOCH,
+                    finished_at: None,
+                    collapsed: false,
+                })
+                .collect();
+            let mut samples = Vec::with_capacity(20);
+            for sample in 0..20 {
+                let offset = sample * size.saturating_sub(80) / 19;
+                let started = std::time::Instant::now();
+                let visible = panel_display(&blocks, "", offset, 80);
+                assert_eq!(visible.len(), 80);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            let median = samples[samples.len() / 2];
+            let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+            println!(
+                "V110_METRIC name=block_visible_window size={size} median_ms={median:.3} p95_ms={p95:.3}"
+            );
+            assert!(
+                p95 < 8.0,
+                "{size} block visible-window p95 {p95:.3}ms exceeds 8ms budget"
+            );
+        }
+    }
 }

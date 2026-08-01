@@ -55,6 +55,7 @@ fn bench_v110_vt_parse_100k_lines() {
         bytes.len(),
         mbps
     );
+    println!("V110_METRIC name=vt_parse size=100000 elapsed_ms={elapsed_ms:.3}");
     // 预算参考（V110_PLAN §3.4 间接）：大体量解析不应阻塞首屏。
     // 此处只记录数值，硬阈值留给 v1.10.0 基线测量后定（§3.4 末段）。
     assert!(
@@ -80,6 +81,7 @@ fn bench_v110_vt_parse_1m_lines_scrollback() {
         bytes.len(),
         mbps
     );
+    println!("V110_METRIC name=vt_parse size=1000000 elapsed_ms={elapsed_ms:.3}");
     // 预算：V110_PLAN §3.4 "百万行历史搜索首批 < 250ms"——此处测解析非搜索，
     // 仅保证不爆炸式增长（< 30s 为 sanity check）
     assert!(
@@ -123,6 +125,7 @@ fn bench_v110_smart_select_on_long_line() {
         per_call_us,
         matches
     );
+    println!("V110_METRIC name=smart_select per_call_us={per_call_us:.3}");
     // 预算参考：Smart Select 应远快于人眼感知（< 1ms/call 是宽裕上限）
     assert!(
         per_call_us < 1000.0,
@@ -162,6 +165,7 @@ fn bench_v110_resize_under_load() {
         elapsed_ms,
         per_resize_ms
     );
+    println!("V110_METRIC name=resize_after_output per_resize_ms={per_resize_ms:.3}");
     // V110_PLAN §3.3 性能决策门：此处只采集基线，不强阈值。
     // 50k 行 scrollback 下 resize ~75ms 是当前观测值。是否优化取决于：
     // (a) profile 是否指向 reflow/scrollback 拷贝为热点

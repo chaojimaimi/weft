@@ -365,15 +365,28 @@ impl Config {
             default_scrollback.lines,
         );
 
-        if self.editor.submit_on_ctrl_enter {
+        let default_editor = EditorConfig::default();
+        if self.editor.submit_on_ctrl_enter != default_editor.submit_on_ctrl_enter
+            || self.editor.smart_select != default_editor.smart_select
+        {
             let editor_entry = doc.entry("editor").or_insert_with(toml_edit::table);
             if editor_entry.is_none() {
                 *editor_entry = toml_edit::table();
             }
             let editor = editor_entry.as_table_mut().expect("editor is a table");
-            editor["submit_on_ctrl_enter"] = toml_edit::value(true);
+            if self.editor.submit_on_ctrl_enter {
+                editor["submit_on_ctrl_enter"] = toml_edit::value(true);
+            } else {
+                editor.remove("submit_on_ctrl_enter");
+            }
+            if self.editor.smart_select != default_editor.smart_select {
+                editor["smart_select"] = toml_edit::value(self.editor.smart_select);
+            } else {
+                editor.remove("smart_select");
+            }
         } else if let Some(editor) = doc.get_mut("editor").and_then(|item| item.as_table_mut()) {
             editor.remove("submit_on_ctrl_enter");
+            editor.remove("smart_select");
         }
 
         // [logo] section — write variant when non-default; clear it when

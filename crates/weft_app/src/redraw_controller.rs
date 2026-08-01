@@ -530,6 +530,7 @@ impl App {
                 self.settings.draft.window.height,
                 self.settings.draft.window.sidebar_width,
                 self.settings.draft.editor.submit_on_ctrl_enter,
+                self.settings.draft.editor.smart_select,
                 &settings_keybindings,
                 self.settings.draft.logo.variant,
                 self.settings.error.as_deref(),
@@ -743,6 +744,7 @@ impl App {
                 active_pane_id,
                 pane.pane_session_id,
             );
+            crate::performance_probe::report_first_frame_once();
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.
             if self.frame_trace_enabled {

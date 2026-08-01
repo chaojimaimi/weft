@@ -71,6 +71,19 @@ pub struct SmartTarget {
     pub end: usize,
 }
 
+/// A semantic target together with coordinates suitable for terminal UI
+/// selection. Byte offsets remain the source of truth; display columns and
+/// character indices are derived once here so Grid and BlockView callers do
+/// not implement subtly different CJK/emoji conversions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartDisplayTarget {
+    pub target: SmartTarget,
+    pub start_display_col: usize,
+    pub end_display_col: usize,
+    pub start_char: usize,
+    pub end_char: usize,
+}
+
 impl SmartTarget {
     #[must_use]
     pub fn text<'a>(&self, text: &'a str) -> &'a str {
@@ -139,6 +152,52 @@ pub fn match_at(text: &str, byte_idx: usize) -> Option<SmartTarget> {
     })
 }
 
+/// Match a target at a terminal display column and return both byte and UI
+/// coordinate ranges. `end_display_col` and `end_char` are exclusive.
+#[must_use]
+pub fn match_display_at(text: &str, display_col: usize) -> Option<SmartDisplayTarget> {
+    let byte_idx = byte_index_at_display_col(text, display_col)?;
+    let target = match_at(text, byte_idx)?;
+    Some(SmartDisplayTarget {
+        start_display_col: display_col_at_byte(text, target.start),
+        end_display_col: display_col_at_byte(text, target.end),
+        start_char: text[..target.start].chars().count(),
+        end_char: text[..target.end].chars().count(),
+        target,
+    })
+}
+
+/// Convert a character index (used by BlockView hit testing) to a byte index.
+#[must_use]
+pub fn byte_index_at_char(text: &str, char_index: usize) -> Option<usize> {
+    if char_index == text.chars().count() {
+        return Some(text.len());
+    }
+    text.char_indices().nth(char_index).map(|(byte, _)| byte)
+}
+
+fn byte_index_at_display_col(text: &str, target_col: usize) -> Option<usize> {
+    let mut col = 0usize;
+    for (byte, ch) in text.char_indices() {
+        let width = terminal_char_width(ch);
+        if width == 0 {
+            continue;
+        }
+        if target_col < col.saturating_add(width) {
+            return Some(byte);
+        }
+        col = col.saturating_add(width);
+    }
+    None
+}
+
+fn display_col_at_byte(text: &str, byte_idx: usize) -> usize {
+    text[..byte_idx.min(text.len())]
+        .chars()
+        .map(terminal_char_width)
+        .sum()
+}
+
 /// 把任意字节偏移对齐到 char 边界（向后退到 char 起点）。
 fn align_to_char_boundary(text: &str, mut idx: usize) -> usize {
     while idx > 0 && !text.is_char_boundary(idx) {
@@ -150,48 +209,68 @@ fn align_to_char_boundary(text: &str, mut idx: usize) -> usize {
 /// 向两侧扩展到 token 边界。
 ///
 /// 边界规则（保守，避免把无关文本算进目标）：
-/// 1. `char::is_whitespace` 总是边界
+/// 1. 非转义空白是边界；`\ ` 可出现在终端打印的路径中
 /// 2. East Asian Wide 字符（display width == 2）与 narrow 字符之间是边界
-///    —— 例如"编辑src"切成"编辑"+"src"，"src文件"切成"src"+"文件"
+///    —— 路径分隔符两侧除外，因此 `/tmp/中文/main.rs` 保持完整
 /// 3. narrow 内部不切标点（URL/path/email/hash 含 `:/.@-`）
 fn expand_word(text: &str, idx: usize) -> (usize, usize) {
-    // idx 处的 char 决定 token 的"宽度类别"
-    let anchor_ch = text[idx..].chars().next().unwrap_or(' ');
-    let anchor_wide = terminal_char_width(anchor_ch) == 2;
-
-    // 向左扩展：收集与 anchor 同类的连续 char
     let mut start = idx;
     while start > 0 {
         let prev = prev_char_start(text, start);
-        let Some(ch) = text[prev..].chars().next() else {
+        let Some(prev_ch) = text[prev..].chars().next() else {
             break;
         };
-        if ch.is_whitespace() {
+        let Some(current_ch) = text[start..].chars().next() else {
+            break;
+        };
+        if prev_ch.is_whitespace() && !is_escaped_at(text, prev) {
             break;
         }
-        let ch_wide = terminal_char_width(ch) == 2;
-        if ch_wide != anchor_wide {
-            break; // CJK ↔ ASCII 边界
+        if width_class_differs(prev_ch, current_ch) && !path_boundary_bridge(prev_ch, current_ch) {
+            break;
         }
         start = prev;
     }
 
-    // 向右扩展
-    let mut end = idx;
+    let mut end = idx + text[idx..].chars().next().map_or(0, char::len_utf8);
     while end < text.len() {
-        let Some(ch) = text[end..].chars().next() else {
+        let Some(next_ch) = text[end..].chars().next() else {
             break;
         };
-        if ch.is_whitespace() {
+        let prev = prev_char_start(text, end);
+        let Some(prev_ch) = text[prev..].chars().next() else {
+            break;
+        };
+        if next_ch.is_whitespace() && !is_escaped_at(text, end) {
             break;
         }
-        let ch_wide = terminal_char_width(ch) == 2;
-        if ch_wide != anchor_wide {
-            break; // CJK ↔ ASCII 边界
+        if width_class_differs(prev_ch, next_ch) && !path_boundary_bridge(prev_ch, next_ch) {
+            break;
         }
-        end += ch.len_utf8();
+        end += next_ch.len_utf8();
     }
     (start, end)
+}
+
+fn width_class_differs(left: char, right: char) -> bool {
+    (terminal_char_width(left) == 2) != (terminal_char_width(right) == 2)
+}
+
+fn path_boundary_bridge(left: char, right: char) -> bool {
+    matches!(left, '/' | '\\') || matches!(right, '/' | '\\')
+}
+
+fn is_escaped_at(text: &str, byte: usize) -> bool {
+    let mut cursor = byte;
+    let mut slashes = 0usize;
+    while cursor > 0 {
+        cursor = prev_char_start(text, cursor);
+        if !text[cursor..].starts_with('\\') {
+            break;
+        }
+        slashes += 1;
+    }
+    slashes % 2 == 1
 }
 
 /// 返回 `pos` 之前一个 char 的起点（pos 必须 > 0）。
@@ -526,307 +605,4 @@ fn is_ipv6(s: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn m(text: &str, byte_idx: usize) -> Option<SmartTargetKind> {
-        match_at(text, byte_idx).map(|t| t.kind)
-    }
-
-    // ---------- 基本优先级（V110_PLAN §3.2）----------
-
-    #[test]
-    fn url_at_cursor() {
-        let s = "see https://example.com/path?q=1 now";
-        let idx = s.find("example").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Url));
-    }
-
-    #[test]
-    fn http_url_priority_over_path() {
-        // URL 含 `/` 但应是 URL，非 Path
-        let s = "open https://a.com/b";
-        let idx = s.find("a.com").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Url));
-    }
-
-    #[test]
-    fn email_at_cursor() {
-        let s = "contact user@example.com for details";
-        let idx = s.find("example").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Email));
-    }
-
-    #[test]
-    fn host_port_at_cursor() {
-        let s = "ssh root@1.2.3.4:2222 then";
-        let idx = s.find("2222").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::HostPort));
-    }
-
-    #[test]
-    fn ipv4_without_port() {
-        let s = "ping 192.168.1.1 to test";
-        let idx = s.find("168").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::IpOrHost));
-    }
-
-    #[test]
-    fn git_hash_7char() {
-        let s = "fixed in abc1234 last week";
-        let idx = s.find("abc1").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::GitHash));
-    }
-
-    #[test]
-    fn git_hash_40char() {
-        let s = "commit deadbeefcafebabe1234567890abcdef12345678 done";
-        let idx = s.find("dead").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::GitHash));
-    }
-
-    #[test]
-    fn path_at_cursor() {
-        let s = "edit src/lib.rs to fix";
-        let idx = s.find("lib").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Path));
-    }
-
-    #[test]
-    fn path_line_column_highest_priority() {
-        let s = "src/lib.rs:42:8 error here";
-        let idx = s.find("lib").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::PathLineColumn));
-        // 完整范围覆盖到 column
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(&s[t.start..t.end], "src/lib.rs:42:8");
-    }
-
-    #[test]
-    fn path_line_only() {
-        let s = "see ./main.rs:15 for";
-        let idx = s.find("main").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::PathLineColumn));
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(&s[t.start..t.end], "./main.rs:15");
-    }
-
-    // ---------- 边界修剪（V110_PLAN §5 退出标准：标点边界）----------
-
-    #[test]
-    fn url_in_parens_not_include_closing() {
-        let s = "see (https://example.com) for";
-        let idx = s.find("example").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Url);
-        assert_eq!(&s[t.start..t.end], "https://example.com");
-    }
-
-    #[test]
-    fn url_in_brackets() {
-        let s = "ref [https://example.com] now";
-        let idx = s.find("example").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(&s[t.start..t.end], "https://example.com");
-    }
-
-    #[test]
-    fn url_in_angles() {
-        let s = "<https://example.com>";
-        let t = match_at(s, 5).unwrap();
-        assert_eq!(&s[t.start..t.end], "https://example.com");
-    }
-
-    // ---------- CJK / 全角边界（V110_PLAN §5 退出标准核心）----------
-
-    #[test]
-    fn url_adjacent_to_cjk() {
-        // CJK 紧贴 URL，不应把 CJK 算进 URL
-        let s = "访问https://example.com查看";
-        let idx = s.find("example").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Url);
-        assert_eq!(&s[t.start..t.end], "https://example.com");
-        // 起点不包含"访问"，终点不包含"查看"
-        assert!(!s[t.start..t.end].contains('访'));
-        assert!(!s[t.start..t.end].contains('查'));
-    }
-
-    #[test]
-    fn path_surrounded_by_cjk() {
-        let s = "编辑src/main.rs文件";
-        let idx = s.find("main").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Path);
-        assert_eq!(&s[t.start..t.end], "src/main.rs");
-    }
-
-    #[test]
-    fn cjk_word_is_identifier() {
-        // 纯 CJK（无 URL/路径特征）回退到 Identifier，不 panic
-        let s = "你好世界";
-        let idx = s.find("好").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Identifier));
-    }
-
-    // ---------- 恶意输入安全（V110_PLAN §3.2 "禁止隐式执行"）----------
-
-    #[test]
-    fn shell_metacharacters_only_selected_not_executed() {
-        // matcher 只返回范围，不执行。`;rm -rf` 应被识别为标识符，
-        // is_safe_to_open 应为 false，调用方据此决定不打开。
-        let s = "foo;rm -rf /";
-        let idx = s.find("foo").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert!(!t.kind.is_safe_to_open() || t.kind == SmartTargetKind::Identifier);
-    }
-
-    #[test]
-    fn file_scheme_recognized_but_caller_must_validate() {
-        // file:// 识别为 URL 类型，但 is_safe_to_open 对 Url 返回 true
-        // 这是钩子；调用方仍必须做路径存在性 + 越界校验（V110_PLAN §5.5）
-        let s = "open file:///etc/passwd here";
-        let idx = s.find("etc").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Url);
-    }
-
-    #[test]
-    fn whitespace_cursor_returns_none() {
-        assert_eq!(m("a b", 1), None);
-        assert_eq!(m("   ", 0), None);
-    }
-
-    #[test]
-    fn empty_string_returns_none() {
-        assert_eq!(m("", 0), None);
-    }
-
-    #[test]
-    fn out_of_range_returns_none_or_aligned() {
-        // 不应 panic
-        let _ = m("abc", 100);
-    }
-
-    // ---------- 优先级冲突仲裁 ----------
-
-    #[test]
-    fn url_beats_path_when_scheme_present() {
-        // https://a.com 含 `/`，但优先识别为 URL 而非 Path
-        let s = "https://a.com/b";
-        let idx = s.find("a.com").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::Url));
-    }
-
-    #[test]
-    fn path_line_column_beats_url_when_no_scheme() {
-        // /var/log:1 没有 scheme，但 path:line 模式
-        let s = "/var/log:1";
-        let idx = s.find("var").unwrap();
-        assert_eq!(m(s, idx), Some(SmartTargetKind::PathLineColumn));
-    }
-
-    // ---------- 范围正确性 ----------
-
-    #[test]
-    fn identifier_fallback_single_word() {
-        let s = "run cargo build";
-        let idx = s.find("cargo").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Identifier);
-        assert_eq!(&s[t.start..t.end], "cargo");
-    }
-
-    #[test]
-    fn tilde_path() {
-        let s = "cat ~/.config/weft";
-        let idx = s.find("config").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Path);
-        assert_eq!(&s[t.start..t.end], "~/.config/weft");
-    }
-
-    // ---------- rust-reviewer B1-B4 回归（裸文件名 / 句末点 / 括号）----------
-
-    #[test]
-    fn bare_filename_with_line() {
-        // B1/B2: 编译器典型输出，无路径前缀
-        let s = "error in main.rs:42 here";
-        let idx = s.find("main").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::PathLineColumn);
-        assert_eq!(&s[t.start..t.end], "main.rs:42");
-    }
-
-    #[test]
-    fn bare_filename_with_line_and_column() {
-        // B2: lib.rs:10:5（行:列）
-        let s = "see lib.rs:10:5 for";
-        let idx = s.find("lib").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::PathLineColumn);
-        assert_eq!(&s[t.start..t.end], "lib.rs:10:5");
-    }
-
-    #[test]
-    fn filename_bare_without_line_is_path() {
-        // 无 :num 后缀的裸文件名 → Path（非 Identifier）
-        let s = "edit Cargo.toml now";
-        let idx = s.find("Cargo").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Path);
-        assert_eq!(&s[t.start..t.end], "Cargo.toml");
-    }
-
-    #[test]
-    fn path_line_column_in_parens_trimmed() {
-        // B3: (src/main.rs:42) 不应含括号
-        let s = "see (src/main.rs:42) for";
-        let idx = s.find("main").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::PathLineColumn);
-        assert_eq!(&s[t.start..t.end], "src/main.rs:42");
-    }
-
-    #[test]
-    fn url_trailing_period_trimmed() {
-        // B4: 句末 https://x.com. 的 `.` 应修剪
-        let s = "visit https://x.com.";
-        let idx = s.find("x.com").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Url);
-        assert_eq!(&s[t.start..t.end], "https://x.com");
-    }
-
-    #[test]
-    fn email_trailing_period_detected() {
-        // B4: a@b.com. 应检测为 Email（而非降级 Identifier）
-        let s = "mail me at a@b.com. please";
-        let idx = s.find("b.com").unwrap();
-        let t = match_at(s, idx).unwrap();
-        assert_eq!(t.kind, SmartTargetKind::Email);
-        assert_eq!(&s[t.start..t.end], "a@b.com");
-    }
-
-    #[test]
-    fn url_path_trailing_slash_dot_preserved() {
-        // B4 保护：`config/.` 末尾的合法 `.` 不应被修剪
-        // （虽然这是路径，但验证 trim_brackets 不会误删）
-        let s = "cat ./config/.";
-        let idx = s.find("config").unwrap();
-        let t = match_at(s, idx).unwrap();
-        // 整个 ./config/. 是 Path，末尾 . 保留
-        assert_eq!(t.kind, SmartTargetKind::Path);
-        assert_eq!(&s[t.start..t.end], "./config/.");
-    }
-
-    #[test]
-    fn bare_filename_not_confused_with_hostport() {
-        // B1 关键：main.rs:42 不应是 HostPort（port=42, host=main.rs）
-        // 优先级：PathLineColumn > HostPort
-        let s = "fix main.rs:42 now";
-        let idx = s.find("main").unwrap();
-        let kind = m(s, idx);
-        assert_eq!(kind, Some(SmartTargetKind::PathLineColumn));
-    }
-}
+mod tests;

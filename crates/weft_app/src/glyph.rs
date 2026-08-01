@@ -123,8 +123,10 @@ pub struct GlyphAtlas {
     primary_font: Font,
     /// CJK fallback font (PingFang SC).
     cjk_font: Option<Font>,
+    cjk_family: String,
     /// Emoji fallback font (Apple Color Emoji).
     emoji_font: Option<Font>,
+    emoji_family: String,
     /// Symbol fallback font (Apple Symbols) — last-resort glyphs the primary
     /// font lacks (e.g. ❯ U+276F in the Dingbats block, box-drawing, arrows).
     symbol_font: Option<Font>,
@@ -147,21 +149,6 @@ impl GlyphAtlas {
         // Menlo path (guaranteed on macOS). A missing primary is fatal.
         let primary_font = resolve_font(&font_config.family, &["/System/Library/Fonts/Menlo.ttc"])
             .expect("failed to load primary font (no family match and Menlo missing)");
-
-        // CJK fallback
-        let cjk_font = resolve_font(
-            &font_config.cjk_family,
-            &[
-                "/System/Library/Fonts/PingFang.ttc",
-                "/System/Library/Fonts/STHeiti Light.ttc",
-            ],
-        );
-
-        // Emoji fallback
-        let emoji_font = resolve_font(
-            &font_config.emoji_family,
-            &["/System/Library/Fonts/Apple Color Emoji.ttc"],
-        );
 
         // Symbol fallback (Apple Symbols) — covers glyphs like ❯ (U+276F) that
         // Menlo lacks, so the prompt marker renders instead of blanking.
@@ -237,8 +224,13 @@ impl GlyphAtlas {
         // Pre-rasterize the prompt marker and common UI glyphs at init.
         for &ch in &['❯', '❮', '›', '→', '•', '·', '…', '─', '▸', '▾', '●', '○']
         {
+            let font = if primary_font.glyph_for_char(ch).is_some() {
+                &primary_font
+            } else {
+                symbol_font.as_ref().unwrap_or(&primary_font)
+            };
             let placed = Self::rasterize_and_place(
-                &primary_font,
+                font,
                 ch,
                 scaled_size,
                 cell_w,
@@ -254,34 +246,6 @@ impl GlyphAtlas {
             );
             if let Some(info) = placed {
                 cache.insert(ch, info);
-            }
-        }
-
-        // Pre-rasterize common CJK punctuation and a few CJK chars
-        let cjk_chars: &[char] = &[
-            '、', '。', '「', '」', '【', '】', '，', '；', '：', '？', '！', '（', '）', '…', '—',
-            '《', '》', '·',
-        ];
-        if let Some(ref cjk) = cjk_font {
-            for &ch in cjk_chars {
-                let placed = Self::rasterize_and_place(
-                    cjk,
-                    ch,
-                    scaled_size,
-                    cell_w,
-                    cell_h,
-                    true,
-                    &mut atlas_pixels,
-                    atlas_w,
-                    atlas_h,
-                    &mut next_x,
-                    &mut next_y,
-                    &mut row_height,
-                    primary_descent_px,
-                );
-                if let Some(info) = placed {
-                    cache.insert(ch, info);
-                }
             }
         }
 
@@ -318,8 +282,10 @@ impl GlyphAtlas {
             next_y,
             row_height,
             primary_font,
-            cjk_font,
-            emoji_font,
+            cjk_font: None,
+            cjk_family: font_config.cjk_family.clone(),
+            emoji_font: None,
+            emoji_family: font_config.emoji_family.clone(),
             symbol_font,
             scaled_size,
             primary_descent_px,
@@ -337,6 +303,27 @@ impl GlyphAtlas {
             return self.ascii[ch as usize].as_ref();
         }
         self.cache.get(&ch)
+    }
+
+    /// Load large TTC fallbacks only when output actually needs them. On the
+    /// current macOS font set, eagerly opening PingFang + Apple Color Emoji
+    /// retained more than 500 MiB of `MALLOC_LARGE` allocations even in an
+    /// ASCII-only idle terminal.
+    fn ensure_script_font(&mut self, is_emoji: bool, is_wide: bool) {
+        if is_emoji && self.emoji_font.is_none() {
+            self.emoji_font = resolve_font(
+                &self.emoji_family,
+                &["/System/Library/Fonts/Apple Color Emoji.ttc"],
+            );
+        } else if is_wide && self.cjk_font.is_none() {
+            self.cjk_font = resolve_font(
+                &self.cjk_family,
+                &[
+                    "/System/Library/Fonts/PingFang.ttc",
+                    "/System/Library/Fonts/STHeiti Light.ttc",
+                ],
+            );
+        }
     }
 
     /// Look up a cached glyph by character, or rasterize on demand.
@@ -361,31 +348,18 @@ impl GlyphAtlas {
         // Determine which font to use
         let is_wide = weft_core::grid::terminal_char_width(ch) > 1;
         let is_emoji = is_emoji_char(ch);
+        self.ensure_script_font(is_emoji, is_wide);
 
         let font = if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
             self.cjk_font.as_ref().unwrap_or(&self.primary_font)
         } else {
-            // Narrow text: prefer the monospace primary, but if it lacks the
-            // glyph (e.g. ❯ U+276F, some box-drawing/punctuation) fall back to
-            // the CJK then emoji font before giving up. Without this, a missing
-            // glyph rasterizes as a blank cell — the input-box prompt marker ❯
-            // disappeared entirely.
+            // Narrow text: prefer the monospace primary, then the lightweight
+            // symbol fallback. CJK and emoji fonts are loaded by script class
+            // above instead of probing both large TTCs for every missing glyph.
             if self.primary_font.glyph_for_char(ch).is_some() {
                 &self.primary_font
-            } else if self
-                .cjk_font
-                .as_ref()
-                .is_some_and(|f| f.glyph_for_char(ch).is_some())
-            {
-                self.cjk_font.as_ref().unwrap()
-            } else if self
-                .emoji_font
-                .as_ref()
-                .is_some_and(|f| f.glyph_for_char(ch).is_some())
-            {
-                self.emoji_font.as_ref().unwrap()
             } else if self
                 .symbol_font
                 .as_ref()
@@ -545,25 +519,16 @@ impl GlyphAtlas {
         // sequences, flag pairs, skin tone modifiers) need Apple Color Emoji;
         // wide CJK clusters use the CJK fallback; everything else uses the
         // primary font with the same fallback ladder as `get_or_rasterize`.
-        let is_emoji = is_emoji_char(base_char);
+        let is_emoji = is_emoji_char(base_char)
+            || cluster.contains('\u{fe0f}')
+            || cluster.contains('\u{200d}');
+        self.ensure_script_font(is_emoji, is_wide);
         let font = if is_emoji {
             self.emoji_font.as_ref().unwrap_or(&self.primary_font)
         } else if is_wide {
             self.cjk_font.as_ref().unwrap_or(&self.primary_font)
         } else if self.primary_font.glyph_for_char(base_char).is_some() {
             &self.primary_font
-        } else if self
-            .cjk_font
-            .as_ref()
-            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
-        {
-            self.cjk_font.as_ref().unwrap()
-        } else if self
-            .emoji_font
-            .as_ref()
-            .is_some_and(|f| f.glyph_for_char(base_char).is_some())
-        {
-            self.emoji_font.as_ref().unwrap()
         } else if self
             .symbol_font
             .as_ref()
