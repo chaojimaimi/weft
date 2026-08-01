@@ -37,8 +37,8 @@ use tracing::{debug, warn};
 use weft_core::config::AiConfig;
 
 use client::{
-    build_backend, effective_base_url, fetch_ollama_models, is_loopback_url, AiBackend, AiError,
-    CancelFlag, TagModel,
+    build_backend, build_http_client, effective_base_url, fetch_ollama_models, is_loopback_url,
+    AiBackend, AiError, CancelFlag, TagModel,
 };
 
 pub use metrics::{AiMetrics, AiMetricsSnapshot};
@@ -346,15 +346,11 @@ impl AiState {
         if !is_loopback_url(&base_url) {
             return None;
         }
-        // v1.8.8: connect_timeout only — /api/tags is a fast local call,
-        // but keep the configured timeout as a fallback for the total
-        // request (not streaming, so overall timeout is fine here).
+        // Use the same no-proxy/no-redirect transport policy as completions.
+        // For this non-streaming endpoint it bounds header/body read
+        // inactivity while preserving the same transport policy.
         let timeout = std::time::Duration::from_secs(config.effective_timeout_secs());
-        let http = match reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(timeout)
-            .build()
-        {
+        let http = match build_http_client(std::time::Duration::from_secs(10), timeout) {
             Ok(c) => c,
             Err(_) => return None,
         };

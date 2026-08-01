@@ -9,7 +9,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::client::{is_loopback_url, AiBackend, AiError, CancelFlag, OllamaBackend};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
+use super::client::{
+    build_backend, is_loopback_url, AiBackend, AiError, CancelFlag, OllamaBackend,
+};
 use super::prompt::{ChatMessage, ChatRole};
 use weft_core::config::AiConfig;
 
@@ -44,6 +50,67 @@ fn simple_messages() -> Vec<ChatMessage> {
             content: "test user".into(),
         },
     ]
+}
+
+fn production_backend_at(base_url: &str, timeout_secs: u32) -> Box<dyn AiBackend> {
+    let cfg = AiConfig {
+        provider: Some("ollama".into()),
+        model: Some("test-model".into()),
+        base_url: Some(base_url.into()),
+        timeout_secs: Some(timeout_secs),
+        ..Default::default()
+    };
+    build_backend(&cfg)
+        .expect("production backend should build")
+        .expect("ollama provider should be enabled")
+}
+
+/// Spawn a minimal HTTP/1.1 chunked responder. Each accepted request receives
+/// the same sequence of `(delay_before_chunk, NDJSON_chunk)` values.
+async fn spawn_chunked_chat_server(
+    attempts: usize,
+    chunks: Vec<(Duration, String)>,
+) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut handlers = Vec::with_capacity(attempts);
+        for _ in 0..attempts {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let chunks = chunks.clone();
+            handlers.push(tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                          Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                for (delay, chunk) in chunks {
+                    tokio::time::sleep(delay).await;
+                    let frame = format!("{:X}\r\n{}\r\n", chunk.len(), chunk);
+                    if stream.write_all(frame.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = stream.write_all(b"0\r\n\r\n").await;
+            }));
+        }
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+    });
+    (format!("http://{address}"), task)
 }
 
 // ── /api/tags ─────────────────────────────────────────────────────────
@@ -163,6 +230,153 @@ async fn list_models_errors_on_connection_refused() {
         Err(other) => panic!("expected Network error, got {other:?}"),
         Ok(_) => panic!("expected error, got models"),
     }
+}
+
+// ── network-boundary hardening ──────────────────────────────────────
+
+#[tokio::test]
+async fn production_client_does_not_follow_redirects() {
+    let destination = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"message\":{\"content\":\"redirected\"},\"done\":true}\n",
+            "application/x-ndjson",
+        ))
+        .expect(0)
+        .mount(&destination)
+        .await;
+
+    let origin = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/api/chat", destination.uri())),
+        )
+        .mount(&origin)
+        .await;
+
+    let backend = production_backend_at(&origin.uri(), 2);
+    match backend.complete(simple_messages(), CancelFlag::new()).await {
+        Err(AiError::Status { status, .. }) => assert_eq!(status, 307),
+        Err(other) => panic!("expected redirect status error, got {other:?}"),
+        Ok(value) => panic!("redirect must not be followed, got {value:?}"),
+    }
+}
+
+#[tokio::test]
+async fn production_client_applies_configured_stream_read_timeout() {
+    let chunks = vec![
+        (
+            Duration::ZERO,
+            "{\"message\":{\"content\":\"\"},\"done\":false}\n".into(),
+        ),
+        (
+            Duration::from_millis(1_200),
+            "{\"message\":{\"content\":\"too late\"},\"done\":true}\n".into(),
+        ),
+    ];
+    // The production backend retries one network failure, so serve both
+    // attempts with the same mid-stream stall.
+    let (base_url, server_task) = spawn_chunked_chat_server(2, chunks).await;
+
+    let backend = production_backend_at(&base_url, 1);
+    match backend.complete(simple_messages(), CancelFlag::new()).await {
+        Err(AiError::Network(error)) => assert!(error.is_timeout(), "{error}"),
+        Err(other) => panic!("expected timeout network error, got {other:?}"),
+        Ok(value) => panic!("configured read timeout was ignored: {value:?}"),
+    }
+    server_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn production_client_resets_read_timeout_after_each_chunk() {
+    let chunks = vec![
+        (
+            Duration::ZERO,
+            "{\"message\":{\"content\":\"slow\"},\"done\":false}\n".into(),
+        ),
+        (
+            Duration::from_millis(600),
+            "{\"message\":{\"content\":\"-but\"},\"done\":false}\n".into(),
+        ),
+        (
+            Duration::from_millis(600),
+            "{\"message\":{\"content\":\"-healthy\"},\"done\":true}\n".into(),
+        ),
+    ];
+    let (base_url, server_task) = spawn_chunked_chat_server(1, chunks).await;
+
+    let backend = production_backend_at(&base_url, 1);
+    let started = std::time::Instant::now();
+    let result = backend
+        .complete(simple_messages(), CancelFlag::new())
+        .await
+        .expect("sub-timeout chunk gaps must keep the stream alive");
+
+    assert_eq!(result, "slow-but-healthy");
+    assert!(started.elapsed() >= Duration::from_millis(1_200));
+    server_task.await.unwrap();
+}
+
+#[test]
+fn production_client_ignores_system_proxy_child() {
+    if std::env::var_os("WEFT_PROXY_TEST_CHILD").is_none() {
+        return;
+    }
+    let target = std::env::var("WEFT_PROXY_TARGET").expect("child target URL");
+    let runtime = tokio::runtime::Runtime::new().expect("child runtime");
+    runtime.block_on(async move {
+        let backend = production_backend_at(&target, 2);
+        let result = backend.complete(simple_messages(), CancelFlag::new()).await;
+        assert_eq!(result.expect("system proxy must be bypassed"), "direct");
+    });
+}
+
+#[tokio::test]
+async fn production_client_ignores_system_proxy() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            b"{\"message\":{\"content\":\"direct\"},\"done\":true}\n",
+            "application/x-ndjson",
+        ))
+        .expect(1)
+        .mount(&target)
+        .await;
+
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(502).set_body_string("proxy used"))
+        .expect(0)
+        .mount(&proxy)
+        .await;
+
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "ai::mock_tests::production_client_ignores_system_proxy_child",
+            "--nocapture",
+        ])
+        .env("WEFT_PROXY_TEST_CHILD", "1")
+        .env("WEFT_PROXY_TARGET", target.uri())
+        .env("HTTP_PROXY", proxy.uri())
+        .env("http_proxy", proxy.uri())
+        .env("ALL_PROXY", proxy.uri())
+        .env("all_proxy", proxy.uri())
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .output()
+        .expect("run isolated proxy child test");
+
+    assert!(
+        output.status.success(),
+        "proxy child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ── /api/chat streaming ──────────────────────────────────────────────

@@ -305,7 +305,8 @@ pub struct AiConfig {
     pub model: Option<String>,
     /// Max output tokens for a single completion. `None` ⇒ 4096.
     pub max_tokens: Option<u32>,
-    /// Request timeout in seconds. `None` ⇒ 30.
+    /// Idle read timeout in seconds. The timer resets after every response
+    /// chunk, so a healthy long generation may exceed it. `None` ⇒ 30.
     pub timeout_secs: Option<u32>,
     /// Auto-diagnose failed blocks (exit_code != 0). Off by default —
     /// the user triggers diagnosis manually via the block action button
@@ -344,7 +345,8 @@ impl AiConfig {
         }
     }
 
-    /// Effective request timeout (seconds). Falls back to 30s.
+    /// Effective idle read timeout (seconds). The timer resets after each
+    /// successful read and falls back to 30s.
     pub fn effective_timeout_secs(&self) -> u64 {
         self.timeout_secs.unwrap_or(30) as u64
     }

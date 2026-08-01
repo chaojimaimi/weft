@@ -138,15 +138,23 @@ pub struct TagModel {
     pub modified_at: String,
 }
 
-/// Shared builder for the [`reqwest::Client`]. v1.8.8: use
-/// `connect_timeout` (short, for connection establishment) instead of
-/// `timeout` (which covers the *entire* streaming response). Large models
-/// like qwen3.5:9b can take >30s to generate, and the overall timeout
-/// fires mid-stream, causing reqwest to abort with
-/// "error decoding response body".
-fn build_http_client(connect_timeout: Duration) -> Result<HttpClient, AiError> {
+/// Shared builder for every Ollama HTTP client.
+///
+/// v1.8.10 hardens the local-only contract at the transport layer as well as
+/// at URL validation: reqwest otherwise honors system proxy environment
+/// variables and follows redirects by default. Either behavior could send a
+/// loopback request (including its prompt) beyond the configured endpoint.
+/// `read_timeout` is an idle timeout and resets after each received chunk, so
+/// long healthy generations remain supported while a stalled stream stops.
+pub(super) fn build_http_client(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<HttpClient, AiError> {
     HttpClient::builder()
         .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(AiError::Network)
 }
@@ -165,11 +173,11 @@ pub fn build_backend(
     if kind != "ollama" {
         return Err(AiError::UnknownProvider(kind.to_string()));
     }
-    // v1.8.8: connect_timeout only — the generation phase can take much
-    // longer than the configured timeout for large models. Cap at 10s
-    // (loopback Ollama should connect instantly).
+    // Loopback Ollama should connect instantly. The configurable timeout is
+    // applied as a per-read idle timeout, not a total generation deadline.
     let connect_timeout = Duration::from_secs(10);
-    let http = Arc::new(build_http_client(connect_timeout)?);
+    let read_timeout = Duration::from_secs(cfg.effective_timeout_secs());
+    let http = Arc::new(build_http_client(connect_timeout, read_timeout)?);
     let backend = OllamaBackend::new(http, cfg.clone())?;
     Ok(Some(Box::new(backend)))
 }
