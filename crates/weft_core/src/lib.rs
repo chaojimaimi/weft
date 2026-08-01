@@ -21,6 +21,7 @@ pub mod search;
 pub mod secrets;
 pub mod selection;
 pub mod shell;
+pub mod smart_select;
 pub mod syntax;
 pub mod vt;
 pub mod workflow;

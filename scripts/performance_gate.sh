@@ -11,6 +11,12 @@ echo "==> Performance gate: VT parsing and 10k-scrollback resize"
 cargo test -p weft_core --lib perf_ -- \
     --ignored --nocapture --test-threads=1
 
+# v1.10 规模基准（V110_IMPLEMENTATION_PLAN.md §3.4 + §6）。
+# 这些是 #[ignore] 计时测试，采集基线供 docs/perf/v1.10/ 报告对比。
+echo "==> Performance gate: v1.10 scale benchmarks (100k/1M lines, smart select, resize)"
+cargo test -p weft_core --test bench_v110_scale -- \
+    --ignored --nocapture --test-threads=1
+
 echo "==> Performance gate: 10k history filtering and virtualization"
 cargo test -p weft_app perf_panel_10k_history_filter_and_virtualize -- \
     --ignored --nocapture --test-threads=1
