@@ -114,11 +114,7 @@ pub(super) fn set_opt_string(table: &mut toml_edit::Table, key: &str, new: &Opti
 /// means "clear the override and fall back to default" (e.g. syntax
 /// colors, output colors) — leaving a stale disk value would silently
 /// override the default.
-pub(super) fn set_opt_string_clear(
-    table: &mut toml_edit::Table,
-    key: &str,
-    new: &Option<String>,
-) {
+pub(super) fn set_opt_string_clear(table: &mut toml_edit::Table, key: &str, new: &Option<String>) {
     match new {
         Some(s) => {
             table.insert(key, toml_edit::value(s.as_str()));
@@ -178,13 +174,24 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
         || ai.timeout_secs != default_ai.timeout_secs
         || ai.enable_error_diagnosis != default_ai.enable_error_diagnosis
         || ai.enable_command_generation != default_ai.enable_command_generation;
-    if ai_dirty {
+    // v1.8.9 fix: even when the new config is all-default (ai_dirty = false),
+    // we must still enter the write path if the document already has an [ai]
+    // section — otherwise stale values like `provider = "ollama"` survive a
+    // save and the Enabled toggle appears stuck "on". This mirrors the
+    // existing booleans logic (remove when default) for the provider key.
+    let has_existing_ai = doc.get("ai").is_some();
+    if ai_dirty || has_existing_ai {
         let ai_entry = doc.entry("ai").or_insert_with(toml_edit::table);
         if ai_entry.is_none() {
             *ai_entry = toml_edit::table();
         }
         let table = ai_entry.as_table_mut().expect("ai is a table");
-        set_opt_string(table, "provider", &ai.provider);
+        // v1.8.9 fix: provider must use _clear variant so that turning AI off
+        // (provider = None) actually removes the key from the TOML. The
+        // non-clear variant preserves the old value when None, which caused
+        // the Enabled toggle to appear stuck "on" after saving — the old
+        // `provider = "ollama"` survived the save and was reloaded next launch.
+        set_opt_string_clear(table, "provider", &ai.provider);
         // v1.8: api_key is never written. Remove any stale value from old configs.
         if table.contains_key("api_key") {
             table.remove("api_key");
@@ -470,4 +477,53 @@ where
     }
     let section = entry.as_table_mut().expect("profile section is a table");
     f(section);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AiConfig;
+
+    /// v1.8.9 regression test: turning AI off (provider = None) must remove
+    /// the `provider` key from the TOML so the change survives a save/reload.
+    /// Previously `set_opt_string` preserved the old value when None, so the
+    /// Enabled toggle appeared stuck "on" after saving.
+    #[test]
+    fn write_ai_removes_provider_when_off() {
+        // Simulate a config that currently has provider = "ollama".
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["ai"] = toml_edit::table();
+        {
+            let table = doc["ai"].as_table_mut().unwrap();
+            table["provider"] = toml_edit::value("ollama");
+        }
+        // User turns AI off → provider = None.
+        let ai_off = AiConfig {
+            provider: None,
+            ..Default::default()
+        };
+        write_ai_section(&mut doc, &ai_off);
+        let table = doc["ai"].as_table().unwrap();
+        assert!(
+            !table.contains_key("provider"),
+            "provider key must be removed when AI is turned off"
+        );
+    }
+
+    #[test]
+    fn write_ai_writes_provider_when_on() {
+        let mut doc = toml_edit::DocumentMut::new();
+        let ai_on = AiConfig {
+            provider: Some("ollama".into()),
+            model: Some("llama3.1".into()),
+            ..Default::default()
+        };
+        write_ai_section(&mut doc, &ai_on);
+        let table = doc["ai"].as_table().unwrap();
+        assert_eq!(
+            table["provider"].as_str(),
+            Some("ollama"),
+            "provider must be written when AI is on"
+        );
+    }
 }

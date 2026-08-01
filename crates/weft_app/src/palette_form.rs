@@ -410,10 +410,39 @@ impl App {
 
         // Cancel on Escape.
         if key == KeyCode::Escape {
-            // v1.8.4 fix: AiCommand 是通过 Cmd+Shift+A 直接打开的（非从
-            // Search 进入），Esc 应直接关闭整个 Palette popup，与 Search
-            // 模式行为对齐。之前只切回 Search 子模式但 popup 仍 open，
-            // 用户感知为 "Esc 失灵"。
+            // v1.8.9: Two-stage Esc — if AI results are showing, the first
+            // Esc clears them and restores the input buffer so the user can
+            // edit/retry; a second Esc closes the palette. If there are no
+            // results (or the request is still pending), Esc closes
+            // immediately. This mirrors the UX of Warp/other AI palettes
+            // and avoids an accidental Esc discarding a useful result.
+            let has_results = !self.palette.results.is_empty();
+            let is_pending = matches!(
+                &self.palette.submode,
+                PaletteSubMode::AiCommand { pending_id, .. } if pending_id.is_some()
+            );
+            if has_results && !is_pending {
+                // First Esc: clear results + error, restore the last query.
+                if let PaletteSubMode::AiCommand {
+                    buffer,
+                    last_query,
+                    error,
+                    ..
+                } = &mut self.palette.submode
+                {
+                    if buffer.is_empty() && !last_query.is_empty() {
+                        *buffer = std::mem::take(last_query);
+                    }
+                    *error = None;
+                }
+                self.palette.results.clear();
+                self.palette.selection = 0;
+                self.ai_state.cancel_all();
+                self.request_redraw();
+                return true;
+            }
+            // No results (or pending): close the palette.
+            self.ai_state.cancel_all();
             self.close_palette();
             self.request_redraw();
             return true;
