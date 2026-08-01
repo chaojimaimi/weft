@@ -87,7 +87,8 @@ pub struct MetalRenderer {
     /// v1.8.2: Per-block AI diagnose state (set per-frame by the app).
     /// The block view renders an inline panel below the output of blocks
     /// that have a diagnose result or a pending request.
-    pub block_diagnose_state: std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    pub block_diagnose_state:
+        std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
     /// v1.8.2: Whether the local Ollama backend is configured. Mirrors
     /// `App::ai_state.is_configured()`; the renderer uses this to decide
     /// whether to draw the diagnose button on failed block headers.
@@ -450,6 +451,14 @@ impl MetalRenderer {
         let clear_a = bg_a * self.opacity as f64;
 
         // Collect + rasterize on-screen characters into the glyph atlas.
+        // v1.8.9: collect diagnose panel texts before the partial borrows
+        // below so the atlas can warm up their (often CJK) glyphs.
+        let diagnose_texts: Vec<&str> = self
+            .block_diagnose_state
+            .values()
+            .filter_map(|s| s.result.as_ref().and_then(|r| r.as_ref().ok()))
+            .map(String::as_str)
+            .collect();
         // Passed as partial borrows (`&mut self.atlas`, `&self.find_state`)
         // rather than a `&mut self` method call so they stay disjoint from
         // the immutable `self.layer` borrow held by `drawable` for the frame.
@@ -467,6 +476,7 @@ impl MetalRenderer {
             palette,
             settings,
             tab_bar,
+            &diagnose_texts,
         );
         Self::warm_background_pane_atlases(
             &mut self.atlas,

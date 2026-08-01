@@ -40,6 +40,7 @@ impl MetalRenderer {
         palette: Option<&PaletteDrawParams<'_>>,
         settings: Option<&SettingsDrawParams<'_>>,
         tab_bar: &TabBarDrawState,
+        diagnose_texts: &[&str],
     ) {
         // Collect unique on-screen GRID + panel characters not yet in the
         // atlas, then rasterize each exactly once.
@@ -143,6 +144,15 @@ impl MetalRenderer {
                 for line in live.output.lines().take(200) {
                     missing.extend(line.chars());
                 }
+            }
+            // v1.8.9 fix: warm up AI diagnose panel text. The diagnose
+            // result is dynamically produced by the local Ollama backend
+            // and contains CJK characters that aren't in any static warmup
+            // list. Without this, the atlas has no glyphs for them and
+            // `push_text` silently skips each missing grapheme, leaving
+            // only ASCII punctuation visible (the "fragmented output" bug).
+            for text in diagnose_texts {
+                missing.extend(text.chars());
             }
         }
         // Find bar (Cmd+F): warm up the query + status text + button

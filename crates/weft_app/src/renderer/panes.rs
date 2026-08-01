@@ -75,6 +75,8 @@ impl MetalRenderer {
                 None,
                 None,
                 tab_bar,
+                // Background panes don't render diagnose panels.
+                &[],
             );
         }
     }
