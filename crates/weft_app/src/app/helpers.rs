@@ -253,16 +253,25 @@ pub(crate) fn first_run_welcome() -> Option<String> {
     let _ = std::fs::write(&marker, b"1");
     // Leading space + HIST_IGNORE_SPACE (default in zsh) keeps this out of
     // shell history. The printf is one-shot; it doesn't persist anywhere.
-    let banner = "\x1b[2m# Welcome to Weft v1.0\x1b[0m\n\
-\x1b[2m# Core shortcuts:\x1b[0m\n\
-\x1b[2m#   Cmd+T        New tab      Cmd+W  Close pane/tab\x1b[0m\n\
-\x1b[2m#   Cmd+Shift+[  Prev tab     Cmd+Shift+]  Next tab\x1b[0m\n\
-\x1b[2m#   Cmd+P        Command palette (fuzzy)\x1b[0m\n\
-\x1b[2m#   Cmd+F        Find         Cmd+Shift+B  Toggle sidebar\x1b[0m\n\
-\x1b[2m#   Cmd+,        Settings     Cmd+Shift+T  Cycle theme\x1b[0m\n\
-\x1b[2m# Block view groups commands and output. Type a command and press Enter.\x1b[0m\n";
+    Some(welcome_banner_command(env!("CARGO_PKG_VERSION")))
+}
+
+fn welcome_banner_command(version: &str) -> String {
+    // Keep the command itself printable and let shell printf decode `\033`.
+    // Rust's Debug string formatting would encode ESC as the literal text
+    // `\u{1b}`, which both zsh and bash display instead of interpreting.
+    let banner = format!(
+        "\\033[2m# Welcome to Weft v{version}\\033[0m\\n\
+         \\033[2m# Core shortcuts:\\033[0m\\n\
+         \\033[2m#   Cmd+T        New tab      Cmd+W  Close pane/tab\\033[0m\\n\
+         \\033[2m#   Cmd+Shift+[  Prev tab     Cmd+Shift+]  Next tab\\033[0m\\n\
+         \\033[2m#   Cmd+P        Command palette (fuzzy)\\033[0m\\n\
+         \\033[2m#   Cmd+F        Find         Cmd+Shift+B  Toggle sidebar\\033[0m\\n\
+         \\033[2m#   Cmd+,        Settings     Cmd+Shift+T  Cycle theme\\033[0m\\n\
+         \\033[2m# Block view groups commands and output. Type a command and press Enter.\\033[0m\\n"
+    );
     // Leading space keeps this out of zsh history (HIST_IGNORE_SPACE default).
-    Some(format!(" printf {:?}\n", banner))
+    format!(" printf '%b' '{banner}'\n")
 }
 
 /// Configure shell integration for the child shell and return env overrides.
@@ -429,6 +438,21 @@ mod tests {
             banner.contains("Welcome"),
             "banner should contain welcome text"
         );
+        assert!(
+            banner.contains(concat!("Weft v", env!("CARGO_PKG_VERSION"))),
+            "banner should report the current package version: {banner:?}"
+        );
+        assert!(
+            !banner.contains("\\u{1b}") && !banner.contains('\x1b'),
+            "PTY command must contain portable printable escapes: {banner:?}"
+        );
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &banner])
+            .output()
+            .expect("execute welcome printf");
+        assert!(output.status.success());
+        assert!(output.stdout.starts_with(b"\x1b[2m# Welcome"));
+        assert!(output.stdout.ends_with(b"\x1b[0m\n"));
         assert!(marker.exists(), "marker should be created after first run");
 
         // Second call: marker now exists → should return None.

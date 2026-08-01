@@ -1,7 +1,7 @@
-# v1.0 V11: Release pipeline for Weft.app
+# v1.9: Release pipeline for Weft.app
 #
 # Triggers on:
-#   - Push of version tags (v1.0.0, v1.0.1, ...)
+#   - Push of semantic version tags (v1.9.0, v1.9.1, ...)
 #   - Manual dispatch from Actions tab
 #
 # Produces:
@@ -26,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 1.0.0)"
+        description: "Release version (must match Cargo.toml, e.g. 1.9.0)"
         required: true
-        default: "1.0.0"
+        default: "1.9.0"
 
 permissions:
   contents: write
@@ -37,21 +37,43 @@ env:
   APP_NAME: Weft
   BUNDLE_ID: dev.weft.terminal
   MACOS_MIN: "12.0"
+  MACOSX_DEPLOYMENT_TARGET: "12.0"
 
 jobs:
   build-macos:
     name: Build macOS .app
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate release version contract
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          requested="${REQUESTED_VERSION#v}"
+          workspace=$(awk '
+            /^\[workspace\.package\]$/ { in_section=1; next }
+            /^\[/ && in_section { exit }
+            in_section && /^version[[:space:]]*=/ {
+              gsub(/.*=[[:space:]]*"|"[[:space:]]*$/, ""); print; exit
+            }
+          ' Cargo.toml)
+          if [[ -z "${requested}" || "${requested}" != "${workspace}" ]]; then
+            echo "Requested version '${requested}' does not match workspace '${workspace}'" >&2
+            exit 1
+          fi
+          echo "version=${workspace}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${workspace}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
+          components: rustfmt, clippy
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -61,6 +83,13 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run release quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          ./scripts/architecture_gate.sh
 
       - name: Build release binary
         run: cargo build --release
@@ -107,13 +136,31 @@ jobs:
       - name: Sign, notarize, staple
         run: ./scripts/notarize.sh
 
+      - name: Verify signed app
+        run: |
+          codesign --verify --deep --strict --verbose=2 target/release/osx/Weft.app
+          xcrun stapler validate target/release/osx/Weft.app
+          spctl --assess --type execute --verbose=2 target/release/osx/Weft.app
+
       - name: Create distributable ZIP
         run: |
           cd target/release/osx
-          ditto -c -k --keepParent Weft.app Weft-${{ github.ref_name }}.zip
+          ditto -c -k --keepParent Weft.app Weft-${{ steps.release.outputs.tag }}.zip
 
       - name: Create distributable DMG
-        run: ./scripts/build-dmg.sh
+        env:
+          DMG_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          ./scripts/build-dmg.sh
+          hdiutil verify target/release/osx/Weft-${DMG_VERSION}.dmg
+
+      - name: Create artifact checksums
+        run: |
+          cd target/release/osx
+          shasum -a 256 \
+            Weft-${{ steps.release.outputs.tag }}.zip \
+            Weft-${{ steps.release.outputs.version }}.dmg \
+            > SHA256SUMS
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -121,9 +168,12 @@ jobs:
           files: |
             target/release/osx/Weft-*.zip
             target/release/osx/Weft-*.dmg
+            target/release/osx/SHA256SUMS
           draft: true
           generate_release_notes: true
-          name: Weft ${{ github.ref_name }}
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Weft ${{ steps.release.outputs.tag }}
 
       - name: Cleanup keychain
         if: always()

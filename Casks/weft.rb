@@ -1,6 +1,8 @@
 cask "weft" do
-  version "1.0.0"
-  sha256 :no_check # Replaced with actual hash on first release
+  version "1.9.0"
+  # Replaced by scripts/update-cask.sh from the final signed ZIP before the
+  # draft release is published. Distribution acceptance rejects :no_check.
+  sha256 :no_check
 
   # Download URL — update once the first GitHub Release is published.
   # The release workflow uploads Weft-<tag>.zip as a release asset.

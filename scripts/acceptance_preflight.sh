@@ -14,6 +14,7 @@ APP_DIR="target/release/osx/Weft.app"
 PLIST="$APP_DIR/Contents/Info.plist"
 V17_MANUAL_MATRIX="docs/V17_MANUAL_ACCEPTANCE.md"
 V18_MANUAL_MATRIX="docs/V18_MANUAL_ACCEPTANCE.md"
+V19_RELEASE_MATRIX="docs/V19_RELEASE_ACCEPTANCE.md"
 failures=0
 
 workspace_version=$(awk '
@@ -109,14 +110,14 @@ else
 fi
 
 echo "==> Acceptance preflight: manual-gate contract"
-for matrix in "$V17_MANUAL_MATRIX" "$V18_MANUAL_MATRIX"; do
+for matrix in "$V17_MANUAL_MATRIX" "$V18_MANUAL_MATRIX" "$V19_RELEASE_MATRIX"; do
     if [ ! -f "$matrix" ]; then
         echo "  FAIL: $matrix is missing"
         failures=$((failures + 1))
     fi
 done
 
-if [ -f "$V17_MANUAL_MATRIX" ] && [ -f "$V18_MANUAL_MATRIX" ]; then
+if [ -f "$V17_MANUAL_MATRIX" ] && [ -f "$V18_MANUAL_MATRIX" ] && [ -f "$V19_RELEASE_MATRIX" ]; then
     for marker in V17-ANSI-1 V17-SEARCH-1 V17-COMPLETION-1 V17-RUNBOOK-1 V17-RELEASE-1; do
         if ! grep -Fq "**${marker}**" "$V17_MANUAL_MATRIX"; then
             echo "  FAIL: $V17_MANUAL_MATRIX is missing $marker"
@@ -129,15 +130,21 @@ if [ -f "$V17_MANUAL_MATRIX" ] && [ -f "$V18_MANUAL_MATRIX" ]; then
             failures=$((failures + 1))
         fi
     done
+    for marker in V19-VERSION-1 V19-PACKAGE-1 V19-SIGN-1 V19-GUI-1; do
+        if ! grep -Fq "**${marker}**" "$V19_RELEASE_MATRIX"; then
+            echo "  FAIL: $V19_RELEASE_MATRIX is missing $marker"
+            failures=$((failures + 1))
+        fi
+    done
     if [ "$failures" -eq 0 ]; then
-        echo "  OK: v1.7-v1.8 manual acceptance matrices cover required release areas"
+        echo "  OK: v1.7-v1.9 acceptance matrices cover required release areas"
     fi
 fi
 
 echo
 if [ "$failures" -eq 0 ]; then
     echo "Acceptance preflight: ALL AUTOMATED CHECKS PASSED"
-    echo "Manual v1.7-v1.8 acceptance is still required; see $V17_MANUAL_MATRIX and $V18_MANUAL_MATRIX."
+    echo "Manual/distribution acceptance is still required; see v1.7-v1.9 matrices."
     exit 0
 fi
 
