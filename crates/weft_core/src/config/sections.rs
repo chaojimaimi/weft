@@ -303,7 +303,7 @@ pub struct AiConfig {
     pub base_url: Option<String>,
     /// Model id, e.g. `"llama3.1"`, `"qwen2.5"`.
     pub model: Option<String>,
-    /// Max output tokens for a single completion. `None` ⇒ 1024.
+    /// Max output tokens for a single completion. `None` ⇒ 4096.
     pub max_tokens: Option<u32>,
     /// Request timeout in seconds. `None` ⇒ 30.
     pub timeout_secs: Option<u32>,
@@ -349,10 +349,13 @@ impl AiConfig {
         self.timeout_secs.unwrap_or(30) as u64
     }
 
-    /// Effective max_tokens. Falls back to 1024 (a reasonable default for
-    /// short shell-command generation / diagnosis).
+    /// Effective max_tokens. Falls back to 4096. v1.8.8: raised from 1024
+    /// because thinking-capable models (qwen3.5, gemma4) spend a large
+    /// fraction of their token budget on internal reasoning before emitting
+    /// visible content; 1024 was exhausted by thinking alone, yielding an
+    /// empty completion. 4096 leaves ample room for thinking + answer.
     pub fn effective_max_tokens(&self) -> u32 {
-        self.max_tokens.unwrap_or(1024)
+        self.max_tokens.unwrap_or(4096)
     }
 
     /// Provider id, lowercased and trimmed, for `match` dispatch.
@@ -374,7 +377,7 @@ mod ai_config_tests {
         assert!(!cfg.is_configured());
         assert_eq!(cfg.provider_kind(), None);
         assert_eq!(cfg.effective_timeout_secs(), 30);
-        assert_eq!(cfg.effective_max_tokens(), 1024);
+        assert_eq!(cfg.effective_max_tokens(), 4096);
     }
 
     #[test]

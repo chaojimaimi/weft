@@ -122,7 +122,7 @@ pub fn truncate_bytes(text: &str, max_bytes: usize) -> String {
 pub fn build_command_gen_messages(prompt: &CommandGenPrompt) -> Vec<ChatMessage> {
     let system = "你是 macOS 终端模拟器 Weft 的 shell 命令生成器。\
 将用户的自然语言请求转换为单条 POSIX shell 命令。\
-只回复命令本身——不要 markdown 代码围栏、不要解释、不要 $ 前缀。\
+只回复命令本身——不要 markdown 代码围栏、不要解释、不要 $ 前缀、不要思考过程。\
 优先使用 macOS/BSD 可移植工具（用 grep -E 而非 GNU grep -P，用 find 而非 fd）。\
 如果请求危险或具破坏性，回复：# refused: <原因>。\
 如果请求不明确，回复：# ambiguous: <一个简短的澄清问题>。";
@@ -173,6 +173,7 @@ pub fn build_diagnose_messages(prompt: &DiagnosePrompt) -> Vec<ChatMessage> {
     let system = "你是终端模拟器 Weft 的 shell 错误诊断专家。\
 用户执行了一条以非零状态码退出的命令。请用中文简明扼要地解释：\
 (1) 最可能的原因，(2) 具体的修复方法或下一步诊断建议。\
+直接给出诊断结论，不要展示思考过程或推理步骤。\
 回答控制在 200 字以内。不要逐字重复命令本身。\
 不要使用 markdown 标题。如果失败与密钥/凭证相关（如 auth token），\
 请指出这一点但不要回显密钥本身。";

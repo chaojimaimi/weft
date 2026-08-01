@@ -63,8 +63,15 @@ pub enum AiError {
     /// to talk to anything other than `127.0.0.1` / `localhost` / `::1`.
     #[error("non-loopback AI endpoint rejected: {0}")]
     NonLoopbackEndpoint(String),
-    /// The provider returned an empty completion.
-    #[error("provider returned an empty completion")]
+    /// The provider returned an empty completion. v1.8.8: this usually means
+    /// a thinking-capable model (qwen3.5 / gemma4) exhausted the `num_predict`
+    /// budget on internal reasoning without emitting any visible content.
+    /// The prompt now explicitly asks to skip the thinking trace, and the
+    /// default budget was raised to 4096 — but if you still hit this,
+    /// increase `[ai] max_tokens` or pick a non-thinking model.
+    #[error(
+        "model returned empty content (likely thinking budget exhausted; try raising max_tokens)"
+    )]
     Empty,
     /// The response stream exceeded [`MAX_RESPONSE_BYTES`].
     #[error("response exceeded {0} byte limit")]
@@ -296,7 +303,17 @@ impl OllamaBackend {
         {
             Ok(s) => Ok(s),
             Err(AiError::Network(e)) => {
-                tracing::warn!(error = %e, "first stream attempt failed; retrying once");
+                // DIAG-v1.8.8: classify the reqwest error so we can tell
+                // connect failures (Ollama down) from decode/body failures
+                // (mid-stream timeout or Ollama crash during generation).
+                tracing::warn!(
+                    error = %e,
+                    is_connect = e.is_connect(),
+                    is_decode = e.is_decode(),
+                    is_body = e.is_body(),
+                    is_timeout = e.is_timeout(),
+                    "first stream attempt failed; retrying once"
+                );
                 self.stream_chat_once(messages, cancel).await
             }
             Err(e) => Err(e),
@@ -326,13 +343,39 @@ impl OllamaBackend {
                 })
             }).collect::<Vec<_>>(),
             "stream": true,
+            // v1.8.8: Disable thinking/reasoning traces. Thinking-capable
+            // models (qwen3.5, gemma4) emit reasoning as empty-content
+            // NDJSON lines that consume the entire num_predict budget
+            // without producing visible output, resulting in an empty
+            // completion. `think: false` tells Ollama to skip the reasoning
+            // phase entirely — measured effect on qwen3.5:9b diagnosis:
+            // 4096 tokens / 100s / empty  →  142 tokens / 3.6s / valid.
+            "think": false,
             "options": {
                 "num_predict": self.max_tokens,
             },
             "keep_alive": "5m",
         });
 
-        let resp = self.http.post(&url).json(&body).send().await?;
+        // DIAG-v1.8.8: log send() failures with error classification before
+        // they bubble up. This is the first failure exit — if Ollama drops
+        // the connection before sending response headers (e.g. model load
+        // failure, OOM), reqwest returns a decode/connect error here.
+        let resp = match self.http.post(&url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    is_connect = e.is_connect(),
+                    is_decode = e.is_decode(),
+                    is_body = e.is_body(),
+                    is_timeout = e.is_timeout(),
+                    model = %self.model,
+                    "send().await failed (response-header phase)"
+                );
+                return Err(AiError::Network(e));
+            }
+        };
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -366,8 +409,20 @@ impl OllamaBackend {
             let chunk = match chunk_res {
                 Ok(c) => c,
                 Err(e) => {
+                    // DIAG-v1.8.8: chunk-level failure — this is where the
+                    // v1.8.7 timeout fix should land. Log the error class
+                    // and whether we have partial content to salvage.
+                    tracing::warn!(
+                        error = %e,
+                        is_connect = e.is_connect(),
+                        is_decode = e.is_decode(),
+                        is_body = e.is_body(),
+                        is_timeout = e.is_timeout(),
+                        has_partial = !acc.trim().is_empty(),
+                        acc_len = acc.len(),
+                        "stream chunk error (mid-stream phase)"
+                    );
                     if !acc.trim().is_empty() {
-                        tracing::warn!(error = %e, "stream chunk error; returning partial result");
                         return Ok(acc);
                     }
                     return Err(AiError::Network(e));
@@ -438,6 +493,13 @@ impl OllamaBackend {
                     if acc.trim().is_empty() {
                         return Err(AiError::Empty);
                     }
+                    // DIAG-v1.8.8: success baseline — compare against failures.
+                    tracing::info!(
+                        model = %self.model,
+                        acc_len = acc.len(),
+                        total_bytes,
+                        "stream completed (done:true)"
+                    );
                     return Ok(acc);
                 }
             }
