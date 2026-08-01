@@ -724,4 +724,53 @@ impl App {
             }
         }
     }
+
+    /// v1.8.9 fix: After recovery restore, attach persisted TabSnapshots to
+    /// the rebuilt tabs so the history-hydration loop can read `block_ids`.
+    ///
+    /// `restore_workspace` rebuilds tabs + panes + cwds from the recovery
+    /// snapshot but leaves `restored_snapshot = None`. The normal
+    /// `restore_tab_snapshots` path sets it via `restore_from_snapshot`. Since
+    /// both stores (recovery YAML + tabs SQLite) are written in the same
+    /// `TabsAutoSave` cycle, we match by position and only carry over the
+    /// `block_ids` (the editor draft is already set by `restore_workspace`).
+    pub(super) fn attach_recovery_tab_snapshots(&mut self) {
+        let Some(store) = self.sessions.block_store() else {
+            return;
+        };
+        let snaps = match store.load_tabs() {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => {
+                info!("no saved tab snapshots to attach after recovery restore");
+                return;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to load tab snapshots after recovery");
+                return;
+            }
+        };
+        let tabs = self.sessions.tabs_mut();
+        let attached = snaps
+            .iter()
+            .zip(tabs.iter_mut())
+            .filter_map(|(snap, tab)| {
+                // Only the active pane's restored_snapshot is consulted by the
+                // hydration loop (Tab derefs to the active pane). Multi-pane
+                // per-pane block_ids tracking is a follow-up; v1.8.9 fix
+                // restores the common single-pane case.
+                let pane = tab.pane_mut(tab.active_pane_id())?;
+                if pane.restored_snapshot.is_none() {
+                    pane.restored_snapshot = Some(snap.clone());
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .count();
+        info!(
+            attached,
+            total_tabs = self.sessions.tabs().len(),
+            "attached block_ids from TabSnapshots after recovery restore"
+        );
+    }
 }

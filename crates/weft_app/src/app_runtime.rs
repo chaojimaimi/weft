@@ -478,8 +478,23 @@ impl ApplicationHandler<AppEvent> for App {
         // the full session topology (tabs + panes + cwds + drafts).
         if !recovery_restored {
             self.restore_tab_snapshots();
+        } else {
+            // v1.8.9 fix: recovery restore rebuilt the tab topology + cwds +
+            // drafts via `restore_workspace`, but unlike the normal
+            // `restore_tab_snapshots` path it never sets `tab.restored_snapshot`.
+            // That field carries `block_ids`, which the hydration loop below
+            // needs to filter the global SQLite history into each tab's block
+            // tracker (sidebar history panel). Without it, Restore showed the
+            // tab layout but an empty history, while Ignore (which falls
+            // through to `restore_tab_snapshots`) showed the full history.
+            //
+            // The recovery snapshot (WorkspaceDocument) doesn't carry
+            // block_ids — they live in TabSnapshot (SQLite). Both stores are
+            // written in the same TabsAutoSave cycle, so tab order matches.
+            // Load TabSnapshots and attach them by position so the existing
+            // hydration loop picks up `block_ids` naturally.
+            self.attach_recovery_tab_snapshots();
         }
-
         // Restore history only after the tab topology is final. Hydrating the
         // initial terminal before cwd-based replacement discarded the loaded
         // history, and additional restored tabs never received it at all.
@@ -870,5 +885,44 @@ mod tests {
         hydrate_persisted_history(&mut terminal, &newest_first, &[], allocator);
         assert!(terminal.block_tracker().blocks().is_empty());
         assert_eq!(terminal.editor().history().len(), 2);
+    }
+
+    /// v1.8.9 regression test for the recovery-restore history bug.
+    ///
+    /// Before the fix, `restore_workspace` (recovery Restore button) rebuilt
+    /// tabs + cwds but left `restored_snapshot = None`, so the hydration loop
+    /// passed empty `block_ids` and the block tracker (sidebar history) was
+    /// empty — while the Ignore path (which goes through
+    /// `restore_tab_snapshots`) loaded the full history. This test verifies
+    /// the core invariant: when `restored_snapshot` carries `block_ids`,
+    /// hydrate populates the block tracker; when it's absent, it doesn't.
+    #[test]
+    fn hydrate_with_recovered_block_ids_populates_tracker() {
+        let newest_first = vec![block(10, "❯ git status"), block(20, "❯ make test")];
+        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30));
+
+        // Simulate the post-fix recovery path: restored_snapshot was attached
+        // with this tab's block_ids = [10, 20].
+        let mut terminal = Terminal::new(24, 80);
+        hydrate_persisted_history(&mut terminal, &newest_first, &[10, 20], allocator.clone());
+        assert_eq!(
+            terminal.block_tracker().blocks().len(),
+            2,
+            "recovery restore with attached block_ids should hydrate the tracker"
+        );
+
+        // Contrast with the pre-fix recovery path: restored_snapshot was None,
+        // yielding empty block_ids and an empty tracker.
+        let mut terminal_bare = Terminal::new(24, 80);
+        hydrate_persisted_history(
+            &mut terminal_bare,
+            &newest_first,
+            &[],
+            allocator,
+        );
+        assert!(
+            terminal_bare.block_tracker().blocks().is_empty(),
+            "empty block_ids (pre-fix recovery path) leaves the tracker empty"
+        );
     }
 }
