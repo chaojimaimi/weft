@@ -17,7 +17,7 @@ BUNDLE_ID="dev.weft.terminal"
 # without manual edits. Falls back to a hardcoded version if parsing fails.
 VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
 if [[ -z "${VERSION}" ]]; then
-    VERSION="1.9.0"
+    VERSION="1.10.3"
 fi
 MIN_OS="12.0"
 

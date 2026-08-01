@@ -19,7 +19,7 @@ APP_NAME="Weft"
 if [[ -z "${DMG_VERSION:-}" ]]; then
     VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')"
     if [[ -z "${VERSION}" ]]; then
-        VERSION="1.9.0"
+        VERSION="1.10.3"
     fi
 else
     VERSION="${DMG_VERSION}"
