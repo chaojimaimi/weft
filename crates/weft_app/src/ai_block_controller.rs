@@ -7,8 +7,8 @@
 //! through `poll_ai_results` → `AiResultEvent::Diagnose` →
 //! `block_diagnose_state`.
 
-use crate::app_state::BlockDiagnoseState;
 use crate::ai::DiagnosePrompt;
+use crate::app_state::BlockDiagnoseState;
 use weft_core::blocks::BlockId;
 
 impl crate::App {
@@ -53,7 +53,12 @@ impl crate::App {
             .active()
             .terminal
             .as_ref()
-            .and_then(|t| t.block_tracker().session_blocks().iter().find(|b| b.id == block_id))
+            .and_then(|t| {
+                t.block_tracker()
+                    .session_blocks()
+                    .iter()
+                    .find(|b| b.id == block_id)
+            })
             .cloned()
         else {
             tracing::warn!(?block_id, "block not found for diagnose");

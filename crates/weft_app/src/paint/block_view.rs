@@ -618,13 +618,20 @@ impl MetalRenderer {
                         self.push_text(&mut verts, left, text_y, "★", star_color, 1);
                         (
                             left + 2.0 * cw,
-                            block_header_text_cols(left + 2.0 * cw, right, cw, self.scale, ai_configured)
-                                .min(cols.saturating_sub(2)),
+                            block_header_text_cols(
+                                left + 2.0 * cw,
+                                right,
+                                cw,
+                                self.scale,
+                                ai_configured,
+                            )
+                            .min(cols.saturating_sub(2)),
                         )
                     } else {
                         (
                             left,
-                            block_header_text_cols(left, right, cw, self.scale, ai_configured).min(cols),
+                            block_header_text_cols(left, right, cw, self.scale, ai_configured)
+                                .min(cols),
                         )
                     };
                     self.push_text(&mut verts, text_x, text_y, text, color, text_cols);
@@ -738,11 +745,21 @@ impl MetalRenderer {
                     let panel_bg = if *is_error {
                         // Error: reddish tint.
                         let err = color_to_normalized(self.theme.output.failure);
-                        [err[0] * 0.15 + theme_bg[0] * 0.85, err[1] * 0.15 + theme_bg[1] * 0.85, err[2] * 0.15 + theme_bg[2] * 0.85, 1.0]
+                        [
+                            err[0] * 0.15 + theme_bg[0] * 0.85,
+                            err[1] * 0.15 + theme_bg[1] * 0.85,
+                            err[2] * 0.15 + theme_bg[2] * 0.85,
+                            1.0,
+                        ]
                     } else {
                         // Success/info: accent-tinted.
                         let acc = color_to_normalized(self.theme.accent);
-                        [acc[0] * 0.12 + theme_bg[0] * 0.88, acc[1] * 0.12 + theme_bg[1] * 0.88, acc[2] * 0.12 + theme_bg[2] * 0.88, 1.0]
+                        [
+                            acc[0] * 0.12 + theme_bg[0] * 0.88,
+                            acc[1] * 0.12 + theme_bg[1] * 0.88,
+                            acc[2] * 0.12 + theme_bg[2] * 0.88,
+                            1.0,
+                        ]
                     };
                     push_quad(
                         &mut verts,

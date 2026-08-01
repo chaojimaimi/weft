@@ -434,14 +434,14 @@ fn pane_hit_test_finds_correct_pane_in_vertical_split() {
 }
 
 #[test]
-fn active_pane_dimensions_use_split_rect_not_full_content() {
+fn active_pane_dimensions_use_split_rect_and_terminal_content_gutter() {
     let mut t = tab_with_terminal(100);
     t.split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
         .unwrap();
 
     assert_eq!(
         t.active_pane_dimensions_for_rect([0.0, 0.0, 800.0, 600.0], 10.0, 20.0),
-        Some((30, 40))
+        Some((30, 37))
     );
     assert_eq!(
         t.active_pane_dimensions_for_rect([0.0, 0.0, 800.0, 600.0], 0.0, 20.0),

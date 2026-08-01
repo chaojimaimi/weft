@@ -486,7 +486,7 @@ impl Tab {
             .into_iter()
             .find_map(|(id, rect)| (id == self.active_pane).then_some(rect))?;
         let [x0, y0, x1, y1] = rect;
-        let cols = ((x1 - x0).max(0.0) / cell_w).floor() as usize;
+        let cols = crate::layout::terminal_content_cols((x1 - x0).max(0.0), cell_w);
         let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
         (rows > 0 && cols > 0).then_some((rows, cols))
     }

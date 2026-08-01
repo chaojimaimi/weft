@@ -135,20 +135,18 @@ impl GridGeometry {
             right: self.chrome_left,
             bottom: self.viewport_height.max(self.chrome_top),
         });
-        let (rows, cols) = if self.cell_width <= 0.0
-            || self.cell_height <= 0.0
-            || content.width() <= 0.0
-        {
-            (0, 0)
-        } else {
-            (
-                (content.height() / self.cell_height).floor() as usize,
-                crate::layout::terminal_content_cols(
-                    content.width() as f32,
-                    self.cell_width as f32,
-                ),
-            )
-        };
+        let (rows, cols) =
+            if self.cell_width <= 0.0 || self.cell_height <= 0.0 || content.width() <= 0.0 {
+                (0, 0)
+            } else {
+                (
+                    (content.height() / self.cell_height).floor() as usize,
+                    crate::layout::terminal_content_cols(
+                        content.width() as f32,
+                        self.cell_width as f32,
+                    ),
+                )
+            };
         TerminalLayout {
             viewport,
             content,

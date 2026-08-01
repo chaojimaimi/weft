@@ -88,14 +88,8 @@ pub(super) fn block_header_text_cols(
     if !cell_width.is_finite() || cell_width <= 0.0 {
         return 0;
     }
-    let geometry = block_header_action_geometry(
-        right,
-        0.0,
-        cell_width,
-        cell_width,
-        scale,
-        ai_configured,
-    );
+    let geometry =
+        block_header_action_geometry(right, 0.0, cell_width, cell_width, scale, ai_configured);
     // v1.8.2: when ai_configured, text must stop before the diagnose slot.
     let text_right = if ai_configured {
         geometry.diagnose[0] - cell_width * 0.5
@@ -151,15 +145,10 @@ pub(super) fn push_block_header_actions(
             block_id,
         ));
     let diagnose_hovered = action_hovered
-        == Some(crate::block_component::BlockHeaderAction::Diagnose(block_id));
-    let geometry = block_header_action_geometry(
-        right,
-        y,
-        pitch,
-        cw,
-        renderer.scale,
-        ai_configured,
-    );
+        == Some(crate::block_component::BlockHeaderAction::Diagnose(
+            block_id,
+        ));
+    let geometry = block_header_action_geometry(right, y, pitch, cw, renderer.scale, ai_configured);
     let metrics = crate::ui_tokens::UiMetrics::for_scale(renderer.scale);
     let line_w = metrics.stroke * 1.5;
     let btn_color = if is_hovered {
@@ -407,7 +396,12 @@ pub(super) fn push_block_header_actions(
         let dot_s = stem_w * 1.4;
         push_quad(
             verts,
-            [diag_cx - dot_s * 0.5, btn_cy + r * 0.55, diag_cx + dot_s * 0.5, btn_cy + r * 0.55 + dot_s],
+            [
+                diag_cx - dot_s * 0.5,
+                btn_cy + r * 0.55,
+                diag_cx + dot_s * 0.5,
+                btn_cy + r * 0.55 + dot_s,
+            ],
             bg_uv,
             [0.0; 4],
             btn_color,

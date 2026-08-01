@@ -638,8 +638,7 @@ impl MetalRenderer {
                         } else {
                             warning_c
                         };
-                        let status_cols = content_cols
-                            .saturating_sub(2);
+                        let status_cols = content_cols.saturating_sub(2);
                         if status_cols > 0 {
                             self.push_text(
                                 &mut verts,

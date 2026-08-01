@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::client::{is_loopback_url, AiError, CancelFlag, OllamaBackend};
+use super::client::{is_loopback_url, AiBackend, AiError, CancelFlag, OllamaBackend};
 use super::prompt::{ChatMessage, ChatRole};
 use weft_core::config::AiConfig;
 
@@ -55,8 +55,8 @@ async fn list_models_returns_models_on_success() {
         .and(path("/api/tags"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "models": [
-                {"name": "llama3.1", "size": 4932946240, "modified_at": "2026-07-01T00:00:00Z"},
-                {"name": "qwen2.5", "size": 5000000000, "modified_at": "2026-07-15T00:00:00Z"}
+                {"name": "llama3.1", "size": 4_932_946_240_u64, "modified_at": "2026-07-01T00:00:00Z"},
+                {"name": "qwen2.5", "size": 5_000_000_000_u64, "modified_at": "2026-07-15T00:00:00Z"}
             ]
         })))
         .mount(&server)
@@ -84,10 +84,7 @@ async fn list_models_returns_empty_when_no_models() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/api/tags"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"models": []})),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"models": []})))
         .mount(&server)
         .await;
 
@@ -139,8 +136,7 @@ async fn list_models_errors_when_models_field_missing() {
     Mock::given(method("GET"))
         .and(path("/api/tags"))
         .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({"unrelated": "field"})),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"unrelated": "field"})),
         )
         .mount(&server)
         .await;
@@ -266,9 +262,9 @@ async fn chat_stream_errors_on_provider_error_object() {
 }
 
 #[tokio::test]
-async fn chat_stream_errors_on_malformed_ndjson_line() {
+async fn chat_stream_skips_malformed_ndjson_line() {
     let server = MockServer::start().await;
-    let body = "not valid json\n";
+    let body = "not valid json\n{\"message\":{\"content\":\"recovered\"},\"done\":true}\n";
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
@@ -278,11 +274,11 @@ async fn chat_stream_errors_on_malformed_ndjson_line() {
         .await;
 
     let backend = backend_at(&server.uri());
-    match backend.complete(simple_messages(), CancelFlag::new()).await {
-        Err(AiError::Parse(_)) => {}
-        Err(other) => panic!("expected Parse error, got {other:?}"),
-        Ok(_) => panic!("expected error, got content"),
-    }
+    let result = backend.complete(simple_messages(), CancelFlag::new()).await;
+    assert_eq!(
+        result.expect("valid line after malformed input"),
+        "recovered"
+    );
 }
 
 #[tokio::test]

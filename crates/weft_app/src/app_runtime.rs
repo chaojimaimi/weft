@@ -849,8 +849,14 @@ mod tests {
         hydrate_persisted_history(&mut terminal_b, &newest_first, &[1], allocator);
 
         // Both editors see the full global command history (↑-key recall).
-        assert_eq!(terminal_a.editor().history(), ["echo newest", "echo oldest"]);
-        assert_eq!(terminal_b.editor().history(), ["echo newest", "echo oldest"]);
+        assert_eq!(
+            terminal_a.editor().history(),
+            ["echo newest", "echo oldest"]
+        );
+        assert_eq!(
+            terminal_b.editor().history(),
+            ["echo newest", "echo oldest"]
+        );
 
         // Block trackers are per-tab isolated.
         let ids_a: Vec<_> = terminal_a
@@ -914,12 +920,7 @@ mod tests {
         // Contrast with the pre-fix recovery path: restored_snapshot was None,
         // yielding empty block_ids and an empty tracker.
         let mut terminal_bare = Terminal::new(24, 80);
-        hydrate_persisted_history(
-            &mut terminal_bare,
-            &newest_first,
-            &[],
-            allocator,
-        );
+        hydrate_persisted_history(&mut terminal_bare, &newest_first, &[], allocator);
         assert!(
             terminal_bare.block_tracker().blocks().is_empty(),
             "empty block_ids (pre-fix recovery path) leaves the tracker empty"

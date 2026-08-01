@@ -73,7 +73,8 @@ impl BlockStore {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM tabs", [])?;
         for snap in snapshots {
-            let block_ids_json = serde_json::to_string(&snap.block_ids).unwrap_or_else(|_| "[]".into());
+            let block_ids_json =
+                serde_json::to_string(&snap.block_ids).unwrap_or_else(|_| "[]".into());
             tx.execute(
                 "INSERT INTO tabs (id, position, active, cwd, block_scroll_offset, editor_buffer, shell_phase, block_ids) \
                  VALUES (NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",

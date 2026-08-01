@@ -12,7 +12,8 @@ cd "$ROOT"
 
 APP_DIR="target/release/osx/Weft.app"
 PLIST="$APP_DIR/Contents/Info.plist"
-MANUAL_MATRIX="docs/V17_MANUAL_ACCEPTANCE.md"
+V17_MANUAL_MATRIX="docs/V17_MANUAL_ACCEPTANCE.md"
+V18_MANUAL_MATRIX="docs/V18_MANUAL_ACCEPTANCE.md"
 failures=0
 
 workspace_version=$(awk '
@@ -31,8 +32,13 @@ bundle_metadata_version=$(awk '
     }
 ' crates/weft_app/Cargo.toml)
 
-assignment_version() {
-    awk -F '"' '/^VERSION=/ { print $2; exit }' "$1"
+resolved_script_version() {
+    script=$1
+    if grep -Fq "grep -m1 '^version = ' Cargo.toml" "$script"; then
+        printf '%s\n' "$workspace_version"
+    else
+        awk -F '"' '/^VERSION=/ { print $2; exit }' "$script"
+    fi
 }
 
 check_equal() {
@@ -53,8 +59,8 @@ if [ -z "$workspace_version" ]; then
     failures=$((failures + 1))
 else
     check_equal "crates/weft_app bundle metadata" "$workspace_version" "$bundle_metadata_version"
-    check_equal "scripts/build-app.sh" "$workspace_version" "$(assignment_version scripts/build-app.sh)"
-    check_equal "scripts/build-dmg.sh" "$workspace_version" "$(assignment_version scripts/build-dmg.sh)"
+    check_equal "scripts/build-app.sh" "$workspace_version" "$(resolved_script_version scripts/build-app.sh)"
+    check_equal "scripts/build-dmg.sh" "$workspace_version" "$(resolved_script_version scripts/build-dmg.sh)"
 fi
 
 echo "==> Acceptance preflight: App bundle structure"
@@ -103,25 +109,35 @@ else
 fi
 
 echo "==> Acceptance preflight: manual-gate contract"
-if [ ! -f "$MANUAL_MATRIX" ]; then
-    echo "  FAIL: $MANUAL_MATRIX is missing"
-    failures=$((failures + 1))
-else
+for matrix in "$V17_MANUAL_MATRIX" "$V18_MANUAL_MATRIX"; do
+    if [ ! -f "$matrix" ]; then
+        echo "  FAIL: $matrix is missing"
+        failures=$((failures + 1))
+    fi
+done
+
+if [ -f "$V17_MANUAL_MATRIX" ] && [ -f "$V18_MANUAL_MATRIX" ]; then
     for marker in V17-ANSI-1 V17-SEARCH-1 V17-COMPLETION-1 V17-RUNBOOK-1 V17-RELEASE-1; do
-        if ! grep -Fq "**${marker}**" "$MANUAL_MATRIX"; then
-            echo "  FAIL: $MANUAL_MATRIX is missing $marker"
+        if ! grep -Fq "**${marker}**" "$V17_MANUAL_MATRIX"; then
+            echo "  FAIL: $V17_MANUAL_MATRIX is missing $marker"
+            failures=$((failures + 1))
+        fi
+    done
+    for marker in V18-SETTINGS-1 V18-COMMAND-2 V18-DIAGNOSE-2 V18-SAFETY-2 V18-PERF-1; do
+        if ! grep -Fq "**${marker}**" "$V18_MANUAL_MATRIX"; then
+            echo "  FAIL: $V18_MANUAL_MATRIX is missing $marker"
             failures=$((failures + 1))
         fi
     done
     if [ "$failures" -eq 0 ]; then
-        echo "  OK: v1.7 manual acceptance matrix covers required release areas"
+        echo "  OK: v1.7-v1.8 manual acceptance matrices cover required release areas"
     fi
 fi
 
 echo
 if [ "$failures" -eq 0 ]; then
     echo "Acceptance preflight: ALL AUTOMATED CHECKS PASSED"
-    echo "Manual v1.7 acceptance is still required; see $MANUAL_MATRIX."
+    echo "Manual v1.7-v1.8 acceptance is still required; see $V17_MANUAL_MATRIX and $V18_MANUAL_MATRIX."
     exit 0
 fi
 

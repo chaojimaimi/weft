@@ -23,6 +23,11 @@ pub mod metrics;
 pub mod prompt;
 pub mod redact;
 
+#[cfg(test)]
+mod mock_tests;
+#[cfg(test)]
+mod real_tests;
+
 use std::sync::Arc;
 use std::time::Instant;
 

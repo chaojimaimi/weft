@@ -105,7 +105,8 @@ pub(super) struct LayoutPassInput<'a, 'b> {
     /// rows are injected after its output to render the diagnose panel.
     /// Uses a separate lifetime `'b` because the output (`LayoutPassOutput<'a>`)
     /// does not borrow from this field — `DiagnosePanel` rows own their text.
-    pub(super) block_diagnose_state: &'b std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    pub(super) block_diagnose_state:
+        &'b std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
@@ -274,7 +275,9 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
                     Err(err) => format!("AI error: {}", err),
                 };
                 text.lines()
-                    .flat_map(|line| block_line_chunks(line, cols.saturating_sub(2)).collect::<Vec<_>>())
+                    .flat_map(|line| {
+                        block_line_chunks(line, cols.saturating_sub(2)).collect::<Vec<_>>()
+                    })
                     .collect()
             } else {
                 Vec::new()

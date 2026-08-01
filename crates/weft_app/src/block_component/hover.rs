@@ -57,7 +57,7 @@ pub(crate) fn block_header_action_at(
             crate::overlay::HitTarget::BlockDiagnoseClose(id) => {
                 Some(BlockHeaderAction::CloseDiagnose(id))
             }
-            _ => None
+            _ => None,
         }
     })
 }

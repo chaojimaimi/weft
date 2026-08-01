@@ -324,7 +324,10 @@ pub(crate) fn build_settings_scene(
         if row_idx < layout.max_rows {
             let row_y = layout.content_top + row_idx as f32 * cell_h;
             let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
-            scene.hits.push(HitRegion::from_rect(row_rect, SettingsTarget::LocalAiTestConnection));
+            scene.hits.push(HitRegion::from_rect(
+                row_rect,
+                SettingsTarget::LocalAiTestConnection,
+            ));
             scene.semantics.push(SemanticNode {
                 role: SemanticRole::Button,
                 label: "Test AI connection".into(),

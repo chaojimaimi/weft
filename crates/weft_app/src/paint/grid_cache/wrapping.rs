@@ -229,7 +229,8 @@ mod tests {
         line.push_str(suffix);
         let total_width = weft_core::grid::terminal_text_width(&line);
         assert_eq!(
-            total_width, cols + overflow,
+            total_width,
+            cols + overflow,
             "test setup: line width must be cols+{} for small-overflow case",
             overflow
         );
@@ -278,7 +279,11 @@ mod tests {
             "progress bar with large overflow must WRAP to preserve ETA/speed info; got 1 chunk (clipped)"
         );
         // wrap 后所有 chunk 拼接应保留完整原文（信息无丢失）
-        assert_eq!(chunks.concat(), line, "wrapped chunks must preserve full content");
+        assert_eq!(
+            chunks.concat(),
+            line,
+            "wrapped chunks must preserve full content"
+        );
         // 最后一个 chunk 应包含 ETA 信息（证明尾部没被截断）
         assert!(
             chunks.last().unwrap().contains("1m59s") || chunks.concat().ends_with("1m59s"),
@@ -334,7 +339,10 @@ mod tests {
         line_clip.push_str(&bar);
         line_clip.push_str(&" ".repeat(spaces_clip));
         line_clip.push_str(suffix);
-        assert_eq!(weft_core::grid::terminal_text_width(&line_clip), cols + overflow_clip);
+        assert_eq!(
+            weft_core::grid::terminal_text_width(&line_clip),
+            cols + overflow_clip
+        );
         let chunks = block_line_chunks(&line_clip, cols).collect::<Vec<_>>();
         assert_eq!(
             chunks.len(),
@@ -351,7 +359,10 @@ mod tests {
         line_wrap.push_str(&bar);
         line_wrap.push_str(&" ".repeat(spaces_wrap));
         line_wrap.push_str(suffix);
-        assert_eq!(weft_core::grid::terminal_text_width(&line_wrap), cols + overflow_wrap);
+        assert_eq!(
+            weft_core::grid::terminal_text_width(&line_wrap),
+            cols + overflow_wrap
+        );
         let chunks = block_line_chunks(&line_wrap, cols).collect::<Vec<_>>();
         assert_eq!(
             chunks.len(),

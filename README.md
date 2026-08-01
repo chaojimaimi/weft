@@ -9,15 +9,17 @@ A modern macOS terminal emulator with block-based command history, Metal GPU ren
 - **Shell integration** — OSC 133 markers from zsh integration split commands into blocks
 - **Find** — async regex/case-sensitive search across full scrollback (FindWorker background thread)
 - **Multi-tab** — Cmd+T new tab, Cmd+W close, Cmd+Shift+[/] cycle
+- **Split panes + workspaces** — nested pane layouts, save/open workspace, crash recovery
 - **Themes** — 11 built-in themes (Tokyo Night, Solarized, One Dark, Gruvbox, Catppuccin, Nord, ...) + custom theme files
 - **System theme follow** — auto-switch light/dark with macOS appearance
-- **Settings UI** — Cmd+, opens panel with Appearance/Font/Keybindings/Window/Logo tabs
+- **Settings UI** — Cmd+, opens Appearance/Font/Keybindings/Window/Local AI/Advanced settings with profiles
 - **Command palette** — Cmd+P fuzzy command runner + workflow execution
 - **History sidebar** — Cmd+Shift+B searchable, click-to-scroll command history
 - **Context menu** — F7 for Copy Command/Toggle Fold/Send to Input
 - **Logo variants** — 4 Dock icon variants (Cool/Warm/Light/Transparent) switchable in Settings
 - **IME + CJK** — full Unicode-width-aware glyph layout
 - **Session restore** — tab metadata + editor drafts persisted across restarts
+- **Local AI** — loopback-only Ollama command generation and failed-block diagnosis; suggestions are inserted, never auto-executed
 
 ## Performance
 
@@ -110,7 +112,7 @@ Enables OSC 133 markers that split commands into blocks (visible in block view +
 ## Development
 
 ```bash
-cargo test --workspace          # 654 tests
+cargo test --workspace
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
