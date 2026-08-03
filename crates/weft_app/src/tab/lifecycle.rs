@@ -7,11 +7,25 @@ pub(super) const MAX_CLOSE_TAIL_EVENTS: usize = 256;
 
 impl Tab {
     pub(super) fn process_pty_output(&mut self, data: &[u8]) -> bool {
-        let Some(terminal) = &mut self.terminal else {
-            return false;
+        // v1.10.4: detect alt-screen (DEC 1049) enter/exit. When a TUI
+        // toggles between alt-screen and primary screen, the PTY cols must
+        // switch between full-width (alt-screen: TUI needs every column to
+        // paint borders/layout) and gutter-subtracted (primary screen:
+        // BlockView reserves breathing room). Capture the state before
+        // processing so we can flag the transition after the mutable
+        // borrow on `self.terminal` ends.
+        let (response, alt_changed) = match &mut self.terminal {
+            Some(terminal) => {
+                let was_alt = terminal.is_alt_screen_active();
+                terminal.process(data);
+                let now_alt = terminal.is_alt_screen_active();
+                (terminal.take_response(), was_alt != now_alt)
+            }
+            None => return false,
         };
-        terminal.process(data);
-        let response = terminal.take_response();
+        if alt_changed {
+            self.pending_alt_rescale = true;
+        }
         if !response.is_empty() {
             if let Some(pty) = &self.pty {
                 if let Err(error) = pty.write_sync(&response) {

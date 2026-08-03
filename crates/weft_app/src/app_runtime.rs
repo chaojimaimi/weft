@@ -3,13 +3,18 @@
 use super::*;
 
 pub(crate) fn install_runtime_diagnostics() {
-    // v1.3: write diagnostics to /tmp/weft.log. v1.4.0: honor RUST_LOG.
-    let log_path = std::path::PathBuf::from("/tmp/weft.log");
-    let _ = std::fs::remove_file(&log_path);
+    // v1.10.4: write to ~/Library/Logs/Weft/weft.log (macOS standard location)
+    // and APPEND across launches so a crash/relaunch doesn't wipe the prior
+    // session's diagnostics. Previously this truncated /tmp/weft.log on every
+    // start, which erased the exact现场 dogfood bugs need.
+    // v1.4.0: honor RUST_LOG, default to `info`.
+    let log_path = runtime_log_path(std::env::var_os("HOME").as_deref());
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let file = match std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&log_path)
     {
         Ok(f) => f,
@@ -28,6 +33,12 @@ pub(crate) fn install_runtime_diagnostics() {
         .with_env_filter(filter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+    // v1.10.4: session separator so multiple appended launches stay readable.
+    tracing::info!(
+        pid = std::process::id(),
+        version = env!("CARGO_PKG_VERSION"),
+        "=== Weft session start ==="
+    );
     setup_panic_hook(std::panic::take_hook());
 }
 
@@ -41,10 +52,11 @@ fn setup_panic_hook(default_hook: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Send 
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // v1.10.4: append (not truncate) so multiple panics across launches
+        // don't overwrite each other's backtrace — essential for dogfood.
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
-            .write(true)
-            .truncate(true)
+            .append(true)
             .open(&path)
         {
             use std::io::Write;
@@ -89,6 +101,15 @@ fn panic_log_path(home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
     home.map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("Library/Logs/Weft/panic.log")
+}
+
+/// v1.10.4: runtime tracing log path under the macOS-standard location.
+/// Falls back to `/tmp/weft.log` only when `$HOME` is unavailable.
+fn runtime_log_path(home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    match home {
+        Some(h) => std::path::PathBuf::from(h).join("Library/Logs/Weft/weft.log"),
+        None => std::path::PathBuf::from("/tmp/weft.log"),
+    }
 }
 
 fn schedule_synchronized_output_watchdog(

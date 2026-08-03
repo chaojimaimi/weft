@@ -130,6 +130,25 @@ fn fills_terminal_cell_edges(ch: char) -> bool {
     matches!(ch, '\u{2500}'..='\u{259f}')
 }
 
+/// v1.10.4: Resolve a block-view foreground color, applying the
+/// minimum-contrast boost ONLY to readable text. Terminal graphic glyphs
+/// (box drawing / block elements — [`fills_terminal_cell_edges`]) are
+/// decoration whose exact color is the app's design intent (TUIs draw
+/// borders with intentionally low-contrast colors); boosting them toward
+/// white turns subtle borders into glaring white bars.
+fn resolve_block_fg_color(
+    fg: [f32; 4],
+    background: [f32; 4],
+    ch: char,
+    minimum_contrast: f32,
+) -> [f32; 4] {
+    if fills_terminal_cell_edges(ch) {
+        fg
+    } else {
+        ensure_minimum_text_contrast(fg, background, minimum_contrast)
+    }
+}
+
 impl MetalRenderer {
     /// v1.4.1: Cached wrapper around `push_block_output_text`. On a cache
     /// hit, the cached vertices (built in local origin (0, 0)) are translated
@@ -280,8 +299,15 @@ impl MetalRenderer {
 
             let contrast_background =
                 contrast_background(bg_final, paint.canvas, paint.selection, source_index);
+            // v1.10.4: terminal graphic glyphs (box drawing / block elements)
+            // are decoration — TUIs draw borders/bars with intentionally
+            // low-contrast colors (e.g. opencode's ▀ input-box edge on a dark
+            // canvas). The contrast booster would brighten those toward white,
+            // turning the intended dim border into a glaring white bar, so
+            // skip it for graphic characters (same set as
+            // `fills_terminal_cell_edges`).
             let fg_final =
-                ensure_minimum_text_contrast(fg_final, contrast_background, self.minimum_contrast);
+                resolve_block_fg_color(fg_final, contrast_background, ch, self.minimum_contrast);
 
             // DIM remains an explicit application-owned hierarchy signal and
             // is applied after the optional display contrast correction.
@@ -383,7 +409,8 @@ impl MetalRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        contrast_background, fills_terminal_cell_edges, reverse_colors, semantic_fallback_at,
+        contrast_background, fills_terminal_cell_edges, resolve_block_fg_color, reverse_colors,
+        semantic_fallback_at,
     };
     use crate::paint::primitives::color_to_normalized;
     use weft_core::config::Theme;
@@ -396,6 +423,38 @@ mod tests {
         for glyph in ['A', '中', '●'] {
             assert!(!fills_terminal_cell_edges(glyph), "glyph={glyph}");
         }
+    }
+
+    // ── v1.10.4: block-view graphic-glyph contrast exemption ───────────
+
+    #[test]
+    fn block_view_graphic_glyph_skips_minimum_contrast_boost() {
+        // Same root cause as the grid path: a graphic glyph with
+        // intentionally low contrast (opencode's ▀ border, fg=21,20,27 on
+        // bg=15,15,15, ratio ~1.05) must NOT be brightened toward white by
+        // the 7.0 minimum-contrast threshold.
+        let fg = color_to_normalized(weft_core::grid::Color::rgb(21, 20, 27));
+        let bg = color_to_normalized(weft_core::grid::Color::rgb(15, 15, 15));
+        let resolved = resolve_block_fg_color(fg, bg, '▀', 7.0);
+        for i in 0..3 {
+            assert!(
+                (resolved[i] - fg[i]).abs() < 1e-6,
+                "graphic glyph must keep designed color, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_view_readable_text_still_gets_minimum_contrast_boost() {
+        // Real text (a dark letter on a dark canvas) still gets boosted to
+        // meet the 7.0 threshold — the exemption must not apply to content.
+        let fg = color_to_normalized(weft_core::grid::Color::rgb(80, 45, 20));
+        let bg = color_to_normalized(weft_core::grid::Color::rgb(15, 15, 15));
+        let resolved = resolve_block_fg_color(fg, bg, 'A', 7.0);
+        assert!(
+            crate::paint::primitives::text_contrast_ratio(resolved, bg) >= 6.99,
+            "readable text boosted to threshold, got {resolved:?}"
+        );
     }
 
     #[test]

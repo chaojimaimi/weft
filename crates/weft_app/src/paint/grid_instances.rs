@@ -198,6 +198,17 @@ const HYPERLINK_COLOR: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
 /// Thickness of hyperlink and cursor-underline decorations, in physical px.
 const UNDERLINE_HEIGHT: f32 = 2.0;
 
+/// v1.10.4: Whether a character is a terminal *graphic* glyph (Box Drawing
+/// U+2500-U+257F, Block Elements U+2580-U+259F) rather than readable text.
+/// These are drawn as borders, bars, and gauges by TUIs (opencode input-box
+/// edge, htop table rules, ollama progress bars). The app controls their
+/// exact color — often intentionally low-contrast — so the minimum-contrast
+/// booster must not brighten them. Mirrors block_view's
+/// `fills_terminal_cell_edges` but is shared with the grid path.
+fn is_terminal_graphic_char(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{259f}')
+}
+
 /// Build the dual-stream instances for a single grid row.
 ///
 /// This is the pure-logic core of the grid renderer. For each cell in the
@@ -302,6 +313,39 @@ pub(crate) fn build_row_instances(
             crate::paint::primitives::ensure_minimum_text_contrast(fg, final_bg, minimum_contrast)
         };
 
+        // v1.10.4 fix: skip the minimum-contrast correction for terminal
+        // graphic characters (Box Drawing U+2500-U+257F and Block Elements
+        // U+2580-U+259F). TUIs like opencode intentionally draw borders with
+        // low-contrast dark glyphs (e.g. ▀ fg=rgb(21,20,27) on
+        // bg=rgb(15,15,15) — a subtle input-box edge). The contrast booster
+        // read that as unreadable text and brightened it toward white,
+        // turning the intended dim border into a glaring "white bar".
+        // Graphic glyphs are decoration, not text: their exact color is the
+        // app's design intent, and "readability" doesn't apply.
+        let final_fg = if !is_cursor && is_terminal_graphic_char(cell.character) {
+            fg
+        } else {
+            final_fg
+        };
+
+        // SGR DIM (faint) is an application-owned hierarchy signal
+        // (opencode/vim use it to dim secondary labels, model pickers,
+        // borders). Applied AFTER the optional contrast correction, the
+        // same ordering as block_view/style.rs:286-297, so alt-screen
+        // TUIs match the shell-output path. Not applied to cursor text:
+        // the cursor already pins black-on-cursor-color and dimming it
+        // would hurt visibility.
+        let final_fg = if !is_cursor && cell.flags.contains(CellFlags::DIM) {
+            [
+                final_fg[0] * 0.5,
+                final_fg[1] * 0.5,
+                final_fg[2] * 0.5,
+                final_fg[3],
+            ]
+        } else {
+            final_fg
+        };
+
         // ── Cell render width ──────────────────────────────────────
         let cell_w = if cell.width == CellWidth::Full && col + 1 < num_cols {
             cw * 2.0
@@ -383,6 +427,35 @@ pub(crate) fn build_row_instances(
             result.glyph_instances.push(GlyphInstance::Decoration {
                 dst: [x0, y1 - UNDERLINE_HEIGHT, x1, y1],
                 color: HYPERLINK_COLOR,
+            });
+        }
+
+        // ── Glyph stream: SGR text attribute decorations ──────────
+        // v1.10.4: honor UNDERLINE / DOUBLE_UNDER / STRIKETHROUGH on the
+        // alt-screen (grid) path, mirroring block_view/style.rs:331-360 so
+        // TUIs (less/man/vim/opencode) render text decorations identically
+        // to shell output. Colors follow final_fg so DIM'd decorations stay
+        // visually grouped with their text.
+        if cell.flags.contains(CellFlags::UNDERLINE) || cell.flags.contains(CellFlags::DOUBLE_UNDER)
+        {
+            let underline_y = y1 - UNDERLINE_HEIGHT;
+            result.glyph_instances.push(GlyphInstance::Decoration {
+                dst: [x0, underline_y, x1, underline_y + UNDERLINE_HEIGHT],
+                color: final_fg,
+            });
+            if cell.flags.contains(CellFlags::DOUBLE_UNDER) {
+                let second_y = underline_y - 3.0;
+                result.glyph_instances.push(GlyphInstance::Decoration {
+                    dst: [x0, second_y, x1, second_y + UNDERLINE_HEIGHT],
+                    color: final_fg,
+                });
+            }
+        }
+        if cell.flags.contains(CellFlags::STRIKETHROUGH) {
+            let strike_y = y0 + ch * 0.5 - 1.0;
+            result.glyph_instances.push(GlyphInstance::Decoration {
+                dst: [x0, strike_y, x1, strike_y + UNDERLINE_HEIGHT],
+                color: final_fg,
             });
         }
     }

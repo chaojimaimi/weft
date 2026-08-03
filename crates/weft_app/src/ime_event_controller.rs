@@ -176,6 +176,16 @@ impl App {
                         event_replay::ImeCommitTarget::Pty { tab } => {
                             // Typed/IME text is raw keyboard input, not paste;
                             // bracketed-paste wrapping would corrupt less/vim.
+                            // v1.10.4: log the committed text at info so CJK
+                            // input drop/corruption during dogfood is observable
+                            // from the default-level log without bumping
+                            // RUST_LOG. Truncate to 40 chars to bound size.
+                            tracing::info!(
+                                tab,
+                                bytes = text.len(),
+                                preview = %text.chars().take(40).collect::<String>(),
+                                "IME commit → PTY"
+                            );
                             self.drain_effects(effect::ime_commit_effects(tab, &text));
                         }
                     }

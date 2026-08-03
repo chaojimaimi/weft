@@ -1,7 +1,7 @@
 # v1.9: Release pipeline for Weft.app
 #
 # Triggers on:
-#   - Push of semantic version tags (v1.10.3, v1.10.4, ...)
+#   - Push of semantic version tags (v1.10.3, v1.10.4, v1.10.5, ...)
 #   - Manual dispatch from Actions tab
 #
 # Produces:
@@ -26,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (must match Cargo.toml, e.g. 1.10.3)"
+        description: "Release version (must match Cargo.toml, e.g. 1.10.4)"
         required: true
-        default: "1.10.3"
+        default: "1.10.4"
 
 permissions:
   contents: write

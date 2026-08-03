@@ -704,6 +704,7 @@ impl MetalRenderer {
                     cursor_style: terminal.cursor_style,
                     hidden_before_row: terminal.primary_screen_visible_row_start(),
                     owned_rows: terminal.primary_screen_viewport_ownership(),
+                    is_alt_screen: terminal.is_alt_screen_active(),
                 },
             );
             self.grid_build_us_counter

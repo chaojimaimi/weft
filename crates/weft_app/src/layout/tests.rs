@@ -914,3 +914,27 @@ fn terminal_content_cols_safe_on_degenerate_inputs() {
     // Extremely narrow pane collapses to 1 col.
     assert_eq!(super::terminal::terminal_content_cols(5.0, 12.0), 1);
 }
+
+// ── v1.10.4: terminal_full_cols (alt-screen TUI full-width mode) ─────
+
+#[test]
+fn terminal_full_cols_does_not_subtract_gutter() {
+    // pane_width=1200, cell_w=12 → raw cols=100 (no gutter subtraction)
+    let raw = (1200.0_f32 / 12.0) as usize;
+    let full = super::terminal::terminal_full_cols(1200.0, 12.0);
+    assert_eq!(full, raw, "terminal_full_cols must NOT subtract gutter");
+    // And it must be MORE than the gutter-subtracted version.
+    let with_gutter = super::terminal::terminal_content_cols(1200.0, 12.0);
+    assert!(
+        full > with_gutter,
+        "full cols ({full}) must exceed gutter-subtracted cols ({with_gutter})"
+    );
+}
+
+#[test]
+fn terminal_full_cols_safe_on_degenerate_inputs() {
+    assert_eq!(super::terminal::terminal_full_cols(0.0, 12.0), 1);
+    assert_eq!(super::terminal::terminal_full_cols(1200.0, 0.0), 1);
+    assert_eq!(super::terminal::terminal_full_cols(-10.0, 12.0), 1);
+    assert_eq!(super::terminal::terminal_full_cols(5.0, 12.0), 1);
+}

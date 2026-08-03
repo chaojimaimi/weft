@@ -6,6 +6,13 @@ impl App {
     pub(super) fn handle_redraw_requested(&mut self) {
         self.pump_pty();
         let had_output = self.process_messages();
+        // v1.10.4: if the active pane entered/exited alt-screen (DEC 1049),
+        // recompute geometry so PTY cols switch between full-width (TUI)
+        // and gutter-subtracted (BlockView). Must happen before the render
+        // so the grid dimensions match the new screen mode this frame.
+        if self.sessions.active_mut().take_pending_alt_rescale() {
+            self.recompute_layout();
+        }
         if self
             .sessions
             .active()

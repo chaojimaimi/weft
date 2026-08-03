@@ -73,6 +73,13 @@ pub struct Tab {
     /// Currently focused pane. Keyboard input, IME, and Deref forward here.
     /// Always points at a leaf present in `split_tree` / `panes`.
     active_pane: PaneId,
+    /// v1.10.4: set when the active pane enters/exits alt-screen (DEC 1049).
+    /// The redraw loop checks this to trigger a geometry recompute so PTY
+    /// cols switch between full-width (alt-screen TUI) and gutter-subtracted
+    /// (BlockView shell output). Consumed only when the tab is active; a
+    /// background tab's flag self-heals on activation because
+    /// `resize_all_panes_for_rect` re-reads `is_alt_screen_active()` live.
+    pending_alt_rescale: bool,
 }
 
 impl std::ops::Deref for Tab {
@@ -425,6 +432,7 @@ impl Tab {
             split_tree: SplitTree::new(pane_id),
             panes,
             active_pane: pane_id,
+            pending_alt_rescale: false,
         }
     }
 
@@ -453,6 +461,14 @@ impl Tab {
     /// bump the counter (e.g. `drain_effects`).
     pub(crate) fn input_seq(&self) -> u64 {
         self.active().input_seq
+    }
+
+    /// v1.10.4: True when the active pane entered/exited alt-screen (DEC 1049)
+    /// since the last geometry recompute. The redraw loop checks this to
+    /// trigger `recompute_layout` so PTY cols switch between full-width
+    /// (alt-screen TUI) and gutter-subtracted (BlockView shell output).
+    pub(crate) fn take_pending_alt_rescale(&mut self) -> bool {
+        std::mem::replace(&mut self.pending_alt_rescale, false)
     }
 
     /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
@@ -486,7 +502,19 @@ impl Tab {
             .into_iter()
             .find_map(|(id, rect)| (id == self.active_pane).then_some(rect))?;
         let [x0, y0, x1, y1] = rect;
-        let cols = crate::layout::terminal_content_cols((x1 - x0).max(0.0), cell_w);
+        let pane_width = (x1 - x0).max(0.0);
+        // v1.10.4: mirror resize_all_panes_for_rect — alt-screen TUI uses
+        // full pane width (no BlockView gutter).
+        let is_alt = self
+            .panes
+            .get(&self.active_pane)
+            .and_then(|p| p.terminal.as_ref())
+            .is_some_and(|t| t.is_alt_screen_active());
+        let cols = if is_alt {
+            crate::layout::terminal_full_cols(pane_width, cell_w)
+        } else {
+            crate::layout::terminal_content_cols(pane_width, cell_w)
+        };
         let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
         (rows > 0 && cols > 0).then_some((rows, cols))
     }
@@ -514,14 +542,26 @@ impl Tab {
         let mut active_resized = false;
         for (pane_id, rect) in layouts {
             let [x0, y0, x1, y1] = rect;
-            // Use content cols (with BlockView gutter subtracted) so PTY
-            // reports the same width BlockView can actually display.
-            // Without this, progress bars (ollama pull, brew upgrade) wrap
-            // their last 2-3 chars to the next line because the program
-            // emits PTY-cols-wide lines but BlockView renders fewer cols.
             let pane_width = (x1 - x0).max(0.0);
-            let cols = crate::layout::terminal_content_cols(pane_width, cell_w);
-            let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
+            let pane_height = (y1 - y0).max(0.0);
+            // v1.10.4: alt-screen TUIs (vim/opencode/htop/less) need the
+            // FULL pane width — their borders/layouts assume PTY cols = the
+            // visible terminal width. The BlockView gutter (cell_w*1.5 per
+            // side, ~3 cols) is only meaningful for shell output (it gives
+            // history blocks breathing room and prevents progress bars from
+            // wrapping). When a pane is in alt-screen mode, skip the gutter
+            // subtraction so the TUI can paint edge-to-edge.
+            let is_alt = self
+                .panes
+                .get(&pane_id)
+                .and_then(|p| p.terminal.as_ref())
+                .is_some_and(|t| t.is_alt_screen_active());
+            let cols = if is_alt {
+                crate::layout::terminal_full_cols(pane_width, cell_w)
+            } else {
+                crate::layout::terminal_content_cols(pane_width, cell_w)
+            };
+            let rows = (pane_height / cell_h).floor() as usize;
             if rows == 0 || cols == 0 {
                 continue;
             }

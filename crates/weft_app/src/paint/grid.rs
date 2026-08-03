@@ -41,6 +41,39 @@ pub(crate) struct GridViewPolicy<'a> {
     pub(crate) cursor_style: CursorStyle,
     pub(crate) hidden_before_row: Option<usize>,
     pub(crate) owned_rows: Option<&'a [bool]>,
+    /// v1.10.4: true when the terminal is in alt-screen mode (DEC 1049).
+    /// Used to soften the cursor color for underline/bar styles so they
+    /// don't appear as a jarring bright line at TUI input edges.
+    pub(crate) is_alt_screen: bool,
+}
+
+/// v1.10.4: Resolve the effective cursor color for the grid path.
+///
+/// Alt-screen TUIs (opencode/vim/htop) position the cursor at their
+/// input/prompt edges. A bright cursor color (#f0d4a8 in weft-warm)
+/// renders as a jarring "white bar" when the cursor style is Underline/Bar
+/// (a thin line spanning the cell). Blend the cursor color toward the
+/// foreground at 50% so the cursor stays visible but no longer dominates
+/// the TUI's own visual hierarchy.
+///
+/// Block cursors keep full intensity (they're position indicators that
+/// need to be unmistakable — dimming them would hurt usability in vim/etc).
+fn alt_screen_cursor_color(
+    raw_cursor: [f32; 4],
+    default_fg: [f32; 4],
+    is_alt_screen: bool,
+    cursor_style: CursorStyle,
+) -> [f32; 4] {
+    if is_alt_screen && !cursor_style.is_block() {
+        [
+            raw_cursor[0] * 0.5 + default_fg[0] * 0.5,
+            raw_cursor[1] * 0.5 + default_fg[1] * 0.5,
+            raw_cursor[2] * 0.5 + default_fg[2] * 0.5,
+            raw_cursor[3],
+        ]
+    } else {
+        raw_cursor
+    }
 }
 
 impl MetalRenderer {
@@ -79,7 +112,13 @@ impl MetalRenderer {
 
         let default_fg = color_to_normalized(self.theme.foreground);
         let default_bg = color_to_normalized(self.theme.background);
-        let cursor_color = color_to_normalized(self.theme.cursor);
+        let raw_cursor_color = color_to_normalized(self.theme.cursor);
+        let cursor_color = alt_screen_cursor_color(
+            raw_cursor_color,
+            default_fg,
+            policy.is_alt_screen,
+            policy.cursor_style,
+        );
         let selection_bg = {
             let accent = color_to_normalized(self.theme.accent);
             let mut c = [
@@ -360,7 +399,8 @@ impl MetalRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{primary_screen_mask_changed, primary_screen_row_hidden};
+    use super::{alt_screen_cursor_color, primary_screen_mask_changed, primary_screen_row_hidden};
+    use weft_core::grid::CursorStyle;
 
     #[test]
     fn primary_screen_mask_hides_unowned_rows_without_mutating_the_grid() {
@@ -379,5 +419,50 @@ mod tests {
         assert!(primary_screen_mask_changed(None, Some(5)));
         assert!(!primary_screen_mask_changed(Some(5), Some(5)));
         assert!(!primary_screen_mask_changed(None, None));
+    }
+
+    // ── v1.10.4: alt-screen cursor color softening ──────────────────────
+
+    #[test]
+    fn alt_screen_blends_underline_cursor_toward_foreground() {
+        let cursor = [0.94, 0.83, 0.66, 1.0]; // #f0d4a8 amber-white
+        let fg = [0.88, 0.83, 0.77, 1.0]; // #e0d4c4 warm cream
+        let softened = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Underline);
+        // 50% blend: each channel = (cursor + fg) / 2
+        for i in 0..3 {
+            assert!((softened[i] - (cursor[i] + fg[i]) * 0.5).abs() < 1e-6);
+        }
+        assert_eq!(softened[3], cursor[3], "alpha unchanged");
+    }
+
+    #[test]
+    fn alt_screen_keeps_block_cursor_at_full_intensity() {
+        let cursor = [0.94, 0.83, 0.66, 1.0];
+        let fg = [0.88, 0.83, 0.77, 1.0];
+        let result = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Block);
+        assert_eq!(
+            result, cursor,
+            "Block cursor keeps full intensity in alt-screen"
+        );
+    }
+
+    #[test]
+    fn primary_screen_keeps_cursor_at_full_intensity() {
+        let cursor = [0.94, 0.83, 0.66, 1.0];
+        let fg = [0.5, 0.5, 0.5, 1.0];
+        let result = alt_screen_cursor_color(cursor, fg, false, CursorStyle::Underline);
+        assert_eq!(
+            result, cursor,
+            "non-alt-screen keeps cursor at full intensity"
+        );
+    }
+
+    #[test]
+    fn alt_screen_bar_cursor_also_blended() {
+        let cursor = [0.94, 0.83, 0.66, 1.0];
+        let fg = [0.2, 0.2, 0.2, 1.0];
+        let result = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Bar);
+        assert_ne!(result, cursor, "Bar cursor is softened in alt-screen");
+        assert!(result[0] < cursor[0], "blended toward darker fg");
     }
 }

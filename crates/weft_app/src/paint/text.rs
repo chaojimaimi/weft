@@ -130,6 +130,11 @@ impl MetalRenderer {
                     selection,
                     char_index..grapheme_end,
                 );
+                // Note: unlike the grid/block-view paths, this call site is
+                // NOT exempted for terminal graphic glyphs (box drawing /
+                // block elements). It renders user-typed, syntax-highlighted
+                // prompt/command text — readable content — not TUI border
+                // cells, so the minimum-contrast boost always applies here.
                 let color = crate::paint::primitives::ensure_minimum_text_contrast(
                     source_color,
                     background,

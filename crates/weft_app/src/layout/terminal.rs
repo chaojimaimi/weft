@@ -42,6 +42,17 @@ pub fn terminal_content_cols(pane_width: f32, cell_w: f32) -> usize {
     ((content_width / cell_w).max(1.0)) as usize
 }
 
+/// v1.10.4: Full pane-width column count for alt-screen TUIs (vim/opencode/
+/// htop/less). Unlike [`terminal_content_cols`], this does NOT subtract the
+/// BlockView gutter — TUIs assume PTY cols = the visible terminal width and
+/// need every column to paint borders/layouts edge-to-edge.
+pub fn terminal_full_cols(pane_width: f32, cell_w: f32) -> usize {
+    if cell_w <= 0.0 || pane_width <= 0.0 {
+        return 1;
+    }
+    ((pane_width / cell_w).max(1.0)) as usize
+}
+
 // ── Prompt (editor input box) ─────────────────────────────────────────
 //
 // The input box sits at the bottom of the viewport. Its height grows with
