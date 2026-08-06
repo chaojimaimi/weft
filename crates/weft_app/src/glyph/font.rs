@@ -40,15 +40,19 @@ pub(super) fn drawable_glyphs_for_char(ct_font: &core_text::font::CTFont, ch: ch
     glyphs
 }
 
-/// Rasterize a color emoji (sbix bitmap) glyph to an alpha mask via CoreText +
-/// CoreGraphics. font-kit's `rasterize_glyph` cannot handle color bitmap fonts
-/// (Apple Color Emoji produces 0 pixels on A8/RGBA32 canvases). This bypasses
-/// font-kit by creating a color-supporting CGContext and using
+/// Rasterize a color emoji (sbix bitmap) glyph to premultiplied RGBA via
+/// CoreText + CoreGraphics. font-kit's `rasterize_glyph` cannot handle color
+/// bitmap fonts (Apple Color Emoji produces 0 pixels on A8/RGBA32 canvases).
+/// This bypasses font-kit by creating a color-supporting CGContext and using
 /// `CTFontDrawGlyphs` directly, which renders the sbix bitmap in full color.
-/// The RGBA result is reduced to a single alpha channel for the R8 atlas.
+///
+/// v1.10.4: the full RGBA is returned (premultiplied alpha, row-major, Y
+/// top-down as the atlas expects) instead of reducing to an alpha mask — the
+/// color atlas stores the emoji's own RGB. Callers must upload with
+/// bytes_per_pixel = 4 into the color texture.
 ///
 /// Returns `None` if the glyph cannot be found or rasterized.
-pub(super) fn rasterize_emoji_alpha(
+pub(super) fn rasterize_emoji_rgba(
     font: &Font,
     ch: char,
     scaled_size: f32,
@@ -96,27 +100,32 @@ pub(super) fn rasterize_emoji_alpha(
         .collect();
     ct_font.draw_glyphs(&glyphs, &positions, ctx.clone());
 
-    // Read RGBA → alpha mask with Y-flip (atlas is top-down).
+    // Read premultiplied RGBA with Y-flip (atlas is top-down). All 4 channels
+    // are kept — the color atlas stores the emoji's own RGB.
     let bpr = ctx.bytes_per_row();
     let raw = ctx.data();
-    let mut alpha = vec![0u8; w * h];
+    let mut rgba = vec![0u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
             let src_idx = y * bpr + x * 4;
             if src_idx + 3 < raw.len() {
                 let dst_y = h - 1 - y; // flip Y for top-down atlas
-                alpha[dst_y * w + x] = raw[src_idx + 3];
+                let dst_idx = (dst_y * w + x) * 4;
+                rgba[dst_idx] = raw[src_idx]; // R
+                rgba[dst_idx + 1] = raw[src_idx + 1]; // G
+                rgba[dst_idx + 2] = raw[src_idx + 2]; // B
+                rgba[dst_idx + 3] = raw[src_idx + 3]; // A (premultiplied)
             }
         }
     }
 
-    let nonzero = alpha.iter().filter(|&&p| p > 0).count();
+    let nonzero = rgba.iter().filter(|&&p| p > 0).count();
     if nonzero == 0 {
         tracing::warn!("emoji '{ch}' rasterized to 0 pixels via CoreText");
         return None;
     }
-    tracing::debug!("emoji '{ch}' rasterized: {nonzero} non-zero pixels");
-    Some(alpha)
+    tracing::debug!("emoji '{ch}' rasterized: {nonzero} non-zero bytes");
+    Some(rgba)
 }
 
 /// Resolve a font by family name via the system source, falling back to a list

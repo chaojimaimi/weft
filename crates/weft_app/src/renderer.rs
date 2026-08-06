@@ -267,6 +267,30 @@ pub struct MetalRenderer {
 impl MetalRenderer {
     // new() moved to paint/metal_backend.rs (M4 step 3).
 
+    /// v1.10.5/6: BlockView-mode TUI caret anchor — the grid cursor mapped
+    /// into the live block's snapshot text. v1.10.6 prefers the precisely
+    /// tracked snapshot line over the formula (which breaks when the
+    /// snapshot skips empty rows).
+    fn block_view_tui_cursor(
+        &self,
+        terminal: &Terminal,
+        grid: &weft_core::grid::Grid,
+    ) -> Option<(usize, usize)> {
+        let live = terminal.block_tracker().in_flight()?;
+        if !terminal.show_block_view() {
+            return None;
+        }
+        let tracked = terminal.primary_screen_cursor_snapshot_line();
+        let line = tracked.unwrap_or_else(|| {
+            crate::block_component::block_view_tui_cursor_line(
+                live.output.lines().count(),
+                terminal.grid().num_rows,
+                grid.cursor.row,
+            )
+        });
+        Some((line, grid.cursor.col))
+    }
+
     /// Draw the terminal Grid (and optional overlays) to screen.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
@@ -611,6 +635,9 @@ impl MetalRenderer {
                         cache_namespace: active_pane_session_id,
                         block_diagnose_state: &self.block_diagnose_state,
                         ai_configured: self.ai_configured,
+                        tui_cursor: None,
+                        tui_preedit: None,
+                        cursor_blink_on: false,
                     },
                     selection,
                 )
@@ -647,6 +674,23 @@ impl MetalRenderer {
                         cache_namespace: active_pane_session_id,
                         block_diagnose_state: &self.block_diagnose_state,
                         ai_configured: self.ai_configured,
+                        // v1.10.5: BlockView-mode TUI caret + IME preedit —
+                        // the grid cursor mapped into the live block's
+                        // snapshot text. Primary-screen TUIs (openclaw/pi)
+                        // input at their own bottom row; while the BlockView
+                        // renders the document the grid cursor is invisible,
+                        // so caret and marked text paint on the live row.
+                        // No in-flight block (e.g. prompt bootstrapping) →
+                        // no caret: there is no document row to anchor on.
+                        // v1.10.6: prefer the precisely-tracked cursor
+                        // snapshot line (from snapshot construction) over
+                        // the formula guess. The formula breaks when the
+                        // snapshot skips empty rows; the tracked value is
+                        // exact. Fallback to the formula + clamp when no
+                        // snapshot has been taken yet.
+                        tui_cursor: self.block_view_tui_cursor(terminal, grid),
+                        tui_preedit: tui_preedit.map(|p| (p.text, p.cursor)),
+                        cursor_blink_on,
                     },
                     selection,
                 )
@@ -785,8 +829,14 @@ impl MetalRenderer {
             vertices.extend_from_slice(&self.build_status_hint_vertices(terminal));
         }
 
+        // v1.10.6: only draw the grid-path TUI preedit in grid view. In
+        // BlockView the preedit is painted inside `build_block_view_vertices`
+        // (on the mapped live-block row); drawing it again here at the grid
+        // cursor position produces a duplicate preedit ("two pinyin strings").
         if let Some(preedit) = tui_preedit {
-            vertices.extend_from_slice(&self.build_tui_preedit_for_grid(preedit, grid));
+            if !show_blocks {
+                vertices.extend_from_slice(&self.build_tui_preedit_for_grid(preedit, grid));
+            }
         }
 
         // Overlay the editor input box at the bottom (Editor mode only).

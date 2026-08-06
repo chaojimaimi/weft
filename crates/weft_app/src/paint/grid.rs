@@ -269,38 +269,7 @@ impl MetalRenderer {
         let cache = self.grid_row_cache.borrow();
         let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
         for row_inst in cache.iter() {
-            batch.push_row(row_inst, &|ch, cluster| {
-                // v1.6.0: multi-scalar graphemes (EXTRA flag) resolve via
-                // the cluster atlas path; single-scalar cells use the
-                // fast `atlas.get(ch)` path.
-                if let Some(cluster) = cluster {
-                    if let Some(glyph) = self.atlas.get_cluster(cluster) {
-                        let (u, v) = glyph.uv_origin;
-                        let (uw, vh) = glyph.uv_size;
-                        return [u, v + vh, u + uw, v];
-                    }
-                    // Cluster not yet rasterized — fall through to lead char
-                    // so the cell isn't blank. The rasterization will happen
-                    // asynchronously via get_or_rasterize_cluster on a later
-                    // frame (or the cluster is already in cache from warmup).
-                }
-                let ch_resolved = if ch == '\0' { ' ' } else { ch };
-                if let Some(glyph) = self.atlas.get(ch_resolved) {
-                    let (u, v) = glyph.uv_origin;
-                    let (uw, vh) = glyph.uv_size;
-                    // V-swap compensates for CAMetalLayer's vertical flip
-                    // (same convention as the legacy single-stream path).
-                    [u, v + vh, u + uw, v]
-                } else {
-                    let (u, v) = self
-                        .atlas
-                        .get(' ')
-                        .map(|g| g.uv_origin)
-                        .unwrap_or((0.0, 0.0));
-                    let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-                    [u, v + vh, u + uw, v]
-                }
-            });
+            batch.push_row(row_inst, &|ch, cluster| self.resolve_glyph_uv(ch, cluster));
         }
         (batch, rebuilt_rows)
     }
@@ -368,32 +337,45 @@ impl MetalRenderer {
                 origin_x,
                 origin_y_base + row as f32 * ch,
             );
-            batch.push_row(&row_inst, &|ch, cluster| {
-                // v1.6.0: multi-scalar graphemes resolve via cluster atlas.
-                if let Some(cluster) = cluster {
-                    if let Some(glyph) = self.atlas.get_cluster(cluster) {
-                        let (u, v) = glyph.uv_origin;
-                        let (uw, vh) = glyph.uv_size;
-                        return [u, v + vh, u + uw, v];
-                    }
-                }
-                let ch_resolved = if ch == '\0' { ' ' } else { ch };
-                if let Some(glyph) = self.atlas.get(ch_resolved) {
-                    let (u, v) = glyph.uv_origin;
-                    let (uw, vh) = glyph.uv_size;
-                    [u, v + vh, u + uw, v]
-                } else {
-                    let (u, v) = self
-                        .atlas
-                        .get(' ')
-                        .map(|g| g.uv_origin)
-                        .unwrap_or((0.0, 0.0));
-                    let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
-                    [u, v + vh, u + uw, v]
-                }
-            });
+            batch.push_row(&row_inst, &|ch, cluster| self.resolve_glyph_uv(ch, cluster));
         }
         batch
+    }
+
+    /// Resolve a cell's glyph UV rect (+ color-atlas flag) from the atlas.
+    ///
+    /// v1.6.0: multi-scalar graphemes (EXTRA flag) resolve via the cluster
+    /// atlas path; single-scalar cells use the fast `atlas.get(ch)` path.
+    /// A cluster that hasn't been rasterized yet falls through to the lead
+    /// scalar so the cell isn't blank — the cluster rasterizes on a later
+    /// frame (or via warmup).
+    ///
+    /// v1.10.4: returns `is_color` for glyphs stored in the RGBA color
+    /// atlas (color emoji) so `push_row` can emit the fg.a=2.0 sentinel.
+    fn resolve_glyph_uv(&self, ch: char, cluster: Option<&str>) -> ([f32; 4], bool) {
+        if let Some(cluster) = cluster {
+            if let Some(glyph) = self.atlas.get_cluster(cluster) {
+                let (u, v) = glyph.uv_origin;
+                let (uw, vh) = glyph.uv_size;
+                return ([u, v + vh, u + uw, v], glyph.is_color);
+            }
+        }
+        let ch_resolved = if ch == '\0' { ' ' } else { ch };
+        if let Some(glyph) = self.atlas.get(ch_resolved) {
+            let (u, v) = glyph.uv_origin;
+            let (uw, vh) = glyph.uv_size;
+            // V-swap compensates for CAMetalLayer's vertical flip (same
+            // convention as the legacy single-stream path).
+            ([u, v + vh, u + uw, v], glyph.is_color)
+        } else {
+            let (u, v) = self
+                .atlas
+                .get(' ')
+                .map(|g| g.uv_origin)
+                .unwrap_or((0.0, 0.0));
+            let (uw, vh) = self.atlas.get(' ').map(|g| g.uv_size).unwrap_or((0.0, 0.0));
+            ([u, v + vh, u + uw, v], false)
+        }
     }
 }
 

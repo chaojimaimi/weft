@@ -14,13 +14,15 @@ use pathfinder_geometry::transform2d::Transform2F;
 use pathfinder_geometry::vector::{Vector2F, Vector2I};
 
 use super::atlas;
-use super::font::{is_emoji_char, rasterize_emoji_alpha};
 use super::special;
 use super::{GlyphAtlas, GlyphInfo};
 
 impl GlyphAtlas {
     /// Allocate a slot in the atlas (layout only, no pixel work).
     /// Advances the atlas cursor and returns UV/layout info for the slot.
+    ///
+    /// v1.10.4: `is_color` selects the RGBA color atlas (and its independent
+    /// allocator cursor) for color emoji; otherwise the R8 mask atlas.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn allocate_slot(
         is_wide: bool,
@@ -31,6 +33,7 @@ impl GlyphAtlas {
         next_x: &mut u32,
         next_y: &mut u32,
         row_height: &mut u32,
+        is_color: bool,
     ) -> Option<GlyphInfo> {
         let glyph_w = if is_wide { cell_w * 2 } else { cell_w };
 
@@ -62,6 +65,7 @@ impl GlyphAtlas {
             size: (glyph_w, cell_h),
             advance: glyph_w as f32,
             is_wide,
+            is_color,
         })
     }
 
@@ -132,16 +136,9 @@ impl GlyphAtlas {
             return pixels;
         }
 
-        // Emoji (color bitmap glyphs like 📁📄) cannot be rasterized by font-kit
-        // (it produces 0 pixels on A8). Use the CoreText/CG color path instead.
-        if is_emoji_char(ch) {
-            if let Some(alpha) =
-                rasterize_emoji_alpha(font, ch, scaled_size, glyph_w, cell_h, primary_descent_px)
-            {
-                return alpha;
-            }
-            // Fall through to font-kit if CoreText path fails.
-        }
+        // v1.10.4: color emoji no longer flow through this function — callers
+        // route them to `font::rasterize_emoji_rgba` (CoreText RGBA) and the
+        // color atlas. This path returns R8 alpha masks only.
 
         let mut canvas = Canvas::new(glyph_size, Format::A8);
 
@@ -176,6 +173,12 @@ impl GlyphAtlas {
     }
 
     /// Upload a glyph's pixel data to the Metal texture at the given UV origin.
+    /// Upload a glyph's pixel data into the atlas at the slot's UV origin.
+    ///
+    /// v1.10.4: `bytes_per_pixel` distinguishes the R8 mask atlas (1 B/px,
+    /// alpha-only) from the RGBA color atlas (4 B/px, premultiplied RGBA).
+    /// `bytes_per_row` = width × bytes_per_pixel.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn upload_region(
         texture: &metal::Texture,
         pixels: &[u8],
@@ -183,10 +186,12 @@ impl GlyphAtlas {
         uv_origin: (f32, f32),
         atlas_w: u32,
         atlas_h: u32,
+        bytes_per_pixel: u32,
     ) {
         let x = (uv_origin.0 * atlas_w as f32) as u64;
         let y = (uv_origin.1 * atlas_h as f32) as u64;
-        let height = (pixels.len() / width as usize) as u64;
+        let bytes_per_row = width as u64 * bytes_per_pixel as u64;
+        let height = pixels.len() as u64 / bytes_per_row.max(1);
 
         let region = MTLRegion {
             origin: metal::MTLOrigin { x, y, z: 0 },
@@ -201,7 +206,7 @@ impl GlyphAtlas {
             region,
             0,
             pixels.as_ptr() as *const std::ffi::c_void,
-            width as u64,
+            bytes_per_row,
         );
     }
 
@@ -275,6 +280,9 @@ impl GlyphAtlas {
             size: (glyph_w, cell_h),
             advance: glyph_w as f32,
             is_wide,
+            // Init-time pre-rasterization only covers ASCII + UI symbols,
+            // which all live in the R8 mask atlas.
+            is_color: false,
         })
     }
 
@@ -298,6 +306,20 @@ impl GlyphAtlas {
         let desc = TextureDescriptor::new();
         desc.set_texture_type(metal::MTLTextureType::D2);
         desc.set_pixel_format(MTLPixelFormat::R8Unorm);
+        desc.set_width(width as u64);
+        desc.set_height(height as u64);
+        desc.set_storage_mode(MTLStorageMode::Shared);
+        desc.set_usage(MTLTextureUsage::ShaderRead);
+
+        device.new_texture(&desc)
+    }
+
+    /// v1.10.4: RGBA8Unorm atlas texture for color emoji. Premultiplied-alpha
+    /// RGBA from CoreText is uploaded as-is; the shader unpacks it.
+    pub(super) fn create_color_texture(device: &Device, width: u32, height: u32) -> metal::Texture {
+        let desc = TextureDescriptor::new();
+        desc.set_texture_type(metal::MTLTextureType::D2);
+        desc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
         desc.set_width(width as u64);
         desc.set_height(height as u64);
         desc.set_storage_mode(MTLStorageMode::Shared);

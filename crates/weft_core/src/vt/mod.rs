@@ -358,7 +358,9 @@ impl Terminal {
         debug_assert!(!bytes.is_empty());
         let phase = self.block_tracker.phase();
         // Snap back to live viewport for new content — same gate as print().
-        if phase != ShellPhase::AtPrompt {
+        // Skipped while the user is browsing primary-screen TUI history so a
+        // redraw cannot yank the viewport back to the live bottom.
+        if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
             self.grid.scroll_offset = 0;
         }
         let capturing = !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting;
@@ -796,7 +798,9 @@ impl Terminal {
                 tracing::debug!(set, "DECOM origin mode toggled");
             }
             7 => { /* DECAWM — auto wrap mode, always on */ }
-            25 => self.cursor_visible = set, // DECTCEM — cursor show/hide
+            25 => {
+                self.cursor_visible = set; // DECTCEM — cursor show/hide
+            }
             47 | 1049 => {
                 // Swap only on a real state change.
                 if set != self.capabilities.alt_active {

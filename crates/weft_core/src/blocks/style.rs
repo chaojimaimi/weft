@@ -225,6 +225,17 @@ impl BlockTracker {
         self.phase = ShellPhase::AtPrompt;
     }
 
+    /// v1.10.7: reverse [`defer_screen_command_end`](Self::defer_screen_command_end).
+    /// A nested shell's `133;B` (internal command of a still-running
+    /// screen-owned TUI) cancels the pending exit; restore `CommandExecuting`
+    /// so the in-flight session block keeps capturing (via the screen
+    /// snapshot) instead of splitting per internal command.
+    pub fn resume_screen_command(&mut self) {
+        if self.screen_document_start.is_some() {
+            self.phase = ShellPhase::CommandExecuting;
+        }
+    }
+
     pub fn finish_deferred_screen_command(&mut self, exit_code: Option<i32>) {
         self.finalize(exit_code);
         self.phase = ShellPhase::AtPrompt;

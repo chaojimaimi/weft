@@ -92,6 +92,10 @@ impl MetalRenderer {
             let (u, v) = g.uv_origin;
             let (uw, vh) = g.uv_size;
             let cell_w = w as f32 * cw;
+            // v1.10.4: color emoji live in the RGBA color atlas — the shader
+            // routes them there via the fg.a=2.0 sentinel (fg itself is
+            // meaningless for color glyphs; the color comes from the atlas).
+            let fg = if g.is_color { [0.0, 0.0, 0.0, 2.0] } else { fg };
             push_quad(
                 vertices,
                 [px, y, px + cell_w, y + glyph_height],
@@ -153,6 +157,13 @@ impl MetalRenderer {
                     let (u, v) = g.uv_origin;
                     let (uw, vh) = g.uv_size;
                     let cell_w = w as f32 * cw;
+                    // v1.10.4: color emoji live in the RGBA color atlas —
+                    // same fg.a=2.0 sentinel as `push_text_with_height`.
+                    let color = if g.is_color {
+                        [0.0, 0.0, 0.0, 2.0]
+                    } else {
+                        color
+                    };
                     push_quad(
                         vertices,
                         [px, y, px + cell_w, y + self.cell_height() as f32],

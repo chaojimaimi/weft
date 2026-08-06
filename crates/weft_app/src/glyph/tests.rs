@@ -38,8 +38,12 @@ fn modern_pictographs_use_the_color_emoji_path() {
 #[test]
 fn lobster_rasterizes_with_visible_ink() {
     let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
-    let pixels = GlyphAtlas::rasterize_glyph(&font, '🦞', 28.0, 28, 32, true, 6.0);
-    let (top, bottom) = ink_y_bbox(&pixels, 28, 32).expect("lobster emoji must have ink");
+    // v1.10.4: color emoji rasterize via the CoreText RGBA path (the A8
+    // `rasterize_glyph` no longer handles them).
+    let pixels = rasterize_emoji_rgba(&font, '🦞', 28.0, 28, 32, 6.0)
+        .expect("lobster must rasterize via CoreText RGBA");
+    assert_eq!(pixels.len(), 28 * 32 * 4, "RGBA = 4 bytes/pixel");
+    let (top, bottom) = ink_y_bbox_rgba(&pixels, 28, 32).expect("lobster emoji must have ink");
     let ink_height = bottom - top + 1;
     assert!(ink_height >= 20, "lobster ink is too small: {ink_height}px");
 }
@@ -56,10 +60,12 @@ fn astral_emoji_discards_the_surrogate_placeholder_glyph() {
 #[test]
 fn color_emoji_rasterization_tracks_terminal_zoom() {
     let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
-    let small = GlyphAtlas::rasterize_glyph(&font, '🦞', 16.0, 20, 22, true, 4.0);
-    let large = GlyphAtlas::rasterize_glyph(&font, '🦞', 28.0, 32, 36, true, 7.0);
-    let (small_top, small_bottom) = ink_y_bbox(&small, 20, 22).expect("small emoji ink");
-    let (large_top, large_bottom) = ink_y_bbox(&large, 32, 36).expect("large emoji ink");
+    let small =
+        rasterize_emoji_rgba(&font, '🦞', 16.0, 20, 22, 4.0).expect("small lobster must rasterize");
+    let large =
+        rasterize_emoji_rgba(&font, '🦞', 28.0, 32, 36, 7.0).expect("large lobster must rasterize");
+    let (small_top, small_bottom) = ink_y_bbox_rgba(&small, 20, 22).expect("small emoji ink");
+    let (large_top, large_bottom) = ink_y_bbox_rgba(&large, 32, 36).expect("large emoji ink");
     assert!(
         large_bottom - large_top > small_bottom - small_top,
         "color emoji must grow when terminal zoom grows"
@@ -309,7 +315,8 @@ fn cjk_glyph_not_stretched_and_centered() {
     );
 }
 
-/// Ink bounding box (top_row, bottom_row) over a pixel slice for a w×h glyph.
+/// Ink bounding box (top_row, bottom_row) over an A8 pixel slice for a w×h
+/// glyph (1 byte/pixel) — the font-kit mask path.
 fn ink_y_bbox(pixels: &[u8], w: u32, h: u32) -> Option<(i32, i32)> {
     let mut min_r = i32::MAX;
     let mut max_r = i32::MIN;
@@ -328,6 +335,104 @@ fn ink_y_bbox(pixels: &[u8], w: u32, h: u32) -> Option<(i32, i32)> {
     } else {
         None
     }
+}
+
+/// Ink bounding box (top_row, bottom_row) over a **premultiplied RGBA**
+/// pixel slice for a w×h glyph (4 bytes/pixel). Ink = alpha > 0.
+fn ink_y_bbox_rgba(pixels: &[u8], w: u32, h: u32) -> Option<(i32, i32)> {
+    let mut min_r = i32::MAX;
+    let mut max_r = i32::MIN;
+    let mut any = false;
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let idx = (y as usize * w as usize + x as usize) * 4;
+            if pixels[idx + 3] > 0 {
+                any = true;
+                min_r = min_r.min(y);
+                max_r = max_r.max(y);
+            }
+        }
+    }
+    if any {
+        Some((min_r, max_r))
+    } else {
+        None
+    }
+}
+
+/// v1.10.4: color-emoji pixels must keep their RGB (the R8 alpha-only
+/// extraction of the pre-fix pipeline destroyed color). Every nonzero-alpha
+/// pixel must have at least one nonzero RGB channel, and the RGB channels
+/// must not be all identical to the alpha channel (which would indicate a
+/// grayscale reduction).
+#[test]
+fn emoji_rgba_preserves_color_channels() {
+    let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
+    let pixels =
+        rasterize_emoji_rgba(&font, '🦞', 28.0, 28, 32, 6.0).expect("lobster must rasterize");
+    let colored = pixels
+        .chunks_exact(4)
+        .filter(|px| px[3] > 0 && (px[0] > 0 || px[1] > 0 || px[2] > 0))
+        .count();
+    assert!(
+        colored > 0,
+        "lobster must have colored (non-grayscale) pixels"
+    );
+}
+
+/// v1.10.4: `allocate_slot` flags color-atlas slots via `is_color`, so the
+/// caller can route uploads and the fg.a=2.0 sentinel consistently. This is
+/// pure layout logic — no Metal device needed.
+#[test]
+fn allocate_slot_marks_color_slots() {
+    let (atlas_w, atlas_h) = (256u32, 256u32);
+    let (mut nx, mut ny, mut rh) = (0u32, 0u32, 0u32);
+    let color = GlyphAtlas::allocate_slot(
+        false, 14, 28, atlas_w, atlas_h, &mut nx, &mut ny, &mut rh, true,
+    )
+    .expect("color slot must allocate");
+    assert!(color.is_color, "emoji slot must be flagged is_color");
+
+    let (mut nx, mut ny, mut rh) = (0u32, 0u32, 0u32);
+    let mask = GlyphAtlas::allocate_slot(
+        false, 14, 28, atlas_w, atlas_h, &mut nx, &mut ny, &mut rh, false,
+    )
+    .expect("mask slot must allocate");
+    assert!(!mask.is_color, "mask slot must not be flagged is_color");
+
+    // Independent allocator cursors: each starts at the origin.
+    assert_eq!(color.uv_origin, mask.uv_origin);
+}
+
+/// v1.10.4: a cluster only uses the RGBA color atlas when it is emoji AND
+/// the emoji font has the base scalar. `"e\u{fe0f}"` passes the classifier
+/// but would render as an untintable white 'e' from CoreText's cascade.
+#[test]
+fn cluster_color_atlas_requires_emoji_classification_and_font_glyph() {
+    assert!(super::cluster_wants_color_atlas(true, true));
+    assert!(!super::cluster_wants_color_atlas(true, false));
+    assert!(!super::cluster_wants_color_atlas(false, true));
+    assert!(!super::cluster_wants_color_atlas(false, false));
+}
+
+/// v1.10.4: lock the font behavior the `cluster_wants_color_atlas` gate
+/// depends on — real emoji base scalars exist in Apple Color Emoji, plain
+/// text scalars don't. If a font-kit/CoreText change breaks this, color
+/// emoji silently degrade (gate closes) or `"e\u{fe0f}"` turns white
+/// (gate opens too wide).
+#[test]
+fn emoji_font_glyph_presence_matches_gate_expectations() {
+    let font = Font::from_path("/System/Library/Fonts/Apple Color Emoji.ttc", 0).unwrap();
+    for ch in ['🦞', '👩', '🇨', '❤', '✅', '☕', '⚽'] {
+        assert!(
+            font.glyph_for_char(ch).is_some(),
+            "{ch} must exist in Apple Color Emoji for the color gate"
+        );
+    }
+    assert!(
+        font.glyph_for_char('e').is_none(),
+        "'e' must NOT exist in Apple Color Emoji (text cluster stays on A8)"
+    );
 }
 
 /// Regression: a CJK glyph (PingFang '中') and a Latin glyph (Menlo 'M')

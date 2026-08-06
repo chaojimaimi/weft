@@ -24,7 +24,20 @@ mod rasterize;
 mod special;
 mod tests;
 
-use font::{is_emoji_char, nonzero_cell_dimension, resolve_font};
+use font::{is_emoji_char, nonzero_cell_dimension, rasterize_emoji_rgba, resolve_font};
+
+/// v1.10.4: a cluster renders via the RGBA color atlas only when it is
+/// classified emoji **and** the emoji font contains the base scalar.
+///
+/// Clusters like `"e\u{fe0f}"` pass the `is_emoji_char || contains(fe0f)`
+/// classifier, but the emoji font has no 'e' — CoreText cascades and draws
+/// a white text glyph that can't be fg-tinted. Those stay on the A8 mask
+/// path so normal foreground coloring applies. Real emoji (🦞, 👩🏽, 🇨🇳,
+/// ❤️) all have base scalars in Apple Color Emoji (probe-verified) and
+/// keep the color path.
+fn cluster_wants_color_atlas(is_emoji: bool, emoji_font_has_base: bool) -> bool {
+    is_emoji && emoji_font_has_base
+}
 
 /// UV rect for a glyph in the atlas texture.
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +53,11 @@ pub struct GlyphInfo {
     pub advance: f32,
     /// Whether this glyph occupies double width (CJK).
     pub is_wide: bool,
+    /// v1.10.4: whether this glyph's pixels live in the RGBA color atlas
+    /// (color emoji — Apple Color Emoji sbix bitmaps) instead of the R8
+    /// alpha-mask atlas. Color glyphs carry their own RGB; the instance's
+    /// `fg` is ignored (a sentinel alpha encodes this to the shader).
+    pub is_color: bool,
 }
 
 /// v1.6.0 step 6: LRU-tracked entry in the cluster cache. Each entry carries
@@ -77,6 +95,13 @@ pub struct ClusterCacheStats {
 /// Pre-rasterized glyph atlas uploaded to a Metal texture.
 pub struct GlyphAtlas {
     texture: metal::Texture,
+    /// v1.10.4: RGBA8Unorm atlas for color emoji (Apple Color Emoji sbix
+    /// bitmaps carry their own RGB; the R8 mask atlas cannot store color).
+    /// Same dimensions / row-packing as `texture` but with an independent
+    /// cursor (color glyphs are rare, so their own allocator keeps the R8
+    /// layout dense). UVs live in [0,1] of whichever texture `GlyphInfo`
+    /// points into, selected by `GlyphInfo::is_color`.
+    color_texture: metal::Texture,
     cache: HashMap<char, GlyphInfo>,
     /// v1.0 P1.5-B3: Direct-indexed lookup for ASCII chars (0..=127).
     /// Terminal output is overwhelmingly ASCII (digits, letters, punctuation,
@@ -119,6 +144,10 @@ pub struct GlyphAtlas {
     next_y: u32,
     /// Row height for current atlas row.
     row_height: u32,
+    /// v1.10.4: independent allocator cursor for the RGBA color atlas.
+    color_next_x: u32,
+    color_next_y: u32,
+    color_row_height: u32,
     /// Primary font (Menlo for Latin).
     primary_font: Font,
     /// CJK fallback font (PingFang SC).
@@ -252,6 +281,10 @@ impl GlyphAtlas {
         // Create Metal texture and upload atlas
         let texture = Self::create_texture(device, atlas_w, atlas_h);
         Self::upload_pixels(&texture, &atlas_pixels, atlas_w, atlas_h);
+        // v1.10.4: RGBA color atlas for color emoji. Same size as the mask
+        // atlas; its own allocator cursor keeps the R8 layout dense (color
+        // glyphs are rare — a handful of emoji per session).
+        let color_texture = Self::create_color_texture(device, atlas_w, atlas_h);
 
         info!(
             "Glyph atlas created: {}x{} texture, {} glyphs cached",
@@ -267,6 +300,7 @@ impl GlyphAtlas {
         // rows (visible in `ls -l` output with Chinese filenames).
         Self {
             texture,
+            color_texture,
             cache,
             ascii,
             cluster_cache: HashMap::new(),
@@ -281,6 +315,9 @@ impl GlyphAtlas {
             next_x,
             next_y,
             row_height,
+            color_next_x: 0,
+            color_next_y: 0,
+            color_row_height: 0,
             primary_font,
             cjk_font: None,
             cjk_family: font_config.cjk_family.clone(),
@@ -371,43 +408,90 @@ impl GlyphAtlas {
             }
         };
 
-        // Step 1: Allocate atlas slot (layout only, no pixel work)
-        let info = Self::allocate_slot(
-            is_wide,
-            self.cell_width,
-            self.cell_height,
-            self.atlas_w,
-            self.atlas_h,
-            &mut self.next_x,
-            &mut self.next_y,
-            &mut self.row_height,
-        )?;
+        // Step 1: Allocate atlas slot (layout only, no pixel work). Color
+        // emoji get a slot in the RGBA color atlas (independent allocator);
+        // everything else uses the R8 mask atlas.
+        let info = if is_emoji {
+            Self::allocate_slot(
+                is_wide,
+                self.cell_width,
+                self.cell_height,
+                self.atlas_w,
+                self.atlas_h,
+                &mut self.color_next_x,
+                &mut self.color_next_y,
+                &mut self.color_row_height,
+                true,
+            )?
+        } else {
+            Self::allocate_slot(
+                is_wide,
+                self.cell_width,
+                self.cell_height,
+                self.atlas_w,
+                self.atlas_h,
+                &mut self.next_x,
+                &mut self.next_y,
+                &mut self.row_height,
+                false,
+            )?
+        };
 
-        // Step 2: Rasterize the glyph once
+        // Step 2: Rasterize the glyph once. Color emoji go through the
+        // CoreText RGBA path (their own RGB is stored in the color atlas);
+        // everything else through the font-kit A8 mask path.
         let glyph_w = if is_wide {
             self.cell_width * 2
         } else {
             self.cell_width
         };
-        let pixels = Self::rasterize_glyph(
-            font,
-            ch,
-            self.scaled_size,
-            glyph_w,
-            self.cell_height,
-            is_wide,
-            self.primary_descent_px,
-        );
+        let pixels = if is_emoji {
+            // Fall back to a fully transparent slot if CoreText can't draw
+            // the emoji — a blank is safer than a garbage atlas sample.
+            font::rasterize_emoji_rgba(
+                font,
+                ch,
+                self.scaled_size,
+                glyph_w,
+                self.cell_height,
+                self.primary_descent_px,
+            )
+            .unwrap_or_else(|| vec![0u8; (glyph_w * self.cell_height * 4) as usize])
+        } else {
+            Self::rasterize_glyph(
+                font,
+                ch,
+                self.scaled_size,
+                glyph_w,
+                self.cell_height,
+                is_wide,
+                self.primary_descent_px,
+            )
+        };
 
-        // Step 3: Upload to Metal texture
-        Self::upload_region(
-            &self.texture,
-            &pixels,
-            info.size.0,
-            info.uv_origin,
-            self.atlas_w,
-            self.atlas_h,
-        );
+        // Step 3: Upload to Metal texture — color emoji into the RGBA atlas
+        // (4 B/px), everything else into the R8 mask atlas (1 B/px).
+        if is_emoji {
+            Self::upload_region(
+                &self.color_texture,
+                &pixels,
+                info.size.0,
+                info.uv_origin,
+                self.atlas_w,
+                self.atlas_h,
+                4,
+            );
+        } else {
+            Self::upload_region(
+                &self.texture,
+                &pixels,
+                info.size.0,
+                info.uv_origin,
+                self.atlas_w,
+                self.atlas_h,
+                1,
+            );
+        }
 
         // v1.0 P1.5-B3: ASCII chars are mirrored into the direct-index array
         // (alongside `cache`) so future `get()` calls hit the O(1) fast path
@@ -539,17 +623,44 @@ impl GlyphAtlas {
             &self.primary_font
         };
 
-        // Allocate atlas slot (layout only).
-        let info = Self::allocate_slot(
-            is_wide,
-            self.cell_width,
-            self.cell_height,
-            self.atlas_w,
-            self.atlas_h,
-            &mut self.next_x,
-            &mut self.next_y,
-            &mut self.row_height,
-        )?;
+        // v1.10.4: only emoji clusters whose base scalar the emoji font
+        // actually contains go to the RGBA color atlas (see
+        // `cluster_wants_color_atlas`). Everything else stays on the R8
+        // mask atlas so fg tinting still applies.
+        let color_emoji = cluster_wants_color_atlas(
+            is_emoji,
+            self.emoji_font
+                .as_ref()
+                .is_some_and(|f| f.glyph_for_char(base_char).is_some()),
+        );
+
+        // Allocate atlas slot (layout only). Emoji clusters go into the RGBA
+        // color atlas; other clusters (CJK+combining marks) use the R8 atlas.
+        let info = if color_emoji {
+            Self::allocate_slot(
+                is_wide,
+                self.cell_width,
+                self.cell_height,
+                self.atlas_w,
+                self.atlas_h,
+                &mut self.color_next_x,
+                &mut self.color_next_y,
+                &mut self.color_row_height,
+                true,
+            )?
+        } else {
+            Self::allocate_slot(
+                is_wide,
+                self.cell_width,
+                self.cell_height,
+                self.atlas_w,
+                self.atlas_h,
+                &mut self.next_x,
+                &mut self.next_y,
+                &mut self.row_height,
+                false,
+            )?
+        };
 
         let glyph_w = if is_wide {
             self.cell_width * 2
@@ -557,7 +668,9 @@ impl GlyphAtlas {
             self.cell_width
         };
 
-        // Shape + rasterize the full cluster via CoreText CTLine.
+        // Shape + rasterize the full cluster via CoreText CTLine. Color emoji
+        // clusters keep their RGBA pixels for the color atlas; text clusters
+        // (combining marks) reduce to an alpha mask for the R8 atlas.
         let pixels = cluster::rasterize_cluster_alpha(
             font,
             cluster,
@@ -565,6 +678,7 @@ impl GlyphAtlas {
             glyph_w,
             self.cell_height,
             self.primary_descent_px,
+            color_emoji,
         );
 
         let pixels = match pixels {
@@ -572,27 +686,53 @@ impl GlyphAtlas {
             None => {
                 // Cluster couldn't be shaped — fall back to rasterizing the
                 // lead scalar alone so the cell renders something visible
-                // (v1.5 behavior) instead of a blank slot.
-                Self::rasterize_glyph(
-                    font,
-                    base_char,
-                    self.scaled_size,
-                    glyph_w,
-                    self.cell_height,
-                    is_wide,
-                    self.primary_descent_px,
-                )
+                // (v1.5 behavior) instead of a blank slot. The fallback must
+                // produce the same pixel format the upload below expects.
+                if color_emoji {
+                    rasterize_emoji_rgba(
+                        font,
+                        base_char,
+                        self.scaled_size,
+                        glyph_w,
+                        self.cell_height,
+                        self.primary_descent_px,
+                    )
+                    .unwrap_or_else(|| vec![0u8; (glyph_w * self.cell_height * 4) as usize])
+                } else {
+                    Self::rasterize_glyph(
+                        font,
+                        base_char,
+                        self.scaled_size,
+                        glyph_w,
+                        self.cell_height,
+                        is_wide,
+                        self.primary_descent_px,
+                    )
+                }
             }
         };
 
-        Self::upload_region(
-            &self.texture,
-            &pixels,
-            info.size.0,
-            info.uv_origin,
-            self.atlas_w,
-            self.atlas_h,
-        );
+        if color_emoji {
+            Self::upload_region(
+                &self.color_texture,
+                &pixels,
+                info.size.0,
+                info.uv_origin,
+                self.atlas_w,
+                self.atlas_h,
+                4,
+            );
+        } else {
+            Self::upload_region(
+                &self.texture,
+                &pixels,
+                info.size.0,
+                info.uv_origin,
+                self.atlas_w,
+                self.atlas_h,
+                1,
+            );
+        }
 
         let key = Arc::from(cluster);
         // v1.6.0 step 6: store with current access counter as last_used.
@@ -618,6 +758,13 @@ impl GlyphAtlas {
     /// Get the Metal atlas texture.
     pub fn texture(&self) -> &metal::Texture {
         &self.texture
+    }
+
+    /// v1.10.4: Get the RGBA color atlas texture (color emoji). The renderer
+    /// binds it at fragment texture index 1 and the shader selects it when
+    /// `GlyphInfo::is_color` is set (via the fg.a sentinel).
+    pub fn color_texture(&self) -> &metal::Texture {
+        &self.color_texture
     }
 
     /// v1.6.0 step 6: Snapshot of cluster cache performance counters for

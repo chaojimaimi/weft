@@ -152,6 +152,9 @@ impl MetalRenderer {
                         cache_namespace: pane.pane_session_id,
                         block_diagnose_state: &std::collections::HashMap::new(),
                         ai_configured: false,
+                        tui_cursor: None,
+                        tui_preedit: None,
+                        cursor_blink_on: false,
                     },
                     &mut selection,
                 );

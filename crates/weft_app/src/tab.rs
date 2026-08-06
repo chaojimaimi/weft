@@ -634,9 +634,55 @@ impl Tab {
         if data.is_empty() {
             return Ok(());
         }
-        // A history view remains sticky even at offset zero. Genuine PTY
-        // input is the semantic boundary for returning to the live TUI.
-        self.snap_to_bottom();
+        // Genuine PTY input is the semantic boundary for returning to the
+        // live view — EXCEPT while a command is executing. During
+        // CommandExecuting, keystrokes are input TO the running program (a
+        // primary-screen TUI like openclaw, or an interactive prompt), not a
+        // request to leave history browsing. Snapping here would clear
+        // `primary_history_view`, and when the program's redraw then crosses
+        // the TUI detection threshold, `show_block_view()` flips to the live
+        // grid mid-interaction — the openclaw "jump to top" symptom. The
+        // redraw_controller's follow logic already snaps on fresh output when
+        // appropriate, so this snap is redundant during execution anyway.
+        let executing = self.terminal.as_ref().is_some_and(|t| {
+            t.block_tracker().phase() == weft_core::blocks::ShellPhase::CommandExecuting
+        });
+        if !executing {
+            self.snap_to_bottom();
+        } else if self
+            .terminal
+            .as_ref()
+            .is_some_and(weft_core::vt::Terminal::is_alt_screen_active)
+        {
+            // Round 4 review (LOW-1): inside an alternate-screen child
+            // (vim/less) the BlockView is not rendered — a snapshot bypass
+            // window has no consumer. Keep the keystroke from arming a
+            // window that would only rescan the frozen primary document.
+        } else {
+            // v1.10.4: EVERY keystroke during execution drives the running
+            // program's repaint. A screen-owned primary-screen TUI (openclaw)
+            // has suspended print capture, so its live block updates only via
+            // snapshot refresh — arm the rate-limit bypass window on every
+            // keystroke, whether or not the user is browsing history. Without
+            // this, a keypress right after the user scrolled back to the tail
+            // (history browsing off) is gated by the 50ms snapshot rate limit
+            // and the selection change lags a blink (the persistent flicker).
+            // The redraw's split pty batches (cursor-move header, then
+            // content) each get an unthrottled snapshot inside the window.
+            self.primary_history_refresh.arm_force();
+            // v1.10.6: also refresh the snapshot NOW (synchronously) so the
+            // precise cursor line is available for the next paint frame —
+            // even if no PTY output arrives (e.g. IME preedit before commit,
+            // or a TUI that redraws on the next vsync). Without this the
+            // cursor_snapshot_line stays None until the force window is
+            // consumed, and the caret/preedit fall back to the imprecise
+            // formula (which lands on the wrong row).
+            if let Some(terminal) = self.terminal.as_mut() {
+                if terminal.show_block_view() {
+                    terminal.snapshot_primary_screen_output_for_caret();
+                }
+            }
+        }
         let pane = self.active_mut();
         if let Some(terminal) = &mut pane.terminal {
             terminal.cancel_primary_screen_interrupt_capture();
@@ -715,7 +761,16 @@ impl Tab {
             }
         }
 
-        need_redraw |= self.refresh_primary_history_snapshot(processed_pty_output);
+        // v1.10.4: a keypress opened the bypass window — publish the snapshot
+        // now that this frame's repaint bytes are processed. Gated on
+        // `processed_pty_output` so wakeups with no pty data skip the scan.
+        need_redraw |= if processed_pty_output && self.primary_history_refresh.take_force() {
+            self.terminal
+                .as_mut()
+                .is_some_and(weft_core::vt::Terminal::refresh_primary_history_snapshot_now)
+        } else {
+            self.refresh_primary_history_snapshot(processed_pty_output)
+        };
         let mut drained = Vec::new();
         let mut reset_scroll = false;
         if let Some(terminal) = &mut self.terminal {

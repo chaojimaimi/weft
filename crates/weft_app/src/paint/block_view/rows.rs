@@ -65,6 +65,9 @@ impl MetalRenderer {
             cache_namespace: _,
             block_diagnose_state,
             ai_configured: _,
+            tui_cursor: _,
+            tui_preedit: _,
+            cursor_blink_on: _,
         } = model;
 
         let cw = self.cell_width() as f32;

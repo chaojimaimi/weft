@@ -133,6 +133,9 @@ impl super::MetalRenderer {
 
         let ranges = self.pane_instance_ranges.borrow();
         let atlas_tex = self.atlas.texture();
+        // v1.10.4: RGBA color atlas for color emoji, sampled at texture(1)
+        // when a glyph instance carries the fg.a=2.0 sentinel.
+        let color_tex = self.atlas.color_texture();
         let glyph_ring = self.instance_ring.borrow();
         let bg_ring = self.bg_stream.ring.borrow();
 
@@ -158,6 +161,7 @@ impl super::MetalRenderer {
                 encoder.set_vertex_buffer(2, Some(&glyph_ring[glyph_ring_idx]), 0);
                 encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
                 encoder.set_fragment_texture(0, Some(atlas_tex));
+                encoder.set_fragment_texture(1, Some(color_tex));
                 encoder.set_fragment_sampler_state(0, Some(&self.sampler));
                 let glyph_count = glyph_instances.len() / 16;
                 encoder.draw_indexed_primitives_instanced(
@@ -214,6 +218,7 @@ impl super::MetalRenderer {
                     encoder.set_vertex_buffer(2, Some(&glyph_ring[glyph_ring_idx]), 0);
                     encoder.set_vertex_bytes(1, 8, vp_data.as_ptr() as *const _);
                     encoder.set_fragment_texture(0, Some(atlas_tex));
+                    encoder.set_fragment_texture(1, Some(color_tex));
                     encoder.set_fragment_sampler_state(0, Some(&self.sampler));
                     let glyph_start_instance = glyph_start / 16;
                     let glyph_instance_count = (glyph_end - glyph_start) / 16;

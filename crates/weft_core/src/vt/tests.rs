@@ -47,12 +47,14 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
 
     // Claude Code enables color-scheme reporting and then paints its primary
     // screen with absolute cursor moves instead of entering DEC 1049.
-    t.process(b"\x1b[?2031h\x1b[6G");
+    // v1.10.5: CUP (`H`) — CHR (`G`) is horizontal-only and no longer
+    // absolute evidence (pi's input-line redraw false-positive).
+    t.process(b"\x1b[?2031h\x1b[H");
     assert!(
         t.show_block_view(),
         "one absolute move is not enough evidence"
     );
-    t.process(b"\x1b[13G");
+    t.process(b"\x1b[2;1H");
     assert!(t.primary_screen_app_active());
     assert!(!t.show_block_view());
     t.set_primary_history_view(true);
@@ -1535,6 +1537,110 @@ fn new_output_resets_scroll_offset() {
 }
 
 #[test]
+fn tui_redraw_preserves_scroll_offset_while_browsing_history() {
+    // v1.10.4: while the user browses history of a primary-screen TUI
+    // (openclaw/Claude Code — phase NotIntegrated, no alt-screen), the TUI's
+    // redraw output must NOT reset grid.scroll_offset. Before the fix, every
+    // printed char during a redraw snapped the viewport back to the live
+    // bottom, so pressing arrow keys inside the TUI (which trigger a redraw)
+    // yanked the view up to the top.
+    let mut t = Terminal::new(5, 20);
+    // Establish TUI ownership: shell integration 133;C (→ CommandExecuting)
+    // + relative cursor moves (openclaw redraw pattern). `screen_owner`
+    // classifies by cursor-addressing volume within CommandExecuting.
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07tui\x1b]133;C\x07");
+    t.process(b"\x1b[2A\x1b[3B");
+    assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
+
+    // User enters history browsing mode, THEN scrolls up into history.
+    // (Entering resets scroll_offset to 0 by design — the browsing offset
+    // is established after the mode is active.)
+    t.set_primary_history_view(true);
+    for i in 0..10 {
+        t.process(format!("history-row-{i}\r\n").as_bytes());
+    }
+    t.grid_mut().scroll_up_history(3);
+    assert!(t.grid().is_scrolled(), "precondition: scrolled up");
+    let scrolled_offset = t.grid().scroll_offset;
+
+    // TUI redraws (relative move + erase + text) while user browses history.
+    t.process(b"\x1b[999D\x1b[3A\x1b[3B\x1b[Joption-a\r\noption-b\r\n");
+    assert_eq!(
+        t.grid().scroll_offset,
+        scrolled_offset,
+        "TUI redraw must NOT reset scroll_offset while browsing history"
+    );
+
+    // But plain (non-history) output still resets — the normal path is intact.
+    t.set_primary_history_view(false);
+    t.process(b"X");
+    assert_eq!(
+        t.grid().scroll_offset,
+        0,
+        "plain output still resets offset"
+    );
+}
+
+#[test]
+fn large_cuu_clamps_cursor_and_repaints_visible_rows() {
+    // v1.10.4: a TUI redraw that moves the cursor far above the viewport
+    // (openclaw's `\x1b[999D\x1b[1027A` "back to my document top" pattern)
+    // clamps the cursor at row 0 — the repaint writes into the live
+    // viewport rows, which the renderer reads via `cell()` (offset 0 →
+    // live rows). The UI must be fully visible, exactly like xterm/tmux.
+    let mut t = Terminal::with_scrollback(10, 40, 2000);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
+    for i in 0..50 {
+        t.process(format!("anim-row-{i}\r\n").as_bytes());
+    }
+    assert_eq!(t.grid().scroll_offset, 0);
+    assert_eq!(t.grid().cursor.row, 9, "cursor at viewport bottom");
+
+    // Redraw: CUB 999 + CUU 1027 clamps at row 0; ED + repaint.
+    t.process(b"\x1b[999D\x1b[1027A\x1b[Joption-a\r\noption-b\r\n");
+    assert_eq!(t.grid().cursor.row, 2);
+    assert_eq!(t.grid().scroll_offset, 0, "clamp must not scroll");
+    // The renderer reads through `cell()` (offset-mapped): at offset 0 the
+    // live rows ARE the visible window, so the repaint is what the user sees.
+    assert_eq!(
+        t.grid().cell(0, 0).character,
+        'o',
+        "repaint must be visible at the top of the live viewport"
+    );
+    let mut row0 = String::new();
+    for col in 0..20 {
+        row0.push(t.grid().cell(0, col).character);
+    }
+    assert_eq!(row0.trim(), "option-a");
+}
+
+#[test]
+fn custom_scroll_region_clamps_cursor_without_viewport_scroll() {
+    // A large CUU inside a custom scroll region clamps at the region top —
+    // the viewport never moves (standard DECSTBM behavior).
+    let mut t = Terminal::with_scrollback(10, 40, 2000);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07cmd\x1b]133;C\x07");
+    for i in 0..50 {
+        t.process(format!("row-{i}\r\n").as_bytes());
+    }
+    assert_eq!(t.grid().cursor.row, 9);
+
+    // Custom region rows 2..=8 (1-based) = 1..=8 (0-based), cursor inside.
+    t.process(b"\x1b[2;9r\x1b[2;5H");
+    t.process(b"\x1b[999D\x1b[1027A");
+    assert_eq!(
+        t.grid().cursor.row,
+        1,
+        "cursor clamps at the custom region top"
+    );
+    assert_eq!(
+        t.grid().scroll_offset,
+        0,
+        "custom-region CUU must not scroll the viewport"
+    );
+}
+
+#[test]
 fn alt_screen_enter_clear_and_exit_restores() {
     let mut t = Terminal::new(5, 10);
     t.process(b"hello");
@@ -1872,6 +1978,95 @@ fn osc_133_end_with_exit_code() {
     assert_eq!(
         t.shell_markers()[0],
         ShellMarker::CommandEnd { exit_code: 42 }
+    );
+}
+
+/// v1.10.7 regression: a screen-owned TUI session whose shell integration
+/// runs INSIDE the app (pi spawns an interactive zsh that inherits
+/// `WEFT_SHELL_INTEGRATION`) re-emits the OSC 133 markers per internal
+/// command. Each `133;D` + `133;A` precmd pair used to defer a primary-screen
+/// exit, and the next `133;B` settled it immediately — finalizing the session
+/// block per internal command (one prompt split into many blocks). The
+/// nested markers must keep ONE in-flight block until the TUI really exits.
+#[test]
+fn nested_shell_markers_do_not_split_screen_session_blocks() {
+    let mut t = Terminal::new(10, 40);
+    // User starts pi (screen-owned TUI, DEC 2026 sync + relative moves).
+    // The typed command echoes to the grid BEFORE preexec emits 133;B, so
+    // `snapshot_command_line` captures "pi" as the pending command.
+    t.process(b"\x1b]133;A\x07pi\r");
+    t.process(b"\x1b]133;B\x07\x1b]133;C\x07");
+    t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+    assert!(t.primary_screen_app_active(), "TUI detected");
+    assert!(
+        t.block_tracker().screen_document_start().is_some(),
+        "screen ownership begun"
+    );
+    let blocks_before = t.block_tracker().blocks().len();
+
+    // pi internal command #1: nested zsh precmd (D;0 + A) then preexec (B+C).
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert_eq!(
+        t.block_tracker().phase(),
+        ShellPhase::CommandExecuting,
+        "the 133;D→133;A pair must not drop the session out of execution"
+    );
+    t.process(b"echo hi\x1b]133;B\x07\x1b]133;C\x07");
+    assert_eq!(
+        t.block_tracker().phase(),
+        ShellPhase::CommandExecuting,
+        "nested 133;B must resume the screen command, not settle it"
+    );
+    t.process("nested output one".as_bytes());
+    assert_eq!(
+        t.block_tracker().blocks().len(),
+        blocks_before,
+        "internal command markers must not finalize a block"
+    );
+    assert!(
+        t.block_tracker().screen_document_start().is_some(),
+        "screen ownership survives nested markers"
+    );
+
+    // pi internal command #2 (same pattern).
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process("nested output two".as_bytes());
+    assert_eq!(t.block_tracker().blocks().len(), blocks_before);
+    assert_eq!(t.block_tracker().phase(), ShellPhase::CommandExecuting);
+
+    // The REAL exit: 133;D (or precmd after the app ended) defers, and the
+    // idle settle finalizes exactly ONE block.
+    t.process(b"\x1b]133;D;0\x07");
+    assert!(t.settle_primary_screen_exit());
+    let blocks = t.block_tracker().blocks();
+    assert_eq!(
+        blocks.len(),
+        blocks_before + 1,
+        "real exit finalizes exactly one session block"
+    );
+    assert_eq!(blocks[blocks.len() - 1].command, "pi");
+}
+
+/// v1.10.7: a real exit is deferred once with its exit code, and a later
+/// `133;D` (nested precmd pair) must NOT overwrite the pending exit code —
+/// the settled block keeps the first (real) exit code.
+#[test]
+fn nested_marker_does_not_overwrite_pending_exit_code() {
+    let mut t = Terminal::new(10, 40);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
+    t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+    assert!(t.primary_screen_app_active());
+
+    // Real exit: shell precmd emits `133;D;130` then `133;A`.
+    t.process(b"\x1b]133;D;130\x07\x1b]133;A\x07");
+    // A nested marker burst must not re-defer with a different code.
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(t.settle_primary_screen_exit());
+    let blocks = t.block_tracker().blocks();
+    assert_eq!(
+        blocks.last().map(|b| b.exit_code),
+        Some(Some(130)),
+        "the first (real) exit code wins over nested 133;D;0"
     );
 }
 
@@ -2331,7 +2526,7 @@ fn osc8_link_at_block_capture_resolves_url() {
     let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
         t.hyperlinks().url(id).map(std::sync::Arc::<str>::from)
     };
-    let (_text, styled): (String, StyledOutput) = t
+    let (_text, styled, _): (String, StyledOutput, Option<usize>) = t
         .grid()
         .document_snapshot_from_position_with_resolver(0, url_resolver);
     // The first line should have a LinkSpan covering "link" (chars 0-4).

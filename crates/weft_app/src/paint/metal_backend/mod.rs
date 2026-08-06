@@ -646,9 +646,11 @@ impl MetalRenderer {
         // Uses the per-vertex descriptor (3×float4, stride 48) + B0 ring.
         if vertex_data_size > 0 {
             let tex = self.atlas.texture();
+            // v1.10.4: RGBA color atlas for color emoji (fg.a=2.0 sentinel).
+            let color_tex = self.atlas.color_texture();
             encoder.set_render_pipeline_state(&self.pipeline);
             let ring = self.vertex_buffer_ring.borrow();
-            // v1.0 P1.5-B0 fix: render the buffer we just wrote this frame
+            // v1.0 P1.5-B0 fix: render the buffer we wrote just this frame
             // (ring[ring_idx]), NOT ring_idx-1 (which is last frame's buffer
             // and caused content-change flicker in block view).
             let cur = ring_idx;
@@ -658,6 +660,7 @@ impl MetalRenderer {
             // Atlas + sampler may already be bound from the instance draw;
             // rebind defensively in case only this path runs (block view).
             encoder.set_fragment_texture(0, Some(tex));
+            encoder.set_fragment_texture(1, Some(color_tex));
             encoder.set_fragment_sampler_state(0, Some(&self.sampler));
 
             self.draw_legacy_vertex_ranges(encoder, vertices.len());

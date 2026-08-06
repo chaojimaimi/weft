@@ -47,6 +47,9 @@ impl MetalRenderer {
             cache_namespace,
             block_diagnose_state,
             ai_configured,
+            tui_cursor,
+            tui_preedit,
+            cursor_blink_on: _,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -61,6 +64,7 @@ impl MetalRenderer {
 
         let theme_bg = scale_color_alpha(color_to_normalized(self.theme.background), self.opacity);
         let fg = color_to_normalized(self.theme.foreground);
+        let accent = color_to_normalized(self.theme.accent);
         let output_fg = color_to_normalized(self.theme.output.output_default);
         let prompt_c = [
             fg[0] * 0.70 + theme_bg[0] * 0.30,
@@ -129,6 +133,13 @@ impl MetalRenderer {
         self.styled_paint_us_counter.set(0);
         let palette_fp = self.block_palette_fingerprint(palette);
         let render_generation = self.styled_cache_generation();
+        // v1.10.5: capture the in-flight block's styled output before
+        // `live` is moved into the layout pass. Live block rows
+        // (block_id == None) read their colors from this, not from the
+        // finished-blocks table. Cheap Arc clone (reviewer MEDIUM).
+        let live_styled = live
+            .as_ref()
+            .and_then(|live| live.styled_output.map(std::sync::Arc::clone));
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
             compute_block_layout_pass(
@@ -412,7 +423,20 @@ impl MetalRenderer {
                             }
                         }
                         let t0 = std::time::Instant::now();
-                        let (source, styled) = style::block_arc_identity(blocks, *block_id);
+                        // v1.10.5: live block rows (block_id == None) carry
+                        // their styles on the in-flight block's
+                        // `styled_output`, NOT in the finished-blocks table.
+                        // `block_arc_identity` returns (None, None) for them,
+                        // which used to make every live row fall back to the
+                        // monochrome output_fg — the "pi turns colorless on
+                        // first keystroke" regression (screen-owned snapshots
+                        // rebuild the styled output from the grid, but paint
+                        // never consulted it for live rows).
+                        let (source, styled) = if block_id.is_none() {
+                            (None, live_styled.clone())
+                        } else {
+                            style::block_arc_identity(blocks, *block_id)
+                        };
                         let source = (*line != usize::MAX).then_some(source).flatten();
                         self.push_block_output_text_cached(
                             &mut verts,
@@ -446,6 +470,57 @@ impl MetalRenderer {
                         self.styled_paint_us_counter.set(
                             self.styled_paint_us_counter.get() + t0.elapsed().as_micros() as u64,
                         );
+                        // v1.10.5: BlockView-mode TUI caret + IME preedit at
+                        // the mapped live-block row. Primary-screen TUIs kept
+                        // in the BlockView (openclaw/pi) input at their own
+                        // bottom row; the grid cursor is invisible while the
+                        // document renders, so the blinking caret and marked
+                        // text are drawn directly on the document row.
+                        // (Reviewer HIGH: `tui_caret_row_matches` restricts
+                        // this to LIVE rows — finished-block rows reuse a
+                        // 0-based index that collides numerically and must
+                        // never carry the caret/preedit.)
+                        if let Some((cursor_line, cursor_col)) = tui_cursor {
+                            if crate::block_component::tui_caret_row_matches(
+                                block_id.map(|b| b.0),
+                                *line,
+                                cursor_line,
+                            ) {
+                                let caret_x = left + cursor_col as f32 * cw;
+                                // v1.10.5: the BlockView TUI caret is the
+                                // ONLY input affordance while the document
+                                // renders (the grid cursor is invisible).
+                                // The blink timer only wakes for AtPrompt
+                                // (redraw_controller.rs), so in
+                                // CommandExecuting `cursor_blink_on` is stale
+                                // and the caret would never paint. Keep it
+                                // steady-on for TUI block views instead.
+                                push_quad(
+                                    &mut verts,
+                                    [caret_x, y + ch - 2.0, caret_x + 2.0, y + ch],
+                                    bg_uv,
+                                    [0.0; 4],
+                                    accent,
+                                );
+                                if let Some((preedit, preedit_cursor)) = tui_preedit {
+                                    self.push_block_tui_preedit(
+                                        &mut verts,
+                                        crate::paint::preedit::BlockTuiPreeditParams {
+                                            text: preedit,
+                                            cursor: preedit_cursor,
+                                            x: caret_x,
+                                            y,
+                                            right,
+                                            cols,
+                                            cursor_col,
+                                            bg_uv,
+                                            theme_bg,
+                                            accent,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     } else {
                         let mut char_offset = 0;
                         for (ci, chunk) in chunks.iter().enumerate() {
@@ -482,7 +557,13 @@ impl MetalRenderer {
                                     }
                                 }
                                 let t0 = std::time::Instant::now();
-                                let (source, styled) = style::block_arc_identity(blocks, *block_id);
+                                // v1.10.5: live rows read styles from the
+                                // in-flight block (see the single-row branch).
+                                let (source, styled) = if block_id.is_none() {
+                                    (None, live_styled.clone())
+                                } else {
+                                    style::block_arc_identity(blocks, *block_id)
+                                };
                                 self.push_block_output_text_cached(
                                     &mut verts,
                                     style::BlockOutputTextPaint {
@@ -521,6 +602,48 @@ impl MetalRenderer {
                                     self.styled_paint_us_counter.get()
                                         + t0.elapsed().as_micros() as u64,
                                 );
+                                // v1.10.5: wrapped cursor row (split pane —
+                                // block cols < grid cols). The caret/preedit
+                                // land on the chunk containing the cursor
+                                // column; live rows only (see the single-row
+                                // branch above for the index-collision note).
+                                if let Some((cursor_line, cursor_col)) = tui_cursor {
+                                    if crate::block_component::tui_caret_row_matches(
+                                        block_id.map(|b| b.0),
+                                        *line,
+                                        cursor_line,
+                                    ) && ci == cursor_col / cols
+                                    {
+                                        let chunk_col = cursor_col % cols;
+                                        let caret_x = left + chunk_col as f32 * cw;
+                                        // v1.10.5: steady-on caret (see the
+                                        // single-row branch above).
+                                        push_quad(
+                                            &mut verts,
+                                            [caret_x, cy + ch - 2.0, caret_x + 2.0, cy + ch],
+                                            bg_uv,
+                                            [0.0; 4],
+                                            accent,
+                                        );
+                                        if let Some((preedit, preedit_cursor)) = tui_preedit {
+                                            self.push_block_tui_preedit(
+                                                &mut verts,
+                                                crate::paint::preedit::BlockTuiPreeditParams {
+                                                    text: preedit,
+                                                    cursor: preedit_cursor,
+                                                    x: caret_x,
+                                                    y: cy,
+                                                    right,
+                                                    cols,
+                                                    cursor_col: chunk_col,
+                                                    bg_uv,
+                                                    theme_bg,
+                                                    accent,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             char_offset += chunk.chars().count();
                         }

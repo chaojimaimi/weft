@@ -255,6 +255,12 @@ fn render(device: &Device, case: &Case) -> (image::RgbaImage, Duration) {
     encoder.set_vertex_buffer(0, Some(&vertex_buffer), 0);
     encoder.set_vertex_bytes(1, 8, viewport.as_ptr().cast());
     encoder.set_fragment_texture(0, Some(&atlas));
+    // v1.10.4: `text_fragment` declares color_atlas at texture(1). Snapshot
+    // vertices are bg quads only (fg = [0;4], never the fg.a=2.0 sentinel),
+    // so the branch is never taken — but the slot is declared, so bind a
+    // benign texture rather than leaving it unbound if text quads are ever
+    // added here.
+    encoder.set_fragment_texture(1, Some(&atlas));
     encoder.set_fragment_sampler_state(0, Some(&sampler));
     encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, (vertices.len() / 12) as u64);
     encoder.end_encoding();

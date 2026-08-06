@@ -213,7 +213,16 @@ pub fn grid_cursor_visible(
     blink_on: bool,
     app_prompt_visible: bool,
 ) -> bool {
-    terminal_visible && !app_prompt_visible && (!style.is_blinking() || blink_on)
+    // v1.10.6: `app_prompt_visible` covers the IME preedit overlay. When a
+    // TUI is actively composing (preedit active) but hid the terminal cursor
+    // (`?25l` — pi/openclaw manage their own cursor), force the cursor bar
+    // ON so the user sees where input lands. The preedit overlay draws at
+    // the grid cursor; hiding the caret underneath it makes the input
+    // position invisible. (vim/less never trigger this — they show their
+    // own cursor, so `app_prompt_visible` stays false for them.)
+    let normal = terminal_visible && !app_prompt_visible && (!style.is_blinking() || blink_on);
+    let composing_override = app_prompt_visible && !terminal_visible;
+    normal || composing_override
 }
 
 #[cfg(test)]

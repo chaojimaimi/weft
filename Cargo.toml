@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.10.4"
+version = "1.10.6"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -47,7 +47,7 @@ pathfinder_geometry = "0.5"
 bitflags = { version = "2", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
 crossbeam-channel = "0.5"
 unicode-width = "0.2"
 unicode-segmentation = "1"

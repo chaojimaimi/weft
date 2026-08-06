@@ -2,6 +2,7 @@ use super::attrs::ShellMarker;
 use super::osc::{parse_osc7_cwd, parse_x11_color};
 use super::param;
 use super::Terminal;
+use super::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
 use crate::blocks::{CapturedStyle, ShellPhase};
 use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
@@ -15,12 +16,13 @@ impl vte::Perform for Terminal {
         let phase = self.block_tracker.phase();
 
         // Snap back to the live viewport for new content — EXCEPT when idle at
-        // an integrated prompt (AtPrompt). In that state the shell may emit
-        // prompt re-renders or async segments that would otherwise destroy
-        // the user's scroll position while they're reading history. During
-        // CommandExecuting (output streaming) and in non-integrated mode
-        // (plain grid terminal), new output always resets scroll.
-        if phase != ShellPhase::AtPrompt {
+        // an integrated prompt (AtPrompt) or when the user is deliberately
+        // browsing history of a primary-screen TUI (primary_history_view).
+        // In those states the app may emit re-renders or async segments that
+        // would otherwise destroy the user's scroll position while they're
+        // reading history. During CommandExecuting (output streaming) and in
+        // non-integrated mode (plain grid terminal), new output resets scroll.
+        if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
             self.grid.scroll_offset = 0;
         }
 
@@ -384,7 +386,11 @@ impl vte::Perform for Terminal {
 
         // Diagnostic: trace cursor-moving CSIs to pin down TUI cursor desync.
         if super::capture_cursor::is_primary_screen_addressing(action, param(params, 0, 1)) {
-            self.note_primary_screen_cursor_addressing();
+            let absolute = super::capture_cursor::is_absolute_primary_screen_addressing(
+                action,
+                param(params, 0, 1),
+            );
+            self.note_primary_screen_cursor_addressing(absolute);
         }
         if matches!(
             action,
@@ -750,17 +756,55 @@ impl vte::Perform for Terminal {
                     match params[1] {
                         b"A" => {
                             self.snapshot_primary_screen_output();
+                            // v1.10.7: a screen-owned TUI session whose shell
+                            // emits 133;A (precmd) while still running — e.g. pi
+                            // spawns an interactive zsh that inherits
+                            // WEFT_SHELL_INTEGRATION and re-emits the markers per
+                            // internal command. If a pending exit ALREADY exists
+                            // (the precmd pair `133;D → 133;A` arrived together,
+                            // or `133;A` follows `133;D` of the previous marker
+                            // run), deferring again would reset `phase` to
+                            // AtPrompt and split the session block per internal
+                            // command. Only defer when no exit is pending.
                             let defer_screen_exit =
                                 self.block_tracker.screen_document_start().is_some()
-                                    && self.block_tracker.phase() == ShellPhase::CommandExecuting;
+                                    && self.block_tracker.phase() == ShellPhase::CommandExecuting
+                                    && self.capabilities.primary_screen_exit.is_none();
                             self.capabilities.primary_screen_cursor_ops = 0;
+                            self.capabilities.primary_screen_absolute_addressing = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             self.shell_markers.push(ShellMarker::PromptStart);
                             if defer_screen_exit {
                                 self.defer_primary_screen_exit(None);
+                                // v1.10.7: do NOT unlock the render-mode lock
+                                // here. This branch is also reachable by the
+                                // FIRST marker of a nested run (pi's inner
+                                // zsh prompt before any internal command
+                                // completed → no pending exit yet), and
+                                // unlocking would let the next CUP repaint
+                                // flip the session to the live grid. The lock
+                                // is released in `settle_primary_screen_exit`
+                                // (the real finalize path) and at a real
+                                // 133;B command start.
+                            } else if self.capabilities.primary_screen_exit.is_some()
+                                && self.block_tracker.screen_document_start().is_some()
+                            {
+                                // v1.10.7: this 133;A is the second marker of a
+                                // nested precmd pair (`133;D → 133;A`) from a
+                                // shell running INSIDE the screen-owned TUI — the
+                                // pending exit belongs to the first marker of the
+                                // run and the session is still executing. Keep it
+                                // executing (do NOT let `on_prompt_start` finalize
+                                // the in-flight block). The render-mode lock must
+                                // SURVIVE nested markers.
+                                self.block_tracker.resume_screen_command();
                             } else {
                                 self.block_tracker.on_prompt_start();
+                                // v1.10.7: real prompt boundary (or shell
+                                // outside a screen session) — the render-mode
+                                // lock belongs to the previous command only.
+                                self.capabilities.primary_screen_block_view_locked = false;
                             }
                             // Clear the git branch: the precmd hook re-emits
                             // OSC 9;git= if (and only if) the cwd is still a git
@@ -774,33 +818,80 @@ impl vte::Perform for Terminal {
                             self.command_from_editor = None;
                         }
                         b"B" => {
-                            self.settle_primary_screen_exit();
-                            self.capabilities.primary_history_view = false;
-                            self.capabilities.primary_screen_cursor_ops = 0;
-                            self.reset_primary_screen_synchronized_frame();
-                            self.shell_markers.push(ShellMarker::CommandStart);
-                            // 133;B (preexec): if the editor submitted the
-                            // command, record that; otherwise snapshot the grid
-                            // row (real shells emit a newline first, so the
-                            // cursor may sit below the command —
-                            // `snapshot_command_line` walks up).
-                            let command = if let Some(c) = self.command_from_editor.take() {
-                                c
+                            // v1.10.7: nested-shell guard. A screen-owned TUI
+                            // session (pi/openclaw) whose shell integration runs
+                            // inside the app (pi spawns interactive zsh) emits
+                            // `133;B` <200ms after the `133;A`/`133;D` precmd
+                            // pair — that is a NEW INTERNAL COMMAND of the still
+                            // running TUI, not a command typed at the shell after
+                            // the app exited. Settling here would finalize the
+                            // session block per internal command (one prompt
+                            // split into many blocks). A real app exit leaves the
+                            // user time to type the next command, so the pending
+                            // exit would already have been settled by the idle
+                            // timer. When the pending exit is still younger than
+                            // the settle window, cancel it and keep the in-flight
+                            // block: the nested command's output still flows into
+                            // the screen snapshot (screen-owned capture), so the
+                            // session block grows without splitting.
+                            let nested_marker =
+                                self.capabilities.primary_screen_exit.as_ref().is_some_and(
+                                    |pending| {
+                                        pending.last_activity.elapsed()
+                                            < PRIMARY_SCREEN_EXIT_SETTLE_DELAY
+                                    },
+                                ) && self.block_tracker.screen_document_start().is_some();
+                            if nested_marker {
+                                self.capabilities.primary_screen_exit = None;
+                                self.block_tracker.resume_screen_command();
+                                self.capabilities.primary_history_view = false;
+                                self.capabilities.primary_screen_cursor_ops = 0;
+                                self.capabilities.primary_screen_absolute_addressing = false;
+                                self.reset_primary_screen_synchronized_frame();
+                                self.shell_markers.push(ShellMarker::CommandStart);
                             } else {
-                                self.snapshot_command_line()
-                            };
-                            self.freeze_primary_screen_document_candidate();
-                            self.block_tracker.on_command_start(command);
+                                self.settle_primary_screen_exit();
+                                self.capabilities.primary_history_view = false;
+                                self.capabilities.primary_screen_cursor_ops = 0;
+                                self.capabilities.primary_screen_absolute_addressing = false;
+                                // v1.10.7: real command start — a new command
+                                // re-detects and re-locks its render mode at
+                                // first screen ownership.
+                                self.capabilities.primary_screen_block_view_locked = false;
+                                self.reset_primary_screen_synchronized_frame();
+                                self.shell_markers.push(ShellMarker::CommandStart);
+                                // 133;B (preexec): if the editor submitted the
+                                // command, record that; otherwise snapshot the grid
+                                // row (real shells emit a newline first, so the
+                                // cursor may sit below the command —
+                                // `snapshot_command_line` walks up).
+                                let command = if let Some(c) = self.command_from_editor.take() {
+                                    c
+                                } else {
+                                    self.snapshot_command_line()
+                                };
+                                self.freeze_primary_screen_document_candidate();
+                                self.block_tracker.on_command_start(command);
+                            }
                         }
                         b"C" => {
                             self.shell_markers.push(ShellMarker::CommandOutputStart);
                             self.block_tracker.on_command_output_start();
                         }
                         b"D" => {
+                            // v1.10.7: see `133;A` — a `133;D` arriving while an
+                            // exit is already pending is the shell integration's
+                            // precmd pair (`133;D;rc → 133;A`) or the closing of
+                            // a nested command marker run; the FIRST marker of
+                            // the run already deferred. Deferring again would
+                            // overwrite the exit code and reset `phase`, churning
+                            // the session block.
                             let defer_screen_exit =
-                                self.block_tracker.screen_document_start().is_some();
+                                self.block_tracker.screen_document_start().is_some()
+                                    && self.capabilities.primary_screen_exit.is_none();
                             self.snapshot_primary_screen_output();
                             self.capabilities.primary_screen_cursor_ops = 0;
+                            self.capabilities.primary_screen_absolute_addressing = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             let exit_code = if params.len() > 2 {
@@ -815,6 +906,24 @@ impl vte::Perform for Terminal {
                                 .push(ShellMarker::CommandEnd { exit_code });
                             if defer_screen_exit {
                                 self.defer_primary_screen_exit(Some(exit_code));
+                            } else if self.capabilities.primary_screen_exit.is_some()
+                                && self.block_tracker.screen_document_start().is_some()
+                            {
+                                // v1.10.7: nested precmd pair — the first marker
+                                // of this run already deferred. Do NOT let
+                                // `on_command_end` finalize the in-flight
+                                // session block mid-session.
+                                // v1.10.7 (reviewer LOW): if the pending exit
+                                // came from a `133;A` (exit_code None — the
+                                // nested run's first marker), this REAL `133;D`
+                                // carries the authoritative exit code of the
+                                // TUI session; upgrade it so the finalized
+                                // block shows the session's code, not None.
+                                if let Some(pending) = &mut self.capabilities.primary_screen_exit {
+                                    if pending.exit_code.is_none() {
+                                        pending.exit_code = Some(exit_code);
+                                    }
+                                }
                             } else {
                                 self.block_tracker.on_command_end(exit_code);
                             }

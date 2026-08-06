@@ -40,4 +40,20 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// the diagnose button is not rendered on block headers and the
     /// `Action::DiagnoseBlock` keybinding is a no-op.
     pub(crate) ai_configured: bool,
+    /// v1.10.5: BlockView-mode TUI caret — the grid cursor mapped into the
+    /// live block's snapshot text `(line, col)`. Primary-screen TUIs kept
+    /// in the BlockView (openclaw/pi) input at their own bottom row; the
+    /// grid cursor is invisible while the document renders, so the caret
+    /// (blinking bar) and IME preedit are drawn directly on the live block
+    /// row. `None` for Editor-mode / non-TUI block views.
+    pub(crate) tui_cursor: Option<(usize, usize)>,
+    /// v1.10.5: active IME preedit for a BlockView-mode TUI, drawn at the
+    /// mapped caret. `(text, caret_byte_range)`.
+    pub(crate) tui_preedit: Option<(&'a str, Option<(usize, usize)>)>,
+    /// v1.10.5: reserved for future blink-driven TUI caret animation.
+    /// Currently unused — the BlockView TUI caret is steady-on (the blink
+    /// timer only wakes for AtPrompt, so in CommandExecuting this flag is
+    /// stale and would hide the caret permanently).
+    #[allow(dead_code)]
+    pub(crate) cursor_blink_on: bool,
 }

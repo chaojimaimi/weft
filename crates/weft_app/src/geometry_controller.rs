@@ -590,6 +590,9 @@ impl App {
             cache_namespace: self.sessions.active().pane_session_id,
             block_diagnose_state: &self.block_diagnose_state,
             ai_configured: self.ai_state.is_configured(),
+            tui_cursor: None,
+            tui_preedit: None,
+            cursor_blink_on: false,
         })
     }
 

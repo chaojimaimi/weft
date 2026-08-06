@@ -19,7 +19,10 @@ pub(crate) fn install_runtime_diagnostics() {
     {
         Ok(f) => f,
         Err(_) => {
-            tracing_subscriber::fmt::init();
+            // v1.10.6: local-time timestamps even in the stderr fallback.
+            tracing_subscriber::fmt()
+                .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+                .init();
             let default_hook = std::panic::take_hook();
             setup_panic_hook(default_hook);
             return;
@@ -27,9 +30,13 @@ pub(crate) fn install_runtime_diagnostics() {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // v1.10.6: timestamp in LOCAL time (CST) instead of the default UTC.
+    // The default SystemTime formatter emits RFC3339 UTC, which read as
+    // "8 hours in the past" for Asia/Shanghai users and made logs confusing.
     let subscriber = tracing_subscriber::fmt()
         .with_writer(std::sync::Arc::new(file))
         .with_ansi(false)
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
         .with_env_filter(filter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);

@@ -67,6 +67,23 @@ impl Terminal {
 
     pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
         self.synchronized_frame_cleared_rows = 0;
+        // v1.10.6: DEC 2026 synchronized output (`?2026h`) is strong TUI
+        // evidence — a plain shell command never emits it. pi and other
+        // modern TUIs use it on EVERY repaint; without counting it toward
+        // TUI detection, cursor_ops stays < 2 (pi only sends one CUU on
+        // startup + CHR per keystroke, neither reaching the threshold) and
+        // `primary_screen_app_active()` is never true. Count it the same
+        // way as cursor addressing, then start the output capture if the
+        // threshold is crossed.
+        if !self.capabilities.alt_active {
+            self.capabilities.primary_screen_cursor_ops = self
+                .capabilities
+                .primary_screen_cursor_ops
+                .saturating_add(1);
+            if self.primary_screen_app_active() {
+                self.begin_primary_screen_output_capture();
+            }
+        }
     }
 
     pub(super) fn finish_primary_screen_synchronized_frame(&mut self) {
@@ -110,14 +127,35 @@ impl Terminal {
         }
     }
 
-    pub(super) fn note_primary_screen_cursor_addressing(&mut self) {
-        if !self.capabilities.alt_active
-            && self.block_tracker.phase() == ShellPhase::CommandExecuting
-        {
+    pub(super) fn note_primary_screen_cursor_addressing(&mut self, absolute: bool) {
+        // v1.10.4: count cursor addressing on the primary screen regardless
+        // of shell phase. Previously gated on CommandExecuting, which missed
+        // TUIs that run WITHOUT shell integration (phase stays NotIntegrated —
+        // e.g. openclaw, or any app started before the shell hooks installed).
+        // Such apps still own the viewport via CUU/CUD + EL/ED redraws and
+        // need the TUI-safe scroll path; the 133;A/B markers reset the count
+        // at each prompt, so the phase gate added no protection against
+        // misclassification within a command.
+        //
+        // Round 4 review (MEDIUM-2): scope caveat — in an integrated shell
+        // the count resets at every OSC 133 prompt marker, but a genuinely
+        // non-integrated session (no 133 at all) never resets it, so
+        // `tui_owned_scroll()` stays true for the rest of the session (a
+        // permanent dirty-all rebuild; correctness unaffected). Note also
+        // that this phase-free counting ONLY feeds the scroll/blit path —
+        // `primary_screen_app_active()` still requires CommandExecuting, so
+        // screen ownership, snapshots and the BlockView never engage for a
+        // non-integrated app (fixed by `tui_scroll_discards_blit_...` tests
+        // which drive the 133 sequence first).
+        if !self.capabilities.alt_active {
             self.capabilities.primary_screen_cursor_ops = self
                 .capabilities
                 .primary_screen_cursor_ops
                 .saturating_add(1);
+            // v1.10.4: absolute addressing (CUP/VPA/CHR) marks a
+            // full-viewport repainter (Claude Code) that needs the live
+            // grid; relative-only TUIs (openclaw) keep the BlockView.
+            self.capabilities.primary_screen_absolute_addressing |= absolute;
             if self.primary_screen_app_active() {
                 self.begin_primary_screen_output_capture();
             }
@@ -133,7 +171,7 @@ impl Terminal {
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
-        let (frozen_text, frozen_styled) = self.primary_screen_document_snapshot(document_start);
+        let (frozen_text, frozen_styled, _) = self.primary_screen_document_snapshot(document_start);
         self.capabilities.primary_screen_interrupt_capture = Some(PrimaryScreenInterruptCapture {
             frozen_text,
             frozen_styled,
@@ -222,6 +260,19 @@ impl Terminal {
         self.scroll_grid_rows(count, true);
     }
 
+    /// v1.10.4: Whether the current viewport is owned by a TUI that repaints
+    /// after scrolling (alt-screen apps, or primary-screen TUIs with >= 2
+    /// cursor-addressing ops — the openclaw/Claude-Code pattern). Such apps
+    /// must NOT use the GPU scroll-blit fast path (which assumes scrolled
+    /// rows keep their content): they overwrite scrolled rows with their
+    /// redraw, so blitting stale content under the redraw produced the
+    /// "content squeezed together / overlapping" corruption. The print path
+    /// also uses this to keep cursor-follow viewport scrolls alive across
+    /// TUI repaints.
+    pub(super) fn tui_owned_scroll(&self) -> bool {
+        self.capabilities.alt_active || self.capabilities.primary_screen_cursor_ops >= 2
+    }
+
     fn scroll_grid_rows(&mut self, count: usize, down: bool) {
         let origin_before = self.grid.scrollback.position();
         let (top, bottom) = self.grid.scroll_region();
@@ -238,7 +289,7 @@ impl Terminal {
             count,
             down,
         );
-        if self.capabilities.alt_active {
+        if self.tui_owned_scroll() {
             self.grid.discard_scroll_and_dirty_all();
         }
         if !self.hyperlinks.cell_map_is_empty() {
@@ -247,11 +298,25 @@ impl Terminal {
     }
 
     pub(super) fn begin_primary_screen_output_capture(&mut self) {
+        let was_owned = self.block_tracker.screen_document_start().is_some();
         self.block_tracker
             .begin_screen_owned_output(self.capabilities.primary_screen_document_candidate);
+        // v1.10.7: first screen ownership of this command locks the render
+        // mode. Sparse repainters (pi/openclaw) detected with relative-only
+        // addressing keep the BlockView for the whole command, even when a
+        // later repaint issues a full-viewport CUP (which would otherwise
+        // flip the layout to the live grid mid-task and hide the history
+        // blocks). Full-viewport CUP TUIs (Claude Code) lock to the grid.
+        if !was_owned && self.block_tracker.screen_document_start().is_some() {
+            self.capabilities.primary_screen_block_view_locked =
+                !self.capabilities.primary_screen_absolute_addressing;
+        }
     }
 
-    fn primary_screen_document_snapshot(&self, document_start: u64) -> (String, StyledOutput) {
+    fn primary_screen_document_snapshot(
+        &self,
+        document_start: u64,
+    ) -> (String, StyledOutput, Option<usize>) {
         // v1.6.1: resolve hyperlink ids to URLs via the Terminal's registry
         // so captured Block output preserves OSC 8 links. The closure borrows
         // `&self.hyperlinks` immutably, which coexists with `&self.grid`.
@@ -308,6 +373,14 @@ impl Terminal {
                 1,
                 false,
             );
+            // v1.10.4: LF overflow is THE dominant scroll path for
+            // primary-screen TUIs (content streaming past the bottom row).
+            // `grid.index()` records a pending_scroll delta; for TUI-owned
+            // viewports we discard it so the renderer rebuilds instead of
+            // GPU-blitting stale content under the app's redraw.
+            if self.tui_owned_scroll() {
+                self.grid.discard_scroll_and_dirty_all();
+            }
         }
         scrolled
     }
@@ -325,6 +398,9 @@ impl Terminal {
                 1,
                 true,
             );
+            if self.tui_owned_scroll() {
+                self.grid.discard_scroll_and_dirty_all();
+            }
         }
         scrolled
     }
@@ -353,7 +429,9 @@ impl Terminal {
         self.block_tracker.bootstrap_ready()
             && !self.capabilities.alt_active
             && !self.primary_screen_exit_pending()
-            && (!self.primary_screen_app_active() || self.capabilities.primary_history_view)
+            && (!self.primary_screen_app_active()
+                || self.capabilities.primary_history_view
+                || self.capabilities.primary_screen_block_view_locked)
     }
 
     pub fn primary_screen_exit_pending(&self) -> bool {
@@ -366,9 +444,21 @@ impl Terminal {
     /// the current cursor. They stay in the Grid for terminal correctness and
     /// detached history, but the live renderer must not expose them as part of
     /// the application's frame.
+    ///
+    /// v1.10.6: only applies to full-viewport CUP TUIs (claude code). A
+    /// sparse repainter (pi/openclaw) starts from the shell's 133;B boundary
+    /// and writes content incrementally — the frozen `document_start` predates
+    /// the app's own output, so hiding rows before it would hide the app's
+    /// content. v1.10.7: gate on the per-command render-mode LOCK (set at
+    /// first screen ownership) instead of the transient absolute flag, so a
+    /// sparse repainter's occasional CUP cannot start hiding rows mid-task.
     pub fn primary_screen_visible_row_start(&self) -> Option<usize> {
         let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
-        if self.capabilities.alt_active || !owns_live_view || self.grid.scroll_offset > 0 {
+        if self.capabilities.alt_active
+            || !owns_live_view
+            || self.grid.scroll_offset > 0
+            || self.capabilities.primary_screen_block_view_locked
+        {
             return None;
         }
         self.block_tracker.screen_document_start().map(|start| {
@@ -385,20 +475,64 @@ impl Terminal {
     /// This is a rendering policy only: unowned shell rows remain in the Grid
     /// so a sparse, multi-stage TUI repaint cannot destroy data needed by a
     /// later stage or by detached history capture.
+    ///
+    /// v1.10.6: only return the ownership mask when the TUI has used absolute
+    /// cursor addressing (CUP/VPA) — the full-viewport repaint pattern that
+    /// touches every row. A sparse repainter like pi/openclaw only touches
+    /// its input row per keystroke; applying the partial mask would hide the
+    /// rest of the TUI's content (the "pi interface vanishes until touchpad
+    /// scroll" symptom). v1.10.7: gate on the per-command render-mode LOCK
+    /// (set at first screen ownership) instead of the transient absolute
+    /// flag, so a sparse repainter's occasional CUP cannot start masking
+    /// rows mid-task. `hidden_before_row` (from `screen_document_start`)
+    /// still hides shell rows above the TUI boundary — that is independent
+    /// of the ownership mask and always applies.
     pub fn primary_screen_viewport_ownership(&self) -> Option<&[bool]> {
         let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
-        (!self.capabilities.alt_active && owns_live_view && self.grid.scroll_offset == 0)
-            .then_some(
-                self.capabilities
-                    .primary_screen_ownership
-                    .viewport
-                    .as_deref(),
-            )
-            .flatten()
+        if self.capabilities.alt_active
+            || !owns_live_view
+            || self.grid.scroll_offset > 0
+            || self.capabilities.primary_screen_block_view_locked
+        {
+            return None;
+        }
+        self.capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_deref()
     }
 
     pub fn primary_history_view(&self) -> bool {
         self.capabilities.primary_history_view
+    }
+
+    /// v1.10.6: the cursor's line index in the most recent primary-screen
+    /// snapshot. `None` until the first snapshot, or when the cursor sat on
+    /// a row the snapshot skipped (empty / unowned).
+    pub fn primary_screen_cursor_snapshot_line(&self) -> Option<usize> {
+        self.capabilities.primary_screen_cursor_snapshot_line
+    }
+
+    /// v1.10.6: refresh just the cursor's snapshot line, without the
+    /// rate-limit or `replace_screen_snapshot` side effects. Called on
+    /// every keystroke so the caret/preedit have a precise row even when
+    /// no PTY output has arrived yet (IME preedit, idle TUI).
+    /// v1.10.7 (reviewer MEDIUM): skip the full document rebuild when the
+    /// cursor position is unchanged since the last caret refresh — the
+    /// tracked line only depends on the cursor's row, and this call has no
+    /// rate limit.
+    pub fn snapshot_primary_screen_output_for_caret(&mut self) {
+        if self.block_tracker.screen_document_start().is_none() {
+            return;
+        }
+        let cursor = (self.grid.cursor.row, self.grid.cursor.col);
+        if self.capabilities.last_caret_snapshot_cursor == Some(cursor) {
+            return;
+        }
+        self.capabilities.last_caret_snapshot_cursor = Some(cursor);
+        let document_start = self.block_tracker.screen_document_start().unwrap_or(0);
+        let (_, _, cursor_line) = self.primary_screen_document_snapshot(document_start);
+        self.capabilities.primary_screen_cursor_snapshot_line = cursor_line;
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
@@ -429,8 +563,40 @@ impl Terminal {
         self.refresh_primary_history_snapshot_at(Instant::now())
     }
 
+    /// v1.10.4: immediate snapshot refresh for keypress-driven redraws.
+    ///
+    /// Keystrokes are low-frequency (tens of ms apart at most) compared to
+    /// the display-frame rate limit, and they drive the TUI's repaint — a
+    /// selection change must show up on the next frame. Waiting out the 50ms
+    /// window makes the browsing view lag a blink behind, which reads as a
+    /// flicker: frame N shows the old selection, frame N+1 the new one.
+    ///
+    /// v1.10.4 (round 4): gate on screen-ownership instead of
+    /// `primary_history_view`. Once a primary-screen TUI is screen-owned
+    /// (`screen_document_start` set), `is_capturing()` returns false and the
+    /// live block is ONLY updated through this snapshot — so a relative-only
+    /// TUI (openclaw) kept in the BlockView needs the refresh even while
+    /// following the live tail (history browsing off).
+    ///
+    /// v1.10.7: the v1.10.4 MEDIUM-1 absolute-addressing skip is REMOVED. A
+    /// sparse repainter like pi does occasional CUP full-viewport repaints,
+    /// flipping `primary_screen_absolute_addressing` true while following —
+    /// the skip then froze the session block's snapshot (resumed sessions
+    /// lost their replay body; the final block kept only the last pre-CUP
+    /// frame). The snapshot is the ONLY content source for screen-owned
+    /// blocks, so it must refresh regardless of the transient addressing
+    /// mode. The rate limit still bounds the rescan cost.
+    pub fn refresh_primary_history_snapshot_now(&mut self) -> bool {
+        if self.block_tracker.screen_document_start().is_none() {
+            return false;
+        }
+        self.snapshot_primary_screen_output();
+        self.capabilities.primary_history_snapshot_at = Some(Instant::now());
+        true
+    }
+
     pub(super) fn refresh_primary_history_snapshot_at(&mut self, now: Instant) -> bool {
-        if !self.capabilities.primary_history_view || !self.primary_screen_app_active() {
+        if self.block_tracker.screen_document_start().is_none() {
             return false;
         }
         if self
@@ -460,8 +626,13 @@ impl Terminal {
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
-        let (text, styled) = self.primary_screen_document_snapshot(document_start);
+        let (text, styled, cursor_line) = self.primary_screen_document_snapshot(document_start);
         let (text, styled) = space_primary_screen_exit_tail(text, styled);
+        // v1.10.6: store the precisely-tracked cursor snapshot line so the
+        // BlockView paint can place the caret/preedit on the exact document
+        // row instead of guessing from a formula that breaks when the
+        // snapshot skips empty rows.
+        self.capabilities.primary_screen_cursor_snapshot_line = cursor_line;
         self.block_tracker.replace_screen_snapshot(&text, styled);
     }
 
@@ -520,6 +691,12 @@ impl Terminal {
         self.snapshot_primary_screen_output();
         self.block_tracker
             .finish_deferred_screen_command(pending.exit_code);
+        // v1.10.7: the render-mode lock belongs to the command being
+        // finalized — release it here (covers the idle-timer settle AND the
+        // 133;B settle; nested-marker paths never settle, so the lock
+        // survives them). The next command re-detects and re-locks at its
+        // first screen ownership.
+        self.capabilities.primary_screen_block_view_locked = false;
         self.capabilities.primary_screen_interrupt_capture = None;
         // A killed TUI is not guaranteed to emit DEC mouse-mode resets. Do
         // not let stale reporting state turn later shell clicks into literal
@@ -627,6 +804,7 @@ fn space_primary_screen_exit_tail(
 mod tests {
     use super::*;
     use crate::blocks::StyledLine;
+    use crate::vt::ScreenOwner;
 
     #[test]
     fn exit_tail_spacing_shifts_parallel_style_line_indices() {
@@ -678,5 +856,379 @@ mod tests {
         assert_eq!(viewport_row_for_document_start(12, 10, 8), 2);
         assert_eq!(viewport_row_for_document_start(8, 10, 8), 0);
         assert_eq!(viewport_row_for_document_start(30, 10, 8), 8);
+    }
+
+    #[test]
+    fn tui_scroll_discards_blit_and_dirties_all_rows() {
+        // v1.10.4: a primary-screen TUI (openclaw — relative cursor moves +
+        // EL/ED redraws on the main screen) must NOT use the GPU scroll-blit
+        // fast path: the app overwrites scrolled rows, so blitting stale
+        // content under the redraw produced "content squeezed together".
+        // `scroll_grid_up` on a TUI-owned viewport must clear pending_scroll
+        // (renderer then rebuilds all rows instead of blitting).
+        let mut t = Terminal::new(5, 20);
+        // Shell integration → CommandExecuting, then TUI cursor addressing.
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07tui\x1b]133;C\x07");
+        // Fill the screen (5 rows → cursor lands on the bottom row).
+        for i in 0..5 {
+            t.process(format!("row{i}\r\n").as_bytes());
+        }
+        // Accumulate TUI cursor-addressing evidence (2+ ops) WITHOUT entering
+        // alt-screen (the openclaw pattern: relative moves).
+        t.process("\x1b[2A\x1b[3B".as_bytes());
+        assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
+
+        // Scroll the TUI viewport up.
+        t.process("\x1b[1S".as_bytes());
+        // The renderer must NOT see a pending scroll blit delta.
+        assert_eq!(
+            t.grid().take_pending_scroll(),
+            0,
+            "TUI scroll must discard the blit delta (disable GPU scroll blit)"
+        );
+        // All rows dirty → renderer rebuilds the whole viewport.
+        assert!(
+            t.grid().dirty_rows().count() >= 5,
+            "all rows must be dirty after TUI scroll"
+        );
+
+        // Sanity: the top row changed after scrolling (content moved up).
+        let g = t.grid();
+        let mut row0 = String::new();
+        for c in 0..g.num_cols {
+            row0.push(g.cell(0, c).character);
+        }
+        assert_ne!(row0.trim_end(), "row0", "top row must change after scroll");
+    }
+
+    #[test]
+    fn dec2026_synchronized_output_triggers_tui_detection() {
+        // v1.10.6: pi (coding-agent CLI) uses DEC 2026 synchronized output
+        // (?2026h) on every repaint. A plain shell command never emits it.
+        // Without counting it toward TUI detection, cursor_ops stays < 2
+        // (pi sends only one CUU at startup) and the TUI is never detected
+        // — it stays in the BlockView where IME/cursor/color are broken.
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
+        // Startup: one CUU + CHR 1 (<2 ops, not detected yet).
+        t.process("\x1b[3A\x1b[1G".as_bytes());
+        assert!(!t.primary_screen_app_active(), "<2 ops: not yet a TUI");
+        assert!(t.show_block_view());
+        // First keystroke: synchronized output begins → TUI detected.
+        t.process("\x1b[?2026h".as_bytes());
+        assert!(
+            t.primary_screen_app_active(),
+            "DEC 2026 synchronized output must count as TUI evidence"
+        );
+        assert!(
+            t.show_block_view(),
+            "DEC 2026 TUI (non-absolute) stays in BlockView"
+        );
+    }
+
+    #[test]
+    fn chr_input_line_redraw_keeps_block_view() {
+        // v1.10.6: pi (coding-agent CLI) uses CHR (horizontal-only) for its
+        // input-line redraw + DEC 2026 sync output. CHR counts toward TUI
+        // detection but NOT toward absolute addressing — pi stays in the
+        // BlockView (bottom-aligned live block + history blocks), matching
+        // the Warp-style layout the user expects. IME uses the precisely
+        // tracked cursor snapshot line (v1.10.6) + steady caret + preedit
+        // dedup so composition works in the BlockView.
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
+        t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
+        assert!(!t.primary_screen_app_active(), "<2 ops: not yet a TUI");
+        assert!(t.show_block_view());
+        t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+        assert!(t.primary_screen_app_active(), "TUI detected (>= 2 ops)");
+        assert!(
+            t.show_block_view(),
+            "non-absolute TUI stays in BlockView (bottom-aligned, history blocks)"
+        );
+    }
+
+    #[test]
+    fn relative_addressing_tui_keeps_block_view() {
+        // openclaw/pi pattern — relative cursor moves only (A/B/D, CHR).
+        // v1.10.6 (final direction): non-absolute TUIs stay in the
+        // BlockView (bottom-aligned live block + history blocks), the
+        // Warp-style layout the user expects. Only full-viewport CUP
+        // TUIs (claude code) switch to the live grid.
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
+        t.process("\x1b[999D\x1b[915A".as_bytes());
+        assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
+        assert!(t.show_block_view(), "non-absolute TUI stays in BlockView");
+    }
+
+    #[test]
+    fn absolute_addressing_tui_switches_to_live_grid() {
+        // The Claude Code pattern — CUP addresses. Same live-grid path.
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07claude\x1b]133;C\x07");
+        t.process("\x1b[H\x1b[2;1H".as_bytes());
+        assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
+        assert!(
+            !t.show_block_view(),
+            "absolute-addressing TUI needs the live grid"
+        );
+    }
+
+    #[test]
+    fn osc133_reset_clears_absolute_addressing_flag() {
+        // The absolute-addressing evidence is per-command, like cursor_ops:
+        // the 133;D end marker (and 133;A/B, defensively) must clear it.
+        // (The flag is actually reset at 133;D here; the 133;A reset is
+        // redundant defense for the interrupt path.)
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07claude\x1b]133;C\x07");
+        t.process("\x1b[H\x1b[2;1H".as_bytes());
+        assert!(!t.show_block_view());
+        // Command ends, next prompt, then a new command.
+        t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+        t.settle_primary_screen_exit();
+        t.process(b"sh\x1b]133;B\x07\x1b]133;C\x07\x1b[2A\x1b[3B");
+        assert!(t.primary_screen_app_active());
+        // v1.10.6 (final direction): the flag cleared → the relative-only
+        // move sequence does NOT count as absolute, so the TUI keeps the
+        // BlockView (only CUP/VPA-driven full repaints switch to the grid).
+        assert!(
+            t.show_block_view(),
+            "absolute flag cleared → relative-only TUI keeps BlockView"
+        );
+    }
+
+    #[test]
+    fn screen_owned_snapshot_refreshes_without_history_view() {
+        // v1.10.6: snapshot refresh is driven by screen ownership for
+        // history browsing. A primary-screen TUI uses the live grid
+        // (show_block_view == false), but the snapshot must still be
+        // publishable for the moment the user scrolls into history
+        // browsing (show_block_view → true via primary_history_view).
+        let mut t = Terminal::new(5, 48);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
+        t.process("\x1b[999D\x1b[915A".as_bytes());
+        assert!(t.primary_screen_app_active());
+        assert!(t.show_block_view(), "non-absolute TUI stays in BlockView");
+        assert!(
+            t.block_tracker().screen_document_start().is_some(),
+            "cursor addressing must begin screen ownership"
+        );
+
+        t.process("choice A".as_bytes());
+        assert!(
+            !t.primary_history_view(),
+            "precondition: following the live tail, not browsing history"
+        );
+        assert!(
+            t.refresh_primary_history_snapshot_now(),
+            "screen-owned snapshot refresh must work without history browsing"
+        );
+        assert!(
+            t.block_tracker()
+                .in_flight()
+                .is_some_and(|live| live.output.contains("choice A")),
+            "live block must publish the repainted content"
+        );
+    }
+
+    #[test]
+    fn snapshot_refresh_requires_screen_ownership() {
+        // Plain command output (no cursor addressing) is NOT screen-owned:
+        // print capture still feeds the live block, so the snapshot refresh
+        // must stay a no-op.
+        let mut t = Terminal::new(5, 48);
+        t.process(b"\x1b]133;A\x07echo hi\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("plain output".as_bytes());
+        assert!(!t.primary_screen_app_active());
+        assert!(t.block_tracker().screen_document_start().is_none());
+        assert!(
+            !t.refresh_primary_history_snapshot_now(),
+            "non-screen-owned output must not refresh a screen snapshot"
+        );
+    }
+
+    #[test]
+    fn non_integrated_addressing_engages_blit_discard_but_not_screen_ownership() {
+        // v1.10.4 (reviewer MEDIUM-2): in a genuinely non-integrated session
+        // (no OSC 133 ever — phase stays NotIntegrated) relative addressing
+        // must still engage the TUI-safe scroll path (`tui_owned_scroll`),
+        // while screen ownership / BlockView stay OFF because
+        // `primary_screen_app_active()` requires CommandExecuting. The
+        // count never resets without 133 markers — that leak is accepted and
+        // documented on `note_primary_screen_cursor_addressing`.
+        let mut t = Terminal::new(5, 20);
+        assert_eq!(t.screen_owner(), ScreenOwner::Shell);
+        t.process("\x1b[2A\x1b[3B".as_bytes());
+        assert!(
+            t.tui_owned_scroll(),
+            "relative addressing must engage the TUI-safe scroll path"
+        );
+        assert_eq!(
+            t.screen_owner(),
+            ScreenOwner::Shell,
+            "non-integrated phase must NOT grant screen ownership"
+        );
+        assert!(
+            t.block_tracker().screen_document_start().is_none(),
+            "no screen-owned snapshot state for a non-integrated session"
+        );
+        // The count persists (no 133 to reset it) — scroll path stays engaged.
+        t.process("\x1b[4B".as_bytes());
+        assert!(t.tui_owned_scroll());
+    }
+
+    #[test]
+    fn nested_run_starting_with_a_keeps_the_block_view_lock() {
+        // v1.10.7 (reviewer HIGH): the FIRST marker of a nested run can be
+        // `133;A` with NO pending exit (pi's inner zsh prompt before any
+        // internal command completed). The old defer-branch unlock released
+        // the render-mode lock there, so the next CUP repaint flipped the
+        // session to the live grid mid-task. The lock must survive until the
+        // REAL settle.
+        let mut t = Terminal::new(8, 40);
+        t.process(b"\x1b]133;A\x07pi\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
+        t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+        assert!(t.primary_screen_app_active());
+        assert!(t.show_block_view(), "relative-detected TUI locks BlockView");
+
+        // Nested run #1: A is the FIRST marker (no pending exit yet).
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert!(
+            t.show_block_view(),
+            "a nested 133;A with no pending exit must not unlock BlockView"
+        );
+        assert!(t.block_tracker().phase() == ShellPhase::CommandExecuting);
+        t.process("\x1b[2J\x1b[Hworking...".as_bytes());
+        assert!(
+            t.show_block_view(),
+            "CUP repaint after a nested A-start must keep BlockView"
+        );
+
+        // Nested run #2: D-then-A pair.
+        t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert!(t.show_block_view());
+
+        // Real settle (idle timer path) releases the lock for the next command.
+        t.process(b"\x1b]133;D;0\x07");
+        assert!(t.settle_primary_screen_exit());
+        assert!(!t.capabilities.primary_screen_block_view_locked);
+    }
+
+    #[test]
+    fn sparse_repainter_locks_block_view_through_later_cup_repaints() {
+        // v1.10.7: a sparse repainter (pi) detected with relative-only
+        // addressing locks the BlockView for the whole command. Its
+        // occasional full-viewport CUP repaint (task start, layout change)
+        // must NOT flip the renderer to the live grid — that flip caused
+        // per-task layout flicker and hid the Warp-style history blocks.
+        let mut t = Terminal::new(8, 40);
+        t.process(b"\x1b]133;A\x07pi\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
+        t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+        assert!(t.primary_screen_app_active(), "TUI detected");
+        assert!(
+            t.show_block_view(),
+            "relative-detected TUI locks the BlockView"
+        );
+
+        // Task start: pi clears the viewport and repaints (CUP addressing).
+        t.process("\x1b[2J\x1b[Hworking...\x1b[2;1Hprogress".as_bytes());
+        assert!(t.primary_screen_app_active());
+        assert!(
+            t.show_block_view(),
+            "a CUP repaint inside a locked session must keep the BlockView"
+        );
+        assert_eq!(
+            t.primary_screen_visible_row_start(),
+            None,
+            "no row hiding for BlockView-locked TUIs"
+        );
+        assert_eq!(t.primary_screen_viewport_ownership(), None);
+
+        // Nested marker bursts must not unlock the render mode.
+        t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert!(
+            t.show_block_view(),
+            "nested markers must not unlock the BlockView"
+        );
+
+        // Real exit settles the block; the NEXT command re-detects its mode.
+        t.process(b"\x1b]133;D;0\x07");
+        assert!(t.settle_primary_screen_exit());
+        t.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("\x1b[H\x1b[2;1H".as_bytes());
+        assert!(
+            !t.show_block_view(),
+            "a later absolute-addressing TUI re-detects to the live grid"
+        );
+    }
+
+    #[test]
+    fn absolute_tui_following_tail_refreshes_snapshot_for_the_final_block() {
+        // v1.10.7: the v1.10.4 MEDIUM-1 skip is removed. An absolute-
+        // addressing TUI (Claude Code) follows in the live grid, so the
+        // BlockView has no snapshot consumer WHILE following — but the
+        // session block's final content (exit history, resumed sessions)
+        // comes from the snapshot, so it must keep refreshing. A sparse
+        // repainter like pi toggles CUP per repaint; freezing on that
+        // transient flag made blocks lose their body.
+        let mut t = Terminal::new(5, 48);
+        t.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("\x1b[H\x1b[2;1H".as_bytes());
+        assert!(t.primary_screen_app_active());
+        assert!(
+            !t.show_block_view(),
+            "absolute TUI follows in the live grid"
+        );
+
+        t.process("answer".as_bytes());
+        assert!(
+            t.refresh_primary_history_snapshot_now(),
+            "following an absolute TUI must still refresh the snapshot (final block content)"
+        );
+        assert!(t
+            .block_tracker()
+            .in_flight()
+            .is_some_and(|live| live.output.contains("answer")));
+        // History browsing keeps refreshing too.
+        t.set_primary_history_view(true);
+        assert!(t.refresh_primary_history_snapshot_now());
+        assert!(t
+            .block_tracker()
+            .in_flight()
+            .is_some_and(|live| live.output.contains("answer")));
+    }
+
+    #[test]
+    fn tui_lf_overflow_discards_blit_and_dirties_all_rows() {
+        // v1.10.4 (reviewer HIGH): the LF-overflow path — content streaming
+        // past the bottom row — is the DOMINANT scroll route for primary-
+        // screen TUIs (openclaw streams lines with \r\n). It goes through
+        // `index_primary_screen` → `grid.index()`, NOT `scroll_grid_rows`.
+        // The TUI-safe discard must apply there too, or the GPU blit fires
+        // under the app's redraw and reproduces the squeeze corruption.
+        let mut t = Terminal::new(5, 20);
+        // Shell integration → CommandExecuting, then TUI cursor addressing.
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07tui\x1b]133;C\x07");
+        // Establish TUI ownership (relative cursor moves, no alt-screen).
+        t.process("\x1b[2A\x1b[3B".as_bytes());
+        assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
+
+        // Overflow the viewport with plain line feeds.
+        for i in 0..8 {
+            t.process(format!("overflow-{i}\r\n").as_bytes());
+        }
+        assert_eq!(
+            t.grid().take_pending_scroll(),
+            0,
+            "LF overflow on a TUI viewport must discard the blit delta"
+        );
+        assert!(
+            t.grid().dirty_rows().count() >= 5,
+            "all rows must be dirty after TUI LF overflow"
+        );
     }
 }

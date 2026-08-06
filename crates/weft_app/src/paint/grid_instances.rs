@@ -52,6 +52,12 @@ impl BgInstance {
     }
 }
 
+/// UV resolver passed to [`GridInstanceBatch::push_row`]. Returns the
+/// glyph's UV rect plus whether the glyph lives in the RGBA color atlas
+/// (v1.10.4 color emoji → fg.a=2.0 sentinel in the emitted instance).
+/// The `'a` lifetime lets callers pass closures borrowing the renderer.
+pub(crate) type ResolveUv<'a> = dyn Fn(char, Option<&str>) -> ([f32; 4], bool) + 'a;
+
 /// A glyph instance before UV resolution. The caller resolves UVs from
 /// the glyph atlas during serialization ([`GridInstanceBatch::push_row`]).
 ///
@@ -145,10 +151,15 @@ impl GridInstanceBatch {
     /// graphemes can be resolved via `atlas.get_or_rasterize_cluster`.
     /// When `cluster` is `Some`, the closure should use the cluster path;
     /// otherwise it falls back to `atlas.get(ch)`.
+    ///
+    /// v1.10.4: the closure returns `(uv, is_color)`. `is_color` marks
+    /// glyphs stored in the RGBA color atlas (color emoji); their `fg` is
+    /// replaced by an alpha=2.0 sentinel so the fragment shader can route
+    /// them to the color texture. Normal glyphs keep their own `fg`.
     pub(crate) fn push_row(
         &mut self,
         row: &GridRowInstances,
-        resolve_uv: &dyn Fn(char, Option<&str>) -> [f32; 4],
+        resolve_uv: &ResolveUv<'_>,
     ) -> PaneInstanceRanges {
         let bg_start = self.bg_stream.len();
         for bi in &row.bg_instances {
@@ -165,8 +176,12 @@ impl GridInstanceBatch {
                     fg,
                     cluster,
                 } => {
-                    let uv = resolve_uv(*ch, cluster.as_deref());
-                    push_cell_instance(&mut self.glyph_stream, *dst, uv, *fg, [0.0; 4]);
+                    let (uv, is_color) = resolve_uv(*ch, cluster.as_deref());
+                    // fg.a = 2.0 sentinel (normal fg alpha ≤ 1.0): the shader
+                    // detects color-atlas glyphs via `fg.a > 1.5` and samples
+                    // color_atlas instead of tinting the mask with fg.
+                    let fg = if is_color { [0.0, 0.0, 0.0, 2.0] } else { *fg };
+                    push_cell_instance(&mut self.glyph_stream, *dst, uv, fg, [0.0; 4]);
                 }
                 GlyphInstance::Decoration { dst, color } => {
                     // UV [0,0,0,1] → mask=0 → only bg (color) shows.
@@ -491,6 +506,14 @@ mod tests {
     const CW: f32 = 10.0;
     const CH: f32 = 20.0;
 
+    // v1.10.4: the color-emoji sentinel is fg.a = 2.0; every real fg alpha
+    // source (palette u8/255, contrast boost, REVERSE swap, DIM, opacity)
+    // stays ≤ 1.0, so `fg.a > 1.5` in the shader is unambiguous. Assert the
+    // test constants here at compile time.
+    const _: () = {
+        assert!(FG[3] <= 1.0 && BG[3] <= 1.0 && CURSOR[3] <= 1.0 && SELECTION[3] <= 1.0);
+    };
+
     /// Build instances for row 0 of a 1-row grid.
     fn build(
         grid: &Grid,
@@ -808,7 +831,7 @@ mod tests {
         let row = build_plain(&grid);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.1, 0.2, 0.3, 0.4];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
         let ranges = batch.push_row(&row, &resolve_uv);
 
         // Bg stream: 8 floats per run.
@@ -818,6 +841,31 @@ mod tests {
         // Glyph stream: 16 floats per glyph.
         assert_eq!(batch.glyph_stream.len(), 16);
         assert_eq!(ranges.glyph_range, (0, 16));
+    }
+
+    // ── v1.10.4: color-emoji fg sentinel ─────────────────────────────
+
+    #[test]
+    fn color_glyph_replaces_fg_with_alpha_2_sentinel() {
+        let grid = make_grid(&[Cell::with_char('A')]);
+        let row = build_plain(&grid);
+
+        // Color-atlas glyph (emoji): fg must become the [0,0,0,2.0] sentinel
+        // so the shader routes the quad to the RGBA color texture. Normal
+        // fg alpha is ≤ 1.0, so 2.0 is unambiguous (checked below).
+        let mut batch = GridInstanceBatch::default();
+        let color_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], true);
+        batch.push_row(&row, &color_uv);
+        // Layout: origin(2) size(2) uv(4) fg(4) bg(4) → fg = floats[8..12].
+        assert_eq!(&batch.glyph_stream[8..12], &[0.0, 0.0, 0.0, 2.0]);
+        // UV unchanged.
+        assert_eq!(&batch.glyph_stream[4..8], &[0.1, 0.2, 0.3, 0.4]);
+
+        // Mask-atlas glyph: fg passes through untouched.
+        let mut batch = GridInstanceBatch::default();
+        let mask_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
+        batch.push_row(&row, &mask_uv);
+        assert_eq!(&batch.glyph_stream[8..12], &FG[..]);
     }
 
     // ── Test 16: multi-pane ranges don't overlap ──────────────────
@@ -831,7 +879,7 @@ mod tests {
         let row_b = build_plain(&grid_b);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.1, 0.2, 0.3, 0.4];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
         let ranges_a = batch.push_row(&row_a, &resolve_uv);
         let ranges_b = batch.push_row(&row_b, &resolve_uv);
 
@@ -946,7 +994,7 @@ mod tests {
         // Text glyphs must have bg = [0;4] (the bg stream paints bg).
         // Verified via batch serialization: floats [12..16) are the bg field.
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| [0.5, 0.5, 0.6, 0.6];
+        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.5, 0.5, 0.6, 0.6], false);
         batch.push_row(&row_instances, &resolve_uv);
         let gs = &batch.glyph_stream;
         for chunk in gs.chunks(16) {

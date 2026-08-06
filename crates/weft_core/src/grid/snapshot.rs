@@ -164,7 +164,7 @@ impl Grid {
         &self,
         document_start: u64,
         url_resolver: F,
-    ) -> (String, StyledOutput)
+    ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
     {
@@ -222,7 +222,7 @@ impl Grid {
         scrollback_owned: &[bool],
         viewport_owned: &[bool],
         url_resolver: F,
-    ) -> (String, StyledOutput)
+    ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
     {
@@ -260,13 +260,14 @@ impl Grid {
             let _ = id;
             None
         };
-        self.document_snapshot_with_url_resolver(
+        let (text, styled, _) = self.document_snapshot_with_url_resolver(
             scrollback_start,
             viewport_start,
             scrollback_owned,
             viewport_owned,
             url_resolver,
-        )
+        );
+        (text, styled)
     }
 
     /// v1.6.1: Snapshot variant that resolves hyperlink ids to URLs via the
@@ -281,22 +282,47 @@ impl Grid {
         scrollback_owned: Option<&[bool]>,
         viewport_owned: Option<&[bool]>,
         url_resolver: F,
-    ) -> (String, StyledOutput)
+    ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
     {
+        let cursor_row = self.cursor.row;
         let scrollback = (scrollback_start..self.scrollback.len()).filter_map(|index| {
             scrollback_owned
                 .map_or(true, |owned| owned.get(index).copied().unwrap_or(false))
                 .then(|| self.scrollback.get(index))
                 .flatten()
         });
-        let viewport = self
+        // v1.10.6: pair each viewport row with its grid index so we can
+        // detect the cursor row during snapshot construction. The index
+        // is needed because empty rows are skipped, breaking the 1:1
+        // correspondence between grid rows and snapshot lines.
+        let viewport_indexed: Vec<(usize, &Row)> = self
             .viewport
             .iter()
             .take(self.num_rows)
             .enumerate()
-            .skip(viewport_start.min(self.num_rows));
+            .skip(viewport_start.min(self.num_rows))
+            .filter(|(index, _)| {
+                viewport_owned.map_or(true, |owned| owned.get(*index).copied().unwrap_or(false))
+            })
+            .collect();
+        // v1.10.7: tag each row with whether it is the cursor's grid row.
+        // The scrollback chain never carries the cursor (it always sits in
+        // the viewport), so scrollback rows are never tagged. The viewport
+        // rows keep their absolute grid index (the `enumerate` ran BEFORE the
+        // `.skip(viewport_start)`), so the cursor is matched by index, not by
+        // chain position. The v1.10.6 tracker counted every yielded row
+        // (scrollback first), which shifted the match by the number of
+        // scrollback rows between `document_start` and the viewport origin —
+        // the caret/preedit then landed N rows above the real input row.
+        let cursor_row_excluded = !viewport_owned.map_or(true, |owned| {
+            owned.get(cursor_row).copied().unwrap_or(false)
+        });
+        let scrollback_tagged = scrollback.map(|row| (false, row));
+        let viewport_tagged = viewport_indexed
+            .into_iter()
+            .map(|(index, row)| (index == cursor_row, row));
         let mut text = String::new();
         let mut lines = Vec::new();
         let mut span_count = 0_usize;
@@ -304,11 +330,10 @@ impl Grid {
         let mut started = false;
         let mut pending_empty = 0_usize;
         let mut line_index = 0_usize;
-        for row in scrollback.chain(viewport.filter_map(|(index, row)| {
-            viewport_owned
-                .map_or(true, |owned| owned.get(index).copied().unwrap_or(false))
-                .then_some(row)
-        })) {
+        let mut cursor_snapshot_line: Option<usize> = None;
+        // Walk the grid rows in document order.
+        for (on_cursor_index, row) in scrollback_tagged.chain(viewport_tagged) {
+            let on_cursor_row = on_cursor_index && !cursor_row_excluded;
             let style_budget =
                 style_enabled.then(|| MAX_SNAPSHOT_COLOR_SPANS.saturating_sub(span_count));
             let row = styled_row(
@@ -322,7 +347,12 @@ impl Grid {
                 if row.text_overflow {
                     mark_snapshot_truncated(&mut text);
                     lines.clear();
-                    return (text, StyledOutput { lines });
+                    return (text, StyledOutput { lines }, cursor_snapshot_line);
+                }
+                // If the cursor is on this empty row, resolve to the
+                // preceding line_index (the line the user sees just above).
+                if on_cursor_row {
+                    cursor_snapshot_line = Some(line_index);
                 }
                 pending_empty += usize::from(started);
                 continue;
@@ -332,21 +362,25 @@ impl Grid {
                 for _ in 0..=pending_empty {
                     if !push_snapshot_text(&mut text, "\n") {
                         lines.clear();
-                        return (text, StyledOutput { lines });
+                        return (text, StyledOutput { lines }, cursor_snapshot_line);
                     }
                 }
             } else {
                 started = true;
             }
+            // The cursor lands on this non-empty row → snapshot line_index.
+            if on_cursor_row {
+                cursor_snapshot_line = Some(line_index);
+            }
             pending_empty = 0;
             if !push_snapshot_text(&mut text, &row.text) {
                 lines.clear();
-                return (text, StyledOutput { lines });
+                return (text, StyledOutput { lines }, cursor_snapshot_line);
             }
             if row.text_overflow {
                 mark_snapshot_truncated(&mut text);
                 lines.clear();
-                return (text, StyledOutput { lines });
+                return (text, StyledOutput { lines }, cursor_snapshot_line);
             }
             if row.style_overflow {
                 style_enabled = false;
@@ -369,7 +403,7 @@ impl Grid {
                 });
             }
         }
-        (text, StyledOutput { lines })
+        (text, StyledOutput { lines }, cursor_snapshot_line)
     }
 }
 
@@ -610,6 +644,61 @@ mod tests {
             grid.document_text_from(command_start),
             "complete answer line 1\ncomplete answer line 2\n\nPress Ctrl-C again to exit\nclaude --resume session-id"
         );
+    }
+
+    /// v1.10.7 regression: the cursor snapshot line must be exact even when
+    /// the document starts in the SCROLLBACK (the shell prompt row scrolled
+    /// above the viewport origin). The v1.10.6 tracker decremented across the
+    /// whole scrollback→viewport chain, shifting the match by the number of
+    /// scrollback rows between `document_start` and the viewport origin — the
+    /// BlockView caret/preedit then landed N rows above the real input row.
+    #[test]
+    fn cursor_snapshot_line_counts_viewport_rows_only() {
+        // 6 rows: 2 scrollback + 4 viewport. The document starts at the
+        // scrollback row right after the (excluded) shell prompt row, so
+        // ONE scrollback row sits between document_start and the viewport.
+        let mut grid = Grid::with_scrollback(4, 40, 2);
+        grid.scrollback.push(row("shell prompt row", 40));
+        let document_start = grid.scrollback.position();
+        grid.scrollback.push(row("banner of the app", 40));
+        grid.viewport[0] = row("app header line", 40);
+        grid.viewport[1] = row("app content line", 40);
+        grid.viewport[2] = row("input prompt: ", 40);
+        grid.viewport[3] = row("", 40);
+        // Cursor sits on viewport row 2 ("input prompt: ") — the row the
+        // user is typing at. In the document it is line index 3
+        // (banner, header, content, input) — NOT 3 - 1 scrollback row.
+        grid.cursor.row = 2;
+        grid.cursor.col = 14;
+
+        let (text, _styled, cursor_line) =
+            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        assert_eq!(
+            text,
+            "banner of the app\napp header line\napp content line\ninput prompt:",
+        );
+        assert_eq!(
+            cursor_line,
+            Some(3),
+            "cursor on viewport row 2 must map to document line 3, not shifted by scrollback rows"
+        );
+    }
+
+    /// The cursor row must still be tracked when the document starts exactly
+    /// at the viewport origin (no scrollback rows between).
+    #[test]
+    fn cursor_snapshot_line_tracks_cursor_at_viewport_origin_document() {
+        let mut grid = Grid::with_scrollback(4, 40, 20);
+        grid.viewport[0] = row("first document row", 40);
+        grid.viewport[1] = row("", 40);
+        grid.viewport[2] = row("input row here", 40);
+        grid.cursor.row = 2;
+        let document_start = grid.scrollback.position();
+
+        let (text, _styled, cursor_line) =
+            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        assert_eq!(text, "first document row\n\ninput row here");
+        assert_eq!(cursor_line, Some(2));
     }
 
     #[test]

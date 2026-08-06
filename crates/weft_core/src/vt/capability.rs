@@ -45,6 +45,39 @@ pub(in crate::vt) struct CapabilityFlags {
     /// `CommandExecuting` phase. `>= 2` distinguishes a primary-screen TUI
     /// (Claude Code, OpenCode) from a plain shell command.
     pub(in crate::vt) primary_screen_cursor_ops: u8,
+    /// Whether the current primary-screen TUI has used absolute cursor
+    /// addressing (CUP `H`/`f`, VPA `d` — v1.10.5: CHR `G` is horizontal-
+    /// only and no longer counts) — the full-viewport repaint pattern of
+    /// Claude Code / OpenCode, which need the live grid. Relative-only
+    /// TUIs (openclaw: CUU/CUD/CUB + EL/ED partial redraws) render
+    /// correctly in the BlockView and must stay there, so this flag
+    /// keeps `show_block_view()` true for them even after `cursor_ops`
+    /// crosses the TUI-detection threshold. Reset with each OSC 133 prompt
+    /// marker like `primary_screen_cursor_ops`.
+    pub(in crate::vt) primary_screen_absolute_addressing: bool,
+    /// v1.10.7: per-command render-mode lock. When a primary-screen TUI is
+    /// first detected with relative-only addressing (a sparse repainter like
+    /// pi/openclaw that redraws its input row per keystroke and only
+    /// occasionally issues a full-viewport CUP), the BlockView stays locked
+    /// for the whole command — a later CUP repaint must not flip the renderer
+    /// to the live grid mid-session (that flips layout every task and loses
+    /// the user's Warp-style history blocks). Set at first screen ownership
+    /// (`!absolute_addressing` at that moment), reset at each real prompt
+    /// boundary. Full-viewport CUP TUIs (Claude Code) detect as absolute →
+    /// lock=false → live grid, unchanged.
+    pub(in crate::vt) primary_screen_block_view_locked: bool,
+    /// v1.10.6: the cursor's line index in the most recent primary-screen
+    /// snapshot. Tracked during snapshot construction (which skips empty
+    /// rows) so the BlockView paint can place the caret/preedit on the
+    /// exact document row. `None` when no snapshot has been taken or the
+    /// cursor was on a skipped empty row.
+    pub(in crate::vt) primary_screen_cursor_snapshot_line: Option<usize>,
+    /// v1.10.7 (reviewer MEDIUM): last `(row, col)` that drove a caret
+    /// snapshot refresh. `snapshot_primary_screen_output_for_caret` is
+    /// called per keystroke (no rate limit) and rebuilds the whole document;
+    /// the tracked cursor line only depends on the cursor position, so a
+    /// keystroke that did not move the cursor can skip the rescan.
+    pub(in crate::vt) last_caret_snapshot_cursor: Option<(usize, usize)>,
     /// Scrollback position of the first row owned by the active primary-screen
     /// application; updated by scroll/erase/reflow transforms.
     pub(in crate::vt) primary_screen_document_candidate: u64,
@@ -76,6 +109,10 @@ impl Default for CapabilityFlags {
             sgr_mouse: false,
             app_cursor_keys: false,
             primary_screen_cursor_ops: 0,
+            primary_screen_absolute_addressing: false,
+            primary_screen_block_view_locked: false,
+            primary_screen_cursor_snapshot_line: None,
+            last_caret_snapshot_cursor: None,
             primary_screen_document_candidate: 0,
             primary_screen_synchronized_frame_seen: false,
             primary_screen_exit: None,

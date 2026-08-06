@@ -11,6 +11,29 @@ pub(crate) struct TuiPreeditDrawParams<'a> {
     pub(crate) cursor: Option<(usize, usize)>,
 }
 
+/// v1.10.5: per-call paint parameters for a BlockView live-block preedit —
+/// the marked text plus the resolved document anchor (pixel origin, clip
+/// edge, block width) and the theme colors. Packed so
+/// [`MetalRenderer::push_block_tui_preedit`] stays under the clippy
+/// argument budget.
+#[derive(Clone, Copy)]
+pub(crate) struct BlockTuiPreeditParams<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) cursor: Option<(usize, usize)>,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) right: f32,
+    pub(crate) cols: usize,
+    /// v1.10.5 (reviewer MEDIUM-1): the caret's column within the row —
+    /// `push_text`'s `max_cols` budgets columns from the text origin, so
+    /// the preedit must be limited to `cols - cursor_col` or its glyphs
+    /// spill past the block's right edge near the end of a line.
+    pub(crate) cursor_col: usize,
+    pub(crate) bg_uv: [f32; 4],
+    pub(crate) theme_bg: [f32; 4],
+    pub(crate) accent: [f32; 4],
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreeditVisualRow {
     pub(crate) grid_row: usize,
@@ -189,6 +212,78 @@ impl MetalRenderer {
             self.push_text(&mut vertices, x, y, &row.text, accent, width);
         }
         vertices
+    }
+
+    /// v1.10.5: draw a single-row IME preedit at a BlockView live-block
+    /// caret (background band + accent text + composition caret). Shares the
+    /// semantics of [`build_tui_preedit_vertices`](Self::build_tui_preedit_
+    /// vertices) but takes an explicit pixel anchor — the grid cursor
+    /// mapped into the live block's document row by the BlockView paint
+    /// pass — instead of deriving the anchor from the grid coordinate
+    /// system (which the BlockView does not render). Rows longer than the
+    /// block width are clipped by `push_text`'s `max_cols`.
+    pub(crate) fn push_block_tui_preedit(
+        &self,
+        verts: &mut Vec<f32>,
+        params: BlockTuiPreeditParams<'_>,
+    ) {
+        let BlockTuiPreeditParams {
+            text,
+            cursor,
+            x,
+            y,
+            right,
+            cols,
+            cursor_col,
+            bg_uv,
+            theme_bg,
+            accent,
+        } = params;
+        if text.is_empty() {
+            return;
+        }
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let preedit_cols = Self::text_col_width(text);
+        let preedit_w = (preedit_cols as f32 * cw).max(1.0);
+        push_quad(
+            verts,
+            [x, y, (x + preedit_w).min(right), y + ch],
+            bg_uv,
+            [0.0; 4],
+            [theme_bg[0], theme_bg[1], theme_bg[2], 0.96],
+        );
+        if let Some((start, end)) = cursor {
+            let (start, end) = crate::paint::prompt::normalize_preedit_range(text, start, end);
+            let prefix_cols = Self::text_col_width(&text[..start]);
+            let selected_cols = Self::text_col_width(&text[start..end]);
+            let marker_x = x + prefix_cols as f32 * cw;
+            if start == end {
+                push_quad(
+                    verts,
+                    [marker_x, y + ch - 2.0, marker_x + 2.0, y + ch],
+                    bg_uv,
+                    [0.0; 4],
+                    accent,
+                );
+            } else if selected_cols > 0 {
+                push_quad(
+                    verts,
+                    [
+                        marker_x,
+                        y + ch - 2.0,
+                        marker_x + selected_cols as f32 * cw,
+                        y + ch,
+                    ],
+                    bg_uv,
+                    [0.0; 4],
+                    accent,
+                );
+            }
+        }
+        // Reviewer MEDIUM-1: max_cols budgets columns FROM the text origin
+        // (the caret), so the remaining row width is `cols - cursor_col`.
+        self.push_text(verts, x, y, text, accent, cols.saturating_sub(cursor_col));
     }
 }
 

@@ -83,8 +83,22 @@ vertex TextVertexOut text_vertex_instanced(
 fragment float4 text_fragment(
     TextVertexOut in [[stage_in]],
     texture2d<float> atlas [[texture(0)]],
+    texture2d<float> color_atlas [[texture(1)]],
     sampler atlas_sampler [[sampler(0)]]
 ) {
+    // v1.10.4: fg.a > 1.5 is the color-emoji sentinel — `push_row` emits
+    // fg = [0,0,0,2.0] for glyphs stored in the RGBA color atlas (normal
+    // fg alpha is ≤ 1.0, verified by unit test). Sample the color texture
+    // and blend the emoji's own RGB over the background. The atlas stores
+    // premultiplied RGBA, so divide by alpha to recover straight RGB for
+    // the same blend math as the mask path below.
+    if (in.fg_color.a > 1.5) {
+        float4 c = color_atlas.sample(atlas_sampler, in.tex_coord);
+        float3 rgb = c.a > 0.001 ? c.rgb / c.a : float3(0.0);
+        float4 color = mix(in.bg_color, float4(rgb, 1.0), c.a);
+        color.a = mix(in.bg_color.a, 1.0, c.a);
+        return color;
+    }
     float mask = atlas.sample(atlas_sampler, in.tex_coord).r;
     float4 color = mix(in.bg_color, in.fg_color, mask);
     color.a = mix(in.bg_color.a, 1.0, mask);

@@ -98,7 +98,10 @@ pub struct InFlightBlock<'a> {
     pub command: &'a str,
     pub cwd: Option<&'a str>,
     pub output: &'a str,
-    pub styled_output: Option<&'a StyledOutput>,
+    /// v1.10.5: borrow the `Arc<StyledOutput>` itself (not the dereferenced
+    /// `&StyledOutput`) so callers can cheap-clone the Arc instead of deep-
+    /// copying the styled lines on the render hot path.
+    pub styled_output: Option<&'a Arc<StyledOutput>>,
 }
 
 /// Shell-phase state machine driven by OSC 133. v0.4 uses it only to
@@ -297,7 +300,7 @@ impl BlockTracker {
                 .and_then(|block| block.cwd.as_deref())
                 .or(self.pending_cwd.as_deref()),
             output: self.output.as_str(),
-            styled_output: self.styled_output.as_deref(),
+            styled_output: self.styled_output.as_ref(),
         })
     }
 

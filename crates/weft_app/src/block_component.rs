@@ -292,6 +292,45 @@ pub(crate) fn block_content_metrics_with_cache(
     (total, terminal.grid().num_rows.max(1))
 }
 
+/// v1.10.5: map a grid cursor row into the live block's snapshot text.
+///
+/// The screen snapshot spans `document_start .. grid end` (all viewport
+/// rows included), so a viewport cursor row sits at
+/// `line_count - grid_rows + cursor_row` in the snapshot. Shared by the
+/// BlockView paint (caret + IME preedit) and the native IME anchor so both
+/// stay on the same document row.
+///
+/// v1.10.6: when the snapshot is shorter than the grid viewport
+/// (`live_line_count < grid_rows`), the mapping collapses to `cursor_row`
+/// itself. But `cursor_row` may exceed `live_line_count` (the TUI wrote
+/// blank/border rows the snapshot omits, or the cursor sits outside the
+/// document boundary). Clamp to the last live line so the caret and preedit
+/// stay at the document's input edge instead of vanishing entirely.
+pub(crate) fn block_view_tui_cursor_line(
+    live_line_count: usize,
+    grid_rows: usize,
+    cursor_row: usize,
+) -> usize {
+    let mapped = live_line_count
+        .saturating_sub(grid_rows)
+        .saturating_add(cursor_row);
+    mapped.min(live_line_count.saturating_sub(1))
+}
+
+/// v1.10.5: whether a laid-out BlockView Output row may carry the TUI caret
+/// and IME preedit. Only LIVE block rows use the snapshot-line index space
+/// the caret maps into; finished-block rows use their own 0-based output
+/// index, which collides numerically (a finished block with N+ lines would
+/// otherwise draw the caret/preedit on its Nth row). The `block_id` is
+/// `None` for live rows and `Some(id)` for finished blocks.
+pub(crate) fn tui_caret_row_matches(
+    block_id: Option<u64>,
+    line_idx: usize,
+    cursor_line: usize,
+) -> bool {
+    block_id.is_none() && line_idx == cursor_line
+}
+
 /// Whether fresh PTY output should keep the BlockView pinned to the live tail.
 ///
 /// A primary-screen application also emits output when it repaints after
@@ -367,6 +406,68 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
     use weft_core::blocks::{Block, BlockId};
+
+    #[test]
+    fn tui_cursor_line_maps_viewport_row_into_snapshot() {
+        // v1.10.5: the grid cursor is a viewport row; the snapshot spans
+        // document_start..grid-end, so the cursor's snapshot line is
+        // line_count - grid_rows + cursor_row.
+        assert_eq!(
+            block_view_tui_cursor_line(34, 34, 33),
+            33,
+            "bottom row maps to the last snapshot line"
+        );
+        assert_eq!(
+            block_view_tui_cursor_line(34, 34, 0),
+            0,
+            "top row maps to the first viewport line"
+        );
+        assert_eq!(
+            block_view_tui_cursor_line(40, 34, 33),
+            39,
+            "scrollback above the viewport shifts the mapping"
+        );
+        // Degenerate inputs saturate instead of underflowing.
+        assert_eq!(block_view_tui_cursor_line(2, 34, 0), 0);
+        // v1.10.6: when snapshot < grid (pi: 10 lines, 33 rows), cursor_row
+        // may exceed live_line_count. Clamp to the last live line so the
+        // caret/preedit stay at the document's input edge.
+        assert_eq!(
+            block_view_tui_cursor_line(10, 33, 13),
+            9,
+            "cursor_row beyond snapshot clamps to the last live line"
+        );
+        assert_eq!(
+            block_view_tui_cursor_line(10, 33, 9),
+            9,
+            "cursor_row at snapshot boundary maps to the last line"
+        );
+    }
+
+    #[test]
+    fn tui_caret_row_matches_live_rows_only() {
+        // v1.10.5 (reviewer HIGH): finished-block rows reuse a 0-based
+        // output index that collides numerically with the live block's
+        // snapshot-line index — the caret/preedit must only paint on live
+        // rows (`block_id == None`), or it draws onto history blocks.
+        let cursor_line = 33;
+        assert!(
+            tui_caret_row_matches(None, cursor_line, cursor_line),
+            "live row at the cursor line matches"
+        );
+        assert!(
+            !tui_caret_row_matches(None, cursor_line + 1, cursor_line),
+            "live row off the cursor line does not match"
+        );
+        assert!(
+            !tui_caret_row_matches(Some(7), cursor_line, cursor_line),
+            "finished-block row with a colliding index must NOT match"
+        );
+        assert!(
+            !tui_caret_row_matches(Some(7), 0, cursor_line),
+            "finished-block row off the cursor line does not match"
+        );
+    }
 
     fn block(exit_code: Option<i32>, collapsed: bool) -> Block {
         let started_at = SystemTime::UNIX_EPOCH;

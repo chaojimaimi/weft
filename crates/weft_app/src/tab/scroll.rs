@@ -125,13 +125,17 @@ impl Tab {
         let detached = !matches!(self.block_scroll_anchor, BlockScrollAnchor::FollowBottom);
         let pane = self.active_mut();
         let changed = if let Some(terminal) = &mut pane.terminal {
-            // Reaching the history tail is still a history position. Keep the
-            // detached BlockView active at offset zero so the last wheel step
-            // cannot switch to the differently laid-out live Grid and appear
-            // to jump. Explicit input / ScrollToBottom calls `snap_to_bottom`
-            // and is the sole boundary that leaves history browsing.
-            let browsing = terminal.primary_screen_app_active()
-                && (detached || terminal.primary_history_view());
+            // v1.10.6: history browsing is ACTIVE ONLY while the user is
+            // detached (anchor != FollowBottom). The previous
+            // `(detached || primary_history_view)` kept history browsing
+            // sticky forever: once the user scrolled up (entering the
+            // detached BlockView snapshot), scrolling back to the tail
+            // (FollowBottom) left `primary_history_view` true, so every
+            // subsequent keystroke rendered the TUI in the BlockView —
+            // whose IME support is a fallback (no preedit, imprecise caret).
+            // The user expects scrolling back to the tail to return to the
+            // live grid (native cursor/IME/color), matching Warp.
+            let browsing = terminal.primary_screen_app_active() && detached;
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
             changed
