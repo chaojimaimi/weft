@@ -222,15 +222,19 @@ impl Pane {
         next
     }
 
-    /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
-    /// Overwriting (rather than preserving) an older pending size is required
-    /// when several window/font/sidebar changes coalesce before the throttle
-    /// flushes them, including for background panes.
+    /// Queue a geometry transaction without resizing the Grid ahead of its PTY.
+    /// Overwriting an older pending size coalesces resize cascades. The effect
+    /// dispatcher applies `TIOCSWINSZ` first and only then commits the Grid,
+    /// preventing old-width progress output from wrapping in a new-width Grid.
     pub(crate) fn resize_terminal_and_queue(&mut self, rows: usize, cols: usize) -> bool {
-        let Some(terminal) = &mut self.terminal else {
+        let Some(terminal) = &self.terminal else {
             return false;
         };
-        terminal.resize(rows, cols);
+        if (terminal.grid().num_rows, terminal.grid().num_cols) == (rows, cols)
+            && self.pending_pty_resize.is_none()
+        {
+            return false;
+        }
         self.pending_pty_resize = Some((rows, cols));
         true
     }

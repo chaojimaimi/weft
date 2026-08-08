@@ -41,6 +41,7 @@ pub(crate) struct PaneSplitGeometry {
 
 mod lifecycle;
 mod primary_history;
+mod resize;
 mod scroll;
 mod tui_scroll;
 
@@ -572,21 +573,6 @@ impl Tab {
             }
         }
         active_resized
-    }
-
-    /// v1.3 Batch 6: Read (non-consuming) every pane's pending PTY resize.
-    /// Returns `(pane_id, (rows, cols))` pairs for all panes that have a
-    /// pending resize. Used by the redraw loop to build per-pane
-    /// `Effect::ResizePty` entries (replacing the old per-tab collection that
-    /// only saw the active pane's pending resize via Deref).
-    pub(crate) fn pending_pane_resizes(&self) -> Vec<(PaneId, (usize, usize))> {
-        let mut out = Vec::new();
-        for (id, pane) in &self.panes {
-            if let Some(dim) = pane.pending_pty_resize {
-                out.push((*id, dim));
-            }
-        }
-        out
     }
 
     /// v1.3 Batch 6: Find the pane whose split-tree-computed rect contains

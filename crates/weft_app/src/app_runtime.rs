@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod resize_transaction;
+use resize_transaction::commit_pty_resize_result;
+
 pub(crate) fn install_runtime_diagnostics() {
     // v1.10.4: write to ~/Library/Logs/Weft/weft.log (macOS standard location)
     // and APPEND across launches so a crash/relaunch doesn't wipe the prior
@@ -86,10 +89,6 @@ fn invalidate_primary_tui_frame(terminal: &mut Terminal) -> bool {
     }
     terminal.grid_mut().clear_screen_all();
     true
-}
-
-fn should_clear_pending_resize(resize_failed: bool) -> bool {
-    !resize_failed
 }
 
 pub(super) fn terminal_capability_env() -> Vec<(String, String)> {
@@ -220,15 +219,21 @@ impl ApplicationHandler<AppEvent> for App {
                         },
                     );
                 }
-                let synchronized = self
+                let active_synchronized = self
                     .sessions
                     .active()
                     .terminal
                     .as_ref()
                     .is_some_and(Terminal::synchronized_output);
-                if !synchronized {
+                let any_synchronized = self
+                    .sessions
+                    .tabs()
+                    .iter()
+                    .any(crate::tab::Tab::any_synchronized_output);
+                if !active_synchronized {
                     self.request_redraw();
-                } else {
+                }
+                if any_synchronized {
                     let proxy = self.proxy.clone();
                     schedule_synchronized_output_watchdog(
                         self.window_runtime
@@ -709,23 +714,24 @@ impl App {
             .pty
             .as_ref()
             .map(|pty| pty.resize(rows as u16, cols as u16));
-        let resize_failed = match resize_result {
-            Some(Ok(())) => {
-                if let Some(terminal) = &mut pane.terminal {
-                    invalidate_primary_tui_frame(terminal);
-                }
-                false
-            }
+        let resize_succeeded = match resize_result {
+            Some(Ok(())) => true,
             Some(Err(error)) => {
                 warn!(%error, tab, pane_id = %pane_id, rows, cols, "failed to apply PTY resize effect");
-                true
+                false
             }
             None => return,
         };
-        if should_clear_pending_resize(resize_failed)
-            && pane.pending_pty_resize == Some((rows, cols))
-        {
-            pane.pending_pty_resize = None;
+        if let Some(terminal) = &mut pane.terminal {
+            let committed = commit_pty_resize_result(
+                terminal,
+                &mut pane.pending_pty_resize,
+                (rows, cols),
+                resize_succeeded,
+            );
+            if committed {
+                invalidate_primary_tui_frame(terminal);
+            }
         }
     }
 }
@@ -799,12 +805,6 @@ mod tests {
         assert!(!invalidate_primary_tui_frame(&mut terminal));
         assert_eq!(terminal.grid().row_text(0), "progress");
         assert_eq!(terminal.grid().row_text(1), "still running");
-    }
-
-    #[test]
-    fn failed_pty_resize_keeps_latest_dimensions_for_retry() {
-        assert!(!should_clear_pending_resize(true));
-        assert!(should_clear_pending_resize(false));
     }
 
     #[test]

@@ -98,6 +98,12 @@ async fn zsh_emits_osc133_markers_without_echoing_hook() {
         s.contains("\u{1b}]133;D;0"),
         "missing command-end marker 133;D;0;\n{s}"
     );
+    assert!(
+        s.contains("\u{1b}]133;A;weft-shell")
+            && s.contains("\u{1b}]133;B;weft-shell")
+            && s.contains("\u{1b}]133;D;0;weft-shell"),
+        "generated shell boundaries must carry the Weft origin tag;\n{s}"
+    );
 
     // The hook source must NOT appear — this is the regression guard for the
     // original PTY-stdin echo bug.

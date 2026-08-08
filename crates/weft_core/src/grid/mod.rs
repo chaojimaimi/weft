@@ -19,6 +19,8 @@ pub use scrollback::Scrollback;
 use std::sync::Arc;
 
 #[cfg(test)]
+mod snapshot_cursor_tests;
+#[cfg(test)]
 mod tests;
 
 /// Terminal grid: visible viewport + scrollback buffer.

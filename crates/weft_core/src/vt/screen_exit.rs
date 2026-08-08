@@ -508,7 +508,7 @@ impl Terminal {
 
     /// v1.10.6: the cursor's line index in the most recent primary-screen
     /// snapshot. `None` until the first snapshot, or when the cursor sat on
-    /// a row the snapshot skipped (empty / unowned).
+    /// a row the snapshot omitted (unowned, leading, or trailing empty).
     pub fn primary_screen_cursor_snapshot_line(&self) -> Option<usize> {
         self.capabilities.primary_screen_cursor_snapshot_line
     }

@@ -331,6 +331,7 @@ impl Grid {
         let mut pending_empty = 0_usize;
         let mut line_index = 0_usize;
         let mut cursor_snapshot_line: Option<usize> = None;
+        let mut pending_empty_cursor_line: Option<usize> = None;
         // Walk the grid rows in document order.
         for (on_cursor_index, row) in scrollback_tagged.chain(viewport_tagged) {
             let on_cursor_row = on_cursor_index && !cursor_row_excluded;
@@ -349,10 +350,10 @@ impl Grid {
                     lines.clear();
                     return (text, StyledOutput { lines }, cursor_snapshot_line);
                 }
-                // If the cursor is on this empty row, resolve to the
-                // preceding line_index (the line the user sees just above).
-                if on_cursor_row {
-                    cursor_snapshot_line = Some(line_index);
+                // Commit this candidate only if a later non-empty row
+                // materializes the pending newlines in the snapshot text.
+                if on_cursor_row && started {
+                    pending_empty_cursor_line = Some(line_index.saturating_add(1 + pending_empty));
                 }
                 pending_empty += usize::from(started);
                 continue;
@@ -364,6 +365,9 @@ impl Grid {
                         lines.clear();
                         return (text, StyledOutput { lines }, cursor_snapshot_line);
                     }
+                }
+                if let Some(cursor_line) = pending_empty_cursor_line.take() {
+                    cursor_snapshot_line = Some(cursor_line);
                 }
             } else {
                 started = true;

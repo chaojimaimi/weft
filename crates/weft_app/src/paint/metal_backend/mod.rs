@@ -269,6 +269,7 @@ impl MetalRenderer {
             grid_build_us_counter: Cell::new(0),
             styled_line_cache: RefCell::new(crate::paint::styled_line_cache::StyledLineCache::new()),
             last_expanded_block_count: Cell::new(0),
+            block_view_tui_caret_area: Cell::new(None),
             grid_row_cache: RefCell::new(Vec::new()),
             force_full_grid: Cell::new(true),
             prev_cursor_row: Cell::new(None),

@@ -58,8 +58,8 @@ __weft_real_zshenv=\"${ZDOTDIR:-$HOME}/.zshenv\"
 if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
     __weft_precmd() {
         local __weft_rc=$?
-        printf '\\033]133;D;%d\\007' \"$__weft_rc\"
-        printf '\\033]133;A\\007'
+        printf '\\033]133;D;%d;weft-shell\\007' \"$__weft_rc\"
+        printf '\\033]133;A;weft-shell\\007'
         printf '\\033]7;file://%s%s\\007' \"${HOSTNAME:-$HOST}\" \"$PWD\"
         # Report the current git branch (if in a repo) for the prompt header.
         local __weft_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
@@ -73,8 +73,8 @@ if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
         PROMPT_EOL_MARK=''
     }
     __weft_preexec() {
-        printf '\\033]133;B\\007'
-        printf '\\033]133;C\\007'
+        printf '\\033]133;B;weft-shell\\007'
+        printf '\\033]133;C;weft-shell\\007'
     }
     # Prepend so our precmd runs before user hooks and captures a clean exit code.
     precmd_functions=(__weft_precmd ${precmd_functions[@]})
@@ -93,14 +93,14 @@ const BASH_INTEGRATION_BODY: &str = "\
 #   [ -n \"$WEFT_SHELL_INTEGRATION\" ] && . ~/.cache/weft/bash-integration.sh
 __weft_bash_precmd() {
     local __weft_rc=$?
-    printf '\\033]133;D;%d\\007' \"$__weft_rc\"
-    printf '\\033]133;A\\007'
+    printf '\\033]133;D;%d;weft-shell\\007' \"$__weft_rc\"
+    printf '\\033]133;A;weft-shell\\007'
     printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"
     PS1=''
 }
 __weft_bash_preexec() {
-    printf '\\033]133;B\\007'
-    printf '\\033]133;C\\007'
+    printf '\\033]133;B;weft-shell\\007'
+    printf '\\033]133;C;weft-shell\\007'
 }
 if [ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]; then
     PROMPT_COMMAND=\"__weft_bash_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}\"
@@ -256,6 +256,10 @@ mod tests {
         // preexec: B (command start) then C (output start).
         assert!(file.body.contains("133;B"));
         assert!(file.body.contains("133;C"));
+        assert!(
+            file.body.contains("weft-shell"),
+            "Weft-owned markers need an origin tag so application OSC 133 zones cannot drive blocks"
+        );
     }
 
     #[test]
@@ -265,6 +269,7 @@ mod tests {
         assert!(snippet.contains("133;A"));
         assert!(snippet.contains("133;B"));
         assert!(snippet.contains("133;C"));
+        assert!(snippet.contains("weft-shell"));
     }
 
     #[test]

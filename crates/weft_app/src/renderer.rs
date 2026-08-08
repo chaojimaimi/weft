@@ -148,6 +148,8 @@ pub struct MetalRenderer {
     pub(crate) styled_line_cache: RefCell<crate::paint::styled_line_cache::StyledLineCache>,
     /// Batch 6 Step 1: per-frame expanded block count from last layout pass.
     pub(crate) last_expanded_block_count: Cell<usize>,
+    /// Actual BlockView TUI caret painted this frame; also anchors native IME.
+    pub(crate) block_view_tui_caret_area: Cell<Option<crate::ime::ImeCursorArea>>,
     /// v1.0 P0-b / v1.4.2 Phase B3: Per-row dual-stream grid cache. Each
     /// entry holds one row's bg floats (8 per run) + glyph floats (16 per
     /// cell). Dirty rows are rebuilt; clean rows are reused. Eliminates
@@ -325,6 +327,7 @@ impl MetalRenderer {
         active_pane_id: weft_core::pane_layout::PaneId,
         active_pane_session_id: u64,
     ) {
+        self.block_view_tui_caret_area.set(None);
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
             None => return,

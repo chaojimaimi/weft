@@ -753,6 +753,11 @@ impl vte::Perform for Terminal {
             }
             "133" => {
                 if params.len() > 1 {
+                    let tagged = params.iter().skip(2).any(|p| *p == b"weft-shell");
+                    if !self.capabilities.accepts_shell_marker(tagged) {
+                        tracing::trace!("ignored untagged application OSC 133 zone");
+                        return;
+                    }
                     match params[1] {
                         b"A" => {
                             self.snapshot_primary_screen_output();

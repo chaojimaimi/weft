@@ -24,6 +24,24 @@ pub struct ImeCursorArea {
     pub height: f32,
 }
 
+/// One geometry result drives both the GPU caret and native IME anchor.
+pub(crate) fn block_view_tui_caret_geometry(
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+) -> (ImeCursorArea, [f32; 4]) {
+    (
+        ImeCursorArea {
+            x,
+            y,
+            width: cell_width,
+            height: cell_height,
+        },
+        [x, y, x + 2.0, y + cell_height],
+    )
+}
+
 fn grid_cursor_area(ctx: LayoutCtx, row: usize, col: usize) -> Option<ImeCursorArea> {
     (ctx.cell_w.is_finite() && ctx.cell_h.is_finite() && ctx.cell_w > 0.0 && ctx.cell_h > 0.0)
         .then_some(ImeCursorArea {
@@ -55,63 +73,6 @@ fn editor_cursor_area(ctx: LayoutCtx, terminal: &Terminal) -> Option<ImeCursorAr
     editor_cursor_area_from_buffer(ctx, &buffer.lines, buffer.cursor, buffer.scroll_offset)
 }
 
-/// v1.10.5: BlockView-mode TUI IME anchor — map the grid cursor into the
-/// live block's snapshot text so the macOS candidate window follows the
-/// visual input box. Primary-screen TUIs kept in the BlockView (openclaw/
-/// pi) input at their own bottom row; while the document renders, the grid
-/// coordinate system has no visible meaning, so the anchor is derived from
-/// the live block's layout instead. Mirrors the BlockView layout pass's
-/// live-row math (`MAX_LAYOUT_LINES_LIVE` truncation means a very deep
-/// cursor line simply misses — the candidate window stays where it was).
-/// Scroll position (block_scroll) is not applied here; the inline preedit
-/// painted on the document row is the primary visual.
-fn block_view_tui_cursor_area(ctx: LayoutCtx, terminal: &Terminal) -> Option<ImeCursorArea> {
-    let live = terminal.block_tracker().in_flight()?;
-    let grid = terminal.grid();
-    // v1.10.7: prefer the precisely-tracked cursor snapshot line (from
-    // snapshot construction, `document_snapshot_with_url_resolver`) so the
-    // candidate window lands on the SAME row the BlockView paint draws the
-    // caret/preedit on. The v1.10.5 formula (`line_count - grid_rows +
-    // cursor_row`) breaks when the snapshot skips empty rows or starts in
-    // the scrollback; the tracked value is exact. Both paint and anchor
-    // share this preference so they can never diverge.
-    let cursor_line = terminal
-        .primary_screen_cursor_snapshot_line()
-        .unwrap_or_else(|| {
-            crate::block_component::block_view_tui_cursor_line(
-                live.output.lines().count(),
-                grid.num_rows,
-                grid.cursor.row,
-            )
-        });
-    // v1.10.5 (reviewer MEDIUM-2): wrap at the SAME column budget as the
-    // BlockView paint (split panes give the block fewer columns than the
-    // grid), so the anchor and the painted caret stay on the same row and
-    // the row's height is measured the same way.
-    let block_cols = crate::layout::layout_block_view(&ctx, ctx.bottom(), false).cols;
-    let lines: Vec<&str> = live.output.lines().collect();
-    let mut dist = 0.0f32;
-    for (index, line) in lines.iter().enumerate().rev() {
-        // Row-top distance from the content bottom, including this row's
-        // full (possibly wrapped) height — matches the layout pass.
-        let wrapped = crate::paint::grid_cache::block_line_chunks(line, block_cols).count();
-        dist += wrapped as f32 * ctx.cell_h;
-        if index == cursor_line {
-            // The cursor may sit on a wrapped chunk row below this line's
-            // first visual row: descend `cursor_col / block_cols` chunks.
-            let chunk_idx = grid.cursor.col / block_cols;
-            let chunk_col = grid.cursor.col % block_cols;
-            return Some(ImeCursorArea {
-                x: ctx.left() + chunk_col as f32 * ctx.cell_w,
-                y: ctx.bottom() - dist + chunk_idx as f32 * ctx.cell_h,
-                width: ctx.cell_w,
-                height: ctx.cell_h,
-            });
-        }
-    }
-    None
-}
-
 /// Keep the native macOS candidate window attached to Weft's GPU caret.
 /// winit converts this physical top-left rectangle into AppKit's text-input
 /// coordinate system and invalidates the current character coordinates.
@@ -126,6 +87,7 @@ pub fn update_cursor_area(
     ctx: LayoutCtx,
     terminal: &Terminal,
     overlay_area: Option<ImeCursorArea>,
+    painted_terminal_area: Option<ImeCursorArea>,
 ) {
     let area = if let Some(oa) = overlay_area {
         Some(oa)
@@ -139,7 +101,7 @@ pub fn update_cursor_area(
                 // block row. Anchor the candidate window there so CJK IME
                 // stays at the input box instead of floating mid-screen.
                 if terminal.show_block_view() {
-                    block_view_tui_cursor_area(ctx, terminal)
+                    painted_terminal_area
                 } else {
                     let cursor = &terminal.grid().cursor;
                     grid_cursor_area(ctx, cursor.row, cursor.col)
@@ -219,11 +181,20 @@ pub fn discard_marked_text(window: &Window) {
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_keyboard_text, editor_cursor_area_from_buffer, encode_passthrough_key,
-        grid_cursor_area, ImeCursorArea,
+        block_view_tui_caret_geometry, direct_keyboard_text, editor_cursor_area_from_buffer,
+        encode_passthrough_key, grid_cursor_area, ImeCursorArea,
     };
     use crate::layout::LayoutCtx;
     use weft_core::input::{InputHandler, KeyCode, Modifiers};
+
+    #[test]
+    fn tui_caret_geometry_is_vertical_and_shared_with_ime() {
+        let (ime, quad) = block_view_tui_caret_geometry(42.0, 100.0, 9.0, 18.0);
+        assert_eq!(quad, [42.0, 100.0, 44.0, 118.0]);
+        assert_eq!((ime.x, ime.y), (quad[0], quad[1]));
+        assert_eq!(ime.height, quad[3] - quad[1]);
+        assert_eq!(ime.width, 9.0);
+    }
 
     #[test]
     fn printable_keyboard_text_preserves_layout_and_shifted_punctuation() {

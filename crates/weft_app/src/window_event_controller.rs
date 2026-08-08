@@ -32,11 +32,12 @@ impl App {
                         terminal_layout_for_renderer(renderer, physical_size, chrome_left);
 
                     if base_layout.cols > 0 && base_layout.rows > 0 {
-                        // Resize ALL tabs' grids immediately for smooth
-                        // animation. The rewrap/dimension-only resize is fast
-                        // (<1ms) so doing it on every intermediate event is
-                        // fine. Background tabs also need resizing so their
-                        // content wraps correctly when switched to.
+                        // Queue every pane's latest target geometry. The active
+                        // pane commits PTY then Grid on this redraw; background
+                        // panes coalesce the cascade and commit both together
+                        // after it settles. Keeping the pair transactional
+                        // prevents old-width output from wrapping in a Grid
+                        // that has already adopted the new width.
                         //
                         // v1.3 Batch 6: resize ALL panes per tab according to
                         // their split-tree rects. For single-pane tabs this is

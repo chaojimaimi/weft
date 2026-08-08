@@ -487,6 +487,9 @@ impl MetalRenderer {
                                 cursor_line,
                             ) {
                                 let caret_x = left + cursor_col as f32 * cw;
+                                let (caret_area, caret_quad) =
+                                    crate::ime::block_view_tui_caret_geometry(caret_x, y, cw, ch);
+                                self.block_view_tui_caret_area.set(Some(caret_area));
                                 // v1.10.5: the BlockView TUI caret is the
                                 // ONLY input affordance while the document
                                 // renders (the grid cursor is invisible).
@@ -495,13 +498,7 @@ impl MetalRenderer {
                                 // CommandExecuting `cursor_blink_on` is stale
                                 // and the caret would never paint. Keep it
                                 // steady-on for TUI block views instead.
-                                push_quad(
-                                    &mut verts,
-                                    [caret_x, y + ch - 2.0, caret_x + 2.0, y + ch],
-                                    bg_uv,
-                                    [0.0; 4],
-                                    accent,
-                                );
+                                push_quad(&mut verts, caret_quad, bg_uv, [0.0; 4], accent);
                                 if let Some((preedit, preedit_cursor)) = tui_preedit {
                                     self.push_block_tui_preedit(
                                         &mut verts,
@@ -616,15 +613,14 @@ impl MetalRenderer {
                                     {
                                         let chunk_col = cursor_col % cols;
                                         let caret_x = left + chunk_col as f32 * cw;
+                                        let (caret_area, caret_quad) =
+                                            crate::ime::block_view_tui_caret_geometry(
+                                                caret_x, cy, cw, ch,
+                                            );
+                                        self.block_view_tui_caret_area.set(Some(caret_area));
                                         // v1.10.5: steady-on caret (see the
                                         // single-row branch above).
-                                        push_quad(
-                                            &mut verts,
-                                            [caret_x, cy + ch - 2.0, caret_x + 2.0, cy + ch],
-                                            bg_uv,
-                                            [0.0; 4],
-                                            accent,
-                                        );
+                                        push_quad(&mut verts, caret_quad, bg_uv, [0.0; 4], accent);
                                         if let Some((preedit, preedit_cursor)) = tui_preedit {
                                             self.push_block_tui_preedit(
                                                 &mut verts,

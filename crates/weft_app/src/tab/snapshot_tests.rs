@@ -17,14 +17,38 @@ fn empty_tab_starts_without_transient_pending_state() {
 }
 
 #[test]
-fn terminal_resize_replaces_stale_pending_size_for_background_convergence() {
+fn terminal_resize_queues_latest_size_without_desynchronizing_grid() {
     let mut tab = tab_with_terminal();
     tab.pending_pty_resize = Some((40, 120));
 
     assert!(tab.resize_terminal_and_queue(22, 78));
     assert_eq!(tab.pending_pty_resize, Some((22, 78)));
     let grid = tab.terminal.as_ref().unwrap().grid();
-    assert_eq!((grid.num_rows, grid.num_cols), (22, 78));
+    assert_eq!(
+        (grid.num_rows, grid.num_cols),
+        (24, 80),
+        "Grid geometry must stay paired with the old PTY until ResizePty commits"
+    );
+}
+
+#[test]
+fn pending_resize_reports_each_panes_synchronized_frame_state() {
+    let mut tab = tab_with_terminal();
+    tab.pending_pty_resize = Some((30, 100));
+    tab.terminal
+        .as_mut()
+        .unwrap()
+        .process(b"\x1b[?2026hpartial");
+
+    assert!(tab.any_synchronized_output());
+    let pending = tab.pending_pane_resizes();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].dimensions(), (30, 100));
+    assert!(pending[0].is_synchronized());
+
+    tab.terminal.as_mut().unwrap().process(b" frame\x1b[?2026l");
+    assert!(!tab.any_synchronized_output());
+    assert!(!tab.pending_pane_resizes()[0].is_synchronized());
 }
 
 fn snapshot(cwd: &str, editor: &EditorBuffer) -> TabSnapshot {

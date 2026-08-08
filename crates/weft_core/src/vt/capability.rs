@@ -41,6 +41,10 @@ pub(in crate::vt) struct CapabilityFlags {
     pub(in crate::vt) sgr_mouse: bool,
     /// Application cursor key mode (DECCKM, CSI ?1h/l).
     pub(in crate::vt) app_cursor_keys: bool,
+    /// Weft's generated shell hook appends `weft-shell` to OSC 133 markers.
+    /// Once observed, untagged OSC 133 belongs to the foreground application
+    /// (semantic zones used by modern TUIs), not to the shell block protocol.
+    pub(in crate::vt) tagged_shell_markers_seen: bool,
     /// Count of absolute cursor-addressing ops observed during the current
     /// `CommandExecuting` phase. `>= 2` distinguishes a primary-screen TUI
     /// (Claude Code, OpenCode) from a plain shell command.
@@ -67,10 +71,9 @@ pub(in crate::vt) struct CapabilityFlags {
     /// lock=false → live grid, unchanged.
     pub(in crate::vt) primary_screen_block_view_locked: bool,
     /// v1.10.6: the cursor's line index in the most recent primary-screen
-    /// snapshot. Tracked during snapshot construction (which skips empty
-    /// rows) so the BlockView paint can place the caret/preedit on the
-    /// exact document row. `None` when no snapshot has been taken or the
-    /// cursor was on a skipped empty row.
+    /// snapshot. Tracked during snapshot construction so the BlockView paint
+    /// can place the caret/preedit on the exact materialized document row.
+    /// `None` before a snapshot or for omitted leading/trailing/unowned rows.
     pub(in crate::vt) primary_screen_cursor_snapshot_line: Option<usize>,
     /// v1.10.7 (reviewer MEDIUM): last `(row, col)` that drove a caret
     /// snapshot refresh. `snapshot_primary_screen_output_for_caret` is
@@ -108,6 +111,7 @@ impl Default for CapabilityFlags {
             mouse_protocol: MouseProtocol::Off,
             sgr_mouse: false,
             app_cursor_keys: false,
+            tagged_shell_markers_seen: false,
             primary_screen_cursor_ops: 0,
             primary_screen_absolute_addressing: false,
             primary_screen_block_view_locked: false,
@@ -196,6 +200,16 @@ impl std::fmt::Display for SettleState {
 }
 
 impl CapabilityFlags {
+    /// OSC 133 is also used by foreground applications as semantic zones.
+    /// After Weft's tagged hook is observed, reject untagged repaint markers
+    /// so they cannot drive the outer shell's block state machine.
+    pub(in crate::vt) fn accepts_shell_marker(&mut self, tagged: bool) -> bool {
+        if tagged {
+            self.tagged_shell_markers_seen = true;
+        }
+        tagged || !self.tagged_shell_markers_seen
+    }
+
     /// Classify who owns the viewport, given the current shell phase.
     ///
     /// Phase is passed in (rather than stored here) because phase lives on

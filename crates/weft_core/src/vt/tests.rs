@@ -2070,6 +2070,58 @@ fn nested_marker_does_not_overwrite_pending_exit_code() {
     );
 }
 
+/// Applications may use OSC 133 A/B/C as semantic output zones. Once the
+/// terminal has seen Weft's origin-tagged shell integration, untagged zones
+/// belong to the foreground application and must never mutate shell/block
+/// state, even when emitted repeatedly during synchronized TUI repaints.
+#[test]
+fn application_osc133_zones_do_not_drive_tagged_shell_session() {
+    let mut t = Terminal::new(10, 40);
+    t.process(b"\x1b]133;A;weft-shell\x07pi\r");
+    t.process(b"\x1b]133;B;weft-shell\x07\x1b]133;C;weft-shell\x07");
+    t.process("\x1b[?2026h\x1b[2Kinput\x1b[2G\x1b[?2026l".as_bytes());
+    assert!(t.block_tracker().screen_document_start().is_some());
+
+    let command = t
+        .block_tracker()
+        .in_flight()
+        .expect("screen command remains live")
+        .command
+        .to_string();
+    let blocks_before = t.block_tracker().blocks().len();
+
+    for (index, text) in ["thinking", "tool output", "final answer"]
+        .into_iter()
+        .enumerate()
+    {
+        t.process(b"\x1b]133;A\x07");
+        if index == 0 {
+            // Exceed the old 200ms timing heuristic. Origin ownership, not
+            // repaint timing, must decide whether this is a shell marker.
+            std::thread::sleep(
+                PRIMARY_SCREEN_EXIT_SETTLE_DELAY + std::time::Duration::from_millis(20),
+            );
+        }
+        t.process(b"\x1b]133;B\x07\x1b]133;C\x07");
+        t.process(format!("\x1b[?2026h\x1b[{};1H\x1b[2K{text}\x1b[?2026l", index + 2).as_bytes());
+        assert_eq!(t.block_tracker().phase(), ShellPhase::CommandExecuting);
+        assert_eq!(t.block_tracker().blocks().len(), blocks_before);
+        assert_eq!(
+            t.block_tracker().in_flight().map(|live| live.command),
+            Some(command.as_str()),
+            "application zones must not overwrite the outer shell command"
+        );
+    }
+
+    t.process(b"\x1b]133;D;0;weft-shell\x07\x1b]133;A;weft-shell\x07");
+    assert!(t.settle_primary_screen_exit());
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(block.command, command);
+    assert!(block.output.contains("thinking"));
+    assert!(block.output.contains("tool output"));
+    assert!(block.output.contains("final answer"));
+}
+
 // ── Command blocks (OSC 133 → BlockTracker) ───────────────────
 
 #[test]

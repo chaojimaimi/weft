@@ -130,10 +130,38 @@ pub(crate) fn ime_commit_effects(tab: usize, text: &str) -> Vec<Effect> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPaneResize {
+    pane_id: PaneId,
+    rows: usize,
+    cols: usize,
+    synchronized: bool,
+}
+
+impl PendingPaneResize {
+    pub(crate) fn new(pane_id: PaneId, (rows, cols): (usize, usize), synchronized: bool) -> Self {
+        Self {
+            pane_id,
+            rows,
+            cols,
+            synchronized,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dimensions(self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_synchronized(self) -> bool {
+        self.synchronized
+    }
+}
+
 pub(crate) fn pending_resize_effects(
-    pending: &[Vec<(PaneId, (usize, usize))>],
+    pending: &[Vec<PendingPaneResize>],
     active_tab: usize,
-    active_ready: bool,
     cascade_settled: bool,
 ) -> Vec<Effect> {
     pending
@@ -141,16 +169,16 @@ pub(crate) fn pending_resize_effects(
         .enumerate()
         .flat_map(|(tab, panes)| {
             let ready = if tab == active_tab {
-                active_ready
+                true
             } else {
                 cascade_settled
             };
-            panes.iter().filter_map(move |(pane_id, (rows, cols))| {
-                ready.then_some(Effect::ResizePty {
+            panes.iter().filter_map(move |resize| {
+                (ready && !resize.synchronized).then_some(Effect::ResizePty {
                     tab,
-                    pane_id: *pane_id,
-                    rows: *rows,
-                    cols: *cols,
+                    pane_id: resize.pane_id,
+                    rows: resize.rows,
+                    cols: resize.cols,
                 })
             })
         })
@@ -173,6 +201,7 @@ mod tests {
     use super::{
         close_tab_effects, context_clipboard_effects, copy_clipboard_effects, ime_commit_effects,
         passthrough_key_effects, pending_resize_effects, process_message_effects, Effect,
+        PendingPaneResize,
     };
 
     #[test]
@@ -211,15 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn active_resize_flushes_before_background_tabs() {
+    fn active_resize_flushes_immediately_while_background_tabs_wait() {
         use weft_core::pane_layout::PaneId;
         let pending = [
-            vec![(PaneId(1), (30, 100))],
-            vec![(PaneId(2), (40, 120))],
+            vec![PendingPaneResize::new(PaneId(1), (30, 100), false)],
+            vec![PendingPaneResize::new(PaneId(2), (40, 120), false)],
             vec![],
         ];
         assert_eq!(
-            pending_resize_effects(&pending, 1, true, false),
+            pending_resize_effects(&pending, 1, false),
             [Effect::ResizePty {
                 tab: 1,
                 pane_id: PaneId(2),
@@ -227,15 +256,17 @@ mod tests {
                 cols: 120,
             }]
         );
-        assert_eq!(pending_resize_effects(&pending, 1, false, false), []);
     }
 
     #[test]
     fn settled_resize_emits_only_latest_pending_dimensions_per_tab() {
         use weft_core::pane_layout::PaneId;
-        let pending = [vec![(PaneId(1), (44, 132))], vec![(PaneId(2), (36, 90))]];
+        let pending = [
+            vec![PendingPaneResize::new(PaneId(1), (44, 132), false)],
+            vec![PendingPaneResize::new(PaneId(2), (36, 90), false)],
+        ];
         assert_eq!(
-            pending_resize_effects(&pending, 0, true, true),
+            pending_resize_effects(&pending, 0, true),
             [
                 Effect::ResizePty {
                     tab: 0,
@@ -258,10 +289,13 @@ mod tests {
         use weft_core::pane_layout::PaneId;
         // Tab 0 has two panes pending resize; tab 1 has one.
         let pending = [
-            vec![(PaneId(1), (30, 80)), (PaneId(2), (30, 40))],
-            vec![(PaneId(3), (40, 100))],
+            vec![
+                PendingPaneResize::new(PaneId(1), (30, 80), false),
+                PendingPaneResize::new(PaneId(2), (30, 40), false),
+            ],
+            vec![PendingPaneResize::new(PaneId(3), (40, 100), false)],
         ];
-        let effects = pending_resize_effects(&pending, 0, true, true);
+        let effects = pending_resize_effects(&pending, 0, true);
         assert_eq!(effects.len(), 3);
         assert!(effects.iter().any(|e| matches!(
             e,
@@ -272,6 +306,36 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn synchronized_panes_defer_resize_without_blocking_ready_siblings() {
+        use weft_core::pane_layout::PaneId;
+        let pending = [vec![
+            PendingPaneResize::new(PaneId(1), (30, 80), true),
+            PendingPaneResize::new(PaneId(2), (30, 40), false),
+        ]];
+
+        assert_eq!(
+            pending_resize_effects(&pending, 0, false),
+            [Effect::ResizePty {
+                tab: 0,
+                pane_id: PaneId(2),
+                rows: 30,
+                cols: 40,
+            }]
+        );
+
+        let committed_after_frame = [vec![PendingPaneResize::new(PaneId(1), (30, 80), false)]];
+        assert_eq!(
+            pending_resize_effects(&committed_after_frame, 0, false),
+            [Effect::ResizePty {
+                tab: 0,
+                pane_id: PaneId(1),
+                rows: 30,
+                cols: 80,
+            }]
+        );
     }
 
     #[test]

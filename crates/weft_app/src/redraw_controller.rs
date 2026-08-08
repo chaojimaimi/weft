@@ -100,20 +100,12 @@ impl App {
         // Flush the PTY SIGWINCH (TIOCSWINSZ) so the foreground app
         // repaints at the new size.
         //
-        // v1.0 fix (live-resize): the active tab's SIGWINCH is now sent
-        // on a SHORT throttle (~30ms) instead of the old 100ms settle
-        // debounce. Alt-screen TUIs (less/vim/man) only re-render on
-        // SIGWINCH — with the old 100ms debounce they never repainted
-        // mid-drag, so the screen stayed stale until mouse release (the
-        // "content doesn't follow the window until released" report).
-        // 30ms ≈ every other vsync at 60Hz: enough coalescing to avoid
-        // hammering the app, tight enough that each Resized within a
-        // drag still drives a repaint. Background tabs keep the old
-        // settle-debounce (their grid is already correct; the SIGWINCH
-        // just syncs the shell, and can wait until activation).
-        let now = std::time::Instant::now();
-        let active_ready = now.duration_since(self.window_runtime.last_resize_instant)
-            > std::time::Duration::from_millis(30);
+        // The active pane commits every redraw: delaying until a resize
+        // cascade pauses leaves its PTY at the old width while the Grid is
+        // already narrow, so long synchronized progress lines auto-wrap and
+        // later `CSI A` repaints cannot erase the extra rows. Background tabs
+        // remain settle-debounced; both their PTY and Grid retain the old
+        // geometry together until the transaction commits.
         let cascade_settled = self.window_runtime.last_resize_instant.elapsed()
             > std::time::Duration::from_millis(100);
         let pending: Vec<_> = self
@@ -122,12 +114,8 @@ impl App {
             .iter()
             .map(|tab| tab.pending_pane_resizes())
             .collect();
-        let resize_effects = effect::pending_resize_effects(
-            &pending,
-            self.sessions.active_idx(),
-            active_ready,
-            cascade_settled,
-        );
+        let resize_effects =
+            effect::pending_resize_effects(&pending, self.sessions.active_idx(), cascade_settled);
         self.drain_effects(resize_effects);
 
         // v0.9 H1: borrow the active Tab once and access its fields
@@ -766,7 +754,13 @@ impl App {
                 // terminal cursor (which is hidden behind the popup).
                 // Without this, CJK IME candidates render off-screen and
                 // users can't complete character composition.
-                crate::ime::update_cursor_area(window, ctx, terminal, palette_ime_area);
+                crate::ime::update_cursor_area(
+                    window,
+                    ctx,
+                    terminal,
+                    palette_ime_area,
+                    renderer.block_view_tui_caret_area.get(),
+                );
             }
             // Flicker fix (Step 2): update the shared flag so the blink
             // timer thread knows whether to keep waking the loop. In
