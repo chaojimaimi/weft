@@ -7,6 +7,7 @@ mod row;
 mod row_extras;
 mod scrollback;
 mod snapshot;
+mod snapshot_line_map;
 pub use cell::{
     terminal_char_width, terminal_grapheme_glyph, terminal_text_width, Cell, CellColor, CellFlags,
     CellWidth, Color,

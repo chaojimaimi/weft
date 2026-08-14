@@ -67,6 +67,7 @@ mod runbook_controller;
 mod scene;
 mod scroll_input;
 mod scrollbar_component;
+mod selection;
 mod settings_component;
 mod settings_controller;
 mod settings_validation;

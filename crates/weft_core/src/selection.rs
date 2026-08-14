@@ -218,6 +218,14 @@ impl SelectionHandler {
         self.block_view_selection = None;
     }
 
+    /// v1.10.20: drop only the grid selection. `clear()` also drops the
+    /// block-view selection; the migration path (grid selection → primary
+    /// history BlockView selection) replaces just the grid half so the
+    /// fresh block selection survives.
+    pub fn clear_grid_selection(&mut self) {
+        self.selection = None;
+    }
+
     /// Get the selected text from the grid.
     pub fn selected_text(&self, grid: &Grid) -> Option<String> {
         self.selection.as_ref().map(|sel| sel.text_from_grid(grid))
@@ -571,6 +579,26 @@ mod tests {
         handler.clear();
         assert!(handler.selection.is_none());
         assert!(!handler.selecting);
+    }
+
+    #[test]
+    fn clear_grid_selection_keeps_block_view_selection() {
+        // v1.10.20: migration drops the grid half only; the fresh block
+        // selection and the in-progress drag must survive.
+        let mut handler = SelectionHandler::new();
+        handler.start(GridPos::new(0, 0), SelectionMode::Simple);
+        let rows = vec![bv_row(BlockViewRowKind::Output, "hello", 0.0, 20.0)];
+        handler.start_block_view(
+            BlockViewPos {
+                row_index: 0,
+                char_index: 2,
+            },
+            rows,
+        );
+        handler.clear_grid_selection();
+        assert!(handler.selection.is_none());
+        assert!(handler.selecting, "drag continues in block space");
+        assert!(handler.block_view_selection.is_some());
     }
 
     // ── BlockViewSelection tests ───────────────────────────────────────

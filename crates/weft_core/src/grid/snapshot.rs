@@ -1,4 +1,4 @@
-use super::{CellColor, CellFlags, Color, Grid, Row};
+use super::{snapshot_line_map::snapshot_row_extent, CellColor, CellFlags, Color, Grid, Row};
 use crate::blocks::{
     AttributeSpan, ForegroundSpan, LinkSpan, StyledLine, StyledOutput, ANSI_ATTRIBUTE_MASK,
     MAX_OUTPUT_BYTES,
@@ -10,6 +10,9 @@ const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
 /// from spamming tiny links that bloat the snapshot. 256 is generous — a
 /// typical line has 0-2 links.
 const MAX_SNAPSHOT_LINK_SPANS: usize = 256;
+
+/// v1.10.20: snapshot text budget — shared with `grid/snapshot_line_map.rs` (single bound for both walks).
+pub(crate) const SNAPSHOT_TEXT_BUDGET: usize = MAX_OUTPUT_BYTES + 4;
 
 /// v1.6.1: Convert a resolved URL `Arc<str>` to the `String` that `LinkSpan`
 /// stores. Centralized so the conversion is consistent across all call sites.
@@ -340,7 +343,7 @@ impl Grid {
             let row = styled_row(
                 row,
                 self.num_cols,
-                (MAX_OUTPUT_BYTES + 4).saturating_sub(text.len()),
+                SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len()),
                 style_budget,
                 &url_resolver,
             );
@@ -426,7 +429,7 @@ struct SnapshotRow {
 }
 
 fn push_snapshot_text(text: &mut String, source: &str) -> bool {
-    let remaining = (MAX_OUTPUT_BYTES + 4).saturating_sub(text.len());
+    let remaining = SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len());
     if source.len() <= remaining {
         text.push_str(source);
         return true;
@@ -483,13 +486,7 @@ fn styled_row<F>(
 where
     F: Fn(u32) -> Option<Arc<str>>,
 {
-    let last = row
-        .cells
-        .iter()
-        .take(num_cols)
-        .rposition(|cell| cell.character != ' ' && cell.character != '\0')
-        .map(|index| index + 1)
-        .unwrap_or(0);
+    let last = snapshot_row_extent(row, num_cols);
     let mut text = String::with_capacity(last.min(text_budget));
     let mut foregrounds: Vec<ForegroundSpan> = Vec::new();
     let mut backgrounds: Vec<ForegroundSpan> = Vec::new();

@@ -381,6 +381,10 @@ impl App {
                         yf,
                         grab_offset,
                     );
+                    // Clear before set_block_scroll's internal sync so the
+                    // history view can exit in the same press (a surviving
+                    // block selection would hold the snapshot view open).
+                    self.sessions.active_mut().selection_handler.clear();
                     self.sessions.active_mut().set_block_scroll(offset);
                     self.interaction.scrollbar_drag =
                         Some(crate::scrollbar_component::ScrollbarDragState {
@@ -391,7 +395,6 @@ impl App {
                     if let Some(window) = &self.window {
                         window.set_cursor(winit::window::CursorIcon::NsResize);
                     }
-                    self.sessions.active_mut().selection_handler.clear();
                     self.request_redraw();
                     return;
                 }
@@ -585,7 +588,12 @@ impl App {
                     }
                     self.interaction.prompt_dragging = true;
                     // Clear any block/grid selection so Cmd+C targets the editor.
-                    self.sessions.active_mut().selection_handler.clear();
+                    let tab = self.sessions.active_mut();
+                    tab.selection_handler.clear();
+                    // v1.10.20 (S1): clearing the block selection releases
+                    // the delayed history-view exit — sync drops the
+                    // snapshot view back to the live grid.
+                    tab.sync_primary_history_view();
                     self.request_redraw();
                 }
                 return;
@@ -638,7 +646,14 @@ impl App {
                             // prompt box, CWD bar, or empty padding). Clear the
                             // existing selection so the user gets visual
                             // feedback that the previous selection is gone.
-                            self.sessions.active_mut().selection_handler.clear();
+                            let tab = self.sessions.active_mut();
+                            tab.selection_handler.clear();
+                            // v1.10.20 (S1): clearing the block selection
+                            // releases the delayed history-view exit (a
+                            // migrated drag's selection is block-space only —
+                            // its grid half is already gone) — sync drops the
+                            // snapshot view back to the live grid.
+                            tab.sync_primary_history_view();
                         }
                     } else {
                         // Grid view (alt-screen): classic grid selection.

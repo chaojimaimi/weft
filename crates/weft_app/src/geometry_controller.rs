@@ -293,7 +293,19 @@ impl App {
         // to subtract the pane's `x0/y0` instead. The adjustment is:
         //   adjusted_x = x - (pane_x0 - content.left)
         // so that grid_position computes (adjusted_x - content.left) = (x - pane_x0).
-        let (adj_x, adj_y) = if layout.contains_content(x, y) {
+        // v1.10.20 (改动 3): a primary-screen TUI grid view additionally
+        // insets by the BlockView gutter (renderer `GridViewPolicy`
+        // `inset_block_gutter` — same judgment, renderer.rs:762). The third
+        // tuple element is that gutter delta: hit-testing must use the SAME
+        // origin as the render or clicks land ~1.5 cols right of the visible
+        // character. Alt-screen TUIs stay edge-to-edge (delta 0).
+        let inset_block_gutter = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .is_some_and(|t| !t.is_alt_screen_active() && t.primary_screen_owns_live_view());
+        let (adj_x, adj_y, gutter_delta) = if layout.contains_content(x, y) {
             let content_rect: weft_core::pane_layout::Rect = [
                 layout.content.left as f32,
                 layout.content.top as f32,
@@ -311,14 +323,17 @@ impl App {
                     let [px0, py0, _, _] = rect;
                     let dx = px0 as f64 - layout.content.left;
                     let dy = py0 as f64 - layout.content.top;
-                    (x - dx, y - dy)
+                    let pane_ctx = layout.layout_ctx().for_pane(rect);
+                    let origin_x =
+                        crate::terminal_geometry::grid_hit_origin_x(&pane_ctx, inset_block_gutter);
+                    (x - dx, y - dy, origin_x - px0 as f64)
                 })
-                .unwrap_or((x, y))
+                .unwrap_or((x, y, 0.0))
         } else {
-            (x, y)
+            (x, y, 0.0)
         };
 
-        let (row, col) = layout.grid_position(adj_x, adj_y, num_rows, num_cols);
+        let (row, col) = layout.grid_position(adj_x - gutter_delta, adj_y, num_rows, num_cols);
         GridPos::new(row, col)
     }
 

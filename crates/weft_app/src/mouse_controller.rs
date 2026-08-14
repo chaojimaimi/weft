@@ -5,21 +5,7 @@
 //! Mouse movement, drag, context-menu, and scroll controller.
 
 use super::*;
-
-/// Direction of drag-selection autoscroll relative to the block content edge.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AutoscrollDir {
-    Up,
-    Down,
-}
-
-/// Pure logic: rows to scroll per autoscroll tick from the pixel overshoot
-/// beyond the content edge. Clamped to [1, 6] so a deep overshoot can't jump
-/// past the drag target and a sub-row overshoot still advances (floor would
-/// freeze on tiny overshoots).
-fn autoscroll_steps(overshoot_px: f32, cell_h: f32) -> usize {
-    ((overshoot_px / cell_h).ceil() as usize).clamp(1, 6)
-}
+use crate::selection::{autoscroll_steps, AutoscrollDir};
 
 impl App {
     /// Handle mouse release.
@@ -170,8 +156,14 @@ impl App {
             .and_then(|session_id| self.sessions.tab_index_by_session_id(session_id));
         if let Some(tab) = release_tab.and_then(|idx| self.sessions.tab_mut(idx)) {
             tab.selection_handler.end();
+            // v1.10.20: selection release re-syncs the primary history view —
+            // the drag deferred its exit (改动 2); back at FollowBottom the
+            // live grid returns.
+            tab.sync_primary_history_view();
         } else if terminal_session.is_none() && !self.sessions.is_empty() {
-            self.sessions.active_mut().selection_handler.end();
+            let tab = self.sessions.active_mut();
+            tab.selection_handler.end();
+            tab.sync_primary_history_view();
         }
 
         let btn = match button {
@@ -391,12 +383,18 @@ impl App {
                 }
                 self.request_redraw();
             } else {
-                // Grid view: untouched by drag autoscroll this round — grid
-                // selection stores viewport-relative `GridPos`, so scrolling
+                // Grid view: viewport-relative `GridPos` selection — scrolling
                 // mid-drag would silently corrupt the copy range (see
-                // docs/FIX_DRAG_AUTOSCROLL.md "Grid 后续任务").
-                let pos = self.pixel_to_grid(x, y);
-                self.sessions.active_mut().selection_handler.extend(pos);
+                // docs/FIX_DRAG_AUTOSCROLL.md "Grid 后续任务"). v1.10.20: a
+                // primary-screen TUI drag held past the top edge migrates
+                // into the primary history snapshot view instead
+                // (pump_selection_autoscroll).
+                self.interaction.selection_drag_pos = Some((x, y));
+                let scrolled = self.pump_selection_autoscroll();
+                if !scrolled {
+                    let pos = self.pixel_to_grid(x, y);
+                    self.sessions.active_mut().selection_handler.extend(pos);
+                }
                 self.request_redraw();
             }
         }
@@ -969,18 +967,35 @@ impl App {
         let up = rows > 0;
         let lines = rows.unsigned_abs() as usize;
         if up {
-            let entered = self.sessions.active_mut().enter_primary_history_if_active();
-            tracing::debug!(
-                entered,
-                rows,
-                app_active = self
-                    .sessions
-                    .active()
-                    .terminal
-                    .as_ref()
-                    .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
-                "SCROLL_DIAG: scroll up into primary history"
-            );
+            // v1.10.20: a wheel scroll while a grid selection is active must
+            // go through the same migration entry point as the drag path —
+            // entering the history view with a live grid selection would
+            // orphan it (L3). Migration failure degrades: keep the grid
+            // selection, do not scroll (would drift its anchor, L2).
+            let (selecting, has_grid_selection, tui_active) = {
+                let tab = self.sessions.active();
+                (
+                    tab.selection_handler.selecting,
+                    tab.selection_handler.selection.is_some(),
+                    tab.terminal
+                        .as_ref()
+                        .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
+                )
+            };
+            if selecting && has_grid_selection && tui_active {
+                if !self.migrate_grid_selection_to_primary_history() {
+                    self.request_redraw();
+                    return;
+                }
+            } else {
+                let entered = self.sessions.active_mut().enter_primary_history_if_active();
+                tracing::debug!(
+                    entered,
+                    rows,
+                    app_active = tui_active,
+                    "SCROLL_DIAG: scroll up into primary history"
+                );
+            }
         }
         let block_view = self
             .sessions
@@ -1020,6 +1035,35 @@ impl App {
             }
         } else {
             // Grid view scroll — needs mutable terminal.
+            // v1.10.20 改动 4 (drift guard): a grid selection is
+            // viewport-relative; scrolling would silently drift its anchor
+            // (L2). No migration path exists here (non-TUI grid), so clear
+            // the selection instead of corrupting the copy range. Only when
+            // the offset actually moves — offset 0 + scroll-down is a no-op.
+            let (had_selection, offset_will_change) = {
+                let terminal = self.sessions.active().terminal.as_ref();
+                match terminal {
+                    Some(t) => {
+                        let grid = t.grid();
+                        let offset = grid.scroll_offset;
+                        let max = grid.scrollback.len();
+                        let new = if up {
+                            (offset + lines).min(max)
+                        } else {
+                            offset.saturating_sub(lines)
+                        };
+                        (
+                            self.sessions.active().selection_handler.selection.is_some(),
+                            new != offset,
+                        )
+                    }
+                    None => (false, false),
+                }
+            };
+            if had_selection && offset_will_change {
+                tracing::debug!("cleared grid selection before viewport scroll (drift guard)");
+                self.sessions.active_mut().selection_handler.clear();
+            }
             if let Some(terminal) = &mut self.sessions.active_mut().terminal {
                 let grid = &mut terminal.grid_mut();
                 if up {
@@ -1032,18 +1076,6 @@ impl App {
         self.request_redraw();
     }
 
-    /// Vertical physical-pixel bounds of the block view's visible content
-    /// area: the layout clip band (top of the clip region to the bottom of
-    /// the clip region). `None` only when the block view isn't active or the
-    /// renderer/terminal is unavailable; an empty history still yields the
-    /// clip band (max_scroll=0 makes any autoscroll a no-op in that case).
-    pub(super) fn block_content_vbounds(&self) -> Option<(f32, f32)> {
-        // 可见 block 内容区 = 布局 clip。用 bv_rows first/last 会带 overscan
-        // (最顶行可到 clip_top - overscan),把向上滚动的触发阈值抬到窗口外。
-        self.compute_block_view_rows()
-            .map(|(_, clip_top, clip_bottom)| (clip_top, clip_bottom))
-    }
-
     /// Drag-selection autoscroll: when the pointer is held past the block
     /// content edge, scroll the viewport toward it and extend the selection
     /// endpoint to the newly revealed edge row. Returns true when a
@@ -1052,8 +1084,7 @@ impl App {
     /// timer wake while the pointer is held still.
     pub(super) fn pump_selection_autoscroll(&mut self) -> bool {
         let selecting = self.sessions.active().selection_handler.selecting;
-        let block_view = self.block_view_active();
-        if !selecting || !block_view {
+        if !selecting {
             self.window_runtime
                 .selection_autoscroll_active
                 .store(false, Ordering::Relaxed);
@@ -1065,6 +1096,63 @@ impl App {
                 .store(false, Ordering::Relaxed);
             return false;
         };
+        if !self.block_view_active() {
+            // v1.10.20: grid-mode drag autoscroll for primary-screen TUIs.
+            // The grid selection is viewport-relative and cannot scroll; a
+            // drag held past the top edge migrates the anchor into the
+            // primary history snapshot view, where the block branch below
+            // takes over (scroll + extend). Failure degrades: keep the grid
+            // selection visible, never switch views and orphan it.
+            let tui_active = self
+                .sessions
+                .active()
+                .terminal
+                .as_ref()
+                .is_some_and(Terminal::primary_screen_app_active);
+            if !tui_active {
+                self.window_runtime
+                    .selection_autoscroll_active
+                    .store(false, Ordering::Relaxed);
+                return false;
+            }
+            let Some((top, bottom)) = self.grid_content_vbounds() else {
+                self.window_runtime
+                    .selection_autoscroll_active
+                    .store(false, Ordering::Relaxed);
+                return false;
+            };
+            let ch = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_height() as f32)
+                .unwrap_or(20.0);
+            let margin = ch; // same edge-row band as the block branch
+            if (y as f32) < top - margin {
+                if !self.migrate_grid_selection_to_primary_history() {
+                    tracing::warn!(
+                        y,
+                        "TUI drag autoscroll migration failed; keeping grid selection"
+                    );
+                    self.window_runtime
+                        .selection_autoscroll_active
+                        .store(false, Ordering::Relaxed);
+                    return false;
+                }
+            } else if (y as f32) > bottom + margin {
+                // Down overshoot: a TUI grid has no scrollable history (its
+                // offset is forced to 0), so there is nothing to scroll
+                // toward; the in-band extend already clamped the endpoint.
+                self.window_runtime
+                    .selection_autoscroll_active
+                    .store(false, Ordering::Relaxed);
+                return false;
+            } else {
+                self.window_runtime
+                    .selection_autoscroll_active
+                    .store(false, Ordering::Relaxed);
+                return false;
+            }
+        }
         let Some((top, bottom)) = self.block_content_vbounds() else {
             self.window_runtime
                 .selection_autoscroll_active
@@ -1133,37 +1221,5 @@ impl App {
             .selection_autoscroll_active
             .store(moved, Ordering::Relaxed);
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::autoscroll_steps;
-
-    #[test]
-    fn autoscroll_steps_zero_or_negative_overshoot_scrolls_one_row() {
-        assert_eq!(autoscroll_steps(0.0, 20.0), 1);
-        assert_eq!(autoscroll_steps(-5.0, 20.0), 1);
-    }
-
-    #[test]
-    fn autoscroll_steps_around_one_row_boundary() {
-        // Exactly one row of overshoot → 1 step; slightly more → 2.
-        assert_eq!(autoscroll_steps(20.0, 20.0), 1);
-        assert_eq!(autoscroll_steps(20.5, 20.0), 2);
-        assert_eq!(autoscroll_steps(1.0, 20.0), 1); // sub-row still advances
-    }
-
-    #[test]
-    fn autoscroll_steps_deep_overshoot_clamps_at_six() {
-        assert_eq!(autoscroll_steps(2000.0, 20.0), 6);
-        assert_eq!(autoscroll_steps(1_000_000.0, 1.0), 6);
-    }
-
-    #[test]
-    fn autoscroll_steps_zero_cell_height_saturates_safely() {
-        // inf / NaN saturate in the float→usize cast and hit the clamp.
-        assert_eq!(autoscroll_steps(40.0, 0.0), 6); // inf → saturate → 6
-        assert_eq!(autoscroll_steps(f32::NAN, 0.0), 1); // NaN → 0 → clamp to 1
     }
 }

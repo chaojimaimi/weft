@@ -191,6 +191,16 @@ impl Terminal {
         self.capabilities.primary_screen_interrupt_capture = None;
     }
 
+    /// v1.10.20 (S2): true while the Ctrl-C interrupt capture window is
+    /// active. During the window the snapshot rewrites the transcript
+    /// (interrupt tail merged in / `space_primary_screen_exit_tail`), so
+    /// viewport-relative line mappings computed against the live grid do not
+    /// match the rendered snapshot rows — the drag-selection migration must
+    /// not run (see `migrate_grid_selection_to_primary_history`).
+    pub fn primary_screen_interrupt_capture_active(&self) -> bool {
+        self.capabilities.primary_screen_interrupt_capture.is_some()
+    }
+
     /// Mouse protocol bytes are meaningful only while the TUI still owns the
     /// PTY. During Ctrl-C settlement they can race behind the exit marker and
     /// become literal `48;x;yM` shell input, so suspend reporting until the
@@ -552,6 +562,50 @@ impl Terminal {
 
     pub fn primary_history_view(&self) -> bool {
         self.capabilities.primary_history_view
+    }
+
+    /// v1.10.20: snapshot line index of a live viewport row, computed with
+    /// the exact same walk parameters as [`Self::primary_screen_document_snapshot`]
+    /// (same document start and ownership masks). `None` when no screen
+    /// document is captured or the row is skipped by the snapshot (unowned /
+    /// empty). Used by the drag-selection anchor migration — the mapping
+    /// must match the snapshot the history BlockView renders, and the
+    /// empty-row skip breaks any 1:1 row arithmetic.
+    pub fn primary_screen_snapshot_line_for_viewport_row(
+        &self,
+        viewport_row: usize,
+    ) -> Option<usize> {
+        let document_start = self.block_tracker.screen_document_start()?;
+        let viewport_origin = self.grid.scrollback.position();
+        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
+            (self.grid.scrollback.index_since(document_start), 0)
+        } else {
+            (
+                self.grid.scrollback.len(),
+                document_start.saturating_sub(viewport_origin) as usize,
+            )
+        };
+        match self
+            .capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_deref()
+        {
+            Some(owned) => self.grid.snapshot_line_index_for_viewport_row(
+                viewport_row,
+                scrollback_start,
+                viewport_start,
+                Some(&self.capabilities.primary_screen_ownership.scrollback),
+                Some(owned),
+            ),
+            None => self.grid.snapshot_line_index_for_viewport_row(
+                viewport_row,
+                scrollback_start,
+                viewport_start,
+                None,
+                None,
+            ),
+        }
     }
 
     /// v1.10.12: alt-screen history peek — true while the user is browsing the

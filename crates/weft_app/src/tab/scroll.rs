@@ -38,6 +38,27 @@ impl BlockScrollAnchor {
     }
 }
 
+/// v1.10.20: pure decision for whether the primary history snapshot view
+/// stays active. Browsing is active while detached (user scrolled up); a
+/// selection drag DELAYS the exit — the user may be selecting across the
+/// scrolled boundary, and dropping the view mid-drag would orphan the
+/// selection (改动 2). A completed block-view selection (migrated drag or a
+/// plain block drag) also delays the exit — it must stay visible and
+/// copyable in the snapshot view (S1); the view returns to the live grid on
+/// the next sync after the selection is cleared (click clears → sync →
+/// exit). A plain grid drag must NOT force the history view open, so the
+/// delay only applies when it is already active.
+pub(crate) fn primary_history_browsing(
+    primary_app_active: bool,
+    detached: bool,
+    selecting: bool,
+    history_view_active: bool,
+    block_selection_active: bool,
+) -> bool {
+    primary_app_active
+        && (detached || ((selecting || block_selection_active) && history_view_active))
+}
+
 impl Tab {
     pub fn block_scroll(&self) -> usize {
         self.block_scroll_anchor.offset_value()
@@ -118,7 +139,9 @@ impl Tab {
         self.set_block_scroll(self.block_scroll_anchor.offset_value().min(max_scroll));
     }
 
-    fn sync_primary_history_view(&mut self) {
+    /// v1.10.20: made `pub(crate)` — mouse release re-syncs after the
+    /// deferred history-view exit (改动 2).
+    pub(crate) fn sync_primary_history_view(&mut self) {
         // v1.3: snapshot the anchor offset before borrowing `terminal` so
         // the disjoint-field borrow through `DerefMut` doesn't conflict.
         // `block_scroll_anchor` and `terminal` are both on the active pane;
@@ -137,7 +160,23 @@ impl Tab {
             // whose IME support is a fallback (no preedit, imprecise caret).
             // The user expects scrolling back to the tail to return to the
             // live grid (native cursor/IME/color), matching Warp.
-            let browsing = terminal.primary_screen_app_active() && detached;
+            //
+            // v1.10.20 (改动 2): a selection drag delays that exit — the
+            // user may be selecting across the scrolled boundary. Mouse
+            // release re-syncs (`mouse_controller::handle_mouse_release`),
+            // so back at FollowBottom the live grid returns then. v1.10.20
+            // (S1): a completed block-view selection also delays the exit
+            // (its grid half was already dropped by the migration), keeping
+            // the snapshot view up until the selection is cleared — the
+            // clear paths re-sync (mouse_press_controller), releasing the
+            // view back to the live grid.
+            let browsing = primary_history_browsing(
+                terminal.primary_screen_app_active(),
+                detached,
+                pane.selection_handler.selecting,
+                terminal.primary_history_view(),
+                pane.selection_handler.block_view_selection.is_some(),
+            );
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
             // v1.10.12: scrolling back to the bottom also exits the alt-screen
@@ -158,6 +197,34 @@ impl Tab {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v1.10.20 改动 2 + S1 state machine: an active selection drag delays
+    /// the history-view exit, but never forces it open for a plain grid
+    /// drag; a completed block-view selection keeps the snapshot view up
+    /// (visible/copyable) until the selection is cleared.
+    #[test]
+    fn primary_history_browsing_delays_exit_only_while_selecting() {
+        // Detached browsing is unaffected by selection state.
+        assert!(primary_history_browsing(true, true, false, true, false));
+        assert!(primary_history_browsing(true, true, true, true, true));
+        // FollowBottom + no drag → exit to the live grid.
+        assert!(!primary_history_browsing(true, false, false, true, false));
+        // FollowBottom + drag in the history view → delayed exit.
+        assert!(primary_history_browsing(true, false, true, true, false));
+        // FollowBottom + completed block selection (migrated drag, S1):
+        // the selection must stay visible and copyable → delayed exit.
+        assert!(primary_history_browsing(true, false, false, true, true));
+        // Same, mid-drag.
+        assert!(primary_history_browsing(true, false, true, true, true));
+        // The delay never forces the history view open when inactive.
+        assert!(!primary_history_browsing(true, false, true, false, true));
+        assert!(!primary_history_browsing(true, false, false, false, true));
+        // Selection cleared → the next sync releases the view.
+        assert!(!primary_history_browsing(true, false, false, true, false));
+        // Non-primary screens never browse.
+        assert!(!primary_history_browsing(false, true, false, true, false));
+        assert!(!primary_history_browsing(false, false, true, false, true));
+    }
 
     #[test]
     fn anchor_offset_round_trip() {

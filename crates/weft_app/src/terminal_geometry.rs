@@ -203,6 +203,21 @@ fn geometry_for_renderer(
     }
 }
 
+/// v1.10.20: x-origin of grid hit-testing for the active pane, mirroring the
+/// render policy's grid content origin (`paint::grid::grid_content_origin_x`,
+/// `GridViewPolicy::inset_block_gutter`, renderer.rs:762): a primary-screen
+/// TUI grid view is inset by the BlockView gutter, so pointer → cell mapping
+/// must use the same origin or clicks/selection land ~1.5 cols right of the
+/// visible character. Alt-screen TUIs paint edge-to-edge (`inset_block_gutter
+/// = false`) — the origin is the pane's left edge, exactly as before.
+pub fn grid_hit_origin_x(pane_ctx: &crate::layout::LayoutCtx, inset_block_gutter: bool) -> f64 {
+    if inset_block_gutter {
+        crate::layout::block_content_x_bounds(pane_ctx).0 as f64
+    } else {
+        pane_ctx.left() as f64
+    }
+}
+
 /// Decide whether the terminal cursor should be drawn in this frame. Steady
 /// cursor styles remain visible across blink phases; only the three blinking
 /// styles follow the blink timer. Application-owned prompts intentionally hide
@@ -227,7 +242,7 @@ pub fn grid_cursor_visible(
 
 #[cfg(test)]
 mod tests {
-    use super::{grid_cursor_visible, GridGeometry, PhysicalRect};
+    use super::{grid_cursor_visible, grid_hit_origin_x, GridGeometry, PhysicalRect};
     use weft_core::grid::CursorStyle;
 
     fn geometry() -> GridGeometry {
@@ -377,5 +392,65 @@ mod tests {
         assert_eq!(layout.grid_position(10.0, 66.0, 36, 98), (0, 0));
         assert_eq!(layout.grid_position(22.0, 86.0, 36, 98), (1, 1));
         assert_eq!(layout.grid_position(5000.0, 5000.0, 36, 98), (35, 97));
+    }
+
+    // ── v1.10.20: grid hit origin ↔ grid render origin alignment ─────────
+
+    fn hit_origin_ctx() -> crate::layout::LayoutCtx {
+        crate::layout::LayoutCtx {
+            viewport: (1080.0, 720.0),
+            cell_w: 10.0,
+            cell_h: 20.0,
+            padding_x: 8.0,
+            padding_y: 8.0,
+            chrome_top: 28.0,
+            chrome_left: 60.0,
+            pane_origin: (0.0, 0.0),
+            clip: None,
+        }
+    }
+
+    /// The pointer → cell origin must coincide with the render origin
+    /// (`grid_content_origin_x`): a primary TUI click must hit the character
+    /// that is actually drawn under the cursor (gutter inset), and an
+    /// alt-screen TUI must keep the pane edge.
+    #[test]
+    fn grid_hit_origin_matches_render_content_origin_at_same_geometry() {
+        let ctx = hit_origin_ctx();
+        let render_inset = crate::paint::grid::grid_content_origin_x(&ctx, true);
+        let render_plain = crate::paint::grid::grid_content_origin_x(&ctx, false);
+        assert_eq!(
+            grid_hit_origin_x(&ctx, true) as f32,
+            render_inset,
+            "inset hit origin == inset render origin == BlockView content left"
+        );
+        assert_eq!(
+            grid_hit_origin_x(&ctx, false) as f32,
+            render_plain,
+            "edge-to-edge hit origin == render origin == pane left"
+        );
+        // The inset is exactly the BlockView gutter (1.5 cells at this size).
+        assert!(
+            (grid_hit_origin_x(&ctx, true) - ctx.left() as f64 - ctx.cell_w as f64 * 1.5).abs()
+                < 1e-6
+        );
+        assert_eq!(grid_hit_origin_x(&ctx, false), ctx.left() as f64);
+    }
+
+    /// The same alignment must hold for a split-pane context (pane_origin +
+    /// clip): grid hit-testing is pane-local, like the render origin.
+    #[test]
+    fn grid_hit_origin_alignment_holds_for_pane_local_context() {
+        let ctx = hit_origin_ctx().for_pane([100.0, 100.0, 600.0, 500.0]);
+        assert_eq!(
+            grid_hit_origin_x(&ctx, true) as f32,
+            crate::paint::grid::grid_content_origin_x(&ctx, true)
+        );
+        assert_eq!(grid_hit_origin_x(&ctx, false), ctx.left() as f64);
+        // And the inset origin is the pane's own left edge + gutter.
+        assert!(
+            (grid_hit_origin_x(&ctx, true) - ctx.left() as f64 - ctx.cell_w as f64 * 1.5).abs()
+                < 1e-6
+        );
     }
 }
