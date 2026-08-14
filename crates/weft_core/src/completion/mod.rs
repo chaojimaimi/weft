@@ -33,15 +33,16 @@ pub enum CompletionSource {
 }
 
 impl CompletionSource {
-    /// Lower = higher priority. History first, then Filesystem, then
-    /// PathExecutable, then Workflow, then WorkspaceCommand.
+    /// Lower = higher priority. PATH executables & command-like sources first,
+    /// then history, then filesystem paths (Warp-style: a real command outranks
+    /// its own history entry; files only appear when no command/history matches).
     pub fn priority(self) -> u8 {
         match self {
-            Self::History => 0,
-            Self::Filesystem => 1,
-            Self::PathExecutable => 2,
-            Self::Workflow => 3,
-            Self::WorkspaceCommand => 4,
+            Self::PathExecutable => 0,
+            Self::Workflow => 1,
+            Self::WorkspaceCommand => 2,
+            Self::History => 3,
+            Self::Filesystem => 4,
         }
     }
 }
@@ -162,9 +163,12 @@ mod tests {
         let cancel = CancelToken::new();
 
         let candidates = complete_with_providers(&providers, &request, &cancel);
-        assert_eq!(candidates[0].source, CompletionSource::History);
-        assert_eq!(candidates[0].label, "cargo test");
-        assert_eq!(candidates[1].label, "cargo");
+        // 2.2: PATH executables outrank history — "cargo" (PathExecutable)
+        // surfaces before the "cargo test" history entry.
+        assert_eq!(candidates[0].source, CompletionSource::PathExecutable);
+        assert_eq!(candidates[0].label, "cargo");
+        assert_eq!(candidates[1].label, "cat");
+        assert_eq!(candidates[2].label, "cargo test");
 
         cancel.cancel();
         assert!(complete_with_providers(&providers, &request, &cancel).is_empty());

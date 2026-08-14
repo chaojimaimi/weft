@@ -249,18 +249,103 @@ pub(super) fn reveal_path_in_finder(path: &std::path::Path) -> Result<(), OpenUr
     }
 }
 
+/// Extract the login `$PATH` from a (possibly polluted) shell stdout.
+/// The shell prints `\x01$PATH\x02`; anything the user's rc files printed
+/// before that (fortune/neofetch/echo) is noise and must not corrupt the
+/// leading PATH entry — without sentinels, `<pollution>\n/opt/homebrew/bin`
+/// would glue pollution to the first real entry and drop homebrew from the
+/// scan. Returns `None` when either sentinel is missing, when they appear in
+/// the wrong order, or when the extracted value fails the sanity check
+/// (non-empty and containing `/`).
+fn extract_path_from_output(s: &str) -> Option<&str> {
+    let (start, end) = (s.find('\x01')?, s.find('\x02')?);
+    if end <= start {
+        return None;
+    }
+    let path = &s[start + 1..end];
+    if path.is_empty() || !path.contains('/') {
+        return None;
+    }
+    Some(path)
+}
+
+/// 启动时解析用户登录 shell 的 `$PATH`(GUI/Dock 启动的 weft 进程 PATH 是
+/// macOS 默认四目录,不含 homebrew/`~/.local/bin`/nvm/cargo 等;这些由登录
+/// shell 的 .zprofile/.zshrc 添加)。失败/为空时回退到进程 env PATH。
+///
+/// 不继承 stdin/stderr;500ms deadline 后强杀子进程,防止病态 .zshrc
+/// (阻塞 daemon、卡住的 eval)拖死主线程上的启动扫描。
+fn resolve_login_path() -> Option<std::ffi::OsString> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    // -l 登录(source .zprofile/.bash_profile)+ -i 交互(source .zshrc/.bashrc)
+    // + -c 跑命令。SOH/STX 哨兵包裹 PATH,屏蔽 rc 文件的 stdout 污染;
+    // printf 不带尾换行,避免解析噪音。Rust 侧 \\x01 是字面反斜杠+x01,
+    // shell 的 printf 再解释为 SOH 控制字节。
+    let mut child = Command::new(&shell)
+        .args(["-lic", "printf '\\x01%s\\x02' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let _ = child.kill();
+                    return None;
+                }
+                break;
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    // 子进程已退出(被 try_wait reap),读管道即时返回,不会阻塞。
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let path = extract_path_from_output(&out)?;
+    Some(std::ffi::OsString::from(path.to_string()))
+}
+
+/// Pure-ish:给定路径,判断是否为"可执行文件"(跟随符号链接)。
+/// pnpm/node/brew 等是 symlink → Cellar/shim;`metadata`(非 symlink_metadata)
+/// 解析链接目标,is_file() 对指向普通文件/脚本的 symlink 返回 true。
+/// 额外要求可执行位(mode & 0o111),排除 PATH 目录里的 .DS_Store/README 等。
+fn is_executable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
 /// Scan `$PATH` for executable names (files, not dirs). Best-effort: unreadable
 /// / missing dirs are skipped. Deduped + sorted. Cached once at startup.
 pub(super) fn scan_path_bins() -> Vec<String> {
     let mut bins = std::collections::BTreeSet::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                        if let Some(name) = entry.file_name().to_str() {
-                            bins.insert(name.to_string());
-                        }
+    let path = resolve_login_path().or_else(|| std::env::var_os("PATH"));
+    let Some(path) = path else { return Vec::new() };
+    for dir in std::env::split_paths(&path) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if is_executable_file(&entry.path()) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        bins.insert(name.to_string());
                     }
                 }
             }
@@ -369,7 +454,10 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
 
 #[cfg(test)]
 mod tests {
-    use super::{logo_image_bytes, should_use_bundle_dock_icon};
+    use super::{
+        extract_path_from_output, is_executable_file, logo_image_bytes, scan_path_bins,
+        should_use_bundle_dock_icon,
+    };
     use std::path::Path;
     use weft_core::config::LogoVariant;
 
@@ -410,5 +498,75 @@ mod tests {
                 "{variant:?} alpha bounds {bounds:?} must preserve the Dock safe area"
             );
         }
+    }
+
+    #[test]
+    fn is_executable_file_follows_symlinks_and_requires_exec_bit() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("weft-exec-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let plain_file = dir.join("tool");
+        let no_exec = dir.join("readme.txt");
+        let link = dir.join("tool-link");
+        let dir_link = dir.join("dir-link");
+        let target_dir = dir.join("target-dir");
+        std::fs::write(&plain_file, b"#!/bin/sh\n").expect("write tool");
+        std::fs::write(&no_exec, b"notes\n").expect("write readme");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+
+        std::fs::set_permissions(&plain_file, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755");
+        std::fs::set_permissions(&no_exec, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 644");
+        symlink(&plain_file, &link).expect("symlink to file");
+        symlink(&target_dir, &dir_link).expect("symlink to dir");
+
+        assert!(is_executable_file(&plain_file), "0o755 file");
+        assert!(is_executable_file(&link), "symlink to executable file");
+        assert!(!is_executable_file(&no_exec), "0o644 file");
+        assert!(!is_executable_file(&dir_link), "symlink to dir");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_login_path_extracts_between_sentinels() {
+        // Clean output: extract exactly the sentinel-wrapped PATH.
+        assert_eq!(
+            extract_path_from_output("\x01/opt/homebrew/bin:/usr/bin\x02"),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        // Polluted output (fortune/neofetch/echo before the printf): the
+        // leading PATH entry must NOT absorb the pollution.
+        assert_eq!(
+            extract_path_from_output("fortune line\n\x01/opt/homebrew/bin:/usr/bin\x02"),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        // Missing sentinels → fall back to env PATH.
+        assert_eq!(extract_path_from_output("garbage"), None);
+        // Reversed sentinel order → fall back.
+        assert_eq!(extract_path_from_output("\x02/usr/bin\x01"), None);
+        // Sanity check: non-empty and containing '/' is required.
+        assert_eq!(
+            extract_path_from_output("\x01/usr/bin\x02"),
+            Some("/usr/bin")
+        );
+        assert_eq!(extract_path_from_output("\x01\x02"), None);
+    }
+
+    #[test]
+    fn scan_path_bins_finds_system_commands() {
+        // Smoke: on macOS the PATH (login or fallback) always resolves core
+        // system commands, so the scan must be non-empty and include ls/cat.
+        let bins = scan_path_bins();
+        assert!(!bins.is_empty(), "PATH scan must not be empty");
+        assert!(
+            bins.iter().any(|b| b == "ls" || b == "cat"),
+            "expected ls or cat in PATH bins, got {bins:?}"
+        );
     }
 }

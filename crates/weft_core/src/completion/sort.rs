@@ -10,7 +10,7 @@ use super::CompletionCandidate;
 const MAX_RESULTS: usize = 50;
 
 /// Sort candidates by (source priority, label). Lower priority value = higher rank.
-/// History > Filesystem > PathExecutable > Workflow > WorkspaceCommand.
+/// PathExecutable > Workflow > WorkspaceCommand > History > Filesystem.
 pub fn sort_candidates(candidates: &mut [CompletionCandidate]) {
     candidates.sort_by(|a, b| {
         a.source
@@ -121,5 +121,37 @@ mod tests {
         // Shorter label sorts first
         assert_eq!(candidates[0].label, "my file");
         assert_eq!(candidates[1].label, "my file.txt");
+    }
+
+    #[test]
+    fn command_outranks_history_and_files() {
+        // 2.2: PATH executable beats history beats filesystem — a real command
+        // must surface first even when its label sorts after others.
+        let mut candidates = vec![
+            candidate("aaa", CompletionSource::PathExecutable),
+            candidate("mmm", CompletionSource::History),
+            candidate("zzz", CompletionSource::Filesystem),
+        ];
+        sort_candidates(&mut candidates);
+        let labels: Vec<_> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["aaa", "mmm", "zzz"]);
+        assert_eq!(candidates[0].source, CompletionSource::PathExecutable);
+        assert_eq!(candidates[1].source, CompletionSource::History);
+        assert_eq!(candidates[2].source, CompletionSource::Filesystem);
+    }
+
+    #[test]
+    fn dedupe_keeps_command_over_history() {
+        // 2.2 regression guard: after sort, the PathExecutable entry precedes
+        // the History entry, so dedupe keeps the command (label "less" no
+        // longer gets tagged History).
+        let mut candidates = vec![
+            candidate("less", CompletionSource::History),
+            candidate("less", CompletionSource::PathExecutable),
+        ];
+        sort_candidates(&mut candidates);
+        let result = dedupe_candidates(candidates);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source, CompletionSource::PathExecutable);
     }
 }

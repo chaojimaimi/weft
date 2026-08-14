@@ -151,7 +151,14 @@ fn run_worker(
         let claimed_filesystem = filesystem_in_flight
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok();
-        if !remaining.is_zero() && !request.cancel.is_cancelled() && claimed_filesystem {
+        // 2.2 gate: only list files at an Argument position or with a
+        // path-like prefix (`./`, `/usr/...`). A bare command prefix
+        // ("pnp") must not surface file entries.
+        if !remaining.is_zero()
+            && !request.cancel.is_cancelled()
+            && claimed_filesystem
+            && (request.position == CompletePosition::Argument || request.prefix.contains('/'))
+        {
             let (filesystem_tx, filesystem_rx) = std::sync::mpsc::sync_channel(1);
             let prefix = request.prefix.clone();
             let cwd = request.cwd.clone();
