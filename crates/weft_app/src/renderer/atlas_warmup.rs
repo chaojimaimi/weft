@@ -45,6 +45,10 @@ impl MetalRenderer {
         // Collect unique on-screen GRID + panel characters not yet in the
         // atlas, then rasterize each exactly once.
         let mut missing = HashSet::new();
+        // v1.10.12: styled (bold/italic) grid characters — the atlas rasterizes
+        // styled faces on demand; `get_or_rasterize` degrades CJK/emoji/missing
+        // variants to the regular face internally.
+        let mut missing_styled: HashSet<(char, crate::glyph::GlyphStyle)> = HashSet::new();
         // v1.6.0: also collect multi-scalar grapheme cluster strings from
         // cells with CellFlags::EXTRA. These are rasterized via the
         // cluster atlas path (CoreText CTLine shaping) rather than the
@@ -54,8 +58,15 @@ impl MetalRenderer {
             for col in 0..grid.num_cols {
                 let cell = grid.cell(row, col);
                 let ch = cell.character;
-                if ch != '\0' && ch != ' ' && atlas.get(ch).is_none() {
-                    missing.insert(ch);
+                if ch != '\0' && ch != ' ' {
+                    let style = crate::glyph::GlyphStyle::from_flags(cell.flags);
+                    if atlas.get_style(ch, style).is_none() {
+                        if style == crate::glyph::GlyphStyle::REGULAR {
+                            missing.insert(ch);
+                        } else {
+                            missing_styled.insert((ch, style));
+                        }
+                    }
                 }
                 // v1.6.0: collect cluster strings for multi-scalar graphemes.
                 if cell.flags.contains(weft_core::grid::CellFlags::EXTRA) {
@@ -211,7 +222,12 @@ impl MetalRenderer {
         // indicator) and the static ● used under Reduce Motion.
         missing.extend(['●', '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']);
         for ch in &missing {
-            atlas.get_or_rasterize(*ch);
+            atlas.get_or_rasterize(*ch, crate::glyph::GlyphStyle::REGULAR);
+        }
+        // v1.10.12: rasterize styled faces. `get_or_rasterize` degrades
+        // CJK/emoji/symbol chars and missing variant faces to regular.
+        for (ch, style) in &missing_styled {
+            atlas.get_or_rasterize(*ch, *style);
         }
         // v1.6.0: rasterize multi-scalar grapheme clusters via the CoreText
         // cluster path. Each unique cluster string is shaped once and cached

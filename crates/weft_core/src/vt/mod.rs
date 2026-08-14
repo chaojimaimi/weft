@@ -46,6 +46,8 @@ pub struct Terminal {
     synchronized_frame_cleared_rows: usize,
     /// 256-color palette (indexed colors for SGR 38;5 / 48;5).
     palette: [Color; 256],
+    /// v1.10.12: Theme background, answered on OSC 11 queries.
+    background_color: Color,
     /// Alternate screen buffer, swapped with `grid` for DEC 1049/47.
     alt_grid: Grid,
     /// Stashed primary cursor, restored on alt-screen exit (DEC 1049).
@@ -90,6 +92,7 @@ impl Terminal {
             synchronized_output_started: None,
             synchronized_frame_cleared_rows: 0,
             palette: Color::standard_palette(),
+            background_color: Color::DEFAULT_BG,
             // Alt-screen apps manage their own scrolling and history.
             alt_grid: Grid::with_scrollback(rows, cols, 0),
             saved_cursor: None,
@@ -123,6 +126,10 @@ impl Terminal {
     /// "switch theme = reset palette".
     pub fn set_palette(&mut self, palette: [Color; 256]) {
         self.palette = palette;
+    }
+
+    pub fn set_background_color(&mut self, color: Color) {
+        self.background_color = color;
     }
 
     pub fn editor(&self) -> &Editor {
@@ -253,6 +260,11 @@ impl Terminal {
                 }
             }
             self.capabilities.alt_active = false;
+            // v1.10.12: leaving the alt screen ends any in-progress history
+            // peek so show_block_view() reverts to the primary-screen rules
+            // and the renderer shows the restored primary grid, not a stale
+            // BlockView overlay.
+            self.capabilities.alt_screen_history_peek = false;
             // Restoring the primary grid — alt-screen hyperlinks are gone.
             self.hyperlinks.clear_cell_map();
             self.active_hyperlink_id = None;

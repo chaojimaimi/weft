@@ -644,6 +644,11 @@ impl Tab {
             // (vim/less) the BlockView is not rendered — a snapshot bypass
             // window has no consumer. Keep the keystroke from arming a
             // window that would only rescan the frozen primary document.
+            //
+            // v1.10.12: any keystroke also exits the alt-screen history peek
+            // (the input is meant for the TUI, so return to its live grid and
+            // reset the browse position to the tail for the next peek).
+            self.snap_to_bottom();
         } else {
             // v1.10.4: EVERY keystroke during execution drives the running
             // program's repaint. A screen-owned primary-screen TUI (openclaw)

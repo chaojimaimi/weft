@@ -228,6 +228,41 @@ impl SessionManager {
     pub fn set_active(&mut self, idx: usize) {
         self.active_tab = idx.min(self.tabs.len().saturating_sub(1));
     }
+
+    /// v1.11: Move a tab from `from` to `to` (drag-to-reorder). No-op when
+    /// indices are equal or out of bounds. `active_tab` is adjusted so it
+    /// continues to point at the same tab (by identity, not position).
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tabs.len() || to >= self.tabs.len() {
+            return;
+        }
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active_tab = adjust_index_after_move(self.active_tab, from, to);
+    }
+}
+
+/// Pure index adjustment after a `remove(from) + insert(to)` move. Returns
+/// the new position of whatever was previously at `idx`.
+///
+/// - If `idx == from`, the moved element is now at `to`.
+/// - If `from < to` (rightward move), elements in `(from, to]` shift left by 1.
+/// - If `from > to` (leftward move), elements in `[to, from)` shift right by 1.
+fn adjust_index_after_move(idx: usize, from: usize, to: usize) -> usize {
+    if idx == from {
+        return to;
+    }
+    if from < to {
+        if idx > from && idx <= to {
+            idx - 1
+        } else {
+            idx
+        }
+    } else if idx >= to && idx < from {
+        idx + 1
+    } else {
+        idx
+    }
 }
 
 impl Default for SessionManager {
@@ -259,6 +294,11 @@ pub struct WindowRuntimeState {
     /// F3-2: When true, a dedicated timer wakes the loop ~every 80ms so the
     /// running-command spinner animates even when no PTY output is streaming.
     pub spinner_anim_active: Arc<AtomicBool>,
+    /// Drag-selection autoscroll timer gate: set while a block-view drag
+    /// selection is held past the content edge so a 40ms timer keeps the
+    /// viewport scrolling even when the pointer doesn't move. Cleared when
+    /// the pointer re-enters the content band or the button is released.
+    pub selection_autoscroll_active: Arc<AtomicBool>,
     /// F3-2: Last time the spinner phase was advanced. Anchors the phase
     /// computation to real elapsed time (frame-count independent).
     pub spinner_time: Instant,
@@ -287,6 +327,7 @@ impl WindowRuntimeState {
             current_logo_variant: weft_core::config::LogoVariant::Cool,
             spinner_phase: 0.0,
             spinner_anim_active: Arc::new(AtomicBool::new(false)),
+            selection_autoscroll_active: Arc::new(AtomicBool::new(false)),
             spinner_time: Instant::now(),
             reduce_motion: false,
             increase_contrast: false,
@@ -325,6 +366,36 @@ pub struct PaneDividerDragState {
     /// The union rect of the two panes the divider separates. Used to compute
     /// `new_ratio = (pointer - bounds[0]) / (bounds[2] - bounds[0])`.
     pub bounds: crate::layout::Rect,
+}
+
+/// v1.11: Tab drag-to-reorder state. Set when the user presses on a tab label
+/// (after switching to it); cleared on mouse release. While `moved` is false,
+/// the gesture is indistinguishable from a plain click (tab already switched
+/// on press, or a close request pending when `close_on_release` is set).
+/// Once the pointer exceeds the drag threshold, `moved` flips to true and
+/// subsequent moves update `insert_index` (ghost gap slot) without touching
+/// the `SessionManager` order — the reorder is committed once on release.
+#[derive(Clone, Copy)]
+pub struct TabBarDragState {
+    /// Physical X where the press started.
+    pub start_x: f64,
+    /// Physical Y where the press started.
+    pub start_y: f64,
+    /// Index of the dragged tab in the `tabs` Vec. Stable for the whole
+    /// gesture — the Vec is only reordered on release.
+    pub drag_index: usize,
+    /// Pointer X offset within the dragged tab's rect at lift (physical px).
+    /// The ghost pill keeps this grip so it never jumps on the first move.
+    pub grab_offset: f32,
+    /// Current gap slot (0..=n-1) the pointer would drop the dragged tab at.
+    /// Updated on every move past the threshold; rendered as a one-slot gap.
+    pub insert_index: usize,
+    /// Whether the drag threshold has been exceeded. Until this flips, no
+    /// reorder happens — the press was treated as a normal click.
+    pub moved: bool,
+    /// Press landed on the tab's close "×" button: a click (no movement)
+    /// performs the close instead of being a no-op tab switch.
+    pub close_on_release: bool,
 }
 
 #[derive(Clone)]
@@ -376,6 +447,14 @@ pub struct InteractionState {
     /// v1.3.2: Active pane divider resize drag. Set on press at a pane
     /// divider; cleared on release. Not persisted (ratio is in-memory only).
     pub pane_divider_drag: Option<PaneDividerDragState>,
+    /// v1.11: Active tab drag-to-reorder. Set on press at a tab label;
+    /// cleared on release. Live-reorders tabs once the drag threshold is
+    /// exceeded.
+    pub tab_drag: Option<TabBarDragState>,
+    /// Last-known pointer position during a block-view drag selection. The
+    /// 40ms autoscroll timer reads it to keep scrolling when the pointer is
+    /// held still past the content edge. Cleared on left-button release.
+    pub selection_drag_pos: Option<(f64, f64)>,
     /// F4: FocusId of the element that had keyboard focus before a modal
     /// surface (Palette/Find/Settings/ContextMenu) opened. Used to restore
     /// focus (visually / for accessibility) when the modal closes. `None`
@@ -411,6 +490,8 @@ impl InteractionState {
             block_action_hovered: None,
             sidebar_drag: None,
             pane_divider_drag: None,
+            tab_drag: None,
+            selection_drag_pos: None,
             prev_focus: None,
             focus_stack: Vec::new(),
         }
@@ -709,8 +790,8 @@ impl SettingsState {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextMenu, InteractionState, PanelState, SessionManager, SettingsState, TabBarState,
-        WindowRuntimeState,
+        adjust_index_after_move, ContextMenu, InteractionState, PanelState, SessionManager,
+        SettingsState, TabBarState, WindowRuntimeState,
     };
     use crate::tab::Tab;
     use std::time::Instant;
@@ -895,5 +976,102 @@ mod tests {
         let (new, prev) = sm.switch_to(99);
         assert_eq!(new, 0);
         assert_eq!(prev, 0);
+    }
+
+    #[test]
+    fn move_tab_rightward_adjusts_active() {
+        let mut sm = SessionManager::new();
+        for _ in 0..5 {
+            sm.push_tab(Tab::empty());
+        }
+        // [A, B, C, D, E], active = B (index 1)
+        sm.set_active(1);
+        sm.move_tab(1, 3); // → [A, C, D, B, E]
+        assert_eq!(sm.active_idx(), 3, "active should follow the moved tab");
+        assert_eq!(sm.len(), 5);
+    }
+
+    #[test]
+    fn move_tab_leftward_adjusts_active() {
+        let mut sm = SessionManager::new();
+        for _ in 0..5 {
+            sm.push_tab(Tab::empty());
+        }
+        // [A, B, C, D, E], active = D (index 3)
+        sm.set_active(3);
+        sm.move_tab(3, 1); // → [A, D, B, C, E]
+        assert_eq!(sm.active_idx(), 1, "active should follow the moved tab");
+    }
+
+    #[test]
+    fn move_tab_preserves_non_active_indices() {
+        let mut sm = SessionManager::new();
+        for _ in 0..5 {
+            sm.push_tab(Tab::empty());
+        }
+        // [A, B, C, D, E], active = A (index 0)
+        sm.set_active(0);
+        sm.move_tab(1, 3); // → [A, C, D, B, E]
+        assert_eq!(
+            sm.active_idx(),
+            0,
+            "active was not the moved tab — should stay put"
+        );
+    }
+
+    #[test]
+    fn move_tab_noop_on_equal_or_oob() {
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(1);
+        sm.move_tab(1, 1);
+        assert_eq!(sm.active_idx(), 1);
+        sm.move_tab(0, 99);
+        assert_eq!(sm.len(), 3, "out-of-bounds move should be a no-op");
+        sm.move_tab(99, 0);
+        assert_eq!(sm.len(), 3);
+    }
+
+    #[test]
+    fn move_tab_session_id_survives_reorder() {
+        let mut sm = SessionManager::new();
+        for _ in 0..4 {
+            sm.push_tab(Tab::empty());
+        }
+        let moved_id = sm.tab(1).unwrap().session_id;
+        let other_id = sm.tab(3).unwrap().session_id;
+        sm.move_tab(1, 3);
+        assert_eq!(
+            sm.tab_index_by_session_id(moved_id),
+            Some(3),
+            "moved tab should now be at index 3"
+        );
+        assert_eq!(
+            sm.tab_index_by_session_id(other_id),
+            Some(2),
+            "displaced tab should shift left"
+        );
+    }
+
+    #[test]
+    fn adjust_index_after_move_rightward() {
+        // Move from 1 to 3: [A,B,C,D,E] → [A,C,D,B,E]
+        assert_eq!(adjust_index_after_move(0, 1, 3), 0); // A stays
+        assert_eq!(adjust_index_after_move(1, 1, 3), 3); // B moved
+        assert_eq!(adjust_index_after_move(2, 1, 3), 1); // C shifts left
+        assert_eq!(adjust_index_after_move(3, 1, 3), 2); // D shifts left
+        assert_eq!(adjust_index_after_move(4, 1, 3), 4); // E stays
+    }
+
+    #[test]
+    fn adjust_index_after_move_leftward() {
+        // Move from 3 to 1: [A,B,C,D,E] → [A,D,B,C,E]
+        assert_eq!(adjust_index_after_move(0, 3, 1), 0); // A stays
+        assert_eq!(adjust_index_after_move(1, 3, 1), 2); // B shifts right
+        assert_eq!(adjust_index_after_move(2, 3, 1), 3); // C shifts right
+        assert_eq!(adjust_index_after_move(3, 3, 1), 1); // D moved
+        assert_eq!(adjust_index_after_move(4, 3, 1), 4); // E stays
     }
 }

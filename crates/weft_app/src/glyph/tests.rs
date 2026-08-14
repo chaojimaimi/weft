@@ -7,6 +7,7 @@
 
 #![cfg(test)]
 
+use super::font::{is_emoji_char, rasterize_emoji_rgba};
 use super::*;
 use font_kit::canvas::{Canvas, Format, RasterizationOptions};
 use font_kit::hinting::HintingOptions;
@@ -23,6 +24,146 @@ fn descent_px(font: &Font, scaled_size: f32) -> f32 {
 fn atlas_cell_dimensions_never_reach_zero() {
     assert_eq!(nonzero_cell_dimension(0), 1);
     assert_eq!(nonzero_cell_dimension(17), 17);
+}
+
+#[test]
+fn menlo_variants_resolve_via_properties_match() {
+    use font_kit::properties::{Style as FontStyle, Weight};
+    // Bold and italic faces of Menlo must be resolvable through the same
+    // family lookup the atlas uses — otherwise styled cells silently
+    // render regular.
+    let bold = super::font::resolve_font_variant(
+        "Menlo",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::BOLD,
+        FontStyle::Normal,
+    );
+    let italic = super::font::resolve_font_variant(
+        "Menlo",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::NORMAL,
+        FontStyle::Italic,
+    );
+    let bold_italic = super::font::resolve_font_variant(
+        "Menlo",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::BOLD,
+        FontStyle::Italic,
+    );
+    assert!(bold.is_some(), "Menlo Bold must resolve");
+    assert!(italic.is_some(), "Menlo Italic must resolve");
+    assert!(bold_italic.is_some(), "Menlo Bold Italic must resolve");
+    // The variant faces must actually be different glyphs from regular —
+    // an 'i' in italic Menlo produces visibly different pixels.
+    if let (Some(italic), Some(regular)) = (
+        italic.as_ref(),
+        Font::from_path("/System/Library/Fonts/Menlo.ttc", 0)
+            .ok()
+            .as_ref(),
+    ) {
+        let (w, h) = (16, 24);
+        let it = GlyphAtlas::rasterize_glyph(
+            italic,
+            'i',
+            20.0,
+            w,
+            h,
+            false,
+            descent_px(italic, 20.0),
+            false,
+        );
+        let re = GlyphAtlas::rasterize_glyph(
+            regular,
+            'i',
+            20.0,
+            w,
+            h,
+            false,
+            descent_px(regular, 20.0),
+            false,
+        );
+        assert_ne!(it, re, "italic 'i' must rasterize differently from regular");
+    }
+}
+
+// v1.10.12-fix regression: a family WITHOUT a true italic face (Fira Code
+// ships only Regular/Bold/Light/…) must NOT resolve an Italic variant —
+// Core Text approximates the request with the Regular face, which would
+// render "italic" as plain. The atlas then synthesizes the oblique.
+#[test]
+fn fira_code_without_italic_variant_is_rejected() {
+    use font_kit::properties::{Style as FontStyle, Weight};
+    let bold = super::font::resolve_font_variant(
+        "Fira Code",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::BOLD,
+        FontStyle::Normal,
+    );
+    let italic = super::font::resolve_font_variant(
+        "Fira Code",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::NORMAL,
+        FontStyle::Italic,
+    );
+    let bold_italic = super::font::resolve_font_variant(
+        "Fira Code",
+        &["/System/Library/Fonts/Menlo.ttc"],
+        Weight::BOLD,
+        FontStyle::Italic,
+    );
+    assert!(bold.is_some(), "Fira Code Bold must resolve");
+    assert!(
+        italic.is_none(),
+        "Fira Code has no italic face — the approximated regular must be rejected"
+    );
+    assert!(
+        bold_italic.is_none(),
+        "Fira Code has no bold-italic face — must be rejected"
+    );
+}
+
+// v1.10.12-fix: synthetic italic must lean FORWARD on screen (top-right /
+// bottom-left), matching a true italic face. Regression for the sign error
+// where m12 = +0.2 rendered backward.
+//
+// IMPORTANT: the rasterized glyph bitmap is stored BOTTOM-UP (row 0 = visual
+// bottom); the paint path V-flips it for display. So in the bitmap the VISUAL
+// TOP is the high row indices (2h/3..h) and the VISUAL BOTTOM is the low row
+// indices (0..h/3). Forward lean ⇒ the visual top shifts right relative to
+// the visual bottom when the skew is applied.
+#[test]
+fn synthesized_italic_skews_forward() {
+    let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
+    let (w, h): (u32, u32) = (24, 32);
+    let (wu, hu) = (w as usize, h as usize);
+    let descent = descent_px(&font, 24.0);
+    let plain = GlyphAtlas::rasterize_glyph(&font, 'l', 24.0, w, h, false, descent, false);
+    let skewed = GlyphAtlas::rasterize_glyph(&font, 'l', 24.0, w, h, false, descent, true);
+    assert_ne!(plain, skewed, "synthetic italic must differ from regular");
+    let ink_x_mean = |px: &[u8], y0: usize, y1: usize| -> f32 {
+        let (mut sum, mut n) = (0usize, 0usize);
+        for y in y0..y1 {
+            for x in 0..wu {
+                if px[y * wu + x] > 0 {
+                    sum += x;
+                    n += 1;
+                }
+            }
+        }
+        if n == 0 {
+            f32::NAN
+        } else {
+            sum as f32 / n as f32
+        }
+    };
+    // Bitmap is bottom-up: rows 0..h/3 = visual BOTTOM, rows 2h/3..h = visual TOP.
+    let bottom_shift = ink_x_mean(&skewed, 0, hu / 3) - ink_x_mean(&plain, 0, hu / 3);
+    let top_shift = ink_x_mean(&skewed, 2 * hu / 3, hu) - ink_x_mean(&plain, 2 * hu / 3, hu);
+    assert!(
+        top_shift > bottom_shift + 0.5,
+        "forward italic: visual top must shift right more than visual bottom \
+         (top Δ={top_shift:.2}, bottom Δ={bottom_shift:.2})"
+    );
 }
 
 #[test]
@@ -85,6 +226,7 @@ fn prewarm_path_uses_edge_to_edge_procedural_box_line() {
         width,
         height,
         false,
+        false,
         &mut atlas,
         width,
         height,
@@ -139,7 +281,16 @@ fn menlo_renders_angle_quote_with_ink() {
     // prompt color/visibility depends on Menlo rendering it directly.)
     let font = Font::from_path("/System/Library/Fonts/Menlo.ttc", 0).unwrap();
     assert!(font.glyph_for_char('❯').is_some(), "Menlo must have ❯");
-    let px = GlyphAtlas::rasterize_glyph(&font, '❯', 28.0, 14, 28, false, descent_px(&font, 28.0));
+    let px = GlyphAtlas::rasterize_glyph(
+        &font,
+        '❯',
+        28.0,
+        14,
+        28,
+        false,
+        descent_px(&font, 28.0),
+        false,
+    );
     let ink = px.iter().filter(|p| **p > 0).count();
     assert!(ink > 50, "❯ must rasterize with ink, got {ink}");
 }
@@ -169,6 +320,7 @@ fn unsupported_grapheme_fallbacks_rasterize_with_matching_cell_width() {
             28,
             is_wide,
             descent_px(&font, 28.0),
+            false,
         );
         assert!(px.iter().any(|value| *value > 0), "{ch} must have ink");
         assert_eq!(
@@ -280,6 +432,7 @@ fn cjk_glyph_not_stretched_and_centered() {
         ch_h as u32,
         true,
         descent_px(&cjk, scaled),
+        false,
     );
     // rasterize_glyph returns a Vec<u8>; build a Canvas-like view.
     assert_eq!(pixels.len(), (cw * ch_h) as usize);
@@ -409,10 +562,10 @@ fn allocate_slot_marks_color_slots() {
 /// but would render as an untintable white 'e' from CoreText's cascade.
 #[test]
 fn cluster_color_atlas_requires_emoji_classification_and_font_glyph() {
-    assert!(super::cluster_wants_color_atlas(true, true));
-    assert!(!super::cluster_wants_color_atlas(true, false));
-    assert!(!super::cluster_wants_color_atlas(false, true));
-    assert!(!super::cluster_wants_color_atlas(false, false));
+    assert!(super::query::cluster_wants_color_atlas(true, true));
+    assert!(!super::query::cluster_wants_color_atlas(true, false));
+    assert!(!super::query::cluster_wants_color_atlas(false, true));
+    assert!(!super::query::cluster_wants_color_atlas(false, false));
 }
 
 /// v1.10.4: lock the font behavior the `cluster_wants_color_atlas` gate
@@ -504,8 +657,16 @@ fn cjk_and_latin_share_baseline() {
     // CRITICAL: both pass Menlo's descent as the baseline anchor — the
     // production invariant. Pre-fix, CJK used its own (smaller) descent.
     let primary_descent = descent_px(&menlo, scaled);
-    let m_px =
-        GlyphAtlas::rasterize_glyph(&menlo, 'M', scaled, cell_w, cell_h, false, primary_descent);
+    let m_px = GlyphAtlas::rasterize_glyph(
+        &menlo,
+        'M',
+        scaled,
+        cell_w,
+        cell_h,
+        false,
+        primary_descent,
+        false,
+    );
     let cjk_px = GlyphAtlas::rasterize_glyph(
         &pingfang,
         '中',
@@ -514,6 +675,7 @@ fn cjk_and_latin_share_baseline() {
         cell_h,
         true,
         primary_descent,
+        false,
     );
 
     let (m_top, m_bot) = ink_y_bbox(&m_px, cell_w, cell_h).expect("'M' must have ink");

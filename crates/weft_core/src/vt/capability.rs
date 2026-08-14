@@ -59,6 +59,12 @@ pub(in crate::vt) struct CapabilityFlags {
     /// crosses the TUI-detection threshold. Reset with each OSC 133 prompt
     /// marker like `primary_screen_cursor_ops`.
     pub(in crate::vt) primary_screen_absolute_addressing: bool,
+    /// v1.10.12: the TUI ever used relative cursor addressing (A/B/D/…).
+    /// A sparse repainter (omp/pi) repaints incrementally — shell rows above
+    /// its document boundary must NOT be hidden (it didn't repaint them).
+    /// Pure full-viewport CUP TUIs (claude code) never set this and DO get
+    /// the boundary hiding.
+    pub(in crate::vt) primary_screen_relative_addressing_seen: bool,
     /// v1.10.7: per-command render-mode lock. When a primary-screen TUI is
     /// first detected with relative-only addressing (a sparse repainter like
     /// pi/openclaw that redraws its input row per keystroke and only
@@ -69,7 +75,6 @@ pub(in crate::vt) struct CapabilityFlags {
     /// (`!absolute_addressing` at that moment), reset at each real prompt
     /// boundary. Full-viewport CUP TUIs (Claude Code) detect as absolute →
     /// lock=false → live grid, unchanged.
-    pub(in crate::vt) primary_screen_block_view_locked: bool,
     /// v1.10.6: the cursor's line index in the most recent primary-screen
     /// snapshot. Tracked during snapshot construction so the BlockView paint
     /// can place the caret/preedit on the exact materialized document row.
@@ -96,6 +101,13 @@ pub(in crate::vt) struct CapabilityFlags {
     /// User-driven history-browsing toggle (scroll-up while a primary-screen
     /// TUI owns the viewport).
     pub(in crate::vt) primary_history_view: bool,
+    /// v1.10.12: alt-screen history peek — while an alt-screen TUI (omp/less/
+    /// vim without mouse reporting) owns the screen, the user can scroll up to
+    /// overlay the terminal's history BlockView over the TUI. When true this
+    /// makes `show_block_view()` return true even though `alt_active` is true
+    /// (the BlockView paint is grid-content-independent, so this is safe).
+    /// Cleared on scroll-back-to-bottom, any PTY input, or alt-screen exit.
+    pub(in crate::vt) alt_screen_history_peek: bool,
     /// Timestamp of the most recent history-snapshot refresh (rate-limited by
     /// `PRIMARY_HISTORY_SNAPSHOT_INTERVAL`).
     pub(in crate::vt) primary_history_snapshot_at: Option<Instant>,
@@ -112,9 +124,9 @@ impl Default for CapabilityFlags {
             sgr_mouse: false,
             app_cursor_keys: false,
             tagged_shell_markers_seen: false,
-            primary_screen_cursor_ops: 0,
             primary_screen_absolute_addressing: false,
-            primary_screen_block_view_locked: false,
+            primary_screen_relative_addressing_seen: false,
+            primary_screen_cursor_ops: 0,
             primary_screen_cursor_snapshot_line: None,
             last_caret_snapshot_cursor: None,
             primary_screen_document_candidate: 0,
@@ -122,6 +134,7 @@ impl Default for CapabilityFlags {
             primary_screen_exit: None,
             primary_screen_interrupt_capture: None,
             primary_history_view: false,
+            alt_screen_history_peek: false,
             primary_history_snapshot_at: None,
             primary_screen_ownership: PrimaryScreenOwnership::default(),
         }

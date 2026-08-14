@@ -269,7 +269,9 @@ impl MetalRenderer {
         let cache = self.grid_row_cache.borrow();
         let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
         for row_inst in cache.iter() {
-            batch.push_row(row_inst, &|ch, cluster| self.resolve_glyph_uv(ch, cluster));
+            batch.push_row(row_inst, &|ch, cluster, style| {
+                self.resolve_glyph_uv(ch, cluster, style)
+            });
         }
         (batch, rebuilt_rows)
     }
@@ -337,7 +339,9 @@ impl MetalRenderer {
                 origin_x,
                 origin_y_base + row as f32 * ch,
             );
-            batch.push_row(&row_inst, &|ch, cluster| self.resolve_glyph_uv(ch, cluster));
+            batch.push_row(&row_inst, &|ch, cluster, style| {
+                self.resolve_glyph_uv(ch, cluster, style)
+            });
         }
         batch
     }
@@ -345,14 +349,23 @@ impl MetalRenderer {
     /// Resolve a cell's glyph UV rect (+ color-atlas flag) from the atlas.
     ///
     /// v1.6.0: multi-scalar graphemes (EXTRA flag) resolve via the cluster
-    /// atlas path; single-scalar cells use the fast `atlas.get(ch)` path.
-    /// A cluster that hasn't been rasterized yet falls through to the lead
-    /// scalar so the cell isn't blank — the cluster rasterizes on a later
-    /// frame (or via warmup).
+    /// atlas path; single-scalar cells use the fast `atlas.get_style(ch)`
+    /// path. A cluster that hasn't been rasterized yet falls through to the
+    /// lead scalar so the cell isn't blank — the cluster rasterizes on a
+    /// later frame (or via warmup).
     ///
     /// v1.10.4: returns `is_color` for glyphs stored in the RGBA color
     /// atlas (color emoji) so `push_row` can emit the fg.a=2.0 sentinel.
-    fn resolve_glyph_uv(&self, ch: char, cluster: Option<&str>) -> ([f32; 4], bool) {
+    ///
+    /// v1.10.12: `style` (bold/italic from the cell's SGR flags) selects
+    /// the atlas face. Clusters (multi-scalar graphemes) always resolve
+    /// regular — fallback fonts have no style faces.
+    fn resolve_glyph_uv(
+        &self,
+        ch: char,
+        cluster: Option<&str>,
+        style: crate::glyph::GlyphStyle,
+    ) -> ([f32; 4], bool) {
         if let Some(cluster) = cluster {
             if let Some(glyph) = self.atlas.get_cluster(cluster) {
                 let (u, v) = glyph.uv_origin;
@@ -361,11 +374,20 @@ impl MetalRenderer {
             }
         }
         let ch_resolved = if ch == '\0' { ' ' } else { ch };
-        if let Some(glyph) = self.atlas.get(ch_resolved) {
+        if let Some(glyph) = self.atlas.get_style(ch_resolved, style) {
             let (u, v) = glyph.uv_origin;
             let (uw, vh) = glyph.uv_size;
             // V-swap compensates for CAMetalLayer's vertical flip (same
             // convention as the legacy single-stream path).
+            ([u, v + vh, u + uw, v], glyph.is_color)
+        } else if let Some(glyph) = self
+            .atlas
+            .get_style(ch_resolved, crate::glyph::GlyphStyle::REGULAR)
+        {
+            // v1.10.12: styled face not rasterized yet (non-ASCII char before
+            // warmup) — degrade to the regular face instead of a blank cell.
+            let (u, v) = glyph.uv_origin;
+            let (uw, vh) = glyph.uv_size;
             ([u, v + vh, u + uw, v], glyph.is_color)
         } else {
             let (u, v) = self

@@ -176,13 +176,116 @@ fn load_by_family(family: &str) -> Option<Font> {
     let handle = source
         .select_best_match(&[FamilyName::Title(family.to_string())], &Properties::new())
         .ok()?;
+    font_from_handle(handle)
+}
+
+/// v1.10.12: Materialize a font-kit `Handle` (Path or Memory) into a `Font`.
+/// User-installed families (Fira Code, JetBrains Mono, …) commonly resolve
+/// to `Handle::Memory` — Core Text hands back font data in memory — and
+/// skipping it silently fell back to Menlo for every custom family.
+fn font_from_handle(handle: font_kit::handle::Handle) -> Option<Font> {
     match handle {
         font_kit::handle::Handle::Path { path, font_index } => {
             Font::from_path(path, font_index).ok()
         }
-        // Memory handles are rare (in-process fonts); skip them.
-        font_kit::handle::Handle::Memory { .. } => None,
+        font_kit::handle::Handle::Memory { bytes, font_index } => {
+            Font::from_bytes(bytes, font_index).ok()
+        }
     }
+}
+
+/// v1.10.12: Resolve a styled variant (bold / italic) of a font family.
+///
+/// Prefers the system source's `select_best_match` with the requested
+/// weight/style properties (correct for any installed family, including
+/// user-configured fonts). Falls back to known TTC face indices for the
+/// bundled Menlo path (face order in Menlo.ttc: 0 regular, 1 bold,
+/// 2 italic, 3 bold-italic).
+///
+/// v1.10.12-fix: `select_best_match` approximates missing variants — a
+/// family without an Italic face (e.g. Fira Code ships only Regular/Bold/
+/// Light/…) silently returns the Regular face for an Italic request. We
+/// verify the returned face's actual properties and reject the mismatch,
+/// so callers fall back to synthetic italic instead of rendering plain.
+/// Returns `None` when the family has no usable variant.
+pub(super) fn resolve_font_variant(
+    family: &str,
+    fallback_paths: &[&str],
+    weight: font_kit::properties::Weight,
+    style: font_kit::properties::Style,
+) -> Option<Font> {
+    if !family.is_empty() {
+        let source = SystemSource::new();
+        // font_kit Properties exposes weight/style/stretch as public fields.
+        let props = Properties {
+            weight,
+            style,
+            ..Properties::new()
+        };
+        if let Ok(handle) =
+            source.select_best_match(&[FamilyName::Title(family.to_string())], &props)
+        {
+            if let Some(f) = font_from_handle(handle) {
+                if variant_properties_match(&f, weight, style) {
+                    return Some(f);
+                }
+            }
+            // Core Text's best-match can approximate badly (e.g. a Bold
+            // request for Menlo returns the Italic face). Fall through to
+            // the path fallback — it verifies both properties and family.
+        }
+    }
+    let face_index = match (
+        weight == font_kit::properties::Weight::BOLD,
+        style == font_kit::properties::Style::Italic,
+    ) {
+        (true, true) => 3,
+        (true, false) => 1,
+        (false, true) => 2,
+        _ => 0,
+    };
+    for path in fallback_paths {
+        if let Ok(f) = Font::from_path(path, face_index) {
+            if variant_properties_match(&f, weight, style) && variant_matches_family(&f, family) {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// v1.10.12-fix: a path fallback (Menlo.ttc faces) must only be used for
+/// the family it actually belongs to — loading Menlo's italic face for a
+/// Fira Code request would visually mix two unrelated fonts mid-line.
+fn variant_matches_family(font: &Font, family: &str) -> bool {
+    if family.is_empty() {
+        return true;
+    }
+    let name = font.family_name();
+    name == family || name.starts_with(family)
+}
+
+/// v1.10.12-fix: True when the loaded face really is the requested variant.
+/// Bold accepts any weight ≥ 600 (Semibold/Bold); italic requires the actual
+/// `Style::Italic` — Core Text's approximation of a missing italic face is
+/// the regular face with `Style::Normal`, which must be rejected.
+fn variant_properties_match(
+    font: &Font,
+    weight: font_kit::properties::Weight,
+    style: font_kit::properties::Style,
+) -> bool {
+    let p = font.properties();
+    if style == font_kit::properties::Style::Italic
+        && p.style != font_kit::properties::Style::Italic
+    {
+        return false;
+    }
+    if weight == font_kit::properties::Weight::BOLD
+        && p.weight < font_kit::properties::Weight::SEMIBOLD
+    {
+        return false;
+    }
+    true
 }
 
 #[allow(dead_code)]

@@ -187,7 +187,14 @@ impl App {
                 winit::event::ElementState::Released => {
                     match self.interaction.modal_mouse_capture.consume_release(button) {
                         Some(crate::input_router::MouseGestureOwner::Modal)
-                        | Some(crate::input_router::MouseGestureOwner::Suppressed) => {}
+                        | Some(crate::input_router::MouseGestureOwner::Suppressed) => {
+                            // v1.11.13: a press that fell through to the tab
+                            // bar while a modal (palette/settings) was open
+                            // may have set `tab_drag`; its release is consumed
+                            // here, so cancel the gesture or it would pin the
+                            // ghost pill and swallow later CursorMoved events.
+                            self.cancel_tab_drag();
+                        }
                         Some(crate::input_router::MouseGestureOwner::TerminalSession(
                             session_id,
                         )) => {
@@ -231,6 +238,19 @@ impl App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.interaction.last_mouse_x = position.x;
                 self.interaction.last_mouse_y = position.y;
+                // v1.11: tab drag-to-reorder takes priority over all other
+                // pointer routing. Must run before the modal/terminal routing
+                // because a tab press switches tabs, which changes the active
+                // session — the normal routing would then send CursorMoved to
+                // the wrong session and skip handle_mouse_move entirely.
+                if self.interaction.tab_drag.is_some() {
+                    tracing::debug!(
+                        "TAB_DRAG_DIAG: CursorMoved at ({}, {}), tab_drag is some, calling handle_tab_drag_move",
+                        position.x, position.y
+                    );
+                    self.handle_tab_drag_move(position.x, position.y);
+                    return;
+                }
                 if crate::input_router::route_modal_pointer(
                     self.palette.open,
                     self.settings.open,
@@ -263,6 +283,11 @@ impl App {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
+                // v1.11.13: a drag that ends with the pointer outside the
+                // window is cancelled (not committed) — the release event may
+                // never arrive, and a stale tab_drag would pin the ghost pill
+                // to the screen edge and swallow every later CursorMoved.
+                self.cancel_tab_drag();
                 if self.interaction.scrollbar_hovered && self.interaction.scrollbar_drag.is_none() {
                     self.interaction.scrollbar_hovered = false;
                     if let Some(window) = &self.window {
@@ -303,6 +328,10 @@ impl App {
                     self.window_runtime.cursor_blink_on = true;
                     self.window_runtime.cursor_blink_time = std::time::Instant::now();
                 } else {
+                    // v1.11.13: switching apps mid-drag (Cmd+Tab) can drop the
+                    // mouse release — cancel the drag so the ghost doesn't
+                    // stay pinned and future moves aren't swallowed.
+                    self.cancel_tab_drag();
                     self.interaction.modal_mouse_capture.suspend_active();
                     self.reset_ime_context("window focus lost");
                 }

@@ -1,5 +1,26 @@
 //! Atlas coordinate helpers shared by prewarmed and dynamic glyph slots.
 
+/// UV rect for a glyph in the atlas texture.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+pub struct GlyphInfo {
+    /// Top-left UV coordinate in atlas (normalized 0..1).
+    pub uv_origin: (f32, f32),
+    /// UV size in atlas (normalized 0..1).
+    pub uv_size: (f32, f32),
+    /// Glyph bitmap size in pixels.
+    pub size: (u32, u32),
+    /// Horizontal advance width in pixels.
+    pub advance: f32,
+    /// Whether this glyph occupies double width (CJK).
+    pub is_wide: bool,
+    /// v1.10.4: whether this glyph's pixels live in the RGBA color atlas
+    /// (color emoji — Apple Color Emoji sbix bitmaps) instead of the R8
+    /// alpha-mask atlas. Color glyphs carry their own RGB; the instance's
+    /// `fg` is ignored (a sentinel alpha encodes this to the shader).
+    pub is_color: bool,
+}
+
 /// Return UVs spanning the centers of the slot's first and last pixels.
 /// Linear sampling at raw slot boundaries blends adjacent transparent atlas
 /// cells into edge-touching block glyphs, producing horizontal hairline gaps.

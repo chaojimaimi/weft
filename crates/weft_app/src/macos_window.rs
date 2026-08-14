@@ -7,6 +7,23 @@ use objc2::msg_send;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+/// v1.11: NSView `mouseDownCanMoveWindow` override — returns `NO` so macOS
+/// does not auto-start a window drag when the user presses on the tab bar
+/// (which lives in the titlebar region under `FullSizeContentView`).
+///
+/// Without this override, winit's NSView inherits the default
+/// `mouseDownCanMoveWindow` (which returns `YES` for non-opaque views), and
+/// macOS intercepts `CursorMoved` events during the drag — preventing
+/// tab-to-reorder from ever seeing pointer movement. The tab-bar controller
+/// still calls `drag_window()` explicitly for empty titlebar regions, so
+/// background-to-drag-window behavior is preserved.
+unsafe extern "C" fn mouse_down_can_move_window(
+    _self: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::NO
+}
+
 /// Attach a Metal layer to the winit window's NSView.
 pub(crate) unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window, scale: f64) {
     let handle = window.window_handle().expect("Failed to get window handle");
@@ -73,6 +90,45 @@ pub(crate) fn configure_titlebar(window: &Window) {
         ns_window.setTitlebarAppearsTransparent(true);
         ns_window.setTitleVisibility(NSWindowTitleVisibility::NSWindowTitleHidden);
         ns_window.setMovableByWindowBackground(false);
+
+        // v1.11: Override `mouseDownCanMoveWindow` on the NSView's class to
+        // return NO. winit 0.30's NSView subclass does not override this
+        // method, so it inherits the default (YES for non-opaque views). With
+        // FullSizeContentView, the tab bar lives in the titlebar region; if
+        // mouseDownCanMoveWindow returns YES, macOS auto-starts a window drag
+        // on press+move, stealing CursorMoved events from winit and breaking
+        // tab drag-to-reorder. Returning NO lets the press reach winit's
+        // mouseDown handler (tab switch + tab_drag state), and the subsequent
+        // CursorMoved events flow through to handle_tab_drag_move. The
+        // tab-bar background still drags the window via explicit
+        // drag_window() in mouse_press_controller.
+        // SAFETY: `view_class` is the live Objective-C class object of the
+        // window's NSView (retrieved via `object_getClass`, always valid for
+        // an initialized NSView); the selector `mouseDownCanMoveWindow` and
+        // the "B@:" encoding (BOOL return, id self, SEL _cmd) exactly match
+        // the swapped implementation's signature; `class_replaceMethod` is
+        // thread-safe and the override applies to the class (all windows
+        // share the winit NSView subclass). `transmute` between the typed
+        // extern "C" fn pointer and the runtime's untyped `Imp` form is sound
+        // for the Objective-C calling convention (both are fn pointers).
+        let view_class =
+            objc2::ffi::object_getClass(&*ns_view as *const NSView as *mut _) as *mut _;
+        let sel = objc2::sel!(mouseDownCanMoveWindow);
+        let imp: unsafe extern "C" fn(
+            *mut objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+        ) -> objc2::runtime::Bool = mouse_down_can_move_window;
+        // IMP is `Option<unsafe extern "C" fn()>` — transmute the typed
+        // function pointer to the untyped form expected by the runtime.
+        let imp_raw: unsafe extern "C" fn() = std::mem::transmute(imp);
+        // Type encoding: "B@:" = BOOL return, id self, SEL _cmd
+        let types = b"B@:\0";
+        objc2::ffi::class_replaceMethod(
+            view_class,
+            sel.as_ptr(),
+            Some(imp_raw),
+            types.as_ptr() as *const std::os::raw::c_char,
+        );
     }));
 }
 

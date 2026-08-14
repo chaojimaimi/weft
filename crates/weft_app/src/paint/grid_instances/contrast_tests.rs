@@ -45,14 +45,13 @@ fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowIn
 fn terminal_grid_applies_minimum_contrast_without_touching_background() {
     const BACKGROUND: [f32; 4] = [0.1, 0.1, 0.2, 1.0];
     let mut grid = Grid::new(1, 1);
-    let mut cell = Cell::with_char('A');
-    cell.fg = CellColor::Rgb(Color::rgb(80, 45, 20));
-    grid.viewport[0].cells[0] = cell;
+    grid.viewport[0].cells[0] = Cell::with_char('A');
+    let low_contrast_default = [80.0 / 255.0, 45.0 / 255.0, 20.0 / 255.0, 1.0];
     let result = build_row_instances(
         &grid,
         &Color::standard_palette(),
         0,
-        [0.8, 0.8, 0.8, 1.0],
+        low_contrast_default,
         BACKGROUND,
         [1.0; 4],
         [0.3, 0.5, 0.7, 0.6],
@@ -98,6 +97,39 @@ fn grid_dim_attr_halves_non_cursor_fg_channels() {
         assert!((actual - exp).abs() < 1e-6, "DIM fg mismatch");
     }
     assert!(fg[0] > fg[1] && fg[1] > fg[2], "channel order preserved");
+}
+
+#[test]
+fn grid_explicit_terminal_color_preserves_application_hierarchy() {
+    let mut grid = Grid::new(1, 1);
+    grid.viewport[0].cells[0].character = 'A';
+    grid.viewport[0].cells[0].fg = CellColor::Rgb(Color::rgb(128, 128, 128));
+    let instances = build_row_instances(
+        &grid,
+        &Color::standard_palette(),
+        0,
+        FG_FULL,
+        BG_DARK,
+        [1.0; 4],
+        [0.3, 0.5, 0.7, 0.6],
+        &Cursor::default(),
+        CursorStyle::Block,
+        false,
+        &SelectionHandler::new(),
+        1.0,
+        7.0,
+        10.0,
+        20.0,
+        0.0,
+        0.0,
+    );
+    let GlyphInstance::Text { fg, .. } = &instances.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    let expected = 128.0 / 255.0;
+    assert!(fg[..3]
+        .iter()
+        .all(|channel| (*channel - expected).abs() < 1e-6));
 }
 
 #[test]
@@ -305,24 +337,6 @@ fn graphic_char_keeps_designed_dim_color_under_high_threshold() {
     assert!(
         (fg[0] - 80.0 / 255.0).abs() < 1e-4,
         "graphic glyph must not be boosted, got fg={fg:?}"
-    );
-}
-
-#[test]
-fn readable_text_still_gets_minimum_contrast_boost() {
-    // The exemption must NOT apply to actual text: a dark-brown letter on
-    // the dark canvas still gets boosted to meet the 7.0 threshold.
-    let mut cell = Cell::with_char('A');
-    cell.fg = CellColor::Rgb(Color::rgb(80, 45, 20));
-    cell.bg = CellColor::Rgb(Color::rgb(15, 15, 15));
-    let result = build_high_contrast_cell(&cell);
-    let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
-        panic!("expected text glyph");
-    };
-    let bg: [f32; 4] = [15.0 / 255.0, 15.0 / 255.0, 15.0 / 255.0, 1.0];
-    assert!(
-        crate::paint::primitives::text_contrast_ratio(*fg, bg) >= 6.99,
-        "real text still boosted to meet threshold, got fg={fg:?}"
     );
 }
 

@@ -68,6 +68,7 @@ impl App {
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
+                t.set_background_color(r.theme().background);
             }
         }
         info!(tab_idx = idx, "new tab created");
@@ -80,6 +81,9 @@ impl App {
     /// application shell must drain. Closing the last tab requests exit;
     /// otherwise the previous tab becomes active and a redraw is requested.
     pub(super) fn close_tab(&mut self) -> Vec<Effect> {
+        // v1.11.13: closing a tab mid-drag would leave drag_index/insert_index
+        // pointing past the shrunk Vec. Cancel the gesture first.
+        self.cancel_tab_drag();
         let removed_idx = self.sessions.active_idx();
         let blocks = self
             .sessions
@@ -281,6 +285,24 @@ impl App {
             .collect();
         let labels = titles.iter().map(|title| title.compact.clone()).collect();
         let tooltips = titles.into_iter().map(|title| title.tooltip).collect();
+        // v1.11.13: ghost-drag draw state. Only engaged past the threshold
+        // and while the dragged index is still valid; the ghost x is the
+        // pointer minus the grip captured at lift (clamped by the renderer
+        // into the visible strip).
+        let (drag_index, drag_ghost_x, drag_insert_index) = match self.interaction.tab_drag {
+            Some(drag)
+                if drag.moved
+                    && drag.drag_index < self.sessions.len()
+                    && drag.insert_index < self.sessions.len() =>
+            {
+                (
+                    Some(drag.drag_index),
+                    Some(self.interaction.last_mouse_x as f32 - drag.grab_offset),
+                    Some(drag.insert_index),
+                )
+            }
+            _ => (None, None, None),
+        };
         TabBarDrawState {
             tab_count: self.sessions.len(),
             active_tab: self.sessions.active_idx(),
@@ -293,6 +315,9 @@ impl App {
             arrow_right_hovered: self.tab_bar.arrow_right_hovered,
             chrome_left: self.tab_bar_chrome_left(),
             layout_right: self.tab_bar_layout_right(),
+            drag_index,
+            drag_ghost_x,
+            drag_insert_index,
         }
     }
 
@@ -333,6 +358,7 @@ impl App {
         for tab in self.sessions.tabs_mut() {
             if let Some(t) = &mut tab.terminal {
                 t.set_palette(theme.palette);
+                t.set_background_color(theme.background);
             }
         }
         info!(dark = self.config_state.theme_is_dark, name, "theme cycled");
@@ -350,6 +376,7 @@ impl App {
         }
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.set_palette(theme.palette);
+            t.set_background_color(theme.background);
         }
         self.config_state.theme_is_dark = dark;
         // v1.0: sync config.theme.name + preferred_dark_theme so Settings
@@ -690,6 +717,7 @@ impl App {
                             if let Some(t) = &mut tab.terminal {
                                 if let Some(r) = &self.renderer {
                                     t.set_palette(r.theme().palette);
+                                    t.set_background_color(r.theme().background);
                                 }
                             }
                             tab.restore_from_snapshot(snap);
@@ -709,6 +737,7 @@ impl App {
                         if let Some(t) = &mut tab.terminal {
                             if let Some(r) = &self.renderer {
                                 t.set_palette(r.theme().palette);
+                                t.set_background_color(r.theme().background);
                             }
                         }
                         self.sessions.push_tab(tab);

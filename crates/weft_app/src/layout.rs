@@ -254,6 +254,7 @@ impl Spacing {
 }
 
 mod chrome;
+mod drag;
 mod settings;
 mod surfaces;
 mod terminal;
@@ -265,6 +266,8 @@ pub use chrome::{
     layout_panel, layout_tab_strip, layout_tab_tooltip, tab_strip_right_edge, PanelLayout,
     TabStripInput, TabStripLayout,
 };
+#[allow(unused_imports)]
+pub use drag::{insertion_index_for_x, is_noop, render_slot};
 #[allow(unused_imports)]
 pub use settings::{layout_settings, FooterButtonRects, SettingsLayout, SETTINGS_NARROW_THRESHOLD};
 #[allow(unused_imports)]

@@ -74,6 +74,7 @@ mod smart_select_controller;
 mod snapshot_persistence;
 mod tab;
 mod tab_bar_component;
+mod tab_drag_controller;
 mod terminal_geometry;
 mod transfer_controller;
 mod ui_tokens;

@@ -202,6 +202,7 @@ impl crate::App {
                         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
                             if let Some(r) = self.renderer.as_ref() {
                                 t.set_palette(r.theme().palette);
+                                t.set_background_color(r.theme().background);
                             }
                         }
                         // v1.3.4: New pane is already forked at the right

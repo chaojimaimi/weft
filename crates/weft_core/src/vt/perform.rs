@@ -707,6 +707,22 @@ impl vte::Perform for Terminal {
                     }
                 }
             }
+            "11" => {
+                // OSC 11 background query — answer the app theme's
+                // background in xterm rgb:RR/GG/BB form so TUIs detect
+                // dark vs light. Only queries (`OSC 11` / `OSC 11;?`)
+                // are answered; a set request (`OSC 11;rgb:..`) is not.
+                let is_query =
+                    params.len() == 1 || params.get(1).is_some_and(|p| p.is_empty() || p == b"?");
+                if is_query {
+                    let [r, g, b] = [
+                        self.background_color.r,
+                        self.background_color.g,
+                        self.background_color.b,
+                    ];
+                    self.respond(format!("\x1b]11;rgb:{r:02x}/{g:02x}/{b:02x}\x1b\\").as_bytes());
+                }
+            }
             "7" => {
                 if params.len() > 1 {
                     if let Some(path) = parse_osc7_cwd(params[1]) {
@@ -777,6 +793,7 @@ impl vte::Perform for Terminal {
                                     && self.capabilities.primary_screen_exit.is_none();
                             self.capabilities.primary_screen_cursor_ops = 0;
                             self.capabilities.primary_screen_absolute_addressing = false;
+                            self.capabilities.primary_screen_relative_addressing_seen = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             self.shell_markers.push(ShellMarker::PromptStart);
@@ -807,9 +824,7 @@ impl vte::Perform for Terminal {
                             } else {
                                 self.block_tracker.on_prompt_start();
                                 // v1.10.7: real prompt boundary (or shell
-                                // outside a screen session) — the render-mode
-                                // lock belongs to the previous command only.
-                                self.capabilities.primary_screen_block_view_locked = false;
+                                // outside a screen session).
                             }
                             // Clear the git branch: the precmd hook re-emits
                             // OSC 9;git= if (and only if) the cwd is still a git
@@ -852,6 +867,7 @@ impl vte::Perform for Terminal {
                                 self.capabilities.primary_history_view = false;
                                 self.capabilities.primary_screen_cursor_ops = 0;
                                 self.capabilities.primary_screen_absolute_addressing = false;
+                                self.capabilities.primary_screen_relative_addressing_seen = false;
                                 self.reset_primary_screen_synchronized_frame();
                                 self.shell_markers.push(ShellMarker::CommandStart);
                             } else {
@@ -859,10 +875,9 @@ impl vte::Perform for Terminal {
                                 self.capabilities.primary_history_view = false;
                                 self.capabilities.primary_screen_cursor_ops = 0;
                                 self.capabilities.primary_screen_absolute_addressing = false;
-                                // v1.10.7: real command start — a new command
-                                // re-detects and re-locks its render mode at
+                                // v1.10.7: real command start — a new
+                                // command re-detects its render mode at
                                 // first screen ownership.
-                                self.capabilities.primary_screen_block_view_locked = false;
                                 self.reset_primary_screen_synchronized_frame();
                                 self.shell_markers.push(ShellMarker::CommandStart);
                                 // 133;B (preexec): if the editor submitted the
@@ -897,6 +912,7 @@ impl vte::Perform for Terminal {
                             self.snapshot_primary_screen_output();
                             self.capabilities.primary_screen_cursor_ops = 0;
                             self.capabilities.primary_screen_absolute_addressing = false;
+                            self.capabilities.primary_screen_relative_addressing_seen = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
                             let exit_code = if params.len() > 2 {

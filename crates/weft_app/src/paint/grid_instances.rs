@@ -19,11 +19,12 @@
 //! the builder itself does not depend on the glyph atlas.
 
 use crate::paint::primitives::{push_cell_instance, resolve_cell_color};
-use weft_core::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use weft_core::selection::SelectionHandler;
 
 #[cfg(test)]
 mod contrast_tests;
+mod style_tests;
 
 // ── Data structures ───────────────────────────────────────────────────
 
@@ -56,7 +57,8 @@ impl BgInstance {
 /// glyph's UV rect plus whether the glyph lives in the RGBA color atlas
 /// (v1.10.4 color emoji → fg.a=2.0 sentinel in the emitted instance).
 /// The `'a` lifetime lets callers pass closures borrowing the renderer.
-pub(crate) type ResolveUv<'a> = dyn Fn(char, Option<&str>) -> ([f32; 4], bool) + 'a;
+pub(crate) type ResolveUv<'a> =
+    dyn Fn(char, Option<&str>, crate::glyph::GlyphStyle) -> ([f32; 4], bool) + 'a;
 
 /// A glyph instance before UV resolution. The caller resolves UVs from
 /// the glyph atlas during serialization ([`GridInstanceBatch::push_row`]).
@@ -83,6 +85,8 @@ pub(crate) enum GlyphInstance {
         /// v1.6.0: full cluster string when `CellFlags::EXTRA` is set.
         /// `None` for single-scalar cells (the common case).
         cluster: Option<std::sync::Arc<str>>,
+        /// v1.10.12: SGR bold/italic style variant (drives the atlas face).
+        style: crate::glyph::GlyphStyle,
     },
     Decoration {
         dst: [f32; 4],
@@ -175,8 +179,9 @@ impl GridInstanceBatch {
                     ch,
                     fg,
                     cluster,
+                    style,
                 } => {
-                    let (uv, is_color) = resolve_uv(*ch, cluster.as_deref());
+                    let (uv, is_color) = resolve_uv(*ch, cluster.as_deref(), *style);
                     // fg.a = 2.0 sentinel (normal fg alpha ≤ 1.0): the shader
                     // detects color-atlas glyphs via `fg.a > 1.5` and samples
                     // color_atlas instead of tinting the mask with fg.
@@ -318,6 +323,8 @@ pub(crate) fn build_row_instances(
         // ── Final fg ───────────────────────────────────────────────
         // Cursor block: black text on cursor color. Cursor bar/underline:
         // cursor-colored text (matches existing single-stream behavior).
+        let explicit_terminal_color =
+            cell.fg != CellColor::Default || cell.flags.contains(CellFlags::REVERSE);
         let final_fg = if is_cursor {
             if cursor_style.is_block() {
                 [0.0, 0.0, 0.0, 1.0]
@@ -335,9 +342,13 @@ pub(crate) fn build_row_instances(
         // bg=rgb(15,15,15) — a subtle input-box edge). The contrast booster
         // read that as unreadable text and brightened it toward white,
         // turning the intended dim border into a glaring "white bar".
-        // Graphic glyphs are decoration, not text: their exact color is the
-        // app's design intent, and "readability" doesn't apply.
-        let final_fg = if !is_cursor && is_terminal_graphic_char(cell.character) {
+        // Graphic glyphs and explicit SGR/ANSI foregrounds are presentation
+        // owned by the terminal application. Preserve them exactly so its
+        // text hierarchy and subtle decorations survive; default/theme text
+        // still receives Weft's configured readability correction.
+        let final_fg = if !is_cursor
+            && (is_terminal_graphic_char(cell.character) || explicit_terminal_color)
+        {
             fg
         } else {
             final_fg
@@ -418,6 +429,8 @@ pub(crate) fn build_row_instances(
                 ch: cell.character,
                 fg: final_fg,
                 cluster,
+                // v1.10.12: bold/italic SGR styles select the atlas face.
+                style: crate::glyph::GlyphStyle::from_flags(cell.flags),
             });
         }
 
@@ -576,6 +589,7 @@ mod tests {
                 ch,
                 fg,
                 cluster: _,
+                style: _,
             } => {
                 assert_eq!(*ch, 'A');
                 assert_eq!(*fg, FG);
@@ -831,7 +845,9 @@ mod tests {
         let row = build_plain(&grid);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
+        let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+            ([0.1, 0.2, 0.3, 0.4], false)
+        };
         let ranges = batch.push_row(&row, &resolve_uv);
 
         // Bg stream: 8 floats per run.
@@ -854,7 +870,9 @@ mod tests {
         // so the shader routes the quad to the RGBA color texture. Normal
         // fg alpha is ≤ 1.0, so 2.0 is unambiguous (checked below).
         let mut batch = GridInstanceBatch::default();
-        let color_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], true);
+        let color_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+            ([0.1, 0.2, 0.3, 0.4], true)
+        };
         batch.push_row(&row, &color_uv);
         // Layout: origin(2) size(2) uv(4) fg(4) bg(4) → fg = floats[8..12].
         assert_eq!(&batch.glyph_stream[8..12], &[0.0, 0.0, 0.0, 2.0]);
@@ -863,7 +881,9 @@ mod tests {
 
         // Mask-atlas glyph: fg passes through untouched.
         let mut batch = GridInstanceBatch::default();
-        let mask_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
+        let mask_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+            ([0.1, 0.2, 0.3, 0.4], false)
+        };
         batch.push_row(&row, &mask_uv);
         assert_eq!(&batch.glyph_stream[8..12], &FG[..]);
     }
@@ -879,7 +899,9 @@ mod tests {
         let row_b = build_plain(&grid_b);
 
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.1, 0.2, 0.3, 0.4], false);
+        let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+            ([0.1, 0.2, 0.3, 0.4], false)
+        };
         let ranges_a = batch.push_row(&row_a, &resolve_uv);
         let ranges_b = batch.push_row(&row_b, &resolve_uv);
 
@@ -994,7 +1016,9 @@ mod tests {
         // Text glyphs must have bg = [0;4] (the bg stream paints bg).
         // Verified via batch serialization: floats [12..16) are the bg field.
         let mut batch = GridInstanceBatch::default();
-        let resolve_uv = |_ch: char, _cluster: Option<&str>| ([0.5, 0.5, 0.6, 0.6], false);
+        let resolve_uv = |_ch: char, _cluster: Option<&str>, _style: crate::glyph::GlyphStyle| {
+            ([0.5, 0.5, 0.6, 0.6], false)
+        };
         batch.push_row(&row_instances, &resolve_uv);
         let gs = &batch.glyph_stream;
         for chunk in gs.chunks(16) {

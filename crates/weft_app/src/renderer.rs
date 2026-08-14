@@ -282,6 +282,13 @@ impl MetalRenderer {
         if !terminal.show_block_view() {
             return None;
         }
+        // v1.10.12: during an alt-screen history peek the active grid is the
+        // TUI's alt grid, whose cursor is meaningless over the history BlockView
+        // overlay. Suppress the caret (and the preedit caret area it seeds) so
+        // nothing is drawn on top of the browsed history.
+        if terminal.is_alt_screen_active() {
+            return None;
+        }
         let tracked = terminal.primary_screen_cursor_snapshot_line();
         let line = tracked.unwrap_or_else(|| {
             crate::block_component::block_view_tui_cursor_line(

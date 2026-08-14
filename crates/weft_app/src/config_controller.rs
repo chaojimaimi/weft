@@ -80,11 +80,16 @@ pub(super) fn decide_reload(
 /// v1.5.0: must touch EVERY pane in EVERY tab, not just the active one.
 /// A profile switch that only recolors the focused pane leaves background
 /// panes with the old palette until the user focuses them — visibly wrong.
-pub(super) fn apply_palette_to_all_panes(tabs: &mut [Tab], palette: [weft_core::grid::Color; 256]) {
+pub(super) fn apply_palette_to_all_panes(
+    tabs: &mut [Tab],
+    palette: [weft_core::grid::Color; 256],
+    background: weft_core::grid::Color,
+) {
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
             if let Some(t) = pane.terminal.as_mut() {
                 t.set_palette(palette);
+                t.set_background_color(background);
             }
         }
     }
@@ -243,7 +248,7 @@ impl App {
         // v1.5.0: reseed palette on EVERY pane in EVERY tab, not just the
         // active one. A profile switch must recolor all panes so background
         // panes don't keep the old palette until the user focuses them.
-        apply_palette_to_all_panes(self.sessions.tabs_mut(), theme.palette);
+        apply_palette_to_all_panes(self.sessions.tabs_mut(), theme.palette, theme.background);
         // v1.0: sync preferred_dark_theme from the freshly loaded config.
         let cfg_name = &config.theme.name;
         if !cfg_name.contains("light") && !cfg_name.is_empty() {
@@ -544,7 +549,7 @@ mod tests {
         };
 
         let tabs: &mut [Tab] = &mut [tab0, tab1];
-        apply_palette_to_all_panes(tabs, new_palette);
+        apply_palette_to_all_panes(tabs, new_palette, weft_core::grid::Color::DEFAULT_BG);
 
         // Both tabs' panes must have the new palette.
         for (i, tab) in tabs.iter().enumerate() {
@@ -568,7 +573,7 @@ mod tests {
             b: 0,
             a: 0,
         }; 256];
-        apply_palette_to_all_panes(&mut [tab], palette);
+        apply_palette_to_all_panes(&mut [tab], palette, weft_core::grid::Color::DEFAULT_BG);
     }
 
     // ── apply_scrollback_to_all_panes ────────────────────────────────
@@ -614,7 +619,7 @@ mod tests {
             b: 0x56,
             a: 0xFF,
         };
-        apply_palette_to_all_panes(&mut tabs, palette);
+        apply_palette_to_all_panes(&mut tabs, palette, weft_core::grid::Color::DEFAULT_BG);
         apply_scrollback_to_all_panes(&mut tabs, 4321);
 
         for (tab_index, tab) in tabs.iter_mut().enumerate() {

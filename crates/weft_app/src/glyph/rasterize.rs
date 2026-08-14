@@ -92,6 +92,22 @@ impl GlyphAtlas {
     ///
     /// **Half-width (is_wide=false):** scale_x ≈ 1 (the monospace primary
     /// advances `cell_width == glyph_w`), unchanged.
+    /// v1.10.12-fix: skew for synthesized italic (families without a true
+    /// italic face, e.g. Fira Code). tan(≈11°) ≈ 0.2 — the classic
+    /// synthetic-oblique slope.
+    ///
+    /// Sign note (verified empirically 2026-08-10): the glyph bitmap this
+    /// produces is stored BOTTOM-UP (row 0 = visual bottom), and the atlas→quad
+    /// paint path V-flips it for display. With `m12 = +0.2` the on-screen lean
+    /// came out BACKWARD (top-left / bottom-right) — confirmed by an ASCII
+    /// probe of the rasterized 'l' and by the user's screenshot. Negating to
+    /// `m12 = -0.2` yields the correct FORWARD lean (top-right / bottom-left).
+    /// The `synthesized_italic_skews_forward` test guards this.
+    fn synthesize_italic_transform() -> Transform2F {
+        // row_major(m11, m12, m21, m22): x' = m11·x + m12·y.
+        Transform2F::row_major(1.0, -0.2, 0.0, 1.0, 0.0, 0.0)
+    }
+
     pub(super) fn glyph_transform(
         font: &Font,
         glyph_id: u32,
@@ -99,11 +115,12 @@ impl GlyphAtlas {
         glyph_w: u32,
         is_wide: bool,
         primary_descent_px: f32,
+        synthesize_italic: bool,
     ) -> Transform2F {
         let upem = font.metrics().units_per_em as f32;
         let descent_px = primary_descent_px;
 
-        if is_wide {
+        let base = if is_wide {
             // Center the glyph's natural advance inside the double-wide slot.
             let advance_px = font
                 .advance(glyph_id)
@@ -116,11 +133,17 @@ impl GlyphAtlas {
         } else {
             Transform2F::from_translation(Vector2F::new(0.0, descent_px))
                 * Transform2F::from_scale(Vector2F::new(1.0, -1.0))
+        };
+        if synthesize_italic {
+            base * Self::synthesize_italic_transform()
+        } else {
+            base
         }
     }
 
     /// Rasterize a single glyph into a pixel buffer.
     /// Returns the pixel data ready for upload to the atlas texture.
+    #[allow(clippy::too_many_arguments)] // font + slot geometry + style flags
     pub(super) fn rasterize_glyph(
         font: &Font,
         ch: char,
@@ -129,6 +152,7 @@ impl GlyphAtlas {
         cell_h: u32,
         is_wide: bool,
         primary_descent_px: f32,
+        synthesize_italic: bool,
     ) -> Vec<u8> {
         let glyph_size = Vector2I::new(glyph_w as i32, cell_h as i32);
 
@@ -153,6 +177,7 @@ impl GlyphAtlas {
                 glyph_w,
                 is_wide,
                 primary_descent_px,
+                synthesize_italic,
             );
 
             let result = font.rasterize_glyph(
@@ -219,6 +244,7 @@ impl GlyphAtlas {
         cell_w: u32,
         cell_h: u32,
         is_wide: bool,
+        synthesize_italic: bool,
         atlas_pixels: &mut [u8],
         atlas_w: u32,
         atlas_h: u32,
@@ -254,6 +280,7 @@ impl GlyphAtlas {
             cell_h,
             is_wide,
             primary_descent_px,
+            synthesize_italic,
         );
         for y in 0..cell_h {
             for x in 0..glyph_w {

@@ -97,6 +97,8 @@ impl Tab {
         let changed = self.terminal.as_mut().is_some_and(|terminal| {
             let changed = terminal.primary_history_view();
             terminal.set_primary_history_view(false);
+            // v1.10.12: also leave any alt-screen history peek.
+            terminal.set_alt_screen_history_peek(false);
             changed
         });
         if changed {
@@ -138,6 +140,11 @@ impl Tab {
             let browsing = terminal.primary_screen_app_active() && detached;
             let changed = terminal.primary_history_view() != browsing;
             terminal.set_primary_history_view(browsing);
+            // v1.10.12: scrolling back to the bottom also exits the alt-screen
+            // history peek, returning the viewport to the live TUI grid.
+            if !detached && terminal.is_alt_screen_history_peek() {
+                terminal.set_alt_screen_history_peek(false);
+            }
             changed
         } else {
             false

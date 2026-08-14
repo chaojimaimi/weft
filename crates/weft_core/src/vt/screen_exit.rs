@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 
 mod freeze;
 mod ownership;
+mod tail;
+
+use tail::{merge_primary_screen_interrupt_tail, space_primary_screen_exit_tail};
 
 pub(in crate::vt) use ownership::PrimaryScreenOwnership;
 
@@ -156,6 +159,9 @@ impl Terminal {
             // full-viewport repainter (Claude Code) that needs the live
             // grid; relative-only TUIs (openclaw) keep the BlockView.
             self.capabilities.primary_screen_absolute_addressing |= absolute;
+            // v1.10.12: relative moves mark a sparse repainter — it paints
+            // incrementally, so row-boundary hiding must stay off.
+            self.capabilities.primary_screen_relative_addressing_seen |= !absolute;
             if self.primary_screen_app_active() {
                 self.begin_primary_screen_output_capture();
             }
@@ -298,19 +304,8 @@ impl Terminal {
     }
 
     pub(super) fn begin_primary_screen_output_capture(&mut self) {
-        let was_owned = self.block_tracker.screen_document_start().is_some();
         self.block_tracker
             .begin_screen_owned_output(self.capabilities.primary_screen_document_candidate);
-        // v1.10.7: first screen ownership of this command locks the render
-        // mode. Sparse repainters (pi/openclaw) detected with relative-only
-        // addressing keep the BlockView for the whole command, even when a
-        // later repaint issues a full-viewport CUP (which would otherwise
-        // flip the layout to the live grid mid-task and hide the history
-        // blocks). Full-viewport CUP TUIs (Claude Code) lock to the grid.
-        if !was_owned && self.block_tracker.screen_document_start().is_some() {
-            self.capabilities.primary_screen_block_view_locked =
-                !self.capabilities.primary_screen_absolute_addressing;
-        }
     }
 
     fn primary_screen_document_snapshot(
@@ -425,13 +420,30 @@ impl Terminal {
         }
     }
 
+    /// v1.10.12-fix: a primary-screen TUI (omp/pi/openclaw) owns the screen
+    /// for the whole command — while it runs, the live grid IS its interface
+    /// (full-screen repaint). The BlockView (document list) must NOT replace
+    /// the live UI, otherwise the TUI renders as a truncated document block
+    /// (half-empty screen) and scrolling is bounded by the captured document
+    /// length instead of the screen + scrollback. Only explicit history
+    /// browsing (`primary_history_view`) switches to the BlockView snapshot.
+    /// `screen_owned_tui_active()` is stable across transient `cursor_ops`
+    /// resets (nested 133 markers), so no render-mode lock is needed.
     pub fn show_block_view(&self) -> bool {
         self.block_tracker.bootstrap_ready()
-            && !self.capabilities.alt_active
-            && !self.primary_screen_exit_pending()
-            && (!self.primary_screen_app_active()
-                || self.capabilities.primary_history_view
-                || self.capabilities.primary_screen_block_view_locked)
+            && (self.capabilities.alt_screen_history_peek
+                || (!self.capabilities.alt_active
+                    && (self.capabilities.primary_history_view
+                        || (!self.primary_screen_exit_pending()
+                            && !self.screen_owned_tui_active()
+                            && !self.primary_screen_app_active()))))
+    }
+
+    /// v1.10.12-fix: whether a primary-screen TUI currently owns the screen
+    /// (document capture started and not yet settled). While true, the live
+    /// grid renders the TUI's own full-screen output.
+    fn screen_owned_tui_active(&self) -> bool {
+        self.block_tracker.screen_document_start().is_some()
     }
 
     pub fn primary_screen_exit_pending(&self) -> bool {
@@ -457,7 +469,11 @@ impl Terminal {
         if self.capabilities.alt_active
             || !owns_live_view
             || self.grid.scroll_offset > 0
-            || self.capabilities.primary_screen_block_view_locked
+            // v1.10.12-fix: only pure full-viewport CUP TUIs (claude code)
+            // hide the shell rows above their document boundary. A sparse
+            // repainter (omp/pi) paints incrementally — hiding rows before
+            // `document_start` would clip its output.
+            || self.capabilities.primary_screen_relative_addressing_seen
         {
             return None;
         }
@@ -492,7 +508,9 @@ impl Terminal {
         if self.capabilities.alt_active
             || !owns_live_view
             || self.grid.scroll_offset > 0
-            || self.capabilities.primary_screen_block_view_locked
+            // v1.10.12-fix: sparse repainters never apply the ownership mask
+            // (their partial row-touch pattern would hide the rest of the UI).
+            || self.capabilities.primary_screen_relative_addressing_seen
         {
             return None;
         }
@@ -504,6 +522,20 @@ impl Terminal {
 
     pub fn primary_history_view(&self) -> bool {
         self.capabilities.primary_history_view
+    }
+
+    /// v1.10.12: alt-screen history peek — true while the user is browsing the
+    /// terminal's history BlockView over an alt-screen TUI (omp/less/man).
+    pub fn is_alt_screen_history_peek(&self) -> bool {
+        self.capabilities.alt_screen_history_peek
+    }
+
+    /// v1.10.12: enter/exit the alt-screen history peek. Entering makes
+    /// `show_block_view()` true (BlockView overlays the TUI); exiting restores
+    /// the live alt grid. Does NOT touch `grid.scroll_offset` or primary-screen
+    /// snapshots — block positioning uses the pane's `block_scroll_anchor`.
+    pub fn set_alt_screen_history_peek(&mut self, on: bool) {
+        self.capabilities.alt_screen_history_peek = on;
     }
 
     /// v1.10.6: the cursor's line index in the most recent primary-screen
@@ -618,7 +650,7 @@ impl Terminal {
             let (text, styled) = merge_primary_screen_interrupt_tail(
                 capture.frozen_text.clone(),
                 capture.frozen_styled.clone(),
-                capture.tail.as_str(),
+                &capture.tail,
             );
             self.block_tracker.replace_screen_snapshot(&text, styled);
             return;
@@ -696,7 +728,6 @@ impl Terminal {
         // 133;B settle; nested-marker paths never settle, so the lock
         // survives them). The next command re-detects and re-locks at its
         // first screen ownership.
-        self.capabilities.primary_screen_block_view_locked = false;
         self.capabilities.primary_screen_interrupt_capture = None;
         // A killed TUI is not guaranteed to emit DEC mouse-mode resets. Do
         // not let stale reporting state turn later shell clicks into literal
@@ -718,138 +749,14 @@ impl Terminal {
     }
 }
 
-fn merge_primary_screen_interrupt_tail(
-    frozen_text: String,
-    frozen_styled: StyledOutput,
-    tail: &str,
-) -> (String, StyledOutput) {
-    let tail = semantic_exit_tail(tail).trim_matches('\n');
-    if tail.is_empty() {
-        return (frozen_text, frozen_styled);
-    }
-    let merged = format!("{}\n\n{}", frozen_text.trim_end_matches('\n'), tail);
-    space_primary_screen_exit_tail(merged, frozen_styled)
-}
-
-fn semantic_exit_tail(tail: &str) -> &str {
-    let explicit = ["Press Ctrl-C again to exit", "Resume this session with:"]
-        .into_iter()
-        .filter_map(|marker| line_marker_start(tail, marker))
-        .min();
-    let session_card = tail
-        .match_indices("Session")
-        .filter(|(start, _)| *start == 0 || tail.as_bytes().get(start - 1) == Some(&b'\n'))
-        .find_map(|(start, _)| {
-            tail[start..]
-                .lines()
-                .skip(1)
-                .take(3)
-                .any(|line| line.trim_start().starts_with("Continue"))
-                .then_some(start)
-        });
-    explicit
-        .into_iter()
-        .chain(session_card)
-        .min()
-        .map_or(tail, |start| &tail[start..])
-}
-
-fn line_marker_start(text: &str, marker: &str) -> Option<usize> {
-    text.match_indices(marker)
-        .map(|(start, _)| start)
-        .find(|&start| start == 0 || text.as_bytes().get(start - 1) == Some(&b'\n'))
-}
-
 fn viewport_row_for_document_start(start: u64, viewport_origin: u64, rows: usize) -> usize {
     start.saturating_sub(viewport_origin).min(rows as u64) as usize
-}
-
-fn space_primary_screen_exit_tail(
-    text: String,
-    mut styled: StyledOutput,
-) -> (String, StyledOutput) {
-    if !text.contains("Press Ctrl-C again to exit") && !text.contains("Resume this session with:") {
-        return (text, styled);
-    }
-    let lines: Vec<&str> = text.split('\n').collect();
-    let insert_before: Vec<usize> = (1..lines.len())
-        .filter(|&index| {
-            let line = lines[index].trim();
-            let semantic_tail =
-                line == "Press Ctrl-C again to exit" || line == "Resume this session with:";
-            semantic_tail && !lines[index - 1].trim().is_empty()
-        })
-        .collect();
-    if insert_before.is_empty() {
-        drop(lines);
-        return (text, styled);
-    }
-
-    let mut spaced = Vec::with_capacity(lines.len() + insert_before.len());
-    for (index, line) in lines.into_iter().enumerate() {
-        if insert_before.binary_search(&index).is_ok() {
-            spaced.push("");
-        }
-        spaced.push(line);
-    }
-    for line in &mut styled.lines {
-        let original = line.line as usize;
-        let shift = insert_before.partition_point(|&index| index <= original);
-        line.line = line.line.saturating_add(shift as u32);
-    }
-    (spaced.join("\n"), styled)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::StyledLine;
     use crate::vt::ScreenOwner;
-
-    #[test]
-    fn exit_tail_spacing_shifts_parallel_style_line_indices() {
-        let styled = StyledOutput {
-            lines: (0..4)
-                .map(|line| StyledLine {
-                    line,
-                    foregrounds: Vec::new(),
-                    backgrounds: Vec::new(),
-                    links: Vec::new(),
-                    attributes: Vec::new(),
-                })
-                .collect(),
-        };
-        let (text, styled) = space_primary_screen_exit_tail(
-            "answer\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume id"
-                .to_string(),
-            styled,
-        );
-
-        assert_eq!(
-            text,
-            "answer\n\nPress Ctrl-C again to exit\n\nResume this session with:\nclaude --resume id"
-        );
-        assert_eq!(
-            styled
-                .lines
-                .iter()
-                .map(|line| line.line)
-                .collect::<Vec<_>>(),
-            [0, 2, 4, 5]
-        );
-    }
-
-    #[test]
-    fn semantic_tail_discards_repainted_banners_for_claude_and_opencode() {
-        assert_eq!(
-            semantic_exit_tail("repainted answer\nPress Ctrl-C again to exit\nResume this session with:\nclaude --resume id"),
-            "Press Ctrl-C again to exit\nResume this session with:\nclaude --resume id"
-        );
-        assert_eq!(
-            semantic_exit_tail("opencode banner\nSession   project\nContinue  opencode -s id"),
-            "Session   project\nContinue  opencode -s id"
-        );
-    }
 
     #[test]
     fn document_start_maps_to_a_clamped_viewport_row() {
@@ -921,20 +828,18 @@ mod tests {
             "DEC 2026 synchronized output must count as TUI evidence"
         );
         assert!(
-            t.show_block_view(),
-            "DEC 2026 TUI (non-absolute) stays in BlockView"
+            !t.show_block_view(),
+            "a detected TUI owns the screen — the live grid renders it"
         );
     }
 
     #[test]
-    fn chr_input_line_redraw_keeps_block_view() {
+    fn chr_input_line_redraw_uses_live_grid() {
         // v1.10.6: pi (coding-agent CLI) uses CHR (horizontal-only) for its
         // input-line redraw + DEC 2026 sync output. CHR counts toward TUI
-        // detection but NOT toward absolute addressing — pi stays in the
-        // BlockView (bottom-aligned live block + history blocks), matching
-        // the Warp-style layout the user expects. IME uses the precisely
-        // tracked cursor snapshot line (v1.10.6) + steady caret + preedit
-        // dedup so composition works in the BlockView.
+        // detection. v1.10.12: a screen-owned TUI renders in the LIVE GRID
+        // (full-screen, low-latency) — the BlockView only appears when the
+        // user scrolls into history browsing.
         let mut t = Terminal::new(5, 20);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
         t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
@@ -943,23 +848,29 @@ mod tests {
         t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
         assert!(t.primary_screen_app_active(), "TUI detected (>= 2 ops)");
         assert!(
-            t.show_block_view(),
-            "non-absolute TUI stays in BlockView (bottom-aligned, history blocks)"
+            !t.show_block_view(),
+            "screen-owned TUI renders in the live grid"
         );
     }
 
     #[test]
-    fn relative_addressing_tui_keeps_block_view() {
+    fn relative_addressing_tui_uses_live_grid() {
         // openclaw/pi pattern — relative cursor moves only (A/B/D, CHR).
-        // v1.10.6 (final direction): non-absolute TUIs stay in the
-        // BlockView (bottom-aligned live block + history blocks), the
-        // Warp-style layout the user expects. Only full-viewport CUP
-        // TUIs (claude code) switch to the live grid.
+        // v1.10.12: a screen-owned TUI (any addressing style) renders in
+        // the live grid; the BlockView appears only while history browsing.
         let mut t = Terminal::new(5, 20);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
         t.process("\x1b[999D\x1b[915A".as_bytes());
         assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
-        assert!(t.show_block_view(), "non-absolute TUI stays in BlockView");
+        assert!(
+            !t.show_block_view(),
+            "screen-owned TUI renders in the live grid"
+        );
+        // History browsing switches to the BlockView document snapshot.
+        t.set_primary_history_view(true);
+        assert!(t.show_block_view(), "history browsing uses the BlockView");
+        t.set_primary_history_view(false);
+        assert!(!t.show_block_view());
     }
 
     #[test]
@@ -990,12 +901,12 @@ mod tests {
         t.settle_primary_screen_exit();
         t.process(b"sh\x1b]133;B\x07\x1b]133;C\x07\x1b[2A\x1b[3B");
         assert!(t.primary_screen_app_active());
-        // v1.10.6 (final direction): the flag cleared → the relative-only
-        // move sequence does NOT count as absolute, so the TUI keeps the
-        // BlockView (only CUP/VPA-driven full repaints switch to the grid).
+        // v1.10.12: the flag cleared → the relative-only move sequence
+        // does not count as absolute, but the screen-owned TUI still
+        // renders in the live grid.
         assert!(
-            t.show_block_view(),
-            "absolute flag cleared → relative-only TUI keeps BlockView"
+            !t.show_block_view(),
+            "absolute flag cleared → relative-only TUI still uses the live grid"
         );
     }
 
@@ -1010,7 +921,7 @@ mod tests {
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
         t.process("\x1b[999D\x1b[915A".as_bytes());
         assert!(t.primary_screen_app_active());
-        assert!(t.show_block_view(), "non-absolute TUI stays in BlockView");
+        assert!(!t.show_block_view(), "screen-owned TUI uses the live grid");
         assert!(
             t.block_tracker().screen_document_start().is_some(),
             "cursor addressing must begin screen ownership"
@@ -1080,80 +991,120 @@ mod tests {
     }
 
     #[test]
-    fn nested_run_starting_with_a_keeps_the_block_view_lock() {
-        // v1.10.7 (reviewer HIGH): the FIRST marker of a nested run can be
-        // `133;A` with NO pending exit (pi's inner zsh prompt before any
-        // internal command completed). The old defer-branch unlock released
-        // the render-mode lock there, so the next CUP repaint flipped the
-        // session to the live grid mid-task. The lock must survive until the
-        // REAL settle.
+    fn nested_run_starting_with_a_stays_in_live_grid() {
+        // v1.10.12: the FIRST marker of a nested run can be `133;A` with NO
+        // pending exit (omp/pi's inner zsh prompt before any internal command
+        // completed). Screen ownership keeps the live grid stable across
+        // nested markers and CUP repaints — no render-mode lock required.
         let mut t = Terminal::new(8, 40);
         t.process(b"\x1b]133;A\x07pi\x1b]133;B\x07\x1b]133;C\x07");
         t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
         t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
         assert!(t.primary_screen_app_active());
-        assert!(t.show_block_view(), "relative-detected TUI locks BlockView");
+        assert!(!t.show_block_view(), "screen-owned TUI uses the live grid");
 
         // Nested run #1: A is the FIRST marker (no pending exit yet).
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
         assert!(
-            t.show_block_view(),
-            "a nested 133;A with no pending exit must not unlock BlockView"
+            !t.show_block_view(),
+            "nested markers must not flip the render mode"
         );
         assert!(t.block_tracker().phase() == ShellPhase::CommandExecuting);
         t.process("\x1b[2J\x1b[Hworking...".as_bytes());
         assert!(
-            t.show_block_view(),
-            "CUP repaint after a nested A-start must keep BlockView"
+            !t.show_block_view(),
+            "CUP repaint inside a screen-owned TUI must keep the live grid"
         );
 
         // Nested run #2: D-then-A pair.
         t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
-        assert!(t.show_block_view());
+        assert!(!t.show_block_view());
 
-        // Real settle (idle timer path) releases the lock for the next command.
+        // History browsing switches to the BlockView snapshot.
+        t.set_primary_history_view(true);
+        assert!(t.show_block_view(), "history browsing uses the BlockView");
+
+        // Real settle (idle timer path) ends the screen-owned session.
         t.process(b"\x1b]133;D;0\x07");
         assert!(t.settle_primary_screen_exit());
-        assert!(!t.capabilities.primary_screen_block_view_locked);
+    }
+
+    // v1.10.12 regression: while a nested 133;D defers the exit (pending
+    // settle window), history browsing must still show the BlockView —
+    // otherwise scrolling during a nested command lands on the empty grid
+    // scrollback ("cannot scroll through the history").
+    #[test]
+    fn history_browsing_works_while_exit_is_pending() {
+        let mut t = Terminal::new(8, 40);
+        t.process(b"\x1b]133;A\x07omp\x1b]133;B\x07\x1b]133;C\x07");
+        t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
+        t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+        assert!(t.primary_screen_app_active());
+        assert!(!t.show_block_view(), "screen-owned TUI uses the live grid");
+
+        // Nested command finishes → pending exit (settle window open).
+        t.process(b"\x1b]133;D;0\x07");
+        assert!(
+            t.primary_screen_exit_pending(),
+            "nested D defers the exit into the settle window"
+        );
+
+        // Scrolling into history must still switch to the BlockView.
+        t.set_primary_history_view(true);
+        assert!(
+            t.show_block_view(),
+            "history browsing must work even while an exit is pending"
+        );
+
+        t.set_primary_history_view(false);
+        assert!(
+            !t.show_block_view(),
+            "back to the live grid when not browsing"
+        );
+        // The pending exit still settles normally afterwards.
+        assert!(t.settle_primary_screen_exit());
     }
 
     #[test]
-    fn sparse_repainter_locks_block_view_through_later_cup_repaints() {
-        // v1.10.7: a sparse repainter (pi) detected with relative-only
-        // addressing locks the BlockView for the whole command. Its
+    fn sparse_repainter_stays_in_live_grid_through_cup_repaints() {
+        // v1.10.12: a sparse repainter (omp/pi) detected with relative-only
+        // addressing renders in the live grid for the whole command. Its
         // occasional full-viewport CUP repaint (task start, layout change)
-        // must NOT flip the renderer to the live grid — that flip caused
-        // per-task layout flicker and hid the Warp-style history blocks.
+        // must NOT flip the renderer to the BlockView — that flip truncated
+        // the UI and blocked history scrolling.
         let mut t = Terminal::new(8, 40);
         t.process(b"\x1b]133;A\x07pi\x1b]133;B\x07\x1b]133;C\x07");
         t.process("\x1b[3A\x1b[1G\x1b[?25l".as_bytes());
         t.process("\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
         assert!(t.primary_screen_app_active(), "TUI detected");
-        assert!(
-            t.show_block_view(),
-            "relative-detected TUI locks the BlockView"
-        );
+        assert!(!t.show_block_view(), "screen-owned TUI uses the live grid");
 
         // Task start: pi clears the viewport and repaints (CUP addressing).
         t.process("\x1b[2J\x1b[Hworking...\x1b[2;1Hprogress".as_bytes());
         assert!(t.primary_screen_app_active());
         assert!(
-            t.show_block_view(),
-            "a CUP repaint inside a locked session must keep the BlockView"
+            !t.show_block_view(),
+            "a CUP repaint inside a screen-owned session must keep the live grid"
         );
         assert_eq!(
             t.primary_screen_visible_row_start(),
             None,
-            "no row hiding for BlockView-locked TUIs"
+            "no row hiding for sparse repainters"
         );
         assert_eq!(t.primary_screen_viewport_ownership(), None);
 
-        // Nested marker bursts must not unlock the render mode.
+        // Nested marker bursts must not flip the render mode.
         t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
         assert!(
-            t.show_block_view(),
-            "nested markers must not unlock the BlockView"
+            !t.show_block_view(),
+            "nested markers must not flip the live grid"
         );
+
+        // History browsing switches to the BlockView snapshot.
+        t.set_primary_history_view(true);
+        assert!(t.show_block_view(), "history browsing uses the BlockView");
+        t.set_primary_history_view(false);
+        assert!(!t.show_block_view());
 
         // Real exit settles the block; the NEXT command re-detects its mode.
         t.process(b"\x1b]133;D;0\x07");

@@ -94,6 +94,53 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
 }
 
 #[test]
+fn alt_screen_history_peek_overlays_block_view_during_alt() {
+    let mut t = term();
+    // Bootstrap the block tracker so show_block_view() can ever be true.
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    assert!(t.show_block_view());
+
+    // Entering the alt screen normally hides the BlockView (the TUI owns the
+    // viewport).
+    t.process(b"\x1b[?1049h");
+    assert!(t.is_alt_screen_active());
+    assert!(
+        !t.show_block_view(),
+        "alt screen hides the block view by default"
+    );
+
+    // Enabling the peek must overlay the BlockView over the TUI.
+    t.set_alt_screen_history_peek(true);
+    assert!(t.is_alt_screen_history_peek());
+    assert!(
+        t.show_block_view(),
+        "peek must make the block view render over the alt-screen TUI"
+    );
+
+    // Disabling the peek returns to the live alt grid.
+    t.set_alt_screen_history_peek(false);
+    assert!(!t.show_block_view());
+}
+
+#[test]
+fn alt_screen_exit_clears_history_peek() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"\x1b[?1049h");
+    t.set_alt_screen_history_peek(true);
+    assert!(t.is_alt_screen_history_peek());
+
+    // Exiting the alt screen must clear the peek flag so it does not leak into
+    // the restored primary-screen view (which would wrongly keep BlockView on).
+    t.process(b"\x1b[?1049l");
+    assert!(!t.is_alt_screen_active());
+    assert!(
+        !t.is_alt_screen_history_peek(),
+        "peek must clear when leaving the alt screen"
+    );
+}
+
+#[test]
 fn primary_screen_history_view_snapshot_refresh_is_explicitly_coalesced() {
     let mut terminal = Terminal::new(5, 48);
     terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
@@ -1960,6 +2007,41 @@ fn osc_set_title() {
     let mut t = term();
     t.process(b"\x1b]0;mytitle\x07");
     assert_eq!(t.title(), "mytitle");
+}
+
+// v1.10.12: OSC 11 background-color query. TUIs (omp/pi/opencode) probe it
+// at startup to pick their theme; the response carries the app theme's
+// background in xterm `rgb:RR/GG/BB` form.
+#[test]
+fn osc11_background_query_answers_theme_background() {
+    let mut t = term();
+    t.set_background_color(Color::rgb(0x12, 0x34, 0x56));
+    t.process(b"\x1b]11;?\x07");
+    assert_eq!(t.take_response(), b"\x1b]11;rgb:12/34/56\x1b\\");
+}
+
+#[test]
+fn osc11_background_default_is_darkish() {
+    let mut t = term();
+    t.process(b"\x1b]11;?\x07");
+    let resp = t.take_response();
+    let s = String::from_utf8_lossy(&resp);
+    assert!(
+        s.starts_with("\x1b]11;rgb:") && s.ends_with("\x1b\\"),
+        "malformed OSC 11 response: {s}"
+    );
+}
+
+// A set request (`OSC 11;rgb:..`) must not be answered — xterm semantics.
+#[test]
+fn osc11_set_request_is_not_answered() {
+    let mut t = term();
+    t.process(b"\x1b]11;rgb:ff/00/00\x07");
+    assert_eq!(
+        t.take_response(),
+        b"",
+        "set request must not produce a reply"
+    );
 }
 
 #[test]

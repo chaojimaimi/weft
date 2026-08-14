@@ -345,6 +345,7 @@ impl App {
         {
             if let Some(r) = &self.renderer {
                 t.set_palette(r.theme().palette);
+                t.set_background_color(r.theme().background);
             }
         }
 

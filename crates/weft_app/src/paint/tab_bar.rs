@@ -74,6 +74,17 @@ pub struct TabBarDrawState {
     /// Right edge available to tab items. The chrome background still spans
     /// the full window; vertical splits reserve the right pane above itself.
     pub layout_right: f32,
+    /// v1.11.13: Index of the tab being dragged (ghost drag), if any. That
+    /// tab is not drawn in its slot; every other tab slides by one slot to
+    /// open the gap at `drag_insert_index`.
+    pub drag_index: Option<usize>,
+    /// v1.11.13: Left edge (physical px) of the ghost pill following the
+    /// pointer (`pointer_x - grab_offset`, clamped into the visible strip).
+    /// `Some` only while a drag is active.
+    pub drag_ghost_x: Option<f32>,
+    /// v1.11.13: Gap slot the pointer currently targets (0..=n-1). Drives
+    /// the slide of the non-dragged tabs via `layout::render_slot`.
+    pub drag_insert_index: Option<usize>,
 }
 
 impl MetalRenderer {
@@ -163,9 +174,25 @@ impl MetalRenderer {
         let y0 = 0.0f32;
         let y1 = bar_h;
 
+        // v1.11.13: ghost drag — the dragged tab leaves its slot (drawn as a
+        // floating pill after the loop) and every other tab slides by one
+        // slot to open the gap at `drag_insert_index`.
+        let drag_index = tab_bar.drag_index;
+        let drag_insert = tab_bar.drag_insert_index.unwrap_or(0);
+
         for i in 0..tab_bar.tab_count {
+            if drag_index == Some(i) {
+                continue; // Drawn as the ghost pill after the loop.
+            }
+            let slot = match drag_index {
+                Some(d) => match crate::layout::render_slot(i, d, drag_insert, tab_bar.tab_count) {
+                    Some(slot) => slot,
+                    None => i, // Defensive: out-of-range drag — draw in place.
+                },
+                None => i,
+            };
             // Apply scroll offset to x position.
-            let x0 = tabs_start + i as f32 * tab_w - scroll_offset;
+            let x0 = tabs_start + slot as f32 * tab_w - scroll_offset;
             let x1 = x0 + tab_w;
 
             // CPU-side cull: skip tabs entirely outside the visible region.
@@ -223,8 +250,10 @@ impl MetalRenderer {
                 );
             }
 
-            // Divider between tabs.
-            if i > 0 && x0 >= vis_left {
+            // Divider between tabs. Uses the display slot, not the data
+            // index: during a drag the leftmost displayed tab may be
+            // `i > 0` (gap open before it) and must not get a stray line.
+            if slot > 0 && x0 >= vis_left {
                 push_quad(
                     &mut vertices,
                     [draw_x0, y0, draw_x0 + 1.0, y1],
@@ -302,6 +331,60 @@ impl MetalRenderer {
 
             // Hit rect: close_rect registered only when cx is in view.
             // Hit regions now live in the TabBar Scene (tab_bar_component.rs).
+        }
+
+        // ── Ghost pill (v1.11.13) ──
+        // The dragged tab floats above the strip at the pointer's grip point:
+        // body lifted a few px with a soft shadow below and the accent
+        // underline, no × button, no divider. Drawn last so it composites
+        // above the slid tabs. The shadow quad is painted before the body
+        // (painter's order — the vertex pipeline has no depth buffer).
+        if let Some(di) = drag_index {
+            if di < tab_bar.tab_count {
+                if let Some(gx) = tab_bar.drag_ghost_x {
+                    let gw = tab_w;
+                    let gx0 = gx.clamp(vis_left, (vis_right - gw).max(vis_left));
+                    let lift = 4.0f32;
+                    let gy0 = -lift;
+                    let gy1 = bar_h - 2.0;
+                    let shadow = [0.0, 0.0, 0.0, 0.28];
+                    push_quad(
+                        &mut vertices,
+                        [gx0 + 2.0, gy1, gx0 + gw - 2.0, bar_h],
+                        [0.0; 4],
+                        [0.0; 4],
+                        shadow,
+                    );
+                    let ghost_bg = color_to_normalized(ui.raised);
+                    push_quad(
+                        &mut vertices,
+                        [gx0, gy0, gx0 + gw, gy1],
+                        [0.0; 4],
+                        [0.0; 4],
+                        ghost_bg,
+                    );
+                    push_quad(
+                        &mut vertices,
+                        [gx0, gy1 - 2.0, gx0 + gw, gy1],
+                        [0.0; 4],
+                        [0.0; 4],
+                        accent_hover,
+                    );
+                    if let Some(label) = tab_bar.labels.get(di) {
+                        let max_cols = ((gw - close_w - label_gap) / cw) as usize;
+                        let max_cols = max_cols.max(1).saturating_sub(1);
+                        let display = truncate_to_columns(label, max_cols);
+                        self.push_text(
+                            &mut vertices,
+                            gx0 + cw * 0.5,
+                            gy0 + (bar_h - ch) * 0.5,
+                            &display,
+                            fg,
+                            max_cols,
+                        );
+                    }
+                }
+            }
         }
 
         // Full cwd + command tooltip. The tab itself stays dense; hovering
