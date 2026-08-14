@@ -20,6 +20,9 @@ Thumbs.db
 # ZCode harness working directory
 .zcode/
 
+# OpenCode harness working directory
+.opencode/
+
 # Runtime log
 weft.log
 
