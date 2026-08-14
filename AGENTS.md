@@ -36,11 +36,11 @@ bug 修复**禁止凭猜直接改代码**。必须遵循 `superpowers:systematic
 - 新增/修改的 VT 行为（print/scroll/CSI）必须有回归测试
 - 测试命令：`cargo test --workspace`
 
-### 4. 文件规模：main.rs 不再膨胀
+### 4. 文件规模：模块化 + 行数治理
 
-- `main.rs` 已超 6600 行（远超 800 行硬上限），**禁止继续往里加新功能**
-- 新功能必须拆到独立模块（参考 `menu.rs`、`renderer.rs`、`tab.rs`）
-- `commit-gate.sh` 会检查暂存区 `.rs` 文件行数，超 800 行直接 block
+- `main.rs` 已完成拆分（2026-08 重构，6600+ → 490 行），只保留模块声明与启动编排，**禁止重新膨胀**
+- 新功能必须拆到独立模块（参考 `app/`、`paint/`、`glyph/`、`layout/`、`tab/`、`block_view/` 子模块）
+- `commit-gate.sh` 会检查暂存区 `.rs` 文件行数：超 800 行且不在 `scripts/architecture_allowlist.txt` 中直接 block；allowlist 变更需审计理由
 
 ### 5. 验证：未实测不算修复
 
@@ -56,7 +56,7 @@ bug 修复**禁止凭猜直接改代码**。必须遵循 `superpowers:systematic
 ### 大文件分析用 context-mode
 
 分析 >500 行的文件时，优先用 `ctx_execute_file`（sandbox 内运行代码分析，只返回摘要），而非 `Read` 整个文件。
-`main.rs` 6600+ 行直接 Read 会消耗大量上下文。
+当前大文件集中在 `vt/tests.rs`(3080)、`config/tests.rs`(2373)、`pane_layout.rs`(1867)、`paint/block_view.rs`(1189)、`mouse_controller.rs`(1159) 等，直接 Read 会消耗大量上下文。
 
 ### 命令绕行
 
@@ -67,22 +67,28 @@ bug 修复**禁止凭猜直接改代码**。必须遵循 `superpowers:systematic
 ```
 crates/
   weft_app/     — 主应用（窗口、事件循环、渲染器、菜单）
-    src/main.rs     — App 结构体 + 事件处理（6600+ 行，不再加功能）
-    src/renderer.rs — Metal GPU 渲染器
+    src/main.rs     — 模块声明 + 启动编排（490 行，禁止膨胀）
+    src/app/        — App 结构体 + Action
+    src/paint/      — Metal 绘制（block_view/ grid_cache/ grid_instances/ prompt/ 等）
+    src/glyph/      — 字形图集（atlas/ font/ rasterize/ style/ query/）
+    src/layout/     — 布局上下文（含 drag.rs 纯函数）
+    src/tab/        — Tab 管理（含 scroll.rs）
+    src/*controller — 事件控制器（mouse/ geometry/ redraw/ lifecycle/ …）
     src/menu.rs     — 原生 NSMenu 菜单栏（v1.1）
-    src/tab.rs      — Tab 管理
-    src/glyph.rs    — 字形图集
-    src/layout.rs   — 布局上下文
   weft_core/    — 核心（VT 解析、Grid、PTY、输入、配置）
-    src/vt.rs       — Terminal + vte::Perform
-    src/grid.rs     — Grid + Row + Cell
+    src/vt/         — Terminal + vte::Perform（perform.rs/ screen_exit/ osc.rs/ …）
+    src/grid/       — Grid + Row + Cell（snapshot/ scrollback/ …）
+    src/blocks/     — 命令块模型（output_capture/ continuation/ …）
     src/pty.rs      — forkpty + async read loop
-    src/input.rs    — 键盘/鼠标编码
-    src/config.rs   — Action enum + KeyBindings + Config
+    src/input/      — 键盘/鼠标编码
+    src/config/     — Action enum + KeyBindings + Config（多 profile/ 主题）
+    src/completion/ — 补全（排序/ 提供器）
+    src/selection/  — 选择模型（block_view 行快照）
 docs/
   PROGRESS.md       — 开发进度（每次改动后更新）
   ROADMAP.md        — 版本规划
   ARCHITECTURE.md   — 架构文档
+  FIX_*.md          — 每个 bug 修复的根因分析与实施方案
 ```
 
 ## 编码规范（项目专属）
