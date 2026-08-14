@@ -62,6 +62,10 @@ pub struct CompletionCandidate {
     pub source: CompletionSource,
     /// True for filesystem directories (Path source only).
     pub is_dir: bool,
+    /// Match-quality tier within the same source (lower sorts first).
+    /// Mirrors `crate::complete::Match::match_quality`: COMMON(0) >
+    /// PREFIX(1). Other sources keep the default 1.
+    pub match_quality: u8,
 }
 
 /// v1.7.2: A completion request. Replaces `CompleteCtx` for provider code.

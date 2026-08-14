@@ -51,7 +51,16 @@ pub struct Match {
     /// True when this is a filesystem directory (Path kind only). Used by the
     /// renderer to draw a 📁/📄 icon in the Warp-style completion popup.
     pub is_dir: bool,
+    /// Match-quality tier within the same source kind. Lower sorts first.
+    /// Command candidates: `COMMON` (0, high-frequency commands) outrank
+    /// `PREFIX` (1, ordinary prefix match) so `l` shows `ls` before
+    /// `lam`/languagesetup. Non-command sources keep the default 1.
+    pub match_quality: u8,
 }
+
+/// Quality tiers for command candidates (lower = higher priority).
+pub const MATCH_QUALITY_COMMON: u8 = 0;
+pub const MATCH_QUALITY_PREFIX: u8 = 1;
 
 impl Match {
     fn new(label: String, kind: MatchKind, insert: String) -> Self {
@@ -60,6 +69,7 @@ impl Match {
             kind,
             insert,
             is_dir: false,
+            match_quality: MATCH_QUALITY_PREFIX,
         }
     }
 }
@@ -96,11 +106,12 @@ pub fn complete(prefix: &str, ctx: &CompleteCtx, position: CompletePosition) -> 
     let mut seen = std::collections::HashSet::new();
     out.retain(|m| seen.insert(m.label.clone()));
 
-    // Rank by (kind priority, label), then cap.
+    // Rank by (kind priority, match quality, label), then cap.
     out.sort_by(|a, b| {
         a.kind
             .priority()
             .cmp(&b.kind.priority())
+            .then_with(|| a.match_quality.cmp(&b.match_quality))
             .then_with(|| a.label.cmp(&b.label))
     });
     out.truncate(MAX_RESULTS);
@@ -123,13 +134,29 @@ pub fn history_matches(prefix: &str, history: &[String]) -> Vec<Match> {
     out
 }
 
-/// `$PATH` executable prefix matches. Public so the v1.7.2
+/// High-frequency commands that should surface before alphabetically-earlier
+/// candidates when the prefix is short (e.g. `l` shows `ls` before
+/// `lam`/languagesetup). Keep this list small and general-purpose —
+/// it is a display-priority hint, not a filter.
+pub const COMMON_COMMANDS: &[&str] = &[
+    "brew", "cat", "cd", "chmod", "chown", "cp", "cargo", "curl", "docker", "find", "git", "grep",
+    "htop", "kill", "less", "ls", "make", "mkdir", "mv", "nano", "node", "npm", "ollama", "ping",
+    "pnpm", "python", "python3", "rm", "rsync", "scp", "sed", "ssh", "sudo", "tar", "top", "touch",
+    "vim", "wget", "which",
+];
+
+/// `$PATH` executable prefix matches, weighted so `COMMON_COMMANDS`
+/// outrank ordinary alphabetically-earlier candidates. Public so the v1.7.2
 /// `completion::providers` module can wrap the same logic.
 pub fn command_matches(prefix: &str, path_bins: &[String]) -> Vec<Match> {
     let mut out = Vec::new();
     for bin in path_bins {
         if bin.starts_with(prefix) && bin.len() > prefix.len() {
-            out.push(Match::new(bin.clone(), MatchKind::Command, bin.clone()));
+            let mut m = Match::new(bin.clone(), MatchKind::Command, bin.clone());
+            if COMMON_COMMANDS.contains(&bin.as_str()) {
+                m.match_quality = MATCH_QUALITY_COMMON;
+            }
+            out.push(m);
         }
     }
     out

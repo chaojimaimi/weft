@@ -477,7 +477,9 @@ impl InteractionState {
             last_mouse_y: 0.0,
             prompt_dragging: false,
             popup_width_scale: 0.6,
-            popup_max_rows: 8,
+            // B1: 16 rows (was 8) — short prefixes like "l" match 100+ commands;
+            // more visible rows make high-frequency commands findable.
+            popup_max_rows: 16,
             drag_state: None,
             scrollbar_drag: None,
             panel_scrollbar_drag: None,

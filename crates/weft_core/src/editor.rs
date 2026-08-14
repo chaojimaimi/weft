@@ -1027,7 +1027,7 @@ mod tests {
 
     // ── Tab completion ────────────────────────────────────────────────────
 
-    use crate::complete::{Match, MatchKind};
+    use crate::complete::{Match, MatchKind, MATCH_QUALITY_PREFIX};
 
     fn m(label: &str, insert: &str) -> Match {
         Match {
@@ -1035,6 +1035,7 @@ mod tests {
             kind: MatchKind::Command,
             insert: insert.into(),
             is_dir: false,
+            match_quality: MATCH_QUALITY_PREFIX,
         }
     }
 

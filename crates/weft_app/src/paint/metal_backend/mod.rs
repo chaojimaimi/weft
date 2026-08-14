@@ -243,7 +243,8 @@ impl MetalRenderer {
             opacity,
             hit_regions: Vec::new(),
             popup_width_scale: 0.6,
-            popup_max_rows: 8,
+            popup_max_rows: 16, // B1: see InteractionState::new
+
             context_menu_target: None,
             layout_ctx: None,
             find_state: None,

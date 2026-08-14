@@ -221,6 +221,7 @@ fn candidate_to_match(candidate: weft_core::completion::CompletionCandidate) -> 
         kind,
         insert: candidate.insert,
         is_dir: candidate.is_dir,
+        match_quality: candidate.match_quality,
     }
 }
 

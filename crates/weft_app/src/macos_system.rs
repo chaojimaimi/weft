@@ -269,18 +269,99 @@ fn extract_path_from_output(s: &str) -> Option<&str> {
     Some(path)
 }
 
+/// Resolve the user's login shell: `$SHELL` env → `dscl` user record →
+/// `/bin/zsh` fallback. GUI/Dock-launched processes usually have no
+/// `SHELL` variable, so the env-only lookup silently picked the fallback
+/// even when the real shell is bash/fish. `dscl . -read ... UserShell`
+/// reads the actual login shell from the directory service without touching
+/// any rc file. Best-effort: any failure returns `None`, letting the
+/// caller fall back.
+fn resolve_user_shell() -> Option<std::ffi::OsString> {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    if let Some(shell) = std::env::var_os("SHELL") {
+        if !shell.is_empty() {
+            return Some(shell);
+        }
+    }
+    // dscl . -read /Users/<user> UserShell  → "UserShell: /bin/zsh"
+    let user = std::env::var("USER").unwrap_or_default();
+    if user.is_empty() {
+        return None;
+    }
+    let mut child = Command::new("/usr/bin/dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "UserShell"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap — never leave a zombie
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    use std::io::Read;
+    let mut out = String::new();
+    if child.stdout.take()?.read_to_string(&mut out).is_err() {
+        let _ = child.wait();
+        return None;
+    }
+    let shell = out
+        .lines()
+        .find_map(|line| line.strip_prefix("UserShell:"))
+        .map(str::trim)
+        .filter(|s| s.starts_with('/'));
+    let shell = shell.map(std::ffi::OsString::from);
+    // Child already reaped by try_wait above; this wait is a no-op guard.
+    let _ = child.wait();
+    shell
+}
+
+/// Parse the `PATH="..."` assignment emitted by `/usr/libexec/path_helper -s`.
+/// macOS's path_helper reads `/etc/paths` + `/etc/paths.d/*` (Homebrew and
+/// other installers drop files there) and prints
+/// `PATH="/a:/b"; export PATH;`. Returns `None` when the quoted value is
+/// missing or fails the same sanity check as the login-PATH sentinels.
+fn extract_path_helper_path(s: &str) -> Option<&str> {
+    let start = s.find("PATH=\"")? + "PATH=\"".len();
+    let rest = &s[start..];
+    let end = rest.find('"')?;
+    let path = &rest[..end];
+    if path.is_empty() || !path.contains('/') {
+        return None;
+    }
+    Some(path)
+}
+
 /// 启动时解析用户登录 shell 的 `$PATH`(GUI/Dock 启动的 weft 进程 PATH 是
 /// macOS 默认四目录,不含 homebrew/`~/.local/bin`/nvm/cargo 等;这些由登录
-/// shell 的 .zprofile/.zshrc 添加)。失败/为空时回退到进程 env PATH。
+/// shell 的 .zprofile/.zshrc 添加)。失败/为空时回退到 path_helper 输出,
+/// 再回退到进程 env PATH(见 `scan_path_bins`)。
 ///
-/// 不继承 stdin/stderr;500ms deadline 后强杀子进程,防止病态 .zshrc
-/// (阻塞 daemon、卡住的 eval)拖死主线程上的启动扫描。
+/// 不继承 stdin/stderr;1500ms deadline 后强杀子进程,防止病态 .zshrc
+/// (阻塞 daemon、卡住的 eval)拖死主线程上的启动扫描。shell 经
+/// `resolve_user_shell` 探测(dscl),不再假设 `$SHELL` 存在。
 fn resolve_login_path() -> Option<std::ffi::OsString> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let shell = resolve_user_shell().unwrap_or_else(|| "/bin/zsh".into());
     // -l 登录(source .zprofile/.bash_profile)+ -i 交互(source .zshrc/.bashrc)
     // + -c 跑命令。SOH/STX 哨兵包裹 PATH,屏蔽 rc 文件的 stdout 污染;
     // printf 不带尾换行,避免解析噪音。Rust 侧 \\x01 是字面反斜杠+x01,
@@ -292,7 +373,7 @@ fn resolve_login_path() -> Option<std::ffi::OsString> {
         .stdout(Stdio::piped())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + Duration::from_millis(1500);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -334,24 +415,98 @@ fn is_executable_file(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Scan `$PATH` for executable names (files, not dirs). Best-effort: unreadable
-/// / missing dirs are skipped. Deduped + sorted. Cached once at startup.
+/// Collect executable names from *multiple* PATH sources and take their
+/// union (BTreeSet dedupes + sorts). Sources, in order:
+///
+/// 1. login-shell PATH (`resolve_login_path`, via `resolve_user_shell`)
+/// 2. `/usr/libexec/path_helper -s` output (reads /etc/paths + /etc/paths.d,
+///    where Homebrew/Docker installers register their bin dirs)
+/// 3. process env PATH (macOS default four dirs for GUI-launched apps)
+///
+/// Best-effort: unreadable/missing dirs are skipped, failing sources are
+/// ignored. Cached once at startup by the caller.
 pub(super) fn scan_path_bins() -> Vec<String> {
     let mut bins = std::collections::BTreeSet::new();
-    let path = resolve_login_path().or_else(|| std::env::var_os("PATH"));
-    let Some(path) = path else { return Vec::new() };
-    for dir in std::env::split_paths(&path) {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if is_executable_file(&entry.path()) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        bins.insert(name.to_string());
+    for path in path_sources() {
+        for dir in std::env::split_paths(&path) {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if is_executable_file(&entry.path()) {
+                        if let Some(name) = entry.file_name().to_str() {
+                            bins.insert(name.to_string());
+                        }
                     }
                 }
             }
         }
     }
     bins.into_iter().collect()
+}
+
+/// The ordered list of PATH strings to scan, deduped (a dir appearing in
+/// several sources is only scanned once — split_paths cost is negligible,
+/// the BTreeSet dedupe in `scan_path_bins` covers names).
+fn path_sources() -> Vec<std::ffi::OsString> {
+    let mut sources: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(path) = resolve_login_path() {
+        sources.push(path);
+    }
+    if let Some(path) = path_helper_path() {
+        sources.push(path);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        sources.push(path);
+    }
+    sources
+}
+
+/// Run `/usr/libexec/path_helper -s` and parse the emitted `PATH="..."`.
+/// path_helper is macOS-native, reads /etc/paths.d (Homebrew writes
+/// `/etc/paths.d/homebrew`), has no side effects and is fast (<10ms).
+/// Returns `None` on spawn/parse failure so the caller falls through to
+/// the next source.
+fn path_helper_path() -> Option<std::ffi::OsString> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new("/usr/libexec/path_helper")
+        .args(["-s"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    // path_helper is normally <10ms, but a wedged /etc/paths.d entry must
+    // not block the startup scan forever — same deadline pattern as
+    // resolve_login_path (shorter: no rc files involved).
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap — never leave a zombie
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    if child.stdout.take()?.read_to_string(&mut out).is_err() {
+        let _ = child.wait();
+        return None;
+    }
+    let path = extract_path_helper_path(&out).map(std::ffi::OsString::from);
+    // Child already reaped by try_wait above; this wait is a no-op guard.
+    let _ = child.wait();
+    path
 }
 
 /// Load the weft window icon from the embedded 256×256 PNG. Returns `None`
@@ -455,8 +610,8 @@ pub(super) unsafe fn set_dock_icon(variant: weft_core::config::LogoVariant) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_path_from_output, is_executable_file, logo_image_bytes, scan_path_bins,
-        should_use_bundle_dock_icon,
+        extract_path_from_output, extract_path_helper_path, is_executable_file, logo_image_bytes,
+        path_sources, resolve_user_shell, scan_path_bins, should_use_bundle_dock_icon,
     };
     use std::path::Path;
     use weft_core::config::LogoVariant;
@@ -568,5 +723,68 @@ mod tests {
             bins.iter().any(|b| b == "ls" || b == "cat"),
             "expected ls or cat in PATH bins, got {bins:?}"
         );
+    }
+
+    #[test]
+    fn extract_path_helper_path_parses_quoted_assignment() {
+        // Canonical path_helper -s output.
+        assert_eq!(
+            extract_path_helper_path("PATH=\"/opt/homebrew/bin:/usr/bin\"; export PATH;"),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        // Multiple lines / leading noise are tolerated.
+        assert_eq!(
+            extract_path_helper_path(
+                "foo
+PATH=\"/usr/local/bin:/usr/bin\"; export PATH;"
+            ),
+            Some("/usr/local/bin:/usr/bin")
+        );
+        // Missing / empty / path-less values → None.
+        assert_eq!(extract_path_helper_path("export PATH;"), None);
+        assert_eq!(extract_path_helper_path("PATH=\"\";"), None);
+        assert_eq!(extract_path_helper_path("PATH=\"relative\";"), None);
+    }
+
+    #[test]
+    fn path_sources_is_non_empty_and_deduped_by_scan() {
+        // The union must at least cover the process env PATH, and the bins
+        // scan must remain deterministic (BTreeSet).
+        let sources = path_sources();
+        assert!(!sources.is_empty(), "must have at least one PATH source");
+        let bins = scan_path_bins();
+        let mut sorted = bins.clone();
+        sorted.sort();
+        assert_eq!(bins, sorted, "bins must be sorted");
+    }
+
+    #[test]
+    fn resolve_user_shell_prefers_env_or_falls_back_safely() {
+        // Save the real SHELL and always restore it, so a panicking assert
+        // cannot leak a polluted environment into parallel tests.
+        let original_shell = std::env::var_os("SHELL");
+        // With SHELL set, it is used directly (no subprocess).
+        std::env::set_var("SHELL", "/bin/bash");
+        let result = resolve_user_shell();
+        match original_shell.as_ref() {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        assert_eq!(result, Some(std::ffi::OsString::from("/bin/bash")));
+        // Empty SHELL + no USER → pure fallback path, no dscl spawn: the
+        // guard must return None without panicking or leaking a child.
+        std::env::set_var("SHELL", "");
+        let original_user = std::env::var_os("USER");
+        std::env::remove_var("USER");
+        let result = resolve_user_shell();
+        match original_user.as_ref() {
+            Some(v) => std::env::set_var("USER", v),
+            None => std::env::remove_var("USER"),
+        }
+        match original_shell.as_ref() {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        assert_eq!(result, None, "no SHELL and no USER must fall back safely");
     }
 }

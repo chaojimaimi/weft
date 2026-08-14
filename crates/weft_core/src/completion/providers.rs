@@ -25,6 +25,7 @@ impl super::CompletionProvider for HistoryProvider {
                 insert: m.insert,
                 source: CompletionSource::History,
                 is_dir: false,
+                match_quality: 1,
             })
             .collect()
     }
@@ -49,6 +50,7 @@ impl super::CompletionProvider for PathExecutableProvider {
                 insert: m.insert,
                 source: CompletionSource::PathExecutable,
                 is_dir: false,
+                match_quality: m.match_quality,
             })
             .collect()
     }
@@ -75,6 +77,7 @@ impl super::CompletionProvider for FilesystemProvider {
                 insert: m.insert,
                 source: CompletionSource::Filesystem,
                 is_dir: m.is_dir,
+                match_quality: 1,
             })
             .collect()
     }
@@ -112,6 +115,7 @@ impl super::CompletionProvider for WorkflowProvider {
                 insert: cmd.clone(),
                 source: CompletionSource::Workflow,
                 is_dir: false,
+                match_quality: 1,
             })
             .collect()
     }
@@ -146,6 +150,7 @@ impl super::CompletionProvider for WorkspaceCommandProvider {
                 insert: cmd.clone(),
                 source: CompletionSource::WorkspaceCommand,
                 is_dir: false,
+                match_quality: 1,
             })
             .collect()
     }

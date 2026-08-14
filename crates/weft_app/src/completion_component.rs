@@ -131,6 +131,7 @@ mod tests {
             kind: MatchKind::Command,
             insert: label.into(),
             is_dir: false,
+            match_quality: weft_core::complete::MATCH_QUALITY_PREFIX,
         }
     }
 

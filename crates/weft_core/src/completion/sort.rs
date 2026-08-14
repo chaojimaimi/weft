@@ -9,13 +9,17 @@ use super::CompletionCandidate;
 /// `crate::complete::MAX_RESULTS`.
 const MAX_RESULTS: usize = 50;
 
-/// Sort candidates by (source priority, label). Lower priority value = higher rank.
-/// PathExecutable > Workflow > WorkspaceCommand > History > Filesystem.
+/// Sort candidates by (source priority, match quality, label). Lower
+/// priority value = higher rank.
+/// PathExecutable > Workflow > WorkspaceCommand > History > Filesystem;
+/// within a source, COMMON-command candidates (match_quality 0) precede
+/// ordinary prefix matches (1), then label order.
 pub fn sort_candidates(candidates: &mut [CompletionCandidate]) {
     candidates.sort_by(|a, b| {
         a.source
             .priority()
             .cmp(&b.source.priority())
+            .then_with(|| a.match_quality.cmp(&b.match_quality))
             .then_with(|| a.label.cmp(&b.label))
     });
 }
@@ -45,6 +49,21 @@ mod tests {
             insert: label.to_string(),
             source,
             is_dir: false,
+            match_quality: 1,
+        }
+    }
+
+    fn candidate_quality(
+        label: &str,
+        source: CompletionSource,
+        match_quality: u8,
+    ) -> CompletionCandidate {
+        CompletionCandidate {
+            label: label.to_string(),
+            insert: label.to_string(),
+            source,
+            is_dir: false,
+            match_quality,
         }
     }
 
@@ -153,5 +172,34 @@ mod tests {
         let result = dedupe_candidates(candidates);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].source, CompletionSource::PathExecutable);
+    }
+
+    #[test]
+    fn common_command_outranks_alphabetically_earlier_prefix() {
+        // B3: within PathExecutable, COMMON-command quality 0 beats ordinary
+        // quality 1 even when its label sorts later ("ls" before "lam").
+        let mut candidates = vec![
+            candidate("lam", CompletionSource::PathExecutable),
+            candidate_quality("ls", CompletionSource::PathExecutable, 0),
+            candidate("last", CompletionSource::PathExecutable),
+        ];
+        sort_candidates(&mut candidates);
+        let labels: Vec<_> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["ls", "lam", "last"]);
+    }
+
+    #[test]
+    fn quality_is_secondary_to_source_priority() {
+        // Source priority dominates: a PathExecutable candidate (priority 0)
+        // outranks a History candidate (priority 3) regardless of quality —
+        // COMMON quality on a low-priority source must not leapfrog it.
+        let mut candidates = vec![
+            candidate_quality("zzz", CompletionSource::PathExecutable, 0),
+            candidate("mmm", CompletionSource::History),
+        ];
+        sort_candidates(&mut candidates);
+        let labels: Vec<_> = candidates.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, vec!["zzz", "mmm"]);
+        assert_eq!(candidates[0].source, CompletionSource::PathExecutable);
     }
 }
