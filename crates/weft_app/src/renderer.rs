@@ -759,6 +759,8 @@ impl MetalRenderer {
                     hidden_before_row: terminal.primary_screen_visible_row_start(),
                     owned_rows: terminal.primary_screen_viewport_ownership(),
                     is_alt_screen: terminal.is_alt_screen_active(),
+                    inset_block_gutter: !terminal.is_alt_screen_active()
+                        && terminal.primary_screen_owns_live_view(),
                 },
             );
             self.grid_build_us_counter

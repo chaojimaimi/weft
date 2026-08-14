@@ -76,11 +76,24 @@ pub struct Tab {
     active_pane: PaneId,
     /// v1.10.4: set when the active pane enters/exits alt-screen (DEC 1049).
     /// The redraw loop checks this to trigger a geometry recompute so PTY
-    /// cols switch between full-width (alt-screen TUI) and gutter-subtracted
-    /// (BlockView shell output). Consumed only when the tab is active; a
-    /// background tab's flag self-heals on activation because
-    /// `resize_all_panes_for_rect` re-reads `is_alt_screen_active()` live.
+    /// cols switch between full-width (TUI) and gutter-subtracted (BlockView
+    /// shell output). Consumed only when the tab is active; a background
+    /// tab's flag self-heals on activation because
+    /// `resize_all_panes_for_rect` re-reads the screen mode live.
+    ///
+    /// v1.10.19: consumption is debounced via `alt_rescale_last_flip` /
+    /// `alt_rescale_last_taken` (see `tab/resize.rs`) so a burst of toggles
+    /// coalesces into one recompute instead of one per flip.
     pending_alt_rescale: bool,
+    /// v1.10.19: time of the last alt-screen toggle that armed
+    /// `pending_alt_rescale`. `None` until the first toggle.
+    alt_rescale_last_flip: Option<std::time::Instant>,
+    /// v1.10.19: time the pending rescale was last consumed by
+    /// `take_pending_alt_rescale`. A fresh toggle inside the debounce window
+    /// after a consumed recompute marks a burst (the SIGWINCH feedback loop
+    /// toggles every ~130ms); the recompute then holds until the toggles go
+    /// quiet so the burst coalesces into one.
+    alt_rescale_last_taken: Option<std::time::Instant>,
 }
 
 impl std::ops::Deref for Tab {
@@ -434,6 +447,8 @@ impl Tab {
             panes,
             active_pane: pane_id,
             pending_alt_rescale: false,
+            alt_rescale_last_flip: None,
+            alt_rescale_last_taken: None,
         }
     }
 
@@ -462,14 +477,6 @@ impl Tab {
     /// bump the counter (e.g. `drain_effects`).
     pub(crate) fn input_seq(&self) -> u64 {
         self.active().input_seq
-    }
-
-    /// v1.10.4: True when the active pane entered/exited alt-screen (DEC 1049)
-    /// since the last geometry recompute. The redraw loop checks this to
-    /// trigger `recompute_layout` so PTY cols switch between full-width
-    /// (alt-screen TUI) and gutter-subtracted (BlockView shell output).
-    pub(crate) fn take_pending_alt_rescale(&mut self) -> bool {
-        std::mem::replace(&mut self.pending_alt_rescale, false)
     }
 
     /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
@@ -504,14 +511,17 @@ impl Tab {
             .find_map(|(id, rect)| (id == self.active_pane).then_some(rect))?;
         let [x0, y0, x1, y1] = rect;
         let pane_width = (x1 - x0).max(0.0);
-        // v1.10.4: mirror resize_all_panes_for_rect — alt-screen TUI uses
-        // full pane width (no BlockView gutter).
-        let is_alt = self
+        // v1.10.19: full pane width whenever the pane is an alt-screen TUI
+        // or a screen-owning primary-screen TUI (see
+        // `Terminal::wants_full_width_cols`) — cols must NOT swing with a
+        // primary-screen TUI's transient DEC 1049 toggles (102↔99 flapping
+        // re-queues TIOCSWINSZ every cycle: the resize feedback loop).
+        let full_width = self
             .panes
             .get(&self.active_pane)
             .and_then(|p| p.terminal.as_ref())
-            .is_some_and(|t| t.is_alt_screen_active());
-        let cols = if is_alt {
+            .is_some_and(Terminal::wants_full_width_cols);
+        let cols = if full_width {
             crate::layout::terminal_full_cols(pane_width, cell_w)
         } else {
             crate::layout::terminal_content_cols(pane_width, cell_w)
@@ -545,19 +555,18 @@ impl Tab {
             let [x0, y0, x1, y1] = rect;
             let pane_width = (x1 - x0).max(0.0);
             let pane_height = (y1 - y0).max(0.0);
-            // v1.10.4: alt-screen TUIs (vim/opencode/htop/less) need the
-            // FULL pane width — their borders/layouts assume PTY cols = the
-            // visible terminal width. The BlockView gutter (cell_w*1.5 per
-            // side, ~3 cols) is only meaningful for shell output (it gives
-            // history blocks breathing room and prevents progress bars from
-            // wrapping). When a pane is in alt-screen mode, skip the gutter
-            // subtraction so the TUI can paint edge-to-edge.
-            let is_alt = self
+            // v1.10.19: full width for alt-screen TUIs and screen-owning
+            // primary-screen TUIs (see `Terminal::wants_full_width_cols`).
+            // Cols must not swing with transient DEC 1049 toggles — the
+            // 99↔102 flip re-queues a PTY resize each cycle, feeding the
+            // SIGWINCH → redraw → toggle oscillation. The BlockView gutter
+            // lives at the render layer only (grid content x-inset).
+            let full_width = self
                 .panes
                 .get(&pane_id)
                 .and_then(|p| p.terminal.as_ref())
-                .is_some_and(|t| t.is_alt_screen_active());
-            let cols = if is_alt {
+                .is_some_and(Terminal::wants_full_width_cols);
+            let cols = if full_width {
                 crate::layout::terminal_full_cols(pane_width, cell_w)
             } else {
                 crate::layout::terminal_content_cols(pane_width, cell_w)

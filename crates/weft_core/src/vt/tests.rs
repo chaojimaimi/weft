@@ -140,6 +140,51 @@ fn alt_screen_exit_clears_history_peek() {
     );
 }
 
+/// v1.10.19: PTY cols must NOT swing with a primary-screen TUI's transient
+/// DEC 1049 toggles. The old is_alt-only selection produced 102↔99 col
+/// flapping (alt uses full width, primary uses gutter-subtracted width);
+/// every flip queued a TIOCSWINSZ → SIGWINCH → redraw → flip, the ~130ms
+/// resize oscillation. `wants_full_width_cols` is alt-state-independent for
+/// screen-owning TUIs.
+#[test]
+fn primary_tui_full_width_cols_are_stable_across_transient_alt_toggles() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"\x1b[?2031h\x1b[H\x1b[2;1H");
+    assert!(t.primary_screen_app_active());
+    assert!(
+        t.wants_full_width_cols(),
+        "screen-owning primary TUI uses full width"
+    );
+
+    // Transient alt phase of the same TUI — the resize-loop feedback.
+    t.process(b"\x1b[?1049h");
+    assert!(t.wants_full_width_cols(), "alt phase keeps full width");
+    t.process(b"\x1b[?1049l");
+    assert!(
+        t.wants_full_width_cols(),
+        "primary phase after a transient alt exit keeps full width"
+    );
+
+    // A plain alt-screen TUI (vim) is full width too, before and after exit.
+    t.process(b"\x1b[?1049h");
+    assert!(t.wants_full_width_cols());
+    t.process(b"\x1b[?1049l");
+    assert!(t.wants_full_width_cols());
+
+    // While the primary-screen exit is still settling the TUI remains on
+    // screen — keep full width until the screen settles.
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    assert!(t.primary_screen_exit_pending());
+    assert!(t.wants_full_width_cols(), "exit-pending keeps full width");
+
+    t.settle_primary_screen_exit();
+    assert!(
+        !t.wants_full_width_cols(),
+        "a settled shell prompt returns to gutter-subtracted cols"
+    );
+}
+
 #[test]
 fn primary_screen_history_view_snapshot_refresh_is_explicitly_coalesced() {
     let mut terminal = Terminal::new(5, 48);

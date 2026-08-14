@@ -728,17 +728,18 @@ impl App {
         let Some(pane) = session.pane_mut(pane_id) else {
             return;
         };
-        let resize_result = pane
-            .pty
-            .as_ref()
-            .map(|pty| pty.resize(rows as u16, cols as u16));
-        let resize_succeeded = match resize_result {
-            Some(Ok(())) => true,
-            Some(Err(error)) => {
+        // v1.10.19: the TIOCSWINSZ is deduped against the last-sent winsize
+        // (Pane::apply_winsize_ioctl). Re-requesting a size the PTY already
+        // has must not re-issue the ioctl — each redundant one SIGWINCHes
+        // the foreground app, keeping a resize feedback loop alive. The
+        // in-memory Grid is still committed below so grid dims never drift
+        // from the PTY's.
+        let (ioctl_sent, resize_succeeded) = match pane.apply_winsize_ioctl(rows, cols) {
+            Ok(sent) => (sent, true),
+            Err(error) => {
                 warn!(%error, tab, pane_id = %pane_id, rows, cols, "failed to apply PTY resize effect");
-                false
+                (false, false)
             }
-            None => return,
         };
         if let Some(terminal) = &mut pane.terminal {
             let committed = commit_pty_resize_result(
@@ -747,7 +748,9 @@ impl App {
                 (rows, cols),
                 resize_succeeded,
             );
-            if committed {
+            // Only a real size change needs the TUI frame invalidation; a
+            // deduped commit resizes the Grid to dims it already holds.
+            if committed && ioctl_sent {
                 invalidate_primary_tui_frame(terminal);
             }
         }

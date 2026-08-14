@@ -450,6 +450,36 @@ impl Terminal {
         self.capabilities.primary_screen_exit.is_some()
     }
 
+    /// v1.10.19: Whether the pane's PTY cols should span the full pane width
+    /// (no BlockView gutter subtraction). True for alt-screen TUIs
+    /// (vim/htop/less — they paint edge-to-edge) and for primary-screen TUIs
+    /// that own the screen (omp/pi/openclaw), including while their exit is
+    /// still settling.
+    ///
+    /// MUST NOT depend on a primary-screen TUI's transient DEC 1049 state: a
+    /// col count that swings with `?1049h/l` feedback (SIGWINCH → redraw →
+    /// toggle → TIOCSWINSZ → SIGWINCH) oscillates forever, re-queuing a PTY
+    /// resize every cycle. The BlockView gutter is expressed at the render
+    /// layer only (grid content x-inset, see
+    /// `weft_app::paint::grid::grid_content_origin_x`), so cols stay stable
+    /// across alt toggles.
+    pub fn wants_full_width_cols(&self) -> bool {
+        self.capabilities.alt_active
+            || self.primary_screen_app_active()
+            || self.primary_screen_exit_pending()
+    }
+
+    /// v1.10.19: Whether a primary-screen TUI currently owns the live grid
+    /// view. Rendering policy: when true (and not in alt mode), the grid
+    /// content origin is inset by the BlockView gutter so scrolling up into
+    /// `primary_history_view` (which switches to BlockView) keeps every
+    /// column at the same physical x — without the inset, grid content
+    /// renders ~1.5 cols left of BlockView content and the transcript
+    /// visibly shifts right on the transition.
+    pub fn primary_screen_owns_live_view(&self) -> bool {
+        self.primary_screen_app_active() || self.primary_screen_exit_pending()
+    }
+
     /// First viewport row owned by the active primary-screen application.
     ///
     /// Shell rows can remain physically present above a TUI that paints below

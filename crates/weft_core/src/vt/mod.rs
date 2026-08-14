@@ -264,6 +264,14 @@ impl Terminal {
             // peek so show_block_view() reverts to the primary-screen rules
             // and the renderer shows the restored primary grid, not a stale
             // BlockView overlay.
+            //
+            // v1.10.19: kept unconditional — the resize feedback loop that
+            // used to hammer this path (primary-screen TUI SIGWINCH repaints
+            // toggling DEC 1049 every ~130ms, each toggle clearing the peek
+            // and yanking a scrolled-up history back to the grid) is broken
+            // at the source (stable cols + winsize dedup + rescale debounce),
+            // so the only alt exits here are real ones, where clearing the
+            // peek is correct (see alt_screen_exit_clears_history_peek).
             self.capabilities.alt_screen_history_peek = false;
             // Restoring the primary grid — alt-screen hyperlinks are gone.
             self.hyperlinks.clear_cell_map();

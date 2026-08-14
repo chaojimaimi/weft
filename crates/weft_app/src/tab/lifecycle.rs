@@ -25,6 +25,10 @@ impl Tab {
         };
         if alt_changed {
             self.pending_alt_rescale = true;
+            // v1.10.19: arm the debounce window — take_pending_alt_rescale
+            // holds the recompute while toggles repeat inside it so a burst
+            // coalesces into one recompute (see tab/resize.rs).
+            self.alt_rescale_last_flip = Some(std::time::Instant::now());
         }
         if !response.is_empty() {
             if let Some(pty) = &self.pty {

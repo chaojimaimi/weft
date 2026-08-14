@@ -733,11 +733,21 @@ impl App {
                 if phase == winit::event::TouchPhase::Cancelled {
                     return;
                 }
+                // v1.10.19: A1-fix parity with scroll_local_view — compute
+                // max_scroll LIVE from the layout cache instead of the
+                // per-frame cached value. The cached metrics are None during
+                // grid-mode execution (primary-screen TUI), which clamped to
+                // 0 and kicked the PixelDelta fast path straight back to
+                // FollowBottom — the trackpad's first flick then discarded
+                // the scroll-up the user had just started.
                 let max_scroll = self
                     .renderer
                     .as_ref()
-                    .and_then(|renderer| renderer.cached_scroll_metrics.get())
-                    .map(|(_, _, max)| max)
+                    .and_then(|renderer| {
+                        let terminal = self.sessions.active().terminal.as_ref()?;
+                        let (_total, _visible, max) = renderer.block_scroll_metrics(terminal);
+                        Some(max)
+                    })
                     .unwrap_or(0);
                 self.sessions
                     .active_mut()

@@ -45,6 +45,32 @@ pub(crate) struct GridViewPolicy<'a> {
     /// Used to soften the cursor color for underline/bar styles so they
     /// don't appear as a jarring bright line at TUI input edges.
     pub(crate) is_alt_screen: bool,
+    /// v1.10.19: true for a primary-screen TUI grid view. The grid content
+    /// origin is inset by the BlockView gutter so scrolling up into
+    /// `primary_history_view` (which switches to BlockView) keeps every
+    /// column at the same physical x — without the inset, grid content
+    /// renders ~1.5 cols left of BlockView content and the transcript
+    /// visibly shifts right on the transition. Alt-screen TUIs stay
+    /// edge-to-edge (no gutter).
+    pub(crate) inset_block_gutter: bool,
+}
+
+/// v1.10.19: Grid content origin x for `ctx`.
+///
+/// With `inset_block_gutter` the origin is BlockView's content left edge
+/// (pane left + gutter), so the grid and the `primary_history_view`
+/// BlockView place column 0 at the same physical x on a scroll-up
+/// transition. Without it (alt-screen TUI), the origin is the pane's left
+/// edge — the TUI paints edge-to-edge.
+pub(crate) fn grid_content_origin_x(
+    ctx: &crate::layout::LayoutCtx,
+    inset_block_gutter: bool,
+) -> f32 {
+    if inset_block_gutter {
+        crate::layout::block_content_x_bounds(ctx).0
+    } else {
+        ctx.left()
+    }
 }
 
 /// v1.10.4: Resolve the effective cursor color for the grid path.
@@ -227,11 +253,15 @@ impl MetalRenderer {
         self.instances_unchanged.set(false);
 
         // Layout offsets read from `self.layout_ctx` (set by draw() entry).
-        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-        let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
         let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
         let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
-        let origin_x = self.padding_x + chrome_left + pane_origin_x;
+        // v1.10.19: primary-screen TUI grid views inset by the BlockView
+        // gutter (grid_content_origin_x) so a scroll-up into
+        // primary_history_view doesn't shift content 1.5 cols to the right.
+        let origin_x = self
+            .layout_ctx
+            .map(|ctx| grid_content_origin_x(&ctx, policy.inset_block_gutter))
+            .unwrap_or(self.padding_x);
         let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
 
         let mut rebuilt_rows = 0usize;
@@ -305,11 +335,18 @@ impl MetalRenderer {
         let cursor_style = weft_core::grid::CursorStyle::Block;
         let selection = SelectionHandler::new();
 
-        let chrome_left = self.layout_ctx.map(|c| c.chrome_left).unwrap_or(0.0);
-        let pane_origin_x = self.layout_ctx.map(|c| c.pane_origin.0).unwrap_or(0.0);
         let chrome_top = self.layout_ctx.map(|c| c.chrome_top).unwrap_or(0.0);
         let pane_origin_y = self.layout_ctx.map(|c| c.pane_origin.1).unwrap_or(0.0);
-        let origin_x = self.padding_x + chrome_left + pane_origin_x;
+        // v1.10.19: mirror the active-pane grid policy — a background pane
+        // whose primary-screen TUI owns the live grid also insets by the
+        // BlockView gutter so its grid content stays column-aligned with
+        // the BlockView it would switch to on history scroll.
+        let inset_block_gutter =
+            !terminal.is_alt_screen_active() && terminal.primary_screen_owns_live_view();
+        let origin_x = self
+            .layout_ctx
+            .map(|ctx| grid_content_origin_x(&ctx, inset_block_gutter))
+            .unwrap_or(self.padding_x);
         let origin_y_base = self.padding_y + chrome_top + pane_origin_y;
 
         let hidden_before_row = terminal.primary_screen_visible_row_start();
@@ -403,7 +440,11 @@ impl MetalRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{alt_screen_cursor_color, primary_screen_mask_changed, primary_screen_row_hidden};
+    use super::{
+        alt_screen_cursor_color, grid_content_origin_x, primary_screen_mask_changed,
+        primary_screen_row_hidden,
+    };
+    use crate::layout::LayoutCtx;
     use weft_core::grid::CursorStyle;
 
     #[test]
@@ -468,5 +509,57 @@ mod tests {
         let result = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Bar);
         assert_ne!(result, cursor, "Bar cursor is softened in alt-screen");
         assert!(result[0] < cursor[0], "blended toward darker fg");
+    }
+
+    // ── v1.10.19: grid ↔ BlockView content x alignment (Fix A) ──────────
+
+    /// v1.10.19: at the same geometry, the inset grid origin and the
+    /// BlockView content left edge must coincide — scrolling a primary-screen
+    /// TUI up into `primary_history_view` switches grid → BlockView and
+    /// every column must stay at the same physical x (no 1.5-col shift).
+    #[test]
+    fn grid_origin_x_matches_block_view_content_left_at_same_geometry() {
+        let ctx = LayoutCtx {
+            viewport: (1080.0, 720.0),
+            cell_w: 10.0,
+            cell_h: 20.0,
+            padding_x: 8.0,
+            padding_y: 8.0,
+            chrome_top: 28.0,
+            chrome_left: 60.0,
+            pane_origin: (0.0, 0.0),
+            clip: None,
+        };
+        let (block_left, _) = crate::layout::block_content_x_bounds(&ctx);
+        assert_eq!(
+            grid_content_origin_x(&ctx, true),
+            block_left,
+            "inset grid origin == BlockView content left edge"
+        );
+        // The inset is exactly the BlockView gutter (1.5 cells at this size).
+        assert!((grid_content_origin_x(&ctx, true) - ctx.left() - ctx.cell_w * 1.5).abs() < 1e-6);
+        // Alt-screen TUIs keep the pane edge (edge-to-edge, no gutter).
+        assert_eq!(grid_content_origin_x(&ctx, false), ctx.left());
+    }
+
+    /// v1.10.19: the same alignment must hold for a split-pane context
+    /// (pane_origin + clip): grid and BlockView are both pane-local.
+    #[test]
+    fn grid_origin_alignment_holds_for_pane_local_context() {
+        let ctx = LayoutCtx {
+            viewport: (1080.0, 720.0),
+            cell_w: 10.0,
+            cell_h: 20.0,
+            padding_x: 8.0,
+            padding_y: 8.0,
+            chrome_top: 28.0,
+            chrome_left: 0.0,
+            pane_origin: (0.0, 0.0),
+            clip: None,
+        };
+        let pane_ctx = ctx.for_pane([100.0, 100.0, 600.0, 500.0]);
+        let (block_left, _) = crate::layout::block_content_x_bounds(&pane_ctx);
+        assert_eq!(grid_content_origin_x(&pane_ctx, true), block_left);
+        assert_eq!(grid_content_origin_x(&pane_ctx, false), pane_ctx.left());
     }
 }

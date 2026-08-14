@@ -63,6 +63,12 @@ pub struct Pane {
     /// position the caret at.
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
+    /// v1.10.19: winsize `(rows, cols)` last actually sent to the PTY via
+    /// TIOCSWINSZ. `apply_winsize_ioctl` dedups against it: re-requesting a
+    /// size the PTY already has must not re-issue the ioctl (each redundant
+    /// one SIGWINCHes the foreground app — the feedback that keeps a resize
+    /// loop alive). `None` until the first successful ioctl.
+    pub(crate) last_sent_winsize: Option<(usize, usize)>,
     pub(crate) pending_pty_output: Option<Vec<u8>>,
     /// R2-1: private — use the block-scroll API methods below instead.
     /// Replaces the raw `usize` offset with a `BlockScrollAnchor` so the
@@ -144,6 +150,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
@@ -170,6 +177,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
@@ -199,6 +207,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
@@ -237,6 +246,42 @@ impl Pane {
         }
         self.pending_pty_resize = Some((rows, cols));
         true
+    }
+
+    /// v1.10.19: True when `requested` differs from the winsize last sent to
+    /// the PTY. Coalesced `pending_pty_resize` overwrites (alt-screen flips
+    /// 102→99→102…) flush sizes the PTY already has; re-issuing TIOCSWINSZ
+    /// for those would SIGWINCH the foreground app for no state change —
+    /// each redundant ioctl is one more turn of the resize feedback loop.
+    pub(crate) fn should_send_winsize_ioctl(
+        last_sent_winsize: Option<(usize, usize)>,
+        requested: (usize, usize),
+    ) -> bool {
+        last_sent_winsize != Some(requested)
+    }
+
+    /// v1.10.19: Send a queued winsize to the PTY via TIOCSWINSZ, deduping
+    /// against the last size actually sent (see [`should_send_winsize_ioctl`]).
+    ///
+    /// Returns `Ok(true)` when the ioctl was issued, `Ok(false)` when it was
+    /// deduped (the PTY already has this size — the caller still commits the
+    /// in-memory Grid dimensions, which may have drifted), and `Err` when the
+    /// ioctl failed or the pane has no PTY (the caller skips the Grid commit
+    /// and retries on the next flush).
+    pub(crate) fn apply_winsize_ioctl(&mut self, rows: usize, cols: usize) -> Result<bool, String> {
+        let winsize = (rows, cols);
+        if !Self::should_send_winsize_ioctl(self.last_sent_winsize, winsize) {
+            return Ok(false);
+        }
+        let Some(pty) = &self.pty else {
+            return Err("no pty attached to pane".to_string());
+        };
+        pty.resize(rows as u16, cols as u16)
+            .map(|()| {
+                self.last_sent_winsize = Some(winsize);
+                true
+            })
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn set_restored_cwd_fallback(&mut self, cwd: Option<String>) {
@@ -351,6 +396,42 @@ mod tests {
                 .and_then(|s| s.cwd.as_deref()),
             Some("/saved"),
             "a later fallback must not replace the original recovery state"
+        );
+    }
+
+    // ── v1.10.19: PTY winsize dedup (resize-loop defense layer 1) ────────
+
+    #[test]
+    fn should_send_winsize_ioctl_skips_sizes_already_sent() {
+        assert!(!Pane::should_send_winsize_ioctl(Some((24, 80)), (24, 80)));
+        assert!(Pane::should_send_winsize_ioctl(Some((24, 80)), (24, 100)));
+        assert!(Pane::should_send_winsize_ioctl(Some((24, 80)), (25, 80)));
+        // Before any ioctl was ever sent, every request is a real send.
+        assert!(Pane::should_send_winsize_ioctl(None, (24, 80)));
+    }
+
+    #[test]
+    fn apply_winsize_ioctl_dedups_and_records_the_last_sent_size() {
+        // with_terminal_only has no PTY — the dedup decision still applies:
+        // a re-request of the last-sent size must short-circuit before any
+        // PTY access (Ok(false)), while a genuinely new size takes the
+        // ioctl path and fails with the "no pty" error.
+        let mut pane = Pane::with_terminal_only(1000);
+        pane.last_sent_winsize = Some((24, 80));
+        assert_eq!(pane.apply_winsize_ioctl(24, 80), Ok(false));
+        assert_eq!(
+            pane.last_sent_winsize,
+            Some((24, 80)),
+            "dedup does not touch last_sent_winsize"
+        );
+        assert!(
+            pane.apply_winsize_ioctl(24, 100).is_err(),
+            "a changed size must reach the ioctl path (no pty here → error)"
+        );
+        assert_eq!(
+            pane.last_sent_winsize,
+            Some((24, 80)),
+            "failed ioctl must not record the requested size"
         );
     }
 }
