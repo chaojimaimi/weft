@@ -159,6 +159,17 @@ pub(crate) fn color_to_normalized(color: Color) -> [f32; 4] {
     ]
 }
 
+/// CWD gray: a theme-independent dimmed version of the command foreground.
+///
+/// Deliberately NOT `theme.output.cwd` — that key is a per-theme "coordinated
+/// accent" (warp_dark is a dark coral, dracula a dark violet), so switching
+/// themes changes the CWD hue. Deriving from `foreground` × 0.65 gives every
+/// theme the same neutral gray, keeps the "CWD dim < command bright" hierarchy,
+/// and auto-adapts to light themes (dark fg → darker gray, still readable).
+pub(crate) fn derive_cwd_gray(fg: [f32; 4]) -> [f32; 4] {
+    [fg[0] * 0.65, fg[1] * 0.65, fg[2] * 0.65, 1.0]
+}
+
 pub(crate) fn scale_color_alpha(mut color: [f32; 4], opacity: f32) -> [f32; 4] {
     color[3] *= opacity.clamp(0.0, 1.0);
     color
@@ -434,6 +445,42 @@ mod tests {
         let adjusted = ensure_minimum_text_contrast(foreground, background, 7.0);
         assert!(text_contrast_ratio(adjusted, background) >= 6.99);
         assert!(adjusted[0] < foreground[0]);
+    }
+
+    #[test]
+    fn derive_cwd_gray_dims_foreground_uniformly_and_theme_independently() {
+        // 每个主题用同一公式(fg × 0.65),CWD 不随主题 `output.cwd` 键变。
+        for theme in [
+            weft_core::config::Theme::weft_warm(),
+            weft_core::config::Theme::warp_dark(),
+            weft_core::config::Theme::dracula(),
+            weft_core::config::Theme::weft_light(),
+        ] {
+            let fg = color_to_normalized(theme.foreground);
+            let gray = derive_cwd_gray(fg);
+            for i in 0..3 {
+                assert!(
+                    (gray[i] - fg[i] * 0.65).abs() < 1e-5,
+                    "cwd channel must be fg × 0.65"
+                );
+            }
+            assert_eq!(gray[3], 1.0);
+            // CWD 暗于命令色,保持 "CWD 暗 < 命令亮" 层次
+            assert!(gray[0] < fg[0]);
+        }
+    }
+
+    #[test]
+    fn derive_cwd_gray_stays_readable_on_light_theme() {
+        // 浅色主题 fg 本身是深色,×0.65 后仍是深灰,在浅背景上保持可读
+        let light = weft_core::config::Theme::weft_light();
+        let fg = color_to_normalized(light.foreground);
+        let bg = color_to_normalized(light.background);
+        let gray = derive_cwd_gray(fg);
+        assert!(
+            text_contrast_ratio(gray, bg) >= 4.5,
+            "light-theme CWD must stay readable"
+        );
     }
 
     #[test]

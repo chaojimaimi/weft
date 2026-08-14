@@ -180,32 +180,30 @@ impl App {
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Close(idx)) => {
-                            if idx == self.sessions.active_idx() {
-                                let effects = self.close_active_tab_with_confirmation();
-                                self.drain_effects(effects);
-                            } else {
-                                if !self.confirm_background_tab_close(idx) {
-                                    return;
-                                }
-                                // Close a background tab — remove and adjust index.
-                                let blocks = self
-                                    .sessions
-                                    .tab_mut(idx)
-                                    .map(crate::tab::Tab::finish_pending_blocks)
-                                    .unwrap_or_default();
-                                self.sessions.close_background(idx);
-                                self.tab_bar.hovered_tab = None;
-                                self.request_redraw();
-                                let mut effects = Vec::new();
-                                if !blocks.is_empty() {
-                                    effects.push(crate::effect::Effect::PersistBlocks { blocks });
-                                }
-                                effects.push(crate::effect::Effect::PersistTabs);
-                                self.drain_effects(effects);
-                            }
+                            // v1.11.13: deferred close — pressing × no longer
+                            // closes immediately. The press records a drag
+                            // candidate with `close_on_release`; a plain click
+                            // (no movement past the threshold) closes on
+                            // release, while a drag past the threshold
+                            // reorders the tab instead.
+                            self.tab_bar.hovered_tab = None;
+                            self.interaction.tab_drag = Some(crate::app_state::TabBarDragState {
+                                start_x: x,
+                                start_y: y,
+                                drag_index: idx,
+                                grab_offset: 0.0,
+                                insert_index: idx,
+                                moved: false,
+                                close_on_release: true,
+                            });
+                            self.request_redraw();
                             return;
                         }
                         Some(crate::tab_bar_component::TabBarTarget::Tab(hit_index)) => {
+                            tracing::debug!(
+                                "TAB_DRAG_DIAG: press hit tab={} at ({}, {}), bar_h={}, setting tab_drag",
+                                hit_index, x, y, bar_h
+                            );
                             if self.sessions.active_idx() != hit_index {
                                 self.reset_ime_context("tab clicked");
                                 self.sessions.switch_to(hit_index);
@@ -216,6 +214,19 @@ impl App {
                             self.interaction.block_selected = None;
                             self.interaction.block_action_hovered = None;
                             self.scroll_active_tab_into_view();
+                            // v1.11: record press position for drag-to-reorder.
+                            // The tab is already switched (above). If the user
+                            // drags beyond the threshold, the ghost drag takes
+                            // over; otherwise this is a plain click.
+                            self.interaction.tab_drag = Some(crate::app_state::TabBarDragState {
+                                start_x: x,
+                                start_y: y,
+                                drag_index: hit_index,
+                                grab_offset: 0.0,
+                                insert_index: hit_index,
+                                moved: false,
+                                close_on_release: false,
+                            });
                             self.request_redraw();
                             return;
                         }
@@ -231,6 +242,11 @@ impl App {
                     // (winit's native drag_window handles the drag). Detect a
                     // double-click here to toggle maximize, matching the macOS
                     // native titlebar double-click behavior.
+                    tracing::debug!(
+                        "TAB_DRAG_DIAG: no hit at ({}, {}), will drag_window",
+                        xf,
+                        yf
+                    );
                     let now = std::time::Instant::now();
                     let is_double = self
                         .tab_bar
@@ -437,7 +453,10 @@ impl App {
                 let yf = y as f32;
                 // Chevron occupies the first cell [content_left, content_left + cw).
                 if xf >= content_left && xf < content_left + cw {
-                    for row in &self.compute_block_view_rows() {
+                    let Some((rows, _, _)) = self.compute_block_view_rows() else {
+                        return;
+                    };
+                    for row in &rows {
                         if row.kind == weft_core::selection::BlockViewRowKind::Command
                             && yf >= row.y_top
                             && yf < row.y_bottom
@@ -607,7 +626,9 @@ impl App {
                         // with what the user saw at drag start, even if a PTY
                         // update re-lays-out the view mid-drag.
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            let rows_snapshot = self.compute_block_view_rows();
+                            let Some((rows_snapshot, _, _)) = self.compute_block_view_rows() else {
+                                return;
+                            };
                             self.sessions
                                 .active_mut()
                                 .selection_handler
@@ -670,6 +691,9 @@ impl App {
                     // Right click: extend selection.
                     if block_view {
                         if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
+                            let Some((rows_snapshot, _, _)) = self.compute_block_view_rows() else {
+                                return;
+                            };
                             if self
                                 .sessions
                                 .active_mut()
@@ -677,7 +701,6 @@ impl App {
                                 .block_view_selection
                                 .is_none()
                             {
-                                let rows_snapshot = self.compute_block_view_rows();
                                 self.sessions
                                     .active_mut()
                                     .selection_handler

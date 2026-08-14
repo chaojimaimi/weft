@@ -6,10 +6,11 @@
 //! pipeline + grid rendering; overlay builders in `paint/overlays.rs` call
 //! these via the same `self.push_text(...)` syntax with zero call-site edits.
 
-use crate::paint::primitives::{push_quad, syntax_color};
+use crate::paint::primitives::push_quad;
 use crate::renderer::MetalRenderer;
+use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
-use weft_core::syntax;
+use weft_core::syntax::TokenKind;
 
 impl MetalRenderer {
     /// Column width of a character (0 for zero-width combining marks,
@@ -59,9 +60,14 @@ impl MetalRenderer {
             fg,
             max_cols,
             self.cell_height() as f32,
+            crate::glyph::GlyphStyle::REGULAR,
         );
     }
 
+    /// v1.10.12: `style` selects the atlas face (bold/italic) for the whole
+    /// run. UI text (`push_text`) stays regular; block-view history cells
+    /// pass their SGR flags-derived style.
+    #[allow(clippy::too_many_arguments)] // run geometry + style; mirrors push_text's arity
     pub(crate) fn push_text_with_height(
         &self,
         vertices: &mut Vec<f32>,
@@ -70,6 +76,7 @@ impl MetalRenderer {
         fg: [f32; 4],
         max_cols: usize,
         glyph_height: f32,
+        style: crate::glyph::GlyphStyle,
     ) {
         let cw = self.cell_width() as f32;
         let [x, y] = origin;
@@ -84,7 +91,16 @@ impl MetalRenderer {
                 break; // column budget exhausted
             }
             let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
-            let Some(g) = self.atlas.get(glyph) else {
+            let Some(g) = self.atlas.get_style(glyph, style).or_else(|| {
+                // v1.10.12: styled face not rasterized yet — degrade to the
+                // regular face instead of silently dropping the grapheme.
+                (style != crate::glyph::GlyphStyle::REGULAR)
+                    .then(|| {
+                        self.atlas
+                            .get_style(glyph, crate::glyph::GlyphStyle::REGULAR)
+                    })
+                    .flatten()
+            }) else {
                 col += w;
                 px += w as f32 * cw;
                 continue;
@@ -108,11 +124,22 @@ impl MetalRenderer {
         }
     }
 
-    pub(crate) fn push_line_tokenized_on_canvas(
+    /// Draw one visual row of a prompt line from pre-tokenized spans.
+    ///
+    /// `line` is the full logical line; `char_start`/`char_end` are the visual
+    /// row's char range into it (from PromptVisualRow). Spans come from
+    /// `syntax::tokenize_spans(line, true)` — a whole-logical-line
+    /// tokenization, so string/command state survives visual wrapping.
+    /// `selection` is relative to this visual row (as before).
+    #[allow(clippy::too_many_arguments)] // run geometry + syntax state; mirrors push_text_with_height's arity
+    pub(crate) fn push_line_spans_on_canvas(
         &self,
         vertices: &mut Vec<f32>,
         origin: [f32; 2],
         line: &str,
+        char_start: usize,
+        char_end: usize,
+        spans: &[(Range<usize>, TokenKind)],
         max_cols: usize,
         canvas: [f32; 4],
         selection: Option<(usize, usize, [f32; 4])>,
@@ -121,13 +148,22 @@ impl MetalRenderer {
         let [x, y] = origin;
         let mut col = 0usize;
         let mut px = x;
-        let mut char_index = 0usize;
-        for token in syntax::tokenize(line) {
-            if col >= max_cols {
-                break;
+        let mut char_index; // relative to this visual row; set per segment below
+        'span_loop: for (range, kind) in spans {
+            let seg_start = range.start.max(char_start);
+            let seg_end = range.end.min(char_end);
+            if seg_start >= seg_end {
+                continue;
             }
-            let source_color = syntax_color(token.kind, &self.theme);
-            for grapheme in token.text.graphemes(true) {
+            // Character offset of this segment within the visual row.
+            char_index = seg_start - char_start;
+            let seg: String = line
+                .chars()
+                .skip(seg_start)
+                .take(seg_end - seg_start)
+                .collect();
+            let source_color = crate::paint::primitives::syntax_color(*kind, &self.theme);
+            for grapheme in seg.graphemes(true) {
                 let grapheme_end = char_index + grapheme.chars().count();
                 let background = crate::paint::primitives::text_background_for_range(
                     canvas,
@@ -150,7 +186,7 @@ impl MetalRenderer {
                     continue;
                 }
                 if col + w > max_cols {
-                    break;
+                    break 'span_loop;
                 }
                 let glyph = weft_core::grid::terminal_grapheme_glyph(grapheme);
                 if let Some(g) = self.atlas.get(glyph) {

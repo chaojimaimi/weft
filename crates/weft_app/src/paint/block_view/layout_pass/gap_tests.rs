@@ -14,15 +14,50 @@ fn finished_block(id: u64, output: &str, collapsed: bool) -> Block {
     }
 }
 
-fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> LayoutPassOutput<'a> {
+fn clear_block(id: u64) -> Block {
+    Block {
+        id: BlockId(id),
+        command: "clear".to_owned(),
+        cwd: None,
+        output: "".into(),
+        styled_output: None,
+        exit_code: Some(0),
+        started_at: std::time::SystemTime::UNIX_EPOCH,
+        finished_at: Some(std::time::SystemTime::UNIX_EPOCH),
+        collapsed: false,
+    }
+}
+
+/// R2-2 fix regression test: a bare `clear` block emits a viewport-sized
+/// spacer (viewport_rows * pitch) that the prefix sum does NOT include
+/// (viewport_rows is per-frame). Before the fix, the binary search + fast
+/// forward underestimated every block above the clear, so after scrolling
+/// past it the older block's rows were culled as invisible and its output
+/// vanished.
+#[test]
+fn scrolling_past_clear_keeps_older_output_visible() {
+    // 布局(新→旧):new_blk(有输出), clear, old_blk(有输出)
+    let old_blk = finished_block(1, "old output line\n", false);
+    let clear_blk = clear_block(2);
+    let new_blk = finished_block(3, "new output line\n", false);
+    let blocks = [old_blk, clear_blk, new_blk]; // blocks[0]=最旧
+
+    let mut cache = BlockLayoutCache::default();
+    for b in &blocks {
+        cache.ensure_cached(b, 80);
+    }
+    cache.build_prefix_sum(&blocks);
+
+    // 滚动越过 clear(spacer = viewport_rows=24 行=480px),让 old_blk 进入视口。
+    // block_scroll=30 → 600px;old_blk 位于 cursor_dist [648,752] → 屏幕 y [752,648]。
     let empty_map = std::collections::HashMap::new();
-    compute_block_layout_pass(
+    let layout = compute_block_layout_pass(
         LayoutPassInput {
-            blocks,
+            blocks: &blocks,
             live: None,
             cwd: None,
             git_branch: None,
-            block_scroll: 0.0,
+            block_scroll: 30.0, // 滚动量 > clear spacer,触发快进
             viewport_rows: 24,
             cols: 80,
             pitch: 20.0,
@@ -34,8 +69,104 @@ fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> Layout
             styled_lookup_counter: None,
             block_diagnose_state: &empty_map,
         },
+        &cache,
+    );
+
+    // 断言:old_blk 的 Output 行存在(bug 时会被误判不可见而缺失)
+    let has_old_output = layout
+        .row_data
+        .iter()
+        .any(|r| matches!(r, LaidRow::Output { text, .. } if *text == "old output line"));
+    assert!(
+        has_old_output,
+        "old block output vanished after scrolling past clear"
+    );
+}
+
+fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> LayoutPassOutput<'a> {
+    completed_layout_cols(blocks, cache, 80)
+}
+
+fn completed_layout_cols<'a>(
+    blocks: &'a [Block],
+    cache: &BlockLayoutCache,
+    cols: usize,
+) -> LayoutPassOutput<'a> {
+    let empty_map = std::collections::HashMap::new();
+    compute_block_layout_pass(
+        LayoutPassInput {
+            blocks,
+            live: None,
+            cwd: None,
+            git_branch: None,
+            block_scroll: 0.0,
+            viewport_rows: 24,
+            cols,
+            pitch: 20.0,
+            header_height: 24.0,
+            content_bottom_y: 800.0,
+            clip_top: 0.0,
+            clip_bottom: 800.0,
+            resolve_styles: false,
+            styled_lookup_counter: None,
+            block_diagnose_state: &empty_map,
+        },
         cache,
     )
+}
+
+/// R2-2 (stage 2): long commands wrap into multiple rows. The wrapped row
+/// count must flow into `command_wrap_rows` (cache), `base_row_count`
+/// (prefix sum) AND the layout pass rows — all from the same
+/// `command_line_chunks` call with the same args, so scroll/height
+/// accounting can't drift between the two paths.
+#[test]
+fn long_command_wraps_into_multiple_layout_rows() {
+    let mut block = finished_block(1, "result\n", false);
+    block.command = "cargo build --release --workspace --verbose".to_owned();
+    let mut cache = BlockLayoutCache::default();
+    cache.ensure_cached(&block, 20); // cols=20 → first line 17 cols (foldable)
+    cache.build_prefix_sum(std::slice::from_ref(&block));
+
+    let cached = cache.get(block.id.0);
+    let wrap_rows = cached.command_wrap_rows;
+    assert!(wrap_rows > 1, "43-char command at cols=20 must wrap");
+
+    // base_row_count = content(1) + gap(1) + wrapped command + separator(1)
+    assert_eq!(cached.base_row_count, 3 + wrap_rows);
+    assert_eq!(cache.prefix_sum(), &[0, 3 + wrap_rows]);
+
+    // Layout pass must agree: command band height = wrap_rows * pitch.
+    let layout = completed_layout_cols(std::slice::from_ref(&block), &cache, 20);
+    let cmd_idx = layout
+        .row_data
+        .iter()
+        .position(|r| matches!(r, LaidRow::Command { .. }))
+        .expect("command row present");
+    assert_eq!(
+        layout.rows[cmd_idx] - layout.rows[cmd_idx - 1],
+        wrap_rows as f32 * 20.0
+    );
+    let cmd_chunks = match &layout.row_data[cmd_idx] {
+        LaidRow::Command { chunks, .. } => chunks.clone(),
+        _ => unreachable!(),
+    };
+    assert_eq!(cmd_chunks.len(), wrap_rows);
+    // Chunks rejoin to the prompt-stripped command (no text loss).
+    assert_eq!(cmd_chunks.concat(), strip_prompt_prefix(&block.command));
+}
+
+/// Collapsed blocks keep the command on a single row regardless of length.
+#[test]
+fn collapsed_long_command_stays_single_line() {
+    let mut block = finished_block(1, "result\n", true);
+    block.command = "cargo build --release --workspace --verbose".to_owned();
+    let mut cache = BlockLayoutCache::default();
+    cache.ensure_cached(&block, 20);
+    cache.build_prefix_sum(std::slice::from_ref(&block));
+    assert_eq!(cache.get(block.id.0).command_wrap_rows, 1);
+    // collapsed: content 0 + gap 0 + command 1 + separator 1
+    assert_eq!(cache.get(block.id.0).base_row_count, 2);
 }
 
 #[test]

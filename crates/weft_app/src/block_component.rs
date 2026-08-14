@@ -1,7 +1,7 @@
 //! Pure presentation model for BlockView metadata.
 
-use crate::paint::grid_cache::block_line_chunks;
-use crate::paint::ui_helpers::{abbreviate_path, block_duration_str};
+use crate::paint::grid_cache::{block_line_chunks, command_line_chunks};
+use crate::paint::ui_helpers::{abbreviate_path, block_duration_str, strip_prompt_prefix};
 use weft_core::blocks::Block;
 use weft_core::vt::Terminal;
 
@@ -17,50 +17,67 @@ pub(crate) enum BlockTone {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BlockPresentation {
-    pub(crate) label: String,
+    /// 首段:CWD 或 "{n} lines" 折叠摘要
+    pub(crate) cwd: String,
+    /// 计时 < 1ms 时为空串,不画
+    pub(crate) duration: String,
+    /// 仅失败/中断有文案;成功为空串
+    pub(crate) status: String,
     pub(crate) tone: BlockTone,
+}
+
+impl BlockPresentation {
+    /// 拼接各段(" · ")供 fallback 文本;bv_rows 已内联相同逻辑,仅单测调用,保留为 canonical join 防漂移。
+    #[allow(dead_code)]
+    pub(crate) fn label(&self) -> String {
+        let mut parts = vec![self.cwd.as_str()];
+        if !self.duration.is_empty() {
+            parts.push(self.duration.as_str());
+        }
+        if !self.status.is_empty() {
+            parts.push(self.status.as_str());
+        }
+        parts.join(" · ")
+    }
 }
 
 pub(crate) fn block_presentation(block: &Block, output_lines: usize) -> BlockPresentation {
     let duration = block_duration_str(block);
-    let status = match block.exit_code {
-        Some(code) => format!("exit {code}"),
-        None => "interrupted".to_string(),
-    };
     let tone = match block.exit_code {
         Some(0) => BlockTone::Success,
         Some(_) => BlockTone::Error,
         None => BlockTone::Warning,
     };
 
-    let mut parts = if block.collapsed {
+    let cwd = if block.collapsed {
         let unit = if output_lines == 1 { "line" } else { "lines" };
-        vec![format!("{output_lines} {unit}")]
+        format!("{output_lines} {unit}")
     } else {
-        vec![block
+        block
             .cwd
             .as_deref()
             .map(abbreviate_path)
-            .unwrap_or_else(|| "~".to_string())]
+            .unwrap_or_else(|| "~".to_string())
     };
-    if !duration.is_empty() {
-        parts.push(duration);
-    }
-    // Success is already conveyed by the normal block tone. Keep explicit
-    // status text for failures/interruption, where it is actionable.
-    if block.exit_code != Some(0) {
-        parts.push(status);
-    }
+    // 成功已由 tone 传达;仅失败/中断保留可操作的显式 status 文案。
+    let status = if block.exit_code != Some(0) {
+        match block.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "interrupted".to_string(),
+        }
+    } else {
+        String::new()
+    };
 
     BlockPresentation {
-        label: parts.join(" · "),
+        cwd,
+        duration,
+        status,
         tone,
     }
 }
 
-/// OpenCode 1.18.x clears its TUI but emits no session card on exit (verified
-/// from the raw PTY stream). Surface stable CLI recovery commands without
-/// inventing a session id or coupling Weft to OpenCode's private database.
+/// OpenCode 1.18.x 退出时清屏但不发 session card(已从原始 PTY 流验证);给出稳定的 CLI 恢复命令,不臆造 session id。
 pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
     const OPENCODE_HINTS: &[&str] = &[
         "Continue last session: opencode -c",
@@ -86,28 +103,60 @@ pub(crate) fn live_context_label(cwd: Option<&str>, git_branch: Option<&str>) ->
     })
 }
 
-/// Prompt height belongs only to the shell editor. A running full-screen
-/// application paints BlockView to the bottom of the viewport.
+/// Prompt 高度只属于 shell 编辑器;运行中的全屏应用把 BlockView 画到视口底部。
 pub(crate) fn block_prompt_lines(terminal: &Terminal) -> Option<usize> {
     (terminal.effective_input_mode() == weft_core::input::InputMode::Editor)
         .then_some(terminal.editor().buffer.lines.len())
 }
 
 /// Total/visible BlockView rows used by scrollbar and input geometry.
-pub(crate) fn completed_block_row_count(output_lines: usize, header_rows: usize) -> usize {
-    output_lines + command_output_gap_rows(output_lines) + header_rows.max(1) + 2
-    // command + accessible header band + separator
+/// R2-2 (stage 2): 命令可折行,`command_wrap_rows` 计多行,再 +1 separator。
+pub(crate) fn completed_block_row_count(
+    output_lines: usize,
+    header_rows: usize,
+    command_wrap_rows: usize,
+) -> usize {
+    output_lines
+        + command_output_gap_rows(output_lines)
+        + header_rows.max(1)
+        + command_wrap_rows
+        + 1
 }
 
-/// Warp-style breathing room between a command and its first output row.
-/// Empty/collapsed commands stay compact because there is no result to split.
+/// Warp 风格:命令与其首行输出之间的留白;空/折叠命令无输出,保持紧凑。
 pub(crate) fn command_output_gap_rows(output_rows: usize) -> usize {
     usize::from(output_rows > 0)
 }
 
-/// A successful shell `clear` leaves one terminal-sized blank screen between
-/// the blocks on either side of it. Keep this semantic in rows so painting,
-/// scrolling, find navigation and history-panel jumps cannot drift apart.
+/// 命令是否有非空输出(决定首行缩进与可折叠态);与 `compute_block_layout` 的 foldable 判定同源。
+pub(crate) fn block_foldable(block: &Block) -> bool {
+    block
+        .output
+        .lines()
+        .rev()
+        .take(500)
+        .any(|line| !line.trim().is_empty())
+}
+
+/// 命令首行可用列数:foldable 缩 3 列,否则 2 列;与 grid_cache / layout_pass 同参数。
+pub(crate) fn command_first_cols(cols: usize, foldable: bool) -> usize {
+    cols.saturating_sub(if foldable { 3 } else { 2 }).max(1)
+}
+
+/// 命令折行行数:折叠=1(单行),展开=`command_line_chunks` 计数。
+/// 三处几何路径(grid_cache、layout_pass::Command、completed_block_* 行数)共用单一来源,量纲不漂移。
+pub(crate) fn command_wrap_rows_for(block: &Block, cols: usize, foldable: bool) -> usize {
+    if block.collapsed {
+        1
+    } else {
+        let cleaned = strip_prompt_prefix(&block.command);
+        command_line_chunks(&cleaned, command_first_cols(cols, foldable), cols)
+            .len()
+            .max(1)
+    }
+}
+
+/// `clear` 在两侧块之间留下一整屏空行;统一用行数表达,避免 paint/滚动/查找/历史跳转漂移。
 pub(crate) fn clear_block_spacer_rows(command: &str, viewport_rows: usize) -> usize {
     usize::from(command.split_whitespace().next() == Some("clear")) * viewport_rows.max(1)
 }
@@ -139,13 +188,14 @@ pub(crate) fn completed_block_layout_rows(
     header_rows: usize,
     viewport_rows: usize,
 ) -> usize {
-    completed_block_row_count(completed_block_output_rows(block, cols), header_rows)
-        + clear_block_spacer_rows(&block.command, viewport_rows)
+    completed_block_row_count(
+        completed_block_output_rows(block, cols),
+        header_rows,
+        command_wrap_rows_for(block, cols, block_foldable(block)),
+    ) + clear_block_spacer_rows(&block.command, viewport_rows)
 }
 
-/// Distance from the bottom of a completed block to the visual row that owns
-/// a Find hit. This mirrors the renderer's bottom-to-top order, including
-/// wrapped output and recovery hints.
+/// 块底到 Find 命中视觉行的距离,镜像渲染器自底向上的顺序(含折行输出与恢复提示)。
 pub(crate) fn completed_block_match_row_from_bottom(
     block: &Block,
     hit: &weft_core::find::BlockMatch,
@@ -191,9 +241,7 @@ pub(crate) fn completed_block_match_row_from_bottom(
     hints + rows_after + chunks.len().saturating_sub(chunk_index + 1) + 1
 }
 
-/// Convert a character-indexed find hit into wrapped visual-row ranges.
-/// Returned columns and lengths are terminal display columns, so CJK and
-/// other wide characters align with the glyphs painted by BlockView.
+/// 把按字符索引的命中转成折行后的视觉行范围;列/长度均为显示列,保证 CJK 与绘制的字形对齐。
 pub(crate) fn block_match_visual_ranges(
     line: &str,
     hit_col: usize,
@@ -237,11 +285,8 @@ pub(crate) fn block_content_metrics(
     block_content_metrics_with_cache(terminal, cols, header_rows, None)
 }
 
-/// R2-2: cached variant of [`block_content_metrics`]. When `cache` is `Some`
-/// and a block's layout is cached, reads `output_rows` in O(1) instead of
-/// re-wrapping every output line in O(m) via [`completed_block_output_rows`].
-/// Falls back to the direct path for uncached blocks (e.g. a block finalized
-/// after the last paint, or callers without renderer access).
+/// R2-2: 缓存变体。缓存命中时 O(1) 读 `output_rows`,否则回退直接计算
+/// (如最后一帧后才 finalized 的块,或无渲染器访问权的调用方)。
 pub(crate) fn block_content_metrics_with_cache(
     terminal: &Terminal,
     cols: usize,
@@ -253,25 +298,32 @@ pub(crate) fn block_content_metrics_with_cache(
     let mut total = 0;
     let viewport_rows = terminal.grid().num_rows.max(1);
     for block in terminal.block_tracker().session_blocks() {
-        // R2-2: read cached output_rows (O(1)) instead of re-wrapping every
-        // block's output every frame (O(m) per block). The cache is keyed by
-        // BlockId.0; ensure_cached was already called by the paint path, so
-        // the entry exists. If somehow it doesn't (e.g. block finalized after
-        // the last paint), fall back to the direct computation.
-        let output_rows = cache
-            .and_then(|c| c.get_if_cached(block.id.0))
+        // R2-2: 命中缓存 O(1) 读 output_rows/command_wrap_rows,未命中
+        // (末帧后才 finalized 的块)回退直接计算。
+        let cached = cache.and_then(|c| c.get_if_cached(block.id.0));
+        let expired = |c: &crate::paint::grid_cache::CachedBlockLayout| {
+            c.cols != cols || c.collapsed != block.collapsed
+        };
+        let output_rows = cached
             .map(|c| {
-                if c.cols != cols || c.collapsed != block.collapsed {
-                    // Stale cache entry — fall back. ensure_cached will fix it
-                    // on the next paint frame. This is rare (resize between
-                    // paint and metrics) and correct, just not O(1).
+                if expired(c) {
+                    // 缓存过期(resize/折叠)回退;下一帧 ensure_cached 修复,罕见且正确。
                     completed_block_output_rows(block, cols)
                 } else {
                     c.output_rows
                 }
             })
             .unwrap_or_else(|| completed_block_output_rows(block, cols));
-        total += completed_block_row_count(output_rows, header_rows)
+        let command_wrap_rows = cached
+            .map(|c| {
+                if expired(c) {
+                    command_wrap_rows_for(block, cols, block_foldable(block))
+                } else {
+                    c.command_wrap_rows
+                }
+            })
+            .unwrap_or_else(|| command_wrap_rows_for(block, cols, block_foldable(block)));
+        total += completed_block_row_count(output_rows, header_rows, command_wrap_rows)
             + clear_block_spacer_rows(&block.command, viewport_rows);
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
@@ -292,20 +344,10 @@ pub(crate) fn block_content_metrics_with_cache(
     (total, terminal.grid().num_rows.max(1))
 }
 
-/// v1.10.5: map a grid cursor row into the live block's snapshot text.
-///
-/// The screen snapshot spans `document_start .. grid end` (all viewport
-/// rows included), so a viewport cursor row sits at
-/// `line_count - grid_rows + cursor_row` in the snapshot. Shared by the
-/// BlockView paint (caret + IME preedit) and the native IME anchor so both
-/// stay on the same document row.
-///
-/// v1.10.6: when the snapshot is shorter than the grid viewport
-/// (`live_line_count < grid_rows`), the mapping collapses to `cursor_row`
-/// itself. But `cursor_row` may exceed `live_line_count` (the TUI wrote
-/// blank/border rows the snapshot omits, or the cursor sits outside the
-/// document boundary). Clamp to the last live line so the caret and preedit
-/// stay at the document's input edge instead of vanishing entirely.
+/// v1.10.5: 把 grid 光标行映射进 live 块快照(`document_start .. grid end`):
+/// `line_count - grid_rows + cursor_row`,BlockView paint(caret/IME preedit)
+/// 与原生 IME anchor 共用同一 document 行。
+/// v1.10.6: 快照短于视口时,钳制到最后一行 live 文本,避免 caret/preedit 消失。
 pub(crate) fn block_view_tui_cursor_line(
     live_line_count: usize,
     grid_rows: usize,
@@ -317,12 +359,8 @@ pub(crate) fn block_view_tui_cursor_line(
     mapped.min(live_line_count.saturating_sub(1))
 }
 
-/// v1.10.5: whether a laid-out BlockView Output row may carry the TUI caret
-/// and IME preedit. Only LIVE block rows use the snapshot-line index space
-/// the caret maps into; finished-block rows use their own 0-based output
-/// index, which collides numerically (a finished block with N+ lines would
-/// otherwise draw the caret/preedit on its Nth row). The `block_id` is
-/// `None` for live rows and `Some(id)` for finished blocks.
+/// v1.10.5: 仅 LIVE 行(block_id=None)可挂 TUI caret/IME preedit;已完成块用
+/// 0 基输出索引,数字上与快照行索引冲突,否则会在其第 N 行画出 caret/preedit。
 pub(crate) fn tui_caret_row_matches(
     block_id: Option<u64>,
     line_idx: usize,
@@ -331,11 +369,8 @@ pub(crate) fn tui_caret_row_matches(
     block_id.is_none() && line_idx == cursor_line
 }
 
-/// Whether fresh PTY output should keep the BlockView pinned to the live tail.
-///
-/// A primary-screen application also emits output when it repaints after
-/// SIGWINCH. Once the user has explicitly entered its detached history view,
-/// that repaint must not steal the viewport and switch back to the live Grid.
+/// 新 PTY 输出是否让 BlockView 保持钉在 live 尾部。主屏应用 SIGWINCH 重绘也会输出;
+/// 用户已进入 detached 历史视图后,该重绘不得抢回视口切回 live Grid。
 pub(crate) fn should_follow_running_output(
     phase: weft_core::blocks::ShellPhase,
     primary_history_view: bool,
@@ -343,12 +378,8 @@ pub(crate) fn should_follow_running_output(
     phase == weft_core::blocks::ShellPhase::CommandExecuting && !primary_history_view
 }
 
-/// Clamp a bottom-relative BlockView offset to the range produced by the
-/// current viewport and wrapping width.
-///
-/// Width, height, font, sidebar and prompt changes can all shrink the range;
-/// retaining an offset from the previous layout makes the newest rows
-/// unreachable or paints blank space.
+/// 把自底偏移钳制到当前视口/折行宽度产生的范围内;宽高/字体/侧栏/prompt 变化都会
+/// 缩小范围,沿用旧偏移会使最新行不可达或画空白。
 pub(crate) fn reconciled_block_scroll(
     scroll: usize,
     total_rows: usize,
@@ -357,12 +388,7 @@ pub(crate) fn reconciled_block_scroll(
     scroll.min(total_rows.saturating_sub(visible_rows))
 }
 
-/// Reconcile one tab's detached transcript after any geometry change.
-///
-/// Window resize events are not the only source of new terminal dimensions:
-/// opening a panel, changing font metrics and restoring a window all call the
-/// shared layout recomputation path too. Keeping the full calculation here
-/// prevents those paths from drifting apart.
+/// 几何变化(窗口/面板/字体/恢复窗口)后统一重算单 tab 的 detached transcript 滚动,防止各路径漂移。
 pub(crate) fn reconciled_terminal_block_scroll(
     terminal: &Terminal,
     layout_ctx: &crate::layout::LayoutCtx,
@@ -386,13 +412,10 @@ pub(crate) fn reconciled_terminal_block_scroll(
     ))
 }
 
-/// F3-2: Braille spinner glyphs for the running-command activity indicator.
-/// Cycled left-to-right by `spinner_phase` (see `spinner_char_for_phase`).
+/// F3-2: 运行命令活动指示器的盲文 spinner 字形,按 `spinner_phase` 从左到右循环。
 pub(crate) const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// F3-2: Map a normalized phase [0, 1) to a braille spinner glyph.
-/// Returns `●` (static dot) when `reduce_motion` is true or the phase is
-/// negative (disabled). Pure logic — unit-tested.
+/// F3-2: 归一化 phase → 盲文字形;reduce_motion 或负 phase 返回静态 `●`。纯逻辑,已单测。
 pub(crate) fn spinner_char_for_phase(phase: f32, reduce_motion: bool) -> char {
     if reduce_motion || phase < 0.0 {
         return '●';
@@ -409,9 +432,7 @@ mod tests {
 
     #[test]
     fn tui_cursor_line_maps_viewport_row_into_snapshot() {
-        // v1.10.5: the grid cursor is a viewport row; the snapshot spans
-        // document_start..grid-end, so the cursor's snapshot line is
-        // line_count - grid_rows + cursor_row.
+        // v1.10.5: 快照跨 document_start..grid end,光标快照行 = line_count - grid_rows + cursor_row。
         assert_eq!(
             block_view_tui_cursor_line(34, 34, 33),
             33,
@@ -429,9 +450,7 @@ mod tests {
         );
         // Degenerate inputs saturate instead of underflowing.
         assert_eq!(block_view_tui_cursor_line(2, 34, 0), 0);
-        // v1.10.6: when snapshot < grid (pi: 10 lines, 33 rows), cursor_row
-        // may exceed live_line_count. Clamp to the last live line so the
-        // caret/preedit stay at the document's input edge.
+        // v1.10.6: 快照 < grid 时 cursor_row 可能超出 live_line_count,钳制到末行。
         assert_eq!(
             block_view_tui_cursor_line(10, 33, 13),
             9,
@@ -446,10 +465,8 @@ mod tests {
 
     #[test]
     fn tui_caret_row_matches_live_rows_only() {
-        // v1.10.5 (reviewer HIGH): finished-block rows reuse a 0-based
-        // output index that collides numerically with the live block's
-        // snapshot-line index — the caret/preedit must only paint on live
-        // rows (`block_id == None`), or it draws onto history blocks.
+        // v1.10.5 (reviewer HIGH): 已完成块的 0 基输出索引与 live 快照行索引数字冲突,
+        // caret/preedit 只能画在 live 行(block_id == None)。
         let cursor_line = 33;
         assert!(
             tui_caret_row_matches(None, cursor_line, cursor_line),
@@ -487,21 +504,30 @@ mod tests {
     #[test]
     fn collapsed_block_uses_one_line_summary() {
         let presentation = block_presentation(&block(Some(0), true), 3);
-        assert_eq!(presentation.label, "3 lines · 1.2s");
+        assert_eq!(presentation.cwd, "3 lines");
+        assert_eq!(presentation.duration, "1.2s");
+        assert_eq!(presentation.status, "", "成功块 status 必须为空");
+        assert_eq!(presentation.label(), "3 lines · 1.2s");
         assert_eq!(presentation.tone, BlockTone::Success);
     }
 
     #[test]
     fn expanded_block_keeps_context_and_surfaces_failure() {
         let presentation = block_presentation(&block(Some(7), false), 3);
-        assert_eq!(presentation.label, "/tmp/weft · 1.2s · exit 7");
+        assert_eq!(presentation.cwd, "/tmp/weft");
+        assert_eq!(presentation.duration, "1.2s");
+        assert_eq!(presentation.status, "exit 7");
+        assert_eq!(presentation.label(), "/tmp/weft · 1.2s · exit 7");
         assert_eq!(presentation.tone, BlockTone::Error);
     }
 
     #[test]
     fn interrupted_block_has_warning_tone() {
         let presentation = block_presentation(&block(None, true), 1);
-        assert_eq!(presentation.label, "1 line · 1.2s · interrupted");
+        assert_eq!(presentation.cwd, "1 line");
+        assert_eq!(presentation.duration, "1.2s");
+        assert_eq!(presentation.status, "interrupted");
+        assert_eq!(presentation.label(), "1 line · 1.2s · interrupted");
         assert_eq!(presentation.tone, BlockTone::Warning);
     }
 
@@ -661,8 +687,9 @@ mod tests {
         );
 
         // Both structural lines are clipped to one rendered row at 8 cols.
-        // The block itself contributes command + header + gap.
-        assert_eq!(block_content_metrics(&terminal, 8, 1).0, 6);
+        // Command "report" (6 cols) exceeds first_cols=5 (foldable → -3),
+        // so it wraps to 2 rows: block = 2 output + 1 gap + 1 header + 2 command + 1 separator.
+        assert_eq!(block_content_metrics(&terminal, 8, 1).0, 7);
     }
 
     #[test]
@@ -721,9 +748,9 @@ mod tests {
 
     #[test]
     fn spinner_char_wraps_around_at_one() {
-        // Phase exactly 1.0 should wrap to index 0.
+        // Phase 1.0 折回 index 0。
         assert_eq!(spinner_char_for_phase(1.0, false), SPINNER_CHARS[0]);
-        // Phase slightly less than 1.0 should be the last glyph.
+        // 略小于 1.0 时为最后一个字形。
         let last_idx = SPINNER_CHARS.len() - 1;
         let last = last_idx as f32 / SPINNER_CHARS.len() as f32;
         assert_eq!(
@@ -732,10 +759,7 @@ mod tests {
         );
     }
 
-    // ---- R2-2 assumption falsification tests ----
-    // These tests validate the 5 assumptions listed in BATCH3_IMPLEMENTATION_PLAN.md
-    // before any prefix-sum optimization is applied. They pin the current behavior
-    // so the optimization can be verified against them.
+    // ---- R2-2 假设证伪测试:钉住现状行为,供前缀和优化验证 ----
 
     fn r22_block(command: &str, output: &str) -> Block {
         Block {
@@ -751,11 +775,7 @@ mod tests {
         }
     }
 
-    /// Assumption 1 (CONFIRMED): block height depends on viewport_rows when
-    /// the command is `clear` — `clear_block_spacer_rows` returns
-    /// `viewport_rows` for clear, 0 otherwise. R2-2 must either include
-    /// viewport_rows in the cache key or extract the spacer as a separate
-    /// O(1) term.
+    /// 假设1: `clear` 的块高度依赖 viewport_rows;R2-2 需将 viewport_rows 纳入缓存键或单独 O(1) 化。
     #[test]
     fn r22_clear_command_height_depends_on_viewport_rows() {
         let b = r22_block("clear", "");
@@ -765,17 +785,16 @@ mod tests {
         let h_30 = completed_block_layout_rows(&b, cols, header_rows, 30);
         let h_50 = completed_block_layout_rows(&b, cols, header_rows, 50);
 
-        // clear command produces a viewport-sized spacer → height must differ.
+        // clear 产生整屏 spacer,高度必须随 viewport_rows 变化。
         assert_ne!(
             h_30, h_50,
             "clear command height must depend on viewport_rows"
         );
-        // The spacer equals viewport_rows; the rest (header + gap) is fixed.
+        // spacer = viewport_rows 之差;其余(header + gap)固定。
         assert_eq!(h_50 - h_30, 20, "delta must equal viewport_rows delta");
     }
 
-    /// Assumption 1 (negative case): non-clear commands do NOT depend on
-    /// viewport_rows. This confirms the dependency is isolated to clear.
+    /// 假设1(反例):非 clear 命令不依赖 viewport_rows,依赖隔离在 clear。
     #[test]
     fn r22_non_clear_command_height_independent_of_viewport_rows() {
         let b = r22_block("ls -la", "file1\nfile2\nfile3\n");
@@ -791,38 +810,30 @@ mod tests {
         );
     }
 
-    /// Assumption 3: `block_content_metrics` is the single total source.
-    /// This test pins its contract: returns (total, visible) where visible
-    /// = grid num_rows. It does NOT test all 6 call sites (see grep in the
-    /// batch 3 research), but pins the function signature/return shape.
+    /// 假设3: 钉住 `block_content_metrics` 的 (total, visible=grid num_rows) 契约。
     #[test]
     fn r22_block_content_metrics_returns_total_and_visible() {
         use weft_core::vt::Terminal;
         let mut terminal = Terminal::new(30, 80);
-        // No blocks → total = 0, visible = num_rows.
+        // 无块 → total = 0,visible = num_rows。
         let (total, visible) = block_content_metrics(&terminal, 80, 2);
         assert_eq!(total, 0);
         assert_eq!(visible, 30);
-        // block_content_metrics reads terminal.grid().num_rows as viewport_rows.
-        // Resizing the terminal changes visible (and would change total if any
-        // block had a clear command).
+        // resize 改变 visible(若有 clear 块也会改变 total)。
         terminal.resize(50, 80);
         let (total2, visible2) = block_content_metrics(&terminal, 80, 2);
         assert_eq!(total2, 0);
         assert_eq!(visible2, 50);
     }
 
-    /// Assumption 5: `CachedBlockLayout.lines` already stores wrapped chunks,
-    /// but `completed_block_output_rows` re-wraps via `block_line_chunks`.
-    /// This test confirms the re-wrap is redundant (same result), validating
-    /// that R2-2 can safely route through the cache.
+    /// 假设5: 缓存已存折行块,直接计算为冗余重折行;钉住两者结果一致,验证可安全走缓存。
     #[test]
     fn r22_cached_chunks_match_completed_block_output_rows() {
         use crate::paint::grid_cache::BlockLayoutCache;
         let b = r22_block("echo hi", "short line\na much longer line that surely wraps past eighty columns when rendered at eighty cols\n");
         let cols = 80;
 
-        // Cache path: ensure_cached + sum chunks per line.
+        // 缓存路径:ensure_cached + 逐行求和。
         let mut cache = BlockLayoutCache::default();
         cache.ensure_cached(&b, cols);
         let cached = cache.get(b.id.0);
@@ -832,7 +843,7 @@ mod tests {
             .map(|line| line.chunk_ranges.len())
             .sum();
 
-        // Direct path: completed_block_output_rows re-wraps.
+        // 直接路径:completed_block_output_rows 重折行。
         let direct_rows = completed_block_output_rows(&b, cols);
 
         assert_eq!(
@@ -841,33 +852,28 @@ mod tests {
         );
     }
 
-    /// R2-2 regression: collapsed blocks must report `output_rows = 0` in the
-    /// cache, matching `completed_block_output_rows`. Without the collapsed
-    /// guard in `compute_block_layout`, the cache would store non-zero rows
-    /// and the scrollbar thumb would be sized as if the output were visible.
+    /// R2-2 回归:折叠块缓存 output_rows 必须为 0,否则滚动条拇指按可见输出尺寸化。
     #[test]
     fn r22_collapsed_block_cache_reports_zero_output_rows() {
         use crate::paint::grid_cache::BlockLayoutCache;
         let mut b = r22_block("echo hi", "line one\nline two\nline three\n");
         let cols = 80;
 
-        // Uncollapsed: cache should have non-zero output_rows.
+        // 未折叠:output_rows 非零。
         let mut cache = BlockLayoutCache::default();
         cache.ensure_cached(&b, cols);
         let uncollapsed_rows = cache.get(b.id.0).output_rows;
         assert_eq!(uncollapsed_rows, 3);
 
-        // Collapse: cache must rebuild with output_rows = 0.
+        // 折叠后缓存重建,output_rows 必须为 0。
         b.collapsed = true;
         cache.ensure_cached(&b, cols);
         assert_eq!(cache.get(b.id.0).output_rows, 0);
 
-        // The cached path must agree with the fallback path.
+        // 缓存路径必须与回退路径一致。
         let mut terminal = Terminal::new(24, 80);
         terminal.process(b"\x1b]133;A\x07echo hi\x1b]133;B\x07\x1b]133;C\x07line one\r\nline two\r\nline three\r\n\x1b]133;D;0\x07");
-        // No direct API to collapse a finalized block; verify via the function
-        // contract: block_content_metrics (None cache) and _with_cache (Some)
-        // must agree.
+        // 无直接 API 折叠已完成块;以缓存/非缓存两条路径总数一致来验证。
         let (total_none, _) = block_content_metrics(&terminal, 80, 1);
         let cache = terminal.block_tracker(); // borrow to build a cache
         let mut blk_cache = BlockLayoutCache::default();

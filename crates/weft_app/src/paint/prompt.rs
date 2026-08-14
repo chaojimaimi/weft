@@ -9,6 +9,8 @@ use crate::paint::primitives::{
     color_to_normalized, composite_color_over, push_quad, scale_color_alpha,
 };
 use crate::renderer::MetalRenderer;
+use std::ops::Range;
+use weft_core::syntax::{tokenize_spans, TokenKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PromptVisualRow {
@@ -330,6 +332,13 @@ impl MetalRenderer {
         }
         // F2 P0-1: only render the visible window [scroll_offset, scroll_offset +
         // visible_rows), adjusting each line's Y by scroll_offset.
+        // 整逻辑行 tokenize(而非逐视觉行):字符串/命令位置状态跨视觉折行保持,
+        // 手动换行(=新逻辑行)重新开始命令位置。
+        let line_spans: Vec<Vec<(Range<usize>, TokenKind)>> = p
+            .lines
+            .iter()
+            .map(|line| tokenize_spans(line, true))
+            .collect();
         let vis_end = (scroll_offset + visible_rows).min(visual.rows.len());
         for (i, selection_range) in visual_selection_ranges
             .iter()
@@ -337,7 +346,7 @@ impl MetalRenderer {
             .take(vis_end)
             .skip(scroll_offset)
         {
-            let line = &visual.rows[i].text;
+            let row = &visual.rows[i];
             let y = text_y0 + (i - scroll_offset) as f32 * ch;
             let (start_x, max_chars) = if i == 0 {
                 let avail = box_cols.saturating_sub(prompt_chars).max(1);
@@ -346,10 +355,18 @@ impl MetalRenderer {
                 (left, box_cols)
             };
             let selection = selection_range.map(|(start, end)| (start, end, selection_canvas));
-            self.push_line_tokenized_on_canvas(
+            // 空 buffer / 空逻辑行:没有 spans,跳过绘制
+            let Some(spans) = line_spans.get(row.source_line) else {
+                continue;
+            };
+            let line = &p.lines[row.source_line];
+            self.push_line_spans_on_canvas(
                 &mut verts,
                 [start_x, y],
                 line,
+                row.char_start,
+                row.char_end,
+                spans,
                 max_chars,
                 box_bg,
                 selection,

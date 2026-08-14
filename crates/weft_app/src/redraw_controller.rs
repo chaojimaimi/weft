@@ -5,6 +5,10 @@ use super::*;
 impl App {
     pub(super) fn handle_redraw_requested(&mut self) {
         self.pump_pty();
+        // Drag-selection autoscroll: the 40ms timer wakes this path while a
+        // drag is held past the block content edge, so the viewport keeps
+        // scrolling (and the selection extending) even with a still pointer.
+        self.pump_selection_autoscroll();
         let had_output = self.process_messages();
         // v1.10.4: if the active pane entered/exited alt-screen (DEC 1049),
         // recompute geometry so PTY cols switch between full-width (TUI)
@@ -540,23 +544,11 @@ impl App {
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid
             // view — the scrollbar only shows in block view anyway.
+            // A1: computed live via `Renderer::block_scroll_metrics` (same
+            // layout-cache path the wheel handler uses) instead of a second
+            // inline copy of the formula.
             let scroll_metrics = if terminal.show_block_view() {
-                let cols = terminal.grid().num_cols;
-                let cache = renderer.block_layout_cache.borrow();
-                let (total, _) = block_content_metrics_with_cache(
-                    terminal,
-                    cols,
-                    renderer.block_header_rows(),
-                    Some(&*cache),
-                );
-                let prompt_lines = crate::block_component::block_prompt_lines(terminal);
-                let cwd_header = crate::layout::block_cwd_header_active(
-                    terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
-                    terminal.cwd().is_some(),
-                );
-                let visible = renderer.block_visible_rows(prompt_lines, cwd_header);
-                let max_scroll = total.saturating_sub(visible);
-                Some((total, visible, max_scroll))
+                Some(renderer.block_scroll_metrics(terminal))
             } else {
                 None
             };
@@ -784,9 +776,16 @@ impl App {
             self.window_runtime
                 .cursor_anim_active
                 .store(anim_active, Ordering::Relaxed);
-            // F3-2: keep the spinner timer running while a command is executing
-            // so the braille activity indicator animates even without PTY output.
+            // F3-2: keep the spinner timer running while a command is executing so the
+            // braille activity indicator animates even without PTY output. Gated on
+            // block view: the spinner is a block-view element only (block_view.rs:948);
+            // in grid mode (primary-screen TUI / alt-screen app owning the screen) there
+            // is nothing to animate, so firing the 80ms timer only triggers pointless
+            // full grid rebuilds (force_full_grid_redraw) — a major contributor to
+            // execution-period flicker. spinner_phase has no grid-mode consumer
+            // (tab_bar/status do not use it).
             let spinner_active = terminal.block_tracker().phase() == ShellPhase::CommandExecuting
+                && terminal.show_block_view()
                 && !self.window_runtime.reduce_motion;
             self.window_runtime
                 .spinner_anim_active

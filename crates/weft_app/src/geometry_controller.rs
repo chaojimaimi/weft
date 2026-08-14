@@ -363,7 +363,7 @@ impl App {
     /// the full-line char index that `StyledLine::link_at` expects.
     pub(super) fn block_view_hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
         let pos = self.pixel_to_block_view_pos(x, y)?;
-        let rows = self.compute_block_view_rows();
+        let (rows, _, _) = self.compute_block_view_rows()?;
         let row = rows.get(pos.row_index)?;
         let line_idx = row.line?;
         let char_index = row.chunk_char_offset + pos.char_index;
@@ -410,7 +410,7 @@ impl App {
             return None;
         }
         let ctx = renderer.layout_ctx?;
-        let rows = self.compute_block_view_rows();
+        let (rows, _, _) = self.compute_block_view_rows()?;
         if rows.is_empty() {
             return None;
         }
@@ -423,34 +423,20 @@ impl App {
         ) {
             return None;
         }
-        // Map pixel x → char index by accumulating each char's display width.
-        // A click in the right half of a double-width cell rounds to that
-        // cell's index (so dragging across it selects the whole CJK char).
-        let mut col_cursor = 0usize; // column units consumed so far
+        // v1.10.13: command first lines render after the chevron + "> " indent;
+        // subtract it so the char index matches the character under the cursor
+        // (continuation lines and output rows are flush-left, indent 0).
         let (content_left, _) = crate::layout::block_content_x_bounds(&ctx);
-        let target_col = ((x as f32 - content_left) / ctx.cell_w).max(0.0) as usize;
-        for (ci, c) in row.text.chars().enumerate() {
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if w == 0 {
-                // Zero-width (combining mark): belongs to the previous cell,
-                // don't advance the column cursor.
-                continue;
-            }
-            // Click lands in this char if it's before the far edge of the cell.
-            // For double-width, the char occupies [col_cursor, col_cursor+2);
-            // a click anywhere in that range maps to this char.
-            if target_col < col_cursor + w {
-                return Some(BlockViewPos {
-                    row_index,
-                    char_index: ci,
-                });
-            }
-            col_cursor += w;
-        }
-        // Past the last char: clamp to end.
+        let char_index = weft_core::selection::pixel_x_to_char_index(
+            &row.text,
+            x,
+            content_left as f64,
+            cw,
+            row.indent_cols,
+        );
         Some(BlockViewPos {
             row_index,
-            char_index: row.text.chars().count(),
+            char_index,
         })
     }
 
@@ -537,25 +523,21 @@ impl App {
     }
 
     /// Compute block-view rows on-demand for hit-testing, instead of reading
-    /// the renderer's previous-frame `block_view_rows` cache. Returns empty
-    /// when not in block view.
-    pub(super) fn compute_block_view_rows(&self) -> Vec<weft_core::selection::BlockViewRow> {
-        let renderer = match self.renderer.as_ref() {
-            Some(r) => r,
-            None => return Vec::new(),
-        };
-        let terminal = match self.sessions.active().terminal.as_ref() {
-            Some(t) => t,
-            None => return Vec::new(),
-        };
+    /// the renderer's previous-frame `block_view_rows` cache. Returns
+    /// `(rows, clip_top, clip_bottom)` — the clip values are the visible
+    /// content band from the layout pass (rows carry overscan). `None` when
+    /// not in block view / no renderer / no terminal.
+    pub(super) fn compute_block_view_rows(
+        &self,
+    ) -> Option<(Vec<weft_core::selection::BlockViewRow>, f32, f32)> {
+        let renderer = self.renderer.as_ref()?;
+        let terminal = self.sessions.active().terminal.as_ref()?;
         if !terminal.show_block_view() {
-            return Vec::new();
+            return None;
         }
         let editor_mode = terminal.effective_input_mode() == weft_core::input::InputMode::Editor;
         let region_bottom_y = if editor_mode {
-            let Some(ctx) = renderer.layout_ctx else {
-                return Vec::new();
-            };
+            let ctx = renderer.layout_ctx?;
             let (_, prompt, _) = crate::paint::prompt::prompt_layout_for_buffer(
                 &ctx,
                 &terminal.editor().buffer.lines,
@@ -563,37 +545,37 @@ impl App {
             );
             prompt.box_rect[1]
         } else {
-            let Some(ctx) = renderer.layout_ctx else {
-                return Vec::new();
-            };
+            let ctx = renderer.layout_ctx?;
             ctx.bottom()
         };
-        renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
-            blocks: terminal.block_tracker().session_blocks(),
-            region_bottom_y,
-            cwd: terminal.cwd(),
-            git_branch: terminal.git_branch(),
-            live: (!editor_mode)
-                .then(|| terminal.block_tracker().in_flight())
-                .flatten(),
-            block_scroll: self.sessions.active().block_scroll_position(),
-            viewport_rows: terminal.grid().num_rows,
-            block_hovered: self.interaction.block_hovered,
-            block_selected: self.interaction.block_selected,
-            block_action_hovered: self.interaction.block_action_hovered,
-            spinner_phase: -1.0,
-            find_block_highlight: renderer
-                .find_state
-                .as_ref()
-                .and_then(|find| find.block_highlight),
-            palette: terminal.palette(),
-            cache_namespace: self.sessions.active().pane_session_id,
-            block_diagnose_state: &self.block_diagnose_state,
-            ai_configured: self.ai_state.is_configured(),
-            tui_cursor: None,
-            tui_preedit: None,
-            cursor_blink_on: false,
-        })
+        Some(
+            renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
+                blocks: terminal.block_tracker().session_blocks(),
+                region_bottom_y,
+                cwd: terminal.cwd(),
+                git_branch: terminal.git_branch(),
+                live: (!editor_mode)
+                    .then(|| terminal.block_tracker().in_flight())
+                    .flatten(),
+                block_scroll: self.sessions.active().block_scroll_position(),
+                viewport_rows: terminal.grid().num_rows,
+                block_hovered: self.interaction.block_hovered,
+                block_selected: self.interaction.block_selected,
+                block_action_hovered: self.interaction.block_action_hovered,
+                spinner_phase: -1.0,
+                find_block_highlight: renderer
+                    .find_state
+                    .as_ref()
+                    .and_then(|find| find.block_highlight),
+                palette: terminal.palette(),
+                cache_namespace: self.sessions.active().pane_session_id,
+                block_diagnose_state: &self.block_diagnose_state,
+                ai_configured: self.ai_state.is_configured(),
+                tui_cursor: None,
+                tui_preedit: None,
+                cursor_blink_on: false,
+            }),
+        )
     }
 
     /// True when the block view is the active renderer (Editor mode, not in
@@ -657,7 +639,7 @@ impl App {
     /// completed blocks, `Some(None)` for the in-flight (running) command,
     /// or `None` when not on a block row.
     pub(super) fn block_at(&self, y: f32) -> Option<Option<BlockId>> {
-        let rows = self.compute_block_view_rows();
+        let (rows, _, _) = self.compute_block_view_rows()?;
         // Find the row whose y-range contains `y`. Header/Command/Output rows
         // retain their owning finalized block; LiveCommand is in-flight.
         for row in &rows {

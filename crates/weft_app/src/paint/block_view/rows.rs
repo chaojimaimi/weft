@@ -34,6 +34,29 @@ pub(super) fn sticky_header_rows(has_cwd: bool) -> usize {
     }
 }
 
+/// Expand wrapped chunks into (chunk index, y_top, char offset) triples
+/// ordered bottom-to-top — the invariant `bv_rows` relies on (index grows
+/// upward). The last chunk (visually lowest) is pushed first; char offsets
+/// are precomputed as prefix sums since iteration is reversed.
+pub(super) fn wrapped_row_positions(
+    y: f32,
+    pitch: f32,
+    chunks: &[String],
+) -> Vec<(usize, f32, usize)> {
+    // Prefix sums: char offset of each chunk within the source line.
+    let mut offsets = Vec::with_capacity(chunks.len());
+    let mut acc = 0usize;
+    for chunk in chunks {
+        offsets.push(acc);
+        acc += chunk.chars().count();
+    }
+    // Bottom-to-top: highest ci (lowest visually) first.
+    (0..chunks.len())
+        .rev()
+        .map(|ci| (ci, y + ci as f32 * pitch, offsets[ci]))
+        .collect()
+}
+
 impl MetalRenderer {
     /// Compute block-view rows for hit-testing WITHOUT building vertices.
     /// This is the M1 on-demand alternative to caching `block_view_rows`
@@ -44,10 +67,15 @@ impl MetalRenderer {
     /// Shares the layout pass with `build_block_view_vertices` via
     /// `compute_block_layout_pass`, so y-bands are identical between paint
     /// and hit-testing. Only the bv_rows extraction is specific to this path.
+    /// Returns `(rows, clip_top, clip_bottom)`: the laid-out rows plus the
+    /// visible content band's clip boundaries from the layout pass. Callers
+    /// that need the visible content edge (e.g. autoscroll) must use the clip
+    /// values, not rows first/last — bv_rows carries overscan, so its topmost
+    /// row can sit above `clip_top - overscan`.
     pub(crate) fn compute_block_view_rows(
         &self,
         model: BlockViewPaintModel<'_>,
-    ) -> Vec<weft_core::selection::BlockViewRow> {
+    ) -> (Vec<weft_core::selection::BlockViewRow>, f32, f32) {
         let BlockViewPaintModel {
             blocks,
             region_bottom_y,
@@ -75,12 +103,12 @@ impl MetalRenderer {
         let vp_w = self.viewport.0;
         let vp_h = self.viewport.1;
         if cw <= 0.0 || ch <= 0.0 || vp_w <= 0.0 || vp_h <= 0.0 {
-            return Vec::new();
+            return (Vec::new(), 0.0, 0.0);
         }
 
         let ctx = match self.layout_ctx {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return (Vec::new(), 0.0, 0.0),
         };
         let cwd_header_active = cwd.is_some() && live.is_none();
         let layout = crate::layout::layout_block_view(&ctx, region_bottom_y, cwd_header_active);
@@ -147,14 +175,15 @@ impl MetalRenderer {
                             y_bottom: row_top_y + pitch,
                             line: line_idx,
                             chunk_char_offset: 0,
+                            indent_cols: 0,
                         });
                     } else {
                         // v1.6.1: track cumulative char offset per chunk so
                         // wrapped-line link resolution can compute the
                         // full-line char index.
-                        let mut offset = 0usize;
-                        for (ci, chunk) in chunks.iter().enumerate() {
-                            let cy = row_top_y + ci as f32 * pitch;
+                        for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks)
+                        {
+                            let chunk = &chunks[ci];
                             bv_rows.push(BlockViewRow {
                                 kind: BlockViewRowKind::Output,
                                 text: chunk.clone(),
@@ -162,34 +191,71 @@ impl MetalRenderer {
                                 y_top: cy,
                                 y_bottom: cy + pitch,
                                 line: line_idx,
-                                chunk_char_offset: offset,
+                                chunk_char_offset: char_offset,
+                                indent_cols: 0,
                             });
-                            offset += chunk.chars().count();
                         }
                     }
                 }
                 LaidRow::Command {
-                    command, block_id, ..
+                    chunks,
+                    foldable,
+                    block_id,
+                    ..
                 } => {
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::Command,
-                        text: command.to_string(),
-                        block_id: Some(*block_id),
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                    });
+                    // R2-2 (stage 2): one BlockViewRow per wrapped chunk
+                    // (mirrors Output's expansion) so hit-testing and
+                    // selection see every command line.
+                    for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks) {
+                        let chunk = &chunks[ci];
+                        bv_rows.push(BlockViewRow {
+                            kind: BlockViewRowKind::Command,
+                            text: chunk.clone(),
+                            block_id: Some(*block_id),
+                            y_top: cy,
+                            y_bottom: cy + pitch,
+                            line: None,
+                            // v1.10.13: first line renders after chevron + "> "
+                            // (3 cols if foldable else 2); continuations are
+                            // flush-left.
+                            indent_cols: if ci == 0 {
+                                if *foldable {
+                                    3
+                                } else {
+                                    2
+                                }
+                            } else {
+                                0
+                            },
+                            chunk_char_offset: char_offset,
+                        });
+                    }
                 }
-                LaidRow::Header { text, block_id, .. } => {
+                LaidRow::Header {
+                    cwd,
+                    duration,
+                    status,
+                    block_id,
+                    ..
+                } => {
+                    // 阶段 3:分段拆开后在此拼回 " · " 全文,供身份匹配/debug。
+                    let mut parts = vec![cwd.as_str()];
+                    if !duration.is_empty() {
+                        parts.push(duration.as_str());
+                    }
+                    if !status.is_empty() {
+                        parts.push(status.as_str());
+                    }
+                    let text = parts.join(" · ");
                     bv_rows.push(BlockViewRow {
                         kind: BlockViewRowKind::Header,
-                        text: text.clone(),
+                        text,
                         block_id: Some(*block_id),
                         y_top: row_top_y,
                         y_bottom: row_top_y + header_height,
                         line: None,
                         chunk_char_offset: 0,
+                        indent_cols: 0,
                     });
                 }
                 LaidRow::LiveHeader { text } => {
@@ -201,6 +267,7 @@ impl MetalRenderer {
                         y_bottom: row_top_y + pitch,
                         line: None,
                         chunk_char_offset: 0,
+                        indent_cols: 0,
                     });
                 }
                 LaidRow::Separator => {
@@ -212,18 +279,24 @@ impl MetalRenderer {
                         y_bottom: row_top_y + pitch,
                         line: None,
                         chunk_char_offset: 0,
+                        indent_cols: 0,
                     });
                 }
-                LaidRow::LiveCommand { command } => {
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::LiveCommand,
-                        text: command.to_string(),
-                        block_id: None,
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                    });
+                LaidRow::LiveCommand { chunks, .. } => {
+                    for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks) {
+                        let chunk = &chunks[ci];
+                        bv_rows.push(BlockViewRow {
+                            kind: BlockViewRowKind::LiveCommand,
+                            text: chunk.clone(),
+                            block_id: None,
+                            y_top: cy,
+                            y_bottom: cy + pitch,
+                            line: None,
+                            // v1.10.13: first line renders after "> " (2 cols).
+                            indent_cols: if ci == 0 { 2 } else { 0 },
+                            chunk_char_offset: char_offset,
+                        });
+                    }
                 }
                 LaidRow::DiagnosePanel { text, block_id, .. } => {
                     // v1.8.2: include the panel's y-band in hit-testing so
@@ -237,13 +310,14 @@ impl MetalRenderer {
                         y_bottom: row_top_y + pitch,
                         line: None,
                         chunk_char_offset: 0,
+                        indent_cols: 0,
                     });
                 }
                 LaidRow::Blank => {}
             }
         }
 
-        bv_rows
+        (bv_rows, layout.clip_top, layout.clip_bottom)
     }
 }
 
@@ -260,6 +334,7 @@ mod tests {
             y_bottom,
             line: None,
             chunk_char_offset: 0,
+            indent_cols: 0,
         }
     }
 
@@ -286,5 +361,13 @@ mod tests {
     fn sticky_header_uses_a_separate_context_row_when_cwd_is_known() {
         assert_eq!(sticky_header_rows(true), 2);
         assert_eq!(sticky_header_rows(false), 1);
+    }
+
+    #[test]
+    fn wrapped_row_positions_are_bottom_to_top() {
+        let chunks = vec!["ab".to_string(), "cd".to_string(), "e".to_string()];
+        let pos = wrapped_row_positions(100.0, 20.0, &chunks);
+        // 视觉从下到上:y 递增、ci 递减、offset 前缀和
+        assert_eq!(pos, vec![(2, 140.0, 4), (1, 120.0, 2), (0, 100.0, 0)]);
     }
 }

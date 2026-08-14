@@ -322,7 +322,9 @@ impl App {
                             if self.accessibility.block_text_key == Some(key) {
                                 return self.accessibility.block_text.clone();
                             }
-                            let mut rows = self.compute_block_view_rows();
+                            let Some((mut rows, _, _)) = self.compute_block_view_rows() else {
+                                return String::new();
+                            };
                             rows.retain(|row| {
                                 row.y_bottom > layout.content.top as f32
                                     && row.y_top < layout.content.bottom as f32

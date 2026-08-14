@@ -193,6 +193,36 @@ impl MetalRenderer {
         crate::ui_tokens::compact_control_row_span(pitch, self.scale)
     }
 
+    /// Block-view scroll metrics `(total, visible, max_scroll)` computed live
+    /// from the layout cache. Shared by the redraw path (scrollbar thumb) and the
+    /// wheel handler (scroll clamping) so the wheel never clamps against the
+    /// per-frame cached value — which is `None` during grid-mode execution and
+    /// would otherwise kill the just-entered `primary_history_view` (scroll-up
+    /// during a running primary-screen TUI became a no-op). History blocks are
+    /// stable while a command runs, so the retained cache yields the correct
+    /// scrollable extent on demand.
+    pub fn block_scroll_metrics(
+        &self,
+        terminal: &weft_core::vt::Terminal,
+    ) -> (usize, usize, usize) {
+        let cols = terminal.grid().num_cols;
+        let cache = self.block_layout_cache.borrow();
+        let (total, _) = crate::block_component::block_content_metrics_with_cache(
+            terminal,
+            cols,
+            self.block_header_rows(),
+            Some(&*cache),
+        );
+        let prompt_lines = crate::block_component::block_prompt_lines(terminal);
+        let cwd_header = crate::layout::block_cwd_header_active(
+            terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
+            terminal.cwd().is_some(),
+        );
+        let visible = self.block_visible_rows(prompt_lines, cwd_header);
+        let max_scroll = total.saturating_sub(visible);
+        (total, visible, max_scroll)
+    }
+
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on
     /// live config reload when font family/size/line-height changes. Returns
     /// the new cell dimensions so the caller can recompute grid rows/cols and

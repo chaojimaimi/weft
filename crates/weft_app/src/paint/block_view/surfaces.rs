@@ -136,7 +136,13 @@ pub(super) fn push_block_surfaces(
                 chunks.len().max(1) as f32 * paint.pitch,
                 BlockTone::Success,
             ),
-            LaidRow::Command { block_id, .. } => (*block_id, paint.pitch, BlockTone::Success),
+            LaidRow::Command {
+                block_id, chunks, ..
+            } => (
+                *block_id,
+                chunks.len().max(1) as f32 * paint.pitch,
+                BlockTone::Success,
+            ),
             LaidRow::Header { block_id, tone, .. } => (*block_id, paint.header_height, *tone),
             _ => continue,
         };

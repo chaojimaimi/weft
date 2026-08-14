@@ -16,7 +16,7 @@ use std::rc::Rc;
 use weft_core::blocks::Block;
 
 mod wrapping;
-pub(crate) use wrapping::{block_line_chunk_ranges, block_line_chunks};
+pub(crate) use wrapping::{block_line_chunk_ranges, block_line_chunks, command_line_chunks};
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
 
@@ -83,6 +83,16 @@ pub(crate) struct CachedBlockLayout {
     /// locate the first visible block, eliminating O(n) traversal of
     /// offscreen blocks.
     pub(crate) base_row_count: usize,
+    /// Whether the command is a bare `clear` (produces a viewport-sized spacer).
+    /// Cached so the clear-prefix-sum can count clear blocks in O(1) without
+    /// putting per-frame `viewport_rows` into the cache key.
+    pub(crate) is_clear: bool,
+    /// R2-2 (stage 2): wrapped row count of the (prompt-stripped) command.
+    /// First line uses `cols - indent` (indent=3 if foldable else 2),
+    /// continuation uses `cols`. Collapsed blocks report 1 (command stays
+    /// single-line). Same source as layout_pass's Command construction so
+    /// `base_row_count` (prefix sum) and `block_total_height` can't drift.
+    pub(crate) command_wrap_rows: usize,
 }
 
 /// Per-renderer block layout cache. Keyed by `BlockId.0`.
@@ -102,6 +112,12 @@ pub(crate) struct BlockLayoutCache {
     /// search to locate the first visible block, eliminating O(n)
     /// traversal of offscreen blocks.
     prefix_sum: Vec<usize>,
+    /// R2-2 fix: prefix sum of clear-block count, parallel to `prefix_sum`.
+    /// `clear_prefix_sum[i]` = number of clear blocks among the i newest.
+    /// Multiplied by `viewport_rows * pitch` per-frame to get total clear
+    /// spacer height — kept out of `base_row_count` because viewport_rows
+    /// is per-frame.
+    clear_prefix_sum: Vec<usize>,
     /// Block IDs from the last `build_prefix_sum` call, in newest-to-oldest
     /// order. Used to detect block set changes (add/remove) that invalidate
     /// the prefix sum.
@@ -239,16 +255,21 @@ impl BlockLayoutCache {
         self.prefix_sum.clear();
         self.prefix_sum.reserve(blocks.len() + 1);
         self.prefix_sum.push(0);
+        self.clear_prefix_sum.clear();
+        self.clear_prefix_sum.reserve(blocks.len() + 1);
+        self.clear_prefix_sum.push(0);
         let mut acc = 0usize;
+        let mut clear_acc = 0usize;
         for b in blocks.iter().rev() {
-            let base = self
-                .entries
-                .get(&b.id.0)
-                .map(|c| c.base_row_count)
-                .unwrap_or(0);
+            let entry = self.entries.get(&b.id.0);
+            let base = entry.map(|c| c.base_row_count).unwrap_or(0);
             acc += base;
             self.prefix_sum.push(acc);
+            let is_clear = entry.map(|c| c.is_clear).unwrap_or(false);
+            clear_acc += usize::from(is_clear);
+            self.clear_prefix_sum.push(clear_acc);
         }
+        debug_assert_eq!(self.prefix_sum.len(), self.clear_prefix_sum.len());
         self.prefix_sum_dirty = false;
     }
 
@@ -259,17 +280,31 @@ impl BlockLayoutCache {
     pub(crate) fn prefix_sum(&self) -> &[usize] {
         &self.prefix_sum
     }
+
+    /// R2-2 fix: prefix sum of clear-block count, parallel to `prefix_sum()`.
+    /// `clear_prefix_sum[i]` = number of clear blocks among the i newest
+    /// blocks. Layout pass multiplies by `viewport_rows * pitch` per-frame
+    /// to recover the spacer height excluded from `base_row_count`.
+    pub(crate) fn clear_prefix_sum(&self) -> &[usize] {
+        &self.clear_prefix_sum
+    }
 }
 
 /// Compute the layout for a single block (expensive — call once, then cache).
 fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
+    // R2-2 fix: bare `clear` produces a viewport-sized spacer. Mirrors
+    // `clear_block_spacer_rows`' command check.
+    let is_clear = block.command.split_whitespace().next() == Some("clear");
+
     // Foldable: does the block have ANY non-empty output line in the last 500?
-    let foldable = block
-        .output
-        .lines()
-        .rev()
-        .take(500)
-        .any(|l| !l.trim().is_empty());
+    // 单一来源 `block_component::block_foldable`,completed_block_* 几何路径共用。
+    let foldable = crate::block_component::block_foldable(block);
+
+    // R2-2 (stage 2): command wrap rows. Single source
+    // `block_component::command_wrap_rows_for` — the prefix-sum
+    // `base_row_count` and the runtime `block_total_height` both consume this
+    // so scroll geometry can't drift between the two paths.
+    let command_wrap_rows = crate::block_component::command_wrap_rows_for(block, cols, foldable);
 
     // Collect raw lines and trim trailing empty/prompt lines.
     let raw_lines: Vec<&str> = block.output.lines().collect();
@@ -312,8 +347,8 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
 
     // R2-2 (Batch 7): base_row_count for prefix-sum. Matches the
     // layout_pass formula: hint/output rows + the conditional command/output
-    // breathing row + command + separator. clear_rows and header_height are
-    // per-frame and excluded.
+    // breathing row + wrapped command rows + separator. clear_rows and
+    // header_height are per-frame and excluded.
     let hint_rows_for_base = if block.collapsed {
         0
     } else {
@@ -322,9 +357,20 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
             .map(|hint| block_line_chunks(hint, cols).count())
             .sum::<usize>()
     };
-    let content_rows = hint_rows_for_base + output_rows;
-    let base_row_count =
-        content_rows + crate::block_component::command_output_gap_rows(content_rows) + 2;
+    // R2-2 fix: avoid double-counting resume hints — `output_rows` above
+    // already includes them, so sum raw output line rows here instead.
+    let content_rows = if block.collapsed {
+        0
+    } else {
+        let line_rows: usize = lines.iter().map(|l| l.chunk_ranges.len()).sum();
+        hint_rows_for_base + line_rows
+    };
+    // R2-2 (stage 2): command counted by wrapped rows instead of a constant
+    // 1. Single-line commands keep the old `+2` total (command + separator).
+    let base_row_count = content_rows
+        + crate::block_component::command_output_gap_rows(content_rows)
+        + command_wrap_rows
+        + 1; // separator
 
     CachedBlockLayout {
         output_len: block.output.len(),
@@ -336,6 +382,8 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         lines,
         output_rows,
         base_row_count,
+        is_clear,
+        command_wrap_rows,
     }
 }
 
@@ -582,6 +630,44 @@ mod tests {
         let empty = mk_block_with_output(2, "true", "");
         let layout_e = compute_block_layout(&empty, 80);
         assert_eq!(layout_e.base_row_count, 2);
+    }
+
+    /// B6 回归:长命令折行必须计入 `command_wrap_rows`(旧 `+2` 常量低估高度),
+    /// 且缓存/回退两条 metrics 路径与单一来源 helper 一致,scrollbar/find 几何不漂移。
+    #[test]
+    fn command_wrap_rows_counts_wrapped_commands_and_stays_consistent() {
+        let block = mk_block_with_output(1, "a very long command that surely wraps", "ok\n");
+        let cols = 20;
+        let layout = compute_block_layout(&block, cols);
+        // 36 列命令,foldable → first_cols=17,折成 2 行。
+        assert_eq!(layout.command_wrap_rows, 2);
+        // 与 block_component 的单一来源 helper 同值(防量纲漂移)。
+        assert_eq!(
+            crate::block_component::command_wrap_rows_for(&block, cols, layout.foldable),
+            layout.command_wrap_rows
+        );
+        // 折叠块命令恒 1 行。
+        let mut collapsed = block.clone();
+        collapsed.collapsed = true;
+        assert_eq!(compute_block_layout(&collapsed, cols).command_wrap_rows, 1);
+
+        // metrics 缓存路径(读 c.command_wrap_rows)必须与直接计算一致。
+        let mut terminal = weft_core::vt::Terminal::new(24, cols);
+        terminal.process(
+            b"\x1b]133;A\x07a very long command that surely wraps\x1b]133;B\x07\x1b]133;C\x07ok\r\n\x1b]133;D;0\x07",
+        );
+        let (direct, _) = crate::block_component::block_content_metrics(&terminal, cols, 1);
+        let mut cache = BlockLayoutCache::default();
+        for blk in terminal.block_tracker().session_blocks() {
+            cache.ensure_cached(blk, cols);
+        }
+        let (cached, _) = crate::block_component::block_content_metrics_with_cache(
+            &terminal,
+            cols,
+            1,
+            Some(&cache),
+        );
+        assert_eq!(cached, direct);
     }
 
     #[test]

@@ -6,6 +6,21 @@
 
 use super::*;
 
+/// Direction of drag-selection autoscroll relative to the block content edge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AutoscrollDir {
+    Up,
+    Down,
+}
+
+/// Pure logic: rows to scroll per autoscroll tick from the pixel overshoot
+/// beyond the content edge. Clamped to [1, 6] so a deep overshoot can't jump
+/// past the drag target and a sub-row overshoot still advances (floor would
+/// freeze on tiny overshoots).
+fn autoscroll_steps(overshoot_px: f32, cell_h: f32) -> usize {
+    ((overshoot_px / cell_h).ceil() as usize).clamp(1, 6)
+}
+
 impl App {
     /// Handle mouse release.
     pub(super) fn handle_mouse_release(
@@ -16,6 +31,37 @@ impl App {
         terminal_session: Option<u64>,
         report_to_pty: bool,
     ) {
+        // v1.11: tab drag-to-reorder end. A drag past the threshold commits
+        // the reorder once (ghost drag model — the Vec was untouched during
+        // the gesture); a sub-threshold release either performs the deferred
+        // × close (`close_on_release`) or is a plain click (tab already
+        // switched on press).
+        if button == winit::event::MouseButton::Left {
+            // Drag-selection autoscroll: releasing the left button ends any
+            // edge-held drag — drop the drag position and stop the 40ms
+            // timer so the viewport freezes immediately.
+            self.interaction.selection_drag_pos = None;
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(false, Ordering::Relaxed);
+            if let Some(drag) = self.interaction.tab_drag.take() {
+                if drag.moved {
+                    let n = self.sessions.len();
+                    if drag.drag_index < n {
+                        let insert = drag.insert_index.min(n.saturating_sub(1));
+                        if !crate::layout::is_noop(drag.drag_index, insert) {
+                            self.sessions.move_tab(drag.drag_index, insert);
+                            self.scroll_active_tab_into_view();
+                        }
+                    }
+                    self.drain_effects(vec![crate::effect::Effect::PersistTabs]);
+                } else if drag.close_on_release {
+                    self.perform_close_request(drag.drag_index);
+                }
+                self.request_redraw();
+                return;
+            }
+        }
         // F3-3: sidebar resize drag end — persist the new width to config.
         if button == winit::event::MouseButton::Left
             && self.interaction.sidebar_drag.take().is_some()
@@ -326,14 +372,29 @@ impl App {
 
         if self.sessions.active_mut().selection_handler.selecting {
             if self.block_view_active() {
-                if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                    self.sessions
-                        .active_mut()
-                        .selection_handler
-                        .extend_block_view(bv_pos);
-                    self.request_redraw();
+                // Drag-selection autoscroll: remember the pointer position so
+                // the 40ms timer keeps scrolling while it is held still past
+                // the content edge. When the pointer is out of the content
+                // band, `pump_selection_autoscroll` scrolls the viewport and
+                // extends the endpoint to the new edge row; otherwise fall
+                // through to the normal in-band extension.
+                self.interaction.selection_drag_pos = Some((x, y));
+                let scrolled = self.pump_selection_autoscroll();
+                if !scrolled {
+                    // Pointer inside the content band: normal extension.
+                    if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
+                        self.sessions
+                            .active_mut()
+                            .selection_handler
+                            .extend_block_view(bv_pos);
+                    }
                 }
+                self.request_redraw();
             } else {
+                // Grid view: untouched by drag autoscroll this round — grid
+                // selection stores viewport-relative `GridPos`, so scrolling
+                // mid-drag would silently corrupt the copy range (see
+                // docs/FIX_DRAG_AUTOSCROLL.md "Grid 后续任务").
                 let pos = self.pixel_to_grid(x, y);
                 self.sessions.active_mut().selection_handler.extend(pos);
                 self.request_redraw();
@@ -737,6 +798,15 @@ impl App {
         self.sessions.active_mut().input_handler.mouse_protocol = mouse_protocol;
         self.sessions.active_mut().input_handler.sgr_mouse = sgr_mouse;
 
+        // Shift disables mouse routing for this gesture on the PRIMARY screen so
+        // the user can browse terminal history even while a primary-screen TUI
+        // captures the mouse. (Alt-screen Shift is handled in the alt block
+        // below as an arrow-key escape hatch for pagers like less/man.)
+        if self.interaction.mods.state().shift_key() && !alt_screen_active {
+            self.scroll_local_view(rows);
+            return;
+        }
+
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
             if !self.terminal_content_contains(x, y) {
@@ -805,16 +875,67 @@ impl App {
             }
         }
 
-        // Alt-screen apps (less, vim, man, etc.) don't use mouse protocol but
-        // still benefit from wheel scroll: translate to Up/Down arrow key
-        // sequences so the pager scrolls its content natively.
+        // Alt-screen apps (less, vim, man, omp, …) don't use mouse protocol but
+        // own the screen. v1.10.12: scroll-UP overlays the terminal's history
+        // BlockView over the TUI (alt-screen history peek) so the user can
+        // browse past output without leaving the TUI; Shift+scroll stays an
+        // arrow-key escape hatch so pagers (less/man) can still be wheel-scrolled.
         if alt_screen_active {
-            let key = if up { KeyCode::Up } else { KeyCode::Down };
-            let mut m = Modifiers::empty();
+            // Escape hatch: Shift+scroll sends ↑/↓ to the TUI (scroll a pager,
+            // navigate omp) and never enters the peek.
             if self.interaction.mods.state().shift_key() {
-                m |= Modifiers::SHIFT;
+                let key = if up { KeyCode::Up } else { KeyCode::Down };
+                let single = self
+                    .sessions
+                    .active_mut()
+                    .input_handler
+                    .encode_key(key, Modifiers::SHIFT);
+                if !single.is_empty() {
+                    let mut batch = Vec::with_capacity(single.len() * lines);
+                    for _ in 0..lines {
+                        batch.extend_from_slice(&single);
+                    }
+                    let _ = self.sessions.active_mut().write_user_input(&batch);
+                }
+                return;
             }
-            let single = self.sessions.active_mut().input_handler.encode_key(key, m);
+            let peek = self
+                .sessions
+                .active()
+                .terminal
+                .as_ref()
+                .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+            if peek {
+                // Already browsing history — navigate the BlockView. Scrolling
+                // back to the bottom clears the peek flag (set_block_scroll).
+                self.scroll_local_view(rows);
+                return;
+            }
+            if up {
+                // Enter the peek: overlay the history BlockView over the TUI.
+                // Only when the block tracker has bootstrapped (history exists).
+                let bootstrap = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| t.block_tracker().bootstrap_ready());
+                if bootstrap {
+                    if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                        t.set_alt_screen_history_peek(true);
+                    }
+                    self.scroll_local_view(rows);
+                    return;
+                }
+            }
+            // Plain scroll-down without an active peek: translate to Up/Down
+            // arrow keys so the TUI can scroll its own content natively.
+            let key = if up { KeyCode::Up } else { KeyCode::Down };
+            let single = self
+                .sessions
+                .active_mut()
+                .input_handler
+                .encode_key(key, Modifiers::empty());
             if !single.is_empty() {
                 let mut batch = Vec::with_capacity(single.len() * lines);
                 for _ in 0..lines {
@@ -838,7 +959,18 @@ impl App {
         let up = rows > 0;
         let lines = rows.unsigned_abs() as usize;
         if up {
-            self.sessions.active_mut().enter_primary_history_if_active();
+            let entered = self.sessions.active_mut().enter_primary_history_if_active();
+            tracing::debug!(
+                entered,
+                rows,
+                app_active = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .is_some_and(weft_core::vt::Terminal::primary_screen_app_active),
+                "SCROLL_DIAG: scroll up into primary history"
+            );
         }
         let block_view = self
             .sessions
@@ -847,12 +979,28 @@ impl App {
             .as_ref()
             .is_some_and(Terminal::show_block_view);
         if block_view {
+            // A1: compute max_scroll LIVE from the layout cache. The per-frame
+            // cached value is None during grid-mode execution (primary-screen TUI),
+            // which would clamp to 0 and immediately exit the primary_history_view
+            // just entered above — making scroll-up during a running command a
+            // no-op. Live compute uses the retained cache (history is stable while
+            // a command runs), so the wheel can actually detach into history.
             let max_scroll = self
                 .renderer
                 .as_ref()
-                .and_then(|renderer| renderer.cached_scroll_metrics.get())
-                .map(|(_, _, max)| max)
+                .and_then(|renderer| {
+                    let terminal = self.sessions.active().terminal.as_ref()?;
+                    let (_total, _visible, max) = renderer.block_scroll_metrics(terminal);
+                    Some(max)
+                })
                 .unwrap_or(0);
+            tracing::debug!(
+                up,
+                lines,
+                max_scroll,
+                current = self.sessions.active().block_scroll(),
+                "SCROLL_DIAG: block-view scroll"
+            );
             if up {
                 let tab = self.sessions.active_mut();
                 tab.scroll_up_by(lines);
@@ -872,5 +1020,140 @@ impl App {
             }
         }
         self.request_redraw();
+    }
+
+    /// Vertical physical-pixel bounds of the block view's visible content
+    /// area: the layout clip band (top of the clip region to the bottom of
+    /// the clip region). `None` only when the block view isn't active or the
+    /// renderer/terminal is unavailable; an empty history still yields the
+    /// clip band (max_scroll=0 makes any autoscroll a no-op in that case).
+    pub(super) fn block_content_vbounds(&self) -> Option<(f32, f32)> {
+        // 可见 block 内容区 = 布局 clip。用 bv_rows first/last 会带 overscan
+        // (最顶行可到 clip_top - overscan),把向上滚动的触发阈值抬到窗口外。
+        self.compute_block_view_rows()
+            .map(|(_, clip_top, clip_bottom)| (clip_top, clip_bottom))
+    }
+
+    /// Drag-selection autoscroll: when the pointer is held past the block
+    /// content edge, scroll the viewport toward it and extend the selection
+    /// endpoint to the newly revealed edge row. Returns true when a
+    /// scroll+extend happened (the caller requests a redraw). Called from
+    /// `on_cursor_moved` per move and from the redraw entry on each 40ms
+    /// timer wake while the pointer is held still.
+    pub(super) fn pump_selection_autoscroll(&mut self) -> bool {
+        let selecting = self.sessions.active().selection_handler.selecting;
+        let block_view = self.block_view_active();
+        if !selecting || !block_view {
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(false, Ordering::Relaxed);
+            return false;
+        }
+        let Some((x, y)) = self.interaction.selection_drag_pos else {
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(false, Ordering::Relaxed);
+            return false;
+        };
+        let Some((top, bottom)) = self.block_content_vbounds() else {
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(false, Ordering::Relaxed);
+            return false;
+        };
+        let ch = self
+            .renderer
+            .as_ref()
+            .map(|r| r.cell_height() as f32)
+            .unwrap_or(20.0);
+        let margin = ch; // start scrolling once the pointer enters the edge row band
+        let (dir, steps) = if (y as f32) < top - margin {
+            (
+                AutoscrollDir::Up,
+                autoscroll_steps((top - margin) - y as f32, ch),
+            )
+        } else if (y as f32) > bottom + margin {
+            (
+                AutoscrollDir::Down,
+                autoscroll_steps(y as f32 - (bottom + margin), ch),
+            )
+        } else {
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(false, Ordering::Relaxed);
+            return false;
+        };
+        // Live max_scroll (same A1 pattern as `scroll_local_view`): the
+        // per-frame cached metric is None during grid-mode execution, which
+        // would clamp to 0 and make the autoscroll a no-op.
+        let max_scroll = self
+            .renderer
+            .as_ref()
+            .and_then(|renderer| {
+                let terminal = self.sessions.active().terminal.as_ref()?;
+                Some(renderer.block_scroll_metrics(terminal).2)
+            })
+            .unwrap_or(0);
+        // At the history top/bottom the saturating scroll has no net effect;
+        // detect that so the 40ms timer can stop instead of idle-spinning
+        // (before = immutable read, then the mutable scroll, then re-read).
+        let before = self.sessions.active().block_scroll();
+        let tab = self.sessions.active_mut();
+        match dir {
+            AutoscrollDir::Up => {
+                tab.scroll_up_by(steps);
+                tab.clamp_block_scroll(max_scroll);
+            }
+            AutoscrollDir::Down => {
+                tab.scroll_down_by(steps);
+                tab.clamp_block_scroll(max_scroll);
+            }
+        }
+        let moved = before != self.sessions.active().block_scroll();
+        // Extend the endpoint: clamp y into the content band so the shared
+        // row hit-test naturally lands on the new edge row.
+        let cy = (y as f32).clamp(top, (bottom - 1.0).max(top));
+        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, cy as f64) {
+            self.sessions
+                .active_mut()
+                .selection_handler
+                .extend_block_view(bv_pos);
+        }
+        self.window_runtime
+            .selection_autoscroll_active
+            .store(moved, Ordering::Relaxed);
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autoscroll_steps;
+
+    #[test]
+    fn autoscroll_steps_zero_or_negative_overshoot_scrolls_one_row() {
+        assert_eq!(autoscroll_steps(0.0, 20.0), 1);
+        assert_eq!(autoscroll_steps(-5.0, 20.0), 1);
+    }
+
+    #[test]
+    fn autoscroll_steps_around_one_row_boundary() {
+        // Exactly one row of overshoot → 1 step; slightly more → 2.
+        assert_eq!(autoscroll_steps(20.0, 20.0), 1);
+        assert_eq!(autoscroll_steps(20.5, 20.0), 2);
+        assert_eq!(autoscroll_steps(1.0, 20.0), 1); // sub-row still advances
+    }
+
+    #[test]
+    fn autoscroll_steps_deep_overshoot_clamps_at_six() {
+        assert_eq!(autoscroll_steps(2000.0, 20.0), 6);
+        assert_eq!(autoscroll_steps(1_000_000.0, 1.0), 6);
+    }
+
+    #[test]
+    fn autoscroll_steps_zero_cell_height_saturates_safely() {
+        // inf / NaN saturate in the float→usize cast and hit the clamp.
+        assert_eq!(autoscroll_steps(40.0, 0.0), 6); // inf → saturate → 6
+        assert_eq!(autoscroll_steps(f32::NAN, 0.0), 1); // NaN → 0 → clamp to 1
     }
 }

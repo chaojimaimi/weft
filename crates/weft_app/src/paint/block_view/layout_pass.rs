@@ -1,12 +1,5 @@
-//! Shared BlockView layout pass — pure geometry computation shared by
-//! `build_block_view_vertices` (paint) and `compute_block_view_rows`
-//! (hit-testing). Eliminates ~200 lines of duplicated layout logic.
-//!
-//! Both paths walk blocks bottom-to-top, accumulate `cursor_dist`, and
-//! push `LaidRow` entries. The only difference is that paint additionally
-//! emits vertices + hit regions, while hit-testing only extracts `bv_rows`.
-//! By sharing this pass, visibility culling and y-band computation live
-//! in one place.
+//! Shared layout pass for BlockView: walk blocks bottom-to-top, accumulate
+//! `cursor_dist`, push `LaidRow` rows (paint + hit-testing both consume this).
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,46 +8,55 @@ use crate::block_component::{
     block_presentation, clear_block_spacer_rows, command_output_gap_rows, command_resume_hints,
     BlockTone,
 };
-use crate::paint::grid_cache::{block_line_chunks, BlockLayoutCache, MAX_LAYOUT_LINES_LIVE};
+use crate::paint::grid_cache::{
+    block_line_chunks, command_line_chunks, BlockLayoutCache, MAX_LAYOUT_LINES_LIVE,
+};
+use crate::paint::ui_helpers::strip_prompt_prefix;
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
 
-/// A laid-out row in the block view. Contains paint-superset fields so both
-/// paint and hit-testing can consume the same layout pass output. Fields
-/// like `line`/`style`/`collapsed`/`foldable`/`tone` are only used by paint;
-/// hit-testing ignores them.
+/// A laid-out row in the block view. Paint-superset fields (`line`/`style`/
+/// `collapsed`/`foldable`/`tone`) are ignored by hit-testing.
 pub(super) enum LaidRow<'a> {
     Output {
         text: &'a str,
         chunks: Rc<[String]>,
         block_id: Option<BlockId>,
-        /// Line index into the block's output (or `usize::MAX` for resume
-        /// hints). Paint uses this to look up `StyledLine`.
+        /// Line index into the block's output; `usize::MAX` for resume hints.
         line: usize,
         /// Resolved styled line for syntax highlighting. `None` for hit-testing.
         style: Option<&'a StyledLine>,
     },
     Command {
         command: &'a str,
+        /// Prompt-stripped command wrapped for the row width. `chunks.len()`
+        /// MUST match `cached.command_wrap_rows` (same wrap call) so the
+        /// prefix-sum and block_total_height stay in lockstep.
+        chunks: Rc<[String]>,
         collapsed: bool,
         foldable: bool,
         block_id: BlockId,
     },
     Header {
-        text: String,
+        cwd: String,
+        duration: String,
+        status: String,
+        /// 必须保留:surfaces.rs 依赖 tone 画 block 背景/rail。
         tone: BlockTone,
         block_id: BlockId,
     },
     Separator,
     LiveCommand {
+        /// Kept for stage 3 (sticky-header reads); render paths use `chunks`.
+        #[allow(dead_code)]
         command: &'a str,
+        chunks: Rc<[String]>,
     },
     LiveHeader {
         text: String,
     },
     Blank,
-    /// v1.8.2: A line of the AI diagnose panel rendered below a block's output.
-    /// `text` is a single wrapped line. `is_first` marks the top line (for
-    /// background + close button hit region). `is_error` tints the background.
+    /// A line of the AI diagnose panel below a block's output. `is_first`
+    /// marks the top line (close-button hit region); `is_error` tints it.
     DiagnosePanel {
         text: String,
         block_id: BlockId,
@@ -66,21 +68,16 @@ pub(super) enum LaidRow<'a> {
 
 /// Output of a shared layout pass: cumulative y-distances + row metadata.
 pub(super) struct LayoutPassOutput<'a> {
-    /// Cumulative y-distance for each row (ascending). `rows[i]` is the
-    /// distance from `content_bottom_y` to the top of row `i`.
+    /// Cumulative y-distance from `content_bottom_y` to the top of each row.
     pub(super) rows: Vec<f32>,
     /// Row metadata parallel to `rows`.
     pub(super) row_data: Vec<LaidRow<'a>>,
-    /// Batch 6 Step 1: actual count of finished blocks whose internal lines
-    /// were expanded (is_visible && !collapsed). Excludes blocks that only
-    /// accumulated cursor_dist in the else branch. When this is << blocks.len(),
-    /// visibility culling is doing its job.
+    /// Count of finished blocks whose internal lines were expanded
+    /// (is_visible && !collapsed) — low vs. `blocks.len()` shows culling works.
     pub(super) expanded_block_count: usize,
 }
 
-/// Parameters for the shared layout pass. Extracted from `BlockViewPaintModel`
-/// so the pass function doesn't need the full model (some fields like
-/// `palette`/`spinner_phase`/`block_hovered` are paint-only).
+/// Parameters for the shared layout pass (subset of `BlockViewPaintModel`).
 pub(super) struct LayoutPassInput<'a, 'b> {
     pub(super) blocks: &'a [Block],
     pub(super) live: Option<InFlightBlock<'a>>,
@@ -94,35 +91,21 @@ pub(super) struct LayoutPassInput<'a, 'b> {
     pub(super) content_bottom_y: f32,
     pub(super) clip_top: f32,
     pub(super) clip_bottom: f32,
-    /// Whether to populate paint-only fields (`style`). Hit-testing passes
-    /// `false` to skip `styled_output` lookups.
+    /// Populate paint-only fields (`style`); hit-testing passes `false`.
     pub(super) resolve_styles: bool,
-    /// Batch 6 Step 1: optional counter incremented for every `styled.line()`
-    /// lookup performed. Paint passes `Some(&Cell)` to collect data for the
-    /// styled-line caching decision; hit-testing passes `None`.
+    /// Counter for `styled.line()` lookups (paint) or `None` (hit-testing).
     pub(super) styled_lookup_counter: Option<&'a Cell<usize>>,
-    /// v1.8.2: Per-block AI diagnose state. When a block has an entry, extra
-    /// rows are injected after its output to render the diagnose panel.
-    /// Uses a separate lifetime `'b` because the output (`LayoutPassOutput<'a>`)
-    /// does not borrow from this field — `DiagnosePanel` rows own their text.
+    /// Per-block AI diagnose state; extra rows render the panel after output.
+    /// Separate lifetime `'b`: output does not borrow from this field.
     pub(super) block_diagnose_state:
         &'b std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
-/// `cursor_dist`, apply visibility culling, and emit `LaidRow` entries.
-///
-/// This is the single source of truth for block-view row geometry. Both
-/// `build_block_view_vertices` and `compute_block_view_rows` call this and
-/// then walk the output to either emit vertices or extract `bv_rows`.
-///
-/// `cache` must have `ensure_cached` called for every block before invoking
-/// this function (the caller does this in a separate mutable borrow).
-///
-/// The returned `LayoutPassOutput` borrows from `blocks`/`live` (for text
-/// references) but NOT from `cache`: source ranges are materialized only for
-/// visible rows into `Rc<[String]>`. This lets the caller drop the cache
-/// borrow immediately and keeps offscreen history from duplicating text.
+/// `cursor_dist`, apply visibility culling, emit `LaidRow` rows (paint +
+/// hit-testing both call this). Caller must `ensure_cached` every block.
+/// Output borrows from `blocks`/`live`, not `cache` — visible rows only are
+/// materialized into `Rc<[String]>`, keeping offscreen history un-duplicated.
 pub(super) fn compute_block_layout_pass<'a, 'b>(
     input: LayoutPassInput<'a, 'b>,
     cache: &BlockLayoutCache,
@@ -187,10 +170,17 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             rows.push(cursor_dist);
             row_data.push(LaidRow::Blank);
         }
-        cursor_dist += pitch;
+        // Live command wraps too; rows feed cursor_dist only (not prefix sum).
+        let live_cmd_chunks: Rc<[String]> = Rc::from(command_line_chunks(
+            &strip_prompt_prefix(live.command),
+            cols.saturating_sub(2).max(1),
+            cols,
+        ));
+        cursor_dist += live_cmd_chunks.len() as f32 * pitch;
         rows.push(cursor_dist);
         row_data.push(LaidRow::LiveCommand {
             command: live.command,
+            chunks: live_cmd_chunks,
         });
         if let Some(text) = crate::block_component::live_context_label(live.cwd.or(cwd), git_branch)
         {
@@ -203,59 +193,60 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         row_data.push(LaidRow::Separator);
     }
 
-    // Finished blocks: R2-2 (Batch 7) prefix-sum binary search.
-    //
-    // Instead of O(n) traversal of all blocks, binary search for the
-    // visible range using the prefix sum of `base_row_count` and only
-    // iterate those blocks + 1 overscan on each side. Offscreen blocks
-    // are skipped entirely (no push to rows/row_data), reducing layout
-    // pass from O(n + k*m) to O(log n + k*m) where k = visible count.
-    //
-    // `sync_rows` (selection.rs:409) already handles rows scrolling out
-    // of the visible set by remapping to the closest y-center, so
-    // omitting offscreen blocks from rows/row_data is safe.
+    // Finished blocks: binary-search the prefix sum for the visible range
+    // (O(log n + k*m)) instead of O(n) traversal, +1 overscan per side.
     let scroll_px = block_scroll * pitch;
     let overscan = header_height + pitch * 2.0;
     let live_cursor_dist = cursor_dist;
 
     let prefix_sum = cache.prefix_sum();
+    let clear_ps = cache.clear_prefix_sum();
+    let clear_pitch = viewport_rows as f32 * pitch;
     let n = blocks.len();
 
-    // Determine the visible block range [start_idx, end_idx) in
-    // "newest-first" index space (0 = newest = blocks[n-1]).
+    // Visible range [start_idx, end_idx), newest-first (0 = blocks[n-1]).
     let (start_idx, end_idx) = if n == 0 || prefix_sum.len() != n + 1 {
         (0usize, n) // fallback: iterate all (no prefix sum built yet)
     } else {
-        // cumulative_height(i) = prefix_sum[i] * pitch + i * header_height
-        // = total height of the i newest finished blocks (excl. live).
-        // clear_rows (per-frame, only for `clear` command) is intentionally
-        // excluded from the prefix sum; this may cause ±1 block of slop
-        // at the edges, covered by the 1-block overscan below.
+        // cumulative_height(i) = prefix_sum[i]*pitch + i*header_height
+        // + clear_ps[i]*clear_pitch (per-frame clear spacer).
         let threshold_low =
             content_bottom_y + scroll_px - clip_bottom - overscan - live_cursor_dist;
         let threshold_high = content_bottom_y + scroll_px - clip_top + overscan - live_cursor_dist;
 
         // first_visible: smallest idx where cumulative_height(idx+1) >= threshold_low
-        let j_low = lower_bound_height(prefix_sum, pitch, header_height, threshold_low);
+        let j_low = lower_bound_height(
+            prefix_sum,
+            clear_ps,
+            pitch,
+            header_height,
+            clear_pitch,
+            threshold_low,
+        );
         let first_visible = j_low.saturating_sub(1);
 
         // last_visible+1: smallest idx where cumulative_height(idx) > threshold_high
-        let j_high = upper_bound_height(prefix_sum, pitch, header_height, threshold_high);
+        let j_high = upper_bound_height(
+            prefix_sum,
+            clear_ps,
+            pitch,
+            header_height,
+            clear_pitch,
+            threshold_high,
+        );
 
-        // 1-block overscan on each side to cover partial blocks and the
-        // sticky header (which references the topmost visible block).
+        // 1-block overscan each side: partial blocks + sticky header.
         let start = first_visible.saturating_sub(1);
         let end = (j_high + 1).min(n);
         (start, end)
     };
 
-    // Fast-forward cursor_dist to the start of the visible range.
-    // Blocks before start_idx (newer, already below the viewport) are
-    // skipped — their height is accounted for via the prefix sum.
+    // Fast-forward cursor_dist past newer offscreen blocks via prefix sum.
     if start_idx > 0 && prefix_sum.len() == n + 1 {
         cursor_dist = live_cursor_dist
             + prefix_sum[start_idx] as f32 * pitch
-            + start_idx as f32 * header_height;
+            + start_idx as f32 * header_height
+            + clear_ps[start_idx] as f32 * clear_pitch;
     }
 
     // Iterate visible range (newest to oldest).
@@ -263,9 +254,8 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         let b = &blocks[n - 1 - idx];
         let cached = cache.get(b.id.0);
 
-        // v1.8.2: Compute diagnose panel lines for this block (if any).
-        // This must happen before block_total_height so the panel's rows
-        // are accounted for in the visibility culling math.
+        // Diagnose panel lines must be computed before block_total_height
+        // so the panel's rows count toward visibility culling.
         let diagnose_lines: Vec<String> = if let Some(ds) = block_diagnose_state.get(&b.id) {
             if ds.is_thinking() {
                 vec!["Diagnosing…".to_string()]
@@ -292,8 +282,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             .map(|r| r.is_err())
             .unwrap_or(false);
 
-        // Compute this block's total height without expanding internal
-        // lines. Uses cached.output_rows (O(1)) for the output portion.
+        // Block height without expanding lines; cached.output_rows is O(1).
         let hint_rows: usize = if b.collapsed {
             0
         } else {
@@ -308,7 +297,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         let block_total_height = (hint_rows + output_rows) as f32 * pitch
             + output_gap_rows as f32 * pitch
             + diagnose_rows as f32 * pitch
-            + pitch // command
+            + cached.command_wrap_rows as f32 * pitch // wrapped command
             + header_height
             + pitch // separator
             + clear_rows as f32 * pitch;
@@ -361,9 +350,8 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
                     },
                 });
             }
-            // v1.8.2: Inject diagnose panel rows after output (before gap).
-            // Lines are in reading order (top to bottom); the layout walks
-            // bottom-to-top, so we iterate in reverse.
+            // Diagnose panel rows after output; reading order is top-down,
+            // the layout walks bottom-to-top, so iterate in reverse.
             for (i, line) in diagnose_lines.iter().enumerate().rev() {
                 cursor_dist += pitch;
                 rows.push(cursor_dist);
@@ -383,10 +371,24 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             rows.push(cursor_dist);
             row_data.push(LaidRow::Blank);
         }
-        cursor_dist += pitch;
+        // Command wrap rows: same `command_line_chunks` call + args as
+        // grid_cache::compute_block_layout so prefix-sum matches runtime.
+        // first_cols 共用 `command_first_cols` 单一来源,防止几何漂移。
+        let first_cols = crate::block_component::command_first_cols(cols, cached.foldable);
+        let cmd_chunks: Rc<[String]> = if b.collapsed {
+            Rc::from([strip_prompt_prefix(&b.command)]) // collapsed: single line
+        } else {
+            Rc::from(command_line_chunks(
+                &strip_prompt_prefix(&b.command),
+                first_cols,
+                cols,
+            ))
+        };
+        cursor_dist += cmd_chunks.len() as f32 * pitch;
         rows.push(cursor_dist);
         row_data.push(LaidRow::Command {
             command: &b.command,
+            chunks: cmd_chunks,
             collapsed: b.collapsed,
             foldable: cached.foldable,
             block_id: b.id,
@@ -395,7 +397,9 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         cursor_dist += header_height;
         rows.push(cursor_dist);
         row_data.push(LaidRow::Header {
-            text: presentation.label,
+            cwd: presentation.cwd,
+            duration: presentation.duration,
+            status: presentation.status,
             tone: presentation.tone,
             block_id: b.id,
         });
@@ -416,20 +420,24 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
     }
 }
 
-/// R2-2 (Batch 7): Find smallest j where `prefix_sum[j] * pitch +
-/// j * header_height >= threshold`. Returns `prefix_sum.len()` if all
-/// elements are below threshold.
+/// Smallest j where `prefix_sum[j]*pitch + j*header_height +
+/// clear_ps[j]*clear_pitch >= threshold`; `len` if none. `clear_pitch`
+/// recovers the per-frame clear-block spacer excluded from the prefix sum.
 fn lower_bound_height(
     prefix_sum: &[usize],
+    clear_ps: &[usize],
     pitch: f32,
     header_height: f32,
+    clear_pitch: f32,
     threshold: f32,
 ) -> usize {
     let mut lo = 0usize;
     let mut hi = prefix_sum.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let height = prefix_sum[mid] as f32 * pitch + mid as f32 * header_height;
+        let height = prefix_sum[mid] as f32 * pitch
+            + mid as f32 * header_height
+            + clear_ps[mid] as f32 * clear_pitch;
         if height < threshold {
             lo = mid + 1;
         } else {
@@ -439,20 +447,23 @@ fn lower_bound_height(
     lo
 }
 
-/// R2-2 (Batch 7): Find smallest j where `prefix_sum[j] * pitch +
-/// j * header_height > threshold` (upper bound). Returns
-/// `prefix_sum.len()` if all elements are <= threshold.
+/// Smallest j where the height formula is `> threshold` (strict upper
+/// bound); `len` if none.
 fn upper_bound_height(
     prefix_sum: &[usize],
+    clear_ps: &[usize],
     pitch: f32,
     header_height: f32,
+    clear_pitch: f32,
     threshold: f32,
 ) -> usize {
     let mut lo = 0usize;
     let mut hi = prefix_sum.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let height = prefix_sum[mid] as f32 * pitch + mid as f32 * header_height;
+        let height = prefix_sum[mid] as f32 * pitch
+            + mid as f32 * header_height
+            + clear_ps[mid] as f32 * clear_pitch;
         if height <= threshold {
             lo = mid + 1;
         } else {
@@ -470,11 +481,8 @@ mod gap_tests;
 mod tests {
     use super::*;
 
-    /// Smoke test: empty input produces empty output. This is the only
-    /// layout-pass test that doesn't require a MetalRenderer; full
-    /// equivalence between paint and hit-testing paths is covered by the
-    /// 1073+ workspace tests that exercise `compute_block_view_rows` and
-    /// `build_block_view_vertices` indirectly through GUI integration tests.
+    /// Empty input → empty output. The only layout-pass test not requiring
+    /// a MetalRenderer; GUI integration tests cover paint/hit-test parity.
     #[test]
     fn empty_layout_pass_produces_empty_output() {
         let input = LayoutPassInput {
@@ -541,18 +549,18 @@ mod tests {
         assert!(out.rows.iter().any(|distance| 120.0 - distance < 0.0));
     }
 
-    // ── R2-2 (Batch 7): binary search helpers ─────────────────────────
-    //
-    // `lower_bound_height` / `upper_bound_height` find the visible block
-    // range via binary search on the prefix sum. Their correctness is what
+    // Binary-search helpers: correctness of the height formula
+    // (`prefix_sum[j]*pitch + j*header_height + clear_ps[j]*clear_pitch`)
     // keeps the O(log n) fast path from skipping or duplicating blocks.
-    // The height formula is `prefix_sum[j] * pitch + j * header_height`.
+    // `clear_pitch = viewport_rows*pitch` recovers clear-block spacers
+    // (excluded from the prefix sum); zeroed clear args exercise the
+    // original semantics.
 
     #[test]
     fn lower_bound_height_empty_returns_zero() {
         // Empty prefix sum (just [0]) → always returns 0 (nothing >= threshold).
-        assert_eq!(lower_bound_height(&[0], 20.0, 24.0, 100.0), 1);
-        assert_eq!(lower_bound_height(&[0], 20.0, 24.0, 0.0), 0);
+        assert_eq!(lower_bound_height(&[0], &[0], 20.0, 24.0, 0.0, 100.0), 1);
+        assert_eq!(lower_bound_height(&[0], &[0], 20.0, 24.0, 0.0, 0.0), 0);
     }
 
     #[test]
@@ -561,14 +569,14 @@ mod tests {
         // heights = [0, 5*20+1*24=124, 10*20+2*24=248, 15*20+3*24=372]
         let ps = [0, 5, 10, 15];
         // threshold=400 → all below → returns 4 (len)
-        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 400.0), 4);
+        assert_eq!(lower_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 400.0), 4);
     }
 
     #[test]
     fn lower_bound_height_all_above_threshold_returns_zero() {
         let ps = [0, 5, 10, 15];
         // threshold=-10 → all above (height[0]=0 >= -10) → returns 0
-        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, -10.0), 0);
+        assert_eq!(lower_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, -10.0), 0);
     }
 
     #[test]
@@ -576,19 +584,19 @@ mod tests {
         // heights = [0, 124, 248, 372]
         let ps = [0, 5, 10, 15];
         // threshold=200 → first >= 200 is index 2 (height=248)
-        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 200.0), 2);
+        assert_eq!(lower_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 200.0), 2);
         // threshold=124 → first >= 124 is index 1 (exact match)
-        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 124.0), 1);
+        assert_eq!(lower_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 124.0), 1);
         // threshold=125 → first >= 125 is still index 2
-        assert_eq!(lower_bound_height(&ps, 20.0, 24.0, 125.0), 2);
+        assert_eq!(lower_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 125.0), 2);
     }
 
     #[test]
     fn upper_bound_height_empty_returns_zero() {
         // upper_bound is strict > : height[0]=0 > -1 → returns 0
-        assert_eq!(upper_bound_height(&[0], 20.0, 24.0, -1.0), 0);
+        assert_eq!(upper_bound_height(&[0], &[0], 20.0, 24.0, 0.0, -1.0), 0);
         // height[0]=0 > 0 is false → returns 1 (len)
-        assert_eq!(upper_bound_height(&[0], 20.0, 24.0, 0.0), 1);
+        assert_eq!(upper_bound_height(&[0], &[0], 20.0, 24.0, 0.0, 0.0), 1);
     }
 
     #[test]
@@ -596,7 +604,7 @@ mod tests {
         // heights = [0, 124, 248, 372]
         let ps = [0, 5, 10, 15];
         // threshold=400 → all <= 400 → returns 4 (len)
-        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 400.0), 4);
+        assert_eq!(upper_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 400.0), 4);
     }
 
     #[test]
@@ -604,28 +612,72 @@ mod tests {
         // heights = [0, 124, 248, 372]
         let ps = [0, 5, 10, 15];
         // threshold=200 → first > 200 is index 2 (height=248)
-        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 200.0), 2);
+        assert_eq!(upper_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 200.0), 2);
         // threshold=124 → first > 124 is index 2 (strict: 124 is not > 124)
-        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 124.0), 2);
+        assert_eq!(upper_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 124.0), 2);
         // threshold=125 → first > 125 is index 2
-        assert_eq!(upper_bound_height(&ps, 20.0, 24.0, 125.0), 2);
+        assert_eq!(upper_bound_height(&ps, &[0; 4], 20.0, 24.0, 0.0, 125.0), 2);
     }
 
-    /// The visible range is [lower_bound(threshold_low) - 1, upper_bound(threshold_high) + 1)
-    /// with 1-block overscan on each side. This test verifies the bounds
-    /// produce a valid range that contains the visible blocks.
+    /// Nonzero `clear_ps` adds `clear_ps[i]*clear_pitch` to the height
+    /// (viewport-sized clear spacer excluded from the prefix sum); without
+    /// it, blocks above a `clear` are underestimated and culled after scroll.
+    #[test]
+    fn bound_height_counts_clear_spacer() {
+        // prefix_sum = [0, 5, 10, 15, 20], clear_ps = [0, 0, 1, 1, 2]
+        // (2 clear blocks among the 4 newest). pitch=20, header=24,
+        // clear_pitch = viewport_rows=24 * pitch=20 = 480.
+        let ps = [0, 5, 10, 15, 20];
+        let clear_ps = [0, 0, 1, 1, 2];
+        let pitch = 20.0_f32;
+        let header = 24.0_f32;
+        let clear_pitch = 480.0_f32;
+        // heights: i=0 → 0; i=1 → 124; i=2 → 728; i=3 → 852; i=4 → 1456
+        assert_eq!(
+            lower_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 124.0),
+            1
+        );
+        assert_eq!(
+            lower_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 700.0),
+            2
+        );
+        assert_eq!(
+            lower_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 900.0),
+            4
+        );
+        assert_eq!(
+            lower_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 5000.0),
+            5
+        );
+        assert_eq!(
+            upper_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 124.0),
+            2
+        );
+        assert_eq!(
+            upper_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 852.0),
+            4
+        );
+        assert_eq!(
+            upper_bound_height(&ps, &clear_ps, pitch, header, clear_pitch, 1456.0),
+            5
+        );
+    }
+
+    /// Visible range = [lower_bound(low) - 1, upper_bound(high) + 1) with
+    /// 1-block overscan; verifies the bounds produce a valid covering range.
     #[test]
     fn binary_search_visible_range_contains_expected_blocks() {
         // 10 blocks, each base_row_count=5 → prefix_sum = [0,5,10,...,50]
         let ps: Vec<usize> = (0..=10).map(|i| i * 5).collect();
+        let clear_ps = vec![0; ps.len()]; // no clear blocks → clear_pitch unused
         let pitch = 20.0_f32;
         let header = 24.0_f32;
         // height(i) = 5i * 20 + i * 24 = 124i
         // Say viewport covers blocks 3..6 (heights 372..744).
         // threshold_low=350 → lower_bound finds first >= 350 → idx 3 (height=372)
         // threshold_high=760 → upper_bound finds first > 760 → idx 7 (height=868)
-        let j_low = lower_bound_height(&ps, pitch, header, 350.0);
-        let j_high = upper_bound_height(&ps, pitch, header, 760.0);
+        let j_low = lower_bound_height(&ps, &clear_ps, pitch, header, 0.0, 350.0);
+        let j_high = upper_bound_height(&ps, &clear_ps, pitch, header, 0.0, 760.0);
         assert_eq!(j_low, 3);
         assert_eq!(j_high, 7);
         // first_visible = j_low - 1 = 2, with overscan start=1
@@ -638,22 +690,10 @@ mod tests {
         assert_eq!(end, 8);
     }
 
-    /// Batch 6 Step 3 (R2-2): criterion micro-benchmark for
-    /// `compute_block_layout_pass`.
-    ///
-    /// Run with:
-    /// ```sh
-    /// cargo test --release -p weft_app --bin weft \
-    ///   bench_layout_pass -- --nocapture --ignored --test-threads=1
-    /// ```
-    ///
-    /// Measures two scenarios at 1k/5k/10k/50k blocks:
-    /// - `all_visible`: clip bounds = ±∞ (every block expanded)
-    /// - `culling_heavy`: 800px viewport, scroll=0 (only ~2 blocks visible)
-    ///
-    /// The ratio proves whether visibility culling is effective, and the
-    /// absolute numbers drive the prefix-sum decision (BATCH4/5 deferred
-    /// pending real data).
+    /// Criterion micro-benchmark (run with `--release --ignored
+    /// --nocapture --test-threads=1`): all_visible (±∞ clip) vs.
+    /// culling_heavy (800px viewport) at 1k/5k/10k/50k blocks; the ratio
+    /// shows whether visibility culling is effective.
     #[test]
     #[ignore = "criterion micro-benchmark; run with --release --ignored --nocapture"]
     fn bench_layout_pass() {
@@ -694,8 +734,7 @@ mod tests {
             for b in &blocks {
                 cache.ensure_cached(b, 80);
             }
-            // R2-2 (Batch 7): build prefix sum so the binary-search fast
-            // path is exercised (otherwise the fallback iterates all blocks).
+            // Build prefix sum so the binary-search fast path is exercised.
             cache.build_prefix_sum(&blocks);
 
             // Scenario 1: all blocks visible (clip bounds = ±∞)
@@ -723,9 +762,8 @@ mod tests {
                 });
             });
 
-            // Scenario 2: heavy culling — 800px viewport, scroll=0.
-            // Only the bottom ~2 blocks are visible; the rest accumulate
-            // cursor_dist without expanding internal lines.
+            // Heavy culling: 800px viewport, scroll=0 — only ~2 blocks
+            // visible; the rest accumulate cursor_dist without expansion.
             group.bench_function(format!("culling_heavy/{count}"), |b| {
                 b.iter(|| {
                     let input = LayoutPassInput {

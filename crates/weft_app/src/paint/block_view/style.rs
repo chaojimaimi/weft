@@ -131,18 +131,18 @@ fn fills_terminal_cell_edges(ch: char) -> bool {
 }
 
 /// v1.10.4: Resolve a block-view foreground color, applying the
-/// minimum-contrast boost ONLY to readable text. Terminal graphic glyphs
-/// (box drawing / block elements — [`fills_terminal_cell_edges`]) are
-/// decoration whose exact color is the app's design intent (TUIs draw
-/// borders with intentionally low-contrast colors); boosting them toward
-/// white turns subtle borders into glaring white bars.
+/// minimum-contrast boost only to theme/default readable text. Explicit
+/// terminal colors and graphic glyphs are application-owned presentation:
+/// boosting them toward white destroys deliberate text hierarchy and turns
+/// subtle borders into glaring white bars.
 fn resolve_block_fg_color(
     fg: [f32; 4],
     background: [f32; 4],
     ch: char,
     minimum_contrast: f32,
+    explicit_terminal_color: bool,
 ) -> [f32; 4] {
-    if fills_terminal_cell_edges(ch) {
+    if fills_terminal_cell_edges(ch) || explicit_terminal_color {
         fg
     } else {
         ensure_minimum_text_contrast(fg, background, minimum_contrast)
@@ -306,8 +306,13 @@ impl MetalRenderer {
             // turning the intended dim border into a glaring white bar, so
             // skip it for graphic characters (same set as
             // `fills_terminal_cell_edges`).
-            let fg_final =
-                resolve_block_fg_color(fg_final, contrast_background, ch, self.minimum_contrast);
+            let fg_final = resolve_block_fg_color(
+                fg_final,
+                contrast_background,
+                ch,
+                self.minimum_contrast,
+                explicit_fg.is_some() || flags.contains(CellFlags::REVERSE),
+            );
 
             // DIM remains an explicit application-owned hierarchy signal and
             // is applied after the optional display contrast correction.
@@ -349,6 +354,9 @@ impl MetalRenderer {
                     fg_final,
                     width,
                     glyph_height,
+                    // v1.10.12: bold/italic SGR styles select the atlas face
+                    // in block history, matching the live grid path.
+                    crate::glyph::GlyphStyle::from_flags(flags),
                 );
             }
 
@@ -435,7 +443,7 @@ mod tests {
         // the 7.0 minimum-contrast threshold.
         let fg = color_to_normalized(weft_core::grid::Color::rgb(21, 20, 27));
         let bg = color_to_normalized(weft_core::grid::Color::rgb(15, 15, 15));
-        let resolved = resolve_block_fg_color(fg, bg, '▀', 7.0);
+        let resolved = resolve_block_fg_color(fg, bg, '▀', 7.0, false);
         for i in 0..3 {
             assert!(
                 (resolved[i] - fg[i]).abs() < 1e-6,
@@ -450,10 +458,21 @@ mod tests {
         // meet the 7.0 threshold — the exemption must not apply to content.
         let fg = color_to_normalized(weft_core::grid::Color::rgb(80, 45, 20));
         let bg = color_to_normalized(weft_core::grid::Color::rgb(15, 15, 15));
-        let resolved = resolve_block_fg_color(fg, bg, 'A', 7.0);
+        let resolved = resolve_block_fg_color(fg, bg, 'A', 7.0, false);
         assert!(
             crate::paint::primitives::text_contrast_ratio(resolved, bg) >= 6.99,
             "readable text boosted to threshold, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn block_view_explicit_terminal_color_preserves_application_hierarchy() {
+        let fg = color_to_normalized(weft_core::grid::Color::rgb(128, 128, 128));
+        let bg = color_to_normalized(weft_core::grid::Color::rgb(8, 65, 78));
+        let resolved = resolve_block_fg_color(fg, bg, 'A', 7.0, true);
+        assert_eq!(
+            resolved, fg,
+            "explicit TUI gray must not be lifted to body text"
         );
     }
 

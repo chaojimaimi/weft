@@ -87,6 +87,64 @@ pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item =
         .into_iter()
 }
 
+/// Take the longest prefix of `s` whose terminal display width fits within
+/// `cap` columns, keeping graphemes atomic (CJK counts 2 columns). Trailing
+/// whitespace that would overflow is left for the next chunk so continuation
+/// lines don't start with blank space. Returns `("", s)` when the first
+/// grapheme alone exceeds `cap` (caller force-takes one grapheme).
+fn take_width_prefix(s: &str, cap: usize) -> (&str, &str) {
+    let mut col = 0usize;
+    let mut end = 0usize;
+    for (byte, grapheme) in s.grapheme_indices(true) {
+        let width = weft_core::grid::terminal_text_width(grapheme);
+        if width == 0 {
+            continue;
+        }
+        if col + width > cap {
+            if grapheme.chars().all(char::is_whitespace) {
+                col += width; // overflow whitespace lands on the next chunk
+                continue;
+            }
+            break;
+        }
+        col += width;
+        end = byte + grapheme.len();
+    }
+    (&s[..end], &s[end..])
+}
+
+/// Wrap a command line: the first line gets `first_cols` (prompt/chevron
+/// indent), continuation lines get full `cols`. Mirrors prompt.rs dual-
+/// capacity wrapping with pure prose rules (commands never hit PureBox /
+/// ProgressGauge structure). Always returns at least one chunk.
+pub(crate) fn command_line_chunks(cmd: &str, first_cols: usize, cols: usize) -> Vec<String> {
+    if cmd.is_empty() {
+        return vec![String::new()];
+    }
+    let cols_eff = cols.max(1);
+    let mut chunks = Vec::new();
+    let mut rest = cmd;
+    let mut cap = first_cols.max(1);
+    while !rest.is_empty() {
+        let (taken, next) = take_width_prefix(rest, cap);
+        if taken.is_empty() {
+            // A single grapheme wider than `cap`: force-take one grapheme
+            // (keeps CJK atoms intact) to guarantee forward progress.
+            let g = rest.graphemes(true).next().unwrap_or("");
+            if g.is_empty() {
+                break;
+            }
+            chunks.push(g.to_string());
+            rest = &rest[g.len()..];
+        } else {
+            chunks.push(taken.to_string());
+            rest = next;
+        }
+        cap = cols_eff; // continuation lines use the full width
+    }
+    chunks
+}
+
 /// Classification of a terminal line for wrap/clip decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StructureKind {
@@ -200,6 +258,32 @@ mod tests {
         assert_eq!(block_line_chunks("ordinary terminal prose", 8).count(), 3);
         let prose = "First sentence.  Second sentence.  Third sentence continues";
         assert!(block_line_chunks(prose, 24).count() > 1);
+    }
+
+    #[test]
+    fn command_wraps_first_line_indent_then_full_width() {
+        // cols=10, first_cols=8: 首行 8 列,续行 10 列
+        let chunks = command_line_chunks("abcdefghijklmnop", 8, 10);
+        assert_eq!(chunks, vec!["abcdefgh", "ijklmnop"]);
+        // 拼接必须还原原文(无字符丢失)
+        assert_eq!(chunks.concat(), "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn command_wrap_counts_cjk_width() {
+        let chunks = command_line_chunks("中文命令测试数据", 4, 4); // 每行 2 个 CJK
+        assert_eq!(chunks.len(), 4);
+        assert_eq!(chunks.concat(), "中文命令测试数据");
+    }
+
+    #[test]
+    fn command_wrap_handles_empty_and_narrow_first_cols() {
+        // 空命令 → 单个空 chunk(调用方 .max(1) 防御)
+        assert_eq!(command_line_chunks("", 8, 10), vec![String::new()]);
+        // 单个 CJK 宽于 first_cols:强制取一个 grapheme,不死循环
+        let chunks = command_line_chunks("中文", 1, 4);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.concat(), "中文");
     }
 
     #[test]

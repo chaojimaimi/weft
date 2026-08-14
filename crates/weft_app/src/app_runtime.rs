@@ -614,6 +614,24 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
 
+        // Drag-selection autoscroll timer — wake the loop ~every 40ms while
+        // a block-view drag selection is held past the content edge, so the
+        // viewport keeps scrolling toward the pointer even when it doesn't
+        // move. The main thread sets `selection_autoscroll_active` inside
+        // `pump_selection_autoscroll` from the edge detection; when false
+        // (no edge-held drag) the timer skips the wake.
+        let autoscroll_proxy = self.proxy.clone();
+        let autoscroll_flag = self.window_runtime.selection_autoscroll_active.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if !autoscroll_flag.load(Ordering::Relaxed) {
+                continue; // no edge-held drag — skip this wake
+            }
+            if autoscroll_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
+
         if self.performance_probe.enabled() {
             let probe_proxy = self.proxy.clone();
             std::thread::spawn(move || {

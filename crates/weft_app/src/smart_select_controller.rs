@@ -52,7 +52,7 @@ impl App {
     fn smart_target_at_pixel(&self, x: f64, y: f64) -> Option<ResolvedSmartTarget> {
         if self.block_view_active() {
             let pos = self.pixel_to_block_view_pos(x, y)?;
-            let rows = self.compute_block_view_rows();
+            let (rows, _, _) = self.compute_block_view_rows()?;
             let (text, click_char, segments) = block_logical_line(&rows, pos)?;
             let byte = byte_index_at_char(&text, click_char)?;
             let target = match_at(&text, byte)?;
@@ -272,6 +272,7 @@ mod tests {
             y_bottom: 20.0,
             line,
             chunk_char_offset: offset,
+            indent_cols: 0,
         }
     }
 

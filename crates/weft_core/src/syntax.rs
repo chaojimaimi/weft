@@ -5,6 +5,8 @@
 //! shell constructs (commands, flags, paths, quoted strings, variables,
 //! operators) well enough to color a line; it is NOT a full shell parser.
 
+use std::ops::Range;
+
 /// What kind of token a piece of a command line is. Drives its color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
@@ -46,6 +48,14 @@ impl Token {
     fn new(text: String, kind: TokenKind) -> Self {
         Self { text, kind }
     }
+}
+
+/// A token span: char range [start, end) into the source line + kind.
+pub(crate) struct TokenSpan {
+    pub start: usize, // char index (matches prompt_visual_layout's char_start/char_end)
+    pub end: usize,
+    pub text: String,
+    pub kind: TokenKind,
 }
 
 fn is_operator_char(c: char) -> bool {
@@ -101,11 +111,16 @@ fn is_number(word: &str) -> bool {
 /// Tokenize a command line into covering spans (every char belongs to exactly
 /// one token). `at_command_position` tracks whether the next word is a command
 /// (true at the start and after an operator).
-pub fn tokenize(line: &str) -> Vec<Token> {
+///
+/// `start_at_command_position` controls whether the *first* word of this
+/// line is eligible to be classified as a command name. Callers rendering a
+/// wrapped continuation line (not the start of the command) pass `false` so
+/// the leading argument isn't mis-coloured as a command.
+fn tokenize_internal(line: &str, start_at_command_position: bool) -> Vec<TokenSpan> {
     let chars: Vec<char> = line.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0;
-    let mut at_command_position = true;
+    let mut at_command_position = start_at_command_position;
 
     while i < chars.len() {
         let c = chars[i];
@@ -115,10 +130,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
-            tokens.push(Token::new(
-                chars[start..i].iter().collect(),
-                TokenKind::Whitespace,
-            ));
+            tokens.push(TokenSpan {
+                start,
+                end: i,
+                text: chars[start..i].iter().collect(),
+                kind: TokenKind::Whitespace,
+            });
             continue;
         }
 
@@ -135,10 +152,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 while i < chars.len() {
                     i += 1;
                 }
-                tokens.push(Token::new(
-                    chars[start..i].iter().collect(),
-                    TokenKind::Comment,
-                ));
+                tokens.push(TokenSpan {
+                    start,
+                    end: i,
+                    text: chars[start..i].iter().collect(),
+                    kind: TokenKind::Comment,
+                });
                 continue;
             }
         }
@@ -158,10 +177,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 }
                 i += 1;
             }
-            tokens.push(Token::new(
-                chars[start..i].iter().collect(),
-                TokenKind::String,
-            ));
+            tokens.push(TokenSpan {
+                start,
+                end: i,
+                text: chars[start..i].iter().collect(),
+                kind: TokenKind::String,
+            });
             at_command_position = false;
             continue;
         }
@@ -171,10 +192,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             while i < chars.len() && is_operator_char(chars[i]) {
                 i += 1;
             }
-            tokens.push(Token::new(
-                chars[start..i].iter().collect(),
-                TokenKind::Operator,
-            ));
+            tokens.push(TokenSpan {
+                start,
+                end: i,
+                text: chars[start..i].iter().collect(),
+                kind: TokenKind::Operator,
+            });
             at_command_position = true; // next word is a command
             continue;
         }
@@ -195,10 +218,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                     i += 1;
                 }
             }
-            tokens.push(Token::new(
-                chars[start..i].iter().collect(),
-                TokenKind::Variable,
-            ));
+            tokens.push(TokenSpan {
+                start,
+                end: i,
+                text: chars[start..i].iter().collect(),
+                kind: TokenKind::Variable,
+            });
             at_command_position = false;
             continue;
         }
@@ -210,11 +235,65 @@ pub fn tokenize(line: &str) -> Vec<Token> {
         }
         let word: String = chars[start..i].iter().collect();
         let kind = classify_word(&word, at_command_position);
-        tokens.push(Token::new(word, kind));
+        tokens.push(TokenSpan {
+            start,
+            end: i,
+            text: word,
+            kind,
+        });
         at_command_position = false;
     }
 
     tokens
+}
+
+/// Tokenize assuming the line starts at a command position (the common case
+/// for a complete one-line command). Wrapped continuation lines should use
+/// `tokenize_at(line, false)` instead.
+pub fn tokenize(line: &str) -> Vec<Token> {
+    tokenize_internal(line, true)
+        .into_iter()
+        .map(|s| Token::new(s.text, s.kind))
+        .collect()
+}
+
+/// Tokenize with an explicit starting command-position state.
+pub fn tokenize_at(line: &str, start_at_command_position: bool) -> Vec<Token> {
+    tokenize_internal(line, start_at_command_position)
+        .into_iter()
+        .map(|s| Token::new(s.text, s.kind))
+        .collect()
+}
+
+/// Tokenize into char-indexed spans (no text copy). Used by the prompt
+/// renderer to color wrapped continuation rows from a whole-logical-line
+/// tokenization, so string/quote/command state survives visual wrapping.
+pub fn tokenize_spans(
+    line: &str,
+    start_at_command_position: bool,
+) -> Vec<(Range<usize>, TokenKind)> {
+    tokenize_internal(line, start_at_command_position)
+        .into_iter()
+        .map(|s| (s.start..s.end, s.kind))
+        .collect()
+}
+
+/// Slice the spans of a logical line down to a visual row's char range
+/// [char_start, char_end). Spans fully cover the line with no overlap, so
+/// the result preserves kinds (a string split by a wrap stays a string).
+pub fn spans_in_range(
+    spans: &[(Range<usize>, TokenKind)],
+    char_start: usize,
+    char_end: usize,
+) -> Vec<(Range<usize>, TokenKind)> {
+    spans
+        .iter()
+        .filter_map(|(range, kind)| {
+            let start = range.start.max(char_start);
+            let end = range.end.min(char_end);
+            (start < end).then_some((start..end, *kind))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -531,5 +610,81 @@ mod tests {
             !kinds.contains(&TokenKind::Default),
             "Default should not appear for normal command words"
         );
+    }
+
+    // ── v1.7.1: tokenize_at continuation-line start state ───────────────
+
+    #[test]
+    fn tokenize_at_continuation_line_does_not_promote_first_word_to_command() {
+        // Continuation line: the leading word is a bare argument "table",
+        // which must NOT be classified as a Command.
+        let toks = tokenize_at("table {{.Names}}\t{{.Status}}", false);
+        let first_word = toks
+            .iter()
+            .find(|t| t.kind != TokenKind::Whitespace)
+            .unwrap();
+        assert_ne!(first_word.kind, TokenKind::Command);
+        assert_eq!(first_word.kind, TokenKind::Argument);
+
+        // Contrast: default tokenize (command position) classifies the first
+        // word as a Command.
+        let toks_cmd = tokenize("table {{.Names}}");
+        let first_cmd = toks_cmd
+            .iter()
+            .find(|t| t.kind != TokenKind::Whitespace)
+            .unwrap();
+        assert_eq!(first_cmd.kind, TokenKind::Command);
+    }
+
+    #[test]
+    fn tokenize_at_false_still_classifies_flags_and_paths_on_continuation() {
+        // Flags and paths on a continuation line keep their kinds — the
+        // start state only affects the command-position check.
+        let toks = tokenize_at("--format /tmp/output", false);
+        let kinds: Vec<_> = toks
+            .iter()
+            .filter(|t| t.kind != TokenKind::Whitespace)
+            .map(|t| t.kind)
+            .collect();
+        assert_eq!(kinds, vec![TokenKind::Flag, TokenKind::Path]);
+    }
+
+    // ── FIX_INPUT_WRAP_SPANS: char-indexed spans for wrapped rows ───────
+
+    #[test]
+    fn tokenize_spans_keeps_string_span_across_wrap_boundary() {
+        // 完整逻辑行,字符串内含折行点(如视觉行在 "{{.Names}}" 后断开)
+        let line = "--format 'table {{.Names}}\\t{{.Status}}'";
+        let spans = tokenize_spans(line, true);
+        // 找到 String span:应覆盖整个 'table ...' 内容(含 \\t 和折行处)
+        let string_spans: Vec<_> = spans
+            .iter()
+            .filter(|(_, k)| *k == TokenKind::String)
+            .collect();
+        assert_eq!(string_spans.len(), 1);
+        let (s_range, _) = string_spans[0];
+        // 折行点({{.Status}} 处)必须位于 String span 内部
+        let cut = line.find("{{.Status}}").unwrap();
+        assert!(s_range.contains(&cut), "折行点必须落在 String span 内");
+        // 视觉行 2 的区间(模拟折行:从 {{.Status}} 处开始)
+        let row2 = spans_in_range(&spans, cut, line.chars().count());
+        assert!(!row2.is_empty());
+        for (_, kind) in &row2 {
+            assert_eq!(*kind, TokenKind::String, "续行片段必须保持 String 色");
+        }
+    }
+
+    #[test]
+    fn spans_in_range_clips_and_keeps_kinds() {
+        let spans = vec![(0..5, TokenKind::Command), (5..10, TokenKind::Flag)];
+        assert_eq!(
+            spans_in_range(&spans, 2, 8),
+            vec![(2..5, TokenKind::Command), (5..8, TokenKind::Flag)]
+        );
+        assert_eq!(
+            spans_in_range(&spans, 6, 10),
+            vec![(6..10, TokenKind::Flag)]
+        );
+        assert!(spans_in_range(&spans, 10, 10).is_empty());
     }
 }
