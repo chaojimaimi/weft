@@ -711,7 +711,16 @@ impl MetalRenderer {
             // Step 2 will make this << session_block_count via visibility culling;
             // for now (pre-Step-2) it equals the total expanded row count.
             bv_rows_count = bv_rows.len();
-            v
+            // v1.10.21: alt-screen history peek — gesture-hint pill at the
+            // pane top, drawn after the block content so it sits on top
+            // (no layout involvement; see paint/alt_peek_pill).
+            if terminal.is_alt_screen_history_peek() {
+                let mut v = v;
+                self.push_alt_peek_pill(&mut v);
+                v
+            } else {
+                v
+            }
         } else {
             // Grid view (alt-screen apps): build per-cell instances
             // (P1.5-B1) into `instances`; overlays go into `vertices`

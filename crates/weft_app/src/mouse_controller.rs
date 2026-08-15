@@ -731,6 +731,24 @@ impl App {
                 if phase == winit::event::TouchPhase::Cancelled {
                     return;
                 }
+                // v1.10.21: during an alt-screen history peek a plain
+                // precise scroll means "interact with the app" — one flick
+                // drops the peek and returns to the live TUI (Warp parity;
+                // see FIX_ALT_PEEK_WARP_ALIGNMENT). Shift+scroll falls
+                // through to the fractional block scroll below.
+                let peeking = self
+                    .sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+                if peeking && !self.interaction.mods.state().shift_key() {
+                    // snap_to_bottom clears the flag and arms the gate's
+                    // re-entry lockout (exit edge detected inside).
+                    self.sessions.active_mut().snap_to_bottom();
+                    self.request_redraw();
+                    return;
+                }
                 // v1.10.19: A1-fix parity with scroll_local_view — compute
                 // max_scroll LIVE from the layout cache instead of the
                 // per-frame cached value. The cached metrics are None during
@@ -883,74 +901,15 @@ impl App {
             }
         }
 
-        // Alt-screen apps (less, vim, man, omp, …) don't use mouse protocol but
-        // own the screen. v1.10.12: scroll-UP overlays the terminal's history
-        // BlockView over the TUI (alt-screen history peek) so the user can
-        // browse past output without leaving the TUI; Shift+scroll stays an
-        // arrow-key escape hatch so pagers (less/man) can still be wheel-scrolled.
+        // Alt-screen apps (less, vim, man, omp, …) don't use mouse protocol
+        // but own the screen. v1.10.21: wheel routing lives in
+        // `alt_wheel_controller` (pure table in `alt_peek::route`, Warp
+        // parity — see FIX_ALT_PEEK_WARP_ALIGNMENT): plain wheels forward
+        // arrows to the TUI, Shift+wheel-up enters the history peek, a
+        // plain wheel inside the peek returns to the live TUI instantly.
+        // Mouse-reporting apps and the primary screen never reach here.
         if alt_screen_active {
-            // Escape hatch: Shift+scroll sends ↑/↓ to the TUI (scroll a pager,
-            // navigate omp) and never enters the peek.
-            if self.interaction.mods.state().shift_key() {
-                let key = if up { KeyCode::Up } else { KeyCode::Down };
-                let single = self
-                    .sessions
-                    .active_mut()
-                    .input_handler
-                    .encode_key(key, Modifiers::SHIFT);
-                if !single.is_empty() {
-                    let mut batch = Vec::with_capacity(single.len() * lines);
-                    for _ in 0..lines {
-                        batch.extend_from_slice(&single);
-                    }
-                    let _ = self.sessions.active_mut().write_user_input(&batch);
-                }
-                return;
-            }
-            let peek = self
-                .sessions
-                .active()
-                .terminal
-                .as_ref()
-                .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
-            if peek {
-                // Already browsing history — navigate the BlockView. Scrolling
-                // back to the bottom clears the peek flag (set_block_scroll).
-                self.scroll_local_view(rows);
-                return;
-            }
-            if up {
-                // Enter the peek: overlay the history BlockView over the TUI.
-                // Only when the block tracker has bootstrapped (history exists).
-                let bootstrap = self
-                    .sessions
-                    .active()
-                    .terminal
-                    .as_ref()
-                    .is_some_and(|t| t.block_tracker().bootstrap_ready());
-                if bootstrap {
-                    if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
-                        t.set_alt_screen_history_peek(true);
-                    }
-                    self.scroll_local_view(rows);
-                    return;
-                }
-            }
-            // Plain scroll-down without an active peek: translate to Up/Down
-            // arrow keys so the TUI can scroll its own content natively.
-            let key = if up { KeyCode::Up } else { KeyCode::Down };
-            let single = self
-                .sessions
-                .active_mut()
-                .input_handler
-                .encode_key(key, Modifiers::empty());
-            if !single.is_empty() {
-                let mut batch = Vec::with_capacity(single.len() * lines);
-                for _ in 0..lines {
-                    batch.extend_from_slice(&single);
-                }
-                let _ = self.sessions.active_mut().write_user_input(&batch);
-            }
+            self.handle_alt_screen_wheel(rows, lines, up);
             return;
         }
 

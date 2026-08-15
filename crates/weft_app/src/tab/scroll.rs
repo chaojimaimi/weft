@@ -59,6 +59,20 @@ pub(crate) fn primary_history_browsing(
         && (detached || ((selecting || block_selection_active) && history_view_active))
 }
 
+/// v1.10.21: whether finishing the drained blocks should snap the view to
+/// the live tail. A non-empty drain snaps UNLESS the user is browsing
+/// primary history or the alt-screen history peek — both are
+/// user-initiated views that must not be yanked by background output
+/// (Warp: blocks and the alt screen are mutually exclusive views).
+pub(crate) fn block_completion_should_snap(
+    terminal: &weft_core::vt::Terminal,
+    drained: &[weft_core::blocks::Block],
+) -> bool {
+    !drained.is_empty()
+        && !terminal.primary_history_view()
+        && !terminal.is_alt_screen_history_peek()
+}
+
 impl Tab {
     pub fn block_scroll(&self) -> usize {
         self.block_scroll_anchor.offset_value()
@@ -115,6 +129,14 @@ impl Tab {
     pub fn snap_to_bottom(&mut self) {
         self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
         self.block_scroll_fraction = 0.0;
+        // v1.10.21: snapshot the peek flag BEFORE the mutable terminal
+        // borrow — the entry gate is a sibling Tab field and the closure
+        // below can't touch it while `self.terminal` is borrowed through
+        // DerefMut (disjoint-field borrows don't work through Deref).
+        let peek_was_active = self
+            .terminal
+            .as_ref()
+            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
         let changed = self.terminal.as_mut().is_some_and(|terminal| {
             let changed = terminal.primary_history_view();
             terminal.set_primary_history_view(false);
@@ -122,6 +144,12 @@ impl Tab {
             terminal.set_alt_screen_history_peek(false);
             changed
         });
+        // v1.10.21: arm the re-entry lockout only on a REAL exit (the flag
+        // was set) — an unconditional note_exit would lock out peek entry
+        // after every keystroke/snap, even with no peek.
+        if peek_was_active {
+            self.alt_peek_gate.note_exit();
+        }
         if changed {
             self.reset_primary_history_refresh();
         }
@@ -148,6 +176,14 @@ impl Tab {
         // reading the offset first releases the immutable pane borrow before
         // `&mut pane.terminal` is taken.
         let detached = !matches!(self.block_scroll_anchor, BlockScrollAnchor::FollowBottom);
+        // v1.10.21: snapshot the peek flag before the terminal borrow so the
+        // entry gate (sibling Tab field) can be armed afterwards — see
+        // snap_to_bottom for the DerefMut borrow constraint.
+        let peek_was_active = self
+            .active()
+            .terminal
+            .as_ref()
+            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
         let pane = self.active_mut();
         let changed = if let Some(terminal) = &mut pane.terminal {
             // v1.10.6: history browsing is ACTIVE ONLY while the user is
@@ -181,13 +217,21 @@ impl Tab {
             terminal.set_primary_history_view(browsing);
             // v1.10.12: scrolling back to the bottom also exits the alt-screen
             // history peek, returning the viewport to the live TUI grid.
-            if !detached && terminal.is_alt_screen_history_peek() {
+            // v1.10.21: the re-entry lockout is armed below, after the
+            // terminal borrow ends (gate is a sibling Tab field).
+            if !detached {
                 terminal.set_alt_screen_history_peek(false);
             }
             changed
         } else {
             false
         };
+        // v1.10.21: arm the re-entry lockout only when the sync actually
+        // cleared an active peek (`!detached && peek_was_active`) — see
+        // snap_to_bottom for why the note is conditional.
+        if !detached && peek_was_active {
+            self.alt_peek_gate.note_exit();
+        }
         if changed {
             self.reset_primary_history_refresh();
         }
@@ -327,5 +371,45 @@ mod tests {
             tab.block_scroll_anchor(),
             BlockScrollAnchor::FixedDocumentRow(2)
         );
+    }
+
+    /// v1.10.21: block completion snaps unless the user is browsing primary
+    /// history or the alt-screen history peek.
+    #[test]
+    fn block_completion_snap_respects_user_browsing_views() {
+        fn drained_block() -> weft_core::blocks::Block {
+            weft_core::blocks::Block {
+                id: weft_core::blocks::BlockId(1),
+                command: "cargo test".into(),
+                cwd: None,
+                output: "ok".into(),
+                styled_output: None,
+                exit_code: Some(0),
+                started_at: std::time::SystemTime::now(),
+                finished_at: None,
+                collapsed: false,
+            }
+        }
+        let t = weft_core::vt::Terminal::new(24, 80);
+        assert!(
+            !block_completion_should_snap(&t, &[]),
+            "empty drain never snaps"
+        );
+
+        let mut t = t;
+        assert!(block_completion_should_snap(&t, &[drained_block()]));
+        t.set_primary_history_view(true);
+        assert!(
+            !block_completion_should_snap(&t, &[drained_block()]),
+            "primary history browsing suppresses the snap"
+        );
+        t.set_primary_history_view(false);
+        t.set_alt_screen_history_peek(true);
+        assert!(
+            !block_completion_should_snap(&t, &[drained_block()]),
+            "an active alt-screen history peek suppresses the snap"
+        );
+        t.set_alt_screen_history_peek(false);
+        assert!(block_completion_should_snap(&t, &[drained_block()]));
     }
 }

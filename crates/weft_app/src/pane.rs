@@ -94,6 +94,10 @@ pub struct Pane {
     pub(crate) tui_scroll_deadline: Option<std::time::Instant>,
     pub(crate) tui_scroll_wake_scheduled: bool,
     pub(crate) primary_history_refresh: PrimaryHistoryRefresh,
+    /// v1.10.21: alt-screen history-peek entry gate (400ms re-entry lockout
+    /// and ≥2-row net-travel threshold; see `crate::alt_peek`). Lives on the
+    /// pane, alongside the peek flag it guards on this pane's Terminal.
+    pub(crate) alt_peek_gate: crate::alt_peek::PeekEntryGate,
 }
 
 impl Pane {
@@ -159,6 +163,7 @@ impl Pane {
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
+            alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
         }
     }
 
@@ -186,6 +191,7 @@ impl Pane {
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
+            alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
         }
     }
 
@@ -216,6 +222,7 @@ impl Pane {
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
             primary_history_refresh: PrimaryHistoryRefresh::default(),
+            alt_peek_gate: crate::alt_peek::PeekEntryGate::default(),
         }
     }
 

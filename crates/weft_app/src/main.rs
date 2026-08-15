@@ -13,6 +13,10 @@ mod accessibility_model;
 mod ai;
 // v1.8.2: Block diagnose controller — bridges block view ↔ AiState::spawn_diagnose.
 mod ai_block_controller;
+// v1.10.21: alt-screen wheel routing + peek entry gate (pure logic).
+mod alt_peek;
+// v1.10.21: alt-screen wheel dispatch (route() wiring; controller stays lean).
+mod alt_wheel_controller;
 mod app;
 mod app_runtime;
 mod app_state;

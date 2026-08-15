@@ -216,6 +216,13 @@ impl MetalRenderer {
         }
         // F2 P0-2: warm up the status hint badge glyphs (▾ + label text).
         missing.extend("\u{25be} passthrough running".chars());
+        // v1.10.21: warm up the alt-screen history-peek pill glyphs (↺ · CJK
+        // label) exactly when the pill can be on screen. `push_text` silently
+        // skips glyphs missing from the atlas, so without this the CJK label
+        // would render as bare punctuation (the "fragmented output" failure).
+        if terminal.is_alt_screen_history_peek() {
+            missing.extend(crate::paint::alt_peek_pill::PILL_TEXT.chars());
+        }
         // v1.7.3-C: warm up the bookmark star (★) used in block headers.
         missing.extend(['\u{2605}']);
         // F3-2: warm up the braille spinner glyphs (animated activity

@@ -14,12 +14,23 @@ impl Tab {
         // BlockView reserves breathing room). Capture the state before
         // processing so we can flag the transition after the mutable
         // borrow on `self.terminal` ends.
+        //
+        // v1.10.21: same capture-before pattern for the alt-screen history
+        // peek — the VT core clears the flag itself on CSI ?1049l (deep in
+        // the parser, unreachable from the app layer), and the entry gate's
+        // re-entry lockout must arm on that exit too. `note_exit` runs after
+        // the terminal borrow ends because the gate is a sibling Pane field.
+        let (was_alt, was_peeking) = match &self.terminal {
+            Some(t) => (t.is_alt_screen_active(), t.is_alt_screen_history_peek()),
+            None => (false, false),
+        };
         let (response, alt_changed) = match &mut self.terminal {
             Some(terminal) => {
-                let was_alt = terminal.is_alt_screen_active();
                 terminal.process(data);
-                let now_alt = terminal.is_alt_screen_active();
-                (terminal.take_response(), was_alt != now_alt)
+                (
+                    terminal.take_response(),
+                    was_alt != terminal.is_alt_screen_active(),
+                )
             }
             None => return false,
         };
@@ -29,6 +40,14 @@ impl Tab {
             // holds the recompute while toggles repeat inside it so a burst
             // coalesces into one recompute (see tab/resize.rs).
             self.alt_rescale_last_flip = Some(std::time::Instant::now());
+        }
+        if was_peeking
+            && !self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| t.is_alt_screen_history_peek())
+        {
+            self.alt_peek_gate.note_exit();
         }
         if !response.is_empty() {
             if let Some(pty) = &self.pty {

@@ -101,12 +101,15 @@ pub(in crate::vt) struct CapabilityFlags {
     /// User-driven history-browsing toggle (scroll-up while a primary-screen
     /// TUI owns the viewport).
     pub(in crate::vt) primary_history_view: bool,
-    /// v1.10.12: alt-screen history peek — while an alt-screen TUI (omp/less/
-    /// vim without mouse reporting) owns the screen, the user can scroll up to
-    /// overlay the terminal's history BlockView over the TUI. When true this
-    /// makes `show_block_view()` return true even though `alt_active` is true
-    /// (the BlockView paint is grid-content-independent, so this is safe).
-    /// Cleared on scroll-back-to-bottom, any PTY input, or alt-screen exit.
+    /// v1.10.12, v1.10.21 (trigger updated): alt-screen history peek — while
+    /// an alt-screen TUI (omp/less/vim without mouse reporting) owns the
+    /// screen, **Shift+wheel-up** overlays the terminal's history BlockView
+    /// over the TUI (plain wheels forward arrow keys to the app instead, Warp
+    /// parity; the mouse_controller routes both through `alt_peek::route`).
+    /// When true this makes `show_block_view()` return true even though
+    /// `alt_active` is true (the BlockView paint is grid-content-independent,
+    /// so this is safe). Cleared on scroll-back-to-bottom, any PTY input, a
+    /// plain (non-Shift) wheel while peeking, or alt-screen exit.
     pub(in crate::vt) alt_screen_history_peek: bool,
     /// Timestamp of the most recent history-snapshot refresh (rate-limited by
     /// `PRIMARY_HISTORY_SNAPSHOT_INTERVAL`).

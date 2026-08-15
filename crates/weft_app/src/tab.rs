@@ -783,7 +783,8 @@ impl Tab {
                 need_redraw = true;
             }
             drained = terminal.block_tracker_mut().drain_unpersisted();
-            reset_scroll = !drained.is_empty() && !terminal.primary_history_view();
+            // v1.10.21: don't yank an active history peek (user browsing).
+            reset_scroll = crate::tab::scroll::block_completion_should_snap(terminal, &drained);
             if terminal.synchronized_output() {
                 need_redraw = false;
             }
