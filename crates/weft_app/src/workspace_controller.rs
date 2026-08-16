@@ -151,11 +151,7 @@ impl App {
             .terminal
             .as_ref()
             .and_then(|t| t.cwd())
-            .or_else(|| {
-                pane.restored_snapshot
-                    .as_ref()
-                    .and_then(|s| s.cwd.as_deref())
-            })
+            .or_else(|| pane.restored_cwd_fallback())
             .map(PathBuf::from);
         let draft = pane
             .terminal
@@ -360,10 +356,12 @@ impl App {
             }
         }
 
-        // v1.6.2 review M5: set the root pane's restored_snapshot so
+        // v1.6.2 review M5: set the root pane's cwd fallback (`restored_cwd`) so
         // `terminal.cwd()` falls back to the saved cwd before OSC 7 is
         // reported by the freshly-spawned shell. Non-root panes get their
-        // restored_snapshot set in `build_subtree` via `set_pane_cwd`.
+        // fallback set in `build_subtree`. This only writes the cwd
+        // fallback — the real TabSnapshot is attached separately by
+        // `attach_recovery_tab_snapshots` (v1.10.24 B1).
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
             let root_pane_id = tab.active_pane_id();
             if let Some(pane) = tab.pane_mut(root_pane_id) {
@@ -873,23 +871,11 @@ mod tests {
         // Pane 1 is B — draft "build".
         let pane_b = tab.pane(panes[1]).unwrap();
         assert_eq!(pane_b.terminal.as_ref().unwrap().editor().text(), "build");
-        assert_eq!(
-            pane_b
-                .restored_snapshot
-                .as_ref()
-                .and_then(|s| s.cwd.as_deref()),
-            Some("/b")
-        );
+        assert_eq!(pane_b.restored_cwd.as_deref(), Some("/b"));
         // Pane 2 is C — draft "test".
         let pane_c = tab.pane(panes[2]).unwrap();
         assert_eq!(pane_c.terminal.as_ref().unwrap().editor().text(), "test");
-        assert_eq!(
-            pane_c
-                .restored_snapshot
-                .as_ref()
-                .and_then(|s| s.cwd.as_deref()),
-            Some("/c")
-        );
+        assert_eq!(pane_c.restored_cwd.as_deref(), Some("/c"));
     }
 
     #[test]

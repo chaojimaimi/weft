@@ -4,7 +4,11 @@
 //! recovery snapshot is available. The user can choose to:
 //!
 //! - **Restore** — rebuild the session from the snapshot.
-//! - **Ignore** — start fresh; the snapshot is kept for potential later recovery.
+//! - **Ignore** — start fresh without restoring; the ignored snapshot is
+//!   superseded by the current session's auto-snapshot (the pre-ignore copy
+//!   survives only as one `.bak` generation — it is NOT kept for later
+//!   recovery or manual loading; that promise cannot hold, see
+//!   docs/FIX_RECOVERY_DESIGN_ALIGNMENT.md Fix 3).
 //! - **Delete** — start fresh; the snapshot is permanently deleted.
 //!
 //! The prompt is modal (`runModal`) and must be invoked on the main thread
@@ -19,7 +23,8 @@ use objc2_foundation::{MainThreadMarker, NSString};
 pub enum RecoveryPromptResponse {
     /// Restore the session from the snapshot.
     Restore,
-    /// Start fresh; keep the snapshot for potential later recovery.
+    /// Start fresh; the ignored snapshot is superseded by the current
+    /// session's auto-snapshot (not kept for later recovery).
     Ignore,
     /// Start fresh; permanently delete the snapshot.
     Delete,
@@ -35,7 +40,8 @@ pub enum RecoveryPromptResponse {
 pub enum RecoveryChoice {
     /// Restore the session from the snapshot.
     Restore,
-    /// Start fresh; keep the snapshot for potential later recovery.
+    /// Start fresh; the ignored snapshot is superseded by the current
+    /// session's auto-snapshot (not kept for later recovery).
     Ignore,
     /// Start fresh; permanently delete the snapshot.
     Delete,
@@ -87,8 +93,8 @@ impl std::error::Error for AlertError {}
 /// 3. **Delete** — returns [`RecoveryPromptResponse::Delete`].
 ///
 /// If the user dismisses the alert via Esc / Cmd+. (cancel), it's treated
-/// as **Ignore** — the snapshot is preserved in case they want to recover
-/// later.
+/// as **Ignore** — a normal session starts; the old snapshot is superseded
+/// by the current session's auto-snapshot.
 pub fn show_recovery_prompt(
     mtm: MainThreadMarker,
     snapshot_age_secs: u64,
@@ -120,7 +126,9 @@ pub fn show_recovery_prompt(
         let restore = NSString::from_str("Restore");
         alert.addButtonWithTitle(&restore);
 
-        // 2. Ignore — keep snapshot, start fresh
+        // 2. Ignore — start fresh; the current session's first autosave
+        //    supersedes the old snapshot (pre-ignore copy survives only as
+        //    one .bak generation — not kept for later recovery)
         let ignore = NSString::from_str("Ignore");
         alert.addButtonWithTitle(&ignore);
 
@@ -147,8 +155,8 @@ pub fn show_recovery_prompt(
     //                            cancel button is the second one (Ignore)
     //                            per AppKit's cancel-button heuristic.
     //
-    // This means Esc = Ignore, which is the desired behavior (preserve
-    // the snapshot in case the user wants to recover later).
+    // This means Esc = Ignore, which is the desired behavior (a fresh
+    // session starts; the old snapshot is superseded by autosave).
     Ok(map_modal_response(response))
 }
 
@@ -233,8 +241,8 @@ fn map_modal_response(response: NSModalResponse) -> RecoveryPromptResponse {
         NS_ALERT_FIRST_BUTTON_RETURN => RecoveryPromptResponse::Restore,
         NS_ALERT_SECOND_BUTTON_RETURN => RecoveryPromptResponse::Ignore,
         NS_ALERT_THIRD_BUTTON_RETURN => RecoveryPromptResponse::Delete,
-        // Any other response (e.g. cancel) defaults to Ignore — the
-        // snapshot is preserved.
+        // Any other response (e.g. cancel) defaults to Ignore — a fresh
+        // session starts; the old snapshot is superseded by autosave.
         _ => RecoveryPromptResponse::Ignore,
     }
 }

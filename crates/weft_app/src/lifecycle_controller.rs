@@ -763,6 +763,18 @@ impl App {
     /// both stores (recovery YAML + tabs SQLite) are written in the same
     /// `TabsAutoSave` cycle, we match by position and only carry over the
     /// `block_ids` (the editor draft is already set by `restore_workspace`).
+    ///
+    /// v1.10.24 (FIX_RECOVERY_DESIGN_ALIGNMENT Fix 2): attachment now also
+    /// applies the persisted `block_scroll_offset` via
+    /// [`Tab::attach_recovery_snapshot`] (which reuses `set_block_scroll`),
+    /// so the recovery Restore path restores the block-view scroll position
+    /// exactly like the SQLite path does.
+    ///
+    /// v1.10.24 B1: this now actually works — `restore_workspace` only sets
+    /// the `restored_cwd` fallback (no stub snapshot), so the `is_some()`
+    /// guard inside `attach_recovery_snapshot` cannot skip the real attach.
+    /// Before the fix `set_restored_cwd_fallback` wrote a stub
+    /// `restored_snapshot`, making this attach a no-op since v1.8.9.
     pub(super) fn attach_recovery_tab_snapshots(&mut self) {
         let Some(store) = self.sessions.block_store() else {
             return;
@@ -782,19 +794,7 @@ impl App {
         let attached = snaps
             .iter()
             .zip(tabs.iter_mut())
-            .filter_map(|(snap, tab)| {
-                // Only the active pane's restored_snapshot is consulted by the
-                // hydration loop (Tab derefs to the active pane). Multi-pane
-                // per-pane block_ids tracking is a follow-up; v1.8.9 fix
-                // restores the common single-pane case.
-                let pane = tab.pane_mut(tab.active_pane_id())?;
-                if pane.restored_snapshot.is_none() {
-                    pane.restored_snapshot = Some(snap.clone());
-                    Some(())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(snap, tab)| tab.attach_recovery_snapshot(snap).then_some(()))
             .count();
         info!(
             attached,

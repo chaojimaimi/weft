@@ -28,11 +28,15 @@
 //!
 //! ## Rollback
 //!
-//! After a restore, the snapshot file is kept as-is. If the user crashes
-//! again before any debounced write, they can restore again from the same
-//! snapshot. Once a debounced write happens (content changed), the old
-//! snapshot moves to `.bak`. On the next clean shutdown, the marker is
-//! written; on the subsequent launch, the snapshot is deleted.
+//! v1.10.24 (FIX_RECOVERY_DESIGN_ALIGNMENT Fix 4): after a Restore the
+//! snapshot is kept as the rollback point only until the first debounced
+//! write — the restore resets the debounce (`hash = None`), so the next
+//! 1 Hz autosave cycle (usually ≤1s later) rewrites it and moves the
+//! pre-restore copy to `.bak`. A second crash BEFORE that first write can
+//! still Restore the same snapshot again; once rewritten, the snapshot
+//! reflects the new session. Cleanup happens only on a later clean shutdown
+//! (marker written, snapshot deleted on the subsequent launch) — it is not
+//! tied to the user confirming the restored session is stable.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

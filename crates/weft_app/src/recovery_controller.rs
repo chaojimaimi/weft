@@ -246,8 +246,9 @@ impl RecoveryController {
     /// v1.6.3: Keep the snapshot but don't restore from it.
     ///
     /// Called when the user chooses "Ignore" in the recovery prompt.
-    /// The snapshot is preserved in case the user wants to recover later
-    /// (e.g. by manually loading the file).
+    /// v1.10.24 (Fix 3): NOT kept for later recovery/manual loading — the
+    /// first autosave (≤1s, hash=None) supersedes it; the old copy survives
+    /// only as one `.bak` generation.
     pub(crate) fn ignore_snapshot(&self) {
         info!("recovery snapshot ignored (preserved on disk)");
     }
@@ -391,6 +392,11 @@ impl App {
                     }
                     Err(e) => {
                         warn!(error = %e, "recovery restore failed, falling back to normal startup");
+                        // v1.10.24 Fix 1: surface on the same channel as the
+                        // success-path warning (not just a warn! log).
+                        self.surface_config_error(&format!(
+                            "Session restore failed, falling back to normal startup: {e}"
+                        ));
                         self.restore_tab_snapshots();
                     }
                 }

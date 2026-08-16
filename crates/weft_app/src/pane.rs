@@ -79,11 +79,21 @@ pub struct Pane {
     /// programmatic jumps and session restore.
     pub(crate) block_scroll_fraction: f32,
     /// Original persisted state retained while a restored shell is starting.
-    /// Until OSC 7 supplies an authoritative cwd, this prevents autosave
-    /// from replacing the saved cwd with a transient `None`. It also
-    /// preserves the complete pane when PTY creation fails and no live
-    /// snapshot is possible.
+    /// Set only by the REAL restore paths (`restore_from_snapshot`,
+    /// `attach_recovery_snapshot`) — never as a stub. The pre-OSC-7 cwd
+    /// lives in [`Pane::restored_cwd`]; the v1.8.9 bug was writing a stub
+    /// here from `set_restored_cwd_fallback`, which made the
+    /// `attach_recovery_snapshot` `is_some()` guard skip every real attach.
     pub restored_snapshot: Option<TabSnapshot>,
+    /// v1.10.24 B1: cwd to report (via `launch_cwd` / `to_snapshot`) until
+    /// the freshly-spawned shell emits its own OSC 7. Written by
+    /// [`Pane::set_restored_cwd_fallback`]. Lives on its own field — the
+    /// v1.8.9 stub-snapshot overload blocked the real recovery snapshot
+    /// attach (block_ids never injected, scroll offset never applied).
+    pub restored_cwd: Option<String>,
+    /// Whether `restored_cwd` has ever been assigned. Preserves the set-once
+    /// contract even when the first call carried `None`.
+    pub(crate) restored_cwd_set: bool,
     /// Wheel rows received while a TUI command is starting but before its
     /// alternate-screen sequence has reached the parser. Replayed once the
     /// alt screen becomes active, so the first trackpad gesture is not lost.
@@ -159,6 +169,8 @@ impl Pane {
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
+            restored_cwd: None,
+            restored_cwd_set: false,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -187,6 +199,8 @@ impl Pane {
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
+            restored_cwd: None,
+            restored_cwd_set: false,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -218,6 +232,8 @@ impl Pane {
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
             block_scroll_fraction: 0.0,
             restored_snapshot: None,
+            restored_cwd: None,
+            restored_cwd_set: false,
             pending_tui_scroll: None,
             tui_scroll_deadline: None,
             tui_scroll_wake_scheduled: false,
@@ -291,19 +307,35 @@ impl Pane {
             .map_err(|error| error.to_string())
     }
 
+    /// v1.10.24 B1: Set the pane's cwd fallback — the directory reported by
+    /// `launch_cwd` / `to_snapshot` until the freshly-spawned shell emits its
+    /// own OSC 7.
+    ///
+    /// Previously this wrote a full stub `TabSnapshot` into
+    /// `restored_snapshot`, which made `attach_recovery_snapshot`'s
+    /// `is_some()` guard skip every real attach — block_ids were never
+    /// injected and the scroll offset never applied (v1.8.9 no-op, see
+    /// FIX_RECOVERY_DESIGN_ALIGNMENT B1). The fallback now lives on its own
+    /// field so the real snapshot can attach freely.
+    ///
+    /// Set-once: the first value wins, even over a later restore step
+    /// (e.g. `build_subtree` re-setting the root leaf).
     pub(crate) fn set_restored_cwd_fallback(&mut self, cwd: Option<String>) {
-        if self.restored_snapshot.is_some() {
+        if self.restored_cwd_set || self.restored_snapshot.is_some() {
             return;
         }
-        self.restored_snapshot = Some(TabSnapshot {
-            position: 0,
-            active: false,
-            cwd,
-            block_scroll_offset: 0,
-            editor_buffer: String::new(),
-            shell_phase: "AtPrompt".to_string(),
-            block_ids: Vec::new(),
-        });
+        self.restored_cwd_set = true;
+        self.restored_cwd = cwd;
+    }
+
+    /// v1.10.24 B1: Effective restored cwd for the pre-OSC-7 interval — the
+    /// real attached snapshot's cwd wins, then the workspace-restore
+    /// fallback.
+    pub(crate) fn restored_cwd_fallback(&self) -> Option<&str> {
+        self.restored_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.cwd.as_deref())
+            .or(self.restored_cwd.as_deref())
     }
 
     /// Non-blocking drain of PTY events into channel. Capped per frame.
@@ -389,18 +421,20 @@ mod tests {
     fn restored_cwd_fallback_is_set_once_and_visible_to_snapshot_logic() {
         let mut pane = Pane::with_terminal_only(1000);
         pane.set_restored_cwd_fallback(Some("/saved".into()));
+        assert_eq!(pane.restored_cwd.as_deref(), Some("/saved"));
         assert_eq!(
-            pane.restored_snapshot
-                .as_ref()
-                .and_then(|s| s.cwd.as_deref()),
-            Some("/saved")
+            pane.restored_cwd_fallback(),
+            Some("/saved"),
+            "the fallback must be visible to the snapshot cwd logic"
+        );
+        assert!(
+            pane.restored_snapshot.is_none(),
+            "v1.8.9 no-op regression: the cwd fallback must not write a stub snapshot"
         );
 
         pane.set_restored_cwd_fallback(Some("/replacement".into()));
         assert_eq!(
-            pane.restored_snapshot
-                .as_ref()
-                .and_then(|s| s.cwd.as_deref()),
+            pane.restored_cwd.as_deref(),
             Some("/saved"),
             "a later fallback must not replace the original recovery state"
         );

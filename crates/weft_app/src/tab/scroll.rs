@@ -1,4 +1,5 @@
 use super::Tab;
+use weft_core::persistence::TabSnapshot;
 
 /// Block-view scroll anchor (R2-1).
 ///
@@ -112,6 +113,38 @@ impl Tab {
         self.block_scroll_anchor = BlockScrollAnchor::from_offset(offset);
         self.block_scroll_fraction = 0.0;
         self.sync_primary_history_view();
+    }
+
+    /// v1.10.24 (FIX_RECOVERY_DESIGN_ALIGNMENT Fix 2): Attach a persisted
+    /// [`TabSnapshot`] to the active pane of a recovered tab and apply its
+    /// block-view scroll offset.
+    ///
+    /// The recovery Restore path rebuilds tabs from the recovery YAML
+    /// snapshot but leaves `restored_snapshot = None` and never applied the
+    /// persisted `block_scroll_offset`. This fills both gaps with the SAME
+    /// primitives the SQLite restore path uses: the snapshot is attached
+    /// (as `attach_recovery_tab_snapshots` already did) and the offset is
+    /// applied via [`Tab::set_block_scroll`] — the scroll half of
+    /// [`Tab::restore_from_snapshot`]. No new scroll logic.
+    ///
+    /// v1.10.24 B1: `restored_snapshot` is guaranteed to be `None` here on
+    /// the recovery path — `set_restored_cwd_fallback` no longer writes a
+    /// stub snapshot (it writes `restored_cwd` instead), so the `is_some()`
+    /// guard below cannot skip the real attach anymore. The v1.8.9 "attach
+    /// was always a no-op" bug is fixed; see `Pane::restored_cwd`.
+    ///
+    /// Returns `true` when the snapshot was newly attached. A zero offset is
+    /// skipped — `FollowBottom` is already the fresh-tab default, matching
+    /// the SQLite path's `from_offset(0)` behavior.
+    pub(crate) fn attach_recovery_snapshot(&mut self, snap: &TabSnapshot) -> bool {
+        if self.restored_snapshot.is_some() {
+            return false;
+        }
+        self.restored_snapshot = Some(snap.clone());
+        if snap.block_scroll_offset != 0 {
+            self.set_block_scroll(snap.block_scroll_offset);
+        }
+        true
     }
 
     pub(crate) fn scroll_block_fractional(&mut self, delta_rows: f32, max_scroll: usize) {
@@ -411,5 +444,53 @@ mod tests {
         );
         t.set_alt_screen_history_peek(false);
         assert!(block_completion_should_snap(&t, &[drained_block()]));
+    }
+
+    /// v1.10.24 B1 (FIX_RECOVERY_DESIGN_ALIGNMENT) regression: the
+    /// workspace-restore cwd fallback must NOT block a later real snapshot
+    /// attach. Before the fix, `set_restored_cwd_fallback` wrote a full stub
+    /// `restored_snapshot`, so `attach_recovery_snapshot`'s `is_some()` guard
+    /// skipped every real attach (v1.8.9 no-op): block_ids were never
+    /// injected and `block_scroll_offset` never applied.
+    #[test]
+    fn cwd_fallback_does_not_block_snapshot_attach() {
+        let mut tab = Tab::empty();
+        // Real Restore order: workspace restore sets the cwd fallback first…
+        tab.set_restored_cwd_fallback(Some("/saved".into()));
+        assert!(
+            tab.restored_snapshot.is_none(),
+            "the cwd fallback must no longer write a stub snapshot"
+        );
+        assert_eq!(
+            tab.launch_cwd(),
+            Some("/saved"),
+            "the fallback must stay visible to launch_cwd"
+        );
+
+        // …then attach_recovery_tab_snapshots attaches the persisted
+        // snapshot. This must now succeed.
+        let snap = TabSnapshot {
+            position: 0,
+            active: false,
+            cwd: Some("/saved".into()),
+            block_scroll_offset: 9,
+            editor_buffer: String::new(),
+            shell_phase: "AtPrompt".to_string(),
+            block_ids: vec![7, 8],
+        };
+        assert!(
+            tab.attach_recovery_snapshot(&snap),
+            "attach must succeed after the cwd fallback (v1.8.9 no-op regression)"
+        );
+        assert_eq!(
+            tab.restored_snapshot.as_ref().unwrap().block_ids,
+            vec![7, 8],
+            "attach must inject the persisted block_ids"
+        );
+        assert_eq!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FixedDocumentRow(9),
+            "attach must apply the persisted block_scroll_offset"
+        );
     }
 }

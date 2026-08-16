@@ -808,7 +808,7 @@ impl Tab {
         self.terminal
             .as_ref()
             .and_then(Terminal::cwd)
-            .or_else(|| self.restored_snapshot.as_ref()?.cwd.as_deref())
+            .or_else(|| self.restored_cwd_fallback())
     }
 
     /// v1.0 H4: Serialize this tab's UI state to a [`TabSnapshot`] for
@@ -820,17 +820,39 @@ impl Tab {
     /// the user presses Enter to spawn a fresh shell in the saved cwd.
     pub fn to_snapshot(&self, position: usize, active: bool) -> Option<TabSnapshot> {
         let Some(terminal) = self.terminal.as_ref() else {
-            let mut snapshot = self.restored_snapshot.clone()?;
+            // PTY-dead pane: keep the recovery state serializable. A fresh
+            // empty tab with no recovery state still returns `None`
+            // (unchanged); a pane with the real attached snapshot or only
+            // the workspace cwd fallback (v1.10.24 B1) stays serializable —
+            // for the fallback-only case we synthesize the same minimal
+            // snapshot the old stub carried.
+            let mut snapshot = match self.restored_snapshot.clone() {
+                Some(snapshot) => snapshot,
+                None => {
+                    let cwd = self.restored_cwd.clone()?;
+                    TabSnapshot {
+                        position: 0,
+                        active: false,
+                        cwd: Some(cwd),
+                        block_scroll_offset: 0,
+                        editor_buffer: String::new(),
+                        shell_phase: "AtPrompt".to_string(),
+                        block_ids: Vec::new(),
+                    }
+                }
+            };
+            if snapshot.cwd.is_none() {
+                snapshot.cwd = self.restored_cwd.clone();
+            }
             snapshot.position = position;
             snapshot.active = active;
             snapshot.block_scroll_offset = self.block_scroll();
             return Some(snapshot);
         };
-        let cwd = terminal.cwd().map(str::to_owned).or_else(|| {
-            self.restored_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.cwd.clone())
-        });
+        let cwd = terminal
+            .cwd()
+            .map(str::to_owned)
+            .or_else(|| self.restored_cwd_fallback().map(str::to_owned));
         let editor_buffer =
             weft_core::persistence::TabSnapshot::encode_editor_buffer(&terminal.editor().buffer);
         let shell_phase = match terminal.block_tracker().phase() {

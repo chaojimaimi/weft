@@ -1011,4 +1011,69 @@ mod tests {
             "empty block_ids (pre-fix recovery path) leaves the tracker empty"
         );
     }
+
+    /// v1.10.24 B1 chain regression: the real Restore order (workspace
+    /// restore sets the cwd fallback, then `attach_recovery_tab_snapshots`
+    /// attaches the persisted snapshot) must deliver `block_ids` to the
+    /// hydration loop — the exact connection the v1.8.9 stub-snapshot no-op
+    /// broke. Extends the hydrate-only test above with the Tab-level chain:
+    /// `attach_recovery_snapshot` must succeed after
+    /// `set_restored_cwd_fallback` so `hydrate_tabs_from_history_store`
+    /// reads the real `block_ids` off `restored_snapshot`.
+    #[test]
+    fn cwd_fallback_then_attach_hydrates_tracker_from_injected_block_ids() {
+        let mut tab = crate::tab::Tab::empty();
+        tab.terminal = Some(Terminal::with_scrollback(24, 80, 1000));
+
+        // Workspace restore: cwd fallback only — no stub snapshot.
+        tab.set_restored_cwd_fallback(Some("/saved".into()));
+        assert!(
+            tab.restored_snapshot.is_none(),
+            "v1.8.9 no-op regression: no stub snapshot from the cwd fallback"
+        );
+
+        // attach_recovery_tab_snapshots: the real attach must succeed.
+        assert!(
+            tab.attach_recovery_snapshot(&weft_core::persistence::TabSnapshot {
+                position: 0,
+                active: false,
+                cwd: Some("/saved".into()),
+                block_scroll_offset: 0,
+                editor_buffer: String::new(),
+                shell_phase: "AtPrompt".into(),
+                block_ids: vec![10, 20],
+            })
+        );
+
+        // hydrate_tabs_from_history_store reads block_ids off the snapshot.
+        let tab_block_ids: Vec<u64> = tab
+            .restored_snapshot
+            .as_ref()
+            .map(|snap| snap.block_ids.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            tab_block_ids,
+            vec![10, 20],
+            "the attached snapshot must inject block_ids (v1.8.9 chain)"
+        );
+
+        let newest_first = vec![block(10, "❯ git status"), block(20, "❯ make test")];
+        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30));
+        hydrate_persisted_history(
+            tab.terminal.as_mut().unwrap(),
+            &newest_first,
+            &tab_block_ids,
+            allocator,
+        );
+        assert_eq!(
+            tab.terminal
+                .as_ref()
+                .unwrap()
+                .block_tracker()
+                .blocks()
+                .len(),
+            2,
+            "injected block_ids must hydrate the tracker (v1.8.9 chain)"
+        );
+    }
 }

@@ -128,6 +128,44 @@ fn new_tab_launch_cwd_prefers_live_then_restored_state() {
     assert_eq!(tab.launch_cwd(), Some("/live/project"));
 }
 
+/// v1.10.24 B1: the workspace-restore cwd fallback (`restored_cwd`) drives
+/// `launch_cwd` before the shell reports OSC 7 — the same semantics the old
+/// stub-snapshot fallback provided (regression guard for the fallback path).
+#[test]
+fn launch_cwd_uses_restored_cwd_fallback_before_osc7() {
+    let mut tab = tab_with_terminal();
+    tab.set_restored_cwd_fallback(Some("/restored/project".into()));
+    assert_eq!(
+        tab.launch_cwd(),
+        Some("/restored/project"),
+        "fallback cwd must drive launch_cwd before OSC 7"
+    );
+
+    tab.terminal
+        .as_mut()
+        .unwrap()
+        .process(b"\x1b]7;file://localhost/live/project\x1b\\");
+    assert_eq!(tab.launch_cwd(), Some("/live/project"));
+}
+
+/// v1.10.24 B1: a PTY-dead workspace-restored pane (terminal None, no real
+/// snapshot, only the cwd fallback) must still serialize via `to_snapshot`.
+/// Before the fix this branch relied on the stub snapshot being present.
+#[test]
+fn to_snapshot_keeps_pty_dead_pane_serializable_with_cwd_fallback_only() {
+    let mut tab = Tab::empty();
+    tab.set_restored_cwd_fallback(Some("/workspace/dir".into()));
+
+    let saved = tab
+        .to_snapshot(1, false)
+        .expect("the cwd fallback must keep a PTY-dead pane serializable");
+    assert_eq!(saved.position, 1);
+    assert!(!saved.active);
+    assert_eq!(saved.cwd.as_deref(), Some("/workspace/dir"));
+    assert!(saved.block_ids.is_empty());
+    assert_eq!(saved.shell_phase, "AtPrompt");
+}
+
 #[test]
 fn queued_alt_screen_teardown_output_is_preserved() {
     let mut tab = tab_with_terminal();
