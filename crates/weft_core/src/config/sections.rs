@@ -33,6 +33,11 @@ pub struct ThemeConfig {
     pub foreground: Option<String>,
     pub background: Option<String>,
     pub cursor: Option<String>,
+    /// v1.10.22: terminal selection highlight base color — now actually
+    /// wired to the grid/block/prompt selection renderer (was dead config).
+    /// `weft_app::paint::selection_color` guarantees WCAG 3:1 against the
+    /// theme background regardless of this value. `None` keeps the built-in
+    /// theme's selection.
     pub selection: Option<String>,
     /// v0.8: signature accent (prompt ❯, scrollbar thumb, cursor glow).
     pub accent: Option<String>,

@@ -27,6 +27,7 @@ pub(crate) mod panel;
 pub(crate) mod preedit;
 pub(crate) mod primitives;
 pub(crate) mod prompt;
+pub(crate) mod selection_color;
 pub(crate) mod settings;
 pub(crate) mod settings_profiles;
 pub(crate) mod status_hint;

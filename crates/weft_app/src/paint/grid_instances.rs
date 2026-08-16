@@ -258,6 +258,9 @@ pub(crate) fn build_row_instances(
     default_bg: [f32; 4],
     cursor_color: [f32; 4],
     selection_bg: [f32; 4],
+    // v1.10.22: painted selection (quad composited onto theme bg) — the
+    // text-contrast benchmark for selected cells.
+    selection_painted: [f32; 4],
     cursor: &Cursor,
     cursor_style: CursorStyle,
     show_cursor: bool,
@@ -332,7 +335,14 @@ pub(crate) fn build_row_instances(
                 cursor_color
             }
         } else {
-            crate::paint::primitives::ensure_minimum_text_contrast(fg, final_bg, minimum_contrast)
+            // v1.10.22: benchmark vs painted — the GPU composites the α=0.6
+            // quad before display, so the raw quad under-measured contrast.
+            let benchmark = if is_selected {
+                selection_painted
+            } else {
+                final_bg
+            };
+            crate::paint::primitives::ensure_minimum_text_contrast(fg, benchmark, minimum_contrast)
         };
 
         // v1.10.4 fix: skip the minimum-contrast correction for terminal
@@ -516,6 +526,8 @@ mod tests {
     const BG: [f32; 4] = [0.1, 0.1, 0.2, 1.0];
     const CURSOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     const SELECTION: [f32; 4] = [0.3, 0.5, 0.7, 0.6];
+    // v1.10.22: painted selection = SELECTION composited onto BG.
+    const SELECTION_PAINTED: [f32; 4] = [0.22, 0.34, 0.50, 1.0];
     const CW: f32 = 10.0;
     const CH: f32 = 20.0;
 
@@ -538,8 +550,24 @@ mod tests {
     ) -> GridRowInstances {
         let palette = Color::standard_palette();
         build_row_instances(
-            grid, &palette, 0, FG, BG, CURSOR, SELECTION, cursor, style, show, sel, opacity, 1.0,
-            CW, CH, 0.0, 0.0,
+            grid,
+            &palette,
+            0,
+            FG,
+            BG,
+            CURSOR,
+            SELECTION,
+            SELECTION_PAINTED,
+            cursor,
+            style,
+            show,
+            sel,
+            opacity,
+            1.0,
+            CW,
+            CH,
+            0.0,
+            0.0,
         )
     }
 

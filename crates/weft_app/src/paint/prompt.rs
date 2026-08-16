@@ -257,16 +257,8 @@ impl MetalRenderer {
         // Editor buffer lines (line 0 starts after the prompt).
         // v0.9: draw a selection highlight for the active mouse-drag range.
         // v1.0 fix: accent-based blend for selection visibility across all themes.
-        let sel_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let bg = color_to_normalized(self.theme.background);
-            [
-                accent[0] * 0.35 + bg[0] * 0.65,
-                accent[1] * 0.35 + bg[1] * 0.65,
-                accent[2] * 0.35 + bg[2] * 0.65,
-                0.60,
-            ]
-        };
+        // v1.10.22: shared selection color (theme.selection base + WCAG 3:1).
+        let sel_bg = crate::paint::selection_color::selection_colors(&self.theme).quad;
         let selection_canvas = composite_color_over(sel_bg, box_bg);
         let mut visual_selection_ranges = vec![None; visual.rows.len()];
         if let Some(((sl, sc), (el, ec))) = p.selection {

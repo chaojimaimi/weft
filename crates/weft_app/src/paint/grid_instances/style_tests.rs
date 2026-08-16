@@ -24,6 +24,7 @@ fn build_row(cells: &[Cell]) -> super::GridRowInstances {
         [0.1, 0.1, 0.2, 1.0],
         [1.0; 4],
         [0.3, 0.5, 0.7, 0.6],
+        [0.22, 0.34, 0.50, 1.0],
         &Cursor::default(),
         CursorStyle::Block,
         false,

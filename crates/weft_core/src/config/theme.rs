@@ -74,6 +74,10 @@ pub struct Theme {
     pub foreground: Color,
     pub background: Color,
     pub cursor: Color,
+    /// v1.10.22: terminal selection highlight base color (grid/block/prompt).
+    /// Previously dead config — the renderer derived selection from accent;
+    /// now the adaptive pipeline in `weft_app::paint::selection_color` uses
+    /// it as the base and guarantees WCAG 3:1 against the background.
     pub selection: Color,
     /// 256-color palette; slots 0-15 are the ANSI colors.
     pub palette: [Color; 256],

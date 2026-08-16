@@ -172,18 +172,13 @@ impl MetalRenderer {
         let clip_top = layout.clip_top;
         let clip_bottom = content_bottom_y;
 
-        let selection_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let bg = color_to_normalized(self.theme.background);
-            let mut c = [
-                accent[0] * 0.35 + bg[0] * 0.65,
-                accent[1] * 0.35 + bg[1] * 0.65,
-                accent[2] * 0.35 + bg[2] * 0.65,
-                1.0,
-            ];
-            c[3] = 0.60;
-            c
-        };
+        // v1.10.22: shared selection color (theme.selection base + WCAG 3:1
+        // adaptive guarantee, evaluated against both the raw theme bg and
+        // the stripe canvas bg — see selection_color.rs). The composite
+        // chain below stays; error/warning tone and hover rows sit on more
+        // heavily tinted canvases and may land slightly under 3:1 there
+        // (accepted boundary, still far above the pre-fix 1.27-1.75).
+        let selection_bg = crate::paint::selection_color::selection_colors(&self.theme).quad;
         for (i, &dist) in rows.iter().enumerate() {
             let row_top_y = content_bottom_y - dist + scroll_px;
             let y = row_top_y;

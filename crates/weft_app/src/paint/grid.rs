@@ -145,17 +145,11 @@ impl MetalRenderer {
             policy.is_alt_screen,
             policy.cursor_style,
         );
-        let selection_bg = {
-            let accent = color_to_normalized(self.theme.accent);
-            let mut c = [
-                accent[0] * 0.35 + default_bg[0] * 0.65,
-                accent[1] * 0.35 + default_bg[1] * 0.65,
-                accent[2] * 0.35 + default_bg[2] * 0.65,
-                1.0,
-            ];
-            c[3] = 0.60;
-            c
-        };
+        // v1.10.22: shared selection color (theme.selection base + WCAG 3:1
+        // adaptive guarantee). quad → GPU, painted → text contrast benchmark.
+        let sel_colors = crate::paint::selection_color::selection_colors(&self.theme);
+        let selection_bg = sel_colors.quad;
+        let selection_painted = sel_colors.painted;
 
         let force_full = self.force_full_grid.get()
             || grid.scroll_offset != self.prev_scroll_offset.get()
@@ -279,6 +273,7 @@ impl MetalRenderer {
                 default_bg,
                 cursor_color,
                 selection_bg,
+                selection_painted,
                 cursor,
                 policy.cursor_style,
                 policy.show_cursor,
@@ -331,6 +326,7 @@ impl MetalRenderer {
         // Cursor/selection colors unused (background pane has no cursor/selection).
         let cursor_color = default_fg;
         let selection_bg = default_bg;
+        let selection_painted = default_bg;
         let cursor = weft_core::grid::Cursor::default();
         let cursor_style = weft_core::grid::CursorStyle::Block;
         let selection = SelectionHandler::new();
@@ -365,6 +361,7 @@ impl MetalRenderer {
                 default_bg,
                 cursor_color,
                 selection_bg,
+                selection_painted,
                 &cursor,
                 cursor_style,
                 false,
