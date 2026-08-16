@@ -55,6 +55,9 @@ rusqlite.workspace = true
 image.workspace = true
 nix.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util"] }
+# v1.10.23: defer the crash-recovery prompt out of the winit handler (see
+# docs/FIX_RECOVERY_MODAL_SPIN.md). Zero transitive deps, MSRV 1.71.
+dispatch2.workspace = true
 # v1.6 AI integration: dependencies for `crates/weft_app/src/ai/`. The module
 # is scaffolding-only in v1.3 (not wired into the app shell, see ROADMAP DC-8
 # and `ai/mod.rs`). Kept on the v1.3 cut so v1.6 builds on a reviewed baseline.

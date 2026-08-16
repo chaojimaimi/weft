@@ -34,7 +34,8 @@ use tracing::{info, warn};
 use weft_core::recovery::{RecoveryError, RecoveryPaths, RecoverySnapshot};
 use weft_core::workspace::WorkspaceDocument;
 
-use crate::App;
+use crate::macos_alert::RecoveryChoice;
+use crate::{App, AppEvent};
 
 /// Result of startup recovery detection.
 #[derive(Debug)]
@@ -47,6 +48,24 @@ pub(crate) enum StartupRecovery {
     /// Unclean shutdown detected and a valid snapshot is available.
     /// The caller should show a recovery prompt and decide what to do.
     UncleanShutdown { snapshot: RecoverySnapshot },
+}
+
+/// v1.10.23: What the startup path should do after detection (replaces the
+/// old `bool` returned by `run_startup_recovery`). The recovery prompt is
+/// now event-driven: detection stays synchronous in `resumed()`, but the
+/// `runModal` itself runs on a deferred main-queue block and the outcome
+/// arrives later via `AppEvent::RecoveryChosen`. See
+/// docs/FIX_RECOVERY_MODAL_SPIN.md.
+#[derive(Debug)]
+pub(super) enum StartupRecoveryOutcome {
+    /// No recovery needed (clean shutdown / no snapshot / prompt failed):
+    /// proceed with the normal tab-snapshot restore.
+    Normal,
+    /// Unclean shutdown with a snapshot: the prompt is being shown on a
+    /// deferred main-queue block. Skip the synchronous restore branches;
+    /// `App::apply_recovery_choice` restores + hydrates when the choice
+    /// event lands.
+    Pending,
 }
 
 /// Orchestrates crash recovery snapshot lifecycle.
@@ -254,17 +273,21 @@ impl App {
     /// v1.6.3: Run crash recovery detection at startup.
     ///
     /// Called from `resumed()` before the normal tab-snapshot restore.
-    /// Returns `true` if a recovery snapshot was successfully restored
-    /// (the normal restore should be skipped), `false` otherwise.
-    pub(super) fn run_startup_recovery(&mut self) -> bool {
+    ///
+    /// v1.10.23 (FIX_RECOVERY_MODAL_SPIN): this method only DETECTS and
+    /// parks. When an unclean shutdown snapshot exists, the snapshot is
+    /// stored in `App::pending_recovery` and the recovery prompt is
+    /// dispatched to the main queue via `dispatch2` — so `runModal` runs
+    /// OUTSIDE the winit event handler (inside the handler, winit's
+    /// `EventLoopWaker` 0.1µs timer is never disarmed: `cleared()` early-
+    /// returns while `event_handler.in_use()`, and the modal's nested run
+    /// loop spins at 84% CPU). The choice comes back asynchronously as
+    /// `AppEvent::RecoveryChosen` → [`App::apply_recovery_choice`].
+    pub(super) fn run_startup_recovery(&mut self) -> StartupRecoveryOutcome {
         match self.recovery.detect_startup_recovery() {
-            StartupRecovery::Clean => {
-                // Clean shutdown — proceed with normal tab-snapshot restore.
-                false
-            }
-            StartupRecovery::NoSnapshot => {
-                // No recovery snapshot — proceed with normal restore.
-                false
+            StartupRecovery::Clean | StartupRecovery::NoSnapshot => {
+                // No recovery needed — proceed with normal tab restore.
+                StartupRecoveryOutcome::Normal
             }
             StartupRecovery::UncleanShutdown { snapshot } => {
                 // Unclean shutdown with a valid snapshot — show the
@@ -281,46 +304,136 @@ impl App {
                     .unwrap_or(0);
                 let age_secs = snapshot_age_secs(now_secs, snapshot.created_at);
                 let tab_count = snapshot.workspace.tabs.len();
-                if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
-                    match crate::macos_alert::show_recovery_prompt(mtm, age_secs, tab_count) {
-                        Ok(crate::macos_alert::RecoveryPromptResponse::Restore) => {
-                            info!("user chose to restore from recovery snapshot");
-                            match self.restore_workspace(&snapshot.workspace) {
-                                Ok(outcome) => {
-                                    if let Some(warning) = outcome.warning() {
-                                        warn!(warning = %warning, "recovery restored with warning");
-                                        self.surface_config_error(&warning.to_string());
-                                    }
-                                    info!("recovery snapshot restored successfully");
-                                    self.recovery.reset_debounce();
-                                    return true;
+                // Park the snapshot BEFORE deferring the prompt: the
+                // RecoveryChosen event consumes it exactly once. `pending`
+                // also records "prompt in flight" for the state machine
+                // (a stray choice event without a pending snapshot is a
+                // no-op — no double restore, no lost state).
+                self.pending_recovery = Some(snapshot);
+                let proxy = self.proxy.clone();
+                // v1.10.23: defer `runModal` out of the winit handler via
+                // the main queue. `dispatch2` is a safe libdispatch
+                // wrapper (no bare `dispatch_async_f` + extern callback).
+                // When the modal closes, the choice is sent back through
+                // the event-loop proxy — the winit loop is fully usable
+                // again by then, so `user_event` processes it normally.
+                dispatch2::DispatchQueue::main().exec_async(move || {
+                    let choice = match objc2_foundation::MainThreadMarker::new() {
+                        Some(mtm) => {
+                            match crate::macos_alert::show_recovery_prompt(
+                                mtm,
+                                age_secs,
+                                tab_count,
+                            ) {
+                                Ok(response) => {
+                                    crate::macos_alert::recovery_choice_from_response(response)
                                 }
                                 Err(e) => {
-                                    warn!(error = %e, "recovery restore failed, falling back to normal startup");
+                                    // Same fallback as pre-v1.10.23: a
+                                    // failed prompt proceeds with the
+                                    // normal startup, snapshot preserved.
+                                    warn!(error = %e, "recovery prompt failed, proceeding with normal startup");
+                                    crate::macos_alert::RecoveryChoice::Ignore
                                 }
                             }
                         }
-                        Ok(crate::macos_alert::RecoveryPromptResponse::Ignore) => {
-                            info!("user chose to ignore recovery snapshot");
-                            self.recovery.ignore_snapshot();
+                        None => {
+                            warn!("recovery prompt skipped: not on main thread");
+                            crate::macos_alert::RecoveryChoice::Ignore
                         }
-                        Ok(crate::macos_alert::RecoveryPromptResponse::Delete) => {
-                            info!("user chose to delete recovery snapshot");
-                            if let Err(e) = self.recovery.delete_snapshot() {
-                                warn!(error = %e, "failed to delete recovery snapshot");
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "recovery prompt failed, proceeding with normal startup");
-                        }
-                    }
-                } else {
-                    warn!("recovery prompt skipped: not on main thread");
-                }
-                false
+                    };
+                    let _ = proxy.send_event(AppEvent::RecoveryChosen(choice));
+                });
+                info!(
+                    age_secs = age_secs,
+                    tabs = tab_count,
+                    "recovery prompt deferred off the winit handler; awaiting user choice"
+                );
+                StartupRecoveryOutcome::Pending
             }
         }
     }
+
+    /// v1.10.23: Handle the user's recovery decision, delivered
+    /// asynchronously as `AppEvent::RecoveryChosen` from the deferred
+    /// prompt block (see [`App::run_startup_recovery`]).
+    ///
+    /// Consumes `App::pending_recovery`: without a pending snapshot the
+    /// event is a no-op (duplicated delivery, or a teardown race where the
+    /// window closed before the choice landed). The window/tab state is
+    /// whatever it actually is when the event arrives — this handler never
+    /// assumes `resumed()` just completed.
+    ///
+    /// Returns `true` if a pending snapshot was processed.
+    pub(super) fn apply_recovery_choice(&mut self, choice: RecoveryChoice) {
+        let Some(snapshot) = take_pending_recovery(&mut self.pending_recovery) else {
+            warn!(
+                ?choice,
+                "recovery choice arrived without a pending snapshot; ignoring"
+            );
+            return;
+        };
+        match choice {
+            RecoveryChoice::Restore => {
+                info!("user chose to restore from recovery snapshot");
+                match self.restore_workspace(&snapshot.workspace) {
+                    Ok(outcome) => {
+                        if let Some(warning) = outcome.warning() {
+                            warn!(warning = %warning, "recovery restored with warning");
+                            self.surface_config_error(&warning.to_string());
+                        }
+                        info!("recovery snapshot restored successfully");
+                        self.recovery.reset_debounce();
+                        // v1.8.9: attach TabSnapshot block_ids so the
+                        // hydration below populates each tab's block
+                        // tracker (sidebar history).
+                        self.attach_recovery_tab_snapshots();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "recovery restore failed, falling back to normal startup");
+                        self.restore_tab_snapshots();
+                    }
+                }
+            }
+            RecoveryChoice::Ignore => {
+                info!("user chose to ignore recovery snapshot");
+                self.recovery.ignore_snapshot();
+                self.restore_tab_snapshots();
+            }
+            RecoveryChoice::Delete => {
+                info!("user chose to delete recovery snapshot");
+                if let Err(e) = self.recovery.delete_snapshot() {
+                    warn!(error = %e, "failed to delete recovery snapshot");
+                }
+                self.restore_tab_snapshots();
+            }
+        }
+        // v1.10.23: hydration now runs here (event-driven) instead of
+        // synchronously in `resumed()` — the tab topology is final only
+        // after the chosen restore path has run.
+        self.hydrate_tabs_from_history_store();
+    }
+}
+
+/// v1.10.23: The 1 Hz autosave must be suppressed while the recovery
+/// prompt is pending — it would overwrite both recovery sources (the
+/// tabs table and the on-disk crash snapshot) with the fresh session
+/// before the user has chosen. See `AppEvent::TabsAutoSave`.
+pub(super) fn autosave_suppressed(pending: &Option<RecoverySnapshot>) -> bool {
+    pending.is_some()
+}
+
+/// v1.10.23: Consume the pending recovery snapshot for a user choice.
+///
+/// The pending-recovery state machine contract (unit-tested below):
+///
+/// - `None → Some(snapshot)`: startup detection parks the snapshot while
+///   the deferred prompt is on screen.
+/// - `Some → None`: the choice event consumes it exactly once.
+/// - A second choice event for the same prompt finds `None` and is
+///   ignored — a duplicated `RecoveryChosen` can never double-restore.
+fn take_pending_recovery(pending: &mut Option<RecoverySnapshot>) -> Option<RecoverySnapshot> {
+    pending.take()
 }
 
 /// Hash a string using the default hasher. Used for content-equality
@@ -694,5 +807,62 @@ mod tests {
     fn snapshot_age_uses_elapsed_time_and_saturates_future_timestamps() {
         assert_eq!(snapshot_age_secs(1_000, 940), 60);
         assert_eq!(snapshot_age_secs(1_000, 1_001), 0);
+    }
+
+    /// v1.10.23: pending-recovery state machine — the deferred prompt's
+    /// snapshot must be consumed exactly once so a duplicated
+    /// `RecoveryChosen` event can never double-restore, and a choice that
+    /// races teardown (no pending snapshot) must be a safe no-op.
+    #[test]
+    fn pending_recovery_state_machine_consumes_the_snapshot_exactly_once() {
+        let snapshot = RecoverySnapshot::from_workspace(sample_workspace("crash"), false);
+
+        // None → Some: startup detection parks the snapshot while the
+        // deferred prompt is on screen.
+        let mut pending: Option<RecoverySnapshot> = None;
+        assert!(pending.is_none(), "start: no pending snapshot");
+        pending = Some(snapshot.clone());
+        assert!(pending.is_some());
+
+        // Some → None: the first choice event consumes it.
+        let taken = take_pending_recovery(&mut pending);
+        assert_eq!(taken, Some(snapshot.clone()));
+        assert!(
+            pending.is_none(),
+            "processing the choice must clear the pending slot"
+        );
+
+        // A duplicated/spurious second choice event: nothing pending → the
+        // handler's take is None and the restore path never runs twice.
+        let spurious = take_pending_recovery(&mut pending);
+        assert!(spurious.is_none(), "second choice event must be a no-op");
+    }
+
+    #[test]
+    fn pending_recovery_is_restored_by_choice_regardless_of_choice_value() {
+        // v1.10.23: every choice variant (Restore / Ignore / Delete)
+        // consumes the parked snapshot — the state machine never stalls
+        // on one path and "loses" the snapshot.
+        let snapshot = RecoverySnapshot::from_workspace(sample_workspace("crash"), false);
+        for choice in [
+            RecoveryChoice::Restore,
+            RecoveryChoice::Ignore,
+            RecoveryChoice::Delete,
+        ] {
+            let mut pending = Some(snapshot.clone());
+            let taken = take_pending_recovery(&mut pending);
+            assert_eq!(taken.as_ref(), Some(&snapshot), "choice {choice:?}");
+            assert!(pending.is_none(), "choice {choice:?} must clear pending");
+        }
+    }
+
+    #[test]
+    fn autosave_is_suppressed_only_while_recovery_prompt_is_pending() {
+        // v1.10.23 regression guard: the deferred recovery modal keeps the
+        // runloop alive, so TabsAutoSave can fire mid-prompt — it must not
+        // overwrite the crash snapshot or tabs table in that window.
+        let snapshot = RecoverySnapshot::from_workspace(sample_workspace("crash"), false);
+        assert!(autosave_suppressed(&Some(snapshot)));
+        assert!(!autosave_suppressed(&None));
     }
 }

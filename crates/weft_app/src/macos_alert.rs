@@ -25,6 +25,36 @@ pub enum RecoveryPromptResponse {
     Delete,
 }
 
+/// v1.10.23: The finalized recovery decision delivered back to the app via
+/// `AppEvent::RecoveryChosen`. Kept separate from
+/// [`RecoveryPromptResponse`] so `AppEvent` (main.rs) stays decoupled from
+/// the alert module's raw response type, and so the "prompt failed / not on
+/// main thread" fallback can be expressed as a plain choice instead of a
+/// `Result`. Pure type — unit-testable without any AppKit state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryChoice {
+    /// Restore the session from the snapshot.
+    Restore,
+    /// Start fresh; keep the snapshot for potential later recovery.
+    Ignore,
+    /// Start fresh; permanently delete the snapshot.
+    Delete,
+}
+
+/// v1.10.23: Map a prompt response to the app-facing recovery choice.
+///
+/// Total (no error arm): the error/abort fallback is decided by the caller
+/// (which maps it to [`RecoveryChoice::Ignore`], matching the pre-v1.10.23
+/// behavior where a failed prompt fell through to the normal tab restore
+/// with the snapshot preserved).
+pub fn recovery_choice_from_response(response: RecoveryPromptResponse) -> RecoveryChoice {
+    match response {
+        RecoveryPromptResponse::Restore => RecoveryChoice::Restore,
+        RecoveryPromptResponse::Ignore => RecoveryChoice::Ignore,
+        RecoveryPromptResponse::Delete => RecoveryChoice::Delete,
+    }
+}
+
 /// Errors raised by the alert wrapper.
 #[derive(Debug)]
 pub enum AlertError {
@@ -251,6 +281,39 @@ mod export_preview_tests {
         assert!(!close_prompt_response_allows_close(1001));
         assert!(!close_prompt_response_allows_close(-1000));
         assert!(!close_prompt_response_allows_close(42));
+    }
+
+    #[test]
+    fn recovery_choice_maps_every_prompt_response() {
+        use super::{recovery_choice_from_response, RecoveryChoice, RecoveryPromptResponse};
+        assert_eq!(
+            recovery_choice_from_response(RecoveryPromptResponse::Restore),
+            RecoveryChoice::Restore
+        );
+        assert_eq!(
+            recovery_choice_from_response(RecoveryPromptResponse::Ignore),
+            RecoveryChoice::Ignore
+        );
+        assert_eq!(
+            recovery_choice_from_response(RecoveryPromptResponse::Delete),
+            RecoveryChoice::Delete
+        );
+    }
+
+    #[test]
+    fn recovery_esc_and_unknown_responses_map_to_ignore() {
+        // v1.10.23: Esc / Cmd+. resolves to NSModalResponse 1001 (the cancel
+        // button is the second one per AppKit's cancel heuristic), and any
+        // other response defaults to Ignore — both must land on
+        // RecoveryChoice::Ignore so the snapshot is preserved.
+        use super::{map_modal_response, recovery_choice_from_response, RecoveryChoice};
+        for response in [1001, -1000, 42, 0] {
+            assert_eq!(
+                recovery_choice_from_response(map_modal_response(response)),
+                RecoveryChoice::Ignore,
+                "response {response} must fall through to Ignore"
+            );
+        }
     }
 
     #[test]

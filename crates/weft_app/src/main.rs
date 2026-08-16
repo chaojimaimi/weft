@@ -160,6 +160,12 @@ pub(crate) enum AppEvent {
         generation: u64,
         node_id: u64,
     },
+    /// v1.10.23: The crash-recovery prompt (deferred to a main-queue block
+    /// so `runModal` never runs inside the winit handler — see
+    /// docs/FIX_RECOVERY_MODAL_SPIN.md) closed; the user picked a recovery
+    /// path. Handled in `App::apply_recovery_choice`, which consumes
+    /// `App.pending_recovery` (a duplicated event is a no-op).
+    RecoveryChosen(crate::macos_alert::RecoveryChoice),
     PerformanceProbeStart,
     PerformanceProbeFinish,
 }
@@ -215,6 +221,12 @@ struct App {
     /// v1.6.3: Crash recovery controller. Manages debounced snapshot
     /// writes, clean-shutdown markers, and startup detection.
     recovery: recovery_controller::RecoveryController,
+    /// v1.10.23: The recovery snapshot detected at startup, parked while
+    /// the deferred recovery prompt is on screen. Consumed exactly once by
+    /// `App::apply_recovery_choice` when `AppEvent::RecoveryChosen`
+    /// arrives; `None` means no prompt is in flight (a stray choice event
+    /// is ignored). See docs/FIX_RECOVERY_MODAL_SPIN.md.
+    pending_recovery: Option<weft_core::recovery::RecoverySnapshot>,
     /// v1.7.1: Main-thread search index for upsert/delete (index maintenance).
     /// The background PaletteSearchWorker owns its own SearchIndex for queries.
     search_index: Option<weft_core::search::SearchIndex>,
@@ -356,6 +368,7 @@ impl App {
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
+            pending_recovery: None,
             search_index: None,
             note_editor: NoteEditorState::default(),
             completion_worker: completion_worker::CompletionWorker::new(move || {

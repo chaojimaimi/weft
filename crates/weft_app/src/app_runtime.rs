@@ -251,13 +251,23 @@ impl ApplicationHandler<AppEvent> for App {
                 self.request_redraw();
             }
             AppEvent::TabsAutoSave => {
-                self.save_changed_tabs();
-                // v1.6.3: Also write a recovery snapshot if the session
-                // state has changed. The debounce check inside the
-                // controller skips the write when nothing changed.
-                if let Some(ws) = self.capture_workspace("recovery".into()) {
-                    if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
-                        warn!(error = %e, "recovery snapshot write failed");
+                // v1.10.23: while the recovery prompt is up (deferred
+                // runModal keeps this runloop alive), the 1 Hz autosave
+                // must not run: it would DELETE-and-replace the tabs
+                // table and overwrite the on-disk crash snapshot with
+                // the fresh single-tab session before the user chooses,
+                // destroying both recovery sources.
+                if crate::recovery_controller::autosave_suppressed(&self.pending_recovery) {
+                    tracing::debug!("skipping autosave while recovery prompt is pending");
+                } else {
+                    self.save_changed_tabs();
+                    // v1.6.3: Also write a recovery snapshot if the session
+                    // state has changed. The debounce check inside the
+                    // controller skips the write when nothing changed.
+                    if let Some(ws) = self.capture_workspace("recovery".into()) {
+                        if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
+                            warn!(error = %e, "recovery snapshot write failed");
+                        }
                     }
                 }
             }
@@ -278,6 +288,16 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::QuitRequested => {
                 self.request_application_close(event_loop);
+            }
+            AppEvent::RecoveryChosen(choice) => {
+                // v1.10.23: the deferred recovery prompt (see
+                // `run_startup_recovery`) closed off the winit handler and
+                // sent the user's choice back through the proxy. Consumes
+                // `pending_recovery`; a duplicate/spurious event is a
+                // no-op. The window/tab state may have changed since
+                // `resumed()` — the handler operates on the state as it
+                // actually is.
+                self.apply_recovery_choice(choice);
             }
             AppEvent::AccessibilityPress {
                 generation,
@@ -420,17 +440,10 @@ impl ApplicationHandler<AppEvent> for App {
 
         // Open the command-block DB (best-effort) and hydrate the tracker with
         // recent history so the panel has content on first show.
-        let mut persisted_history = Vec::new();
         let block_store = weft_cache_dir().and_then(|cache| {
             let path = cache.join("blocks.db");
             match BlockStore::open(&path) {
-                Ok(store) => {
-                    match store.recent(1000) {
-                        Ok(history) => persisted_history = history,
-                        Err(e) => warn!(error = %e, "failed to load block history"),
-                    }
-                    Some(store)
-                }
+                Ok(store) => Some(store),
                 Err(e) => {
                     warn!(error = %e, "failed to open block store; persistence disabled");
                     None
@@ -438,10 +451,6 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
         self.sessions.set_block_store(block_store);
-        let block_id_allocator = self
-            .sessions
-            .block_store()
-            .map(BlockStore::block_id_allocator);
 
         // v1.7.3-C: Open the annotation sidecar store (bookmark/note/tags)
         // sharing the same `blocks.db` file. Best-effort — if it fails to
@@ -489,69 +498,46 @@ impl ApplicationHandler<AppEvent> for App {
         // and offer to restore from a recovery snapshot if one exists.
         // This runs BEFORE the normal tab-snapshot restore so that a
         // successful recovery replaces the normal restore path.
-        let recovery_restored = self.run_startup_recovery();
-
-        // v1.0 H4: restore saved tab snapshots (cwd + editor drafts) so the
-        // session layout survives restarts. The first tab (spawned above by
-        // spawn_pty) is replaced if saved snapshots exist; otherwise it stays
-        // as a fresh shell. The PTY itself is NOT revived — each restored tab
-        // gets a fresh shell, with the editor draft rehydrated.
         //
-        // v1.0 fix: cwd is restored via `chdir` in the child process before
-        // exec (Pty::spawn_with_args `cwd` param), NOT by sending a `cd`
-        // command. Sending `cd` polluted the terminal, shell history, and
-        // block tracker with a spurious `cd <cwd>` block. With chdir the
-        // shell starts in the right directory silently — the initial tab
-        // stays clean. If the saved cwd equals the weft process's cwd (the
-        // common case when launching from the same directory), no rebuild
-        // is needed — the initial tab already has the right cwd.
-        //
-        // v1.6.3: Skip the normal tab-snapshot restore if a recovery
-        // snapshot was just restored — the recovery path already rebuilt
-        // the full session topology (tabs + panes + cwds + drafts).
-        if !recovery_restored {
-            self.restore_tab_snapshots();
-        } else {
-            // v1.8.9 fix: recovery restore rebuilt the tab topology + cwds +
-            // drafts via `restore_workspace`, but unlike the normal
-            // `restore_tab_snapshots` path it never sets `tab.restored_snapshot`.
-            // That field carries `block_ids`, which the hydration loop below
-            // needs to filter the global SQLite history into each tab's block
-            // tracker (sidebar history panel). Without it, Restore showed the
-            // tab layout but an empty history, while Ignore (which falls
-            // through to `restore_tab_snapshots`) showed the full history.
-            //
-            // The recovery snapshot (WorkspaceDocument) doesn't carry
-            // block_ids — they live in TabSnapshot (SQLite). Both stores are
-            // written in the same TabsAutoSave cycle, so tab order matches.
-            // Load TabSnapshots and attach them by position so the existing
-            // hydration loop picks up `block_ids` naturally.
-            self.attach_recovery_tab_snapshots();
-        }
-        // Restore history only after the tab topology is final. Hydrating the
-        // initial terminal before cwd-based replacement discarded the loaded
-        // history, and additional restored tabs never received it at all.
-        //
-        // v1.7.6: Per-tab isolation — each tab's block tracker receives ONLY
-        // the blocks it produced last session (from its TabSnapshot's
-        // `block_ids`). The editor's ↑-key recall still gets the full global
-        // history. This prevents all tabs from showing the same mixed history.
-        if let Some(block_id_allocator) = block_id_allocator {
-            for tab in self.sessions.tabs_mut() {
-                // Clone first to avoid borrow conflict with terminal.as_mut().
-                let tab_block_ids: Vec<u64> = tab
-                    .restored_snapshot
-                    .as_ref()
-                    .map(|snap| snap.block_ids.clone())
-                    .unwrap_or_default();
-                if let Some(terminal) = tab.terminal.as_mut() {
-                    hydrate_persisted_history(
-                        terminal,
-                        &persisted_history,
-                        &tab_block_ids,
-                        block_id_allocator.clone(),
-                    );
-                }
+        // v1.10.23 (FIX_RECOVERY_MODAL_SPIN): detection stays synchronous
+        // here, but when an unclean-shutdown snapshot exists the prompt is
+        // deferred to a main-queue block — `runModal` must never run inside
+        // the winit handler (the EventLoopWaker 0.1µs timer is then never
+        // disarmed and the modal spins at ~84% CPU). The choice arrives
+        // later as `AppEvent::RecoveryChosen` and
+        // `apply_recovery_choice` restores + hydrates then.
+        match self.run_startup_recovery() {
+            recovery_controller::StartupRecoveryOutcome::Normal => {
+                // v1.0 H4: restore saved tab snapshots (cwd + editor drafts)
+                // so the session layout survives restarts. The first tab
+                // (spawned above by spawn_pty) is replaced if saved
+                // snapshots exist; otherwise it stays as a fresh shell. The
+                // PTY itself is NOT revived — each restored tab gets a fresh
+                // shell, with the editor draft rehydrated.
+                //
+                // v1.0 fix: cwd is restored via `chdir` in the child
+                // process before exec (Pty::spawn_with_args `cwd` param),
+                // NOT by sending a `cd` command. Sending `cd` polluted the
+                // terminal, shell history, and block tracker with a
+                // spurious `cd <cwd>` block. With chdir the shell starts in
+                // the right directory silently — the initial tab stays
+                // clean. If the saved cwd equals the weft process's cwd
+                // (the common case when launching from the same directory),
+                // no rebuild is needed — the initial tab already has the
+                // right cwd.
+                self.restore_tab_snapshots();
+                // Restore history only after the tab topology is final.
+                // Hydrating the initial terminal before cwd-based
+                // replacement discarded the loaded history, and additional
+                // restored tabs never received it at all.
+                self.hydrate_tabs_from_history_store();
+            }
+            recovery_controller::StartupRecoveryOutcome::Pending => {
+                // v1.10.23: the recovery prompt is on screen (deferred off
+                // the winit handler). No synchronous restore here —
+                // `apply_recovery_choice` rebuilds the topology and
+                // hydrates history when the user's choice arrives.
+                info!("recovery prompt pending; tab restore deferred to RecoveryChosen event");
             }
         }
 
@@ -752,6 +738,56 @@ impl App {
             // deduped commit resizes the Grid to dims it already holds.
             if committed && ioctl_sent {
                 invalidate_primary_tui_frame(terminal);
+            }
+        }
+    }
+
+    /// v1.10.23: Hydrate per-tab history from the SQLite block store.
+    ///
+    /// Extracted from `resumed()` so BOTH startup paths run it exactly
+    /// once, only after the tab topology is final:
+    ///
+    /// - Synchronous path (no recovery / clean shutdown): right after
+    ///   `restore_tab_snapshots()` in `resumed()`.
+    /// - Event-driven recovery path: inside `apply_recovery_choice`,
+    ///   after the chosen restore path rebuilt the tabs.
+    ///
+    /// v1.7.6: Per-tab isolation — each tab's block tracker receives ONLY
+    /// the blocks it produced last session (from its TabSnapshot's
+    /// `block_ids`). The editor's ↑-key recall still gets the full global
+    /// history. This prevents all tabs from showing the same mixed history.
+    pub(super) fn hydrate_tabs_from_history_store(&mut self) {
+        let Some(block_id_allocator) = self
+            .sessions
+            .block_store()
+            .map(BlockStore::block_id_allocator)
+        else {
+            return;
+        };
+        let persisted_history = match self.sessions.block_store() {
+            Some(store) => match store.recent(1000) {
+                Ok(history) => history,
+                Err(e) => {
+                    warn!(error = %e, "failed to load block history");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        for tab in self.sessions.tabs_mut() {
+            // Clone first to avoid borrow conflict with terminal.as_mut().
+            let tab_block_ids: Vec<u64> = tab
+                .restored_snapshot
+                .as_ref()
+                .map(|snap| snap.block_ids.clone())
+                .unwrap_or_default();
+            if let Some(terminal) = tab.terminal.as_mut() {
+                hydrate_persisted_history(
+                    terminal,
+                    &persisted_history,
+                    &tab_block_ids,
+                    block_id_allocator.clone(),
+                );
             }
         }
     }

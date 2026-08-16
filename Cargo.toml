@@ -37,6 +37,14 @@ winit = "0.30"
 # `block` backs the `Block<...>` callback type used by Metal's
 # `add_completed_handler` (frame-trace GPU timing) and other Objective-C APIs.
 block = "0.1"
+# v1.10.23: Safe wrapper around libdispatch (same author as objc2). Used to
+# defer the crash-recovery NSAlert out of the winit event handler
+# (FIX_RECOVERY_MODAL_SPIN.md) — `Queue::main().exec_async` replaces the
+# forbidden bare `dispatch_async_f` + extern-callback FFI. `default-features
+# = false` keeps objc2 0.6.x / block2 0.6.x (dispatch2's optional interop
+# features) out of the tree — they would duplicate the workspace's objc2 0.5
+# family; `Queue::main().exec_async` only needs the `std` feature.
+dispatch2 = { version = "0.3", default-features = false, features = ["std"] }
 
 # Fonts
 font-kit = "0.14"
