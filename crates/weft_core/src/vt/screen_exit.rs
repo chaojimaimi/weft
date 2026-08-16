@@ -94,7 +94,11 @@ impl Terminal {
             let complete_primary_frame = self.primary_screen_app_active()
                 && self.synchronized_frame_cleared_rows >= self.grid.num_rows;
             if complete_primary_frame {
-                self.discard_superseded_primary_screen_frame();
+                // The viewport already holds the NEW frame (every row was
+                // cleared + repainted inside the sync window) — preserve only
+                // the scrollback rows the clear is about to destroy, so the
+                // surviving frame is not duplicated in the block history.
+                self.discard_superseded_primary_screen_frame(false);
             }
             self.capabilities.primary_screen_synchronized_frame_seen |= complete_primary_frame;
         }
@@ -113,7 +117,10 @@ impl Terminal {
         if self.synchronized_output_started.is_some() && !self.capabilities.alt_active {
             self.synchronized_frame_cleared_rows = self.grid.num_rows;
             if self.primary_screen_app_active() {
-                self.discard_superseded_primary_screen_frame();
+                // CSI 2J: the viewport is blanked right after this call, so
+                // the whole superseded document (scrollback + viewport) is
+                // preserved before both are destroyed.
+                self.discard_superseded_primary_screen_frame(true);
             }
         }
     }
@@ -314,6 +321,13 @@ impl Terminal {
     }
 
     pub(super) fn begin_primary_screen_output_capture(&mut self) {
+        // v1.10.23 (FIX_OMP_CONTENT_LOSS): a new screen-owned session starts
+        // with a clean preservation history. Nested 133 markers keep
+        // `screen_document_start` set, so the accumulated frames survive
+        // them; only a real boundary (settle → next command) resets it.
+        if self.block_tracker.screen_document_start().is_none() {
+            self.capabilities.screen_history = crate::vt::capability::ScreenHistory::default();
+        }
         self.block_tracker
             .begin_screen_owned_output(self.capabilities.primary_screen_document_candidate);
     }
@@ -585,7 +599,7 @@ impl Terminal {
                 document_start.saturating_sub(viewport_origin) as usize,
             )
         };
-        match self
+        let line = match self
             .capabilities
             .primary_screen_ownership
             .viewport
@@ -605,7 +619,10 @@ impl Terminal {
                 None,
                 None,
             ),
-        }
+        };
+        // v1.10.23: the rendered block prepends the preserved-frame history,
+        // so the anchor's rendered line shifts by that many lines.
+        line.map(|line| line + self.screen_history_lines())
     }
 
     /// v1.10.12: alt-screen history peek — true while the user is browsing the
@@ -648,7 +665,10 @@ impl Terminal {
         self.capabilities.last_caret_snapshot_cursor = Some(cursor);
         let document_start = self.block_tracker.screen_document_start().unwrap_or(0);
         let (_, _, cursor_line) = self.primary_screen_document_snapshot(document_start);
-        self.capabilities.primary_screen_cursor_snapshot_line = cursor_line;
+        // v1.10.23: shift by the preserved-frame history — the caret row must
+        // match the composed block output (history + snapshot).
+        self.capabilities.primary_screen_cursor_snapshot_line =
+            cursor_line.map(|line| line + self.screen_history_lines());
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
@@ -736,6 +756,7 @@ impl Terminal {
                 capture.frozen_styled.clone(),
                 &capture.tail,
             );
+            let (text, styled) = self.compose_screen_history(text, styled);
             self.block_tracker.replace_screen_snapshot(&text, styled);
             return;
         }
@@ -744,11 +765,16 @@ impl Terminal {
         };
         let (text, styled, cursor_line) = self.primary_screen_document_snapshot(document_start);
         let (text, styled) = space_primary_screen_exit_tail(text, styled);
+        // v1.10.23 (FIX_OMP_CONTENT_LOSS): prepend the preserved superseded
+        // frames so the block transcript stays complete across full-frame
+        // repaints; the cursor line shifts by the prepended history.
+        let (text, styled) = self.compose_screen_history(text, styled);
         // v1.10.6: store the precisely-tracked cursor snapshot line so the
         // BlockView paint can place the caret/preedit on the exact document
         // row instead of guessing from a formula that breaks when the
         // snapshot skips empty rows.
-        self.capabilities.primary_screen_cursor_snapshot_line = cursor_line;
+        self.capabilities.primary_screen_cursor_snapshot_line =
+            cursor_line.map(|line| line + self.screen_history_lines());
         self.block_tracker.replace_screen_snapshot(&text, styled);
     }
 

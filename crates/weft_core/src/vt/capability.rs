@@ -18,7 +18,7 @@
 //! reset to its default in `Terminal::with_scrollback`. Nothing is serialized
 //! into SQLite, so moving the storage location changes no on-disk schema.
 
-use crate::blocks::ShellPhase;
+use crate::blocks::{ShellPhase, StyledOutput};
 use crate::input::MouseProtocol;
 use std::time::Instant;
 
@@ -26,6 +26,20 @@ use super::screen_exit::{
     PendingPrimaryScreenExit, PrimaryScreenInterruptCapture, PrimaryScreenOwnership,
     PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
 };
+
+/// v1.10.23 (FIX_OMP_CONTENT_LOSS): text+styles of primary-screen document
+/// frames superseded by DEC 2026 full-frame repaints. A repaint (CSI 2J or
+/// whole-frame EL2 inside `?2026h`) clears the scrollback, which physically
+/// deletes every streamed paragraph that scrolled out of the viewport; the
+/// superseded frame is snapshotted into this history BEFORE the clear and
+/// prepended to every subsequent screen snapshot, so history review stays
+/// complete. Bounded at `MAX_OUTPUT_BYTES` (head-keeping, matching the
+/// snapshot truncation semantics). Cleared at each real command start.
+#[derive(Default)]
+pub(in crate::vt) struct ScreenHistory {
+    pub(in crate::vt) text: String,
+    pub(in crate::vt) styled: Option<StyledOutput>,
+}
 
 /// Aggregated capability + primary-screen lifecycle state.
 ///
@@ -117,6 +131,9 @@ pub(in crate::vt) struct CapabilityFlags {
     /// Per-row ownership mask separating shell rows from a primary-screen TUI's
     /// live viewport, preserved across scrolls and resize/reflow.
     pub(in crate::vt) primary_screen_ownership: PrimaryScreenOwnership,
+    /// v1.10.23 (FIX_OMP_CONTENT_LOSS): superseded-frame preservation history
+    /// (see the `ScreenHistory` struct docs).
+    pub(in crate::vt) screen_history: ScreenHistory,
 }
 
 impl Default for CapabilityFlags {
@@ -140,6 +157,7 @@ impl Default for CapabilityFlags {
             alt_screen_history_peek: false,
             primary_history_snapshot_at: None,
             primary_screen_ownership: PrimaryScreenOwnership::default(),
+            screen_history: ScreenHistory::default(),
         }
     }
 }

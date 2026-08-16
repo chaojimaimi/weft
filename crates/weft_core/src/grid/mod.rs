@@ -95,7 +95,11 @@ impl Grid {
             let global = sb_len - offset + row;
             if global < sb_len {
                 if let Some(history_row) = self.scrollback.get(global) {
-                    return &history_row.cells[col];
+                    // v1.10.23 (FIX_OMP_CONTENT_LOSS): history rows keep
+                    // their original width after a narrowing resize (>= the
+                    // current `num_cols`), so `col` is in bounds — the
+                    // `get().unwrap_or(BLANK_CELL)` guard is defensive only.
+                    return history_row.cells.get(col).unwrap_or(&cell::BLANK_CELL);
                 }
             } else {
                 return &self.viewport[global - sb_len].cells[col];

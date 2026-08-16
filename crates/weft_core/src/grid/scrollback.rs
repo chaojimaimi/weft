@@ -117,14 +117,21 @@ impl Scrollback {
     }
 
     /// Keep historical rows compatible with dimension-only viewport rendering.
+    ///
+    /// v1.10.23 (FIX_OMP_CONTENT_LOSS): scrollback rows are only ever GROWN —
+    /// a narrowing resize leaves them at their original width instead of
+    /// truncating the right half of every history line. The viewport rows are
+    /// reshaped by the caller ([`super::Grid::resize_dims`]) and the TUI
+    /// repaints them on SIGWINCH, but rows already scrolled out of the
+    /// viewport cannot be repainted; truncating them lost streamed content
+    /// irreversibly. Rows are therefore always at least `new_cols` wide, so
+    /// column-indexed readers bounded by `num_cols` ([`super::Grid::cell`],
+    /// renderer, selection) stay in bounds.
     pub(super) fn resize_cols(&mut self, new_cols: usize) {
         for row in &mut self.buffer {
-            let old_cols = row.cells.len();
-            resize_row_cells(&mut row.cells, new_cols);
-            row.repair_wide_pairs();
-            // v1.6.0 review M2: drop extras entries beyond the new width.
-            if new_cols < old_cols {
-                row.extras.truncate_cols(new_cols);
+            if row.cells.len() < new_cols {
+                resize_row_cells(&mut row.cells, new_cols);
+                row.repair_wide_pairs();
             }
         }
     }

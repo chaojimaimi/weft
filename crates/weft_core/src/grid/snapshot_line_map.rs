@@ -25,10 +25,15 @@ use super::{CellFlags, Grid, Row};
 /// (cells beyond it are not part of the text). `pub(crate)` so the snapshot
 /// builder (`styled_row` in `super::snapshot`) counts the same cells as this
 /// replay — the line mapping can't drift from the snapshot it maps into.
-pub(crate) fn snapshot_row_extent(row: &Row, num_cols: usize) -> usize {
+///
+/// v1.10.23 (FIX_OMP_CONTENT_LOSS): the extent is the row's OWN width, not
+/// `num_cols` — narrowing resizes now leave scrollback rows at their original
+/// width (see `Scrollback::resize_cols`), and the snapshot must contain the
+/// complete history line. Viewport rows are always exactly `num_cols` wide,
+/// so for them the two widths coincide.
+pub(crate) fn snapshot_row_extent(row: &Row, _num_cols: usize) -> usize {
     row.cells
         .iter()
-        .take(num_cols)
         .rposition(|cell| cell.character != ' ' && cell.character != '\0')
         .map(|index| index + 1)
         .unwrap_or(0)

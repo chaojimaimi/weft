@@ -989,10 +989,14 @@ fn synchronized_full_repaint_discards_superseded_primary_screen_scrollback() {
     terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew banner\r\nnew answer\x1b[?2026l");
     terminal.set_primary_history_view(true);
     let output = terminal.block_tracker().in_flight().unwrap().output;
+    // v1.10.23 (FIX_OMP_CONTENT_LOSS): the superseded frame is PRESERVED
+    // into the block history before the repaint clears the scrollback — the
+    // streamed paragraphs must stay readable when reviewing history.
     assert!(
-        !output.contains("old banner"),
-        "superseded frame leaked: {output:?}"
+        output.contains("old banner"),
+        "superseded frame must be preserved into the block history: {output:?}"
     );
+    assert!(output.contains("old answer 4"));
     assert!(output.contains("new banner"));
 }
 
@@ -2972,6 +2976,151 @@ mod reflow_cjk_tests {
             }
         }
     }
+}
+
+// ── v1.10.23 (FIX_OMP_CONTENT_LOSS): superseded-frame preservation ──
+
+/// Stream `count` lines with the TUI's erase-before-write pattern (EL2
+/// marks each row owned) — the omp resize-repaint flow.
+fn stream_owned_lines(t: &mut Terminal, count: usize, prefix: &str) {
+    for i in 0..count {
+        t.process(format!("\x1b[2K{prefix}{i}\r\n").as_bytes());
+    }
+}
+
+#[test]
+fn full_frame_repaint_preserves_superseded_document_in_block_history() {
+    // v1.10.23: omp's resize repaint — DEC 2026 sync frame + CSI 2J —
+    // used to physically clear the scrollback, deleting every streamed
+    // paragraph that had scrolled out of the viewport. The superseded
+    // document must be preserved into the block history BEFORE the
+    // clear so history review stays complete.
+    let mut t = Terminal::new(5, 20);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07omp\x1b]133;C\x07");
+    // Establish TUI ownership (2+ cursor-addressing ops; CHR 2G counts,
+    // 1G does not), then open the synchronized frame.
+    t.process("\x1b[3A\x1b[2G\x1b[?2026h".as_bytes());
+    assert!(t.primary_screen_app_active());
+    // Paint the first frame; 8 paragraphs, 3 scroll into the scrollback.
+    stream_owned_lines(&mut t, 8, "paragraph ");
+    assert!(
+        !t.grid().scrollback.is_empty(),
+        "precondition: scrolled-out rows"
+    );
+
+    // Resize repaint: clear the whole screen and redraw.
+    t.process("\x1b[2J\x1b[Hfresh frame".as_bytes());
+    assert_eq!(
+        t.grid().scrollback.len(),
+        0,
+        "the repaint physically clears the scrollback"
+    );
+    // The superseded frame must be readable through the block history.
+    assert!(t.refresh_primary_history_snapshot_now());
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    for i in 0..8 {
+        assert!(
+            output.contains(&format!("paragraph {i}")),
+            "streamed paragraph {i} must survive the repaint"
+        );
+    }
+    assert!(
+        output.contains("fresh frame"),
+        "the new frame is the live tail"
+    );
+
+    // A second repaint replaces the live frame — it is 1 line, below the
+    // 4-line preservation floor, so no fragment is preserved — while the
+    // streamed history stays readable and is not duplicated.
+    t.process("\x1b[2J\x1b[Hsecond frame".as_bytes());
+    assert!(t.refresh_primary_history_snapshot_now());
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    assert!(
+        output.contains("paragraph 0"),
+        "history survives a second repaint"
+    );
+    assert!(output.contains("second frame"));
+    assert!(
+        !output.contains("fresh frame"),
+        "the superseded live frame is replaced, not duplicated"
+    );
+
+    // Settle: the finalized block carries the full preserved transcript.
+    t.process(b"\x1b]133;D;0\x07");
+    assert!(t.settle_primary_screen_exit());
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert!(block.output.contains("paragraph 0"));
+    assert!(block.output.contains("paragraph 7"));
+}
+
+#[test]
+fn synchronized_frame_finish_preserves_scrollback_but_not_the_live_frame() {
+    // v1.10.23: the whole-frame-EL2 repaint (no 2J) discards at the
+    // synchronized-frame finish — the viewport already holds the NEW
+    // frame (all rows cleared + rewritten inside the sync window), so
+    // only the scrolled-out paragraphs are at risk. Preserving the
+    // viewport too would duplicate the live frame in the history.
+    let mut t = Terminal::new(5, 20);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07omp\x1b]133;C\x07");
+    t.process("\x1b[3A\x1b[2G\x1b[?2026h".as_bytes());
+    assert!(t.primary_screen_app_active());
+    // 9 paragraphs: the 9th LF at the bottom scrolls p4 out too, so the
+    // scrollback holds p0..p4 (5 rows) and the viewport holds p5..p8.
+    stream_owned_lines(&mut t, 9, "p");
+    assert_eq!(
+        t.grid().scrollback.len(),
+        5,
+        "precondition: 5 scrolled rows"
+    );
+    // Full-frame repaint via per-row EL2 inside the synchronized frame.
+    for row in 0..5 {
+        t.process(format!("\x1b[{};1H\x1b[2Knew-{row}", row + 1).as_bytes());
+    }
+    t.process("\x1b[?2026l".as_bytes());
+    assert_eq!(
+        t.grid().scrollback.len(),
+        0,
+        "finish discard clears the scrollback"
+    );
+
+    assert!(t.refresh_primary_history_snapshot_now());
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    for i in 0..5 {
+        assert!(
+            output.contains(&format!("p{i}")),
+            "scrolled-out paragraph {i} must be preserved"
+        );
+    }
+    assert!(
+        !output.contains("p5"),
+        "viewport content overwritten by the repaint is not preserved"
+    );
+    // The live frame appears exactly once (no duplication).
+    for row in 0..5 {
+        assert_eq!(
+            output.matches(&format!("new-{row}")).count(),
+            1,
+            "live frame row {row} must not be duplicated"
+        );
+    }
+}
+
+#[test]
+fn tiny_repaint_frames_are_not_preserved_into_block_history() {
+    // v1.10.23: resize jitter produces sub-4-line frames; preserving
+    // them would fragment the block history with tiny partial frames.
+    let mut t = Terminal::new(5, 20);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07omp\x1b]133;C\x07");
+    t.process("\x1b[3A\x1b[2G\x1b[?2026h".as_bytes());
+    // A 2-line frame, then a full-frame repaint.
+    t.process("\x1b[2Kab\r\n\x1b[2Kcd".as_bytes());
+    t.process("\x1b[2J\x1b[Hx".as_bytes());
+    assert_eq!(t.grid().scrollback.len(), 0);
+    assert!(t.refresh_primary_history_snapshot_now());
+    let output = t.block_tracker().in_flight().unwrap().output.to_string();
+    assert!(!output.contains("ab"), "tiny frame must not be preserved");
+    assert!(!output.contains("cd"));
+    assert!(output.contains('x'), "the new frame is the live tail");
 }
 
 /// v1.0 P1.5: Performance benchmarks for the VT parse + grid write pipeline.

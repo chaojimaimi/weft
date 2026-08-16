@@ -187,6 +187,19 @@ impl Default for Cell {
     }
 }
 
+/// v1.10.23 (FIX_OMP_CONTENT_LOSS): canonical blank cell returned by
+/// [`super::Grid::cell`] for out-of-range columns — a defensive fallback so
+/// the column-indexed read side never panics on a history row narrower than
+/// the request (the resize invariant normally keeps history rows at least
+/// `num_cols` wide; the guard makes that invariant non-load-bearing).
+pub(crate) static BLANK_CELL: Cell = Cell {
+    character: ' ',
+    fg: CellColor::Default,
+    bg: CellColor::Default,
+    flags: CellFlags::empty(),
+    width: CellWidth::Half,
+};
+
 impl Cell {
     pub fn with_char(ch: char) -> Self {
         let width = if terminal_char_width(ch) > 1 {

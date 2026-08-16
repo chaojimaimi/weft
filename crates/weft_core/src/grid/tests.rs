@@ -677,10 +677,92 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     assert_eq!(grid.cell(0, 3).character, 'D');
     assert_eq!(grid.cell(0, 4).character, ' ');
 
+    // v1.10.23 (FIX_OMP_CONTENT_LOSS): narrowing must NOT truncate history
+    // rows — a TUI cannot repaint rows already scrolled out of the viewport,
+    // so truncation lost the right half of every history line irreversibly.
+    // The history row keeps its original width; the VIEWPORT rows are still
+    // reshaped (the TUI repaints them on SIGWINCH).
     grid.resize_dims(2, 3);
     grid.scroll_to_top();
-    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 3);
+    assert_eq!(
+        grid.scrollback.get(0).unwrap().cells.len(),
+        5,
+        "history rows keep their width when narrowing"
+    );
     assert_eq!(grid.cell(0, 2).character, 'C');
+    assert_eq!(
+        grid.cell(0, 3).character,
+        'D',
+        "right half survives in history"
+    );
+    assert_eq!(grid.cell(0, 4).character, ' ');
+    assert_eq!(
+        grid.document_text_from(0),
+        "ABCD",
+        "the snapshot contains the complete history row"
+    );
+    assert_eq!(
+        grid.viewport[0].cells.len(),
+        3,
+        "viewport rows are reshaped to the new width"
+    );
+}
+
+#[test]
+fn narrowing_resize_keeps_scrollback_rows_at_original_width() {
+    // v1.10.23 (FIX_OMP_CONTENT_LOSS): a narrowing dimension-only resize must
+    // leave scrollback rows at their original width with their full text —
+    // the TUI cannot repaint scrolled-out rows, so the old truncation lost
+    // streamed content irreversibly (omp paragraphs missing their right half
+    // after a resize).
+    let mut grid = Grid::with_scrollback(2, 8, 16);
+    for (col, ch) in "ABCDEFGH".chars().enumerate() {
+        grid.viewport[0].cells[col].character = ch;
+    }
+    grid.scroll_up(1);
+    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 8);
+
+    grid.resize_dims(2, 4);
+    let row = grid.scrollback.get(0).unwrap();
+    assert_eq!(row.cells.len(), 8, "history row keeps its original width");
+    let text: String = row.cells.iter().map(|c| c.character).collect();
+    assert_eq!(text, "ABCDEFGH", "the right half survives the narrowing");
+    assert_eq!(
+        grid.document_text_from(0),
+        "ABCDEFGH",
+        "the snapshot contains the complete history row"
+    );
+    // cell() stays readable within the new viewport width.
+    grid.scroll_to_top();
+    assert_eq!(grid.cell(0, 0).character, 'A');
+    assert_eq!(grid.cell(0, 3).character, 'D');
+
+    // Widen again: history rows pad to the new width, no unwrapping.
+    grid.resize_dims(2, 8);
+    grid.scroll_to_top();
+    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 8);
+    assert_eq!(grid.cell(0, 7).character, 'H');
+}
+
+#[test]
+fn scrollback_row_cell_access_is_bounds_safe() {
+    // v1.10.23 (FIX_OMP_CONTENT_LOSS): defensive — `cell()` must not panic
+    // when a history row is narrower than the requested column. The resize
+    // invariant normally keeps history rows at least `num_cols` wide; the
+    // guard makes the invariant non-load-bearing.
+    let mut grid = Grid::with_scrollback(2, 8, 8);
+    let mut row = Row::new(5);
+    row.cells[0].character = 'x';
+    grid.scrollback.push(row);
+    grid.scroll_offset = 1;
+
+    assert_eq!(grid.cell(0, 0).character, 'x');
+    let out_of_range = grid.cell(0, 7);
+    assert_eq!(
+        out_of_range.character, ' ',
+        "out-of-range column returns a blank cell"
+    );
+    assert_eq!(out_of_range.width, CellWidth::Half);
 }
 
 #[test]
@@ -694,11 +776,19 @@ fn resize_dims_repairs_wide_glyphs_cut_at_the_right_edge() {
     grid.scroll_up(1);
 
     grid.resize_dims(2, 3);
+    // The viewport row is truncated + repaired (orphan lead reset to blank).
     assert_eq!(grid.viewport[0].cells[2].character, ' ');
     assert_eq!(grid.viewport[0].cells[2].width, CellWidth::Half);
     grid.scroll_to_top();
-    assert_eq!(grid.cell(0, 2).character, ' ');
-    assert_eq!(grid.cell(0, 2).width, CellWidth::Half);
+    // v1.10.23 (FIX_OMP_CONTENT_LOSS): the history row is NOT truncated
+    // anymore — its wide pair at cols 2-3 stays intact (the row keeps its
+    // original 4-cell width), so the glyph survives in history/snapshot.
+    assert_eq!(grid.cell(0, 2).character, '中');
+    assert_eq!(grid.cell(0, 2).width, CellWidth::Full);
+    assert!(
+        grid.cell(0, 3).flags.contains(CellFlags::WIDE_SPACER),
+        "the wide pair stays intact in history"
+    );
 }
 
 #[test]
