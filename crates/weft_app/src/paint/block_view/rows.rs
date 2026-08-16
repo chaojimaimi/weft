@@ -90,7 +90,7 @@ impl MetalRenderer {
             spinner_phase: _,
             find_block_highlight: _,
             palette: _,
-            cache_namespace: _,
+            cache_namespace,
             block_diagnose_state,
             ai_configured: _,
             tui_cursor: _,
@@ -129,6 +129,7 @@ impl MetalRenderer {
                 LayoutPassInput {
                     blocks,
                     live,
+                    pane_session_id: cache_namespace,
                     cwd,
                     git_branch,
                     block_scroll,
@@ -144,181 +145,296 @@ impl MetalRenderer {
                     block_diagnose_state,
                 },
                 &cache,
+                &mut self.live_layout_cache.borrow_mut(),
             )
         };
 
-        // Extract bv_rows from the layout output.
+        // Extract bv_rows from the layout output. Hit-testing keeps the
+        // historical full-row set (cull=false) so pointer mapping is
+        // unchanged; the paint path culls, see `build_bv_rows`.
         let scroll_px = block_scroll * pitch;
-        let mut bv_rows = Vec::new();
-
-        for (i, &dist) in layout_out.rows.iter().enumerate() {
-            let row_top_y = content_bottom_y - dist + scroll_px;
-            match &layout_out.row_data[i] {
-                LaidRow::Output {
-                    text,
-                    chunks,
-                    block_id,
-                    line,
-                    ..
-                } => {
-                    // v1.6.1: carry the line index so click-time hyperlink
-                    // resolution can look up `StyledLine::link_at`. Skip
-                    // resume hints (line == usize::MAX) — they have no styled
-                    // output and aren't clickable.
-                    let line_idx = (*line != usize::MAX).then_some(*line);
-                    if chunks.len() <= 1 {
-                        bv_rows.push(BlockViewRow {
-                            kind: BlockViewRowKind::Output,
-                            text: text.to_string(),
-                            block_id: *block_id,
-                            y_top: row_top_y,
-                            y_bottom: row_top_y + pitch,
-                            line: line_idx,
-                            chunk_char_offset: 0,
-                            indent_cols: 0,
-                        });
-                    } else {
-                        // v1.6.1: track cumulative char offset per chunk so
-                        // wrapped-line link resolution can compute the
-                        // full-line char index.
-                        for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks)
-                        {
-                            let chunk = &chunks[ci];
-                            bv_rows.push(BlockViewRow {
-                                kind: BlockViewRowKind::Output,
-                                text: chunk.clone(),
-                                block_id: *block_id,
-                                y_top: cy,
-                                y_bottom: cy + pitch,
-                                line: line_idx,
-                                chunk_char_offset: char_offset,
-                                indent_cols: 0,
-                            });
-                        }
-                    }
-                }
-                LaidRow::Command {
-                    chunks,
-                    foldable,
-                    block_id,
-                    ..
-                } => {
-                    // R2-2 (stage 2): one BlockViewRow per wrapped chunk
-                    // (mirrors Output's expansion) so hit-testing and
-                    // selection see every command line.
-                    for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks) {
-                        let chunk = &chunks[ci];
-                        bv_rows.push(BlockViewRow {
-                            kind: BlockViewRowKind::Command,
-                            text: chunk.clone(),
-                            block_id: Some(*block_id),
-                            y_top: cy,
-                            y_bottom: cy + pitch,
-                            line: None,
-                            // v1.10.13: first line renders after chevron + "> "
-                            // (3 cols if foldable else 2); continuations are
-                            // flush-left.
-                            indent_cols: if ci == 0 {
-                                if *foldable {
-                                    3
-                                } else {
-                                    2
-                                }
-                            } else {
-                                0
-                            },
-                            chunk_char_offset: char_offset,
-                        });
-                    }
-                }
-                LaidRow::Header {
-                    cwd,
-                    duration,
-                    status,
-                    block_id,
-                    ..
-                } => {
-                    // 阶段 3:分段拆开后在此拼回 " · " 全文,供身份匹配/debug。
-                    let mut parts = vec![cwd.as_str()];
-                    if !duration.is_empty() {
-                        parts.push(duration.as_str());
-                    }
-                    if !status.is_empty() {
-                        parts.push(status.as_str());
-                    }
-                    let text = parts.join(" · ");
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::Header,
-                        text,
-                        block_id: Some(*block_id),
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + header_height,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::LiveHeader { text } => {
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::Header,
-                        text: text.clone(),
-                        block_id: None,
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::Separator => {
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::Separator,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::LiveCommand { chunks, .. } => {
-                    for (ci, cy, char_offset) in wrapped_row_positions(row_top_y, pitch, chunks) {
-                        let chunk = &chunks[ci];
-                        bv_rows.push(BlockViewRow {
-                            kind: BlockViewRowKind::LiveCommand,
-                            text: chunk.clone(),
-                            block_id: None,
-                            y_top: cy,
-                            y_bottom: cy + pitch,
-                            line: None,
-                            // v1.10.13: first line renders after "> " (2 cols).
-                            indent_cols: if ci == 0 { 2 } else { 0 },
-                            chunk_char_offset: char_offset,
-                        });
-                    }
-                }
-                LaidRow::DiagnosePanel { text, block_id, .. } => {
-                    // v1.8.2: include the panel's y-band in hit-testing so
-                    // clicks on the panel don't fall through to whatever is
-                    // below. Non-selectable.
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::DiagnosePanel,
-                        text: text.clone(),
-                        block_id: Some(*block_id),
-                        y_top: row_top_y,
-                        y_bottom: row_top_y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::Blank => {}
-            }
-        }
+        let bv_rows = build_bv_rows(
+            &layout_out.rows,
+            &layout_out.row_data,
+            BvRowsGeometry {
+                pitch,
+                header_height,
+                content_bottom_y,
+                scroll_px,
+                clip_top: layout.clip_top,
+                clip_bottom: layout.clip_bottom,
+                cull: false,
+                selection_keep: None,
+            },
+        );
 
         (bv_rows, layout.clip_top, layout.clip_bottom)
     }
+}
+
+/// Build selection/hit-test rows from a shared layout output (bottom-to-top;
+/// wrapped chunks expand into per-chunk rows). Single source for both the
+/// paint path (`build_block_view_vertices`) and hit-testing
+/// (`compute_block_view_rows`) so their y-bands can't drift.
+/// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): `cull=true` materializes only rows
+/// intersecting the clip window; Command rows are always kept (sticky-block
+/// detection needs them, see `sticky_block_id`) and `selection_keep` retains
+/// rows matched by the active selection even off-screen — `sync_rows` remaps
+/// endpoints by (kind, block_id, text), so culling them would drop the
+/// selection endpoints. `cull=false` (hit-testing) preserves the historical
+/// full-row behavior.
+/// Geometry inputs for [`build_bv_rows`] (paint + hit-testing parity).
+pub(super) struct BvRowsGeometry<'a> {
+    pub(super) pitch: f32,
+    pub(super) header_height: f32,
+    pub(super) content_bottom_y: f32,
+    pub(super) scroll_px: f32,
+    pub(super) clip_top: f32,
+    pub(super) clip_bottom: f32,
+    /// Materialize only clip-visible rows (+ Command/selected retention).
+    pub(super) cull: bool,
+    pub(super) selection_keep: Option<&'a [(BlockViewRowKind, Option<BlockId>, &'a str)]>,
+}
+
+pub(super) fn build_bv_rows(
+    rows: &[f32],
+    row_data: &[LaidRow<'_>],
+    geometry: BvRowsGeometry<'_>,
+) -> Vec<BlockViewRow> {
+    let BvRowsGeometry {
+        pitch,
+        header_height,
+        content_bottom_y,
+        scroll_px,
+        clip_top,
+        clip_bottom,
+        cull,
+        selection_keep,
+    } = geometry;
+    let mut bv_rows = Vec::new();
+    for (i, &dist) in rows.iter().enumerate() {
+        let row_top_y = content_bottom_y - dist + scroll_px;
+        let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
+            header_height
+        } else {
+            pitch
+        };
+        let visible = row_top_y + row_height >= clip_top && row_top_y <= clip_bottom;
+        let keep = |kind: BlockViewRowKind, block_id: Option<BlockId>, text: &str| {
+            !cull
+                || visible
+                || matches!(&row_data[i], LaidRow::Command { .. })
+                || selection_keep.is_some_and(|ids| {
+                    ids.iter()
+                        .any(|(k, id, t)| *k == kind && *id == block_id && *t == text)
+                })
+        };
+        let y = row_top_y;
+        match &row_data[i] {
+            LaidRow::Output {
+                text,
+                chunks,
+                block_id,
+                line,
+                ..
+            } => {
+                // v1.6.1: carry the line index so click-time hyperlink
+                // resolution can look up `StyledLine::link_at`. Skip
+                // resume hints (line == usize::MAX) — they have no styled
+                // output and aren't clickable.
+                let line_idx = (*line != usize::MAX).then_some(*line);
+                if chunks.len() <= 1 {
+                    if !keep(BlockViewRowKind::Output, *block_id, text) {
+                        continue;
+                    }
+                    bv_rows.push(BlockViewRow {
+                        kind: BlockViewRowKind::Output,
+                        text: text.to_string(),
+                        block_id: *block_id,
+                        y_top: y,
+                        y_bottom: y + pitch,
+                        line: line_idx,
+                        chunk_char_offset: 0,
+                        indent_cols: 0,
+                    });
+                } else {
+                    // Keep the whole wrapped row if any chunk is retained
+                    // (visible or a selected endpoint).
+                    if !chunks
+                        .iter()
+                        .any(|chunk| keep(BlockViewRowKind::Output, *block_id, chunk))
+                    {
+                        continue;
+                    }
+                    for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
+                        let chunk = &chunks[ci];
+                        bv_rows.push(BlockViewRow {
+                            kind: BlockViewRowKind::Output,
+                            text: chunk.clone(),
+                            block_id: *block_id,
+                            y_top: cy,
+                            y_bottom: cy + pitch,
+                            line: line_idx,
+                            chunk_char_offset: char_offset,
+                            indent_cols: 0,
+                        });
+                    }
+                }
+            }
+            LaidRow::Command {
+                chunks,
+                foldable,
+                block_id,
+                ..
+            } => {
+                for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
+                    let chunk = &chunks[ci];
+                    bv_rows.push(BlockViewRow {
+                        kind: BlockViewRowKind::Command,
+                        text: chunk.clone(),
+                        block_id: Some(*block_id),
+                        y_top: cy,
+                        y_bottom: cy + pitch,
+                        line: None,
+                        // v1.10.13: first line renders after chevron + "> "
+                        // (3 cols if foldable else 2); continuations flush-left.
+                        indent_cols: if ci == 0 {
+                            if *foldable {
+                                3
+                            } else {
+                                2
+                            }
+                        } else {
+                            0
+                        },
+                        chunk_char_offset: char_offset,
+                    });
+                }
+            }
+            LaidRow::Header {
+                cwd,
+                duration,
+                status,
+                block_id,
+                ..
+            } => {
+                // 阶段 3:分段拆开后在此拼回 " · " 全文,供身份匹配/debug。
+                let mut parts = vec![cwd.as_str()];
+                if !duration.is_empty() {
+                    parts.push(duration.as_str());
+                }
+                if !status.is_empty() {
+                    parts.push(status.as_str());
+                }
+                let text = parts.join(" · ");
+                if !keep(BlockViewRowKind::Header, Some(*block_id), &text) {
+                    continue;
+                }
+                bv_rows.push(BlockViewRow {
+                    kind: BlockViewRowKind::Header,
+                    text,
+                    block_id: Some(*block_id),
+                    y_top: y,
+                    y_bottom: y + header_height,
+                    line: None,
+                    chunk_char_offset: 0,
+                    indent_cols: 0,
+                });
+            }
+            LaidRow::LiveHeader { text } => {
+                if !keep(BlockViewRowKind::Header, None, text) {
+                    continue;
+                }
+                bv_rows.push(BlockViewRow {
+                    kind: BlockViewRowKind::Header,
+                    text: text.clone(),
+                    block_id: None,
+                    y_top: y,
+                    y_bottom: y + pitch,
+                    line: None,
+                    chunk_char_offset: 0,
+                    indent_cols: 0,
+                });
+            }
+            LaidRow::Separator => {
+                if !keep(BlockViewRowKind::Separator, None, "") {
+                    continue;
+                }
+                bv_rows.push(BlockViewRow {
+                    kind: BlockViewRowKind::Separator,
+                    text: String::new(),
+                    block_id: None,
+                    y_top: y,
+                    y_bottom: y + pitch,
+                    line: None,
+                    chunk_char_offset: 0,
+                    indent_cols: 0,
+                });
+            }
+            LaidRow::LiveCommand { chunks, .. } => {
+                if !chunks
+                    .iter()
+                    .any(|chunk| keep(BlockViewRowKind::LiveCommand, None, chunk))
+                {
+                    continue;
+                }
+                for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
+                    let chunk = &chunks[ci];
+                    bv_rows.push(BlockViewRow {
+                        kind: BlockViewRowKind::LiveCommand,
+                        text: chunk.clone(),
+                        block_id: None,
+                        y_top: cy,
+                        y_bottom: cy + pitch,
+                        line: None,
+                        indent_cols: if ci == 0 { 2 } else { 0 },
+                        chunk_char_offset: char_offset,
+                    });
+                }
+            }
+            LaidRow::DiagnosePanel { text, block_id, .. } => {
+                // v1.8.2: include the panel's y-band in hit-testing so
+                // clicks on the panel don't fall through to whatever is
+                // below. Non-selectable.
+                if !keep(BlockViewRowKind::DiagnosePanel, Some(*block_id), text) {
+                    continue;
+                }
+                bv_rows.push(BlockViewRow {
+                    kind: BlockViewRowKind::DiagnosePanel,
+                    text: text.clone(),
+                    block_id: Some(*block_id),
+                    y_top: y,
+                    y_bottom: y + pitch,
+                    line: None,
+                    chunk_char_offset: 0,
+                    indent_cols: 0,
+                });
+            }
+            LaidRow::Blank => {}
+        }
+    }
+    bv_rows
+}
+/// Selection-row identities for the bv_rows visibility cull
+/// (v1.10.23, FIX_LIVE_BLOCK_SCROLL_PERF): every row in the active
+/// selection's `[start.row_index, end.row_index]` range, matched the same
+/// way `sync_rows`' exact-match remap does (`kind` + `block_id` + `text`).
+/// Rows whose identity matches stay in the culled snapshot even when
+/// off-screen, so the selection endpoints can't be remapped to a fallback
+/// row and drift once the user scrolls back. Linear scan (selection ranges
+/// are bounded by a drag's row count; kind mismatch short-circuits).
+pub(super) fn selected_row_identities(
+    selection_rows: &[BlockViewRow],
+    start_idx: usize,
+    end_idx: usize,
+) -> Vec<(BlockViewRowKind, Option<BlockId>, &str)> {
+    let (lo, hi) = (start_idx.min(end_idx), start_idx.max(end_idx));
+    selection_rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i >= lo && *i <= hi)
+        .map(|(_, r)| (r.kind.clone(), r.block_id, r.text.as_str()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -369,5 +485,41 @@ mod tests {
         let pos = wrapped_row_positions(100.0, 20.0, &chunks);
         // 视觉从下到上:y 递增、ci 递减、offset 前缀和
         assert_eq!(pos, vec![(2, 140.0, 4), (1, 120.0, 2), (0, 100.0, 0)]);
+    }
+
+    // ── v1.10.23: selected-row retention for the bv_rows cull ──────────
+
+    fn text_row(kind: BlockViewRowKind, id: u64, text: &str) -> BlockViewRow {
+        let mut r = row(kind, id, 0.0, 20.0);
+        r.text = text.to_string();
+        r
+    }
+
+    #[test]
+    fn selected_row_identities_covers_the_closed_range() {
+        let rows = [
+            text_row(BlockViewRowKind::Output, 1, "a"),
+            text_row(BlockViewRowKind::Output, 1, "b"),
+            text_row(BlockViewRowKind::Separator, 0, ""),
+            text_row(BlockViewRowKind::Header, 2, "h"),
+        ];
+        let ids = selected_row_identities(&rows, 3, 1); // reversed endpoints ok
+        assert!(ids.contains(&(BlockViewRowKind::Output, Some(BlockId(1)), "b")));
+        assert!(ids.contains(&(BlockViewRowKind::Separator, Some(BlockId(0)), "")));
+        assert!(ids.contains(&(BlockViewRowKind::Header, Some(BlockId(2)), "h")));
+        assert!(!ids.contains(&(BlockViewRowKind::Output, Some(BlockId(1)), "a")));
+        assert_eq!(ids.len(), 3);
+    }
+
+    /// Empty or OOB ranges degrade to an empty set (nothing retained).
+    #[test]
+    fn selected_row_identities_empty_or_out_of_range() {
+        let rows = [text_row(BlockViewRowKind::Output, 3, "x")];
+        assert!(selected_row_identities(&rows, 5, 9).is_empty());
+        assert!(selected_row_identities(&[], 0, 0).is_empty());
+        // Single-point selection keeps just the endpoint row.
+        let ids = selected_row_identities(&rows, 0, 0);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&(BlockViewRowKind::Output, Some(BlockId(3)), "x")));
     }
 }

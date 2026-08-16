@@ -102,6 +102,9 @@ pub struct InFlightBlock<'a> {
     /// `&StyledOutput`) so callers can cheap-clone the Arc instead of deep-
     /// copying the styled lines on the render hot path.
     pub styled_output: Option<&'a Arc<StyledOutput>>,
+    /// v1.10.23: live-output content version (LiveLayoutCache key) — bumped
+    /// on every mutation, so version equality ⇔ byte-identical output.
+    pub version: u64,
 }
 
 /// Shell-phase state machine driven by OSC 133. v0.4 uses it only to
@@ -144,6 +147,9 @@ pub struct BlockTracker {
     current_cwd: Option<String>,
     output: OutputCapture,
     styled_output: Option<Arc<StyledOutput>>,
+    /// v1.10.23: live-output content version, exposed via
+    /// [`in_flight`](Self::in_flight); bumped on every mutation.
+    live_output_version: u64,
     /// Absolute document position where primary-screen output begins.
     screen_document_start: Option<u64>,
     /// Session-local primary-screen blocks eligible for replay continuation.
@@ -188,6 +194,7 @@ impl BlockTracker {
             current_cwd: None,
             output: OutputCapture::default(),
             styled_output: None,
+            live_output_version: 0,
             screen_document_start: None,
             screen_owned_blocks: HashSet::new(),
             continuation_candidate: None,
@@ -223,6 +230,7 @@ impl BlockTracker {
     pub fn begin_screen_owned_output(&mut self, document_start: u64) {
         if self.phase == ShellPhase::CommandExecuting && self.screen_document_start.is_none() {
             self.output.clear();
+            self.live_output_version = self.live_output_version.wrapping_add(1);
             self.screen_document_start = Some(document_start);
             self.activate_screen_continuation();
         }
@@ -301,6 +309,7 @@ impl BlockTracker {
                 .or(self.pending_cwd.as_deref()),
             output: self.output.as_str(),
             styled_output: self.styled_output.as_ref(),
+            version: self.live_output_version,
         })
     }
 
@@ -380,6 +389,7 @@ impl BlockTracker {
         self.output.clear();
         self.styled_output = None;
         self.screen_document_start = None;
+        self.live_output_version = self.live_output_version.wrapping_add(1);
         self.phase = ShellPhase::CommandExecuting;
     }
 
@@ -404,6 +414,7 @@ impl BlockTracker {
     pub fn on_print(&mut self, c: char, style: CapturedStyle) {
         if self.is_capturing() {
             self.output.print(c, style, MAX_OUTPUT_BYTES);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
@@ -419,6 +430,7 @@ impl BlockTracker {
             return;
         }
         self.output.print_ascii(bytes, style, MAX_OUTPUT_BYTES);
+        self.live_output_version = self.live_output_version.wrapping_add(1);
     }
 
     /// Append a newline to the in-flight block's output. No-op unless a command
@@ -426,24 +438,28 @@ impl BlockTracker {
     pub fn on_newline(&mut self) {
         if self.is_capturing() {
             self.output.newline(MAX_OUTPUT_BYTES);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
     pub fn on_carriage_return(&mut self) {
         if self.is_capturing() {
             self.output.carriage_return();
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
     pub fn on_backspace(&mut self) {
         if self.is_capturing() {
             self.output.backspace();
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
     pub fn on_erase_line(&mut self, mode: u16) {
         if self.is_capturing() {
             self.output.erase_line(mode);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
@@ -453,6 +469,7 @@ impl BlockTracker {
     pub fn on_move_cursor_rows(&mut self, delta: isize) {
         if self.is_capturing() {
             self.output.move_cursor_rows(delta);
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 }
@@ -575,6 +592,40 @@ mod tests {
         let mut t = BlockTracker::new();
         let block = run_one(&mut t, "false", "", 1);
         assert_eq!(block.exit_code, Some(1));
+    }
+
+    /// v1.10.23 review-blocker B2: absolute/relative column moves mutate the
+    /// captured bytes (padded spaces / wide-char overwrite) so they must bump
+    /// the live output version — a stale `LiveLayoutCache` would slice the
+    /// wrong byte range (non-char-boundary panic on multibyte output).
+    #[test]
+    fn cursor_column_moves_bump_live_output_version() {
+        let mut t = BlockTracker::new();
+        t.on_prompt_start();
+        t.on_command_start("echo".to_string());
+        t.on_print('你', CapturedStyle::default()); // 1 wide char (3 UTF-8 bytes)
+        let v0 = t.in_flight().unwrap().version;
+        // Column 1 lands inside the wide char → a space is emitted, the byte
+        // contents change.
+        t.on_set_cursor_column(1);
+        assert_eq!(
+            t.in_flight().unwrap().version,
+            v0 + 1,
+            "set_cursor_column mutates output"
+        );
+        t.on_move_cursor_columns(-1);
+        assert_eq!(
+            t.in_flight().unwrap().version,
+            v0 + 2,
+            "move_cursor_columns mutates output"
+        );
+        // Not capturing: no mutation, no bump.
+        t.on_command_end(0);
+        t.on_prompt_start();
+        assert!(t.in_flight().is_none());
+        t.on_set_cursor_column(2);
+        t.on_move_cursor_columns(1);
+        assert!(t.in_flight().is_none(), "no capture at prompt");
     }
 
     #[test]

@@ -209,6 +209,7 @@ impl BlockTracker {
         if self.screen_document_start.is_some() {
             self.output.replace(snapshot, MAX_OUTPUT_BYTES);
             self.styled_output = None;
+            self.live_output_version = self.live_output_version.wrapping_add(1);
         }
     }
 
@@ -219,6 +220,10 @@ impl BlockTracker {
         self.output.replace(text, MAX_OUTPUT_BYTES);
         self.styled_output =
             (self.output.as_str() == text && styled.has_colors()).then(|| Arc::new(styled));
+        // v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): the live block's content
+        // changed — bump the version so the renderer's LiveLayoutCache
+        // rebuilds instead of serving stale cumulative wrap data.
+        self.live_output_version = self.live_output_version.wrapping_add(1);
     }
 
     pub fn defer_screen_command_end(&mut self) {

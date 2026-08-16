@@ -55,6 +55,7 @@ fn scrolling_past_clear_keeps_older_output_visible() {
         LayoutPassInput {
             blocks: &blocks,
             live: None,
+            pane_session_id: 1,
             cwd: None,
             git_branch: None,
             block_scroll: 30.0, // 滚动量 > clear spacer,触发快进
@@ -70,6 +71,7 @@ fn scrolling_past_clear_keeps_older_output_visible() {
             block_diagnose_state: &empty_map,
         },
         &cache,
+        &mut LiveLayoutCache::default(),
     );
 
     // 断言:old_blk 的 Output 行存在(bug 时会被误判不可见而缺失)
@@ -97,6 +99,7 @@ fn completed_layout_cols<'a>(
         LayoutPassInput {
             blocks,
             live: None,
+            pane_session_id: 1,
             cwd: None,
             git_branch: None,
             block_scroll: 0.0,
@@ -112,6 +115,7 @@ fn completed_layout_cols<'a>(
             block_diagnose_state: &empty_map,
         },
         cache,
+        &mut LiveLayoutCache::default(),
     )
 }
 
@@ -218,7 +222,9 @@ fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
                 cwd: None,
                 output,
                 styled_output: None,
+                version: 1,
             }),
+            pane_session_id: 1,
             cwd: None,
             git_branch: None,
             block_scroll: 0.0,
@@ -234,5 +240,79 @@ fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
             block_diagnose_state: &empty_map,
         },
         &BlockLayoutCache::default(),
+        &mut LiveLayoutCache::default(),
     )
+}
+
+/// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): the live branch materializes
+/// only the visible logical-line window (± overscan) instead of all
+/// `MAX_LAYOUT_LINES_LIVE` lines, while the fixed structural rows keep
+/// their full-layout y-positions.
+#[test]
+fn live_output_culls_offscreen_lines_but_keeps_positions() {
+    let output = (0..20)
+        .map(|line| format!("line-{line}\n"))
+        .collect::<String>();
+    let mk = |scroll: f32| {
+        let live = InFlightBlock {
+            command: "long-running-command",
+            cwd: Some("/tmp"),
+            output: &output,
+            styled_output: None,
+            version: 1,
+        };
+        compute_block_layout_pass(
+            LayoutPassInput {
+                blocks: &[],
+                live: Some(live),
+                pane_session_id: 1,
+                cwd: None,
+                git_branch: None,
+                block_scroll: scroll,
+                viewport_rows: 6,
+                cols: 80,
+                pitch: 20.0,
+                header_height: 24.0,
+                content_bottom_y: 120.0,
+                clip_top: 0.0,
+                clip_bottom: 120.0,
+                resolve_styles: false,
+                styled_lookup_counter: None,
+                block_diagnose_state: &std::collections::HashMap::new(),
+            },
+            &BlockLayoutCache::default(),
+            &mut LiveLayoutCache::default(),
+        )
+    };
+
+    // Following at the bottom: visible band [-64, 184]px → lines 6..19
+    // (14 output rows, overscan = ceil(64/20)+1 = 5) + Blank +
+    // LiveCommand + LiveHeader + Separator = 18 rows.
+    let out = mk(0.0);
+    assert_eq!(out.row_data.len(), 18, "culled live rows + 4 structural");
+    assert!(matches!(&out.row_data[0], LaidRow::Output { text, .. } if *text == "line-19"));
+    assert!(matches!(out.row_data[14], LaidRow::Blank));
+    assert!(matches!(out.row_data[17], LaidRow::Separator));
+    // Blank row keeps its FULL-layout position: total(400px) + pitch.
+    assert_eq!(out.rows[14], 420.0);
+    // Culled lines 0..5 are absent; emitted line indices carry base_idx.
+    assert!(!out
+        .row_data
+        .iter()
+        .any(|r| matches!(r, LaidRow::Output { line, .. } if *line < 6)));
+
+    // Scrolled 5 rows up: band [36, 284]px → lines 1..19 (19 rows).
+    let out = mk(5.0);
+    assert_eq!(out.row_data.len(), 23, "culled live rows + 4 structural");
+    let oldest = out
+        .row_data
+        .iter()
+        .position(|r| matches!(r, LaidRow::Output { text, .. } if *text == "line-1"))
+        .expect("oldest culled-in line");
+    // Its top keeps the FULL-layout position: dist = (20-1)*20 = 380.
+    assert_eq!(out.rows[oldest], 380.0);
+    assert!(!out
+        .row_data
+        .iter()
+        .any(|r| matches!(r, LaidRow::Output { line, .. } if *line < 1)));
 }

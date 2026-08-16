@@ -204,23 +204,65 @@ impl MetalRenderer {
     pub fn block_scroll_metrics(
         &self,
         terminal: &weft_core::vt::Terminal,
+        pane_session_id: u64,
     ) -> (usize, usize, usize) {
         let cols = terminal.grid().num_cols;
-        let cache = self.block_layout_cache.borrow();
-        let (total, _) = crate::block_component::block_content_metrics_with_cache(
-            terminal,
-            cols,
-            self.block_header_rows(),
-            Some(&*cache),
-        );
+        let header_rows = self.block_header_rows();
         let prompt_lines = crate::block_component::block_prompt_lines(terminal);
         let cwd_header = crate::layout::block_cwd_header_active(
             terminal.effective_input_mode() == weft_core::input::InputMode::Editor,
             terminal.cwd().is_some(),
         );
         let visible = self.block_visible_rows(prompt_lines, cwd_header);
+        let blocks = terminal.block_tracker().session_blocks();
+        // v1.10.23 change 2: exact memo — the key covers every input, so the
+        // wheel handler and the same-frame redraw scrollbar share one
+        // computation instead of two O(n_blocks) scans per scroll tick.
+        // `pane_session_id` scopes the key (the memo is renderer-global and
+        // per-Tab version counters start at 0); `cwd_present` mirrors the
+        // `+usize::from(live.cwd.or(terminal.cwd()).is_some())` term of
+        // `block_content_metrics_with_cache` so an OSC 7 cwd change
+        // mid-command invalidates the memo.
+        let in_flight = terminal.block_tracker().in_flight();
+        let (live_version, cwd_present) = match &in_flight {
+            Some(live) => (Some(live.version), live.cwd.or(terminal.cwd()).is_some()),
+            None => (None, false),
+        };
+        let key = crate::paint::live_cache::BlockScrollMetricsKey {
+            pane_session_id,
+            cols: cols as u32,
+            num_rows: terminal.grid().num_rows as u32,
+            live_version,
+            blocks_len: blocks.len() as u32,
+            first_block_id: blocks.first().map(|b| b.id.0),
+            last_block_id: blocks.last().map(|b| b.id.0),
+            cache_rebuilds: self.block_layout_cache.borrow().total_misses(),
+            header_rows: header_rows as u32,
+            visible: visible as u32,
+            cwd_present,
+        };
+        if let Some((cached_key, cached)) = self.scroll_metrics_memo.get() {
+            if cached_key == key {
+                return cached;
+            }
+        }
+        let cache = self.block_layout_cache.borrow();
+        let mut live_cache = self.live_layout_cache.borrow_mut();
+        if in_flight.is_some() {
+            let live = terminal.block_tracker().in_flight().expect("just checked");
+            live_cache.sync(live.output, pane_session_id, live.version, cols);
+        }
+        let (total, _) = crate::block_component::block_content_metrics_with_cache(
+            terminal,
+            cols,
+            header_rows,
+            Some(&*cache),
+            Some(&live_cache),
+        );
         let max_scroll = total.saturating_sub(visible);
-        (total, visible, max_scroll)
+        let result = (total, visible, max_scroll);
+        self.scroll_metrics_memo.set(Some((key, result)));
+        result
     }
 
     /// Rebuild the glyph atlas from a (possibly changed) font config — used on

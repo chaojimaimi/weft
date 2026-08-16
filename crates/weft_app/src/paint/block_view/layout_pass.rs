@@ -8,9 +8,8 @@ use crate::block_component::{
     block_presentation, clear_block_spacer_rows, command_output_gap_rows, command_resume_hints,
     BlockTone,
 };
-use crate::paint::grid_cache::{
-    block_line_chunks, command_line_chunks, BlockLayoutCache, MAX_LAYOUT_LINES_LIVE,
-};
+use crate::paint::grid_cache::{block_line_chunks, command_line_chunks, BlockLayoutCache};
+use crate::paint::live_cache::LiveLayoutCache;
 use crate::paint::ui_helpers::strip_prompt_prefix;
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
 
@@ -81,6 +80,10 @@ pub(super) struct LayoutPassOutput<'a> {
 pub(super) struct LayoutPassInput<'a, 'b> {
     pub(super) blocks: &'a [Block],
     pub(super) live: Option<InFlightBlock<'a>>,
+    /// Pane session scope for the live-layout cache key (the cache is
+    /// renderer-global; per-Tab version counters start at 0, so session id
+    /// must join the key or identical version+cols would cross-hit).
+    pub(super) pane_session_id: u64,
     pub(super) cwd: Option<&'a str>,
     pub(super) git_branch: Option<&'a str>,
     pub(super) block_scroll: f32,
@@ -106,13 +109,17 @@ pub(super) struct LayoutPassInput<'a, 'b> {
 /// hit-testing both call this). Caller must `ensure_cached` every block.
 /// Output borrows from `blocks`/`live`, not `cache` — visible rows only are
 /// materialized into `Rc<[String]>`, keeping offscreen history un-duplicated.
+/// v1.10.23: `live_cache` (synced internally) locates the visible live-line
+/// window via cumulative prefix sums — no per-frame full-document scan.
 pub(super) fn compute_block_layout_pass<'a, 'b>(
     input: LayoutPassInput<'a, 'b>,
     cache: &BlockLayoutCache,
+    live_cache: &mut LiveLayoutCache,
 ) -> LayoutPassOutput<'a> {
     let LayoutPassInput {
         blocks,
         live,
+        pane_session_id,
         cwd,
         git_branch,
         block_scroll,
@@ -138,14 +145,25 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         }
     };
 
-    // Live in-flight block (rendered above finished blocks).
+    // Live in-flight block (rendered above finished blocks). v1.10.23: the
+    // LiveLayoutCache's cumulative prefix sums locate the visible logical-line
+    // window in O(log n); only visible ± overscan lines are sliced out.
+    let scroll_px = block_scroll * pitch;
+    let overscan = header_height + pitch * 2.0;
     if let Some(live) = live {
-        let all_lines: Vec<&str> = live.output.lines().collect();
-        let skip = all_lines.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
-        let live_lines: Vec<&str> = all_lines[skip..].to_vec();
-        let base_idx = skip;
-        for (i, line) in live_lines.iter().enumerate().rev() {
-            let line_idx = base_idx + i;
+        live_cache.sync(live.output, pane_session_id, live.version, cols);
+        // threshold_low/high = viewport bottom/top edges (bottom-space).
+        let (start_idx, end_idx, start_dist) = live_cache.visible_range(
+            pitch,
+            content_bottom_y + scroll_px - clip_bottom - overscan,
+            content_bottom_y + scroll_px - clip_top + overscan,
+            overscan,
+        );
+        cursor_dist = start_dist;
+        for i in (start_idx..end_idx).rev() {
+            let (byte_start, byte_end) = live_cache.line_range(i);
+            let line = &live.output[byte_start..byte_end];
+            let line_idx = live_cache.base_idx() + i;
             let chunks: Rc<[String]> = Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
             let vis_rows = chunks.len();
             cursor_dist += vis_rows as f32 * pitch;
@@ -165,8 +183,9 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
                 },
             });
         }
-        if !live_lines.is_empty() {
-            cursor_dist += pitch;
+        if live_cache.total_lines() > 0 {
+            // Blank sits above the output at the FULL layout height.
+            cursor_dist = (live_cache.total_display_rows() + 1) as f32 * pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::Blank);
         }
@@ -195,8 +214,6 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
 
     // Finished blocks: binary-search the prefix sum for the visible range
     // (O(log n + k*m)) instead of O(n) traversal, +1 overscan per side.
-    let scroll_px = block_scroll * pitch;
-    let overscan = header_height + pitch * 2.0;
     let live_cursor_dist = cursor_dist;
 
     let prefix_sum = cache.prefix_sum();
@@ -488,6 +505,7 @@ mod tests {
         let input = LayoutPassInput {
             blocks: &[],
             live: None,
+            pane_session_id: 1,
             cwd: None,
             git_branch: None,
             block_scroll: 0.0,
@@ -503,7 +521,8 @@ mod tests {
             block_diagnose_state: &std::collections::HashMap::new(),
         };
         let cache = BlockLayoutCache::default();
-        let out = compute_block_layout_pass(input, &cache);
+        let mut live_cache = LiveLayoutCache::default();
+        let out = compute_block_layout_pass(input, &cache, &mut live_cache);
         assert!(out.rows.is_empty());
         assert!(out.row_data.is_empty());
         assert_eq!(out.expanded_block_count, 0);
@@ -521,7 +540,9 @@ mod tests {
                 cwd: Some("/tmp"),
                 output: &output,
                 styled_output: None,
+                version: 1,
             }),
+            pane_session_id: 1,
             cwd: None,
             git_branch: None,
             block_scroll: 0.0,
@@ -536,7 +557,11 @@ mod tests {
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
         };
-        let out = compute_block_layout_pass(input, &BlockLayoutCache::default());
+        let out = compute_block_layout_pass(
+            input,
+            &BlockLayoutCache::default(),
+            &mut LiveLayoutCache::default(),
+        );
         let newest = out
             .row_data
             .iter()
@@ -743,6 +768,7 @@ mod tests {
                     let input = LayoutPassInput {
                         blocks: &blocks,
                         live: None,
+                        pane_session_id: 1,
                         cwd: None,
                         git_branch: None,
                         block_scroll: 0.0,
@@ -757,7 +783,8 @@ mod tests {
                         styled_lookup_counter: None,
                         block_diagnose_state: &std::collections::HashMap::new(),
                     };
-                    let out = compute_block_layout_pass(input, &cache);
+                    let out =
+                        compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
                     black_box(out.expanded_block_count);
                 });
             });
@@ -769,6 +796,7 @@ mod tests {
                     let input = LayoutPassInput {
                         blocks: &blocks,
                         live: None,
+                        pane_session_id: 1,
                         cwd: None,
                         git_branch: None,
                         block_scroll: 0.0,
@@ -783,7 +811,8 @@ mod tests {
                         styled_lookup_counter: None,
                         block_diagnose_state: &std::collections::HashMap::new(),
                     };
-                    let out = compute_block_layout_pass(input, &cache);
+                    let out =
+                        compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
                     black_box(out.expanded_block_count);
                 });
             });

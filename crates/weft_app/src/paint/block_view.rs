@@ -53,7 +53,7 @@ impl MetalRenderer {
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
-        let mut bv_rows: Vec<weft_core::selection::BlockViewRow> = Vec::new();
+        let bv_rows: Vec<weft_core::selection::BlockViewRow> = Vec::new();
         let cw = self.cell_width() as f32;
         let ch = self.cell_height() as f32;
         let vp_w = self.viewport.0;
@@ -144,6 +144,7 @@ impl MetalRenderer {
                 LayoutPassInput {
                     blocks,
                     live,
+                    pane_session_id: cache_namespace,
                     cwd,
                     git_branch,
                     block_scroll,
@@ -159,6 +160,7 @@ impl MetalRenderer {
                     block_diagnose_state,
                 },
                 &cache,
+                &mut self.live_layout_cache.borrow_mut(),
             )
         };
         let LayoutPassOutput {
@@ -179,155 +181,27 @@ impl MetalRenderer {
         // heavily tinted canvases and may land slightly under 3:1 there
         // (accepted boundary, still far above the pre-fix 1.27-1.75).
         let selection_bg = crate::paint::selection_color::selection_colors(&self.theme).quad;
-        for (i, &dist) in rows.iter().enumerate() {
-            let row_top_y = content_bottom_y - dist + scroll_px;
-            let y = row_top_y;
-            match &row_data[i] {
-                LaidRow::Output {
-                    text,
-                    chunks,
-                    block_id,
-                    line,
-                    style: _,
-                } => {
-                    let line_idx = (*line != usize::MAX).then_some(*line);
-                    if chunks.len() <= 1 {
-                        bv_rows.push(weft_core::selection::BlockViewRow {
-                            kind: weft_core::selection::BlockViewRowKind::Output,
-                            text: text.to_string(),
-                            block_id: *block_id,
-                            y_top: y,
-                            y_bottom: y + pitch,
-                            line: line_idx,
-                            chunk_char_offset: 0,
-                            indent_cols: 0,
-                        });
-                    } else {
-                        for (ci, cy, char_offset) in rows::wrapped_row_positions(y, pitch, chunks) {
-                            let chunk = &chunks[ci];
-                            bv_rows.push(weft_core::selection::BlockViewRow {
-                                kind: weft_core::selection::BlockViewRowKind::Output,
-                                text: chunk.clone(),
-                                block_id: *block_id,
-                                y_top: cy,
-                                y_bottom: cy + pitch,
-                                line: line_idx,
-                                chunk_char_offset: char_offset,
-                                indent_cols: 0,
-                            });
-                        }
-                    }
-                }
-                LaidRow::Command {
-                    chunks,
-                    foldable,
-                    block_id,
-                    ..
-                } => {
-                    for (ci, cy, char_offset) in rows::wrapped_row_positions(y, pitch, chunks) {
-                        let chunk = &chunks[ci];
-                        bv_rows.push(weft_core::selection::BlockViewRow {
-                            kind: weft_core::selection::BlockViewRowKind::Command,
-                            text: chunk.clone(),
-                            block_id: Some(*block_id),
-                            y_top: cy,
-                            y_bottom: cy + pitch,
-                            line: None,
-                            // v1.10.13: first line renders after chevron + "> "
-                            // (3 cols if foldable else 2); continuations flush-left.
-                            indent_cols: if ci == 0 {
-                                if *foldable {
-                                    3
-                                } else {
-                                    2
-                                }
-                            } else {
-                                0
-                            },
-                            chunk_char_offset: char_offset,
-                        });
-                    }
-                }
-                LaidRow::Header {
-                    cwd,
-                    duration,
-                    status,
-                    block_id,
-                    ..
-                } => {
-                    let mut parts = vec![cwd.as_str()];
-                    if !duration.is_empty() {
-                        parts.push(duration.as_str());
-                    }
-                    if !status.is_empty() {
-                        parts.push(status.as_str());
-                    }
-                    let text = parts.join(" · ");
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Header,
-                        text,
-                        block_id: Some(*block_id),
-                        y_top: y,
-                        y_bottom: y + header_height,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::LiveHeader { text } => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Header,
-                        text: text.clone(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::Separator => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::Separator,
-                        text: String::new(),
-                        block_id: None,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::LiveCommand { chunks, .. } => {
-                    for (ci, cy, char_offset) in rows::wrapped_row_positions(y, pitch, chunks) {
-                        let chunk = &chunks[ci];
-                        bv_rows.push(weft_core::selection::BlockViewRow {
-                            kind: weft_core::selection::BlockViewRowKind::LiveCommand,
-                            text: chunk.clone(),
-                            block_id: None,
-                            y_top: cy,
-                            y_bottom: cy + pitch,
-                            line: None,
-                            indent_cols: if ci == 0 { 2 } else { 0 },
-                            chunk_char_offset: char_offset,
-                        });
-                    }
-                }
-                LaidRow::DiagnosePanel { text, block_id, .. } => {
-                    bv_rows.push(weft_core::selection::BlockViewRow {
-                        kind: weft_core::selection::BlockViewRowKind::DiagnosePanel,
-                        text: text.clone(),
-                        block_id: Some(*block_id),
-                        y_top: y,
-                        y_bottom: y + pitch,
-                        line: None,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                }
-                LaidRow::Blank => {}
-            }
-        }
+        // v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): bv_rows only materializes
+        // rows intersecting the clip window (plus Command rows for sticky
+        // detection and the active selection's rows, so `sync_rows` remaps
+        // endpoints exactly — see rows::build_bv_rows).
+        let selection_keep = selection.block_view_selection.as_ref().map(|sel| {
+            rows::selected_row_identities(&sel.rows, sel.start.row_index, sel.end.row_index)
+        });
+        let bv_rows = rows::build_bv_rows(
+            &rows,
+            &row_data,
+            rows::BvRowsGeometry {
+                pitch,
+                header_height,
+                content_bottom_y,
+                scroll_px,
+                clip_top,
+                clip_bottom,
+                cull: true,
+                selection_keep: selection_keep.as_deref(),
+            },
+        );
         if let Some(sel) = selection.block_view_selection.as_mut() {
             sel.sync_rows(bv_rows.clone());
         }

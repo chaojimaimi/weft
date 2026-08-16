@@ -106,6 +106,10 @@ pub(crate) struct BlockLayoutCache {
     /// reports per-frame deltas, not cumulative totals.
     hits: usize,
     misses: usize,
+    /// v1.10.23: monotonic rebuild count (misses since creation) — the
+    /// fingerprint for the `block_scroll_metrics` memo: finished-blocks
+    /// metrics change iff some cache entry is rebuilt.
+    misses_total: u64,
     /// R2-2 (Batch 7): prefix sum of `base_row_count`, indexed from the
     /// newest block. `prefix_sum[0] = 0`, `prefix_sum[i]` = sum of
     /// `base_row_count` for the i newest blocks. Enables O(log n) binary
@@ -179,6 +183,10 @@ impl BlockLayoutCache {
             self.dirty_ids.push(id);
         }
         self.prefix_sum_dirty = true;
+        // v1.10.23: invalidate changes what the metrics fallback computes
+        // (get_if_cached → None → direct), so it must bump the memo
+        // fingerprint even before the entry is rebuilt.
+        self.misses_total = self.misses_total.wrapping_add(1);
     }
 
     /// Ensure `block` has a cached layout for `cols`. Recomputes only if
@@ -198,11 +206,20 @@ impl BlockLayoutCache {
         };
         if needs_rebuild {
             self.misses += 1;
+            self.misses_total = self.misses_total.wrapping_add(1);
             self.prefix_sum_dirty = true;
             self.entries.insert(id, compute_block_layout(block, cols));
         } else {
             self.hits += 1;
         }
+    }
+
+    /// v1.10.23: monotonic rebuild count. `block_scroll_metrics` memoizes
+    /// on this — the finished-blocks metrics only change when an entry is
+    /// rebuilt (base_row_count/output_rows/command_wrap_rows/is_clear), so a
+    /// fingerprint of (rebuilds + block set) is exact.
+    pub(crate) fn total_misses(&self) -> u64 {
+        self.misses_total
     }
 
     pub(crate) fn get(&self, id: u64) -> &CachedBlockLayout {
@@ -666,6 +683,7 @@ mod tests {
             cols,
             1,
             Some(&cache),
+            None,
         );
         assert_eq!(cached, direct);
     }

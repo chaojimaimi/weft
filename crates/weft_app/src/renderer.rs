@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 
 use crate::glyph::GlyphAtlas;
 use crate::paint::grid_cache::BlockLayoutCache;
+use crate::paint::live_cache::{BlockScrollMetricsMemo, LiveLayoutCache};
 use crate::paint::overlays::FindDrawState;
 use crate::paint::primitives::{color_to_normalized, push_quad};
 use crate::paint::tab_bar::TabBarDrawState;
@@ -121,6 +122,12 @@ pub struct MetalRenderer {
     /// `self.layer` (from `next_drawable`) across the entire frame, so
     /// `&mut self` is unavailable for cache mutation.
     pub(crate) block_layout_cache: RefCell<BlockLayoutCache>,
+    /// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): live-block cumulative layout
+    /// cache (visible-window O(log n), see paint::live_cache).
+    pub(crate) live_layout_cache: RefCell<LiveLayoutCache>,
+    /// v1.10.23 change 2: exact `block_scroll_metrics` memo — the fingerprint
+    /// covers every input, so wheel + same-frame scrollbar share one scan.
+    pub(crate) scroll_metrics_memo: Cell<BlockScrollMetricsMemo>,
     /// Step 3: cached scroll metrics (total, visible, max_scroll) from the
     /// last draw() call. Read by `active_scrollbar_layout` in mouse handlers
     /// to avoid re-running `block_content_metrics_with_cache` (O(n)) on every

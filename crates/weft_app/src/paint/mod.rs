@@ -17,6 +17,7 @@ mod grid_bench;
 pub(crate) mod grid_cache;
 pub(crate) mod grid_instances;
 pub(crate) mod key_hints;
+pub(crate) mod live_cache;
 pub(crate) mod metal_backend;
 #[cfg(test)]
 mod offscreen_snapshots;

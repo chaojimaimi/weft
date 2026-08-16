@@ -282,16 +282,18 @@ pub(crate) fn block_content_metrics(
     cols: usize,
     header_rows: usize,
 ) -> (usize, usize) {
-    block_content_metrics_with_cache(terminal, cols, header_rows, None)
+    block_content_metrics_with_cache(terminal, cols, header_rows, None, None)
 }
 
 /// R2-2: 缓存变体。缓存命中时 O(1) 读 `output_rows`,否则回退直接计算
 /// (如最后一帧后才 finalized 的块,或无渲染器访问权的调用方)。
+/// v1.10.23: `live_cache`(调用方已 sync)让 live 分支 O(1) 读累计行数;`None` 回退旧路径。
 pub(crate) fn block_content_metrics_with_cache(
     terminal: &Terminal,
     cols: usize,
     header_rows: usize,
     cache: Option<&crate::paint::grid_cache::BlockLayoutCache>,
+    live_cache: Option<&crate::paint::live_cache::LiveLayoutCache>,
 ) -> (usize, usize) {
     use weft_core::blocks::ShellPhase;
 
@@ -328,14 +330,18 @@ pub(crate) fn block_content_metrics_with_cache(
     }
     if terminal.block_tracker().phase() == ShellPhase::CommandExecuting {
         if let Some(live) = terminal.block_tracker().in_flight() {
-            let lines: Vec<&str> = live.output.lines().collect();
-            let start = lines
-                .len()
-                .saturating_sub(crate::paint::grid_cache::MAX_LAYOUT_LINES_LIVE);
-            let output_rows = lines[start..]
-                .iter()
-                .map(|line| block_line_chunks(line, cols).count())
-                .sum::<usize>();
+            let output_rows = live_cache
+                .map(|c| c.total_display_rows())
+                .unwrap_or_else(|| {
+                    let lines: Vec<&str> = live.output.lines().collect();
+                    let start = lines
+                        .len()
+                        .saturating_sub(crate::paint::grid_cache::MAX_LAYOUT_LINES_LIVE);
+                    lines[start..]
+                        .iter()
+                        .map(|line| block_line_chunks(line, cols).count())
+                        .sum::<usize>()
+                });
             total += output_rows + command_output_gap_rows(output_rows);
             total += 2; // command + separator
             total += usize::from(live.cwd.or(terminal.cwd()).is_some());
@@ -880,7 +886,8 @@ mod tests {
         for blk in cache.session_blocks() {
             blk_cache.ensure_cached(blk, 80);
         }
-        let (total_some, _) = block_content_metrics_with_cache(&terminal, 80, 1, Some(&blk_cache));
+        let (total_some, _) =
+            block_content_metrics_with_cache(&terminal, 80, 1, Some(&blk_cache), None);
         assert_eq!(
             total_none, total_some,
             "cached and uncached totals must match"

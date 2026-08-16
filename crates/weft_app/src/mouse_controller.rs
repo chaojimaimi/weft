@@ -625,21 +625,14 @@ impl App {
         x: f64,
         y: f64,
     ) {
-        // v0.9 fix: drain pending PTY messages BEFORE checking alt-screen
-        // state. When `less` (or any alt-screen app) starts, the enter
-        // sequence (`\x1b[?1049h`) is still in the channel until the next
-        // `process_messages` call. Without this drain, the first wheel
-        // events see `alt_active = false` and fall through to the
-        // viewport-scroll branch (which does nothing on alt screen). After
-        // a keyboard event triggers a redraw → process_messages → alt_active
-        // becomes true, the wheel starts working — which matches the user
-        // report "scrolling works only after pressing a key".
-        //
-        // Drain anything already available. If the alt-screen sequence has
-        // not arrived yet, the transition route below queues this gesture and
-        // replays it from `process_messages` once parsing reaches alt screen.
-        self.pump_pty();
-        self.process_messages();
+        // v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): the per-event
+        // `pump_pty + process_messages` (v0.9 alt-screen-entry fix) was
+        // removed — the redraw path (`handle_redraw_requested`) pumps the
+        // PTY on every frame, so a wheel event sees terminal state at most
+        // one frame stale (a single event during the CSI ?1049h transition
+        // can still be misrouted, then self-corrects next frame). The tab /
+        // panel / block-view branches below don't depend on freshly parsed
+        // PTY state; no branch was found that requires the in-place drain.
 
         // v1.2: If the scroll event is over the tab bar, adjust the tab bar
         // horizontal scroll offset instead of scrolling the terminal. This
@@ -761,7 +754,9 @@ impl App {
                     .as_ref()
                     .and_then(|renderer| {
                         let terminal = self.sessions.active().terminal.as_ref()?;
-                        let (_total, _visible, max) = renderer.block_scroll_metrics(terminal);
+                        let pane_session_id = self.sessions.active().pane_session_id;
+                        let (_total, _visible, max) =
+                            renderer.block_scroll_metrics(terminal, pane_session_id);
                         Some(max)
                     })
                     .unwrap_or(0);
@@ -974,7 +969,9 @@ impl App {
                 .as_ref()
                 .and_then(|renderer| {
                     let terminal = self.sessions.active().terminal.as_ref()?;
-                    let (_total, _visible, max) = renderer.block_scroll_metrics(terminal);
+                    let pane_session_id = self.sessions.active().pane_session_id;
+                    let (_total, _visible, max) =
+                        renderer.block_scroll_metrics(terminal, pane_session_id);
                     Some(max)
                 })
                 .unwrap_or(0);
@@ -1148,7 +1145,8 @@ impl App {
             .as_ref()
             .and_then(|renderer| {
                 let terminal = self.sessions.active().terminal.as_ref()?;
-                Some(renderer.block_scroll_metrics(terminal).2)
+                let pane_session_id = self.sessions.active().pane_session_id;
+                Some(renderer.block_scroll_metrics(terminal, pane_session_id).2)
             })
             .unwrap_or(0);
         // At the history top/bottom the saturating scroll has no net effect;

@@ -548,7 +548,7 @@ impl App {
             // layout-cache path the wheel handler uses) instead of a second
             // inline copy of the formula.
             let scroll_metrics = if terminal.show_block_view() {
-                Some(renderer.block_scroll_metrics(terminal))
+                Some(renderer.block_scroll_metrics(terminal, pane.pane_session_id))
             } else {
                 None
             };

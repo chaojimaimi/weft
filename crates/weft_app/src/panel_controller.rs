@@ -313,8 +313,13 @@ impl App {
                 .renderer
                 .as_ref()
                 .map(|r| r.block_layout_cache.borrow());
-            let (total, _) =
-                block_content_metrics_with_cache(terminal, cols, header_rows, cache.as_deref());
+            let (total, _) = block_content_metrics_with_cache(
+                terminal,
+                cols,
+                header_rows,
+                cache.as_deref(),
+                None,
+            );
             // Compute visible rows from the renderer's actual geometry.
             let prompt_lines = crate::block_component::block_prompt_lines(terminal);
             let visible = self

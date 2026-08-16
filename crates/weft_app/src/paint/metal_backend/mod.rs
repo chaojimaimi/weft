@@ -263,6 +263,8 @@ impl MetalRenderer {
             config_status_hint: None,
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
+            live_layout_cache: RefCell::new(crate::paint::live_cache::LiveLayoutCache::default()),
+            scroll_metrics_memo: Cell::new(None),
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),
             styled_lookup_counter: Cell::new(0),

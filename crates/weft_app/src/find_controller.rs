@@ -413,6 +413,7 @@ impl App {
                 cols,
                 renderer.block_header_rows(),
                 Some(&*cache),
+                None,
             );
             let max_scroll = total.saturating_sub(visible);
             let Some(target) = block_find_scroll_target(
