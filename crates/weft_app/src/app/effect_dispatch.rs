@@ -206,10 +206,11 @@ impl crate::App {
 
     /// Copy selection to system clipboard.
     ///
-    /// Dispatches on the active view: block view copies from the captured
-    /// `BlockViewSelection` row snapshot (what the user actually sees), grid
-    /// view copies from the terminal Grid. This split fixes the "复制错位"
-    /// bug where a grid-coordinate copy landed on the wrong line because the
+    /// Dispatches on the active view: block view copies from the
+    /// content-anchored `BlockViewSelection` read through the CURRENT
+    /// document source (what the user sees — no stale snapshot), grid view
+    /// copies from the terminal Grid. This split fixes the "复制错位" bug
+    /// where a grid-coordinate copy landed on the wrong line because the
     /// block view's pitch/scroll/layout don't map 1:1 to grid rows.
     pub(crate) fn copy_selection(&mut self) {
         let text = {
@@ -225,7 +226,11 @@ impl crate::App {
                 .filter(|text| !text.is_empty())
                 .or_else(|| {
                     if terminal.show_block_view() {
-                        tab.selection_handler.block_view_text()
+                        let source = crate::selection::SelectionDocSource::new(
+                            terminal.block_tracker().session_blocks(),
+                            terminal.block_tracker().in_flight().map(|live| live.output),
+                        );
+                        tab.selection_handler.block_view_text(&source)
                     } else {
                         tab.selection_handler.selected_text(terminal.grid())
                     }

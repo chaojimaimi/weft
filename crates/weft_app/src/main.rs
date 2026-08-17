@@ -112,7 +112,7 @@ use weft_core::complete::CompletePosition;
 use weft_core::config::{Action, Config};
 use weft_core::input::{KeyCode, Modifiers, MouseAction, MouseButton, MouseProtocol};
 use weft_core::persistence::BlockStore;
-use weft_core::selection::{BlockViewPos, BlockViewRowKind, GridPos, SelectionMode};
+use weft_core::selection::{BlockSelAnchor, BlockViewRowKind, GridPos, SelectionMode};
 use weft_core::vt::Terminal;
 
 use tracing::{info, warn};

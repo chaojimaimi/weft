@@ -638,6 +638,7 @@ impl MetalRenderer {
                 self.build_block_view_vertices(
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
+                        live_head_lines: terminal.screen_head_lines(),
                         region_bottom_y: box_top_y,
                         cwd: p.cwd,
                         git_branch: terminal.git_branch(),
@@ -671,6 +672,7 @@ impl MetalRenderer {
                 self.build_block_view_vertices(
                     crate::paint::block_view_model::BlockViewPaintModel {
                         blocks: terminal.block_tracker().session_blocks(),
+                        live_head_lines: terminal.screen_head_lines(),
                         // v1.3 multi-pane: region_bottom_y must be pane-local
                         // (clip's bottom edge), not the full vp_h - pad_y.
                         region_bottom_y: self

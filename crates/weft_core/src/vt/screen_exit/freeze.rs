@@ -133,6 +133,18 @@ impl Terminal {
         self.block_tracker.screen_prefix_line_count()
     }
 
+    /// v1.10.26 (rust-reviewer S1): total lines prepended to the live composed
+    /// document's head (preserved-frame history + scroll-out prefix). Live
+    /// content anchors are indices INTO the composed document, so a head grow
+    /// (`append_screen_history_frame` — a superseded frame preserved while a
+    /// live-segment selection is active) silently shifts every live anchor.
+    /// The app includes this in the block-selection fingerprint so a head
+    /// change clears the selection (same semantic as a structural block
+    /// change; a tail append stays index-stable and never clears).
+    pub fn screen_head_lines(&self) -> usize {
+        self.screen_history_lines() + self.screen_prefix_lines()
+    }
+
     /// v1.10.23 (FIX_OMP_CONTENT_LOSS): prepend the accumulated superseded
     /// frames to a fresh document snapshot. The history is the stable
     /// transcript head; the snapshot is the live tail. Zero-cost (text passed

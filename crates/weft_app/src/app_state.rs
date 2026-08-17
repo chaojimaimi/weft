@@ -455,6 +455,11 @@ pub struct InteractionState {
     /// 40ms autoscroll timer reads it to keep scrolling when the pointer is
     /// held still past the content edge. Cleared on left-button release.
     pub selection_drag_pos: Option<(f64, f64)>,
+    /// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): fractional rows accumulated
+    /// past integer rows during autoscroll ticks (the Warp ramp returns f32;
+    /// the scroll API takes whole rows). Reset when the pointer leaves the
+    /// edge band.
+    pub selection_autoscroll_carry: f32,
     /// F4: FocusId of the element that had keyboard focus before a modal
     /// surface (Palette/Find/Settings/ContextMenu) opened. Used to restore
     /// focus (visually / for accessibility) when the modal closes. `None`
@@ -494,6 +499,7 @@ impl InteractionState {
             pane_divider_drag: None,
             tab_drag: None,
             selection_drag_pos: None,
+            selection_autoscroll_carry: 0.0,
             prev_focus: None,
             focus_stack: Vec::new(),
         }

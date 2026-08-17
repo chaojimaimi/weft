@@ -1,9 +1,10 @@
 //! Mouse selection model.
 
 use crate::grid::{CellFlags, Grid};
+use std::cmp::Ordering;
 
-mod block_view;
-mod sync;
+#[cfg(test)]
+mod anchor_tests;
 
 /// A point in the grid (row, col), 0-based.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +182,13 @@ pub struct SelectionHandler {
     pub mode: SelectionMode,
     /// Block-view selection (Warp-style view); separate from `selection`.
     pub block_view_selection: Option<BlockViewSelection>,
+    /// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): opaque structural
+    /// fingerprint of the document the block selection was made against (the
+    /// app stores the finished-block id order). When the next frame's
+    /// fingerprint differs, the document structure changed (split / block
+    /// finish / deletion) and the anchors are stale — the app clears the
+    /// selection.
+    pub block_doc_fingerprint: Option<Vec<u64>>,
 }
 
 impl SelectionHandler {
@@ -190,6 +198,7 @@ impl SelectionHandler {
             selecting: false,
             mode: SelectionMode::Simple,
             block_view_selection: None,
+            block_doc_fingerprint: None,
         }
     }
 
@@ -217,6 +226,7 @@ impl SelectionHandler {
         self.selection = None;
         self.selecting = false;
         self.block_view_selection = None;
+        self.block_doc_fingerprint = None;
     }
 
     /// v1.10.20: drop only the grid selection. `clear()` also drops the
@@ -234,29 +244,29 @@ impl SelectionHandler {
 
     // ── Block-view selection helpers ──────────────────────────────────
 
-    /// Start a block-view selection at `pos`, capturing the current row
-    /// snapshot (owned by the renderer) so subsequent text extraction is
-    /// consistent with what the user saw at drag start.
-    pub fn start_block_view(&mut self, pos: BlockViewPos, rows: Vec<BlockViewRow>) {
-        self.block_view_selection = Some(BlockViewSelection {
-            start: pos,
-            end: pos,
-            rows,
-            frame_delta: 0.0,
-        });
+    /// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): start a content-anchored
+    /// block-view selection at `anchor`. The anchor lives in the unified
+    /// logical document (block output lines / live composed document), so no
+    /// renderer row snapshot is captured — text extraction and per-frame
+    /// highlight derive from the current content source instead.
+    pub fn start_block_view(&mut self, anchor: BlockSelAnchor) {
+        self.block_view_selection = Some(BlockViewSelection::new(anchor, anchor));
         self.selecting = true;
     }
 
     /// Extend the active block-view selection endpoint (during drag).
-    pub fn extend_block_view(&mut self, pos: BlockViewPos) {
+    pub fn extend_block_view(&mut self, anchor: BlockSelAnchor) {
         if let Some(sel) = &mut self.block_view_selection {
-            sel.end = pos;
+            sel.tail = anchor;
         }
     }
 
-    /// Text from the active block-view selection, if any.
-    pub fn block_view_text(&self) -> Option<String> {
-        self.block_view_selection.as_ref().map(|sel| sel.text())
+    /// Text from the active block-view selection, read through the current
+    /// content source, if any.
+    pub fn block_view_text(&self, source: &dyn SelectionContentSource) -> Option<String> {
+        self.block_view_selection
+            .as_ref()
+            .map(|sel| sel.text(source))
     }
 }
 
@@ -267,9 +277,13 @@ impl Default for SelectionHandler {
 }
 
 // ── Block-view selection ──────────────────────────────────────────────
-// Grid coordinates no longer match visible pixels once the block view inserts
-// Header/Separator rows and scrolls. Selection snapshots the renderer's row
-// list, so hit-testing and text extraction see the same rows.
+// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): selection now anchors in the
+// unified logical document (content coordinates) instead of a renderer row
+// snapshot. Hit-testing still produces `BlockViewRow` bands (y geometry +
+// text + block/line keys), but a selection stores only the two endpoint
+// anchors; every highlight/text/interval query is DERIVED per frame from the
+// current `SelectionContentSource` (Warp model — "index space" breakage and
+// the Θ(span×window) copy cost are gone with the snapshot).
 
 use crate::blocks::BlockId;
 
@@ -288,7 +302,8 @@ pub enum BlockViewRowKind {
 }
 
 /// A single rendered row in the block view, captured at layout time. The y
-/// range is scroll-adjusted physical pixels.
+/// range is scroll-adjusted physical pixels. Used for hit-testing and the
+/// `(block, line)` key that maps a pixel row back to a content anchor.
 #[derive(Clone, Debug)]
 pub struct BlockViewRow {
     pub kind: BlockViewRowKind,
@@ -300,12 +315,13 @@ pub struct BlockViewRow {
     pub y_top: f32,
     /// Bottom y of the row (`y_top + pitch`).
     pub y_bottom: f32,
-    /// v1.6.1: Line index into the owning block's `styled_output` (`None` for
-    /// non-Output rows and resume hints); resolves OSC 8 link spans.
+    /// Line index into the owning block's output (`None` for structural
+    /// rows and resume hints); resolves OCR 8 link spans and — together with
+    /// `block_id` — forms the content-coordinate anchor key.
     pub line: Option<usize>,
-    /// v1.6.1: Char offset of this row's text within its source line (0 for
-    /// single-chunk rows). Add it to the chunk-local `char_index` for
-    /// full-line link resolution.
+    /// Char offset of this row's text within its source line (0 for
+    /// single-chunk rows). Add it to the chunk-local `char_index` for the
+    /// full-line anchor char offset.
     pub chunk_char_offset: usize,
     /// v1.10.13: Leading visual indent (columns) of this row's text. Command
     /// first lines indent for the chevron + "> " prompt (2-3 cols); wrapped
@@ -360,85 +376,331 @@ pub fn pixel_x_to_char_index(
     char_index_at_col(text, target_col.saturating_sub(indent_cols))
 }
 
-/// A character-cell position inside the block view: an index into the cached
-/// `BlockViewRow` list plus a char index into that row's `text`.
+// ── Content anchors (v1.10.26) ───────────────────────────────────────────
+
+/// Content-coordinate anchor into the unified logical document.
+///
+/// `block = Some(id)` addresses a finished block's output lines; `None`
+/// addresses the live composed document (`prefix ++ screen` — the primary
+/// history snapshot while a TUI runs, or the streaming in-flight block).
+/// `line` is the line index INSIDE that segment, `char_offset` a char offset
+/// within the line (copy endpoints). Anchors are stable across scroll: a
+/// line's index never changes once assigned (the push-window invariant keeps
+/// scrolled-out lines addressable at their original indices), so neither
+/// content rewrites nor viewport changes can silently move a selection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockViewPos {
-    pub row_index: usize,
-    pub char_index: usize,
+pub struct BlockSelAnchor {
+    pub block: Option<u64>,
+    /// Line index in the segment's logical document.
+    pub line: usize,
+    /// Char offset within the line (copy-ends and endpoint char slicing).
+    pub char_offset: usize,
 }
 
-/// A selection over the block-view row snapshot; extraction walks the rows.
-#[derive(Clone, Debug)]
+impl BlockSelAnchor {
+    pub fn new(block: Option<u64>, line: usize, char_offset: usize) -> Self {
+        Self {
+            block,
+            line,
+            char_offset,
+        }
+    }
+}
+
+/// The content a block-view selection reads. Implemented by `weft_app` over
+/// the `BlockTracker` (finished blocks = output lines; live = the composed
+/// `prefix ++ screen` document) and by in-memory sources in tests.
+///
+/// The document ORDER of segments is the sole authority for cross-segment
+/// comparisons: `order[0]` is the top of the document, the live segment
+/// (`None`) is ALWAYS last.
+pub trait SelectionContentSource {
+    /// Number of logical lines in the segment (`0` for an absent segment).
+    fn line_count(&self, block: Option<u64>) -> usize;
+    /// The segment's line text; `None` when the segment or line is absent.
+    fn line_text(&self, block: Option<u64>, line: usize) -> Option<&str>;
+    /// Document order of the segments, top-to-bottom, `None` (live) last.
+    /// v1.10.26 (rust-reviewer S4): returns a SLICE, not an owned `Vec` —
+    /// `doc_position` queries this per frame, so an allocation per query
+    /// churned O(visible×blocks). Impls cache the order (the app's
+    /// `SelectionDocSource` builds it once at construction).
+    fn block_order(&self) -> &[Option<u64>];
+}
+
+/// Position of a segment in the document order; `len` when absent.
+fn doc_position(source: &dyn SelectionContentSource, block: Option<u64>) -> usize {
+    let order = source.block_order();
+    order
+        .iter()
+        .position(|key| *key == block)
+        .unwrap_or(order.len())
+}
+
+/// Document-order comparison of two anchors: segment position → line →
+/// char_offset (exactly the order the FIX doc's comparator mandates).
+fn anchor_cmp(
+    source: &dyn SelectionContentSource,
+    a: &BlockSelAnchor,
+    b: &BlockSelAnchor,
+) -> Ordering {
+    doc_position(source, a.block)
+        .cmp(&doc_position(source, b.block))
+        .then(a.line.cmp(&b.line))
+        .then(a.char_offset.cmp(&b.char_offset))
+}
+
+/// Clamp a possibly-stale anchor into an existing segment (`lo = min(n-1,line)`,
+/// mirroring Warp `update_selection_after_height_change`). A segment with zero
+/// lines keeps the raw line (no line can ever match it → safe degrade).
+fn clamp_anchor(source: &dyn SelectionContentSource, anchor: BlockSelAnchor) -> BlockSelAnchor {
+    let n = source.line_count(anchor.block);
+    if n == 0 {
+        return anchor;
+    }
+    BlockSelAnchor {
+        line: anchor.line.min(n - 1),
+        ..anchor
+    }
+}
+
+/// A content-anchored block-view selection (Warp model).
+///
+/// No row snapshot, no `frame_delta`, no sync machinery: `head` is the drag
+/// anchor, `tail` the drag endpoint; every query derives from the CURRENT
+/// `SelectionContentSource`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockViewSelection {
-    pub start: BlockViewPos,
-    pub end: BlockViewPos,
-    pub rows: Vec<BlockViewRow>,
-    /// v1.10.25 (B1): the frame displacement delta most recently applied to
-    /// normalize retained rows into the current frame's y coordinate system
-    /// (see `sync_rows` in `selection/sync.rs`). Reused on frames with zero
-    /// exact identity matches so the frozen block stays aligned; 0 before the
-    /// first sync.
-    pub frame_delta: f32,
+    /// The drag anchor (start).
+    pub head: BlockSelAnchor,
+    /// The drag endpoint.
+    pub tail: BlockSelAnchor,
 }
 
 impl BlockViewSelection {
-    /// Extract the selected text by walking the captured row snapshot (rows
-    /// are bottom-to-top, text reads top-to-bottom); the top boundary row
-    /// contributes its tail, the bottom boundary its head. Non-selectable
-    /// rows are skipped without newlines.
-    pub fn text(&self) -> String {
-        if let Some(text) = block_view::wrapped_source_text(self) {
-            return text;
-        }
-        if self.rows.is_empty() {
-            return String::new();
-        }
-        let last = self.rows.len() - 1;
-        let top = self.start.row_index.max(self.end.row_index).min(last);
-        let bottom = self.start.row_index.min(self.end.row_index).min(last);
-        if top < bottom {
-            return String::new();
-        }
-        // Which endpoint is the top one? Determines boundary-row slicing.
-        let (top_pos, bottom_pos) = if self.start.row_index >= self.end.row_index {
-            (self.start, self.end)
-        } else {
-            (self.end, self.start)
-        };
+    pub fn new(head: BlockSelAnchor, tail: BlockSelAnchor) -> Self {
+        Self { head, tail }
+    }
 
+    /// True when both endpoints coincide (a click without any drag).
+    pub fn is_empty(&self) -> bool {
+        self.head == self.tail
+    }
+
+    /// Derive the ordered selection interval against `source`.
+    pub fn interval(&self, source: &dyn SelectionContentSource) -> SelectionInterval {
+        SelectionInterval::new(source, self.head, self.tail)
+    }
+
+    /// Extract the selected text by reading the CURRENT content source
+    /// between the clamped, ordered endpoints (document order). Soft-wrapped
+    /// lines are served whole by the source, so copy needs no chunk
+    /// reassembly; endpoint lines are sliced by their `char_offset`s.
+    pub fn text(&self, source: &dyn SelectionContentSource) -> String {
+        self.interval(source).text(source)
+    }
+}
+
+/// The ordered, per-frame derived range of a block selection. Built once per
+/// frame against the current source and queried per visible layout row
+/// (O(visible) — no snapshot walking, no Θ(span×window) copy cost).
+pub struct SelectionInterval {
+    lo: BlockSelAnchor,
+    hi: BlockSelAnchor,
+    lo_pos: usize,
+    hi_pos: usize,
+    empty: bool,
+}
+
+impl SelectionInterval {
+    pub(crate) fn new(
+        source: &dyn SelectionContentSource,
+        head: BlockSelAnchor,
+        tail: BlockSelAnchor,
+    ) -> Self {
+        if head == tail {
+            let pos = doc_position(source, head.block);
+            return Self {
+                lo: head,
+                hi: tail,
+                lo_pos: pos,
+                hi_pos: pos,
+                empty: true,
+            };
+        }
+        // Clamp stale lines into the current segment bounds BEFORE ordering so
+        // a shrink cannot invert the two endpoints.
+        let (head, tail) = (clamp_anchor(source, head), clamp_anchor(source, tail));
+        let (lo, hi) = if anchor_cmp(source, &head, &tail).is_le() {
+            (head, tail)
+        } else {
+            (tail, head)
+        };
+        let lo_pos = doc_position(source, lo.block);
+        let hi_pos = doc_position(source, hi.block);
+        Self {
+            lo,
+            hi,
+            lo_pos,
+            hi_pos,
+            empty: false,
+        }
+    }
+
+    pub fn empty(&self) -> bool {
+        self.empty
+    }
+
+    /// True when the segment is absent from the document (deleted/split away)
+    /// or its position falls outside the selection span.
+    fn segment_within(
+        &self,
+        source: &dyn SelectionContentSource,
+        block: Option<u64>,
+    ) -> Option<usize> {
+        if self.empty {
+            return None;
+        }
+        let pos = doc_position(source, block);
+        if pos >= source.block_order().len() {
+            return None; // absent segment
+        }
+        if pos < self.lo_pos || pos > self.hi_pos {
+            return None;
+        }
+        Some(pos)
+    }
+
+    /// Whether a layout row with key `(block, line)` is inside the selection.
+    /// Inclusive at both endpoints; absent segments and out-of-range lines
+    /// are never highlighted.
+    pub fn contains(
+        &self,
+        source: &dyn SelectionContentSource,
+        block: Option<u64>,
+        line: usize,
+    ) -> bool {
+        let Some(pos) = self.segment_within(source, block) else {
+            return false;
+        };
+        if line >= source.line_count(block) {
+            return false;
+        }
+        if self.lo_pos == self.hi_pos {
+            return line >= self.lo.line && line <= self.hi.line;
+        }
+        if pos == self.lo_pos {
+            return line >= self.lo.line;
+        }
+        if pos == self.hi_pos {
+            return line <= self.hi.line;
+        }
+        true
+    }
+
+    /// Whether ANY structural row of the segment (command/header/separator —
+    /// rows that carry no `(block, line)` of their own but belong to a block
+    /// visually inside the span) should be banded whole-row.
+    ///
+    /// v1.10.26 (rust-reviewer S2): banded ONLY when the selection straddles
+    /// the segment — lo or hi lives in a DIFFERENT segment. A selection wholly
+    /// inside the segment (both endpoints in it) leaves its structural rows
+    /// unbanded; previously the "any line in segment" test lit up the whole
+    /// header/command when selecting one word mid-block. This is the old
+    /// row-snapshot straddle rule: a segment's structural rows sit outside
+    /// the selected lines unless the span reaches into a neighboring segment.
+    pub fn block_intersects(
+        &self,
+        source: &dyn SelectionContentSource,
+        block: Option<u64>,
+    ) -> bool {
+        let Some(pos) = self.segment_within(source, block) else {
+            return false;
+        };
+        if source.line_count(block) == 0 {
+            return false;
+        }
+        !(self.lo_pos == pos && self.hi_pos == pos)
+    }
+
+    /// Char slice of `(block, line)` inside the selection, in line-char
+    /// coordinates (the paint path converts this to chunk columns via the
+    /// chunk's `char_offset`). `Some((0, len))` for fully covered lines;
+    /// endpoint lines are clamped to their `char_offset`s.
+    pub fn char_range(
+        &self,
+        source: &dyn SelectionContentSource,
+        block: Option<u64>,
+        line: usize,
+    ) -> Option<(usize, usize)> {
+        if !self.contains(source, block, line) {
+            return None;
+        }
+        let len = source
+            .line_text(block, line)
+            .map(|text| text.chars().count())
+            .unwrap_or(0);
+        let pos = doc_position(source, block);
+        let mut start = 0;
+        let mut end = len;
+        if pos == self.lo_pos && line == self.lo.line {
+            start = self.lo.char_offset.min(len);
+        }
+        if pos == self.hi_pos && line == self.hi.line {
+            end = self.hi.char_offset.min(len);
+        }
+        (end > start).then_some((start, end))
+    }
+
+    /// Accumulate the selected text line by line in document order. Lines
+    /// with an empty contribution are skipped without inserting blank lines,
+    /// mirroring the legacy snapshot walker's newline rules.
+    pub fn text(&self, source: &dyn SelectionContentSource) -> String {
+        if self.empty {
+            return String::new();
+        }
         let mut out = String::new();
-        let mut contributed = false; // track for newline insertion
-        for i in (bottom..=top).rev() {
-            let row = &self.rows[i];
-            if !row.is_selectable() || row.text.is_empty() {
+        let mut contributed = false;
+        let order = source.block_order();
+        for (pos, block) in order.iter().enumerate() {
+            if pos < self.lo_pos || pos > self.hi_pos {
                 continue;
             }
-            let chars: Vec<char> = row.text.chars().collect();
-            let max_char = chars.len();
-            let (c_start, c_end) = if top == bottom {
-                // Single row: inclusive range between the two char indices.
-                let lo = top_pos.char_index.min(bottom_pos.char_index).min(max_char);
-                let hi = top_pos.char_index.max(bottom_pos.char_index).min(max_char);
-                (lo, hi)
-            } else if i == top {
-                // Top boundary: tail from the anchor down.
-                (top_pos.char_index.min(max_char), max_char)
-            } else if i == bottom {
-                // Bottom boundary: head up to the drag endpoint.
-                (0, bottom_pos.char_index.min(max_char))
+            let block = *block;
+            let n = source.line_count(block);
+            if n == 0 {
+                continue;
+            }
+            let (line_lo, line_hi) = if self.lo_pos == self.hi_pos {
+                (self.lo.line.min(n - 1), self.hi.line.min(n - 1))
+            } else if pos == self.lo_pos {
+                (self.lo.line.min(n - 1), n - 1)
+            } else if pos == self.hi_pos {
+                (0, self.hi.line.min(n - 1))
             } else {
-                // Middle row: entire text.
-                (0, max_char)
+                (0, n - 1)
             };
-            if c_end > c_start {
+            for line in line_lo..=line_hi {
+                let len = source
+                    .line_text(block, line)
+                    .map(|t| t.chars().count())
+                    .unwrap_or(0);
+                let mut start = 0;
+                let mut end = len;
+                if pos == self.lo_pos && line == self.lo.line {
+                    start = self.lo.char_offset.min(len);
+                }
+                if pos == self.hi_pos && line == self.hi.line {
+                    end = self.hi.char_offset.min(len);
+                }
+                if end <= start {
+                    continue;
+                }
                 if contributed {
                     out.push('\n');
                 }
-                out.extend(&chars[c_start..c_end]);
-                contributed = true;
-            } else if c_end == c_start && top == bottom {
-                // Empty single-row selection: mark contributed anyway.
+                if let Some(text) = source.line_text(block, line) {
+                    out.extend(text.chars().skip(start).take(end - start));
+                }
                 contributed = true;
             }
         }
@@ -555,278 +817,42 @@ mod tests {
         // selection and the in-progress drag must survive.
         let mut handler = SelectionHandler::new();
         handler.start(GridPos::new(0, 0), SelectionMode::Simple);
-        let rows = vec![bv_row(BlockViewRowKind::Output, "hello", 0.0, 20.0)];
-        handler.start_block_view(
-            BlockViewPos {
-                row_index: 0,
-                char_index: 2,
-            },
-            rows,
-        );
+        handler.start_block_view(BlockSelAnchor::new(None, 0, 2));
         handler.clear_grid_selection();
         assert!(handler.selection.is_none());
         assert!(handler.selecting, "drag continues in block space");
         assert!(handler.block_view_selection.is_some());
     }
 
-    // ── BlockViewSelection tests ───────────────────────────────────────
-    // Rows are bottom-to-top; a higher index drag reads top-to-bottom.
-
-    fn bv_row(kind: BlockViewRowKind, text: &str, y_top: f32, y_bottom: f32) -> BlockViewRow {
-        BlockViewRow {
-            kind,
-            text: text.to_string(),
-            block_id: None,
-            y_top,
-            y_bottom,
-            line: None,
-            chunk_char_offset: 0,
-            indent_cols: 0,
-        }
-    }
-
-    fn bv_rows() -> Vec<BlockViewRow> {
-        // 5 rows, index 0 = bottom. Each row 20px tall.
-        vec![
-            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0), // idx 0 (bottom)
-            bv_row(BlockViewRowKind::Output, "hello", 20.0, 40.0), // idx 1
-            bv_row(BlockViewRowKind::Separator, "", 40.0, 60.0),  // idx 2 (skipped)
-            bv_row(BlockViewRowKind::Command, "echo hi", 60.0, 80.0), // idx 3
-            bv_row(BlockViewRowKind::Header, "~/proj", 80.0, 100.0), // idx 4 (top)
-        ]
-    }
-
     #[test]
-    fn bv_single_row_partial() {
-        // Drag within row index 1 ("hello"), char 1..3 -> "el".
-        let rows = bv_rows();
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 1,
-                char_index: 1,
-            },
-            end: BlockViewPos {
-                row_index: 1,
-                char_index: 3,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "el");
-    }
-
-    #[test]
-    fn bv_cross_row_skips_non_selectable() {
-        // Drag idx 3 char 5 down to idx 0 char 2 → "hi" (tail) + "hello" +
-        // "wo" (head); idx 2 Separator skipped, newlines only between
-        // consecutive selectable contributions.
-        let rows = bv_rows();
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 3,
-                char_index: 5,
-            },
-            end: BlockViewPos {
-                row_index: 0,
-                char_index: 2,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "hi\nhello\nwo");
-    }
-
-    #[test]
-    fn bv_reversed_endpoints() {
-        // Same drag with start/end swapped — must still read top-to-bottom.
-        let rows = bv_rows();
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 0,
-                char_index: 2,
-            },
-            end: BlockViewPos {
-                row_index: 3,
-                char_index: 5,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "hi\nhello\nwo");
-    }
-
-    #[test]
-    fn bv_empty_text_returns_empty() {
-        let rows = vec![];
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 0,
-                char_index: 0,
-            },
-            end: BlockViewPos {
-                row_index: 0,
-                char_index: 5,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "");
-    }
-
-    #[test]
-    fn bv_char_index_clamped() {
-        // Out-of-range char indices clamp to "hello"'s 5 chars -> empty slice.
-        let rows = bv_rows();
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 1,
-                char_index: 100,
-            },
-            end: BlockViewPos {
-                row_index: 1,
-                char_index: 200,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "");
-    }
-
-    #[test]
-    fn bv_handler_lifecycle() {
+    fn handler_block_lifecycle_anchor_based() {
+        // v1.10.26: start/extend/clear work on content anchors; text() reads
+        // through the current source (the anchor survives content rewrites —
+        // see anchor_tests for the full regression).
         let mut h = SelectionHandler::new();
-        let rows = bv_rows();
-        // Press at idx 1 char 0, drag to idx 0 char 3 → "hello" + "wor".
-        h.start_block_view(
-            BlockViewPos {
-                row_index: 1,
-                char_index: 0,
-            },
-            rows.clone(),
-        );
+        h.start_block_view(BlockSelAnchor::new(None, 1, 0));
         assert!(h.selecting);
         assert!(h.block_view_selection.is_some());
-        h.extend_block_view(BlockViewPos {
-            row_index: 0,
-            char_index: 3,
-        });
+        h.extend_block_view(BlockSelAnchor::new(None, 0, 3));
         h.end();
         assert!(!h.selecting);
-        let text = h.block_view_text().unwrap();
-        assert_eq!(text, "hello\nwor");
+        // Empty source: no lines to select.
+        struct EmptySource;
+        impl SelectionContentSource for EmptySource {
+            fn line_count(&self, _block: Option<u64>) -> usize {
+                0
+            }
+            fn line_text(&self, _block: Option<u64>, _line: usize) -> Option<&str> {
+                None
+            }
+            fn block_order(&self) -> &[Option<u64>] {
+                const ORDER: [Option<u64>; 1] = [None];
+                &ORDER
+            }
+        }
+        assert_eq!(h.block_view_text(&EmptySource), Some(String::new()));
         h.clear();
         assert!(h.block_view_selection.is_none());
-    }
-
-    // v1.7.0-E: selection must not corrupt styled output (reads plain
-    // `row.text` only); extracted text must contain no ESC bytes.
-    #[test]
-    fn selection_does_not_corrupt_styled_output() {
-        use crate::blocks::{build_styled_output_from_runs, CapturedStyle, CapturedStyleRun};
-        use crate::grid::{CellColor, CellFlags};
-
-        // Build a StyledOutput with 2 lines, each with a colored run.
-        // Line 0: "error: file not found" with red fg on "error"
-        // Line 1: "  see /tmp/log" with green fg on the path
-        let runs = vec![
-            CapturedStyleRun {
-                start_char: 0,
-                end_char: 5,
-                style: CapturedStyle::from_attrs(
-                    CellColor::Palette(1),
-                    CellColor::Default,
-                    CellFlags::BOLD,
-                ),
-            },
-            CapturedStyleRun {
-                start_char: 6,
-                end_char: 21,
-                style: CapturedStyle::default(),
-            },
-            // newline at 21; line 1 starts at 22 and is 14 chars ("  see /tmp/log")
-            CapturedStyleRun {
-                start_char: 22,
-                end_char: 36,
-                style: CapturedStyle::from_attrs(
-                    CellColor::Palette(2),
-                    CellColor::Default,
-                    CellFlags::empty(),
-                ),
-            },
-        ];
-        // Text is stored separately from StyledOutput (text is authoritative
-        // for search/copy; StyledOutput is the parallel style model).
-        let line0_text = "error: file not found";
-        let line1_text = "  see /tmp/log";
-        let full_text = format!("{line0_text}\n{line1_text}");
-        let styled = build_styled_output_from_runs(&full_text, &runs).expect("styled output");
-        // Snapshot the styled output before selection.
-        let original_line_count = styled.lines.len();
-        let original_line0_spans = styled.lines[0].attributes.len();
-        let original_line1_spans = styled.lines[1].attributes.len();
-
-        // Rows reference styled-output lines; text comes from the original.
-        let rows = vec![
-            BlockViewRow {
-                kind: BlockViewRowKind::Output,
-                text: line1_text.to_string(),
-                block_id: None,
-                y_top: 0.0,
-                y_bottom: 20.0,
-                line: Some(1),
-                chunk_char_offset: 0,
-                indent_cols: 0,
-            },
-            BlockViewRow {
-                kind: BlockViewRowKind::Output,
-                text: line0_text.to_string(),
-                block_id: None,
-                y_top: 20.0,
-                y_bottom: 40.0,
-                line: Some(0),
-                chunk_char_offset: 0,
-                indent_cols: 0,
-            },
-        ];
-
-        // Perform a selection spanning both rows.
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 1,
-                char_index: 0,
-            },
-            end: BlockViewPos {
-                row_index: 0,
-                char_index: 5,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-
-        // Extract selection text.
-        let selected_text = sel.text();
-        assert!(
-            !selected_text.is_empty(),
-            "selection text must not be empty"
-        );
-        // V17 §2.7: copied text contains no ANSI escape bytes.
-        assert!(
-            !selected_text.as_bytes().contains(&0x1b),
-            "selection text contains ESC bytes"
-        );
-
-        // The styled output is unchanged — selection had no mutable path.
-        assert_eq!(styled.lines.len(), original_line_count);
-        assert_eq!(
-            styled.lines[0].attributes.len(),
-            original_line0_spans,
-            "line 0 attributes corrupted by selection"
-        );
-        assert_eq!(
-            styled.lines[1].attributes.len(),
-            original_line1_spans,
-            "line 1 attributes corrupted by selection"
-        );
     }
 
     #[test]
@@ -863,26 +889,32 @@ mod tests {
         );
     }
 
+    // ── v1.10.26: the anchor-model core tests live in `anchor_tests` ──────
+
+    fn bv_row(kind: BlockViewRowKind, text: &str, y_top: f32, y_bottom: f32) -> BlockViewRow {
+        BlockViewRow {
+            kind,
+            text: text.to_string(),
+            block_id: None,
+            y_top,
+            y_bottom,
+            line: None,
+            chunk_char_offset: 0,
+            indent_cols: 0,
+        }
+    }
+
+    // v1.10.26: BlockViewRow remains the HIT-TEST row model (y bands + text +
+    // block/line keys); the selection itself no longer snapshots rows. This
+    // test pins the row predicates the hit-testing path relies on.
     #[test]
-    fn text_extracts_wrapped_command_chunks_in_reading_order() {
-        // 修复后的 bv_rows(索引大 = 视觉靠上):[2] 命令首行 [1] 续行 [0] 输出。
-        let rows = vec![
-            bv_row(BlockViewRowKind::Output, "output line", 0.0, 20.0),
-            bv_row(BlockViewRowKind::Command, "ps --filter", 40.0, 60.0),
-            bv_row(BlockViewRowKind::Command, "docker", 60.0, 80.0),
-        ];
-        let sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 0,
-                char_index: 100,
-            },
-            end: BlockViewPos {
-                row_index: 2,
-                char_index: 0,
-            },
-            rows,
-            frame_delta: 0.0,
-        };
-        assert_eq!(sel.text(), "docker\nps --filter\noutput line");
+    fn bv_row_selectability_and_y_containment() {
+        let output = bv_row(BlockViewRowKind::Output, "hello", 0.0, 20.0);
+        assert!(output.is_selectable());
+        assert!(output.contains_y(5.0));
+        assert!(!output.contains_y(20.0)); // half-open band
+        assert_eq!(output.text, "hello");
+        let header = bv_row(BlockViewRowKind::Header, "~/proj", 40.0, 64.0);
+        assert!(!header.is_selectable());
     }
 }

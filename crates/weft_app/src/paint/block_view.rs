@@ -32,6 +32,7 @@ impl MetalRenderer {
     ) {
         let BlockViewPaintModel {
             blocks,
+            live_head_lines,
             region_bottom_y,
             cwd,
             git_branch,
@@ -138,6 +139,10 @@ impl MetalRenderer {
         let live_styled = live
             .as_ref()
             .and_then(|live| live.styled_output.map(std::sync::Arc::clone));
+        // v1.10.26: the live composed document for the selection source is
+        // extracted BEFORE the layout pass moves `live` (raw &str into the
+        // terminal's block storage; outlives the frame).
+        let live_output_for_source = live.as_ref().map(|live| live.output);
         let layout_out = {
             let cache = self.block_layout_cache.borrow();
             compute_block_layout_pass(
@@ -181,13 +186,36 @@ impl MetalRenderer {
         // heavily tinted canvases and may land slightly under 3:1 there
         // (accepted boundary, still far above the pre-fix 1.27-1.75).
         let selection_bg = crate::paint::selection_color::selection_colors(&self.theme).quad;
-        // v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): bv_rows only materializes
-        // rows intersecting the clip window (plus Command rows for sticky
-        // detection and the active selection's rows, so `sync_rows` remaps
-        // endpoints exactly — see rows::build_bv_rows).
-        let selection_keep = selection.block_view_selection.as_ref().map(|sel| {
-            rows::selected_row_identities(&sel.rows, sel.start.row_index, sel.end.row_index)
-        });
+        // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): the selection is
+        // content-anchored — no row snapshot, no `sync_rows`, no
+        // `selected_row_identities` retention. `bv_rows` culls to the pure
+        // visible window again. A structural document change (split / block
+        // finish / deletion — the finished-block id order differs from the
+        // fingerprint recorded at selection start) makes the anchors stale,
+        // so the selection is cleared right here. Streaming append to the
+        // live segment is NOT part of the fingerprint and never clears.
+        if selection.block_view_selection.is_some() {
+            // v1.10.26 (rust-reviewer S1): the fingerprint keys on the live
+            // document's HEAD length too — a preserved superseded frame
+            // prepends lines into the composed document and silently shifts
+            // every live-segment anchor even though the finished-block order
+            // is unchanged.
+            let fingerprint =
+                crate::selection::block_selection_fingerprint(blocks, live_head_lines);
+            if selection.block_doc_fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+                tracing::info!(
+                    ?fingerprint,
+                    "block document structure changed; cleared anchor selection"
+                );
+                selection.clear();
+            }
+        }
+        let doc_source = crate::selection::SelectionDocSource::new(blocks, live_output_for_source);
+        // Per-frame derived selection interval (single direction: content
+        // source → highlight; never snapshot → content).
+        let sel_interval = selection
+            .block_view_selection
+            .map(|sel| sel.interval(&doc_source));
         let bv_rows = rows::build_bv_rows(
             &rows,
             &row_data,
@@ -199,13 +227,8 @@ impl MetalRenderer {
                 clip_top,
                 clip_bottom,
                 cull: true,
-                selection_keep: selection_keep.as_deref(),
             },
         );
-        if let Some(sel) = selection.block_view_selection.as_mut() {
-            sel.sync_rows(bv_rows.clone());
-        }
-        let sel_bv = selection.block_view_selection.as_ref();
         let find_hl_bg = {
             let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
                 .with_increase_contrast(self.increase_contrast);
@@ -218,46 +241,26 @@ impl MetalRenderer {
             background_uv: bg_uv,
             color: find_hl_bg,
         };
-        let sel_range_for_y = |row_mid_y: f32| -> Option<(usize, usize)> {
-            let s = sel_bv?;
-            let snap_idx = s.rows.iter().position(|r| r.contains_y(row_mid_y))?;
-            let top = s.start.row_index.max(s.end.row_index);
-            let bottom = s.start.row_index.min(s.end.row_index);
-            if snap_idx < bottom || snap_idx > top {
-                return None;
-            }
-            let max_char = s.rows[snap_idx].text.chars().count();
-            let (c_start, c_end) = if top == bottom {
-                let lo = s.start.char_index.min(s.end.char_index).min(max_char);
-                let hi = s.start.char_index.max(s.end.char_index).min(max_char);
-                (lo, hi)
-            } else if snap_idx == top {
-                let anchor = if s.start.row_index >= s.end.row_index {
-                    s.start.char_index
-                } else {
-                    s.end.char_index
-                };
-                (anchor.min(max_char), max_char)
-            } else if snap_idx == bottom {
-                let anchor = if s.start.row_index >= s.end.row_index {
-                    s.end.char_index
-                } else {
-                    s.start.char_index
-                };
-                (0, anchor.min(max_char))
-            } else {
-                (0, max_char)
+        // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): per-frame DERIVED highlight
+        // helpers. `key_block` / `key_line` are the layout row's content
+        // coordinates; rows with a real line are tested against the anchor
+        // interval; structural rows (Command/Header/LiveCommand/Separator —
+        // no line) fall back to their owning segment's intersection so a
+        // block visibly inside the selection is fully banded.
+        let char_range_for =
+            |key_block: Option<u64>, key_line: Option<usize>| -> Option<(usize, usize)> {
+                let iv = sel_interval.as_ref()?;
+                let line = key_line?;
+                iv.char_range(&doc_source, key_block, line)
             };
-            (c_end > c_start).then_some((c_start, c_end))
-        };
-        let row_in_selection = |row_mid_y: f32| -> bool {
-            let Some(s) = sel_bv else { return false };
-            let Some(snap_idx) = s.rows.iter().position(|r| r.contains_y(row_mid_y)) else {
+        let row_in_selection = |key_block: Option<u64>, key_line: Option<usize>| -> bool {
+            let Some(iv) = sel_interval.as_ref() else {
                 return false;
             };
-            let top = s.start.row_index.max(s.end.row_index);
-            let bottom = s.start.row_index.min(s.end.row_index);
-            snap_idx >= bottom && snap_idx <= top
+            match key_line {
+                Some(line) => iv.contains(&doc_source, key_block, line),
+                None => iv.block_intersects(&doc_source, key_block),
+            }
         };
 
         let block_canvases = surfaces::push_block_surfaces(
@@ -275,6 +278,16 @@ impl MetalRenderer {
         );
 
         for (i, &dist) in rows.iter().enumerate() {
+            // v1.10.26: the owning segment key of a structural row. A
+            // Separator follows its block's Header (or the live header), so
+            // its association is the PRECEDING row's key.
+            let row_block_key = |row: &LaidRow<'_>| match row {
+                LaidRow::Output { block_id, .. } => block_id.map(|b| b.0),
+                LaidRow::Command { block_id, .. } => Some(block_id.0),
+                LaidRow::Header { block_id, .. } => Some(block_id.0),
+                LaidRow::DiagnosePanel { block_id, .. } => Some(block_id.0),
+                _ => None, // LiveCommand/LiveHeader/Separator → live segment
+            };
             let row_top_y = content_bottom_y - dist + scroll_px;
             let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
                 header_height
@@ -299,8 +312,12 @@ impl MetalRenderer {
                 } => {
                     let canvas = surfaces::canvas_for(&block_canvases, *block_id, theme_bg);
                     let selection_canvas = composite_color_over(selection_bg, canvas);
+                    // v1.10.26: content-coordinate key of this row (resume
+                    // hints carry line == usize::MAX → not addressable).
+                    let key_line = (*line != usize::MAX).then_some(*line);
+                    let key_block = block_id.map(|b| b.0);
                     if chunks.len() <= 1 {
-                        let selection_range = sel_range_for_y(y + pitch * 0.5);
+                        let selection_range = char_range_for(key_block, key_line);
                         if let Some((cs, ce)) = selection_range {
                             self.push_block_view_highlight(
                                 &mut verts,
@@ -403,23 +420,36 @@ impl MetalRenderer {
                             }
                         }
                     } else {
+                        // v1.10.26: the selection range is per SOURCE line;
+                        // each chunk covers a slice of it, so the range is
+                        // projected through the chunk's `char_offset` and
+                        // clamped to the chunk length.
+                        let line_slice = char_range_for(key_block, key_line);
                         let mut char_offset = 0;
                         for (ci, chunk) in chunks.iter().enumerate() {
                             let cy = y + ci as f32 * pitch;
                             if cy + ch > clip_top && cy < clip_bottom {
-                                let selection_range = sel_range_for_y(cy + pitch * 0.5);
+                                let selection_range = line_slice.map(|(cs, ce)| {
+                                    let chunk_len = chunk.chars().count();
+                                    (
+                                        cs.saturating_sub(char_offset).min(chunk_len),
+                                        ce.saturating_sub(char_offset).min(chunk_len),
+                                    )
+                                });
                                 if let Some((cs, ce)) = selection_range {
-                                    self.push_block_view_highlight(
-                                        &mut verts,
-                                        left,
-                                        cy,
-                                        ch,
-                                        chunk,
-                                        cs,
-                                        ce,
-                                        selection_bg,
-                                        bg_uv,
-                                    );
+                                    if ce > cs {
+                                        self.push_block_view_highlight(
+                                            &mut verts,
+                                            left,
+                                            cy,
+                                            ch,
+                                            chunk,
+                                            cs,
+                                            ce,
+                                            selection_bg,
+                                            bg_uv,
+                                        );
+                                    }
                                 }
                                 if let Some(bh) = find_block_highlight {
                                     if bh.0 == block_id.map(|b| b.0).unwrap_or(0)
@@ -454,13 +484,12 @@ impl MetalRenderer {
                                         char_offset,
                                         fallback: output_fg,
                                         canvas,
-                                        selection: selection_range.map(|(start, end)| {
-                                            (
-                                                char_offset + start,
-                                                char_offset + end,
-                                                selection_canvas,
-                                            )
-                                        }),
+                                        // The styled text selection uses FULL-LINE
+                                        // coords (line_slice is already them);
+                                        // the highlight above projected them into
+                                        // the chunk.
+                                        selection: line_slice
+                                            .map(|(start, end)| (start, end, selection_canvas)),
                                         max_cols: cols,
                                         palette,
                                         row_pitch: pitch,
@@ -552,16 +581,18 @@ impl MetalRenderer {
                         } else {
                             (left, cols)
                         };
-                        // v1.10.13: 每行都画 selection 高亮(sel_range_for_y 按 y 找行,返回相对该 chunk 的范围)。
-                        if let Some((cs, ce)) = sel_range_for_y(cy + pitch * 0.5) {
+                        // v1.10.26: command rows carry no content line, so
+                        // they are banded whole-row when their block's segment
+                        // intersects the selection (no partial char slicing).
+                        if row_in_selection(Some(block_id.0), None) {
                             self.push_block_view_highlight(
                                 &mut verts,
                                 lx,
                                 cy,
                                 ch,
                                 chunk,
-                                cs,
-                                ce,
+                                0,
+                                chunk.chars().count(),
                                 selection_bg,
                                 bg_uv,
                             );
@@ -609,7 +640,7 @@ impl MetalRenderer {
                     tone,
                     block_id,
                 } => {
-                    if row_in_selection(y + header_height * 0.5) {
+                    if row_in_selection(Some(block_id.0), None) {
                         push_quad(
                             &mut verts,
                             [left, y, right, y + header_height],
@@ -724,6 +755,17 @@ impl MetalRenderer {
                     );
                 }
                 LaidRow::LiveHeader { text } => {
+                    // v1.10.26: banded whole-row when the live segment
+                    // intersects (parity with the old row-index highlight).
+                    if row_in_selection(None, None) {
+                        push_quad(
+                            &mut verts,
+                            [left, y, right, y + pitch],
+                            bg_uv,
+                            [0.0; 4],
+                            selection_bg,
+                        );
+                    }
                     let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
                         .with_increase_contrast(self.increase_contrast);
                     self.push_text(
@@ -736,7 +778,12 @@ impl MetalRenderer {
                     );
                 }
                 LaidRow::Separator => {
-                    if row_in_selection(y + pitch * 0.5) {
+                    let key = if i == 0 {
+                        None
+                    } else {
+                        row_block_key(&row_data[i - 1])
+                    };
+                    if row_in_selection(key, None) {
                         push_quad(
                             &mut verts,
                             [left, y, right, y + pitch],
@@ -773,16 +820,17 @@ impl MetalRenderer {
                         } else {
                             (left, cols)
                         };
-                        // v1.10.13: 每行都画 selection 高亮(与 Command 分支同机制)。
-                        if let Some((cs, ce)) = sel_range_for_y(cy + pitch * 0.5) {
+                        // v1.10.26: the live command carries no content line; it is banded
+                        // whole-row when the live segment intersects.
+                        if row_in_selection(None, None) {
                             self.push_block_view_highlight(
                                 &mut verts,
                                 lx,
                                 cy,
                                 ch,
                                 chunk,
-                                cs,
-                                ce,
+                                0,
+                                chunk.chars().count(),
                                 selection_bg,
                                 bg_uv,
                             );

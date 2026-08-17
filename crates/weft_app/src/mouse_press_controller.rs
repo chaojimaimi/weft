@@ -627,20 +627,35 @@ impl App {
         match button {
             winit::event::MouseButton::Left => {
                 if selecting {
+                    // v1.10.26 (rust-reviewer N1): a fresh press resets the
+                    // fractional autoscroll carry — a stale sub-row remainder
+                    // from the PREVIOUS drag must not jolt the new drag's
+                    // first 40ms tick.
+                    self.interaction.selection_autoscroll_carry = 0.0;
                     if block_view {
-                        // Block view: hit-test against the cached visible-row
-                        // snapshot and start a block-view selection. The row
-                        // snapshot is cloned so the selection stays consistent
-                        // with what the user saw at drag start, even if a PTY
-                        // update re-lays-out the view mid-drag.
-                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            let Some((rows_snapshot, _, _)) = self.compute_block_view_rows() else {
-                                return;
-                            };
-                            self.sessions
-                                .active_mut()
-                                .selection_handler
-                                .start_block_view(bv_pos, rows_snapshot);
+                        // Block view: hit-test to a content anchor and start a
+                        // block-view selection. v1.10.26: any mouse_down on a
+                        // selectable row starts a NEW selection (the anchor
+                        // overrides any previous one — Warp’s “无法取消” fix),
+                        // and the document fingerprint is recorded so a
+                        // structural change next frame clears a stale one.
+                        if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
+                            let pane = self.sessions.active_mut();
+                            let fingerprint = pane
+                                .terminal
+                                .as_ref()
+                                .map(|t| {
+                                    crate::selection::block_selection_fingerprint(
+                                        t.block_tracker().session_blocks(),
+                                        t.screen_head_lines(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            crate::selection::start_block_selection(
+                                &mut pane.selection_handler,
+                                anchor,
+                                fingerprint,
+                            );
                         } else {
                             // Click missed every selectable row (e.g. on the
                             // prompt box, CWD bar, or empty padding). Clear the
@@ -705,26 +720,32 @@ impl App {
                 if selecting {
                     // Right click: extend selection.
                     if block_view {
-                        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                            let Some((rows_snapshot, _, _)) = self.compute_block_view_rows() else {
-                                return;
-                            };
-                            if self
+                        if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
+                            let has_selection = self
                                 .sessions
-                                .active_mut()
+                                .active()
                                 .selection_handler
                                 .block_view_selection
-                                .is_none()
-                            {
-                                self.sessions
-                                    .active_mut()
-                                    .selection_handler
-                                    .start_block_view(bv_pos, rows_snapshot);
+                                .is_some();
+                            let pane = self.sessions.active_mut();
+                            let fingerprint = pane
+                                .terminal
+                                .as_ref()
+                                .map(|t| {
+                                    crate::selection::block_selection_fingerprint(
+                                        t.block_tracker().session_blocks(),
+                                        t.screen_head_lines(),
+                                    )
+                                })
+                                .unwrap_or_default();
+                            if has_selection {
+                                pane.selection_handler.extend_block_view(anchor);
                             } else {
-                                self.sessions
-                                    .active_mut()
-                                    .selection_handler
-                                    .extend_block_view(bv_pos);
+                                crate::selection::start_block_selection(
+                                    &mut pane.selection_handler,
+                                    anchor,
+                                    fingerprint,
+                                );
                             }
                         }
                     } else {

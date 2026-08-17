@@ -78,6 +78,7 @@ impl MetalRenderer {
     ) -> (Vec<weft_core::selection::BlockViewRow>, f32, f32) {
         let BlockViewPaintModel {
             blocks,
+            live_head_lines: _,
             region_bottom_y,
             cwd,
             git_branch,
@@ -164,7 +165,6 @@ impl MetalRenderer {
                 clip_top: layout.clip_top,
                 clip_bottom: layout.clip_bottom,
                 cull: false,
-                selection_keep: None,
             },
         );
 
@@ -178,28 +178,26 @@ impl MetalRenderer {
 /// (`compute_block_view_rows`) so their y-bands can't drift.
 /// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): `cull=true` materializes only rows
 /// intersecting the clip window; Command rows are always kept (sticky-block
-/// detection needs them, see `sticky_block_id`) and `selection_keep` retains
-/// rows matched by the active selection even off-screen — `sync_rows` remaps
-/// endpoints by (kind, block_id, text), so culling them would drop the
-/// selection endpoints. `cull=false` (hit-testing) preserves the historical
-/// full-row behavior.
+/// detection needs them, see `sticky_block_id`).
+/// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): the selection is content-anchored,
+/// so the cull no longer retains selection rows — `bv_rows` is the pure
+/// visible window again (the selection never reads these rows).
 /// Geometry inputs for [`build_bv_rows`] (paint + hit-testing parity).
-pub(super) struct BvRowsGeometry<'a> {
+pub(super) struct BvRowsGeometry {
     pub(super) pitch: f32,
     pub(super) header_height: f32,
     pub(super) content_bottom_y: f32,
     pub(super) scroll_px: f32,
     pub(super) clip_top: f32,
     pub(super) clip_bottom: f32,
-    /// Materialize only clip-visible rows (+ Command/selected retention).
+    /// Materialize only clip-visible rows (+ Command retention).
     pub(super) cull: bool,
-    pub(super) selection_keep: Option<&'a [(BlockViewRowKind, Option<BlockId>, &'a str)]>,
 }
 
 pub(super) fn build_bv_rows(
     rows: &[f32],
     row_data: &[LaidRow<'_>],
-    geometry: BvRowsGeometry<'_>,
+    geometry: BvRowsGeometry,
 ) -> Vec<BlockViewRow> {
     let BvRowsGeometry {
         pitch,
@@ -209,7 +207,6 @@ pub(super) fn build_bv_rows(
         clip_top,
         clip_bottom,
         cull,
-        selection_keep,
     } = geometry;
     let mut bv_rows = Vec::new();
     for (i, &dist) in rows.iter().enumerate() {
@@ -220,15 +217,9 @@ pub(super) fn build_bv_rows(
             pitch
         };
         let visible = row_top_y + row_height >= clip_top && row_top_y <= clip_bottom;
-        let keep = |kind: BlockViewRowKind, block_id: Option<BlockId>, text: &str| {
-            !cull
-                || visible
-                || matches!(&row_data[i], LaidRow::Command { .. })
-                || selection_keep.is_some_and(|ids| {
-                    ids.iter()
-                        .any(|(k, id, t)| *k == kind && *id == block_id && *t == text)
-                })
-        };
+        // v1.10.26: no selection retention — the keep set is the pure
+        // visible window plus Command rows (sticky detection).
+        let keep = !cull || visible || matches!(&row_data[i], LaidRow::Command { .. });
         let y = row_top_y;
         match &row_data[i] {
             LaidRow::Output {
@@ -244,7 +235,7 @@ pub(super) fn build_bv_rows(
                 // output and aren't clickable.
                 let line_idx = (*line != usize::MAX).then_some(*line);
                 if chunks.len() <= 1 {
-                    if !keep(BlockViewRowKind::Output, *block_id, text) {
+                    if !keep {
                         continue;
                     }
                     bv_rows.push(BlockViewRow {
@@ -260,10 +251,7 @@ pub(super) fn build_bv_rows(
                 } else {
                     // Keep the whole wrapped row if any chunk is retained
                     // (visible or a selected endpoint).
-                    if !chunks
-                        .iter()
-                        .any(|chunk| keep(BlockViewRowKind::Output, *block_id, chunk))
-                    {
+                    if !chunks.iter().any(|_chunk| keep) {
                         continue;
                     }
                     for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
@@ -327,7 +315,7 @@ pub(super) fn build_bv_rows(
                     parts.push(status.as_str());
                 }
                 let text = parts.join(" · ");
-                if !keep(BlockViewRowKind::Header, Some(*block_id), &text) {
+                if !keep {
                     continue;
                 }
                 bv_rows.push(BlockViewRow {
@@ -342,7 +330,7 @@ pub(super) fn build_bv_rows(
                 });
             }
             LaidRow::LiveHeader { text } => {
-                if !keep(BlockViewRowKind::Header, None, text) {
+                if !keep {
                     continue;
                 }
                 bv_rows.push(BlockViewRow {
@@ -357,7 +345,7 @@ pub(super) fn build_bv_rows(
                 });
             }
             LaidRow::Separator => {
-                if !keep(BlockViewRowKind::Separator, None, "") {
+                if !keep {
                     continue;
                 }
                 bv_rows.push(BlockViewRow {
@@ -372,10 +360,7 @@ pub(super) fn build_bv_rows(
                 });
             }
             LaidRow::LiveCommand { chunks, .. } => {
-                if !chunks
-                    .iter()
-                    .any(|chunk| keep(BlockViewRowKind::LiveCommand, None, chunk))
-                {
+                if !chunks.iter().any(|_chunk| keep) {
                     continue;
                 }
                 for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
@@ -396,7 +381,7 @@ pub(super) fn build_bv_rows(
                 // v1.8.2: include the panel's y-band in hit-testing so
                 // clicks on the panel don't fall through to whatever is
                 // below. Non-selectable.
-                if !keep(BlockViewRowKind::DiagnosePanel, Some(*block_id), text) {
+                if !keep {
                     continue;
                 }
                 bv_rows.push(BlockViewRow {
@@ -414,27 +399,6 @@ pub(super) fn build_bv_rows(
         }
     }
     bv_rows
-}
-/// Selection-row identities for the bv_rows visibility cull
-/// (v1.10.23, FIX_LIVE_BLOCK_SCROLL_PERF): every row in the active
-/// selection's `[start.row_index, end.row_index]` range, matched the same
-/// way `sync_rows`' exact-match remap does (`kind` + `block_id` + `text`).
-/// Rows whose identity matches stay in the culled snapshot even when
-/// off-screen, so the selection endpoints can't be remapped to a fallback
-/// row and drift once the user scrolls back. Linear scan (selection ranges
-/// are bounded by a drag's row count; kind mismatch short-circuits).
-pub(super) fn selected_row_identities(
-    selection_rows: &[BlockViewRow],
-    start_idx: usize,
-    end_idx: usize,
-) -> Vec<(BlockViewRowKind, Option<BlockId>, &str)> {
-    let (lo, hi) = (start_idx.min(end_idx), start_idx.max(end_idx));
-    selection_rows
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i >= lo && *i <= hi)
-        .map(|(_, r)| (r.kind.clone(), r.block_id, r.text.as_str()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -485,41 +449,5 @@ mod tests {
         let pos = wrapped_row_positions(100.0, 20.0, &chunks);
         // 视觉从下到上:y 递增、ci 递减、offset 前缀和
         assert_eq!(pos, vec![(2, 140.0, 4), (1, 120.0, 2), (0, 100.0, 0)]);
-    }
-
-    // ── v1.10.23: selected-row retention for the bv_rows cull ──────────
-
-    fn text_row(kind: BlockViewRowKind, id: u64, text: &str) -> BlockViewRow {
-        let mut r = row(kind, id, 0.0, 20.0);
-        r.text = text.to_string();
-        r
-    }
-
-    #[test]
-    fn selected_row_identities_covers_the_closed_range() {
-        let rows = [
-            text_row(BlockViewRowKind::Output, 1, "a"),
-            text_row(BlockViewRowKind::Output, 1, "b"),
-            text_row(BlockViewRowKind::Separator, 0, ""),
-            text_row(BlockViewRowKind::Header, 2, "h"),
-        ];
-        let ids = selected_row_identities(&rows, 3, 1); // reversed endpoints ok
-        assert!(ids.contains(&(BlockViewRowKind::Output, Some(BlockId(1)), "b")));
-        assert!(ids.contains(&(BlockViewRowKind::Separator, Some(BlockId(0)), "")));
-        assert!(ids.contains(&(BlockViewRowKind::Header, Some(BlockId(2)), "h")));
-        assert!(!ids.contains(&(BlockViewRowKind::Output, Some(BlockId(1)), "a")));
-        assert_eq!(ids.len(), 3);
-    }
-
-    /// Empty or OOB ranges degrade to an empty set (nothing retained).
-    #[test]
-    fn selected_row_identities_empty_or_out_of_range() {
-        let rows = [text_row(BlockViewRowKind::Output, 3, "x")];
-        assert!(selected_row_identities(&rows, 5, 9).is_empty());
-        assert!(selected_row_identities(&[], 0, 0).is_empty());
-        // Single-point selection keeps just the endpoint row.
-        let ids = selected_row_identities(&rows, 0, 0);
-        assert_eq!(ids.len(), 1);
-        assert!(ids.contains(&(BlockViewRowKind::Output, Some(BlockId(3)), "x")));
     }
 }

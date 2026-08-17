@@ -5,7 +5,7 @@
 //! Mouse movement, drag, context-menu, and scroll controller.
 
 use super::*;
-use crate::selection::{autoscroll_steps, down_autoscroll_threshold, AutoscrollDir};
+use crate::selection::{autoscroll_ramp_rows, down_autoscroll_threshold, AutoscrollDir};
 
 impl App {
     /// Handle mouse release.
@@ -364,37 +364,34 @@ impl App {
 
         if self.sessions.active_mut().selection_handler.selecting {
             if self.block_view_active() {
-                // Drag-selection autoscroll: remember the pointer position so
-                // the 40ms timer keeps scrolling while it is held still past
-                // the content edge. When the pointer is out of the content
-                // band, `pump_selection_autoscroll` scrolls the viewport and
-                // extends the endpoint to the new edge row; otherwise fall
-                // through to the normal in-band extension.
+                // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): mouse-move NO
+                // LONGER pumps the autoscroll — a stream of move events each
+                // scrolling+extending stacked scrolls (the "停滞+瞬移" event
+                // backlog source). Move only records the pointer for the 40ms
+                // timer and extends the endpoint when the pointer is inside
+                // the content band; the 40ms timer is the SOLE scroll driver.
                 self.interaction.selection_drag_pos = Some((x, y));
-                let scrolled = self.pump_selection_autoscroll();
-                if !scrolled {
-                    // Pointer inside the content band: normal extension.
-                    if let Some(bv_pos) = self.pixel_to_block_view_pos(x, y) {
-                        self.sessions
-                            .active_mut()
-                            .selection_handler
-                            .extend_block_view(bv_pos);
-                    }
+                if let Some(anchor) = self.pixel_to_block_view_pos(x, y) {
+                    self.sessions
+                        .active_mut()
+                        .selection_handler
+                        .extend_block_view(anchor);
                 }
+                self.arm_selection_autoscroll(y);
                 self.request_redraw();
             } else {
                 // Grid view: viewport-relative `GridPos` selection — scrolling
                 // mid-drag would silently corrupt the copy range (see
                 // docs/FIX_DRAG_AUTOSCROLL.md "Grid 后续任务"). v1.10.20: a
                 // primary-screen TUI drag held past the top edge migrates
-                // into the primary history snapshot view instead
-                // (pump_selection_autoscroll).
+                // into the primary history snapshot view instead — the
+                // migration runs on the 40ms timer (arm below), not on move.
                 self.interaction.selection_drag_pos = Some((x, y));
-                let scrolled = self.pump_selection_autoscroll();
-                if !scrolled {
+                if self.selection_autoscroll_overshoot(y).is_none() {
                     let pos = self.pixel_to_grid(x, y);
                     self.sessions.active_mut().selection_handler.extend(pos);
                 }
+                self.arm_selection_autoscroll(y);
                 self.request_redraw();
             }
         }
@@ -1032,20 +1029,96 @@ impl App {
         self.request_redraw();
     }
 
-    /// Drag-selection autoscroll: when the pointer is held past the block
-    /// content edge, scroll the viewport toward it and extend the selection
-    /// endpoint to the newly revealed edge row. Returns true when a
-    /// scroll+extend happened (the caller requests a redraw). Called from
-    /// `on_cursor_moved` per move and from the redraw entry on each 40ms
-    /// timer wake while the pointer is held still.
-    pub(super) fn pump_selection_autoscroll(&mut self) -> bool {
-        let selecting = self.sessions.active().selection_handler.selecting;
-        if !selecting {
+    /// Edge-band overshoot for the drag-selection autoscroll. Returns which
+    /// direction (relative to the content band) the pointer overshoots and by
+    /// how many pixels — measured from the band threshold (one line outside
+    /// the content edge in block view; the top content edge in grid mode).
+    /// Shared by the move handler (which only ARMS the 40ms timer) and the
+    /// timer pump (which scrolls + extends). `None` inside the band.
+    pub(super) fn selection_autoscroll_overshoot(&self, y: f64) -> Option<(AutoscrollDir, f32)> {
+        if !self.sessions.active().selection_handler.selecting {
+            return None;
+        }
+        if self.block_view_active() {
+            let (top, bottom) = self.block_content_vbounds()?;
+            let ch = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_height() as f32)
+                .unwrap_or(20.0);
+            // v1.10.25 Batch 3: in a TUI history snapshot view the content
+            // bottom IS the window bottom (no prompt/bottom chrome), so the
+            // Down band shifts inward to the content's bottom edge row.
+            let pane_bottom = self.renderer.as_ref().and_then(|renderer| {
+                renderer.layout_ctx.map(|ctx| match ctx.clip {
+                    Some(rect) => rect[3],
+                    None => renderer.viewport().1,
+                })
+            });
+            let down_threshold = pane_bottom
+                .map(|pane_bottom| down_autoscroll_threshold(bottom, pane_bottom, ch))
+                .unwrap_or(bottom + ch);
+            if (y as f32) < top - ch {
+                Some((AutoscrollDir::Up, (top - ch) - y as f32))
+            } else if (y as f32) > down_threshold {
+                Some((AutoscrollDir::Down, y as f32 - down_threshold))
+            } else {
+                None
+            }
+        } else {
+            // Grid mode (primary-screen TUI): only the top edge can trigger —
+            // a drag held past it migrates into the primary history view.
+            let tui_active = self
+                .sessions
+                .active()
+                .terminal
+                .as_ref()
+                .is_some_and(Terminal::primary_screen_app_active);
+            if !tui_active {
+                return None;
+            }
+            let (top, _bottom) = self.grid_content_vbounds()?;
+            let ch = self
+                .renderer
+                .as_ref()
+                .map(|r| r.cell_height() as f32)
+                .unwrap_or(20.0);
+            if (y as f32) < top - ch {
+                Some((AutoscrollDir::Up, (top - ch) - y as f32))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// v1.10.26: arm/disarm the 40ms autoscroll timer from a mouse move. This
+    /// is the ONLY thing a move does about autoscroll — the scroll itself
+    /// happens on the timer (see `pump_selection_autoscroll`). Resets the
+    /// fractional row carry when the pointer leaves the band.
+    fn arm_selection_autoscroll(&mut self, y: f64) {
+        if self.selection_autoscroll_overshoot(y).is_some() {
+            self.window_runtime
+                .selection_autoscroll_active
+                .store(true, Ordering::Relaxed);
+        } else {
+            self.interaction.selection_autoscroll_carry = 0.0;
             self.window_runtime
                 .selection_autoscroll_active
                 .store(false, Ordering::Relaxed);
-            return false;
         }
+    }
+
+    /// Drag-selection autoscroll: when the pointer is held past the block
+    /// content edge, scroll the viewport toward it and extend the selection
+    /// endpoint to the newly revealed edge row. Returns true when a
+    /// scroll+extend happened (the caller requests a redraw). v1.10.26
+    /// (FIX_SELECTION_CONTENT_ANCHORS): called ONLY from the redraw entry on
+    /// the 40ms timer wake — mouse-move events arm the timer
+    /// (`arm_selection_autoscroll`) but never pump (the old move-driven pump
+    /// stacked scrolls under event pressure: "停滞+瞬移"). Speed follows the
+    /// Warp ramp — `autoscroll_ramp_rows(overshoot)` rows per tick, the
+    /// fractional remainder carried so long drags accumulate sub-row progress.
+    pub(super) fn pump_selection_autoscroll(&mut self) -> bool {
         let Some((x, y)) = self.interaction.selection_drag_pos else {
             self.window_runtime
                 .selection_autoscroll_active
@@ -1059,106 +1132,24 @@ impl App {
             // primary history snapshot view, where the block branch below
             // takes over (scroll + extend). Failure degrades: keep the grid
             // selection visible, never switch views and orphan it.
-            let tui_active = self
-                .sessions
-                .active()
-                .terminal
-                .as_ref()
-                .is_some_and(Terminal::primary_screen_app_active);
-            if !tui_active {
+            if self.selection_autoscroll_overshoot(y).is_none() {
                 self.window_runtime
                     .selection_autoscroll_active
                     .store(false, Ordering::Relaxed);
                 return false;
             }
-            let Some((top, bottom)) = self.grid_content_vbounds() else {
-                self.window_runtime
-                    .selection_autoscroll_active
-                    .store(false, Ordering::Relaxed);
-                return false;
-            };
-            let ch = self
-                .renderer
-                .as_ref()
-                .map(|r| r.cell_height() as f32)
-                .unwrap_or(20.0);
-            let margin = ch; // same edge-row band as the block branch
-            if (y as f32) < top - margin {
-                if !self.migrate_grid_selection_to_primary_history() {
-                    tracing::warn!(
-                        y,
-                        "TUI drag autoscroll migration failed; keeping grid selection"
-                    );
-                    self.window_runtime
-                        .selection_autoscroll_active
-                        .store(false, Ordering::Relaxed);
-                    return false;
-                }
-            } else if (y as f32) > bottom + margin {
-                // Down overshoot: a TUI grid has no scrollable history (its
-                // offset is forced to 0), so there is nothing to scroll
-                // toward; the in-band extend already clamped the endpoint.
-                self.window_runtime
-                    .selection_autoscroll_active
-                    .store(false, Ordering::Relaxed);
-                return false;
-            } else {
+            if !self.migrate_grid_selection_to_primary_history() {
+                tracing::warn!(
+                    y,
+                    "TUI drag autoscroll migration failed; keeping grid selection"
+                );
                 self.window_runtime
                     .selection_autoscroll_active
                     .store(false, Ordering::Relaxed);
                 return false;
             }
         }
-        let Some((top, bottom)) = self.block_content_vbounds() else {
-            self.window_runtime
-                .selection_autoscroll_active
-                .store(false, Ordering::Relaxed);
-            return false;
-        };
-        let ch = self
-            .renderer
-            .as_ref()
-            .map(|r| r.cell_height() as f32)
-            .unwrap_or(20.0);
-        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): in a TUI
-        // history snapshot view the content bottom IS the window bottom (no
-        // prompt/bottom chrome), so `bottom + margin` would be physically
-        // unreachable and a downward drag could never scroll. Shift the Down
-        // band inward to the content's bottom edge row when that happens;
-        // regular block views with a prompt below keep the legacy band.
-        // The edge row band is one line: scroll starts once the pointer
-        // enters the band.
-        let margin = ch;
-        // v1.10.25 (S2, rust-reviewer should-fix): compare against the ACTIVE
-        // PANE's bottom edge, not the whole-window viewport bottom. In a
-        // vertical split the pane's content bottom is far above the window's,
-        // so the old `viewport().1` falsely declared the Down band reachable
-        // and placed it in the pane below's territory. `layout_ctx` is the
-        // active pane's context (the same one `block_content_vbounds` derives
-        // `bottom` from — same frame, same coordinate system); its clip rect
-        // bottom is the pane's bottom edge. No clip (single pane) keeps the
-        // legacy whole-window viewport bottom so single-pane behavior is
-        // unchanged; if no ctx is available we fall back to that legacy value.
-        let pane_bottom = self.renderer.as_ref().and_then(|renderer| {
-            renderer.layout_ctx.map(|ctx| match ctx.clip {
-                Some(rect) => rect[3],
-                None => renderer.viewport().1,
-            })
-        });
-        let down_threshold = pane_bottom
-            .map(|pane_bottom| down_autoscroll_threshold(bottom, pane_bottom, ch))
-            .unwrap_or(bottom + margin);
-        let (dir, steps) = if (y as f32) < top - margin {
-            (
-                AutoscrollDir::Up,
-                autoscroll_steps((top - margin) - y as f32, ch),
-            )
-        } else if (y as f32) > down_threshold {
-            (
-                AutoscrollDir::Down,
-                autoscroll_steps(y as f32 - down_threshold, ch),
-            )
-        } else {
+        let Some((dir, overshoot_px)) = self.selection_autoscroll_overshoot(y) else {
             self.window_runtime
                 .selection_autoscroll_active
                 .store(false, Ordering::Relaxed);
@@ -1176,6 +1167,11 @@ impl App {
                 Some(renderer.block_scroll_metrics(terminal, pane_session_id).2)
             })
             .unwrap_or(0);
+        // Warp ramp speed, whole rows with fractional carry.
+        let raw = autoscroll_ramp_rows(overshoot_px);
+        let total = self.interaction.selection_autoscroll_carry + raw;
+        let steps = total.floor().max(1.0) as usize;
+        self.interaction.selection_autoscroll_carry = total - steps as f32;
         // At the history top/bottom the saturating scroll has no net effect;
         // detect that so the 40ms timer can stop instead of idle-spinning
         // (before = immutable read, then the mutable scroll, then re-read).
@@ -1194,12 +1190,13 @@ impl App {
         let moved = before != self.sessions.active().block_scroll();
         // Extend the endpoint: clamp y into the content band so the shared
         // row hit-test naturally lands on the new edge row.
+        let (top, bottom) = self.block_content_vbounds().unwrap_or((0.0, 0.0));
         let cy = (y as f32).clamp(top, (bottom - 1.0).max(top));
-        if let Some(bv_pos) = self.pixel_to_block_view_pos(x, cy as f64) {
+        if let Some(anchor) = self.pixel_to_block_view_pos(x, cy as f64) {
             self.sessions
                 .active_mut()
                 .selection_handler
-                .extend_block_view(bv_pos);
+                .extend_block_view(anchor);
         }
         self.window_runtime
             .selection_autoscroll_active

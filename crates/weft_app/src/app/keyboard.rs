@@ -183,6 +183,20 @@ impl crate::App {
             }
         }
 
+        // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): Esc clears transient
+        // selections (Warp parity — "点空/Esc = clear"). The ESC byte still
+        // forwards to the PTY below (vim/less keep their own key handling).
+        if key == KeyCode::Escape {
+            let pane = self.sessions.active_mut();
+            if pane.selection_handler.selecting
+                || pane.selection_handler.block_view_selection.is_some()
+                || pane.selection_handler.selection.is_some()
+            {
+                pane.selection_handler.clear();
+                self.request_redraw();
+            }
+        }
+
         let app_cursor_keys = self
             .tab()
             .terminal

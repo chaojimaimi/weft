@@ -20,9 +20,8 @@ enum SmartSelection {
         end: GridPos,
     },
     Block {
-        rows: Vec<weft_core::selection::BlockViewRow>,
-        start: BlockViewPos,
-        end: BlockViewPos,
+        start: BlockSelAnchor,
+        end: BlockSelAnchor,
     },
 }
 
@@ -51,20 +50,34 @@ impl App {
 
     fn smart_target_at_pixel(&self, x: f64, y: f64) -> Option<ResolvedSmartTarget> {
         if self.block_view_active() {
-            let pos = self.pixel_to_block_view_pos(x, y)?;
+            // v1.10.26: hit-test the row band directly (the anchor API no
+            // longer carries a row index; the target needs the row's
+            // (block_id, line) key to build anchors).
             let (rows, _, _) = self.compute_block_view_rows()?;
-            let (text, click_char, segments) = block_logical_line(&rows, pos)?;
+            let row_index = rows.iter().position(|r| r.contains_y(y as f32))?;
+            let row = &rows[row_index];
+            let renderer = self.renderer.as_ref()?;
+            let ctx = renderer.layout_ctx?;
+            let (content_left, _) = crate::layout::block_content_x_bounds(&ctx);
+            let click_char = weft_core::selection::pixel_x_to_char_index(
+                &row.text,
+                x,
+                content_left as f64,
+                renderer.cell_width() as f64,
+                row.indent_cols,
+            );
+            let (text, click_char, segments) = block_logical_line(&rows, row_index, click_char)?;
             let byte = byte_index_at_char(&text, click_char)?;
             let target = match_at(&text, byte)?;
             let selected_text = target.text(&text).to_string();
             let start_char = text[..target.start].chars().count();
             let end_char = text[..target.end].chars().count();
-            let start = block_pos_at_char(&segments, start_char, false)?;
-            let end = block_pos_at_char(&segments, end_char, true)?;
+            let start = block_pos_at_char(&rows, &segments, start_char, false)?;
+            let end = block_pos_at_char(&rows, &segments, end_char, true)?;
             return Some(ResolvedSmartTarget {
                 kind: target.kind,
                 text: selected_text,
-                selection: SmartSelection::Block { rows, start, end },
+                selection: SmartSelection::Block { start, end },
             });
         }
 
@@ -85,17 +98,32 @@ impl App {
     }
 
     fn apply_smart_selection(&mut self, selection: SmartSelection) {
-        let handler = &mut self.sessions.active_mut().selection_handler;
         match selection {
             SmartSelection::Grid { start, end } => {
+                let handler = &mut self.sessions.active_mut().selection_handler;
                 handler.start(start, SelectionMode::Simple);
                 handler.extend(end);
                 handler.end();
             }
-            SmartSelection::Block { rows, start, end } => {
-                handler.start_block_view(start, rows);
-                handler.extend_block_view(end);
-                handler.end();
+            SmartSelection::Block { start, end } => {
+                let pane = self.sessions.active_mut();
+                let fingerprint = pane
+                    .terminal
+                    .as_ref()
+                    .map(|t| {
+                        crate::selection::block_selection_fingerprint(
+                            t.block_tracker().session_blocks(),
+                            t.screen_head_lines(),
+                        )
+                    })
+                    .unwrap_or_default();
+                crate::selection::start_block_selection(
+                    &mut pane.selection_handler,
+                    start,
+                    fingerprint,
+                );
+                pane.selection_handler.extend_block_view(end);
+                pane.selection_handler.end();
             }
         }
     }
@@ -157,23 +185,26 @@ fn grid_pos_at_display_col(segments: &[(usize, String)], target: usize) -> Optio
     None
 }
 
+/// Reconstruct the logical line containing the clicked row (all wrapped
+/// chunks of one source line), returning the joined text, the click's char
+/// offset, and the chunk segments. v1.10.26 (rust-reviewer B1): the guard is
+/// now ONLY the content line — `block_id` may be `None` (a LIVE output row)
+/// or `Some(id)` (a finished block's output), both addressable as anchors
+/// (the anchor model's `block: Option<u64>`, `None` = live segment). Rows
+/// WITHOUT a content line (command/header/separator/LiveCommand) are not
+/// addressable as anchors, so smart select degrades to `None` there.
 fn block_logical_line(
     rows: &[weft_core::selection::BlockViewRow],
-    clicked: BlockViewPos,
+    clicked_row_index: usize,
+    click_char: usize,
 ) -> Option<(String, usize, Vec<BlockSegment>)> {
-    let clicked_row = rows.get(clicked.row_index)?;
-    let (Some(block_id), Some(line)) = (clicked_row.block_id, clicked_row.line) else {
-        let len = clicked_row.text.chars().count();
-        return Some((
-            clicked_row.text.clone(),
-            clicked.char_index,
-            vec![(clicked.row_index, 0, len)],
-        ));
-    };
+    let clicked_row = rows.get(clicked_row_index)?;
+    let line = clicked_row.line?;
+    let block = clicked_row.block_id;
     let mut segments: Vec<_> = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| row.block_id == Some(block_id) && row.line == Some(line))
+        .filter(|(_, row)| row.block_id == block && row.line == Some(line))
         .map(|(index, row)| (index, row.chunk_char_offset, row.text.chars().count()))
         .collect();
     segments.sort_unstable_by_key(|(_, offset, _)| *offset);
@@ -182,23 +213,27 @@ fn block_logical_line(
         .filter_map(|(index, _, _)| rows.get(*index))
         .map(|row| row.text.as_str())
         .collect();
-    Some((
-        text,
-        clicked_row.chunk_char_offset + clicked.char_index,
-        segments,
-    ))
+    Some((text, clicked_row.chunk_char_offset + click_char, segments))
 }
 
+/// Map a char offset in the logical line back to a content anchor. The
+/// anchor's `char_offset` is the LOGICAL-line offset (the source line is the
+/// unit the selection copies); the chunk only locates which rendered row the
+/// click belongs to.
 fn block_pos_at_char(
+    rows: &[weft_core::selection::BlockViewRow],
     segments: &[BlockSegment],
     target: usize,
     exclusive_end: bool,
-) -> Option<BlockViewPos> {
+) -> Option<BlockSelAnchor> {
     for (index, offset, len) in segments {
         if target < offset + len || (exclusive_end && target == offset + len) {
-            return Some(BlockViewPos {
-                row_index: *index,
-                char_index: target - offset,
+            let row = rows.get(*index)?;
+            let line = row.line?;
+            return Some(BlockSelAnchor {
+                block: row.block_id.map(|b| b.0),
+                line,
+                char_offset: target,
             });
         }
     }
@@ -261,7 +296,9 @@ fn decode_terminal_path(target: &str) -> String {
 mod tests {
     use super::*;
     use weft_core::blocks::BlockId;
-    use weft_core::selection::{BlockViewRow, BlockViewRowKind, BlockViewSelection};
+    use weft_core::selection::{
+        BlockSelAnchor, BlockViewRow, BlockViewRowKind, BlockViewSelection, SelectionContentSource,
+    };
 
     fn block_row(text: &str, offset: usize, line: Option<usize>) -> BlockViewRow {
         BlockViewRow {
@@ -276,20 +313,73 @@ mod tests {
         }
     }
 
+    /// A LIVE segment output row (`block_id` None — the in-flight document).
+    fn live_block_row(text: &str, offset: usize, line: usize) -> BlockViewRow {
+        BlockViewRow {
+            kind: BlockViewRowKind::Output,
+            text: text.into(),
+            block_id: None,
+            y_top: 0.0,
+            y_bottom: 20.0,
+            line: Some(line),
+            chunk_char_offset: offset,
+            indent_cols: 0,
+        }
+    }
+
+    /// In-memory source serving one block (id 7) with the given lines, so
+    /// anchor-built selections can be copied the same way the app copies.
+    struct SingleBlockSource {
+        lines: Vec<String>,
+        /// Cached document order (v1.10.26 rust-reviewer S4 — `block_order`
+        /// returns a slice, no per-query `Vec` allocation).
+        order: Vec<Option<u64>>,
+    }
+
+    impl SingleBlockSource {
+        fn new(lines: Vec<String>) -> Self {
+            Self {
+                lines,
+                order: vec![Some(7), None],
+            }
+        }
+    }
+
+    impl SelectionContentSource for SingleBlockSource {
+        fn line_count(&self, block: Option<u64>) -> usize {
+            if block == Some(7) {
+                self.lines.len()
+            } else {
+                0
+            }
+        }
+        fn line_text(&self, block: Option<u64>, line: usize) -> Option<&str> {
+            if block == Some(7) {
+                self.lines.get(line).map(String::as_str)
+            } else {
+                None
+            }
+        }
+        fn block_order(&self) -> &[Option<u64>] {
+            &self.order
+        }
+    }
+
     fn selected_single_row(text: &str, needle: &str) -> String {
-        let rows = vec![block_row(text, 0, None)];
+        let rows = vec![block_row(text, 0, Some(0))];
         let target = match_at(text, text.find(needle).unwrap()).unwrap();
         let segments = [(0, 0, text.chars().count())];
-        let start =
-            block_pos_at_char(&segments, text[..target.start].chars().count(), false).unwrap();
-        let end = block_pos_at_char(&segments, text[..target.end].chars().count(), true).unwrap();
-        BlockViewSelection {
-            start,
-            end,
-            rows,
-            frame_delta: 0.0,
-        }
-        .text()
+        let start = block_pos_at_char(
+            &rows,
+            &segments,
+            text[..target.start].chars().count(),
+            false,
+        )
+        .unwrap();
+        let end =
+            block_pos_at_char(&rows, &segments, text[..target.end].chars().count(), true).unwrap();
+        let source = SingleBlockSource::new(vec![text.to_string()]);
+        BlockViewSelection::new(start, end).text(&source)
     }
 
     #[test]
@@ -326,27 +416,62 @@ mod tests {
             block_row("https://ex", 0, Some(3)),
             block_row("ample.com/path", 10, Some(3)),
         ];
-        let (text, click, segments) = block_logical_line(
-            &rows,
-            BlockViewPos {
-                row_index: 1,
-                char_index: 2,
-            },
-        )
-        .unwrap();
+        let (text, click, segments) = block_logical_line(&rows, 1, 2).unwrap();
         let target = match_at(&text, byte_index_at_char(&text, click).unwrap()).unwrap();
         assert_eq!(target.text(&text), "https://example.com/path");
-        let start = block_pos_at_char(&segments, 0, false).unwrap();
-        let end = block_pos_at_char(&segments, text.chars().count(), true).unwrap();
+        let start = block_pos_at_char(&rows, &segments, 0, false).unwrap();
+        let end = block_pos_at_char(&rows, &segments, text.chars().count(), true).unwrap();
+        let source = SingleBlockSource::new(vec![
+            "unused".into(),
+            "unused".into(),
+            "unused".into(),
+            text.clone(),
+        ]);
+        assert_eq!(BlockViewSelection::new(start, end).text(&source), text);
         assert_eq!(
-            BlockViewSelection {
-                start,
-                end,
-                rows,
-                frame_delta: 0.0,
+            start,
+            BlockSelAnchor {
+                block: Some(7),
+                line: 3,
+                char_offset: 0
+            },
+            "anchor targets the source line, not a chunk row"
+        );
+    }
+
+    /// Regression (rust-reviewer B1 blocker): LIVE output rows carry
+    /// `(block_id = None, line = Some(idx))` — the anchor model supports a
+    /// None block (the composed live document), so Cmd+Shift+Click on a live
+    /// row must resolve a semantic target instead of degrading to
+    /// "no semantic target". The old guard required BOTH `block_id` and
+    /// `line` to be `Some`, which dropped every live row.
+    #[test]
+    fn live_segment_rows_resolve_a_smart_select_target() {
+        let rows = vec![
+            live_block_row("https://ex", 0, 3),
+            live_block_row("ample.com/path", 10, 3),
+        ];
+        let (text, click, segments) = block_logical_line(&rows, 1, 2).unwrap();
+        let target = match_at(&text, byte_index_at_char(&text, click).unwrap()).unwrap();
+        assert_eq!(target.text(&text), "https://example.com/path");
+        let start = block_pos_at_char(&rows, &segments, 0, false).unwrap();
+        let end = block_pos_at_char(&rows, &segments, text.chars().count(), true).unwrap();
+        assert_eq!(
+            start,
+            BlockSelAnchor {
+                block: None,
+                line: 3,
+                char_offset: 0
+            },
+            "a live row anchors to the live segment (block None)"
+        );
+        assert_eq!(
+            end,
+            BlockSelAnchor {
+                block: None,
+                line: 3,
+                char_offset: text.chars().count()
             }
-            .text(),
-            text
         );
     }
 

@@ -135,6 +135,7 @@ impl MetalRenderer {
                 let (mut vertices, _, _) = self.build_block_view_vertices(
                     BlockViewPaintModel {
                         blocks: pane.terminal.block_tracker().session_blocks(),
+                        live_head_lines: pane.terminal.screen_head_lines(),
                         region_bottom_y,
                         cwd: pane.terminal.cwd(),
                         git_branch: pane.terminal.git_branch(),

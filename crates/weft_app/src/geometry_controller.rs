@@ -215,6 +215,27 @@ impl App {
         for (i, tab) in self.sessions.tabs_mut().iter_mut().enumerate() {
             if tab.terminal.is_some() {
                 let resized = tab.resize_all_panes_for_rect(content_rect, cell_w, cell_h);
+                if resized {
+                    // v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): a terminal
+                    // resize changes every line wrap and char offset — content
+                    // anchors cannot survive it, so block-view selections are
+                    // cleared (Warp clears on resize too). The grid selection
+                    // model is untouched here (its viewport-relative drift
+                    // guards live in the scroll path).
+                    for pane in tab.panes_mut() {
+                        if pane.selection_handler.block_view_selection.is_some() {
+                            tracing::info!("terminal resized; cleared block selection");
+                            // v1.10.26 (rust-reviewer S3): clear only the
+                            // block-view half — the grid `Selection` and the
+                            // in-progress `selecting` flag survive (they have
+                            // their own viewport-relative resize semantics, and
+                            // `clear()` would also drop them, contradicting the
+                            // comment above).
+                            pane.selection_handler.block_view_selection = None;
+                            pane.selection_handler.block_doc_fingerprint = None;
+                        }
+                    }
+                }
                 if resized && i == active {
                     let active_id = tab.active_pane_id();
                     let layouts = tab.split_tree().layout(content_rect);
@@ -377,11 +398,18 @@ impl App {
     /// `chunk_char_offset` is added to the click's `char_index` to compute
     /// the full-line char index that `StyledLine::link_at` expects.
     pub(super) fn block_view_hyperlink_at_pixel(&self, x: f64, y: f64) -> Option<String> {
-        let pos = self.pixel_to_block_view_pos(x, y)?;
         let (rows, _, _) = self.compute_block_view_rows()?;
-        let row = rows.get(pos.row_index)?;
+        let row = rows.iter().find(|r| r.contains_y(y as f32))?;
         let line_idx = row.line?;
-        let char_index = row.chunk_char_offset + pos.char_index;
+        let char_index = row.chunk_char_offset
+            + weft_core::selection::pixel_x_to_char_index(
+                &row.text,
+                x,
+                crate::layout::block_content_x_bounds(&self.renderer.as_ref()?.layout_ctx?).0
+                    as f64,
+                self.renderer.as_ref()?.cell_width() as f64,
+                row.indent_cols,
+            );
         let terminal = self.sessions.active().terminal.as_ref()?;
         let tracker = terminal.block_tracker();
         // Resolve the StyledLine from either a finalized block or the live
@@ -406,7 +434,7 @@ impl App {
         styled_line.and_then(|line| line.link_at(char_index).map(str::to_string))
     }
 
-    /// Convert pixel coordinates to a block-view position.
+    /// Convert pixel coordinates to a block-view CONTENT ANCHOR.
     ///
     /// Used in place of `pixel_to_grid` when `show_block_view()` is true: the
     /// classic grid division (`y / cell_h`) does not match the block view's
@@ -414,11 +442,19 @@ impl App {
     /// pinned CWD bar, or the scroll offset, so a grid-coordinate copy landed
     /// on the wrong line (the "复制错位" bug). This walks the renderer's cached
     /// `block_view_rows` (scroll-adjusted y bands + visible text) and maps the
-    /// click to a char index in the matched row, honoring CJK double-width.
+    /// click to a content anchor: the hit row's `(block_id, line)` key plus a
+    /// char offset into the source line, honoring CJK double-width and the
+    /// chunk's `chunk_char_offset`.
+    ///
+    /// v1.10.26 (FIX_SELECTION_CONTENT_ANCHORS): the anchor replaces the old
+    /// row-index `BlockViewPos`. Only rows with a real `(block, line)` key
+    /// (Output rows) are addressable; structural rows (Command/Header/
+    /// Separator/LiveCommand) carry no document line and are not anchor
+    /// endpoints.
     ///
     /// Returns `None` if no row band contains `y` (e.g. on the CWD bar / input
-    /// box / outside the scroll region) or the matched row isn't selectable.
-    pub(super) fn pixel_to_block_view_pos(&self, x: f64, y: f64) -> Option<BlockViewPos> {
+    /// box / outside the scroll region) or the matched row isn't an Output row.
+    pub(super) fn pixel_to_block_view_pos(&self, x: f64, y: f64) -> Option<BlockSelAnchor> {
         let renderer = self.renderer.as_ref()?;
         let cw = renderer.cell_width() as f64;
         if cw <= 0.0 {
@@ -432,12 +468,10 @@ impl App {
         // Find the row whose [y_top, y_bottom) contains y.
         let row_index = rows.iter().position(|r| r.contains_y(y as f32))?;
         let row = &rows[row_index];
-        if !matches!(
-            row.kind,
-            BlockViewRowKind::Output | BlockViewRowKind::Command | BlockViewRowKind::LiveCommand
-        ) {
+        if row.kind != BlockViewRowKind::Output {
             return None;
         }
+        let line = row.line?;
         // v1.10.13: command first lines render after the chevron + "> " indent;
         // subtract it so the char index matches the character under the cursor
         // (continuation lines and output rows are flush-left, indent 0).
@@ -449,9 +483,10 @@ impl App {
             cw,
             row.indent_cols,
         );
-        Some(BlockViewPos {
-            row_index,
-            char_index,
+        Some(BlockSelAnchor {
+            block: row.block_id.map(|b| b.0),
+            line,
+            char_offset: row.chunk_char_offset + char_index,
         })
     }
 
@@ -566,6 +601,7 @@ impl App {
         Some(
             renderer.compute_block_view_rows(crate::paint::block_view_model::BlockViewPaintModel {
                 blocks: terminal.block_tracker().session_blocks(),
+                live_head_lines: terminal.screen_head_lines(),
                 region_bottom_y,
                 cwd: terminal.cwd(),
                 git_branch: terminal.git_branch(),

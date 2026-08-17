@@ -9,6 +9,12 @@ use crate::app_state::BlockDiagnoseState;
 
 pub(crate) struct BlockViewPaintModel<'a> {
     pub(crate) blocks: &'a [Block],
+    /// v1.10.26 (rust-reviewer S1): lines prepended to the live composed
+    /// document's head (`screen_history_lines + screen_prefix_lines`). The
+    /// block-selection fingerprint keys on it — a preserved-frame append
+    /// head-grow clears a live-segment selection (anchors are indices into
+    /// the composed document and would silently drift).
+    pub(crate) live_head_lines: usize,
     pub(crate) region_bottom_y: f32,
     pub(crate) cwd: Option<&'a str>,
     pub(crate) git_branch: Option<&'a str>,
