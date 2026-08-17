@@ -51,6 +51,7 @@ impl MetalRenderer {
             tui_cursor,
             tui_preedit,
             cursor_blink_on: _,
+            is_alt,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -277,6 +278,17 @@ impl MetalRenderer {
             },
         );
 
+        // v1.10.26 (FIX_IME_PREEDIT): B-path PREEDIT_DIAG tracking. Only
+        // populated while a preedit is active, so the hot path is untouched
+        // on the common (no-IME) frames. `first/last_live_line` record the
+        // visible LIVE row span (block_id None, content line present) the
+        // caret-matching loop actually iterated; `caret_painted` flips when
+        // a live row matched `tui_caret_row_matches` and drew the preedit.
+        let preedit_track = tui_preedit.map(|(p, _)| p);
+        let mut first_live_line: Option<usize> = None;
+        let mut last_live_line: Option<usize> = None;
+        let mut caret_painted = false;
+
         for (i, &dist) in rows.iter().enumerate() {
             // v1.10.26: the owning segment key of a structural row. A
             // Separator follows its block's Header (or the live header), so
@@ -316,6 +328,15 @@ impl MetalRenderer {
                     // hints carry line == usize::MAX → not addressable).
                     let key_line = (*line != usize::MAX).then_some(*line);
                     let key_block = block_id.map(|b| b.0);
+                    // v1.10.26 (FIX_IME_PREEDIT): B-path diagnostic — record
+                    // the visible live-row span so the log can show whether
+                    // the expected caret line is even inside the painted rows.
+                    if preedit_track.is_some() && block_id.is_none() {
+                        if let Some(l) = key_line {
+                            first_live_line = Some(first_live_line.map_or(l, |f: usize| f.min(l)));
+                            last_live_line = Some(last_live_line.map_or(l, |f: usize| f.max(l)));
+                        }
+                    }
                     if chunks.len() <= 1 {
                         let selection_range = char_range_for(key_block, key_line);
                         if let Some((cs, ce)) = selection_range {
@@ -401,6 +422,10 @@ impl MetalRenderer {
                                 // Steady-on: blink timer only wakes for AtPrompt, so cursor_blink_on is stale.
                                 push_quad(&mut verts, caret_quad, bg_uv, [0.0; 4], accent);
                                 if let Some((preedit, preedit_cursor)) = tui_preedit {
+                                    // v1.10.26 (FIX_IME_PREEDIT): the caret
+                                    // matched — the preedit was drawn on a
+                                    // live row (path = "B").
+                                    caret_painted = true;
                                     self.push_block_tui_preedit(
                                         &mut verts,
                                         crate::paint::preedit::BlockTuiPreeditParams {
@@ -527,6 +552,10 @@ impl MetalRenderer {
                                         self.block_view_tui_caret_area.set(Some(caret_area));
                                         push_quad(&mut verts, caret_quad, bg_uv, [0.0; 4], accent);
                                         if let Some((preedit, preedit_cursor)) = tui_preedit {
+                                            // v1.10.26 (FIX_IME_PREEDIT): B-path
+                                            // diagnostic — preedit drawn (wrapped
+                                            // cursor chunk path).
+                                            caret_painted = true;
                                             self.push_block_tui_preedit(
                                                 &mut verts,
                                                 crate::paint::preedit::BlockTuiPreeditParams {
@@ -948,6 +977,33 @@ impl MetalRenderer {
                     }
                 }
             }
+        }
+
+        // v1.10.26 (FIX_IME_PREEDIT): B-path diagnostic — emitted once per
+        // frame while a BlockView-mode TUI preedit is active. Debug-only.
+        if let Some((preedit, _)) = tui_preedit {
+            let empty = preedit.is_empty();
+            let path = if empty {
+                "empty-text"
+            } else if tui_cursor.is_none() {
+                "B-suppressed-none"
+            } else if !caret_painted {
+                "B-no-match"
+            } else {
+                "B"
+            };
+            tracing::debug!(
+                show_block_view = true,
+                is_alt,
+                cursor_col = tui_cursor.map(|c| c.1),
+                preedit_len = preedit.chars().count(),
+                expected_cursor_line = tui_cursor.map(|c| c.0),
+                first_live_line,
+                last_live_line,
+                caret_painted,
+                path,
+                "PREEDIT_DIAG"
+            );
         }
 
         let sticky_block = rows::sticky_block_id(&bv_rows, clip_top, clip_bottom);

@@ -97,6 +97,7 @@ impl MetalRenderer {
             tui_cursor: _,
             tui_preedit: _,
             cursor_blink_on: _,
+            is_alt: _,
         } = model;
 
         let cw = self.cell_width() as f32;

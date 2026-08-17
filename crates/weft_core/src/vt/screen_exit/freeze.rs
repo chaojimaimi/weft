@@ -199,6 +199,45 @@ impl Terminal {
         (composed, StyledOutput { lines })
     }
 
+    /// v1.10.26 (FIX_IME_PREEDIT): map the cursor's row WITHIN the live
+    /// viewport segment to an absolute line in the CURRENT in-flight screen
+    /// block, derived from the composed text structure itself.
+    ///
+    /// [`Self::compose_screen_history`] appends the viewport segment LAST, so
+    /// it occupies the final `segment_len` bytes of the in-flight block's
+    /// text; the count of `\n` before that suffix is exactly the head offset
+    /// (preserved-frame history + scroll-out prefix + separators). Deriving
+    /// from the published text (instead of re-adding
+    /// `screen_history_lines() + screen_prefix_lines()`) makes the anchor
+    /// same-frame, same-source — a 1MiB split consuming the head, or the
+    /// prefix growing between rate-limited publishes, cannot leave it out of
+    /// sync with the rows the BlockView paints (`tui_caret_row_matches` then
+    /// never matches and the caret + IME preedit silently vanish).
+    pub(super) fn composed_cursor_snapshot_line(
+        &self,
+        cursor_line: Option<usize>,
+        segment_len: usize,
+    ) -> Option<usize> {
+        let cursor_line = cursor_line?;
+        let output = self.block_tracker.in_flight()?.output;
+        // The segment is an intact str tail in the normal replace/split
+        // paths, so `head_len` is a char boundary; a degraded >1MiB segment
+        // split truncates inside the segment (`output.len() < segment_len`),
+        // the saturating head becomes 0, and the raw cursor row still anchors
+        // the caret as well as the pre-split heuristic could.
+        let head_len = output.len().saturating_sub(segment_len);
+        // v1.10.26 review B1 guard: every regular publish pairs the output
+        // with its segment length, but degraded paths (interrupt window,
+        // >1MiB truncation) can leave the pair briefly describing different
+        // strings — back off to the nearest char boundary instead of
+        // panicking on a mid-character slice.
+        let mut head_len = head_len;
+        while head_len > 0 && !output.is_char_boundary(head_len) {
+            head_len -= 1;
+        }
+        Some(cursor_line + output[..head_len].matches('\n').count())
+    }
+
     /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): incrementally capture rows
     /// pushed out of the viewport by a scroll (LF overflow via
     /// `index_primary_screen`, CSI S via `scroll_grid_rows`) while a

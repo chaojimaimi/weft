@@ -53,6 +53,12 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// (blinking bar) and IME preedit are drawn directly on the live block
     /// row. `None` for Editor-mode / non-TUI block views.
     pub(crate) tui_cursor: Option<(usize, usize)>,
+    /// v1.10.26 (FIX_IME_PREEDIT): are we inside an alt-screen TUI this
+    /// frame? The renderer suppresses the BlockView caret on alt-screen
+    /// history peeks; carrying the flag into the B-path preedit diagnostic
+    /// (`PREEDIT_DIAG`) distinguishes "suppressed by alt" from "no in-flight
+    /// block".
+    pub(crate) is_alt: bool,
     /// v1.10.5: active IME preedit for a BlockView-mode TUI, drawn at the
     /// mapped caret. `(text, caret_byte_range)`.
     pub(crate) tui_preedit: Option<(&'a str, Option<(usize, usize)>)>,

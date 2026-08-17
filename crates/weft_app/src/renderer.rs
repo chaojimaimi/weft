@@ -660,6 +660,7 @@ impl MetalRenderer {
                         tui_cursor: None,
                         tui_preedit: None,
                         cursor_blink_on: false,
+                        is_alt: terminal.is_alt_screen_active(),
                     },
                     selection,
                 )
@@ -714,6 +715,7 @@ impl MetalRenderer {
                         tui_cursor: self.block_view_tui_cursor(terminal, grid),
                         tui_preedit: tui_preedit.map(|p| (p.text, p.cursor)),
                         cursor_blink_on,
+                        is_alt: terminal.is_alt_screen_active(),
                     },
                     selection,
                 )
@@ -867,9 +869,16 @@ impl MetalRenderer {
         // BlockView the preedit is painted inside `build_block_view_vertices`
         // (on the mapped live-block row); drawing it again here at the grid
         // cursor position produces a duplicate preedit ("two pinyin strings").
+        // v1.10.26 (FIX_IME_PREEDIT): the A-path PREEDIT_DIAG logs from
+        // `build_tui_preedit_for_grid` (paint/preedit.rs).
         if let Some(preedit) = tui_preedit {
             if !show_blocks {
-                vertices.extend_from_slice(&self.build_tui_preedit_for_grid(preedit, grid));
+                vertices.extend_from_slice(&self.build_tui_preedit_for_grid(
+                    preedit,
+                    grid,
+                    !terminal.is_alt_screen_active() && terminal.primary_screen_owns_live_view(),
+                    terminal.is_alt_screen_active(),
+                ));
             }
         }
 

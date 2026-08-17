@@ -84,9 +84,11 @@ pub(crate) fn tui_preedit_rows(
         if grapheme.contains(['\r', '\n']) {
             flush(&mut output, row, chunk_col, chunk_start, byte, &mut chunk);
             row += 1;
-            if row >= rows {
-                return output;
-            }
+            // v1.10.26 (FIX_IME_PREEDIT): clamp past-the-bottom wraps onto
+            // the last row instead of returning — a preedit starting at the
+            // bottom-right cell used to wrap once and abort empty. Only give
+            // up when the START row is outside the grid (the guard above).
+            row = row.min(rows - 1);
             col = 0;
             chunk_col = 0;
             chunk_start = byte + grapheme.len();
@@ -98,9 +100,9 @@ pub(crate) fn tui_preedit_rows(
                 flush(&mut output, row, chunk_col, chunk_start, byte, &mut chunk);
             }
             row += 1;
-            if row >= rows {
-                return output;
-            }
+            // v1.10.26 (FIX_IME_PREEDIT): same clamp — keep folding within
+            // `num_rows` (see the newline branch above) rather than aborting.
+            row = row.min(rows - 1);
             col = 0;
             chunk_col = 0;
             chunk_start = byte;
@@ -119,16 +121,46 @@ pub(crate) fn tui_preedit_rows(
     output
 }
 
+/// v1.10.26 (FIX_IME_PREEDIT): physical x of the left edge of `col` for the
+/// grid-path IME preedit — derived from the SAME content origin the grid
+/// cell renderer uses (`grid::grid_content_origin_x`), so marked text lands
+/// exactly on its grid column. `ctx.col_x()` starts at `left()` and misses
+/// the BlockView gutter inset a primary-screen TUI grid applies
+/// (`inset_block_gutter`), which draws the preedit ~1.5 cells left of its
+/// cell.
+pub(crate) fn grid_preedit_col_x(
+    ctx: &crate::layout::LayoutCtx,
+    col: usize,
+    inset_block_gutter: bool,
+) -> f32 {
+    crate::paint::grid::grid_content_origin_x(ctx, inset_block_gutter) + col as f32 * ctx.cell_w
+}
+
 impl MetalRenderer {
+    /// v1.10.26 (FIX_IME_PREEDIT): grid-path (A-path) preedit draw entry —
+    /// the single caller is renderer.rs's `!show_blocks` grid branch, so the
+    /// PREEDIT_DIAG logged here is the A-path diagnostic.
     pub(crate) fn build_tui_preedit_for_grid(
         &self,
         params: TuiPreeditDrawParams<'_>,
         grid: &Grid,
+        inset_block_gutter: bool,
+        is_alt: bool,
     ) -> Vec<f32> {
+        tracing::debug!(
+            show_block_view = false,
+            is_alt,
+            cursor_row = grid.cursor.row,
+            cursor_col = grid.cursor.col,
+            preedit_len = params.text.chars().count(),
+            path = "A",
+            "PREEDIT_DIAG"
+        );
         self.build_tui_preedit_vertices(
             params,
             (grid.cursor.row, grid.cursor.col),
             (grid.num_rows, grid.num_cols),
+            inset_block_gutter,
         )
     }
 
@@ -137,6 +169,10 @@ impl MetalRenderer {
         params: TuiPreeditDrawParams<'_>,
         grid_cursor: (usize, usize),
         grid_size: (usize, usize),
+        // v1.10.26 (FIX_IME_PREEDIT): same `grid_content_origin_x` flag the
+        // grid cell renderer used this frame — primary-screen TUI grids inset
+        // by the BlockView gutter, alt-screen TUIs paint edge-to-edge.
+        inset_block_gutter: bool,
     ) -> Vec<f32> {
         let mut vertices = Vec::new();
         let Some(ctx) = self.layout_ctx else {
@@ -166,7 +202,7 @@ impl MetalRenderer {
 
         let row_count = rows.len();
         for (row_index, row) in rows.into_iter().enumerate() {
-            let x = ctx.col_x(row.grid_col);
+            let x = grid_preedit_col_x(&ctx, row.grid_col, inset_block_gutter);
             let y = ctx.row_y(row.grid_row);
             let width = Self::text_col_width(&row.text).max(1);
             push_quad(
@@ -361,11 +397,72 @@ mod tests {
     }
 
     #[test]
-    fn preedit_is_clipped_to_the_grid() {
+    fn preedit_is_clamped_to_last_row_instead_of_cut() {
+        // v1.10.26 (FIX_IME_PREEDIT): starting at the last column of the last
+        // row used to abort on the first wrap (returning only "a"). The wrap
+        // now clamps to the last row so the whole preedit is still laid out
+        // (overlapping on the last row) instead of silently losing characters.
         let rows = tui_preedit_rows("abcdef", 0, 3, 1, 4);
         assert_eq!(
             rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
-            ["a"]
+            ["a", "bcde", "f"]
         );
+        assert_eq!(rows[0].grid_col, 3);
+        assert_eq!(rows[1].grid_col, 0);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<String>(),
+            "abcdef",
+            "clamping must not lose preedit text (folded rows overlap on the last row)"
+        );
+    }
+
+    #[test]
+    fn preedit_at_bottom_right_is_not_empty() {
+        // v1.10.26 (FIX_IME_PREEDIT) regression: a preedit starting at the
+        // bottom-right cell used to wrap once and abort empty — the IME
+        // marked text vanished with nothing to show. Both wraps (newline and
+        // width) now fold within `num_rows`.
+        // Wide char at (rows-1, cols-1): previously returned empty.
+        let rows = tui_preedit_rows("中", 1, 4, 2, 5);
+        assert!(
+            !rows.is_empty(),
+            "bottom-right wide preedit must not be empty"
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["中"]
+        );
+        assert_eq!((rows[0].grid_row, rows[0].grid_col), (1, 0));
+        // A newline at the very bottom must clamp, not drop the rest.
+        let rows = tui_preedit_rows("ab\ncd", 0, 3, 1, 4);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "cd"],
+            "bottom-row newline must keep the tail via clamp"
+        );
+    }
+
+    #[test]
+    fn preedit_x_aligns_with_grid_cell_origin() {
+        // v1.10.26 (FIX_IME_PREEDIT): the grid-path preedit shares the grid
+        // renderer's content origin and column advance, so the first grapheme
+        // lands exactly on its grid cell x — with the BlockView gutter inset
+        // for primary-screen TUIs and edge-to-edge for alt-screen TUIs.
+        let ctx = crate::layout::LayoutCtx::new((1200.0, 800.0), 8.0, 8.0, 8.0, 8.0);
+        let col = 5;
+        for inset in [true, false] {
+            let grid_cell_x =
+                crate::paint::grid::grid_content_origin_x(&ctx, inset) + col as f32 * ctx.cell_w;
+            assert_eq!(super::grid_preedit_col_x(&ctx, col, inset), grid_cell_x);
+        }
+        // The inset shift is the very difference the fix applies — without it
+        // the preedit drew ~1.5 cells left of the cell.
+        assert!(
+            super::grid_preedit_col_x(&ctx, col, true)
+                > super::grid_preedit_col_x(&ctx, col, false),
+            "the BlockView gutter inset must shift the preedit right WITH the grid"
+        );
+        // Alt-screen parity with the legacy `col_x` (edge-to-edge, no shift).
+        assert_eq!(super::grid_preedit_col_x(&ctx, col, false), ctx.col_x(col));
     }
 }

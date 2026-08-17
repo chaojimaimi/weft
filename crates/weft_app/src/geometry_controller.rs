@@ -625,6 +625,7 @@ impl App {
                 tui_cursor: None,
                 tui_preedit: None,
                 cursor_blink_on: false,
+                is_alt: terminal.is_alt_screen_active(),
             }),
         )
     }

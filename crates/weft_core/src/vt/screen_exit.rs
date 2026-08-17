@@ -741,11 +741,15 @@ impl Terminal {
         self.capabilities.last_caret_snapshot_cursor = Some(cursor);
         let document_start = self.block_tracker.screen_document_start().unwrap_or(0);
         let (_, _, cursor_line) = self.primary_screen_document_snapshot(document_start);
-        // v1.10.23: shift by the preserved-frame history — the caret row must
-        // match the composed block output (history + snapshot).
-        // v1.10.25: shift by the scroll-out prefix too (three-part compose).
+        // v1.10.26 (FIX_IME_PREEDIT): re-anchor from the published composed
+        // text (`freeze::composed_cursor_snapshot_line`) — the prefix grows
+        // between 50ms publishes, so counted offsets drift past painted rows.
+        let segment_len = self
+            .capabilities
+            .primary_screen_cursor_segment_len
+            .unwrap_or(0);
         self.capabilities.primary_screen_cursor_snapshot_line =
-            cursor_line.map(|line| line + self.screen_history_lines() + self.screen_prefix_lines());
+            self.composed_cursor_snapshot_line(cursor_line, segment_len);
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
@@ -836,6 +840,12 @@ impl Terminal {
             let segment_len = text.len();
             let (text, styled) = self.compose_screen_history(text, styled);
             self.publish_screen_snapshot(text, styled, segment_len);
+            // v1.10.26 review B1: the merged text replaced the in-flight
+            // output — the stored segment length must describe THIS string,
+            // or a mid-window keypress slices at a stale offset (a
+            // non-char-boundary panic under CJK). The raw grid cursor row
+            // anchors the caret here; the interrupt window is transient.
+            self.capabilities.primary_screen_cursor_segment_len = Some(segment_len);
             return;
         }
         let Some(document_start) = self.block_tracker.screen_document_start() else {
@@ -851,17 +861,13 @@ impl Terminal {
         let segment_len = text.len();
         let (text, styled) = self.compose_screen_history(text, styled);
         self.publish_screen_snapshot(text, styled, segment_len);
-        // v1.10.6: store the precisely-tracked cursor snapshot line so the
-        // BlockView paint can place the caret/preedit on the exact document
-        // row instead of guessing from a formula that breaks when the
-        // snapshot skips empty rows.
-        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): compute the caret anchor
-        // AFTER the split — a split consumed the head of the history/prefix,
-        // so only the REMAINING offsets locate the caret on the in-flight
-        // block's composed rows. Pre-split offsets left a ≤50ms caret
-        // out-of-bounds window on split frames.
+        // v1.10.6/25/26 (FIX_IME_PREEDIT): store the caret snapshot line
+        // AFTER publish from the composed text actually written
+        // (`freeze::composed_cursor_snapshot_line`) — pre-split offsets or
+        // recomputed head counts drift past the painted rows on splits.
         self.capabilities.primary_screen_cursor_snapshot_line =
-            cursor_line.map(|line| line + self.screen_history_lines() + self.screen_prefix_lines());
+            self.composed_cursor_snapshot_line(cursor_line, segment_len);
+        self.capabilities.primary_screen_cursor_segment_len = Some(segment_len);
     }
 
     /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): publish a composed screen

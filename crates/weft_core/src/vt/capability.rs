@@ -94,6 +94,13 @@ pub(in crate::vt) struct CapabilityFlags {
     /// can place the caret/preedit on the exact materialized document row.
     /// `None` before a snapshot or for omitted leading/trailing/unowned rows.
     pub(in crate::vt) primary_screen_cursor_snapshot_line: Option<usize>,
+    /// v1.10.26 (FIX_IME_PREEDIT): byte length of the live viewport segment
+    /// text in the CURRENT in-flight screen block (the snapshot text as
+    /// composed LAST by `compose_screen_history`). Stored alongside the caret
+    /// line so the keystroke path (`snapshot_primary_screen_output_for_caret`)
+    /// can re-derive the anchor from the published text structure itself
+    /// instead of re-adding separately-tracked head counts.
+    pub(in crate::vt) primary_screen_cursor_segment_len: Option<usize>,
     /// v1.10.7 (reviewer MEDIUM): last `(row, col)` that drove a caret
     /// snapshot refresh. `snapshot_primary_screen_output_for_caret` is
     /// called per keystroke (no rate limit) and rebuilds the whole document;
@@ -148,6 +155,7 @@ impl Default for CapabilityFlags {
             primary_screen_relative_addressing_seen: false,
             primary_screen_cursor_ops: 0,
             primary_screen_cursor_snapshot_line: None,
+            primary_screen_cursor_segment_len: None,
             last_caret_snapshot_cursor: None,
             primary_screen_document_candidate: 0,
             primary_screen_synchronized_frame_seen: false,
