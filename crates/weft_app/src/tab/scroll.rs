@@ -421,6 +421,7 @@ mod tests {
                 started_at: std::time::SystemTime::now(),
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             }
         }
         let t = weft_core::vt::Terminal::new(24, 80);

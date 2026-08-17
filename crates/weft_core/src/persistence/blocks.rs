@@ -65,6 +65,12 @@ impl BlockStore {
         ensure_tabs_active_column(&conn)?;
         ensure_column(&conn, "blocks", "cwd", "TEXT")?;
         ensure_column(&conn, "blocks", "styled_output", "TEXT")?;
+        ensure_column(
+            &conn,
+            "blocks",
+            "screen_origin",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&conn, "tabs", "block_ids", "TEXT")?;
         let next_block_id =
             conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM blocks", [], |row| {
@@ -91,8 +97,8 @@ impl BlockStore {
             .filter(|json| json.len() <= MAX_STYLED_OUTPUT_JSON_BYTES);
         self.conn.execute(
             "INSERT OR REPLACE INTO blocks \
-             (id, command, cwd, output, styled_output, exit_code, started_ms, finished_ms, collapsed) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, command, cwd, output, styled_output, exit_code, started_ms, finished_ms, collapsed, screen_origin) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 block.id.0 as i64,
                 &block.command,
@@ -103,6 +109,7 @@ impl BlockStore {
                 system_time_to_millis(block.started_at),
                 block.finished_at.map(system_time_to_millis),
                 block.collapsed as i64,
+                block.screen_origin as i64,
             ],
         )?;
         Ok(())
@@ -113,7 +120,7 @@ impl BlockStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, command, cwd, output, \
                     CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
-                    exit_code, started_ms, finished_ms, collapsed \
+                    exit_code, started_ms, finished_ms, collapsed, screen_origin \
              FROM blocks ORDER BY started_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_block)?;
@@ -127,7 +134,7 @@ impl BlockStore {
         let mut stmt = self.conn.prepare(
             "SELECT id, command, cwd, output, \
                     CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
-                    exit_code, started_ms, finished_ms, collapsed \
+                    exit_code, started_ms, finished_ms, collapsed, screen_origin \
              FROM blocks \
              WHERE INSTR(LOWER(command), LOWER(?1)) > 0 \
                 OR INSTR(LOWER(output), LOWER(?1)) > 0 \
@@ -151,7 +158,7 @@ impl BlockStore {
             .query_row(
                 "SELECT id, command, cwd, output, \
                         CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
-                        exit_code, started_ms, finished_ms, collapsed \
+                        exit_code, started_ms, finished_ms, collapsed, screen_origin \
                  FROM blocks WHERE id = ?1",
                 params![block_id.0 as i64],
                 row_to_block,
@@ -172,6 +179,11 @@ pub(crate) fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
     let started_ms: i64 = row.get(6)?;
     let finished_ms: Option<i64> = row.get(7)?;
     let collapsed: i64 = row.get(8)?;
+    // v1.10.26 Batch B review closure (SF-1): screen_origin persisted since
+    // Batch B — a restored TUI block keeps clip-not-wrap across Restore. The
+    // DEFAULT 0 covers legacy rows (shell-wrap semantics), matching the
+    // runtime default for ordinary commands.
+    let screen_origin: i64 = row.get(9)?;
     Ok(Block {
         id: BlockId(id as u64),
         command,
@@ -185,6 +197,7 @@ pub(crate) fn row_to_block(row: &rusqlite::Row) -> rusqlite::Result<Block> {
         started_at: millis_to_system_time(started_ms),
         finished_at: finished_ms.map(millis_to_system_time),
         collapsed: collapsed != 0,
+        screen_origin: screen_origin != 0,
     })
 }
 
@@ -224,6 +237,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(id * 1000),
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(id * 1000 + 5)),
             collapsed: false,
+            screen_origin: false,
         }
     }
 
@@ -344,6 +358,37 @@ mod tests {
         store.insert(&b).unwrap();
         let loaded = store.recent(1).unwrap().pop().unwrap();
         assert!(loaded.collapsed);
+    }
+
+    /// v1.10.26 Batch B review closure (SF-1): a TUI block's `screen_origin`
+    /// must survive persistence so the Restore path does not resurrect the
+    /// `|]` fold — a restored primary-screen block keeps clip-not-wrap.
+    #[test]
+    fn screen_origin_flag_persists() {
+        let store = temp_store();
+        let mut tui = block(21, "omp", "[| top line |]\n[|......|]\n", Some(0));
+        tui.screen_origin = true;
+        store.insert(&tui).unwrap();
+        let plain = block(22, "echo hi", "some output\n", Some(0));
+        store.insert(&plain).unwrap();
+
+        let recent = store.recent(10).unwrap();
+        let loaded_tui = recent.iter().find(|b| b.id == BlockId(21)).unwrap();
+        let loaded_plain = recent.iter().find(|b| b.id == BlockId(22)).unwrap();
+        assert!(
+            loaded_tui.screen_origin,
+            "TUI block's screen_origin must round-trip (clip not fold after restore)"
+        );
+        assert!(
+            !loaded_plain.screen_origin,
+            "ordinary block stays soft-wrappable after restore"
+        );
+
+        // Re-open the DB (simulating restart) and read the same rows back.
+        let path = std::path::Path::new(store.conn.path().expect("temp store is file-backed"));
+        let reopened = BlockStore::open(path).expect("reopen store");
+        let tui_again = reopened.get(BlockId(21)).unwrap().expect("row present");
+        assert!(tui_again.screen_origin, "row survives a store re-open");
     }
 
     #[test]

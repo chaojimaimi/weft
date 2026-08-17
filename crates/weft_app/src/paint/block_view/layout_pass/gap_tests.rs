@@ -11,6 +11,7 @@ fn finished_block(id: u64, output: &str, collapsed: bool) -> Block {
         started_at: std::time::SystemTime::UNIX_EPOCH,
         finished_at: Some(std::time::SystemTime::UNIX_EPOCH),
         collapsed,
+        screen_origin: false,
     }
 }
 
@@ -25,6 +26,7 @@ fn clear_block(id: u64) -> Block {
         started_at: std::time::SystemTime::UNIX_EPOCH,
         finished_at: Some(std::time::SystemTime::UNIX_EPOCH),
         collapsed: false,
+        screen_origin: false,
     }
 }
 
@@ -223,6 +225,7 @@ fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
                 output,
                 styled_output: None,
                 version: 1,
+                screen_origin: false,
             }),
             pane_session_id: 1,
             cwd: None,
@@ -260,6 +263,7 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
             output: &output,
             styled_output: None,
             version: 1,
+            screen_origin: false,
         };
         compute_block_layout_pass(
             LayoutPassInput {

@@ -406,6 +406,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),
             collapsed: false,
+            screen_origin: false,
         };
         assert_eq!(
             process_message_effects(true, vec![completed.clone()], true),

@@ -262,7 +262,17 @@ impl MetalRenderer {
         let mut live_cache = self.live_layout_cache.borrow_mut();
         if in_flight.is_some() {
             let live = terminal.block_tracker().in_flight().expect("just checked");
-            live_cache.sync(live.output, pane_session_id, live.version, cols);
+            // v1.10.26 Batch B review blocker: the metrics total must come from
+            // the SAME sync split as the layout pass — pass live.screen_origin
+            // here or the prefix-sum total drifts from the laid rows (soft-wrap
+            // vs clip row counts diverge).
+            live_cache.sync(
+                live.output,
+                pane_session_id,
+                live.version,
+                cols,
+                live.screen_origin,
+            );
         }
         let (total, _) = crate::block_component::block_content_metrics_with_cache(
             terminal,

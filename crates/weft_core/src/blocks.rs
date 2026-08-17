@@ -92,6 +92,16 @@ pub struct Block {
     /// Panel-local collapse state (v0.4 sidebar). v0.5 will also drive
     /// in-terminal fold via an added `live_range` field — additive, no rewrite.
     pub collapsed: bool,
+    /// v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): true when the block's
+    /// output is a primary-screen TUI document (`screen_document_start` was
+    /// `Some` during the command). Screen-origin lines are hard terminal rows:
+    /// a narrower window CLIPS their right edge instead of soft-wrapping them
+    /// (a TUI `|]` border must never fold onto the next line). Shell-output
+    /// blocks keep soft-wrap semantics. v1.10.26 Batch B review closure (SF-1):
+    /// now persisted to SQLite (`screen_origin INTEGER NOT NULL DEFAULT 0`) so
+    /// a restored TUI block keeps clip-not-wrap across the Restore path —
+    /// otherwise `|]` folding could resurrect after restart.
+    pub screen_origin: bool,
 }
 
 /// A view of the currently-running command (borrowed from [`BlockTracker`]),
@@ -107,6 +117,13 @@ pub struct InFlightBlock<'a> {
     /// v1.10.23: live-output content version (LiveLayoutCache key) — bumped
     /// on every mutation, so version equality ⇔ byte-identical output.
     pub version: u64,
+    /// v1.10.26 Batch B review blocker (BL-1): whether the live output is a
+    /// primary-screen TUI document (`screen_document_start` was set during the
+    /// command). The renderer's live layout splits by this flag: screen-owned
+    /// frames clip on a narrow window, ordinary streaming output soft-wraps —
+    /// the initial Batch B "live is always screen-origin" clip was a functional
+    /// regression for plain commands emitting long lines.
+    pub screen_origin: bool,
 }
 
 /// Shell-phase state machine driven by OSC 133. v0.4 uses it only to
@@ -312,6 +329,7 @@ impl BlockTracker {
             output: self.output.as_str(),
             styled_output: self.styled_output.as_ref(),
             version: self.live_output_version,
+            screen_origin: self.screen_document_start.is_some(),
         })
     }
 
@@ -697,6 +715,7 @@ mod tests {
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
                 collapsed: false,
+                screen_origin: false,
             },
             Block {
                 id: BlockId(3),
@@ -708,6 +727,7 @@ mod tests {
                 started_at: SystemTime::UNIX_EPOCH,
                 finished_at: Some(SystemTime::UNIX_EPOCH),
                 collapsed: false,
+                screen_origin: false,
             },
         ];
         t.load_blocks(loaded);
@@ -734,6 +754,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),
             collapsed: false,
+            screen_origin: false,
         }]);
         assert_eq!(t.blocks().len(), 1);
         // v1.7.5: session_blocks() 现在包含加载的历史（之前会排除）。
@@ -834,6 +855,7 @@ mod tests {
             started_at: SystemTime::now(),
             finished_at: Some(SystemTime::now()),
             collapsed: false,
+            screen_origin: false,
         };
         t.load_blocks(vec![b]);
         assert!(t.has_dirty_blocks());
@@ -898,6 +920,37 @@ mod tests {
         assert_eq!(block.output.as_ref(), "some output\n");
         assert_eq!(block.exit_code, Some(0));
         assert_eq!(t.blocks().len(), 1);
+    }
+
+    /// v1.10.26 Batch B (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): a finalized
+    /// block whose command took the primary screen (`screen_document_start`
+    /// became Some) is marked `screen_origin` so the renderer clips its frame
+    /// rows instead of soft-wrapping them. A plain shell command (no screen
+    /// document) is not marked.
+    #[test]
+    fn finalize_marks_screen_origin_only_for_screen_documents() {
+        let mut t = BlockTracker::new();
+
+        // Plain shell command — capture never becomes screen-owned.
+        t.on_prompt_start();
+        t.on_command_start("echo hi".to_string());
+        t.on_print_ascii_run(b"hi", CapturedStyle::default());
+        t.on_command_end(0);
+        assert!(
+            !t.blocks().last().unwrap().screen_origin,
+            "ordinary shell output must stay soft-wrappable (screen_origin = false)"
+        );
+
+        // A TUI command that takes the primary screen.
+        t.on_prompt_start();
+        t.on_command_start("omp".to_string());
+        t.begin_screen_owned_output(0);
+        t.replace_screen_output("banner\nsecond line");
+        t.on_command_end(0);
+        assert!(
+            t.blocks().last().unwrap().screen_origin,
+            "a screen-owned TUI block must be marked screen_origin"
+        );
     }
 
     #[test]

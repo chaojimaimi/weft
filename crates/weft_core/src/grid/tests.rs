@@ -644,7 +644,9 @@ fn resize_dims_does_not_reflow() {
     grid.viewport[1].cells[0].character = 'X';
 
     // Narrow to 4 cols. A REFLOW would merge/wrap "ABCD" / "EFGH"; a
-    // dimension-only resize just truncates each row in place.
+    // dimension-only resize leaves each row in place. v1.10.26 B-2: narrowing
+    // does NOT physically truncate viewport rows anymore — the row keeps its
+    // 8 cells and the right half is merely clipped from the render window.
     grid.resize_dims(3, 4);
     assert_eq!(grid.num_cols, 4);
     // Row 0 keeps its first 4 chars in place — no relocation.
@@ -652,15 +654,23 @@ fn resize_dims_does_not_reflow() {
     assert_eq!(grid.cell(0, 1).character, 'B');
     assert_eq!(grid.cell(0, 2).character, 'C');
     assert_eq!(grid.cell(0, 3).character, 'D');
-    // The tail "EFGH" is dropped (truncated), NOT moved to row 1.
+    // The tail "EFGH" survives at the row's own width (only-grow); the
+    // renderer / `cell()` reads are bounded by `num_cols`.
+    assert_eq!(
+        grid.viewport[0].cells.len(),
+        8,
+        "viewport row is not truncated"
+    );
+    assert_eq!(grid.viewport[0].cells[4].character, 'E');
     // Row 1 still starts with 'X'.
     assert_eq!(grid.cell(1, 0).character, 'X');
 
-    // Widen back to 8 — cells are padded with blanks, not unwrapped.
+    // Widen back to 8 — cells were never shrunk, so no loss: 'E' is back in
+    // view exactly where it was, not padded as a blank.
     grid.resize_dims(3, 8);
     assert_eq!(grid.cell(0, 0).character, 'A');
     assert_eq!(grid.cell(0, 3).character, 'D');
-    assert_eq!(grid.cell(0, 4).character, ' '); // padded, NOT 'E'
+    assert_eq!(grid.cell(0, 4).character, 'E'); // kept, NOT padded blank
 }
 
 #[test]
@@ -680,8 +690,9 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     // v1.10.23 (FIX_OMP_CONTENT_LOSS): narrowing must NOT truncate history
     // rows — a TUI cannot repaint rows already scrolled out of the viewport,
     // so truncation lost the right half of every history line irreversibly.
-    // The history row keeps its original width; the VIEWPORT rows are still
-    // reshaped (the TUI repaints them on SIGWINCH).
+    // The history row keeps its original width. v1.10.26 B-2 extends the same
+    // only-grow strategy to the VIEWPORT rows (they repaint on SIGWINCH, but
+    // the transient residual frame is clipped rather than destroyed).
     grid.resize_dims(2, 3);
     grid.scroll_to_top();
     assert_eq!(
@@ -703,8 +714,8 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     );
     assert_eq!(
         grid.viewport[0].cells.len(),
-        3,
-        "viewport rows are reshaped to the new width"
+        5,
+        "viewport rows also keep their width when narrowing (B-2 only-grow)"
     );
 }
 
@@ -766,7 +777,7 @@ fn scrollback_row_cell_access_is_bounds_safe() {
 }
 
 #[test]
-fn resize_dims_repairs_wide_glyphs_cut_at_the_right_edge() {
+fn resize_dims_narrowing_keeps_wide_pair_intact() {
     let mut grid = Grid::with_scrollback(2, 4, 10);
     for row in &mut grid.viewport {
         row.cells[2].character = '中';
@@ -776,9 +787,18 @@ fn resize_dims_repairs_wide_glyphs_cut_at_the_right_edge() {
     grid.scroll_up(1);
 
     grid.resize_dims(2, 3);
-    // The viewport row is truncated + repaired (orphan lead reset to blank).
-    assert_eq!(grid.viewport[0].cells[2].character, ' ');
-    assert_eq!(grid.viewport[0].cells[2].width, CellWidth::Half);
+    // v1.10.26 B-2: the viewport row is NO LONGER truncated when narrowing —
+    // it keeps its 4-cell width, so the wide pair at cols 2-3 stays intact
+    // (the renderer, bounded by num_cols=3, just clips col 3 until the TUI
+    // repaints or a full-line erase normalizes the row back to num_cols).
+    assert_eq!(grid.viewport[0].cells[2].character, '中');
+    assert_eq!(grid.viewport[0].cells[2].width, CellWidth::Full);
+    assert!(
+        grid.viewport[0].cells[3]
+            .flags
+            .contains(CellFlags::WIDE_SPACER),
+        "the wide pair stays intact in the viewport row (B-2 only-grow)"
+    );
     grid.scroll_to_top();
     // v1.10.23 (FIX_OMP_CONTENT_LOSS): the history row is NOT truncated
     // anymore — its wide pair at cols 2-3 stays intact (the row keeps its
@@ -806,6 +826,68 @@ fn resize_dims_grows_and_shrinks_rows() {
     assert_eq!(grid.cell(0, 0).character, 'A');
     // Cursor is clamped into range.
     assert!(grid.cursor.row < 2);
+}
+
+/// v1.10.26 Batch B (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-2): a narrowing
+/// dimension-only resize must NOT physically truncate VIEWPORT rows — same as
+/// scrollback, viewport rows only ever GROW. The TUI repaints on SIGWINCH; the
+/// transient residual frame is clipped at the right edge rather than having
+/// its right half deleted irreversibly.
+#[test]
+fn resize_dims_narrowing_keeps_viewport_cells() {
+    let mut grid = Grid::new(2, 8);
+    for (col, ch) in "ABCDEFGH".chars().enumerate() {
+        grid.viewport[0].cells[col].character = ch;
+    }
+
+    grid.resize_dims(2, 4);
+    assert_eq!(grid.num_cols, 4);
+    assert_eq!(
+        grid.viewport[0].cells.len(),
+        8,
+        "viewport row keeps its original width when narrowing"
+    );
+    // Readers bounded by num_cols (renderer / cell()) see the clipped view.
+    assert_eq!(grid.cell(0, 0).character, 'A');
+    assert_eq!(grid.cell(0, 3).character, 'D');
+    // The right half survives: widening again shows it instead of a blank.
+    assert_eq!(grid.viewport[0].cells[4].character, 'E');
+    assert_eq!(grid.viewport[0].cells[7].character, 'H');
+
+    // Widening again: cells were already 8 wide — no reflow, no loss.
+    grid.resize_dims(2, 8);
+    assert_eq!(grid.cell(0, 0).character, 'A');
+    assert_eq!(grid.cell(0, 4).character, 'E');
+    assert_eq!(grid.cell(0, 7).character, 'H');
+}
+
+/// v1.10.26 Batch B: after a narrowing resize kept a viewport row wide, a
+/// full-line erase (CSI 2 K) re-establishes the row at `num_cols` — the TUI's
+/// rewrite normalizes the line back to the visible width. The stale right half
+/// a narrowing resize preserved momentarily is dropped once the line is
+/// erased in full.
+#[test]
+fn el_erase_then_rewrite_normalizes_row_width() {
+    let mut grid = Grid::new(2, 8);
+    for (col, ch) in "ABCDEFGH".chars().enumerate() {
+        grid.viewport[0].cells[col].character = ch;
+    }
+    grid.resize_dims(2, 4);
+    assert_eq!(
+        grid.viewport[0].cells.len(),
+        8,
+        "narrowing keeps the row width (B-2 precondition)"
+    );
+
+    // CSI 2 K — clear the whole line.
+    grid.cursor.col = 0;
+    grid.clear_line_all();
+    assert_eq!(
+        grid.viewport[0].cells.len(),
+        4,
+        "full-line erase normalizes the row width to num_cols"
+    );
+    assert!(grid.viewport[0].cells.iter().all(|c| c.character == ' '));
 }
 
 #[test]

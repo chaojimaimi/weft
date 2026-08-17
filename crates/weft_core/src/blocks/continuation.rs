@@ -90,6 +90,9 @@ impl BlockTracker {
                 started_at: base.started_at,
                 finished_at: Some(SystemTime::now()),
                 collapsed: base.collapsed,
+                // v1.10.26 B-1: a merged continuation is the same TUI document,
+                // so it keeps the screen-origin clip-not-wrap semantics.
+                screen_origin: screen_owned,
             }
         } else {
             if let Some(base) = continuation {
@@ -109,6 +112,7 @@ impl BlockTracker {
                 started_at,
                 finished_at: Some(SystemTime::now()),
                 collapsed: false,
+                screen_origin: screen_owned,
             }
         };
 
@@ -205,6 +209,10 @@ mod tests {
         let original = format!("{REPLAY}\nResume this session with:\ntool --resume session-id");
         finish_screen(&mut tracker, "tool", &original);
         let original_id = tracker.blocks()[0].id;
+        assert!(
+            tracker.blocks()[0].screen_origin,
+            "v1.10.26 B-1: a screen-owned block is marked screen-origin"
+        );
         tracker.drain_unpersisted();
 
         tracker.on_command_start("tool --resume session-id".to_string());
@@ -217,6 +225,10 @@ mod tests {
         assert_eq!(tracker.blocks().len(), 1);
         assert_eq!(tracker.blocks()[0].id, original_id);
         assert_eq!(tracker.blocks()[0].command, "tool");
+        assert!(
+            tracker.blocks()[0].screen_origin,
+            "v1.10.26 B-1: the merged continuation keeps the screen-origin marker (same TUI document)"
+        );
         assert!(tracker.blocks()[0]
             .output
             .ends_with("new answer after resuming"));
@@ -352,6 +364,7 @@ mod tests {
             started_at: std::time::SystemTime::now(),
             finished_at: Some(std::time::SystemTime::now()),
             collapsed: false,
+            screen_origin: false,
         };
         tracker.load_blocks(vec![loaded]);
         let loaded_id = tracker.blocks()[0].id;

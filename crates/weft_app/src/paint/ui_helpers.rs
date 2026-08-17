@@ -268,6 +268,7 @@ mod tests {
             started_at: std::time::SystemTime::UNIX_EPOCH,
             finished_at: None,
             collapsed: false,
+            screen_origin: false,
         }
     }
 
@@ -373,6 +374,7 @@ mod tests {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             },
             Block {
                 id: BlockId(2),
@@ -384,6 +386,7 @@ mod tests {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             },
             Block {
                 id: BlockId(3),
@@ -395,6 +398,7 @@ mod tests {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             },
         ];
         // Empty query matches all.
@@ -418,6 +422,7 @@ mod tests {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             })
             .collect();
         // No scroll: newest first → [cmd5, cmd4, cmd3, cmd2, cmd1].
@@ -465,6 +470,7 @@ mod tests {
                 started_at: std::time::SystemTime::UNIX_EPOCH,
                 finished_at: None,
                 collapsed: false,
+                screen_origin: false,
             })
             .collect();
 
@@ -500,6 +506,7 @@ mod tests {
                     started_at: std::time::SystemTime::UNIX_EPOCH,
                     finished_at: None,
                     collapsed: false,
+                    screen_origin: false,
                 })
                 .collect();
             let mut samples = Vec::with_capacity(20);

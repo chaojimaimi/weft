@@ -504,6 +504,7 @@ mod tests {
             started_at,
             finished_at: Some(started_at + Duration::from_millis(1200)),
             collapsed,
+            screen_origin: false,
         }
     }
 
@@ -778,6 +779,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(100)),
             collapsed: false,
+            screen_origin: false,
         }
     }
 

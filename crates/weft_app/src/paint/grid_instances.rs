@@ -669,6 +669,29 @@ mod tests {
 
     // ── Test 5: consecutive same-bg cells merge ────────────────────
 
+    /// v1.10.26 Batch B (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP): the viewport may
+    /// hold a row wider than `num_cols` right after a narrowing resize (rows
+    /// only grow). The renderer must stay bounded by `num_cols` — the leftover
+    /// right half is clipped, never drawn.
+    #[test]
+    fn wide_viewport_row_renders_exactly_num_cols() {
+        let mut grid = Grid::new(1, 4);
+        // Post-narrowing state: the row kept its original 8-cell width.
+        grid.viewport[0].cells = (0..8u8)
+            .map(|i| Cell::with_char(char::from(b'A' + i)))
+            .collect();
+        let result = build_plain(&grid);
+
+        assert_eq!(
+            result.glyph_instances.len(),
+            4,
+            "only the first num_cols glyphs render; E..H are outside the window"
+        );
+        // Background run spans exactly num_cols * cw.
+        assert_eq!(result.bg_instances.len(), 1);
+        assert_eq!(result.bg_instances[0].w, 4.0 * CW);
+    }
+
     #[test]
     fn consecutive_same_bg_cells_merge_into_one_run() {
         let mut cells: Vec<Cell> = "hello".chars().map(Cell::with_char).collect();

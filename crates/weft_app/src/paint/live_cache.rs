@@ -19,7 +19,9 @@
 //! Rebuild is O(document) but happens once per content version (snapshot
 //! rate-limited to ~50ms), never per scroll tick.
 
-use crate::paint::grid_cache::{block_line_chunks, MAX_LAYOUT_LINES_LIVE};
+use crate::paint::grid_cache::{
+    block_line_chunks, screen_origin_line_chunks, MAX_LAYOUT_LINES_LIVE,
+};
 
 /// Fingerprint of every input `block_scroll_metrics` reads. A matching key
 /// guarantees an identical `(total, visible, max_scroll)`, so the wheel
@@ -62,6 +64,13 @@ pub(crate) struct LiveLayoutCache {
     version: u64,
     /// Wrapping width key — resize invalidates.
     cols: usize,
+    /// v1.10.26 Batch B review blocker (BL-1): whether the live document is
+    /// screen-origin (`screen_document_start` set). Screen-owned frames clip
+    /// per line (one row); ordinary shell output soft-wraps (multiple rows per
+    /// long line). Joined to the key — the flag flips exactly at a version
+    /// bump (`on_command_start` clears / `begin_screen_owned_output` sets), but
+    /// keeping it in the equality test makes the split explicit and future-proof.
+    screen_origin: bool,
     /// Number of logical lines in the tail window.
     total_lines: usize,
     /// Raw index of the window's first line within the full document
@@ -78,15 +87,28 @@ pub(crate) struct LiveLayoutCache {
 }
 
 impl LiveLayoutCache {
-    /// Rebuild the cumulative tables unless `(pane_session_id, version, cols)`
-    /// already match. Callers hold either the layout pass or the metrics
-    /// path; both are idempotent so the paint + hit-testing passes share one
-    /// build. `pane_session_id` disambiguates panes/tabs that coincidentally
+    /// Rebuild the cumulative tables unless `(pane_session_id, version, cols,
+    /// screen_origin)` already match. Callers hold either the layout pass or the
+    /// metrics path; both are idempotent so the paint + hit-testing passes share
+    /// one build. `pane_session_id` disambiguates panes/tabs that coincidentally
     /// share version+cols (per-Tab version counters start at 0) — without it,
     /// one pane's byte ranges could be sliced against another's output
-    /// (silent misrender or a mid-multibyte-char slice panic).
-    pub(crate) fn sync(&mut self, output: &str, pane_session_id: u64, version: u64, cols: usize) {
-        if self.pane_session_id == pane_session_id && self.version == version && self.cols == cols {
+    /// (silent misrender or a mid-multibyte-char slice panic). `screen_origin`
+    /// flips exactly at a version bump, but joining it keeps the wrap-vs-clip
+    /// split explicit in the key.
+    pub(crate) fn sync(
+        &mut self,
+        output: &str,
+        pane_session_id: u64,
+        version: u64,
+        cols: usize,
+        screen_origin: bool,
+    ) {
+        if self.pane_session_id == pane_session_id
+            && self.version == version
+            && self.cols == cols
+            && self.screen_origin == screen_origin
+        {
             return;
         }
         #[cfg(test)]
@@ -96,6 +118,7 @@ impl LiveLayoutCache {
         self.pane_session_id = pane_session_id;
         self.version = version;
         self.cols = cols;
+        self.screen_origin = screen_origin;
         self.line_ranges.clear();
         self.cumulative.clear();
         for line in output.lines() {
@@ -109,14 +132,27 @@ impl LiveLayoutCache {
         self.cumulative.push(0);
         let mut acc = 0u32;
         for &(start, end) in &self.line_ranges[skip..] {
-            acc += block_line_chunks(&output[start..end], cols).count() as u32;
+            // v1.10.26 Batch B review blocker (BL-1): the live layout splits by
+            // screen_origin. Screen-owned TUI frames are hard terminal rows —
+            // one clipped row per line no matter the width. Ordinary shell
+            // output soft-wraps: each line counts as many rows as its wrapped
+            // chunks. Must stay in lockstep with layout_pass's per-line chunk
+            // function (driven by the same `live.screen_origin`), or the
+            // visible-window prefix sums drift from the laid-out rows.
+            let rows = if self.screen_origin {
+                screen_origin_line_chunks(&output[start..end], cols).count() as u32
+            } else {
+                block_line_chunks(&output[start..end], cols).count() as u32
+            };
+            acc += rows;
             self.cumulative.push(acc);
         }
     }
 
     /// Total display rows of the tail window (= `cumulative.last()`).
     /// Identical to the pre-cache formula
-    /// `lines()[skip..].map(|l| block_line_chunks(l, cols).count()).sum()`.
+    /// `lines()[skip..].map(|l| <chunk_count>).sum()` — `screen_origin` lines
+    /// are one row each (clip); ordinary lines count their soft-wrap chunks.
     pub(crate) fn total_display_rows(&self) -> usize {
         self.cumulative.last().copied().unwrap_or(0) as usize
     }
@@ -234,33 +270,45 @@ mod tests {
     use super::*;
 
     /// Fixed pane_session_id for the shared-key tests; the session-scoping
-    /// tests below pass ids explicitly.
+    /// tests below pass ids explicitly. Defaults to the screen-origin (TUI)
+    /// slice so the layout-math tests keep one-clipped-row-per-line geometry;
+    /// the ordinary soft-wrap split is exercised by the dedicated tests under
+    /// `sync(..., screen_origin: false)`.
     fn sync(cache: &mut LiveLayoutCache, output: &str, version: u64, cols: usize) {
-        cache.sync(output, 0, version, cols);
+        cache.sync(output, 0, version, cols, true);
     }
 
-    /// 1 line per 8 chars at cols=8 → 2 display rows; 20 chars → 3 rows.
-    fn wrap_counts(output: &str, cols: usize) -> Vec<usize> {
+    /// Rows-per-line by the live layout split (v1.10.26 Batch B review
+    /// blocker BL-1): screen-origin lines clip to exactly one row regardless
+    /// of width; ordinary shell-output lines count their soft-wrap chunks.
+    fn wrap_counts(output: &str, cols: usize, screen_origin: bool) -> Vec<usize> {
         output
             .lines()
-            .map(|line| block_line_chunks(line, cols).count())
+            .map(|line| {
+                if screen_origin {
+                    screen_origin_line_chunks(line, cols).count()
+                } else {
+                    block_line_chunks(line, cols).count()
+                }
+            })
             .collect()
     }
 
     #[test]
-    fn cumulative_matches_manual_wrap_sum() {
+    fn cumulative_screen_origin_counts_one_per_line() {
         let output = "0123456789abcdefghij\none\ntwo lines\n";
         let mut cache = LiveLayoutCache::default();
         sync(&mut cache, output, 7, 8);
-        let counts = wrap_counts(output, 8);
-        // 20 chars @8 = 3 rows; "one" = 1; "two lines" = 2.
-        assert_eq!(counts, vec![3, 1, 2]);
+        // B-1: a 20-char line at cols 8 (screen-origin) is CLIPPED to one
+        // display row (no soft-wrap) — screen-origin counts are 1 per line.
+        let counts = wrap_counts(output, 8, true);
+        assert_eq!(counts, vec![1, 1, 1]);
         let mut acc = 0;
         for (i, c) in counts.iter().enumerate() {
             acc += c;
             assert_eq!(cache.cumulative()[i + 1] as usize, acc, "prefix at {i}");
         }
-        assert_eq!(cache.total_display_rows(), 6);
+        assert_eq!(cache.total_display_rows(), 3);
         assert_eq!(cache.total_lines(), 3);
         assert_eq!(cache.base_idx(), 0);
         // line_ranges must slice back the exact lines() texts (incl. \r strip).
@@ -288,8 +336,9 @@ mod tests {
 
     #[test]
     fn cache_hit_skips_rebuild_version_and_cols_keys() {
-        // A 60-char first line wraps at cols 40 (2 chunks) vs cols 80
-        // (1 chunk), so a rebuild changes the cumulative.
+        // B-1: the live layout is screen-origin (clip-not-wrap), so wrapping
+        // is cols-INDEPENDENT — the cache still re-keys on cols/version, but
+        // a rebuild produces identical cumulative.
         let output = format!("{}\nbbb\n", "x".repeat(60));
         let mut cache = LiveLayoutCache::default();
         sync(&mut cache, &output, 3, 80);
@@ -301,14 +350,15 @@ mod tests {
         assert_eq!(cache.rebuilds(), 1, "same version+cols must be a hit");
         assert_eq!(cache.cumulative(), cumulative.as_slice());
 
-        // cols change → MISS: rebuild (wrap differs → cumulative changes).
+        // cols change → MISS (re-key) but cumulative IDENTICAL: the
+        // screen-origin clip layout yields one row per line regardless of
+        // width.
         sync(&mut cache, &output, 3, 40);
         assert_eq!(cache.rebuilds(), 2, "cols change must be a miss");
-        assert_ne!(cache.cumulative(), cumulative.as_slice());
         assert_eq!(
             cache.cumulative().last().copied().unwrap_or(0),
-            3,
-            "60ch/40cols = 2 rows + bbb = 1"
+            2,
+            "60-char line clips to 1 row + 'bbb' = 2 rows total"
         );
 
         // version change → MISS even with same cols (and identical bytes:
@@ -330,21 +380,21 @@ mod tests {
     fn different_pane_session_same_version_cols_misses() {
         let output = "aaa\nbbb\n";
         let mut cache = LiveLayoutCache::default();
-        cache.sync(output, 10, 7, 8); // pane A, version 7
+        cache.sync(output, 10, 7, 8, true); // pane A, version 7, screen-origin
         assert_eq!(cache.rebuilds(), 1);
         let pane_a_cumulative = cache.cumulative().to_vec();
         // Pane B: same version+cols, different session → MISS.
-        cache.sync(output, 11, 7, 8);
+        cache.sync(output, 11, 7, 8, true);
         assert_eq!(
             cache.rebuilds(),
             2,
             "same version+cols across sessions must miss"
         );
         // Alternating back to pane A rebuilds again — no cross-session reuse.
-        cache.sync(output, 10, 7, 8);
+        cache.sync(output, 10, 7, 8, true);
         assert_eq!(cache.rebuilds(), 3, "session switch must not reuse");
         assert_eq!(cache.cumulative(), pane_a_cumulative.as_slice());
-        cache.sync(output, 11, 7, 8);
+        cache.sync(output, 11, 7, 8, true);
         assert_eq!(cache.rebuilds(), 4);
     }
 
@@ -352,10 +402,82 @@ mod tests {
     fn same_pane_session_same_version_cols_hits() {
         let output = "aaa\nbbb\n";
         let mut cache = LiveLayoutCache::default();
-        cache.sync(output, 10, 7, 8);
+        cache.sync(output, 10, 7, 8, true);
         assert_eq!(cache.rebuilds(), 1);
-        cache.sync(output, 10, 7, 8);
+        cache.sync(output, 10, 7, 8, true);
         assert_eq!(cache.rebuilds(), 1, "same session+version+cols is a hit");
+    }
+
+    // ── BL-1 (Batch B review blocker): split the live layout by screen_origin
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// A plain shell command (no `screen_document_start`) emits long streaming
+    /// lines. While the command is in flight they must SOFT-WRAP like finished
+    /// shell-output blocks — the initial Batch B "live is always screen-origin"
+    /// clip was a functional regression (a `make` diagnostic line was chopped
+    /// at the window edge mid-stream).
+    #[test]
+    fn ordinary_live_long_line_soft_wraps_with_complete_content() {
+        let output = format!("{}\nshort line\n", "x".repeat(40));
+        let mut cache = LiveLayoutCache::default();
+        // screen_origin = false: ordinary streaming output.
+        cache.sync(&output, 0, 3, 8, false);
+        // 40-char line at cols 8 → 5 wrapped rows; "short line" (10 cols) → 2.
+        let counts = wrap_counts(&output, 8, false);
+        assert_eq!(counts, vec![5, 2], "ordinary long line soft-wraps");
+        assert_eq!(cache.total_display_rows(), 7);
+        // Content is preserved across the wrapped rows (nothing clipped).
+        let mut reconstructed = String::new();
+        for i in 0..cache.total_lines() {
+            let (s, e) = cache.line_range(i);
+            reconstructed.push_str(&output[s..e]);
+            reconstructed.push('\n');
+        }
+        assert_eq!(reconstructed, output, "soft-wrap must not lose text");
+    }
+
+    /// The screen-owned TUI case: a long frame row is a hard terminal row that
+    /// CLIPS to one display row — the `|]` border must never fold.
+    #[test]
+    fn screen_owned_live_long_line_clips_to_one_row() {
+        let line = format!("[|{}|]", "x".repeat(40));
+        let output = format!("{line}\n");
+        let mut cache = LiveLayoutCache::default();
+        cache.sync(&output, 0, 3, 8, true);
+        assert_eq!(
+            cache.total_display_rows(),
+            1,
+            "screen-origin long line is clipped, not wrapped ({line})"
+        );
+        assert_eq!(cache.total_lines(), 1);
+        let counts = wrap_counts(&output, 8, true);
+        assert_eq!(counts, vec![1]);
+    }
+
+    /// The two live modes flip mid-command (`begin_screen_owned_output` after
+    /// plain streaming): the version bump must invalidate the cache and the
+    /// rebuilt layout must switch to clip — same bytes, different row counts.
+    #[test]
+    fn screen_origin_switch_invalidates_cache_and_clips() {
+        let output = format!("{}\n", "y".repeat(40));
+        let mut cache = LiveLayoutCache::default();
+        // Ordinary phase: long line soft-wraps → 40-col line at cols 10 = 4 rows.
+        cache.sync(&output, 0, 7, 10, false);
+        assert_eq!(cache.rebuilds(), 1);
+        assert_eq!(cache.total_display_rows(), 4, "ordinary: wrapped rows");
+        // Same bytes+cols, but the tracker bump from screen handoff changed
+        // state → the flag join forces a MISS, and the rebuilt layout clips.
+        cache.sync(&output, 0, 8, 10, true);
+        assert_eq!(cache.rebuilds(), 2, "screen_origin flip must invalidate");
+        assert_eq!(
+            cache.total_display_rows(),
+            1,
+            "same bytes now clip to one row — the switch took effect"
+        );
+        // Flipping back (new command, plain output) rebuilds again.
+        cache.sync(&output, 0, 9, 10, false);
+        assert_eq!(cache.rebuilds(), 3);
+        assert_eq!(cache.total_display_rows(), 4);
     }
 
     #[test]

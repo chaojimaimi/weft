@@ -791,6 +791,7 @@ mod tests {
             started_at: std::time::SystemTime::now(),
             finished_at: Some(std::time::SystemTime::now()),
             collapsed: false,
+            screen_origin: false,
         }
     }
     #[test]

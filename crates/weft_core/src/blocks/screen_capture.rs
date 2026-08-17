@@ -150,6 +150,9 @@ impl BlockTracker {
                 started_at,
                 finished_at: Some(now),
                 collapsed: false,
+                // v1.10.26 B-1: a settled 1MiB split-head block is a chunk of
+                // the TUI frame document — screen-origin, clip-not-wrap.
+                screen_origin: self.screen_document_start.is_some(),
             };
             if self.screen_document_start.is_some() {
                 self.screen_owned_blocks.insert(block.id.0);
@@ -394,6 +397,10 @@ mod tests {
         );
         assert!(tracker.session_produced_block_ids().contains(&1));
         assert_eq!(tracker.drain_unpersisted().len(), 1);
+        assert!(
+            tracker.blocks()[0].screen_origin,
+            "v1.10.26 B-1: a settled split head block is screen-origin (TUI frame content)"
+        );
     }
 
     /// The full chunking loop (as driven by the Terminal's split path):

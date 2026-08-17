@@ -165,6 +165,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             finished_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_010)),
             collapsed: false,
+            screen_origin: false,
         }
     }
 

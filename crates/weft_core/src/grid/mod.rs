@@ -611,7 +611,13 @@ impl Grid {
             cell.reset();
         }
         self.viewport[row].extras.clear();
-        self.viewport[row].mark_dirty(self.num_cols - 1);
+        // v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-2): a full-line erase
+        // re-establishes the row at `num_cols`. A B-2 narrowing resize may
+        // have left the row temporarily wide (rows only grow); once the TUI
+        // clears and rewrites the line at the new width, the stale right half
+        // is dropped — "normalizing back to num_cols" is the intended outcome.
+        resize_row_cells(&mut self.viewport[row].cells, self.num_cols);
+        self.viewport[row].mark_dirty(self.num_cols.saturating_sub(1));
     }
 
     /// Erase `count` characters starting at cursor (CSI X).
@@ -1028,9 +1034,11 @@ impl Grid {
     // ── Resize / reset ───────────────────────────────────────────
 
     /// Dimension-only resize: change `num_rows`/`num_cols` and reshape the
-    /// viewport rows **without reflowing** content. Rows are truncated or
-    /// blank-padded to `new_cols`; the viewport is grown with blank rows or
-    /// truncated to `new_rows`. The cursor is clamped into range.
+    /// viewport rows **without reflowing** content. Rows are grown (blank-padded)
+    /// when widened and otherwise left at their existing width — they are never
+    /// truncated (v1.10.26 B-2, matching scrollback's only-grow strategy); the
+    /// viewport is grown with blank rows or truncated to `new_rows`. The cursor
+    /// is clamped into range.
     ///
     /// This is the correct resize for the **active** grid when an alt-screen
     /// TUI app (less/vim/man) is running. Those apps paint their content with
@@ -1052,20 +1060,23 @@ impl Grid {
         }
         let old_cols = self.num_cols;
 
-        // Reshape each existing viewport row to the new width: truncate if
-        // narrower, pad with blank cells if wider. Do NOT merge/split rows —
-        // the app owns the layout.
+        // Reshape each existing viewport row to the new width: only GROW.
+        // v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-2): a narrowing resize
+        // must NOT physically truncate viewport rows — same strategy as
+        // scrollback `resize_cols` (rows only ever grow so column-indexed
+        // readers bounded by `num_cols` stay in bounds). The TUI repaints on
+        // SIGWINCH; the transient residual frame is CLIPPED at the right edge
+        // (renderer / `cell()` only ever read the first `num_cols`) instead of
+        // having its right half deleted irreversibly. Do NOT merge/split rows
+        // — the app owns the layout.
         if new_cols != old_cols {
             for row in &mut self.viewport {
-                resize_row_cells(&mut row.cells, new_cols);
-                row.repair_wide_pairs();
-                // v1.6.0 review M2: when narrowing, drop extras entries at
-                // columns that no longer exist so orphaned grapheme/hyperlink
-                // data doesn't accumulate across resize cycles.
-                if new_cols < old_cols {
-                    row.extras.truncate_cols(new_cols);
+                if row.cells.len() < new_cols {
+                    resize_row_cells(&mut row.cells, new_cols);
+                    row.repair_wide_pairs();
                 }
-                // Repaint the whole row after truncation or padding.
+                // Repaint the whole row: widening pads, narrowing resets the
+                // renderer's clip window to `num_cols` for the residual frame.
                 row.mark_dirty(new_cols.saturating_sub(1));
             }
             self.scrollback.resize_cols(new_cols);

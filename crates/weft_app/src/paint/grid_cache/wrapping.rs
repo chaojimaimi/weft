@@ -59,6 +59,21 @@ pub(crate) fn block_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usiz
             return wrap_line_chunk_ranges(text, cols);
         }
     }
+    std::iter::once(0..grapheme_prefix_end(text, cols)).collect()
+}
+
+/// Maximum overflow (in columns) for a progress gauge to be clipped rather
+/// than wrapped. Covers the common off-by-few case (ambiguous-width chars,
+/// SIGWINCH race) without truncating large overflows caused by window
+/// narrowing.
+const PROGRESS_GAUGE_CLIP_TOLERANCE: usize = 3;
+
+/// Longest grapheme-atomic prefix of `text` whose terminal display width fits
+/// within `cols` columns; returns the prefix's end byte index. Shared by the
+/// structural clip (`block_line_chunk_ranges`) and the screen-origin clip —
+/// identical prefix math, no per-site byte-loop duplication. `cols == 0` is
+/// handled by the call sites (whole line, see `wrap_line_chunk_ranges`).
+fn grapheme_prefix_end(text: &str, cols: usize) -> usize {
     let mut end = 0usize;
     let mut col = 0usize;
     for (byte, grapheme) in text.grapheme_indices(true) {
@@ -69,20 +84,49 @@ pub(crate) fn block_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usiz
         col += width;
         end = byte + grapheme.len();
     }
-    std::iter::once(0..end).collect()
+    end
 }
-
-/// Maximum overflow (in columns) for a progress gauge to be clipped rather
-/// than wrapped. Covers the common off-by-few case (ambiguous-width chars,
-/// SIGWINCH race) without truncating large overflows caused by window
-/// narrowing.
-const PROGRESS_GAUGE_CLIP_TOLERANCE: usize = 3;
 
 /// Keep terminal-drawn structure atomic across history resizes; prose reflows.
 pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
     block_line_chunk_ranges(text, cols)
         .into_iter()
         .map(|range| text[range].to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Screen-origin (TUI frame) line clip, v1.10.26
+/// (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): a primary-screen document row is a
+/// hard terminal row, so a narrower window CLIPS its right edge into a single
+/// chunk instead of soft-wrapping it — a TUI `|]` border must NEVER fold onto
+/// the next line at indent 0. Same grapheme-atomic prefix logic as the
+/// structural clip above, but unconditional (applies to plain ASCII frames
+/// like `[| … |]` that `classify_structure_line` treats as prose). Always
+/// returns exactly one source range; shell-output blocks keep soft-wrap via
+/// [`block_line_chunk_ranges`].
+pub(crate) fn screen_origin_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
+    // v1.10.26 Batch B review nit: cols == 0 must return the WHOLE line as a
+    // single chunk, aligned with `wrap_line_chunk_ranges` — a zero-width
+    // (degenerate/unit-test) layout must not produce an empty clipped row.
+    if cols == 0 {
+        return std::iter::once(0..text.len()).collect();
+    }
+    std::iter::once(0..grapheme_prefix_end(text, cols)).collect()
+}
+
+/// Chunked view over [`screen_origin_line_chunk_ranges`] — always a single,
+/// right-clipped chunk per line.
+pub(crate) fn screen_origin_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
+    screen_origin_line_chunk_ranges(text, cols)
+        .into_iter()
+        .map(|range| {
+            if range.is_empty() {
+                String::new()
+            } else {
+                text[range].to_string()
+            }
+        })
         .collect::<Vec<_>>()
         .into_iter()
 }
@@ -514,6 +558,79 @@ mod tests {
         assert!(
             block_line_chunks(&old_full_width, cols).count() > 1,
             "a 203-col full-width source still wraps at 200 (removed by Batch 2)"
+        );
+    }
+
+    /// v1.10.26 Batch B (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): a 200-col TUI
+    /// frame row laid out at 91 cols must clip to a single chunk — no
+    /// continuation row, and `|]` must NEVER appear at the head of a folded
+    /// next line. This is the exact problem-2 regression: maximize a TUI to
+    /// 200, then narrow to 91; the old soft-wrap folded the right border onto
+    /// the next line at indent 0.
+    #[test]
+    fn screen_origin_superwide_line_clips_not_wraps() {
+        let line = format!("[|{}|]", "x".repeat(196));
+        assert_eq!(
+            weft_core::grid::terminal_text_width(&line),
+            200,
+            "setup: a full-width TUI source line at 200 cols"
+        );
+        let cols = 91usize;
+
+        // Screen-origin (TUI frame) row: clip — single chunk, right edge cut.
+        let chunks = screen_origin_line_chunks(&line, cols).collect::<Vec<_>>();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "screen-origin line must not produce a continuation chunk"
+        );
+        assert!(
+            weft_core::grid::terminal_text_width(&chunks[0]) <= cols,
+            "clipped width must fit the layout width {cols}"
+        );
+        assert!(
+            !chunks[0].ends_with("|]"),
+            "`|]` falls in the clipped region and must not appear at the next line head"
+        );
+
+        // The same text as an ordinary shell-output line keeps soft-wrap:
+        // logical lines may overflow and fold across rows (content preserved).
+        let wrapped = block_line_chunks(&line, cols).collect::<Vec<_>>();
+        assert!(
+            wrapped.len() > 1,
+            "shell-output lines still soft-wrap at a narrower layout"
+        );
+        assert_eq!(
+            wrapped.concat(),
+            line,
+            "wrapped shell chunks preserve the full text"
+        );
+    }
+
+    #[test]
+    fn screen_origin_line_that_fits_stays_one_chunk() {
+        // A screen-origin line narrower than the layout must remain a single
+        // chunk ending in its border (nothing clipped).
+        let line = "[| hello |]";
+        let chunks = screen_origin_line_chunks(line, 40).collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], line);
+    }
+
+    /// v1.10.26 Batch B review nit: the screen-origin clip's cols == 0 branch
+    /// aligns with `wrap_line_chunk_ranges` — the whole line stays one chunk
+    /// (a degenerate width must not collapse to an empty clipped row).
+    #[test]
+    fn screen_origin_clip_cols_zero_keeps_whole_line() {
+        let line = "[| hello |]";
+        assert_eq!(
+            screen_origin_line_chunk_ranges(line, 0),
+            vec![0..line.len()],
+            "cols == 0 must be the whole line, matching wrap semantics"
+        );
+        assert_eq!(
+            screen_origin_line_chunks(line, 0).collect::<Vec<_>>(),
+            vec![line.to_string()]
         );
     }
 }

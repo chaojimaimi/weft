@@ -908,6 +908,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
             finished_at: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id)),
             collapsed: false,
+            screen_origin: false,
         }
     }
 

@@ -16,7 +16,10 @@ use std::rc::Rc;
 use weft_core::blocks::Block;
 
 mod wrapping;
-pub(crate) use wrapping::{block_line_chunk_ranges, block_line_chunks, command_line_chunks};
+pub(crate) use wrapping::{
+    block_line_chunk_ranges, block_line_chunks, command_line_chunks,
+    screen_origin_line_chunk_ranges, screen_origin_line_chunks,
+};
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
 
@@ -334,7 +337,16 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         .map(|(idx, line)| {
             let byte_start = line.as_ptr() as usize - block.output.as_ptr() as usize;
             let byte_end = byte_start + line.len();
-            let chunk_ranges: Rc<[Range<usize>]> = Rc::from(block_line_chunk_ranges(line, cols));
+            // v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): the chunk
+            // strategy follows the block's ORIGIN. A screen-origin block (a
+            // primary-screen TUI document) clips overwide rows to a single
+            // chunk — its `|]` border must never fold onto the next line. A
+            // shell-output block keeps soft-wrap (logical lines may overflow).
+            let chunk_ranges: Rc<[Range<usize>]> = Rc::from(if block.screen_origin {
+                screen_origin_line_chunk_ranges(line, cols)
+            } else {
+                block_line_chunk_ranges(line, cols)
+            });
             CachedLine {
                 idx,
                 byte_start,
@@ -420,6 +432,7 @@ mod tests {
             started_at: std::time::SystemTime::UNIX_EPOCH,
             finished_at: None,
             collapsed: false,
+            screen_origin: false,
         }
     }
 

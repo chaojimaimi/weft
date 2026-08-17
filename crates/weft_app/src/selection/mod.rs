@@ -495,6 +495,7 @@ mod tests {
             started_at: SystemTime::now(),
             finished_at: Some(SystemTime::now()),
             collapsed: false,
+            screen_origin: false,
         }
     }
 

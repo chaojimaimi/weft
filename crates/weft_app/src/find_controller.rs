@@ -467,6 +467,7 @@ mod tests {
             started_at: SystemTime::UNIX_EPOCH,
             finished_at: Some(SystemTime::UNIX_EPOCH),
             collapsed: false,
+            screen_origin: false,
         }
     }
 

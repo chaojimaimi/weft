@@ -38,6 +38,7 @@ fn oversized_styled_output_is_not_persisted() {
         started_at: SystemTime::UNIX_EPOCH,
         finished_at: Some(SystemTime::UNIX_EPOCH),
         collapsed: false,
+        screen_origin: false,
     };
 
     store.insert(&block).unwrap();

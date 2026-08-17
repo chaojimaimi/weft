@@ -8,7 +8,9 @@ use crate::block_component::{
     block_presentation, clear_block_spacer_rows, command_output_gap_rows, command_resume_hints,
     BlockTone,
 };
-use crate::paint::grid_cache::{block_line_chunks, command_line_chunks, BlockLayoutCache};
+use crate::paint::grid_cache::{
+    block_line_chunks, command_line_chunks, screen_origin_line_chunks, BlockLayoutCache,
+};
 use crate::paint::live_cache::LiveLayoutCache;
 use crate::paint::ui_helpers::strip_prompt_prefix;
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
@@ -151,7 +153,13 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
     let scroll_px = block_scroll * pitch;
     let overscan = header_height + pitch * 2.0;
     if let Some(live) = live {
-        live_cache.sync(live.output, pane_session_id, live.version, cols);
+        live_cache.sync(
+            live.output,
+            pane_session_id,
+            live.version,
+            cols,
+            live.screen_origin,
+        );
         // threshold_low/high = viewport bottom/top edges (bottom-space).
         let (start_idx, end_idx, start_dist) = live_cache.visible_range(
             pitch,
@@ -164,7 +172,18 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             let (byte_start, byte_end) = live_cache.line_range(i);
             let line = &live.output[byte_start..byte_end];
             let line_idx = live_cache.base_idx() + i;
-            let chunks: Rc<[String]> = Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>());
+            // v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1 + batch review
+            // blocker): the live document splits by screen_origin — screen-
+            // owned TUI frame rows clip on a narrow window (a `|]` border must
+            // never fold onto the next line), ordinary shell output keeps
+            // soft-wrap. Must use the SAME chunk function as LiveLayoutCache's
+            // rebuild (both read `live.screen_origin`) or the visible-window
+            // prefix sums drift from the laid-out rows.
+            let chunks: Rc<[String]> = if live.screen_origin {
+                Rc::from(screen_origin_line_chunks(line, cols).collect::<Vec<_>>())
+            } else {
+                Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>())
+            };
             let vis_rows = chunks.len();
             cursor_dist += vis_rows as f32 * pitch;
             rows.push(cursor_dist);
@@ -541,6 +560,7 @@ mod tests {
                 output: &output,
                 styled_output: None,
                 version: 1,
+                screen_origin: false,
             }),
             pane_session_id: 1,
             cwd: None,
@@ -746,6 +766,7 @@ mod tests {
                     started_at: SystemTime::now(),
                     finished_at: Some(SystemTime::now()),
                     collapsed: false,
+                    screen_origin: false,
                 })
                 .collect()
         }
