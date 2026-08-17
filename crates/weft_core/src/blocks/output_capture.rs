@@ -31,6 +31,16 @@ pub(crate) struct OutputCapture {
     truncated: bool,
     style_runs: Vec<CapturedStyleRun>,
     style_overflow: bool,
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): append-only scroll-out capture
+    /// segment for screen-owned TUI sessions. Rows pushed out of the viewport
+    /// by LF overflow / CSI S are appended here (owned rows only, in push
+    /// order) instead of relying on the scrollback ring — ring eviction is
+    /// decoupled from TUI history. The 50ms snapshot rebuilds the composed
+    /// block text (which folds the prefix in), so `text` itself is not touched
+    /// by appends.
+    screen_prefix: String,
+    /// Parallel styled lines for the prefix (line indices local to the prefix).
+    screen_prefix_styled: Option<StyledOutput>,
 }
 
 impl OutputCapture {
@@ -46,10 +56,23 @@ impl OutputCapture {
         self.truncated = false;
         self.style_runs.clear();
         self.style_overflow = false;
+        self.screen_prefix.clear();
+        self.screen_prefix_styled = None;
     }
 
     pub(crate) fn replace(&mut self, text: &str, max_bytes: usize) {
-        self.clear();
+        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): the screen prefix is NOT
+        // reset here — the composed text passed in already folds the prefix
+        // in (the Terminal builds it from the tracker's prefix copy), and
+        // that copy must survive the rebuild so the NEXT snapshot can fold it
+        // in again. Only the screen segment (text buffer) is replaced.
+        self.text.clear();
+        self.cursor = 0;
+        self.char_cursor = 0;
+        self.line_start_char = 0;
+        self.truncated = false;
+        self.style_runs.clear();
+        self.style_overflow = false;
         let mut end = text.len().min(max_bytes);
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
@@ -281,6 +304,85 @@ impl OutputCapture {
             text.push_str("\n…(output truncated, >1 MiB)");
         }
         (text, styled)
+    }
+
+    // ── Screen prefix (v1.10.25: scroll-out incremental capture) ────────
+
+    /// Append one scroll-captured segment (owned rows pushed out of the
+    /// viewport, already filtered and ordered by the caller's pure function)
+    /// to the append-only screen prefix. The segment's styled lines carry
+    /// prefix-local indices and are shifted by the current prefix line count
+    /// so the prefix styled index stays contiguous.
+    pub(crate) fn append_screen_prefix(&mut self, text: &str, styled: Option<StyledOutput>) {
+        if text.is_empty() {
+            return;
+        }
+        let line_offset = self.screen_prefix_line_count();
+        if !self.screen_prefix.is_empty() {
+            self.screen_prefix.push('\n');
+        }
+        self.screen_prefix.push_str(text);
+        if let Some(styled) = styled.filter(|s| s.has_colors()) {
+            let mut styled = styled;
+            for line in &mut styled.lines {
+                line.line = line.line.saturating_add(line_offset as u32);
+            }
+            match &mut self.screen_prefix_styled {
+                Some(acc) => acc.lines.extend(styled.lines),
+                None => self.screen_prefix_styled = Some(styled),
+            }
+        }
+    }
+
+    /// Drop the first `consumed` bytes of the screen prefix — the part folded
+    /// into a finished block by the 1MiB split. The boundary is always a line
+    /// boundary of the prefix, so the remaining text is intact.
+    pub(crate) fn drain_screen_prefix(&mut self, consumed: usize) {
+        if consumed == 0 {
+            return;
+        }
+        if consumed >= self.screen_prefix.len() {
+            self.screen_prefix.clear();
+            self.screen_prefix_styled = None;
+            return;
+        }
+        // `consumed < len` here (the `consumed >= len` case cleared above):
+        // the split boundary is a '\n' inside the prefix (or an
+        // overlong-line mid-cut) — complete lines fully owned by the head
+        // are exactly the newlines in the consumed bytes.
+        let consumed_lines = self.screen_prefix[..consumed].matches('\n').count();
+        self.screen_prefix.drain(..consumed);
+        if let Some(styled) = &mut self.screen_prefix_styled {
+            styled
+                .lines
+                .retain(|line| (line.line as usize) >= consumed_lines);
+            for line in &mut styled.lines {
+                line.line = line.line.saturating_sub(consumed_lines as u32);
+            }
+            if styled.lines.is_empty() {
+                self.screen_prefix_styled = None;
+            }
+        }
+    }
+
+    pub(crate) fn screen_prefix_len(&self) -> usize {
+        self.screen_prefix.len()
+    }
+
+    pub(crate) fn screen_prefix_text(&self) -> &str {
+        &self.screen_prefix
+    }
+
+    pub(crate) fn screen_prefix_styled(&self) -> Option<&StyledOutput> {
+        self.screen_prefix_styled.as_ref()
+    }
+
+    /// Number of text lines in the screen prefix — the styled-line offset
+    /// applied to the viewport segment when the three-part composed block
+    /// text is built.
+    pub(crate) fn screen_prefix_line_count(&self) -> usize {
+        let text = &self.screen_prefix;
+        text.matches('\n').count() + usize::from(!text.is_empty())
     }
 
     // ── Style RLE maintenance ────────────────────────────────────────────

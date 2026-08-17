@@ -1,12 +1,5 @@
 //! Diagnostic experiments for OMP content-loss / border-wrap discrimination.
 //!
-//! OBSERVATION ONLY: these tests print raw values (run with
-//! `cargo test -p weft_core diagnostic -- --nocapture`) and assert only
-//! objective facts (setup invariants, measured byte counts). They do NOT
-//! lock any hypothesis about whether content loss comes from scrollback ring
-//! eviction vs the 1MiB snapshot budget, or where `|]` lands after re-wrap.
-//! No production behavior is modified.
-//!
 //! Experiment 1 (content loss), two isolated scenarios, each snapshotted
 //! mid-stream and after completion:
 //!   a) ring-eviction isolation: 15_000 streamed lines x ~30 B (~450 KB
@@ -15,6 +8,14 @@
 //!   b) 1MiB-budget isolation: 6_000 lines x ~200 B (~1.2 MB total
 //!      < 10_000 rows but > 1MiB => snapshot text budget must truncate the
 //!      tail unless something else clips it).
+//!
+//! v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): exp1a/b are now REGRESSION tests —
+//! they still print the raw observations (`cargo test -p weft_core diagnostic
+//! -- --nocapture`) but additionally assert the fixed behavior: a) the
+//! scroll-out prefix keeps line 00001 in the block text despite ring
+//! eviction; b) the 1MiB split keeps lines 05991..06000 present (read across
+//! the split blocks, byte-seamless). The extra tests cover the three-part
+//! composed order and the capture-start rebase.
 //!
 //! Experiment 2 (border wrap): a box line drawn at exactly 203 grid cols,
 //! then re-chunked at BlockView cols = 200 (primary TUI full-width cols
@@ -63,18 +64,16 @@ fn stream_lines(terminal: &mut Terminal, from: usize, to: usize, line_fn: fn(usi
 /// Extract the `line NNNNN` number embedded in a snapshot line.
 fn line_number_of(text: &str) -> Option<usize> {
     let after = text.split("line ").nth(1)?;
-    after
-        .split([' ', '\r', '\n', '\0'])
-        .next()?
-        .parse()
-        .ok()
+    after.split([' ', '\r', '\n', '\0']).next()?.parse().ok()
 }
 
 /// Observe the grid + snapshot state and the in-flight block content.
 fn observe(terminal: &Terminal, tag: &str, printed: usize) {
     let doc_start = terminal.block_tracker().screen_document_start();
     let scrollback = &terminal.grid().scrollback;
-    let oldest = scrollback.position().saturating_sub(scrollback.len() as u64);
+    let oldest = scrollback
+        .position()
+        .saturating_sub(scrollback.len() as u64);
     let clamped_start = doc_start.map_or(0, |d| scrollback.index_since(d));
     let raw = doc_start.map_or_else(String::new, |d| terminal.grid().document_text_from(d));
     let first_line = raw.lines().next().unwrap_or("").to_string();
@@ -87,20 +86,37 @@ fn observe(terminal: &Terminal, tag: &str, printed: usize) {
     println!("  oldest retained position     = {}", oldest);
     println!("  document_start               = {doc_start:?}");
     println!("  index_since(document_start)  = {clamped_start} (clamped; 0 means walk starts at oldest retained row)");
-    println!("  grid raw snapshot bytes      = {} (budget = {SNAPSHOT_BUDGET})", raw.len());
+    println!(
+        "  grid raw snapshot bytes      = {} (budget = {SNAPSHOT_BUDGET})",
+        raw.len()
+    );
     println!("  grid raw snapshot lines      = {}", raw.lines().count());
-    println!("  raw snapshot ends_with ' '   = {} (mark_snapshot_truncated space marker)", raw.ends_with(' '));
-    println!("  in-flight snapshot bytes     = {:?}", in_flight.map(|live| live.output.len()));
+    println!(
+        "  raw snapshot ends_with ' '   = {} (mark_snapshot_truncated space marker)",
+        raw.ends_with(' ')
+    );
+    println!(
+        "  in-flight snapshot bytes     = {:?}",
+        in_flight.map(|live| live.output.len())
+    );
     println!("  snapshot first line          = {:?}", first_line);
     println!("  snapshot last  line          = {:?}", last_line);
-    println!("  first line number            = {:?}", line_number_of(&first_line));
-    println!("  last  line number            = {:?}", line_number_of(&last_line));
+    println!(
+        "  first line number            = {:?}",
+        line_number_of(&first_line)
+    );
+    println!(
+        "  last  line number            = {:?}",
+        line_number_of(&last_line)
+    );
     let head_present = raw.contains("line 00001");
     let tail_present = raw.contains(&format!("line {printed:05}"));
     println!("  'line 00001' in snapshot     = {head_present}");
     println!("  'line {printed:05}' (printed tail) in snapshot = {tail_present}");
     let truncated_at = line_number_of(&last_line).map(|n| n + 1);
-    println!("  first line number beyond snapshot = {truncated_at:?} (lines after this are missing)");
+    println!(
+        "  first line number beyond snapshot = {truncated_at:?} (lines after this are missing)"
+    );
 }
 
 #[test]
@@ -124,6 +140,36 @@ fn diagnostic_exp1a_scrollback_ring_eviction() {
     stream_lines(&mut terminal, 8_001, 15_000, line_a);
     assert!(terminal.refresh_primary_history_snapshot_now());
     observe(&terminal, "exp1a end", 15_000);
+
+    // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL) regression: the ring evicted
+    // lines 1..4978 from the grid, but the scroll-out prefix holds them in
+    // the block — ring eviction is decoupled from TUI history. The composed
+    // block text must be the FULL session, in order, each line exactly once.
+    let expected = full_session_text(1, 15_000, line_a);
+    let live = terminal
+        .block_tracker()
+        .in_flight()
+        .expect("in-flight block");
+    assert_eq!(
+        live.output,
+        expected,
+        "screen-owned block must keep the full session after ring eviction (head lines 00001.. in the prefix)"
+    );
+    assert!(live.output.contains("line 00001"));
+    assert!(live.output.contains("line 15000"));
+    // Settling the session finalizes the block with the same complete text.
+    terminal.process(b"\x1b]133;D;0\x07");
+    assert!(terminal.settle_primary_screen_exit());
+    assert_eq!(
+        terminal
+            .block_tracker()
+            .blocks()
+            .last()
+            .unwrap()
+            .output
+            .as_ref(),
+        expected
+    );
 }
 
 #[test]
@@ -138,15 +184,314 @@ fn diagnostic_exp1b_snapshot_budget_truncation() {
     );
     activate_primary_screen_tui(&mut terminal);
 
-    // Mid-stream: 3_000 lines x 201 B (~603 KB) < 1MiB -> no truncation.
+    // Mid-stream: 3_000 lines x 200 B (~600 KB) < 1MiB -> no truncation.
     stream_lines(&mut terminal, 1, 3_000, line_b);
     assert!(terminal.refresh_primary_history_snapshot_now());
     observe(&terminal, "exp1b mid", 3_000);
 
-    // Full run: 6_000 lines x 201 B (~1.2 MB) > 1MiB -> budget truncates.
+    // Full run: 6_000 lines x 200 B (~1.2 MB) > 1MiB -> the 1MiB split
+    // settles the head as a finished block and continues the tail in the
+    // in-flight block (no truncation, seamless text).
     stream_lines(&mut terminal, 3_001, 6_000, line_b);
     assert!(terminal.refresh_primary_history_snapshot_now());
     observe(&terminal, "exp1b end", 6_000);
+
+    // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL) regression: line 05991..06000
+    // must be present — read ACROSS the split blocks (cross-block
+    // concatenation), with contiguous ids and byte-seamless text.
+    let expected = full_session_text(1, 6_000, line_b);
+    let tracker = terminal.block_tracker();
+    assert!(
+        !tracker.blocks().is_empty(),
+        "the 1MiB split must have settled at least one finished block"
+    );
+    let mut concatenated = String::new();
+    let mut previous_id = 0u64;
+    for block in tracker.blocks() {
+        assert!(
+            block.id.0 > previous_id,
+            "split block ids must be strictly increasing"
+        );
+        previous_id = block.id.0;
+        concatenated.push_str(&block.output);
+    }
+    let live = tracker.in_flight().expect("continuation in-flight block");
+    concatenated.push_str(live.output);
+    assert_eq!(
+        concatenated, expected,
+        "finished + in-flight blocks must concatenate to the exact full session (cross-block seam)"
+    );
+    assert!(
+        live.output.contains("line 05991")
+            && live.output.contains("line 05995")
+            && live.output.contains("line 06000"),
+        "tail lines 05991..06000 must live in the continuation block: {}",
+        &live.output[live.output.len().saturating_sub(80)..]
+    );
+    assert!(
+        !tracker.blocks()[0].output.contains("line 05991"),
+        "line 05991 must be beyond the first 1MiB block (cross-block read)"
+    );
+}
+
+/// The exact expected session text for `from..=to` lines (rows joined with
+/// `\n`, no trailing newline) — the strongest no-loss / no-duplication
+/// oracle for the incremental capture.
+fn full_session_text(from: usize, to: usize, line_fn: fn(usize) -> String) -> String {
+    let mut text = String::with_capacity((to - from + 1) * 64);
+    for n in from..=to {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line_fn(n));
+    }
+    text
+}
+
+/// Concatenate the finished blocks and the in-flight continuation — the
+/// cross-block read used by the split regression tests.
+fn concatenated_block_text(terminal: &Terminal) -> String {
+    let tracker = terminal.block_tracker();
+    let mut concatenated = String::new();
+    for block in tracker.blocks() {
+        concatenated.push_str(&block.output);
+    }
+    concatenated.push_str(tracker.in_flight().expect("in-flight continuation").output);
+    concatenated
+}
+
+/// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): Blocker 1 — the consumed-prefix
+/// byte count must not subtract the non-existent history separator when the
+/// preserved-frame history is empty (the omp main scene). With the bug the
+/// first split leaked the consumed '\n' back into the prefix, and the SECOND
+/// refresh recomposed it at the seam — the cross-block concatenation was
+/// expected + 1 byte forever (empirically 1,206,000 vs 1,205,999).
+#[test]
+fn split_then_second_refresh_keeps_cross_block_concatenation_byte_exact() {
+    let mut terminal = Terminal::new(24, 200);
+    activate_primary_screen_tui(&mut terminal);
+    // 5,300 lines x 200 B: 5,276 rows pushed out of the 24-row viewport into
+    // the scroll-out prefix (~1,060,475 B) — the prefix ALONE exceeds
+    // MAX_OUTPUT_BYTES, so the first refresh must split it (history empty,
+    // prefix non-empty).
+    stream_lines(&mut terminal, 1, 5_300, line_b);
+    assert!(terminal.refresh_primary_history_snapshot_now());
+    let expected = full_session_text(1, 5_300, line_b);
+    assert!(
+        !terminal.block_tracker().blocks().is_empty(),
+        "first refresh must settle at least one 1MiB head block"
+    );
+    assert_eq!(
+        concatenated_block_text(&terminal),
+        expected,
+        "first split must be byte-seamless"
+    );
+
+    // Second refresh with no new output: the remaining prefix + viewport
+    // segment is recomposed — the seam must stay exact (no leaked separator
+    // byte re-emitted at the head of the remaining prefix).
+    assert!(terminal.refresh_primary_history_snapshot_now());
+    assert_eq!(
+        concatenated_block_text(&terminal),
+        expected,
+        "second refresh must keep the cross-block concatenation byte-exact"
+    );
+}
+
+/// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): Blocker 2 — a head ending in '\n'
+/// covers exactly `matches('\n')` line indices, not one more. The +1
+/// off-by-one shifted the tail's styled lines: the tail's first line lost
+/// its style and every following style landed one line up (empirically 785
+/// tail text lines vs 784 styled lines). With SGR colors on every line the
+/// split tail must carry one styled line per text line.
+#[test]
+fn split_tail_styled_line_count_matches_text_line_count() {
+    let mut terminal = Terminal::new(24, 200);
+    activate_primary_screen_tui(&mut terminal);
+    let mut buf = String::with_capacity(5_300 * 224);
+    for n in 1..=5_300 {
+        buf.push_str("\x1b[31m");
+        buf.push_str(&line_b(n));
+        buf.push_str("\x1b[0m\r\n");
+    }
+    terminal.process(buf.as_bytes());
+    assert!(terminal.refresh_primary_history_snapshot_now());
+
+    let tracker = terminal.block_tracker();
+    assert!(
+        !tracker.blocks().is_empty(),
+        "colored stream must also trigger the 1MiB split"
+    );
+    let live = tracker.in_flight().expect("in-flight tail");
+    let text_lines = live.output.lines().count();
+    let styled = live
+        .styled_output
+        .expect("colored tail must carry styled lines");
+    assert!(
+        text_lines > 0,
+        "setup: tail must contain the remaining prefix rows and the viewport segment"
+    );
+    assert_eq!(
+        styled.lines.len(),
+        text_lines,
+        "tail styled line count must equal tail text line count (no +1 off-by-one)"
+    );
+    assert!(
+        styled.line(0).is_some(),
+        "tail's FIRST line must keep its style (was dropped by the +1 shift)"
+    );
+    assert!(
+        styled.line(text_lines - 1).is_some(),
+        "tail's LAST line must keep its style"
+    );
+}
+
+/// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): Should-fix 3 — when the live
+/// viewport segment ALONE exceeds 1MiB (no chunkable history/prefix remains),
+/// splitting would cut the segment, and the next refresh re-captures the
+/// whole segment — the settled rows duplicate and the composed text grows
+/// without bound (empirically 1,049,780 -> 2,097,380). The split must
+/// degrade to the old snapshot truncation (head-keeping, no chunking), so
+/// repeated refreshes keep the total bounded.
+#[test]
+fn giant_viewport_segment_truncates_instead_of_growing_across_refreshes() {
+    // 3,000 rows x 360 cols: the viewport holds the whole session, so no
+    // scroll-out prefix exists — the composed text IS the segment, and it
+    // exceeds MAX_OUTPUT_BYTES (~1.08 MB).
+    let mut terminal = Terminal::new(3_000, 360);
+    activate_primary_screen_tui(&mut terminal);
+    let mut buf = String::with_capacity(3_000 * 370);
+    for n in 1..=3_000 {
+        buf.push_str(&format!("line {n:05} {}", "x".repeat(349)));
+        buf.push_str("\r\n");
+    }
+    terminal.process(buf.as_bytes());
+    assert!(terminal.refresh_primary_history_snapshot_now());
+
+    // The segment must be truncated at the 1MiB budget, NOT settled into a
+    // finished block: the in-flight tail holds the truncated segment (≤ MAX),
+    // and the concatenation may only exceed MAX by the chunkable parts that
+    // preceded it (the split drained them from the tracker, so the pre-split
+    // prefix is not observable here).
+    let first = concatenated_block_text(&terminal);
+    let tail = terminal
+        .block_tracker()
+        .in_flight()
+        .expect("in-flight tail");
+    assert!(
+        tail.output.len() <= MAX_OUTPUT_BYTES,
+        "giant segment must be truncated at the 1MiB budget in the in-flight tail, got {} bytes",
+        tail.output.len()
+    );
+    assert!(
+        first.len() <= MAX_OUTPUT_BYTES + 4096,
+        "concatenation must stay near the 1MiB budget (chunkable prefix parts only), got {} bytes",
+        first.len()
+    );
+    assert!(
+        first.contains("line 00001"),
+        "truncation must keep the session head"
+    );
+    assert!(
+        !first.contains("line 03000"),
+        "truncation must drop the session tail"
+    );
+
+    // Another refresh with no new output must NOT double the content (the
+    // pre-fix behavior settled a fresh 1MiB head every refresh: 1,049,780 ->
+    // 2,097,380).
+    assert!(terminal.refresh_primary_history_snapshot_now());
+    let second = concatenated_block_text(&terminal);
+    assert_eq!(
+        second, first,
+        "repeated refreshes must not grow the giant-segment truncation"
+    );
+}
+
+/// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): the three-part composed block text
+/// must be preserved-frame history + scroll-out prefix + viewport snapshot in
+/// that order — the frame preservation (Phase 2) and the incremental capture
+/// coexist without duplication.
+#[test]
+fn three_part_compose_orders_frames_then_prefix_then_viewport() {
+    let mut terminal = Terminal::new(5, 40);
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07\x1b[H\x1b[2;1H");
+    // Stream rows out of the viewport -> old row one is captured into the
+    // scroll-out prefix; old rows two..six stay in the viewport.
+    terminal.process(
+        b"old row one\r\nold row two\r\nold row three\r\nold row four\r\nold row five\r\nold row six\r\n",
+    );
+    assert!(
+        terminal.block_tracker().screen_prefix_len() > 0,
+        "prefix must hold the pushed row"
+    );
+    // Synchronized full repaint with CSI 2J: the superseded viewport (old
+    // rows two..six) is preserved as a history frame BEFORE the clear.
+    terminal.process(b"\x1b[?2026h\x1b[2J\x1b[Hnew row one\x1b[?2026l");
+    // Post-repaint streaming scrolls the new rows out -> more prefix rows.
+    terminal.process(
+        b"new row two\r\nnew row three\r\nnew row four\r\nnew row five\r\nnew row six\r\n",
+    );
+    assert!(terminal.refresh_primary_history_snapshot_now());
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    let frame_pos = output.find("old row two").expect("preserved frame");
+    let prefix_pos = output.find("new row one").expect("prefix row");
+    let snapshot_pos = output.find("new row two").expect("snapshot row");
+    assert!(
+        frame_pos < prefix_pos && prefix_pos < snapshot_pos,
+        "composed order must be frames < prefix < viewport: {output:?}"
+    );
+    // The preserved frame and the prefix must not duplicate each other.
+    for row in [
+        "old row one",
+        "old row two",
+        "old row six",
+        "new row one",
+        "new row two",
+        "new row six",
+    ] {
+        assert_eq!(
+            output.matches(row).count(),
+            1,
+            "row {row} must appear exactly once"
+        );
+    }
+}
+
+/// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): rows the TUI painted BEFORE the
+/// capture threshold (retained owned rows at capture start) are folded into
+/// the prefix by the capture-start rebase, so the composed transcript keeps
+/// document order — older pre-capture rows before newer streamed rows.
+#[test]
+fn pre_capture_owned_rows_precede_streamed_rows_in_document_order() {
+    let mut terminal = Terminal::new(5, 40);
+    // Shell integration, then print rows WITHOUT cursor addressing yet.
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    terminal.process(b"pre-capture banner\r\n");
+    // One cursor op only (below the 2-op threshold) — the capture has not
+    // started, but the printed row is owned.
+    terminal.process("\x1b[2;1H".as_bytes());
+    terminal.process(b"pre-capture content\r\n");
+    // Second cursor op -> the capture starts; the retained owned rows must be
+    // rebased into the prefix.
+    terminal.process("\x1b[3;1H".as_bytes());
+    assert!(terminal.primary_screen_app_active());
+    // Post-capture streaming.
+    terminal.process(b"streamed row after capture\r\n");
+    assert!(terminal.refresh_primary_history_snapshot_now());
+
+    let output = terminal.block_tracker().in_flight().unwrap().output;
+    let pre_pos = output.find("pre-capture banner").expect("pre-capture row");
+    let streamed_pos = output
+        .find("streamed row after capture")
+        .expect("streamed row");
+    assert!(
+        pre_pos < streamed_pos,
+        "pre-capture owned rows must precede newer streamed rows: {output:?}"
+    );
+    assert_eq!(output.matches("pre-capture banner").count(), 1);
+    assert_eq!(output.matches("pre-capture content").count(), 1);
 }
 
 #[test]
@@ -178,12 +523,18 @@ fn diagnostic_exp2_border_wrap_203_cols_core() {
     println!("\n=== [exp2 core] 203-col box line in snapshot ===");
     println!("  snapshot total bytes      = {}", snapshot.len());
     println!("  captured line bytes       = {}", captured.len());
-    println!("  captured first 10 chars   = {:?}", &captured[..captured.len().min(10)]);
+    println!(
+        "  captured first 10 chars   = {:?}",
+        &captured[..captured.len().min(10)]
+    );
     println!(
         "  captured last 10 chars    = {:?}",
         &captured[captured.len().saturating_sub(10)..]
     );
-    println!("  captured terminal width   = {}", terminal_text_width(captured));
+    println!(
+        "  captured terminal width   = {}",
+        terminal_text_width(captured)
+    );
     println!("  captured ends_with '|]'   = {}", captured.ends_with("|]"));
     println!("  captured chars            = {}", captured.chars().count());
 }

@@ -29,6 +29,7 @@ mod continuation;
 mod cursor_capture;
 pub mod export;
 mod output_capture;
+mod screen_capture;
 
 #[cfg(test)]
 mod screen_capture_tests;
@@ -36,6 +37,9 @@ mod semantic;
 mod style;
 
 pub(crate) use output_capture::OutputCapture;
+pub(crate) use screen_capture::{
+    extract_owned_pushed_rows, line_boundary_at_or_before, styled_lines_from, styled_lines_in,
+};
 pub use semantic::{
     classify_block, classify_line, OutputSemanticRole, SemanticLine, SemanticOutput, SemanticSpan,
     MAX_SEMANTIC_SPANS_PER_BLOCK, MAX_SEMANTIC_SPANS_PER_LINE,

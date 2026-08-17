@@ -304,6 +304,10 @@ impl Terminal {
         } else {
             self.grid.scroll_up(count);
         }
+        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): capture rows pushed out of
+        // the viewport into the screen prefix before the ownership transform
+        // rotates the viewport mask (a no-op for down-scrolls — pushed is 0).
+        self.capture_scrolled_out_screen_rows(origin_before);
         self.transform_primary_screen_rows(
             origin_before,
             self.grid.scrollback.position(),
@@ -325,11 +329,18 @@ impl Terminal {
         // with a clean preservation history. Nested 133 markers keep
         // `screen_document_start` set, so the accumulated frames survive
         // them; only a real boundary (settle → next command) resets it.
-        if self.block_tracker.screen_document_start().is_none() {
+        let starting = self.block_tracker.screen_document_start().is_none();
+        if starting {
             self.capabilities.screen_history = crate::vt::capability::ScreenHistory::default();
         }
         self.block_tracker
             .begin_screen_owned_output(self.capabilities.primary_screen_document_candidate);
+        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): first ownership — fold the
+        // retained owned pre-capture rows into the screen prefix so the
+        // composed transcript keeps document order.
+        if starting && self.block_tracker.screen_document_start().is_some() {
+            self.rebase_screen_prefix_at_capture_start();
+        }
     }
 
     fn primary_screen_document_snapshot(
@@ -384,6 +395,10 @@ impl Terminal {
         let (top, bottom) = self.grid.scroll_region();
         let scrolled = self.grid.index();
         if scrolled {
+            // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): capture the row pushed
+            // out of the viewport into the screen prefix before the ownership
+            // transform rotates the viewport mask.
+            self.capture_scrolled_out_screen_rows(origin);
             self.transform_primary_screen_rows(
                 origin,
                 self.grid.scrollback.position(),
@@ -622,7 +637,8 @@ impl Terminal {
         };
         // v1.10.23: the rendered block prepends the preserved-frame history,
         // so the anchor's rendered line shifts by that many lines.
-        line.map(|line| line + self.screen_history_lines())
+        // v1.10.25: the scroll-out prefix shifts it too (three-part compose).
+        line.map(|line| line + self.screen_history_lines() + self.screen_prefix_lines())
     }
 
     /// v1.10.12: alt-screen history peek — true while the user is browsing the
@@ -667,8 +683,9 @@ impl Terminal {
         let (_, _, cursor_line) = self.primary_screen_document_snapshot(document_start);
         // v1.10.23: shift by the preserved-frame history — the caret row must
         // match the composed block output (history + snapshot).
+        // v1.10.25: shift by the scroll-out prefix too (three-part compose).
         self.capabilities.primary_screen_cursor_snapshot_line =
-            cursor_line.map(|line| line + self.screen_history_lines());
+            cursor_line.map(|line| line + self.screen_history_lines() + self.screen_prefix_lines());
     }
 
     pub fn set_primary_history_view(&mut self, active: bool) {
@@ -756,8 +773,9 @@ impl Terminal {
                 capture.frozen_styled.clone(),
                 &capture.tail,
             );
+            let segment_len = text.len();
             let (text, styled) = self.compose_screen_history(text, styled);
-            self.block_tracker.replace_screen_snapshot(&text, styled);
+            self.publish_screen_snapshot(text, styled, segment_len);
             return;
         }
         let Some(document_start) = self.block_tracker.screen_document_start() else {
@@ -768,14 +786,35 @@ impl Terminal {
         // v1.10.23 (FIX_OMP_CONTENT_LOSS): prepend the preserved superseded
         // frames so the block transcript stays complete across full-frame
         // repaints; the cursor line shifts by the prepended history.
+        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): the scroll-out prefix joins
+        // between the frames and the snapshot.
+        let segment_len = text.len();
         let (text, styled) = self.compose_screen_history(text, styled);
+        self.publish_screen_snapshot(text, styled, segment_len);
         // v1.10.6: store the precisely-tracked cursor snapshot line so the
         // BlockView paint can place the caret/preedit on the exact document
         // row instead of guessing from a formula that breaks when the
         // snapshot skips empty rows.
+        // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): compute the caret anchor
+        // AFTER the split — a split consumed the head of the history/prefix,
+        // so only the REMAINING offsets locate the caret on the in-flight
+        // block's composed rows. Pre-split offsets left a ≤50ms caret
+        // out-of-bounds window on split frames.
         self.capabilities.primary_screen_cursor_snapshot_line =
-            cursor_line.map(|line| line + self.screen_history_lines());
-        self.block_tracker.replace_screen_snapshot(&text, styled);
+            cursor_line.map(|line| line + self.screen_history_lines() + self.screen_prefix_lines());
+    }
+
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): publish a composed screen
+    /// snapshot to the in-flight block — or split it into 1MiB finished
+    /// blocks plus an in-flight tail when the session history crossed
+    /// `MAX_OUTPUT_BYTES` (long TUI sessions no longer truncate at the
+    /// snapshot budget).
+    fn publish_screen_snapshot(&mut self, text: String, styled: StyledOutput, segment_len: usize) {
+        if text.len() > MAX_OUTPUT_BYTES {
+            self.split_screen_history(text, styled, segment_len);
+        } else {
+            self.block_tracker.replace_screen_snapshot(&text, styled);
+        }
     }
 
     pub(super) fn defer_primary_screen_exit(&mut self, exit_code: Option<i32>) {

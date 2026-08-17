@@ -412,6 +412,51 @@ impl Grid {
         }
         (text, StyledOutput { lines }, cursor_snapshot_line)
     }
+
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): extract the retained scrollback
+    /// rows `[start, len)` as (text, optional styled line) pairs — the raw
+    /// material for the incremental scroll-out prefix capture. Uses the same
+    /// per-row extraction as the document snapshot (`styled_row`), so prefix
+    /// text and styles match the snapshot semantics; ownership filtering and
+    /// empty-row skipping are applied by the caller's pure function
+    /// (`blocks::screen_capture::extract_owned_pushed_rows`).
+    pub(crate) fn snapshot_rows_from_scrollback<F>(
+        &self,
+        start: usize,
+        url_resolver: F,
+    ) -> Vec<(String, Option<StyledLine>)>
+    where
+        F: Fn(u32) -> Option<Arc<str>>,
+    {
+        (start..self.scrollback.len())
+            .filter_map(|index| {
+                let row = self.scrollback.get(index)?;
+                let snap = styled_row(
+                    row,
+                    self.num_cols,
+                    MAX_OUTPUT_BYTES,
+                    Some(MAX_SNAPSHOT_COLOR_SPANS),
+                    &url_resolver,
+                );
+                let styled = if snap.style_overflow
+                    || (snap.foregrounds.is_empty()
+                        && snap.backgrounds.is_empty()
+                        && snap.attributes.is_empty())
+                {
+                    None
+                } else {
+                    Some(StyledLine {
+                        line: 0,
+                        foregrounds: snap.foregrounds,
+                        backgrounds: snap.backgrounds,
+                        links: snap.links,
+                        attributes: snap.attributes,
+                    })
+                };
+                Some((snap.text, styled))
+            })
+            .collect()
+    }
 }
 
 struct SnapshotRow {

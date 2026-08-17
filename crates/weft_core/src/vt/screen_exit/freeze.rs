@@ -2,7 +2,10 @@
 //! primary screen.
 
 use super::Terminal;
-use crate::blocks::StyledOutput;
+use crate::blocks::{
+    extract_owned_pushed_rows, line_boundary_at_or_before, styled_lines_from, styled_lines_in,
+    StyledOutput, MAX_OUTPUT_BYTES,
+};
 
 /// v1.10.23 (FIX_OMP_CONTENT_LOSS): minimum preserved-frame size (snapshot
 /// text lines). Smaller frames are resize-jitter repaints — preserving them
@@ -123,34 +126,307 @@ impl Terminal {
         text.matches('\n').count() + usize::from(!text.is_empty())
     }
 
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): number of text lines in the
+    /// scroll-out prefix — the second segment of the three-part composed
+    /// block text. Caret and drag-selection offsets shift by it.
+    pub(super) fn screen_prefix_lines(&self) -> usize {
+        self.block_tracker.screen_prefix_line_count()
+    }
+
     /// v1.10.23 (FIX_OMP_CONTENT_LOSS): prepend the accumulated superseded
     /// frames to a fresh document snapshot. The history is the stable
     /// transcript head; the snapshot is the live tail. Zero-cost (text passed
     /// through unchanged) when no frames were preserved.
+    ///
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): the composed block text is now
+    /// THREE parts in document order — preserved-frame history, scroll-out
+    /// prefix (captured from rows pushed out of the viewport), and the
+    /// current viewport snapshot. The prefix is appended by
+    /// [`Self::capture_scrolled_out_screen_rows`] and folded in here.
     pub(super) fn compose_screen_history(
         &self,
         text: String,
         styled: StyledOutput,
     ) -> (String, StyledOutput) {
         let history = &self.capabilities.screen_history;
-        if history.text.is_empty() {
+        let prefix_text = self.block_tracker.screen_prefix_text();
+        if history.text.is_empty() && prefix_text.is_empty() {
             return (text, styled);
         }
-        let mut composed = String::with_capacity(history.text.len() + 1 + text.len());
-        composed.push_str(&history.text);
-        composed.push('\n');
+        let mut composed =
+            String::with_capacity(history.text.len() + prefix_text.len() + 2 + text.len());
+        if !history.text.is_empty() {
+            composed.push_str(&history.text);
+            composed.push('\n');
+        }
+        if !prefix_text.is_empty() {
+            composed.push_str(prefix_text);
+            composed.push('\n');
+        }
         composed.push_str(&text);
-        let offset = self.screen_history_lines() as u32;
+        let history_lines = self.screen_history_lines();
+        let prefix_lines = self.screen_prefix_lines();
         let mut styled = styled;
         for line in &mut styled.lines {
-            line.line = line.line.saturating_add(offset);
+            line.line = line
+                .line
+                .saturating_add((history_lines + prefix_lines) as u32);
         }
         let mut lines = history
             .styled
             .as_ref()
             .map_or_else(Vec::new, |history| history.lines.clone());
+        if let Some(prefix_styled) = self.block_tracker.screen_prefix_styled() {
+            let mut shifted = prefix_styled.lines.clone();
+            for line in &mut shifted {
+                line.line = line.line.saturating_add(history_lines as u32);
+            }
+            lines.extend(shifted);
+        }
         lines.extend(styled.lines);
         (composed, StyledOutput { lines })
+    }
+
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): incrementally capture rows
+    /// pushed out of the viewport by a scroll (LF overflow via
+    /// `index_primary_screen`, CSI S via `scroll_grid_rows`) while a
+    /// screen-owned TUI owns the document. Owned rows are appended to the
+    /// in-flight block's screen prefix BEFORE the scrollback ring can evict
+    /// them, so ring eviction is decoupled from TUI history. Must run BEFORE
+    /// `transform_primary_screen_rows`: the viewport ownership mask has not
+    /// been rotated yet, so its first `pushed` entries describe the pushed
+    /// rows. The interrupt-capture window is skipped — that path owns its own
+    /// frozen transcript + tail capture.
+    pub(super) fn capture_scrolled_out_screen_rows(&mut self, origin_before: u64) {
+        let Some(document_start) = self.block_tracker.screen_document_start() else {
+            return;
+        };
+        if self.capabilities.primary_screen_interrupt_capture.is_some() {
+            return;
+        }
+        let pushed = self
+            .grid
+            .scrollback
+            .position()
+            .saturating_sub(origin_before) as usize;
+        if pushed == 0 {
+            return;
+        }
+        let owned: Vec<bool> = self
+            .capabilities
+            .primary_screen_ownership
+            .viewport
+            .as_deref()
+            // No mask (sparse repainters) ⇒ all rows owned — same semantics
+            // as the snapshot walk with no mask.
+            .map_or_else(
+                || vec![true; pushed],
+                |mask| mask.iter().take(pushed).copied().collect(),
+            );
+        let scrollback_from = self.grid.scrollback.len().saturating_sub(pushed);
+        let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
+            self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
+        };
+        let rows = self
+            .grid
+            .snapshot_rows_from_scrollback(scrollback_from, url_resolver);
+        let (text, styled) = extract_owned_pushed_rows(&rows, &owned);
+        if !text.is_empty() {
+            self.block_tracker.append_screen_prefix(&text, styled);
+        }
+        // Observation fallback: the ring evicted rows older than the screen
+        // document start — only possible for the pre-capture window (every
+        // row pushed during screen ownership is prefix-captured first, so a
+        // normal session never evicts an uncovered row).
+        let oldest_retained = self
+            .grid
+            .scrollback
+            .position()
+            .saturating_sub(self.grid.scrollback.len() as u64);
+        if oldest_retained < document_start {
+            tracing::debug!(
+                document_start,
+                oldest_retained,
+                "scrollback ring eviction reached rows before the screen document start (pre-capture window)"
+            );
+        }
+    }
+
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): at screen-ownership start,
+    /// move the retained owned rows that predate the capture (the TUI's
+    /// pre-threshold frames, still in the scrollback) into the screen prefix
+    /// and flip their ownership. Without this the composed transcript would
+    /// put newer prefix rows BEFORE those older retained rows; with it the
+    /// prefix always holds every row older than the viewport snapshot, in
+    /// document order.
+    pub(super) fn rebase_screen_prefix_at_capture_start(&mut self) {
+        let Some(document_start) = self.block_tracker.screen_document_start() else {
+            return;
+        };
+        let scrollback_from = self.grid.scrollback.index_since(document_start);
+        let owned: Vec<bool> = self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .iter()
+            .skip(scrollback_from)
+            .copied()
+            .collect();
+        if !owned.iter().any(|owned| *owned) {
+            return;
+        }
+        let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
+            self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
+        };
+        let rows = self
+            .grid
+            .snapshot_rows_from_scrollback(scrollback_from, url_resolver);
+        let (text, styled) = extract_owned_pushed_rows(&rows, &owned);
+        if !text.is_empty() {
+            self.block_tracker.append_screen_prefix(&text, styled);
+        }
+        // The captured rows now live in the prefix — flip them so the
+        // snapshot walk skips them (keeping them owned would duplicate them
+        // in the composed block text).
+        for entry in self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .iter_mut()
+            .skip(scrollback_from)
+        {
+            *entry = false;
+        }
+    }
+
+    /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): 1MiB chunking for screen-owned
+    /// TUI history. The composed text exceeded `MAX_OUTPUT_BYTES`: settle the
+    /// head chunk(s) as finished blocks (contiguous ids, byte-seamless text)
+    /// and continue the tail in the in-flight block, so long sessions no
+    /// longer truncate at the snapshot budget. The boundary never cuts inside
+    /// the live viewport segment (`segment_len` bytes at the composed tail) —
+    /// the snapshot is re-captured wholesale on the next refresh, so a
+    /// partial segment in a finished block would duplicate the surviving
+    /// rows. Degradation branch: when the viewport segment ALONE exceeds
+    /// `MAX_OUTPUT_BYTES` (no chunkable history/prefix remains before it),
+    /// splitting would have to cut the segment — the split falls back to the
+    /// old snapshot truncation (head-keeping, tail styles dropped, see
+    /// [`Self::trim_screen_history`]) and warns. Ordinary command-output
+    /// capture (the print path) is untouched — its truncation semantics are
+    /// unchanged.
+    pub(super) fn split_screen_history(
+        &mut self,
+        composed: String,
+        styled: StyledOutput,
+        segment_len: usize,
+    ) {
+        let history_len = self.capabilities.screen_history.text.len();
+        // The '\n' separator between the history and the prefix exists only
+        // when the history is non-empty (see `compose_screen_history`).
+        let history_sep = usize::from(history_len > 0);
+        let prefix_len = self.block_tracker.screen_prefix_len();
+        let composed_len = composed.len();
+        let mut heads: Vec<(String, Option<StyledOutput>)> = Vec::new();
+        let mut rest = composed;
+        let mut line_at = 0usize;
+        while rest.len() > MAX_OUTPUT_BYTES {
+            let natural = line_boundary_at_or_before(&rest, MAX_OUTPUT_BYTES);
+            let clamp = rest.len().saturating_sub(segment_len);
+            if clamp == 0 {
+                // The entire remaining text is the live viewport segment
+                // (>1MiB). Settling any of it in a finished block would
+                // duplicate the settled rows on the next refresh (the
+                // segment is re-captured wholesale) — unbounded growth.
+                // Fall back to the pre-split snapshot truncation: settle the
+                // heads split so far, truncate the segment at the 1MiB
+                // budget in the in-flight block, drop tail styles (matching
+                // `replace_screen_snapshot`'s truncation semantics).
+                let mut end = MAX_OUTPUT_BYTES.min(rest.len());
+                while end > 0 && !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let tail = rest[..end].to_string();
+                let consumed_bytes = composed_len - rest.len();
+                let consumed_h = consumed_bytes.min(history_len);
+                let consumed_p = consumed_bytes
+                    .saturating_sub(history_len + history_sep)
+                    .min(prefix_len);
+                self.trim_screen_history(consumed_h);
+                let head_count = heads.len();
+                self.block_tracker
+                    .split_screen_history(heads, tail, None, consumed_p);
+                tracing::warn!(
+                    heads = head_count,
+                    bytes = rest.len(),
+                    "screen-owned viewport segment alone exceeds 1MiB; degrading to snapshot truncation (chunking disabled)"
+                );
+                return;
+            }
+            let boundary = natural.min(clamp);
+            // Complete lines fully owned by the head — a head ending in '\n'
+            // covers exactly `matches('\n')` line indices (the trailing '\n'
+            // terminates the last line; it does not open a new one). A
+            // mid-line cut leaves the partial line's styled index with the
+            // tail, where the line completes.
+            let head_lines = rest[..boundary].matches('\n').count();
+            let head_styled = styled_lines_in(&styled, line_at, head_lines);
+            heads.push((rest[..boundary].to_string(), head_styled));
+            line_at += head_lines;
+            rest = rest[boundary..].to_string();
+        }
+        let tail_styled = styled_lines_from(&styled, line_at);
+        let consumed_bytes = composed_len - rest.len();
+        // The heads consume the history part first, then the prefix part
+        // (the composed is history + '\n' + prefix + '\n' + segment).
+        let consumed_h = consumed_bytes.min(history_len);
+        let consumed_p = consumed_bytes
+            .saturating_sub(history_len + history_sep)
+            .min(prefix_len);
+        self.trim_screen_history(consumed_h);
+        let head_count = heads.len();
+        let tail_bytes = rest.len();
+        self.block_tracker
+            .split_screen_history(heads, rest, tail_styled, consumed_p);
+        tracing::info!(
+            heads = head_count,
+            tail_bytes,
+            "splitting long TUI history block at 1MiB"
+        );
+    }
+
+    /// Drop the first `consumed` bytes of the preserved-frame history (the
+    /// part folded into a finished block by the 1MiB split). The boundary is
+    /// a line boundary of the history, so the remaining text is intact; kept
+    /// styled lines are re-indexed.
+    fn trim_screen_history(&mut self, consumed: usize) {
+        if consumed == 0 {
+            return;
+        }
+        let history = &mut self.capabilities.screen_history;
+        let consumed = consumed.min(history.text.len());
+        if consumed == 0 {
+            return;
+        }
+        let consumed_lines = history.text[..consumed].matches('\n').count()
+            + usize::from(consumed == history.text.len());
+        // `consumed < len`: the split boundary is a '\n' inside the history
+        // (or an overlong-line mid-cut) — every line fully owned by the head
+        // ends with '\n' in the consumed region, so `matches('\n')` counts
+        // them. `consumed == len`: the whole history was folded into the
+        // head, whose boundary sits past the history end — the last line is
+        // completed by the head's separator '\n' and must be counted too.
+        history.text.drain(..consumed);
+        if let Some(styled) = &mut history.styled {
+            styled
+                .lines
+                .retain(|line| (line.line as usize) >= consumed_lines);
+            for line in &mut styled.lines {
+                line.line = line.line.saturating_sub(consumed_lines as u32);
+            }
+            if styled.lines.is_empty() {
+                history.styled = None;
+            }
+        }
     }
 
     /// Freeze the shell/TUI boundary at OSC 133;B, before the launched
@@ -246,6 +522,22 @@ impl Terminal {
                         .primary_screen_ownership
                         .scrollback
                         .insert(0, false);
+                }
+                // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): rows pushed out
+                // during a screen-owned session were captured into the
+                // in-flight block's screen prefix by
+                // `capture_scrolled_out_screen_rows`; flip their ownership so
+                // the snapshot walk skips them (their text lives in the
+                // prefix — keeping them owned would duplicate them in the
+                // composed block text). Same gates as the capture.
+                if self.block_tracker.screen_document_start().is_some()
+                    && self.capabilities.primary_screen_interrupt_capture.is_none()
+                {
+                    let mask = &mut self.capabilities.primary_screen_ownership.scrollback;
+                    let from = mask.len().saturating_sub(pushed);
+                    for entry in &mut mask[from..] {
+                        *entry = false;
+                    }
                 }
             }
             transform_viewport_ownership(owned, top, bottom, count, down);

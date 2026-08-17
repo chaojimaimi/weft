@@ -495,7 +495,10 @@ mod tests {
             "  last  6 chars of source = {:?}",
             &line[line.len().saturating_sub(6)..]
         );
-        println!("  classify_structure_line = {:?}", classify_structure_line(&line));
+        println!(
+            "  classify_structure_line = {:?}",
+            classify_structure_line(&line)
+        );
 
         let chunks = block_line_chunks(&line, cols).collect::<Vec<_>>();
         println!("  chunk count             = {}", chunks.len());
