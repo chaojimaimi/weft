@@ -511,21 +511,17 @@ impl Tab {
             .find_map(|(id, rect)| (id == self.active_pane).then_some(rect))?;
         let [x0, y0, x1, y1] = rect;
         let pane_width = (x1 - x0).max(0.0);
-        // v1.10.19: full pane width whenever the pane is an alt-screen TUI
-        // or a screen-owning primary-screen TUI (see
-        // `Terminal::wants_full_width_cols`) — cols must NOT swing with a
-        // primary-screen TUI's transient DEC 1049 toggles (102↔99 flapping
-        // re-queues TIOCSWINSZ every cycle: the resize feedback loop).
-        let full_width = self
-            .panes
-            .get(&self.active_pane)
-            .and_then(|p| p.terminal.as_ref())
-            .is_some_and(Terminal::wants_full_width_cols);
-        let cols = if full_width {
-            crate::layout::terminal_full_cols(pane_width, cell_w)
-        } else {
-            crate::layout::terminal_content_cols(pane_width, cell_w)
-        };
+        // v1.10.19: cols must track the pane's terminal cols *kind* (see
+        // `Terminal::tui_cols_kind`) and must NOT swing with a primary-screen
+        // TUI's transient DEC 1049 toggles. v1.10.25 Batch 2: primary-screen
+        // TUIs map to Content width (Full was the v1.10.19 choice) so the
+        // PTY width, the grid render width and the block wrap width are one
+        // value (FIX_TUI_INPUT_WIDTH_ALIGNMENT).
+        // v1.10.25 Batch 3 (B1): the per-frame drift check consumes this and
+        // recomputes unconditionally on mismatch, so the shared
+        // `burst_locked_cols` also applies burst hysteresis — while a toggle
+        // storm is fresh, the target stays Content (tab/resize.rs).
+        let cols = self.burst_locked_cols(self.active_pane, pane_width, cell_w);
         let rows = ((y1 - y0).max(0.0) / cell_h).floor() as usize;
         (rows > 0 && cols > 0).then_some((rows, cols))
     }
@@ -555,22 +551,14 @@ impl Tab {
             let [x0, y0, x1, y1] = rect;
             let pane_width = (x1 - x0).max(0.0);
             let pane_height = (y1 - y0).max(0.0);
-            // v1.10.19: full width for alt-screen TUIs and screen-owning
-            // primary-screen TUIs (see `Terminal::wants_full_width_cols`).
-            // Cols must not swing with transient DEC 1049 toggles — the
-            // 99↔102 flip re-queues a PTY resize each cycle, feeding the
-            // SIGWINCH → redraw → toggle oscillation. The BlockView gutter
-            // lives at the render layer only (grid content x-inset).
-            let full_width = self
-                .panes
-                .get(&pane_id)
-                .and_then(|p| p.terminal.as_ref())
-                .is_some_and(Terminal::wants_full_width_cols);
-            let cols = if full_width {
-                crate::layout::terminal_full_cols(pane_width, cell_w)
-            } else {
-                crate::layout::terminal_content_cols(pane_width, cell_w)
-            };
+            // v1.10.19/25 Batch 2: cols track the pane's terminal cols kind (see
+            // `Terminal::tui_cols_kind`); they must not swing with transient
+            // DEC 1049 toggles — the 99↔102 flip re-queues a PTY resize each
+            // cycle, feeding the SIGWINCH → redraw → toggle oscillation.
+            // v1.10.25 Batch 3 (B1): `burst_locked_cols` adds the burst
+            // hysteresis lock (storm → Content), identically to
+            // `active_pane_dimensions_for_rect`.
+            let cols = self.burst_locked_cols(pane_id, pane_width, cell_w);
             let rows = (pane_height / cell_h).floor() as usize;
             if rows == 0 || cols == 0 {
                 continue;

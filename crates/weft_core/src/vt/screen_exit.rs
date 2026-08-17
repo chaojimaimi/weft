@@ -54,6 +54,57 @@ pub(in crate::vt) struct PrimaryScreenInterruptCapture {
     pub(in crate::vt) origin_row: Option<usize>,
 }
 
+/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): PTY cols policy for
+/// the active pane. The value drives
+/// `Tab::active_pane_dimensions_for_rect` / `Tab::resize_all_panes_for_rect`
+/// (weft_app), which choose between
+/// [`weft_app::layout::terminal_full_cols`] and
+/// [`weft_app::layout::terminal_content_cols`].
+///
+/// v1.10.19: MUST NOT make a primary-screen TUI's transient DEC 1049
+/// toggles produce a *drifting* target: a col count that changes to a new
+/// value each `?1049h/l` feedback cycle (SIGWINCH → redraw → toggle →
+/// TIOCSWINSZ → SIGWINCH) oscillates forever. The two-phase mapping here
+/// is a pure constant function of the alt flag — the same pair of values
+/// replays no matter how often the flag flips, so the target never
+/// ratchets into a third value.
+///
+/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT) re-mapped the primary
+/// phase from Full to Content. That re-opened a real oscillation: the
+/// primary target (Content) now differs from the transient alt target
+/// (Full), and the v1.10.19 defenses ALONE cannot bound that alternation —
+/// the winsize ioctl dedup (pane.rs `should_send_winsize_ioctl`) is a
+/// simple inequality (`last_sent != requested`) that never suppresses an
+/// alternating pair, and the 150ms rescale debounce only gates
+/// `take_pending_alt_rescale`, which the active tab's per-frame drift check
+/// (redraw_controller.rs, recomputes unconditionally when desired !=
+/// current) never calls. The anti-cycle guarantee is the v1.10.25 Batch 3
+/// burst hysteresis at the app-layer cols mirror sites (tab/resize.rs
+/// `Tab::burst_locked_cols`): while a toggle burst is fresh the target is
+/// locked to Content (primary semantics), so the drift check's desired
+/// stays constant and the loop has no energy; a single toggle that goes
+/// quiet unlocks after the window and converges to Full. The v1.10.19 ioctl
+/// dedup remains effective for that converged constant — a sustained phase
+/// re-issues nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TuiColsKind {
+    /// Alt-screen TUI (vim/htop/less): paints edge-to-edge with no
+    /// BlockView gutter. The grid origin is the pane's left edge, so
+    /// every column is renderable.
+    Full,
+    /// Primary-screen TUI (omp/pi/openclaw), including while its exit is
+    /// settling, and plain shell output: the BlockView content width.
+    /// The grid renders inset by the gutter
+    /// (`weft_app::paint::grid::grid_content_origin_x`), so full-width
+    /// cols would overflow the content area by the gutter (~1.5 cols,
+    /// right edge clipped — v1.10.19's full-width scheme). Content width
+    /// makes three independently-computed widths identical: PTY target
+    /// cols == grid render cols == block wrap cols, so the omp input-line
+    /// border `|]` never exceeds the renderable area and never folds to a
+    /// continuation chunk after settle.
+    Content,
+}
+
 impl Terminal {
     /// Primary-screen TUIs such as Claude Code do not enter DEC 1049, but
     /// repeatedly use absolute cursor addressing to own the whole viewport.
@@ -489,23 +540,32 @@ impl Terminal {
         self.capabilities.primary_screen_exit.is_some()
     }
 
-    /// v1.10.19: Whether the pane's PTY cols should span the full pane width
-    /// (no BlockView gutter subtraction). True for alt-screen TUIs
-    /// (vim/htop/less — they paint edge-to-edge) and for primary-screen TUIs
-    /// that own the screen (omp/pi/openclaw), including while their exit is
-    /// still settling.
+    /// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): renamed from
+    /// `wants_full_width_cols` and re-mapped — primary-screen TUIs (which
+    /// returned Full since v1.10.19) now return [`TuiColsKind::Content`].
+    /// omp draws its UI at exactly the PTY cols it receives; Full made its
+    /// input-line border column (`|]`) land one cell past weft's renderable
+    /// area (the right ~1.5 cols were clipped) and later fold into a
+    /// continuation chunk at the settle transition. Content keeps the PTY
+    /// target, the grid render width and the block wrap width identical.
     ///
-    /// MUST NOT depend on a primary-screen TUI's transient DEC 1049 state: a
-    /// col count that swings with `?1049h/l` feedback (SIGWINCH → redraw →
-    /// toggle → TIOCSWINSZ → SIGWINCH) oscillates forever, re-queuing a PTY
-    /// resize every cycle. The BlockView gutter is expressed at the render
-    /// layer only (grid content x-inset, see
-    /// `weft_app::paint::grid::grid_content_origin_x`), so cols stay stable
-    /// across alt toggles.
-    pub fn wants_full_width_cols(&self) -> bool {
-        self.capabilities.alt_active
-            || self.primary_screen_app_active()
-            || self.primary_screen_exit_pending()
+    /// Each phase maps to one constant target (alt → Full, everything else
+    /// → Content), so transient `?1049h/l` feedback replays the same two
+    /// constants instead of ratcheting into new values. That property alone
+    /// does NOT bound a Full↔Content alternation: the ioctl dedup (pane.rs
+    /// `should_send_winsize_ioctl`) only suppresses a repeat of the last
+    /// size sent, and the 150ms debounce (tab/resize.rs) is bypassed by the
+    /// active tab's per-frame drift check. v1.10.25 Batch 3 (B1) adds the
+    /// missing anti-cycle guard at the app-layer mirror sites — burst
+    /// hysteresis (`Tab::burst_locked_cols`) keeps the target at Content
+    /// while toggle flips stay fresh — so this pure mapping feeds a stable
+    /// desired; see FIX_SCROLL_SHIFT_AND_RESIZE_STORM.md 演进注记.
+    pub fn tui_cols_kind(&self) -> TuiColsKind {
+        if self.capabilities.alt_active {
+            TuiColsKind::Full
+        } else {
+            TuiColsKind::Content
+        }
     }
 
     /// v1.10.19: Whether a primary-screen TUI currently owns the live grid

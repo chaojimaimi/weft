@@ -486,3 +486,203 @@ fn close_active_pane_restores_focus_to_sibling() {
     assert!(t.pane(new_id).is_none());
     assert!(t.pane(original).is_some());
 }
+
+// ── v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT) ────────────────────
+//
+// Three independently-computed widths must agree at one pane geometry: the
+// PTY target cols that the Tab mirror sites compute, the grid render cols
+// (grid.num_cols — every cell is drawn), and the BlockView wrap cols.
+
+const TUI_PANE_RECT: weft_core::pane_layout::Rect = [0.0, 0.0, 800.0, 600.0];
+const TUI_CELL_W: f32 = 10.0;
+const TUI_CELL_H: f32 = 20.0;
+
+fn drive_primary_tui(tab: &mut Tab) {
+    tab.process_pty_output(b"\x1b]133;A\x07\x1b]133;B\x07omp\x1b]133;C\x07");
+    tab.process_pty_output(b"\x1b[3A\x1b[1G\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l");
+    let terminal = tab.terminal.as_ref().unwrap();
+    assert!(
+        terminal.primary_screen_app_active(),
+        "precondition: the pane owns a primary-screen TUI"
+    );
+}
+
+/// PTY target cols == grid render cols == block wrap cols for a primary
+/// screen TUI at a single pane geometry (data-level equality). pane 800×600,
+/// cell 10×20 → raw 80 cols, gutter 3 → content 77.
+#[test]
+fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
+    let mut tab = tab_with_terminal(100);
+    drive_primary_tui(&mut tab);
+
+    // (1) PTY target cols computed by the Tab mirror sites (`tui_cols_kind`
+    // → `terminal_content_cols`).
+    let (rows, pty_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(
+        pty_cols, 77,
+        "primary TUI target is the content width (80 raw - 3 gutter cols)"
+    );
+
+    // (2) Grid render cols: commit the grid to the target exactly as the
+    // effect flush does (`commit_pty_resize_result` → `Terminal::resize`),
+    // then the grid holds content cols — the renderer draws every cell from
+    // the gutter-inset origin, so origin + cols·cell_w == content right edge.
+    // (The second mirror site `resize_all_panes_for_rect` queues the same
+    // target.)
+    assert!(tab.resize_all_panes_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H));
+    let queued = tab.active_mut().pending_pty_resize.take().unwrap();
+    assert_eq!(queued, (rows, pty_cols), "both mirror sites agree");
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(rows, pty_cols);
+    let grid_cols = tab.terminal.as_ref().unwrap().grid().num_cols;
+    assert_eq!(grid_cols, pty_cols, "grid render cols == PTY target cols");
+
+    // (3) Block wrap cols at the same pane geometry.
+    let ctx = crate::layout::LayoutCtx::new((800.0, 600.0), TUI_CELL_W, TUI_CELL_H, 0.0, 0.0);
+    let block_cols = crate::layout::layout_block_view(&ctx, 600.0, false).cols;
+    assert_eq!(block_cols, pty_cols, "block wrap cols == PTY target cols");
+
+    // Contrast: an alt-screen TUI (vim) intentionally diverges from the
+    // BlockView — full width, and the grid mirrors its own PTY target.
+    tab.process_pty_output(b"\x1b[?1049h");
+    // v1.10.25 Batch 3 (B1): a fresh flip holds the burst Content lock, so
+    // let the flip go quiet first — the mirror then exposes the live alt
+    // Full target the pane converges to after a real single-toggle launch.
+    tab.alt_rescale_last_flip =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
+    let (_, alt_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(alt_cols, 80, "alt-screen TUI target is the full width");
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(rows, alt_cols);
+    assert_eq!(
+        tab.terminal.as_ref().unwrap().grid().num_cols,
+        alt_cols,
+        "grid render cols always mirror the PTY target (edge-to-edge here)"
+    );
+    tab.process_pty_output(b"\x1b[?1049l");
+    // Back on the primary phase the content target is restored exactly.
+    assert_eq!(
+        tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
+        Some((rows, 77)),
+        "the primary target snaps back to the pre-toggle constant"
+    );
+}
+
+/// A burst of transient `?1049h/l` toggles must not become a winsize ioctl
+/// storm. v1.10.25 Batch 3 (B1) replaced the "value set ≤ 2" assertion
+/// (structurally unable to tell a 99↔102 storm from controlled behaviour)
+/// with an explicit hysteresis model: while the toggle storm is fresh, the
+/// mirror site locks the target to the Content constant (tab/resize.rs
+/// `burst_locked_cols`), so the drift check's desired stays Content —
+/// whatever phase each flip landed on — and the ioctl stream is bounded to
+/// the tiny constant count below.
+#[test]
+fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
+    let mut tab = tab_with_terminal(100);
+    drive_primary_tui(&mut tab);
+
+    // The pane has converged at the content target.
+    let (rows, content_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(content_cols, 77);
+    let mut last_sent: Option<(usize, usize)> = Some((rows, content_cols));
+    let mut emitted_ioctls = 0usize;
+
+    // Walk 20 rounds of 1049h/l through the mirror site + the winsize ioctl
+    // dedup rule exactly as `app_runtime::apply_pty_resize` does
+    // (Pane::should_send_winsize_ioctl). Each flip refreshes
+    // `alt_rescale_last_flip` (tab/lifecycle.rs), keeping the burst window
+    // fresh for the whole storm — exactly the SIGWINCH feedback loop.
+    for round in 0..20 {
+        tab.process_pty_output(b"\x1b[?1049h");
+        let (_, alt_cols) = tab
+            .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+            .unwrap();
+        assert_eq!(
+            alt_cols, content_cols,
+            "round {round}: the burst lock holds the alt phase at Content — an 80-col escape is what feeds the alternation"
+        );
+        if Pane::should_send_winsize_ioctl(last_sent, (rows, alt_cols)) {
+            last_sent = Some((rows, alt_cols));
+            emitted_ioctls += 1;
+        }
+
+        tab.process_pty_output(b"\x1b[?1049l");
+        let (_, primary_cols) = tab
+            .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+            .unwrap();
+        assert_eq!(
+            primary_cols, content_cols,
+            "round {round}: primary phase stays on the Content constant"
+        );
+        if Pane::should_send_winsize_ioctl(last_sent, (rows, primary_cols)) {
+            last_sent = Some((rows, primary_cols));
+            emitted_ioctls += 1;
+        }
+    }
+
+    // Explicit-burst upper bound: a 20-round storm may emit at most a tiny
+    // constant. With the hysteresis lock every measured target is the
+    // already-sent Content size, so in practice zero; ≤2 tolerates one
+    // initial convergence + one final drift without ever resembling the
+    // v1.10.19 99↔102 storm (which emitted once per flip).
+    assert!(
+        emitted_ioctls <= 2,
+        "a 20-round toggle storm must emit ≤ 2 winsize ioctls, got {emitted_ioctls}"
+    );
+    // The pane ends on the primary Content constant — the pre-burst value.
+    assert_eq!(
+        tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
+        Some((rows, content_cols)),
+        "the pane converges to the pre-burst content target"
+    );
+}
+
+/// v1.10.25 Batch 3 (B1): a SINGLE alt toggle (a real TUI launch) is locked
+/// to Content only while the flip stays fresh; once the burst window goes
+/// quiet the live kind applies and the pane converges to the Full target —
+/// one width transition, not an oscillation.
+#[test]
+fn single_alt_toggle_converges_to_full_after_quiet() {
+    let mut tab = tab_with_terminal(100);
+    drive_primary_tui(&mut tab);
+
+    let (_, content_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(content_cols, 77);
+
+    // Single flip: the freshly-armed window pins the target at Content (the
+    // winding grid already holds it → desired == current, no recompute, no
+    // ioctl) — the mirror site must not leap to Full while the burst window
+    // could still be in the SIGWINCH loop.
+    tab.process_pty_output(b"\x1b[?1049h");
+    assert!(tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    let (_, fresh_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(
+        fresh_cols, content_cols,
+        "a fresh single flip holds the Content lock"
+    );
+
+    // The TUI stays quiet → the window expires and the alt phase's Full
+    // target converges (exactly one ioctl afterwards).
+    tab.alt_rescale_last_flip =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
+    let (_, converged) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(converged, 80, "quiet: the alt target converges to Full");
+}

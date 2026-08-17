@@ -472,54 +472,48 @@ mod tests {
         assert!(weft_core::grid::terminal_text_width(&chunks[0]) <= cols);
     }
 
-    /// OBSERVATION-ONLY diagnostic: a border box line drawn at the primary
-    /// TUI's full grid width (203 cols) re-wrapped by the BlockView at its
-    /// content cols (200). Prints raw chunk boundaries; asserts only measure
-    /// the setup line description (203 cols), never the wrap hypothesis.
+    /// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): omp input-line
+    /// border regression. omp draws its UI at exactly the PTY cols it
+    /// receives; the v1.10.19 full-width scheme gave it 203 cols while the
+    /// BlockView wraps at the content width 200 — the `|]` border folded to a
+    /// continuation chunk at indent 0 ("both border chars on the left",
+    /// diagnostic exp2). With the PTY target unified to content width the
+    /// source line is AT MOST the wrap width and the border must stay on one
+    /// line (chunks == 1).
     #[test]
-    fn diagnostic_border_wrap_203_to_200_chunking() {
-        let line = format!("[|{}|]", "x".repeat(199));
-        let source_width = weft_core::grid::terminal_text_width(&line);
-        assert_eq!(
-            source_width, 203,
-            "setup: source line must be exactly 203 display cols"
-        );
+    fn border_box_within_content_width_stays_on_one_line() {
+        // Border boxes up to the content width never fold their `|]` tail.
         let cols = 200usize;
-        println!("\n=== [exp2 app] block_line_chunks(line, {cols}) ===");
-        println!(
-            "  source line width        = {source_width} (chars = {})",
-            line.chars().count()
-        );
-        println!("  first 6 chars of source = {:?}", &line[..6]);
-        println!(
-            "  last  6 chars of source = {:?}",
-            &line[line.len().saturating_sub(6)..]
-        );
-        println!(
-            "  classify_structure_line = {:?}",
-            classify_structure_line(&line)
-        );
-
-        let chunks = block_line_chunks(&line, cols).collect::<Vec<_>>();
-        println!("  chunk count             = {}", chunks.len());
-        let mut char_offset = 0usize;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let w = weft_core::grid::terminal_text_width(chunk);
-            println!(
-                "  chunk[{i}] first6={:?} last6={:?} width={w} chars={} char_offset={char_offset}",
-                &chunk[..chunk.len().min(6)],
-                &chunk[chunk.len().saturating_sub(6)..],
-                chunk.chars().count()
+        for body in [0usize, 100, 196] {
+            let line = format!("[|{}|]", "x".repeat(body));
+            let width = weft_core::grid::terminal_text_width(&line);
+            assert_eq!(width, body + 4);
+            assert!(
+                width <= cols,
+                "setup: the TUI source width must fit the block wrap width"
             );
-            char_offset += chunk.chars().count();
+            let chunks = block_line_chunks(&line, cols).collect::<Vec<_>>();
+            assert_eq!(
+                chunks.len(),
+                1,
+                "source width {width} <= {cols}: the border must not fold"
+            );
+            assert!(
+                chunks[0].ends_with("|]"),
+                "the right border stays at the end of its line"
+            );
         }
-        println!("  chunks.concat == source = {}", chunks.concat() == line);
-        // rows.rs expansion for LaidRow::Output hard-codes indent_cols = 0 for
-        // EVERY chunk (rows.rs:258, rows.rs:279), so a continuation chunk
-        // rendering the fold of the row tail starts at display column 0.
-        println!(
-            "  rows.rs Output indent_cols: chunk[0] = 0, continuation chunk[{:?}] = 0",
-            chunks.len().checked_sub(1)
+        // The pre-fix full-width grid (203 > 200) is the counter-example that
+        // caused the fold — kept as documentation of the bug this fixes.
+        let old_full_width = format!("[|{}|]", "x".repeat(199));
+        assert_eq!(
+            weft_core::grid::terminal_text_width(&old_full_width),
+            203,
+            "the v1.10.19 full-width grid exceeded the wrap width by 3"
+        );
+        assert!(
+            block_line_chunks(&old_full_width, cols).count() > 1,
+            "a 203-col full-width source still wraps at 200 (removed by Batch 2)"
         );
     }
 }

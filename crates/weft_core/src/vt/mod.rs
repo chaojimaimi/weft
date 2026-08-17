@@ -11,7 +11,9 @@ mod perform;
 mod screen_exit;
 pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
-pub use screen_exit::{PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY};
+pub use screen_exit::{
+    TuiColsKind, PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
+};
 
 use crate::blocks::{BlockTracker, CapturedStyle, ShellPhase};
 use crate::editor::Editor;

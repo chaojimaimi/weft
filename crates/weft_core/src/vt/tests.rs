@@ -144,45 +144,107 @@ fn alt_screen_exit_clears_history_peek() {
 /// DEC 1049 toggles. The old is_alt-only selection produced 102↔99 col
 /// flapping (alt uses full width, primary uses gutter-subtracted width);
 /// every flip queued a TIOCSWINSZ → SIGWINCH → redraw → flip, the ~130ms
-/// resize oscillation. `wants_full_width_cols` is alt-state-independent for
-/// screen-owning TUIs.
+/// resize oscillation. `tui_cols_kind` is a constant function of the alt
+/// flag: alt maps to Full, everything else to Content.
+///
+/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): the primary-phase value
+/// is Content, not Full. omp draws its UI exactly at the PTY cols it receives,
+/// so Full made the input-line border (`|]`) land past the renderable area
+/// (right ~1.5 cols clipped) and fold to the next line after settle. The
+/// mapping never ratchets into a new value — each phase still maps to ONE
+/// constant. (v1.10.25 Batch 3: the pure mapping alone does NOT prevent a
+/// Full↔Content *alternation*; the anti-cycle guard is the app-layer burst
+/// hysteresis, `Tab::burst_locked_cols` — see FIX_SCROLL_SHIFT_AND_
+/// RESIZE_STORM.md 演进注记.)
 #[test]
-fn primary_tui_full_width_cols_are_stable_across_transient_alt_toggles() {
+fn primary_tui_content_cols_are_stable_across_transient_alt_toggles() {
     let mut t = term();
     t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
     t.process(b"\x1b[?2031h\x1b[H\x1b[2;1H");
     assert!(t.primary_screen_app_active());
-    assert!(
-        t.wants_full_width_cols(),
-        "screen-owning primary TUI uses full width"
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Content,
+        "a screen-owning primary TUI uses content width"
     );
 
     // Transient alt phase of the same TUI — the resize-loop feedback.
     t.process(b"\x1b[?1049h");
-    assert!(t.wants_full_width_cols(), "alt phase keeps full width");
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Full,
+        "alt phase is edge-to-edge full width"
+    );
     t.process(b"\x1b[?1049l");
-    assert!(
-        t.wants_full_width_cols(),
-        "primary phase after a transient alt exit keeps full width"
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Content,
+        "primary phase after a transient alt exit returns to content width"
     );
 
-    // A plain alt-screen TUI (vim) is full width too, before and after exit.
+    // A plain alt-screen TUI (vim) is full width while active; primary width
+    // is content after it exits.
     t.process(b"\x1b[?1049h");
-    assert!(t.wants_full_width_cols());
+    assert_eq!(t.tui_cols_kind(), TuiColsKind::Full);
     t.process(b"\x1b[?1049l");
-    assert!(t.wants_full_width_cols());
+    assert_eq!(t.tui_cols_kind(), TuiColsKind::Content);
 
     // While the primary-screen exit is still settling the TUI remains on
-    // screen — keep full width until the screen settles.
+    // screen — content width holds until the screen settles (no width jump
+    // at the settle boundary).
     t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
     assert!(t.primary_screen_exit_pending());
-    assert!(t.wants_full_width_cols(), "exit-pending keeps full width");
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Content,
+        "exit-pending keeps content width"
+    );
 
     t.settle_primary_screen_exit();
-    assert!(
-        !t.wants_full_width_cols(),
-        "a settled shell prompt returns to gutter-subtracted cols"
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Content,
+        "a settled shell prompt stays at content width — no settle jump"
     );
+}
+
+/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): the cols mapping is a
+/// PURE function of the alt flag — each phase maps to one CONSTANT target
+/// (`Full` for alt, `Content` for primary), so N toggles replay the same
+/// pair and the primary target never drifts into a third value. This test
+/// locks ONLY that pure mapping; the mapping alone does NOT prevent a
+/// Full↔Content alternation from feeding the SIGWINCH feedback loop — the
+/// v1.10.25 Batch 3 app-layer burst hysteresis (tab/resize.rs
+/// `Tab::burst_locked_cols`, ioctl-count-bounded storm regression in
+/// tab/tests.rs) is the anti-cycle guard.
+#[test]
+fn repeated_transient_1049_toggles_keep_the_tui_cols_target_constant() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"\x1b[?2031h\x1b[H\x1b[2;1H");
+    assert!(t.primary_screen_app_active());
+    let primary_target = t.tui_cols_kind();
+    assert_eq!(primary_target, TuiColsKind::Content);
+
+    // Many 1049h/l flips — the SIGWINCH → redraw → toggle feedback loop
+    // drives ~130ms-period bursts in the field.
+    for flip in 0..50u32 {
+        t.process(b"\x1b[?1049h");
+        assert_eq!(
+            t.tui_cols_kind(),
+            TuiColsKind::Full,
+            "alt phase always Full (flip {flip})"
+        );
+        t.process(b"\x1b[?1049l");
+        assert_eq!(
+            t.tui_cols_kind(),
+            primary_target,
+            "primary phase always Content (flip {flip}) — no drift"
+        );
+    }
+    // The burst leaves no residue: the settled target equals the pre-burst
+    // value, so a pane already at that size emits no further winsize ioctl.
+    assert_eq!(t.tui_cols_kind(), primary_target);
 }
 
 #[test]
