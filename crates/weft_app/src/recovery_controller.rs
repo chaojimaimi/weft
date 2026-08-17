@@ -250,7 +250,7 @@ impl RecoveryController {
     /// first autosave (≤1s, hash=None) supersedes it; the old copy survives
     /// only as one `.bak` generation.
     pub(crate) fn ignore_snapshot(&self) {
-        info!("recovery snapshot ignored (preserved on disk)");
+        info!("recovery snapshot ignored (first autosave ≤1s supersedes it; old copy kept only as one .bak generation)");
     }
 
     /// Reset the debounce state. Called after a restore to force the next

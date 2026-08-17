@@ -1046,18 +1046,23 @@ impl App {
                 .as_ref()
                 .map(|r| r.cell_height() as f32)
                 .unwrap_or(20.0);
-            // v1.10.25 Batch 3: in a TUI history snapshot view the content
-            // bottom IS the window bottom (no prompt/bottom chrome), so the
-            // Down band shifts inward to the content's bottom edge row.
-            let pane_bottom = self.renderer.as_ref().and_then(|renderer| {
-                renderer.layout_ctx.map(|ctx| match ctx.clip {
-                    Some(rect) => rect[3],
-                    None => renderer.viewport().1,
-                })
-            });
-            let down_threshold = pane_bottom
-                .map(|pane_bottom| down_autoscroll_threshold(bottom, pane_bottom, ch))
-                .unwrap_or(bottom + ch);
+            // v1.10.26 Batch D (D-4): the Down-band inner shift applies ONLY
+            // in a snapshot/history view (primary_history_view or an active
+            // alt peek), where no prompt chrome sits below the content. A
+            // regular block view keeps the `bottom + ch` band — the prompt
+            // chrome below makes it physically reachable even when the
+            // geometry reads as full-bleed (a wide border/table fills the
+            // pane), which otherwise mis-triggered a Down scroll from the
+            // last visible line (v1.10.25 ML2).
+            let snapshot_context =
+                self.sessions
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.primary_history_view() || terminal.is_alt_screen_history_peek()
+                    });
+            let down_threshold = down_autoscroll_threshold(bottom, ch, snapshot_context);
             if (y as f32) < top - ch {
                 Some((AutoscrollDir::Up, (top - ch) - y as f32))
             } else if (y as f32) > down_threshold {

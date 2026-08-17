@@ -61,31 +61,14 @@ pub(in crate::vt) struct PrimaryScreenInterruptCapture {
 /// [`weft_app::layout::terminal_full_cols`] and
 /// [`weft_app::layout::terminal_content_cols`].
 ///
-/// v1.10.19: MUST NOT make a primary-screen TUI's transient DEC 1049
-/// toggles produce a *drifting* target: a col count that changes to a new
-/// value each `?1049h/l` feedback cycle (SIGWINCH → redraw → toggle →
-/// TIOCSWINSZ → SIGWINCH) oscillates forever. The two-phase mapping here
-/// is a pure constant function of the alt flag — the same pair of values
-/// replays no matter how often the flag flips, so the target never
-/// ratchets into a third value.
-///
-/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT) re-mapped the primary
-/// phase from Full to Content. That re-opened a real oscillation: the
-/// primary target (Content) now differs from the transient alt target
-/// (Full), and the v1.10.19 defenses ALONE cannot bound that alternation —
-/// the winsize ioctl dedup (pane.rs `should_send_winsize_ioctl`) is a
-/// simple inequality (`last_sent != requested`) that never suppresses an
-/// alternating pair, and the 150ms rescale debounce only gates
-/// `take_pending_alt_rescale`, which the active tab's per-frame drift check
-/// (redraw_controller.rs, recomputes unconditionally when desired !=
-/// current) never calls. The anti-cycle guarantee is the v1.10.25 Batch 3
-/// burst hysteresis at the app-layer cols mirror sites (tab/resize.rs
-/// `Tab::burst_locked_cols`): while a toggle burst is fresh the target is
-/// locked to Content (primary semantics), so the drift check's desired
-/// stays constant and the loop has no energy; a single toggle that goes
-/// quiet unlocks after the window and converges to Full. The v1.10.19 ioctl
-/// dedup remains effective for that converged constant — a sustained phase
-/// re-issues nothing.
+/// Anti-oscillation history (v1.10.19 → v1.10.25; deduped in v1.10.26 Batch
+/// D — the authoritative anti-cycle design lives in
+/// `weft_app::tab::resize::Tab::burst_locked_cols` / `ALT_RESCALE_DEBOUNCE`):
+/// the mapping here is a pure constant function of the alt flag (a toggle
+/// burst can never ratchet the target into a third value), and the
+/// primary↔alt Content/Full alternation is bounded at the app cols mirror
+/// sites by the burst hysteresis — locked to Content while a two-flip storm
+/// signature is fresh, converging to the live kind once it goes quiet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TuiColsKind {
     /// Alt-screen TUI (vim/htop/less): paints edge-to-edge with no
@@ -961,6 +944,16 @@ impl Terminal {
             "settled primary-screen command finalization"
         );
         true
+    }
+
+    /// v1.10.26 Batch D (D-3): consume the head count of the most recent 1MiB
+    /// history split, if any. The app reads this after settling/draining a
+    /// frame (or closing a tab) and advances a detached `block_scroll_anchor`
+    /// by `heads × BLOCK_SPLIT_HEAD_CHROME_ROWS` so the user's viewport stays
+    /// put when the split blocks' chrome rows are inserted (see
+    /// `Tab::compensate_anchor_for_split` in weft_app).
+    pub fn take_pending_screen_split_heads(&mut self) -> Option<usize> {
+        self.capabilities.pending_screen_split_heads.take()
     }
 }
 

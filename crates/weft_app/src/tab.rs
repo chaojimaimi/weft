@@ -50,6 +50,30 @@ pub(crate) use scroll::BlockScrollAnchor;
 pub(crate) use tui_scroll::PendingTuiScroll;
 pub use tui_scroll::TuiScrollResolution;
 
+/// v1.10.26 Batch D (D-1): the two most recent alt-screen flips from the
+/// same source pane — the burst-storm signature for `burst_locked_cols`.
+///
+/// A real alt TUI (vim/less) enters with ONE flip and goes quiet; an omp
+/// repaint feedback loop toggles DEC 1049 every ~130ms. The lock needs the
+/// *two-flip* signature: two flips from the same pane inside the debounce
+/// window, the most recent still fresh — so an isolated single flip is never
+/// locked and a storm is pinned until it goes quiet (then the live kind
+/// converges again). `count` records how many real flips are stored (0..=2);
+/// a value of 1 (a lone flip) never forms a record no matter how fresh it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AltFlipHistory {
+    /// Pane that produced these flips (the active pane at detection time).
+    /// The lock is scoped to this pane: pane A's storm cannot widen pane B's
+    /// real TUI target (v1.10.19 "A 面板风暴误伤 B 面板").
+    pub(crate) src_pane: PaneId,
+    /// The older of the two most recent flips (`count == 1` → not meaningful).
+    pub(crate) older: std::time::Instant,
+    /// The most recent flip.
+    pub(crate) newer: std::time::Instant,
+    /// Real flips recorded, capped at 2. `< 2` → no storm signature.
+    pub(crate) count: u8,
+}
+
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A tab owns one or more panes. The tab-level `session_id` is the externally
@@ -81,13 +105,18 @@ pub struct Tab {
     /// tab's flag self-heals on activation because
     /// `resize_all_panes_for_rect` re-reads the screen mode live.
     ///
-    /// v1.10.19: consumption is debounced via `alt_rescale_last_flip` /
+    /// v1.10.19: consumption is debounced via the flip history /
     /// `alt_rescale_last_taken` (see `tab/resize.rs`) so a burst of toggles
-    /// coalesces into one recompute instead of one per flip.
+    /// coalesces into one recompute instead of one per flip. v1.10.26 (D-2):
+    /// armed off the u64 flip-counter diff, so even-count batches (h→l
+    /// net-zero) still refresh the window.
     pending_alt_rescale: bool,
-    /// v1.10.19: time of the last alt-screen toggle that armed
-    /// `pending_alt_rescale`. `None` until the first toggle.
-    alt_rescale_last_flip: Option<std::time::Instant>,
+    /// v1.10.19/26 (D-1): flip history of the last alt-screen toggles that
+    /// armed `pending_alt_rescale` — the last two flip instants + their
+    /// source pane. `None` until the first flip. Drives both the
+    /// `take_pending_alt_rescale` debounce freshness and the
+    /// `burst_locked_cols` storm lock (see `tab/resize.rs`).
+    alt_flip_history: Option<AltFlipHistory>,
     /// v1.10.19: time the pending rescale was last consumed by
     /// `take_pending_alt_rescale`. A fresh toggle inside the debounce window
     /// after a consumed recompute marks a burst (the SIGWINCH feedback loop
@@ -452,7 +481,7 @@ impl Tab {
             panes,
             active_pane: pane_id,
             pending_alt_rescale: false,
-            alt_rescale_last_flip: None,
+            alt_flip_history: None,
             alt_rescale_last_taken: None,
             resize_output_probe: None,
         }
@@ -767,6 +796,7 @@ impl Tab {
         };
         let mut drained = Vec::new();
         let mut reset_scroll = false;
+        let mut split_heads = 0usize;
         if let Some(terminal) = &mut self.terminal {
             let settled = if alive {
                 terminal.settle_primary_screen_exit_if_idle(std::time::Instant::now())
@@ -777,11 +807,18 @@ impl Tab {
                 need_redraw = true;
             }
             drained = terminal.block_tracker_mut().drain_unpersisted();
+            // v1.10.26 Batch D (D-3): collect any 1MiB history-split head
+            // count settled this frame; the anchor compensation runs after
+            // the terminal borrow ends (disjoint-pane field).
+            split_heads = terminal.take_pending_screen_split_heads().unwrap_or(0);
             // v1.10.21: don't yank an active history peek (user browsing).
             reset_scroll = crate::tab::scroll::block_completion_should_snap(terminal, &drained);
             if terminal.synchronized_output() {
                 need_redraw = false;
             }
+        }
+        if split_heads > 0 {
+            self.compensate_anchor_for_split(split_heads);
         }
         if reset_scroll {
             self.snap_to_bottom();

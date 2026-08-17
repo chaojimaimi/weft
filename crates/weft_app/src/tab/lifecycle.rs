@@ -11,26 +11,30 @@ impl Tab {
         // toggles between alt-screen and primary screen, the PTY cols must
         // switch between full-width (alt-screen: TUI needs every column to
         // paint borders/layout) and gutter-subtracted (primary screen:
-        // BlockView reserves breathing room). Capture the state before
-        // processing so we can flag the transition after the mutable
-        // borrow on `self.terminal` ends.
+        // BlockView reserves breathing room).
+        //
+        // v1.10.26 Batch D (D-2): alt toggles are detected by the terminal's
+        // u64 flip-counter diff across the `process()` batch, not by
+        // comparing the `alt_active` boolean before/after — a batch that
+        // contains an h→l pair nets the boolean to zero yet still performed
+        // two real flips, and those must refresh the flip history / debounce
+        // window or the burst lock expires early (v1.10.19 loop loophole).
         //
         // v1.10.21: same capture-before pattern for the alt-screen history
         // peek — the VT core clears the flag itself on CSI ?1049l (deep in
         // the parser, unreachable from the app layer), and the entry gate's
         // re-entry lockout must arm on that exit too. `note_exit` runs after
         // the terminal borrow ends because the gate is a sibling Pane field.
-        let (was_alt, was_peeking) = match &self.terminal {
-            Some(t) => (t.is_alt_screen_active(), t.is_alt_screen_history_peek()),
-            None => (false, false),
-        };
-        let (response, alt_changed) = match &mut self.terminal {
+        let was_peeking = self
+            .terminal
+            .as_ref()
+            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+        let (response, alt_flips) = match &mut self.terminal {
             Some(terminal) => {
+                let before = terminal.alt_flip_count();
                 terminal.process(data);
-                (
-                    terminal.take_response(),
-                    was_alt != terminal.is_alt_screen_active(),
-                )
+                let flips = terminal.alt_flip_count().saturating_sub(before);
+                (terminal.take_response(), flips)
             }
             None => return false,
         };
@@ -45,12 +49,15 @@ impl Tab {
                 "RESIZE_PROBE first_pty_output",
             );
         }
-        if alt_changed {
+        if alt_flips > 0 {
             self.pending_alt_rescale = true;
             // v1.10.19: arm the debounce window — take_pending_alt_rescale
             // holds the recompute while toggles repeat inside it so a burst
             // coalesces into one recompute (see tab/resize.rs).
-            self.alt_rescale_last_flip = Some(std::time::Instant::now());
+            // v1.10.26 (D-1/D-2): the flip history (last two instants +
+            // source pane) is driven off the counter diff — the burst-storm
+            // signature for the cols mirror lock (`burst_locked_cols`).
+            self.record_alt_flip_instants(alt_flips);
         }
         if was_peeking
             && !self
@@ -77,11 +84,22 @@ impl Tab {
         if preserve_screen_tail {
             self.drain_bounded_close_tail();
         }
-        let Some(terminal) = &mut self.terminal else {
-            return Vec::new();
+        let split_heads;
+        let blocks = {
+            let Some(terminal) = &mut self.terminal else {
+                return Vec::new();
+            };
+            terminal.settle_primary_screen_exit();
+            // v1.10.26 Batch D (D-3): the settle above can split 1MiB TUI
+            // history heads — surface their count so the detached
+            // block-scroll anchor compensates for the inserted chrome rows.
+            split_heads = terminal.take_pending_screen_split_heads().unwrap_or(0);
+            terminal.block_tracker_mut().drain_unpersisted()
         };
-        terminal.settle_primary_screen_exit();
-        terminal.block_tracker_mut().drain_unpersisted()
+        if split_heads > 0 {
+            self.compensate_anchor_for_split(split_heads);
+        }
+        blocks
     }
 
     fn drain_bounded_close_tail(&mut self) {

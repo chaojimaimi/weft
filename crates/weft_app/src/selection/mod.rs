@@ -48,31 +48,26 @@ pub(crate) fn autoscroll_ramp_rows(overshoot_px: f32) -> f32 {
     (overshoot_px.max(0.0).powf(1.5) / 100.0).clamp(1.0, 6.0)
 }
 
-/// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): whether the Down
-/// autoscroll trigger band is physically reachable with the pointer. True
-/// when at least a full line of space sits below `content_bottom` inside the
-/// window — the band `content_bottom + line_h` exists on screen (a prompt /
-/// bottom-chrome case). False when the content bottom is at/within one line
-/// of the window bottom (TUI history snapshot view: padding 0, no prompt
-/// chrome), so the trigger must shift inward to the content's bottom edge.
-pub(crate) fn down_trigger_reachable(content_bottom: f32, window_bottom: f32, line_h: f32) -> bool {
-    line_h > 0.0 && window_bottom - content_bottom >= line_h
-}
-
-/// The y threshold at which a held drag triggers a Down autoscroll. With
-/// bottom chrome the band sits a full line below the content edge
-/// (`content_bottom + line_h`); without it, the content's bottom edge row
-/// itself is the band (`content_bottom - line_h`), so a drag held inside the
-/// last visible line can still scroll the selection downward.
+/// v1.10.26 Batch D (D-4): the y threshold at which a held drag triggers a
+/// Down autoscroll, decided by the VIEW CONTEXT rather than geometry.
+/// In a snapshot/history view (primary_history_view or an active alt-screen
+/// history peek — no prompt/bottom chrome below the content) the band shifts
+/// inward to the content's bottom edge row (`content_bottom - line_h`) so a
+/// drag in the last visible line still scrolls the selection downward.
+/// A regular block view keeps the band a full line below the content edge
+/// (`content_bottom + line_h`) — the prompt chrome below makes that band
+/// physically reachable, so a full-bleed output must not make the last
+/// visible line mis-trigger a Down scroll (v1.10.25 ML2: geometry alone
+/// cannot distinguish the two, which mis-fired on plain block views).
 pub(crate) fn down_autoscroll_threshold(
     content_bottom: f32,
-    window_bottom: f32,
     line_h: f32,
+    snapshot_context: bool,
 ) -> f32 {
-    if down_trigger_reachable(content_bottom, window_bottom, line_h) {
-        content_bottom + line_h
-    } else {
+    if snapshot_context {
         content_bottom - line_h
+    } else {
+        content_bottom + line_h
     }
 }
 
@@ -401,38 +396,22 @@ mod tests {
         }
     }
 
-    // ── v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): Down band
-    // reachability with/without bottom chrome ─────────────────────────────
+    // ── v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) + v1.10.26
+    // Batch D (D-4): Down band divergence by VIEW CONTEXT ───────────────
 
     #[test]
-    fn down_trigger_reachable_requires_a_full_line_of_bottom_space() {
+    fn down_autoscroll_threshold_diverges_by_view_context() {
         const LINE_H: f32 = 20.0;
-        const WINDOW_H: f32 = 800.0;
-        // No bottom chrome: content bottom at/within a line of the window
-        // bottom — the `bottom + margin` band is physically unreachable.
-        assert!(!down_trigger_reachable(WINDOW_H, WINDOW_H, LINE_H));
-        assert!(!down_trigger_reachable(WINDOW_H - 10.0, WINDOW_H, LINE_H));
-        // Prompt / bottom chrome: the band below the content is on screen.
-        assert!(down_trigger_reachable(WINDOW_H - 20.0, WINDOW_H, LINE_H));
-        assert!(down_trigger_reachable(WINDOW_H - 80.0, WINDOW_H, LINE_H));
-        // Degenerate cell height must not claim reachability.
-        assert!(!down_trigger_reachable(100.0, 800.0, 0.0));
-    }
-
-    #[test]
-    fn down_autoscroll_threshold_two_states() {
-        const LINE_H: f32 = 20.0;
-        const WINDOW_H: f32 = 800.0;
-        // With bottom chrome: band stays a full line below the content edge.
-        assert_eq!(down_autoscroll_threshold(700.0, WINDOW_H, LINE_H), 720.0);
-        // Without chrome: the threshold shifts inward to the bottom edge row
-        // (`content_bottom - line_h`), making Down triggerable from the last
-        // visible line of a TUI snapshot that fills the window.
-        assert_eq!(down_autoscroll_threshold(WINDOW_H, WINDOW_H, LINE_H), 780.0);
-        assert_eq!(
-            down_autoscroll_threshold(WINDOW_H - 10.0, WINDOW_H, LINE_H),
-            770.0
-        );
+        // Snapshot/history view (primary_history_view or alt peek): no chrome
+        // below the content → the band shifts inward to the bottom edge row,
+        // so a drag in the last visible line still autoscrolls Down.
+        assert_eq!(down_autoscroll_threshold(800.0, LINE_H, true), 780.0);
+        assert_eq!(down_autoscroll_threshold(790.0, LINE_H, true), 770.0);
+        // Regular block view: the band stays a full line below the content
+        // edge — the prompt chrome below makes it physically reachable, and
+        // a full-bleed block must NOT make the last line mis-trigger.
+        assert_eq!(down_autoscroll_threshold(700.0, LINE_H, false), 720.0);
+        assert_eq!(down_autoscroll_threshold(800.0, LINE_H, false), 820.0);
     }
 
     fn row_with_text(text: &str, cols: usize) -> Row {

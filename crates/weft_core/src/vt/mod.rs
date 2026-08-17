@@ -67,6 +67,12 @@ pub struct Terminal {
     /// Single source of truth for capability + primary-screen lifecycle state.
     /// See `capability.rs` for the field-by-field rationale.
     pub(in crate::vt) capabilities: capability::CapabilityFlags,
+    /// v1.10.26 Batch D (D-2): monotonic DEC 1049/47 alt-screen flip counter.
+    /// The app layer (tab/lifecycle.rs) diffs this across a `process()` batch
+    /// to detect alt toggles — a batch-internal h→l pair nets the `alt_active`
+    /// boolean to zero but still counts as two flips here, so the debounce /
+    /// burst windows can't be silently skipped by even-count batches.
+    alt_flip_count: u64,
 }
 
 impl Terminal {
@@ -104,6 +110,7 @@ impl Terminal {
             parser_in_ground_state: true,
             suppress_joined_scalar: false,
             capabilities: capability::CapabilityFlags::default(),
+            alt_flip_count: 0,
         }
     }
 
@@ -184,6 +191,14 @@ impl Terminal {
     /// Whether the alternate screen buffer is currently active.
     pub fn is_alt_screen_active(&self) -> bool {
         self.capabilities.alt_active
+    }
+
+    /// v1.10.26 Batch D (D-2): total DEC 1049/47 flips ever performed. The
+    /// app layer diffs this before/after a `process()` batch to detect
+    /// alt-screen toggles even when the batch nets the `alt_active` phase to
+    /// zero (an h→l pair counts as two flips).
+    pub fn alt_flip_count(&self) -> u64 {
+        self.alt_flip_count
     }
 
     /// Active mouse reporting mode (DEC modes 9/1000/1002/1003).
@@ -285,6 +300,9 @@ impl Terminal {
             cols = self.grid.num_cols,
             "alt-screen toggled"
         );
+        // v1.10.26 Batch D (D-2): count every real flip for the app-layer
+        // batch-diff detection and burst-storm signature.
+        self.alt_flip_count = self.alt_flip_count.wrapping_add(1);
     }
 
     pub fn attrs(&self) -> &Attrs {

@@ -74,6 +74,17 @@ pub(crate) fn block_completion_should_snap(
         && !terminal.is_alt_screen_history_peek()
 }
 
+/// v1.10.26 Batch D (D-3): the block-scroll offset shift that keeps the
+/// user's viewport steady when a 1MiB history split settles `heads` new
+/// finished blocks. Each head adds [`BLOCK_SPLIT_HEAD_CHROME_ROWS`] structural
+/// rows (Command + Header + Separator) above the live tail in the block view,
+/// so a detached anchor must advance by `heads × chrome` — the content below
+/// the inserted chrome is untouched, so this re-points the anchor at the same
+/// visual row the user was reading.
+pub(crate) fn split_head_anchor_compensation(heads: usize) -> usize {
+    heads.saturating_mul(crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS)
+}
+
 impl Tab {
     pub fn block_scroll(&self) -> usize {
         self.block_scroll_anchor.offset_value()
@@ -113,6 +124,31 @@ impl Tab {
         self.block_scroll_anchor = BlockScrollAnchor::from_offset(offset);
         self.block_scroll_fraction = 0.0;
         self.sync_primary_history_view();
+    }
+
+    /// v1.10.26 Batch D (D-3): after a 1MiB history split settled `heads`
+    /// new finished blocks, advance a detached anchor so the user's viewport
+    /// does not jump. Block scroll offsets measure upward from the content
+    /// bottom, so the compensation is exact only when every head boundary
+    /// sits below the viewport (reading history older than the settled
+    /// span — the reported "jump ~3 lines" case). A viewport INSIDE the
+    /// settled span over-shifts slightly, and an anchor detached within the
+    /// surviving tail (all boundaries above) shifts spuriously by the same
+    /// bounded amount; splits are rare (>1MiB) so the approximation is
+    /// accepted — see `split_head_anchor_compensation` for the floor
+    /// caveat. FollowBottom is untouched — the live tail keeps the view
+    /// pinned to the bottom.
+    pub(crate) fn compensate_anchor_for_split(&mut self, heads: usize) {
+        if heads == 0 {
+            return;
+        }
+        let delta = crate::tab::scroll::split_head_anchor_compensation(heads);
+        if delta == 0 {
+            return;
+        }
+        if let BlockScrollAnchor::FixedDocumentRow(n) = self.block_scroll_anchor {
+            self.block_scroll_anchor = BlockScrollAnchor::FixedDocumentRow(n.saturating_add(delta));
+        }
     }
 
     /// v1.10.24 (FIX_RECOVERY_DESIGN_ALIGNMENT Fix 2): Attach a persisted
@@ -315,6 +351,53 @@ mod tests {
         );
         assert_eq!(BlockScrollAnchor::FollowBottom.offset_value(), 0);
         assert_eq!(BlockScrollAnchor::FixedDocumentRow(7).offset_value(), 7);
+    }
+
+    // ── v1.10.26 Batch D (D-3): split-head chrome compensation ───────────
+
+    /// The per-head chrome rows a settled 1MiB split head adds to the block
+    /// view above the live tail (Command + Header + Separator, layout_pass).
+    #[test]
+    fn split_head_anchor_compensation_scales_with_heads() {
+        assert_eq!(crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS, 3);
+        assert_eq!(split_head_anchor_compensation(0), 0);
+        assert_eq!(split_head_anchor_compensation(1), 3);
+        assert_eq!(split_head_anchor_compensation(2), 6);
+    }
+
+    /// Split-head settlement must advance a DETACHED anchor by the inserted
+    /// chrome rows (keeping the user's visual row) and leave FollowBottom
+    /// untouched.
+    #[test]
+    fn split_head_compensation_only_shifts_detached_anchors() {
+        let mut tab = Tab::empty();
+        tab.scroll_up_by(100);
+        assert!(matches!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FixedDocumentRow(100)
+        ));
+
+        // 2 heads settle → the view advances by 2 × per-head chrome rows so
+        // the user keeps reading the same visual row.
+        tab.compensate_anchor_for_split(2);
+        assert_eq!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FixedDocumentRow(
+                100 + 2 * crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS
+            )
+        );
+
+        // FollowBottom is unaffected by a split.
+        let mut tab = Tab::empty();
+        assert!(matches!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FollowBottom
+        ));
+        tab.compensate_anchor_for_split(3);
+        assert!(matches!(
+            tab.block_scroll_anchor(),
+            BlockScrollAnchor::FollowBottom
+        ));
     }
 
     /// R2-1 regression: scrolling up from FollowBottom transitions the

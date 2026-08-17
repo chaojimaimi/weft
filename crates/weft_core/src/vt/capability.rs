@@ -141,6 +141,11 @@ pub(in crate::vt) struct CapabilityFlags {
     /// v1.10.23 (FIX_OMP_CONTENT_LOSS): superseded-frame preservation history
     /// (see the `ScreenHistory` struct docs).
     pub(in crate::vt) screen_history: ScreenHistory,
+    /// v1.10.26 Batch D (D-3): number of 1MiB split-head blocks settled by the
+    /// most recent `split_screen_history`. `Some(n)` once per split; the app
+    /// layer consumes it (`Terminal::take_pending_screen_split_heads`) to
+    /// compensate a detached block-scroll anchor for the inserted chrome rows.
+    pub(in crate::vt) pending_screen_split_heads: Option<usize>,
 }
 
 impl Default for CapabilityFlags {
@@ -166,6 +171,7 @@ impl Default for CapabilityFlags {
             primary_history_snapshot_at: None,
             primary_screen_ownership: PrimaryScreenOwnership::default(),
             screen_history: ScreenHistory::default(),
+            pending_screen_split_heads: None,
         }
     }
 }

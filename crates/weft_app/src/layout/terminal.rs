@@ -214,6 +214,21 @@ pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
 // here is the *frame* geometry: pitch, left/right/cols, the fixed CWD
 // line position (Editor mode), and the clip region.
 
+/// v1.10.26 Batch D (D-3): structural chrome rows a <b>settled split head</b>
+/// adds to the block view above the live tail. When a long primary-screen
+/// TUI snapshot crosses `MAX_OUTPUT_BYTES`, `split_screen_history`
+/// (vt/screen_exit/freeze.rs) settles 1MiB chunks as finished blocks; each
+/// new block renders a Command row + Header band + Separator (see
+/// `paint/block_view/layout_pass.rs`), i.e. this many rows inserted between
+/// the older content and the live tail. A detached `block_scroll_anchor`
+/// must advance by `heads × this` to keep the user's viewport stationary
+/// (`tab/scroll.rs split_head_anchor_compensation`). This is a FLOOR, not
+/// an exact count: a wrapped pending command renders
+/// `command_line_chunks(...).len()` Command rows, under-compensating by
+/// (chunks - 1) per such head — accepted for the rare >1MiB split. FollowBottom
+/// is unaffected — the live tail keeps the view pinned to the bottom.
+pub const BLOCK_SPLIT_HEAD_CHROME_ROWS: usize = 3;
+
 /// Layout for the block view's outer frame. Mirrors the top-level geometry
 /// computed inline by `MetalRenderer::build_block_view_vertices`
 /// (renderer.rs:2126).

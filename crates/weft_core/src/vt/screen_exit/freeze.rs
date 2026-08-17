@@ -406,6 +406,11 @@ impl Terminal {
                 let head_count = heads.len();
                 self.block_tracker
                     .split_screen_history(heads, tail, None, consumed_p);
+                // v1.10.26 Batch D (D-3): surface the settled head count so
+                // the app can compensate a detached block-scroll anchor for
+                // the chrome rows the new finished blocks insert.
+                let pending = self.capabilities.pending_screen_split_heads.unwrap_or(0);
+                self.capabilities.pending_screen_split_heads = Some(pending + head_count);
                 tracing::warn!(
                     heads = head_count,
                     bytes = rest.len(),
@@ -438,6 +443,11 @@ impl Terminal {
         let tail_bytes = rest.len();
         self.block_tracker
             .split_screen_history(heads, rest, tail_styled, consumed_p);
+        // v1.10.26 Batch D (D-3): surface the settled head count for the
+        // app-layer anchor chrome compensation (see
+        // `Terminal::take_pending_screen_split_heads`).
+        let pending = self.capabilities.pending_screen_split_heads.unwrap_or(0);
+        self.capabilities.pending_screen_split_heads = Some(pending + head_count);
         tracing::info!(
             heads = head_count,
             tail_bytes,

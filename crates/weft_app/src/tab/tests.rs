@@ -549,12 +549,10 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
 
     // Contrast: an alt-screen TUI (vim) intentionally diverges from the
     // BlockView — full width, and the grid mirrors its own PTY target.
+    // v1.10.26 Batch D (D-1): an isolated single flip has no storm signature,
+    // so the mirror exposes the live alt Full target on the very first
+    // measurement — no Content hold to wait out.
     tab.process_pty_output(b"\x1b[?1049h");
-    // v1.10.25 Batch 3 (B1): a fresh flip holds the burst Content lock, so
-    // let the flip go quiet first — the mirror then exposes the live alt
-    // Full target the pane converges to after a real single-toggle launch.
-    tab.alt_rescale_last_flip =
-        Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
     let (_, alt_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
@@ -601,18 +599,31 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
 
     // Walk 20 rounds of 1049h/l through the mirror site + the winsize ioctl
     // dedup rule exactly as `app_runtime::apply_pty_resize` does
-    // (Pane::should_send_winsize_ioctl). Each flip refreshes
-    // `alt_rescale_last_flip` (tab/lifecycle.rs), keeping the burst window
-    // fresh for the whole storm — exactly the SIGWINCH feedback loop.
+    // (Pane::should_send_winsize_ioctl). Each flip refreshes the flip
+    // history (tab/lifecycle.rs), keeping the burst window fresh for the
+    // whole storm — exactly the SIGWINCH feedback loop.
     for round in 0..20 {
         tab.process_pty_output(b"\x1b[?1049h");
         let (_, alt_cols) = tab
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
-        assert_eq!(
-            alt_cols, content_cols,
-            "round {round}: the burst lock holds the alt phase at Content — an 80-col escape is what feeds the alternation"
-        );
+        // v1.10.26 Batch D (D-1): round 0's `?1049h` is the FIRST flip of
+        // the storm — an isolated single flip has no burst signature yet, so
+        // it exposes the live alt Full target (one converging ioctl, allowed
+        // by the ≤2 bound). From the second flip on, the two-flip signature
+        // locks the target at Content for the rest of the burst — no
+        // Full↔Content alternation reaches the ioctl path.
+        if round == 0 {
+            assert_eq!(
+                alt_cols, 80,
+                "round {round}: the storm's first flip is lone — the live alt Full target"
+            );
+        } else {
+            assert_eq!(
+                alt_cols, content_cols,
+                "round {round}: the burst lock holds the alt phase at Content — an 80-col escape is what feeds the alternation"
+            );
+        }
         if Pane::should_send_winsize_ioctl(last_sent, (rows, alt_cols)) {
             last_sent = Some((rows, alt_cols));
             emitted_ioctls += 1;
@@ -649,40 +660,78 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
     );
 }
 
-/// v1.10.25 Batch 3 (B1): a SINGLE alt toggle (a real TUI launch) is locked
-/// to Content only while the flip stays fresh; once the burst window goes
-/// quiet the live kind applies and the pane converges to the Full target —
-/// one width transition, not an oscillation.
+/// v1.10.26 Batch D (D-2): a batch that contains an h→l pair nets the
+/// `alt_active` boolean to zero — the old before/after boolean detection
+/// missed it entirely, so `pending_alt_rescale` was never armed and the
+/// debounce window silently expired on even-count batches (the v1.10.19 lock
+/// loophole). The u64 flip-counter diff counts 2 real flips instead.
 #[test]
-fn single_alt_toggle_converges_to_full_after_quiet() {
+fn batch_internal_h_l_pair_counts_two_flips_and_refreshes_history() {
+    let mut tab = tab_with_terminal(100);
+    drive_primary_tui(&mut tab);
+    assert!(!tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    assert_eq!(
+        tab.terminal.as_ref().unwrap().alt_flip_count(),
+        0,
+        "precondition: no flips yet"
+    );
+
+    // One batch with an h→l pair: phase is net-zero (still primary).
+    tab.process_pty_output(b"\x1b[?1049h\x1b[?1049l");
+
+    let terminal = tab.terminal.as_ref().unwrap();
+    assert_eq!(
+        terminal.alt_flip_count(),
+        2,
+        "a batch-internal h+l must count two flips"
+    );
+    assert!(!terminal.is_alt_screen_active(), "the phase is net-zero");
+    assert!(
+        tab.pending_alt_rescale,
+        "the flip diff must arm the pending rescale (boolean net-zero missed it)"
+    );
+    let hist = tab
+        .alt_flip_history
+        .expect("the flip diff must refresh the flip history");
+    assert_eq!(hist.count, 2, "two real flips recorded in the history");
+    assert_eq!(hist.src_pane, tab.active_pane);
+}
+
+/// v1.10.26 Batch D (D-1): a SINGLE alt toggle (a real TUI launch) must NOT
+/// arm the burst Content lock — the burst signature needs TWO flips from the
+/// same pane inside the debounce window. An isolated single flip exposes the
+/// live alt Full target immediately (one width transition, no Content hold,
+/// no oscillation).
+#[test]
+fn single_alt_toggle_converges_to_full_immediately() {
     let mut tab = tab_with_terminal(100);
     drive_primary_tui(&mut tab);
 
-    let (_, content_cols) = tab
+    let (rows, content_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(content_cols, 77);
 
-    // Single flip: the freshly-armed window pins the target at Content (the
-    // winding grid already holds it → desired == current, no recompute, no
-    // ioctl) — the mirror site must not leap to Full while the burst window
-    // could still be in the SIGWINCH loop.
+    // Single flip: no second flip → no storm — the live alt kind (Full)
+    // applies on the very first measurement. Pre-Batch-D this mis-fired:
+    // any fresh flip held the 150ms Content lock, flashing the wrong width
+    // on a real vim/less launch.
     tab.process_pty_output(b"\x1b[?1049h");
     assert!(tab.terminal.as_ref().unwrap().is_alt_screen_active());
     let (_, fresh_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(
-        fresh_cols, content_cols,
-        "a fresh single flip holds the Content lock"
+        fresh_cols, 80,
+        "an isolated single flip must converge to the live Full target immediately — no Content lock"
     );
 
-    // The TUI stays quiet → the window expires and the alt phase's Full
-    // target converges (exactly one ioctl afterwards).
-    tab.alt_rescale_last_flip =
-        Some(std::time::Instant::now() - std::time::Duration::from_millis(300));
-    let (_, converged) = tab
-        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
-        .unwrap();
-    assert_eq!(converged, 80, "quiet: the alt target converges to Full");
+    tab.process_pty_output(b"\x1b[?1049l");
+    // The exit flip is now a second flip (a stale two-flip storm signature),
+    // but it ends in the primary phase whose Content target is the constant.
+    assert_eq!(
+        tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
+        Some((rows, content_cols)),
+        "the primary target snaps back to the pre-toggle constant"
+    );
 }
