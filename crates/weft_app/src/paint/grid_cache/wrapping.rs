@@ -471,4 +471,52 @@ mod tests {
         );
         assert!(weft_core::grid::terminal_text_width(&chunks[0]) <= cols);
     }
+
+    /// OBSERVATION-ONLY diagnostic: a border box line drawn at the primary
+    /// TUI's full grid width (203 cols) re-wrapped by the BlockView at its
+    /// content cols (200). Prints raw chunk boundaries; asserts only measure
+    /// the setup line description (203 cols), never the wrap hypothesis.
+    #[test]
+    fn diagnostic_border_wrap_203_to_200_chunking() {
+        let line = format!("[|{}|]", "x".repeat(199));
+        let source_width = weft_core::grid::terminal_text_width(&line);
+        assert_eq!(
+            source_width, 203,
+            "setup: source line must be exactly 203 display cols"
+        );
+        let cols = 200usize;
+        println!("\n=== [exp2 app] block_line_chunks(line, {cols}) ===");
+        println!(
+            "  source line width        = {source_width} (chars = {})",
+            line.chars().count()
+        );
+        println!("  first 6 chars of source = {:?}", &line[..6]);
+        println!(
+            "  last  6 chars of source = {:?}",
+            &line[line.len().saturating_sub(6)..]
+        );
+        println!("  classify_structure_line = {:?}", classify_structure_line(&line));
+
+        let chunks = block_line_chunks(&line, cols).collect::<Vec<_>>();
+        println!("  chunk count             = {}", chunks.len());
+        let mut char_offset = 0usize;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let w = weft_core::grid::terminal_text_width(chunk);
+            println!(
+                "  chunk[{i}] first6={:?} last6={:?} width={w} chars={} char_offset={char_offset}",
+                &chunk[..chunk.len().min(6)],
+                &chunk[chunk.len().saturating_sub(6)..],
+                chunk.chars().count()
+            );
+            char_offset += chunk.chars().count();
+        }
+        println!("  chunks.concat == source = {}", chunks.concat() == line);
+        // rows.rs expansion for LaidRow::Output hard-codes indent_cols = 0 for
+        // EVERY chunk (rows.rs:258, rows.rs:279), so a continuation chunk
+        // rendering the fold of the row tail starts at display column 0.
+        println!(
+            "  rows.rs Output indent_cols: chunk[0] = 0, continuation chunk[{:?}] = 0",
+            chunks.len().checked_sub(1)
+        );
+    }
 }

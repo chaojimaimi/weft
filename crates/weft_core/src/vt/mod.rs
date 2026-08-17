@@ -901,3 +901,6 @@ fn param(params: &vte::Params, idx: usize, default: u16) -> u16 {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod diagnostic_tests;
