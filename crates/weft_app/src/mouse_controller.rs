@@ -5,7 +5,7 @@
 //! Mouse movement, drag, context-menu, and scroll controller.
 
 use super::*;
-use crate::selection::{autoscroll_steps, AutoscrollDir};
+use crate::selection::{autoscroll_steps, down_autoscroll_threshold, AutoscrollDir};
 
 impl App {
     /// Handle mouse release.
@@ -1120,16 +1120,43 @@ impl App {
             .as_ref()
             .map(|r| r.cell_height() as f32)
             .unwrap_or(20.0);
-        let margin = ch; // start scrolling once the pointer enters the edge row band
+        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): in a TUI
+        // history snapshot view the content bottom IS the window bottom (no
+        // prompt/bottom chrome), so `bottom + margin` would be physically
+        // unreachable and a downward drag could never scroll. Shift the Down
+        // band inward to the content's bottom edge row when that happens;
+        // regular block views with a prompt below keep the legacy band.
+        // The edge row band is one line: scroll starts once the pointer
+        // enters the band.
+        let margin = ch;
+        // v1.10.25 (S2, rust-reviewer should-fix): compare against the ACTIVE
+        // PANE's bottom edge, not the whole-window viewport bottom. In a
+        // vertical split the pane's content bottom is far above the window's,
+        // so the old `viewport().1` falsely declared the Down band reachable
+        // and placed it in the pane below's territory. `layout_ctx` is the
+        // active pane's context (the same one `block_content_vbounds` derives
+        // `bottom` from — same frame, same coordinate system); its clip rect
+        // bottom is the pane's bottom edge. No clip (single pane) keeps the
+        // legacy whole-window viewport bottom so single-pane behavior is
+        // unchanged; if no ctx is available we fall back to that legacy value.
+        let pane_bottom = self.renderer.as_ref().and_then(|renderer| {
+            renderer.layout_ctx.map(|ctx| match ctx.clip {
+                Some(rect) => rect[3],
+                None => renderer.viewport().1,
+            })
+        });
+        let down_threshold = pane_bottom
+            .map(|pane_bottom| down_autoscroll_threshold(bottom, pane_bottom, ch))
+            .unwrap_or(bottom + margin);
         let (dir, steps) = if (y as f32) < top - margin {
             (
                 AutoscrollDir::Up,
                 autoscroll_steps((top - margin) - y as f32, ch),
             )
-        } else if (y as f32) > bottom + margin {
+        } else if (y as f32) > down_threshold {
             (
                 AutoscrollDir::Down,
-                autoscroll_steps(y as f32 - (bottom + margin), ch),
+                autoscroll_steps(y as f32 - down_threshold, ch),
             )
         } else {
             self.window_runtime

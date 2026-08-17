@@ -283,7 +283,13 @@ mod tests {
         let start =
             block_pos_at_char(&segments, text[..target.start].chars().count(), false).unwrap();
         let end = block_pos_at_char(&segments, text[..target.end].chars().count(), true).unwrap();
-        BlockViewSelection { start, end, rows }.text()
+        BlockViewSelection {
+            start,
+            end,
+            rows,
+            frame_delta: 0.0,
+        }
+        .text()
     }
 
     #[test]
@@ -332,7 +338,16 @@ mod tests {
         assert_eq!(target.text(&text), "https://example.com/path");
         let start = block_pos_at_char(&segments, 0, false).unwrap();
         let end = block_pos_at_char(&segments, text.chars().count(), true).unwrap();
-        assert_eq!(BlockViewSelection { start, end, rows }.text(), text);
+        assert_eq!(
+            BlockViewSelection {
+                start,
+                end,
+                rows,
+                frame_delta: 0.0,
+            }
+            .text(),
+            text
+        );
     }
 
     #[test]

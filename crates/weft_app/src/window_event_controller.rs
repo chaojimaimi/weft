@@ -95,6 +95,18 @@ impl App {
                             "all tabs resized (event)"
                         );
                         self.window_runtime.last_resize_instant = std::time::Instant::now();
+                        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING)
+                        // DEBUG probe (stage 1/4): the Resized event — anchor
+                        // for the ioctl-commit / first-pty-output / first-present
+                        // RESIZE_PROBE chain that quantifies the resize blank
+                        // interval and the omp repaint latency.
+                        tracing::debug!(
+                            rows = base_layout.rows,
+                            cols = base_layout.cols,
+                            "RESIZE_PROBE window_resized",
+                        );
+                        // `renderer.resize()` above already armed the stage-4
+                        // first-present probe.
                         // v1.2-fix: re-clamp tab scroll offset after resize.
                         // The window may have grown/shrunk, changing max_scroll.
                         // Without this, a stale scroll_offset can leave tabs

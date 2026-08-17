@@ -83,14 +83,6 @@ fn setup_panic_hook(default_hook: Box<dyn Fn(&std::panic::PanicInfo<'_>) + Send 
     }));
 }
 
-fn invalidate_primary_tui_frame(terminal: &mut Terminal) -> bool {
-    if !terminal.primary_screen_repaint_capable() {
-        return false;
-    }
-    terminal.grid_mut().clear_screen_all();
-    true
-}
-
 pub(super) fn terminal_capability_env() -> Vec<(String, String)> {
     vec![
         ("TERM".into(), "xterm-256color".into()),
@@ -705,39 +697,63 @@ impl App {
         rows: usize,
         cols: usize,
     ) {
-        let Some(session) = self.sessions.tab_mut(tab) else {
-            return;
-        };
-        // v1.3 Batch 6: target the specific pane by id (not just the active
-        // pane). Pre-v1.3 callers always passed the active pane's id, so
-        // behavior is unchanged for single-pane tabs.
-        let Some(pane) = session.pane_mut(pane_id) else {
-            return;
-        };
         // v1.10.19: the TIOCSWINSZ is deduped against the last-sent winsize
         // (Pane::apply_winsize_ioctl). Re-requesting a size the PTY already
         // has must not re-issue the ioctl — each redundant one SIGWINCHes
         // the foreground app, keeping a resize feedback loop alive. The
         // in-memory Grid is still committed below so grid dims never drift
         // from the PTY's.
-        let (ioctl_sent, resize_succeeded) = match pane.apply_winsize_ioctl(rows, cols) {
-            Ok(sent) => (sent, true),
-            Err(error) => {
-                warn!(%error, tab, pane_id = %pane_id, rows, cols, "failed to apply PTY resize effect");
-                (false, false)
+        //
+        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): the resize
+        // path no longer clears the primary-screen frame. `Terminal::resize`
+        // is dimension-only and keeps the old content, so the sequence is
+        // old-frame stretch (CAMetalLayer keeps presenting the stale drawable)
+        // → dimension-only old content (briefly misaligned, never blank) →
+        // omp's repaint at the new size. `clear_screen_all` used to render a
+        // blank intermediate frame that killed the CA stretch transition.
+        let (ioctl_sent, committed) = {
+            let Some(session) = self.sessions.tab_mut(tab) else {
+                return;
+            };
+            // v1.3 Batch 6: target the specific pane by id (not just the active
+            // pane). Pre-v1.3 callers always passed the active pane's id, so
+            // behavior is unchanged for single-pane tabs.
+            let Some(pane) = session.pane_mut(pane_id) else {
+                return;
+            };
+            let (ioctl_sent, resize_succeeded) = match pane.apply_winsize_ioctl(rows, cols) {
+                Ok(sent) => (sent, true),
+                Err(error) => {
+                    warn!(%error, tab, pane_id = %pane_id, rows, cols, "failed to apply PTY resize effect");
+                    (false, false)
+                }
+            };
+            let mut committed = false;
+            if let Some(terminal) = &mut pane.terminal {
+                committed = commit_pty_resize_result(
+                    terminal,
+                    &mut pane.pending_pty_resize,
+                    (rows, cols),
+                    resize_succeeded,
+                );
             }
+            (ioctl_sent, committed)
         };
-        if let Some(terminal) = &mut pane.terminal {
-            let committed = commit_pty_resize_result(
-                terminal,
-                &mut pane.pending_pty_resize,
-                (rows, cols),
-                resize_succeeded,
+        // DEBUG probe (stage 2/4): ioctl committed — time from the Resized
+        // event to the TIOCSWINSZ taking effect; also arm the PTY-output
+        // probe so the next output for this tab (stage 3/4) logs how long
+        // until omp starts repainting.
+        if committed && ioctl_sent {
+            tracing::debug!(
+                tab,
+                pane_id = %pane_id,
+                rows,
+                cols,
+                since_resize_ms = self.window_runtime.last_resize_instant.elapsed().as_millis(),
+                "RESIZE_PROBE ioctl_commit",
             );
-            // Only a real size change needs the TUI frame invalidation; a
-            // deduped commit resizes the Grid to dims it already holds.
-            if committed && ioctl_sent {
-                invalidate_primary_tui_frame(terminal);
+            if let Some(session) = self.sessions.tab_mut(tab) {
+                session.arm_resize_output_probe();
             }
         }
     }
@@ -806,30 +822,29 @@ mod tests {
     }
 
     #[test]
-    fn primary_tui_resize_invalidation_drops_stale_frame_but_keeps_shell_state() {
+    fn resize_commit_keeps_primary_screen_content_after_dimension_only_resize() {
+        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): the resize
+        // path used to clear_screen_all() before the omp repaint, rendering a
+        // blank frame (killing CA's stretch transition). Resize is now
+        // dimension-only — the old content must survive the commit untouched.
         let mut terminal = Terminal::new(8, 40);
         terminal.process(b"\x1b]7;file://localhost/Users/me/Claude\x07");
         terminal.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
-        terminal.process(b"\x1b[?2026h\x1b[2J\x1b[HOLD ICON\x1b[4;1HOLD HEADER\x1b[?2026l");
-        let cursor_before = (
-            terminal.grid().cursor.row,
-            terminal.grid().cursor.col,
-            terminal.grid().cursor.wrap_pending,
-        );
-
-        assert!(invalidate_primary_tui_frame(&mut terminal));
+        terminal.process(b"\x1b[?2026h\x1b[2J\x1b[HNEW ICON\x1b[?2026l");
+        assert!(terminal.primary_screen_repaint_capable());
+        let mut pending = None;
+        assert!(commit_pty_resize_result(
+            &mut terminal,
+            &mut pending,
+            (10, 50),
+            true
+        ));
         assert_eq!(
-            (
-                terminal.grid().cursor.row,
-                terminal.grid().cursor.col,
-                terminal.grid().cursor.wrap_pending,
-            ),
-            cursor_before
+            (terminal.grid().num_rows, terminal.grid().num_cols),
+            (10, 50),
+            "dimension-only resize must still commit"
         );
-        terminal.process(b"\x1b[HNEW ICON");
-
         assert_eq!(terminal.grid().row_text(0), "NEW ICON");
-        assert!(terminal.grid().row_text(3).is_empty());
         assert_eq!(terminal.cwd(), Some("/Users/me/Claude"));
         assert_eq!(
             terminal
@@ -838,30 +853,6 @@ mod tests {
                 .map(|live| live.command),
             Some("claude")
         );
-    }
-
-    #[test]
-    fn resize_invalidation_does_not_clear_shell_or_alt_screen() {
-        let mut shell = Terminal::new(4, 20);
-        shell.process(b"shell output");
-        assert!(!invalidate_primary_tui_frame(&mut shell));
-        assert_eq!(shell.grid().row_text(0), "shell output");
-
-        shell.process(b"\x1b[?1049hALT");
-        assert!(!invalidate_primary_tui_frame(&mut shell));
-        assert_eq!(shell.grid().row_text(0), "ALT");
-    }
-
-    #[test]
-    fn cursor_addressing_without_synchronized_frames_is_not_destructively_cleared() {
-        let mut terminal = Terminal::new(4, 24);
-        terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07");
-        terminal.process(b"\x1b[Hprogress\x1b[2;1Hstill running");
-        assert!(terminal.primary_screen_app_active());
-
-        assert!(!invalidate_primary_tui_frame(&mut terminal));
-        assert_eq!(terminal.grid().row_text(0), "progress");
-        assert_eq!(terminal.grid().row_text(1), "still running");
     }
 
     #[test]

@@ -101,11 +101,23 @@ impl MetalRenderer {
         self.viewport
     }
 
+    /// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): consume the
+    /// one-shot stage-4 RESIZE_PROBE gate armed by `resize()`; returns the
+    /// resize→present elapsed time the caller logs once per resize.
+    pub(crate) fn take_resize_present_probe(&self) -> Option<std::time::Instant> {
+        self.resize_present_probe.take()
+    }
+
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
         // Use physical pixels for viewport to match drawable_size and grid dimensions
         let vp_w = size.width as f32;
         let vp_h = size.height as f32;
         self.viewport = (vp_w, vp_h);
+        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): arm the
+        // stage-4 RESIZE_PROBE gate so the next draw logs the first present
+        // after this resize (quantifies the blank interval / omp latency).
+        self.resize_present_probe
+            .set(Some(std::time::Instant::now()));
         // IMPORTANT: drawable_size must be in PHYSICAL PIXELS
         self.layer
             .set_drawable_size(CGSize::new(size.width as f64, size.height as f64));

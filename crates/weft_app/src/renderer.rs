@@ -125,6 +125,10 @@ pub struct MetalRenderer {
     /// v1.10.23 (FIX_LIVE_BLOCK_SCROLL_PERF): live-block cumulative layout
     /// cache (visible-window O(log n), see paint::live_cache).
     pub(crate) live_layout_cache: RefCell<LiveLayoutCache>,
+    /// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): RESIZE_PROBE
+    /// stage-4 gate — armed on resize(), consumed once at the next draw to
+    /// log the first present after a Resized.
+    pub(crate) resize_present_probe: std::cell::Cell<Option<std::time::Instant>>,
     /// v1.10.23 change 2: exact `block_scroll_metrics` memo — the fingerprint
     /// covers every input, so wheel + same-frame scrollbar share one scan.
     pub(crate) scroll_metrics_memo: Cell<BlockScrollMetricsMemo>,

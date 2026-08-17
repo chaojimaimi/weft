@@ -3,6 +3,7 @@
 use crate::grid::{CellFlags, Grid};
 
 mod block_view;
+mod sync;
 
 /// A point in the grid (row, col), 0-based.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +242,7 @@ impl SelectionHandler {
             start: pos,
             end: pos,
             rows,
+            frame_delta: 0.0,
         });
         self.selecting = true;
     }
@@ -372,6 +374,12 @@ pub struct BlockViewSelection {
     pub start: BlockViewPos,
     pub end: BlockViewPos,
     pub rows: Vec<BlockViewRow>,
+    /// v1.10.25 (B1): the frame displacement delta most recently applied to
+    /// normalize retained rows into the current frame's y coordinate system
+    /// (see `sync_rows` in `selection/sync.rs`). Reused on frames with zero
+    /// exact identity matches so the frozen block stays aligned; 0 before the
+    /// first sync.
+    pub frame_delta: f32,
 }
 
 impl BlockViewSelection {
@@ -435,46 +443,6 @@ impl BlockViewSelection {
             }
         }
         out
-    }
-
-    /// Refresh the row snapshot and remap `start`/`end` row_index by matching
-    /// (block_id, text, kind); scrolled-off rows map to the closest y-center.
-    pub fn sync_rows(&mut self, new_rows: Vec<BlockViewRow>) {
-        let remap = |old_idx: usize| -> usize {
-            if old_idx >= self.rows.len() || new_rows.is_empty() {
-                return 0;
-            }
-            let old_row = &self.rows[old_idx];
-            // Exact match first (same block + text + kind).
-            if let Some(i) = new_rows.iter().position(|r| {
-                r.kind == old_row.kind && r.block_id == old_row.block_id && r.text == old_row.text
-            }) {
-                return i;
-            }
-            // Fallback: match by text only (LiveCommand rows have no block_id).
-            if let Some(i) = new_rows
-                .iter()
-                .position(|r| r.kind == old_row.kind && r.text == old_row.text)
-            {
-                return i;
-            }
-            // Row scrolled off — use the new row with the closest y-center.
-            let old_yc = (old_row.y_top + old_row.y_bottom) * 0.5;
-            let mut best = 0usize;
-            let mut best_d = f32::MAX;
-            for (i, r) in new_rows.iter().enumerate() {
-                let yc = (r.y_top + r.y_bottom) * 0.5;
-                let d = (yc - old_yc).abs();
-                if d < best_d {
-                    best_d = d;
-                    best = i;
-                }
-            }
-            best
-        };
-        self.start.row_index = remap(self.start.row_index).min(new_rows.len().saturating_sub(1));
-        self.end.row_index = remap(self.end.row_index).min(new_rows.len().saturating_sub(1));
-        self.rows = new_rows;
     }
 }
 
@@ -642,6 +610,7 @@ mod tests {
                 char_index: 3,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "el");
     }
@@ -662,6 +631,7 @@ mod tests {
                 char_index: 2,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "hi\nhello\nwo");
     }
@@ -680,6 +650,7 @@ mod tests {
                 char_index: 5,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "hi\nhello\nwo");
     }
@@ -697,6 +668,7 @@ mod tests {
                 char_index: 5,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "");
     }
@@ -715,6 +687,7 @@ mod tests {
                 char_index: 200,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "");
     }
@@ -743,80 +716,6 @@ mod tests {
         assert_eq!(text, "hello\nwor");
         h.clear();
         assert!(h.block_view_selection.is_none());
-    }
-
-    // sync_rows fallback tests: culled rows may be absent from `new_rows`.
-
-    #[test]
-    fn sync_rows_clipped_row_falls_back_to_y_center() {
-        // Old idx 4 (Header) absent from new_rows; y-center fallback maps
-        // it to new idx 2 (Command, y-center=70).
-        let old_rows = bv_rows();
-        let mut sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 4,
-                char_index: 0,
-            },
-            end: BlockViewPos {
-                row_index: 3,
-                char_index: 5,
-            },
-            rows: old_rows,
-        };
-        let new_rows = vec![
-            bv_row(BlockViewRowKind::Output, "world", 0.0, 20.0), // new idx 0
-            bv_row(BlockViewRowKind::Output, "hello", 20.0, 40.0), // new idx 1
-            bv_row(BlockViewRowKind::Command, "echo hi", 60.0, 80.0), // new idx 2
-        ];
-        sel.sync_rows(new_rows);
-        // start (old idx 4) → new idx 2 (y-center); end exact-matches idx 2.
-        assert_eq!(sel.start.row_index, 2);
-        assert_eq!(sel.end.row_index, 2);
-    }
-
-    #[test]
-    fn sync_rows_all_clipped_does_not_panic() {
-        // Every row offscreen or unmatchable: must not panic; indices clamp.
-        let old_rows = bv_rows();
-        let mut sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 4,
-                char_index: 0,
-            },
-            end: BlockViewPos {
-                row_index: 0,
-                char_index: 3,
-            },
-            rows: old_rows,
-        };
-        let new_rows = vec![
-            bv_row(BlockViewRowKind::Output, "completely_new", 200.0, 220.0),
-            bv_row(BlockViewRowKind::Output, "also_new", 220.0, 240.0),
-        ];
-        sel.sync_rows(new_rows);
-        // Both endpoints must be valid indices into new_rows (0 or 1).
-        assert!(sel.start.row_index < 2);
-        assert!(sel.end.row_index < 2);
-    }
-
-    #[test]
-    fn sync_rows_empty_new_rows_does_not_panic() {
-        // Empty new_rows (pre-layout first frame): must not panic; clamp to 0.
-        let old_rows = bv_rows();
-        let mut sel = BlockViewSelection {
-            start: BlockViewPos {
-                row_index: 2,
-                char_index: 0,
-            },
-            end: BlockViewPos {
-                row_index: 0,
-                char_index: 3,
-            },
-            rows: old_rows,
-        };
-        sel.sync_rows(Vec::new());
-        assert_eq!(sel.start.row_index, 0);
-        assert_eq!(sel.end.row_index, 0);
     }
 
     // v1.7.0-E: selection must not corrupt styled output (reads plain
@@ -901,6 +800,7 @@ mod tests {
                 char_index: 5,
             },
             rows,
+            frame_delta: 0.0,
         };
 
         // Extract selection text.
@@ -981,6 +881,7 @@ mod tests {
                 char_index: 0,
             },
             rows,
+            frame_delta: 0.0,
         };
         assert_eq!(sel.text(), "docker\nps --filter\noutput line");
     }

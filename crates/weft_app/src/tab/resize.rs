@@ -77,6 +77,19 @@ impl Tab {
         true
     }
 
+    /// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): arm the
+    /// one-shot RESIZE_PROBE stage-3 gate — the next PTY output logs the
+    /// post-resize repaint latency, then disarms.
+    pub(crate) fn arm_resize_output_probe(&mut self) {
+        self.resize_output_probe = Some(Instant::now());
+    }
+
+    /// v1.10.25 Batch 3: consume the stage-3 gate if armed; returns the
+    /// elapsed time since it was armed (the ioctl-to-repaint gap).
+    pub(crate) fn take_resize_output_probe(&mut self) -> Option<std::time::Duration> {
+        self.resize_output_probe.take().map(|armed| armed.elapsed())
+    }
+
     /// v1.10.19/25: PTY cols target for one pane — full width on the alt
     /// screen (`Terminal::tui_cols_kind` → [Full][TuiColsKind::Full]),
     /// gutter-subtracted content width otherwise. Sole shared implementation

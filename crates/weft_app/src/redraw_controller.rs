@@ -732,6 +732,15 @@ impl App {
                 pane.pane_session_id,
             );
             crate::performance_probe::report_first_frame_once();
+            // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) DEBUG
+            // probe (stage 4/4): first present after a Resized — closes the
+            // resize-blank-interval chain (stretch → dimension-only → repaint).
+            if let Some(since) = renderer.take_resize_present_probe() {
+                tracing::debug!(
+                    since_resize_ms = since.elapsed().as_millis(),
+                    "RESIZE_PROBE first_present",
+                );
+            }
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.
             if self.frame_trace_enabled {

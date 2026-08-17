@@ -27,6 +27,34 @@ pub(crate) fn autoscroll_steps(overshoot_px: f32, cell_h: f32) -> usize {
     ((overshoot_px / cell_h).ceil() as usize).clamp(1, 6)
 }
 
+/// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): whether the Down
+/// autoscroll trigger band is physically reachable with the pointer. True
+/// when at least a full line of space sits below `content_bottom` inside the
+/// window — the band `content_bottom + line_h` exists on screen (a prompt /
+/// bottom-chrome case). False when the content bottom is at/within one line
+/// of the window bottom (TUI history snapshot view: padding 0, no prompt
+/// chrome), so the trigger must shift inward to the content's bottom edge.
+pub(crate) fn down_trigger_reachable(content_bottom: f32, window_bottom: f32, line_h: f32) -> bool {
+    line_h > 0.0 && window_bottom - content_bottom >= line_h
+}
+
+/// The y threshold at which a held drag triggers a Down autoscroll. With
+/// bottom chrome the band sits a full line below the content edge
+/// (`content_bottom + line_h`); without it, the content's bottom edge row
+/// itself is the band (`content_bottom - line_h`), so a drag held inside the
+/// last visible line can still scroll the selection downward.
+pub(crate) fn down_autoscroll_threshold(
+    content_bottom: f32,
+    window_bottom: f32,
+    line_h: f32,
+) -> f32 {
+    if down_trigger_reachable(content_bottom, window_bottom, line_h) {
+        content_bottom + line_h
+    } else {
+        content_bottom - line_h
+    }
+}
+
 /// Grid column → char index into the row's snapshot text. Mirrors the
 /// snapshot builder's char counting exactly: `WIDE_SPACER` cells are
 /// skipped, each `EXTRA` cluster contributes its full char count (a ZWJ
@@ -260,6 +288,40 @@ mod tests {
         // inf / NaN saturate in the float→usize cast and hit the clamp.
         assert_eq!(autoscroll_steps(40.0, 0.0), 6); // inf → saturate → 6
         assert_eq!(autoscroll_steps(f32::NAN, 0.0), 1); // NaN → 0 → clamp to 1
+    }
+
+    // ── v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): Down band
+    // reachability with/without bottom chrome ─────────────────────────────
+
+    #[test]
+    fn down_trigger_reachable_requires_a_full_line_of_bottom_space() {
+        const LINE_H: f32 = 20.0;
+        const WINDOW_H: f32 = 800.0;
+        // No bottom chrome: content bottom at/within a line of the window
+        // bottom — the `bottom + margin` band is physically unreachable.
+        assert!(!down_trigger_reachable(WINDOW_H, WINDOW_H, LINE_H));
+        assert!(!down_trigger_reachable(WINDOW_H - 10.0, WINDOW_H, LINE_H));
+        // Prompt / bottom chrome: the band below the content is on screen.
+        assert!(down_trigger_reachable(WINDOW_H - 20.0, WINDOW_H, LINE_H));
+        assert!(down_trigger_reachable(WINDOW_H - 80.0, WINDOW_H, LINE_H));
+        // Degenerate cell height must not claim reachability.
+        assert!(!down_trigger_reachable(100.0, 800.0, 0.0));
+    }
+
+    #[test]
+    fn down_autoscroll_threshold_two_states() {
+        const LINE_H: f32 = 20.0;
+        const WINDOW_H: f32 = 800.0;
+        // With bottom chrome: band stays a full line below the content edge.
+        assert_eq!(down_autoscroll_threshold(700.0, WINDOW_H, LINE_H), 720.0);
+        // Without chrome: the threshold shifts inward to the bottom edge row
+        // (`content_bottom - line_h`), making Down triggerable from the last
+        // visible line of a TUI snapshot that fills the window.
+        assert_eq!(down_autoscroll_threshold(WINDOW_H, WINDOW_H, LINE_H), 780.0);
+        assert_eq!(
+            down_autoscroll_threshold(WINDOW_H - 10.0, WINDOW_H, LINE_H),
+            770.0
+        );
     }
 
     fn row_with_text(text: &str, cols: usize) -> Row {

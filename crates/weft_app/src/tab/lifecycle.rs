@@ -34,6 +34,17 @@ impl Tab {
             }
             None => return false,
         };
+        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) DEBUG probe
+        // (stage 3/4): first PTY output after a committed resize — measures
+        // when omp starts repainting (the ioctl-to-repaint gap). Fires once
+        // per resize, then disarms.
+        if let Some(since_ioctl) = self.take_resize_output_probe() {
+            tracing::debug!(
+                since_ioctl_ms = since_ioctl.as_millis(),
+                bytes = data.len(),
+                "RESIZE_PROBE first_pty_output",
+            );
+        }
         if alt_changed {
             self.pending_alt_rescale = true;
             // v1.10.19: arm the debounce window — take_pending_alt_rescale

@@ -94,6 +94,11 @@ pub struct Tab {
     /// toggles every ~130ms); the recompute then holds until the toggles go
     /// quiet so the burst coalesces into one.
     alt_rescale_last_taken: Option<std::time::Instant>,
+    /// v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING): armed after a
+    /// committed PTY resize; the first following PTY output logs the
+    /// post-resize repaint latency (stage 3/4 of the RESIZE_PROBE chain) and
+    /// disarms itself, so it fires once per resize instead of per byte.
+    resize_output_probe: Option<std::time::Instant>,
 }
 
 impl std::ops::Deref for Tab {
@@ -449,6 +454,7 @@ impl Tab {
             pending_alt_rescale: false,
             alt_rescale_last_flip: None,
             alt_rescale_last_taken: None,
+            resize_output_probe: None,
         }
     }
 
