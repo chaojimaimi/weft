@@ -568,7 +568,11 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
         "grid render cols always mirror the PTY target (edge-to-edge here)"
     );
     tab.process_pty_output(b"\x1b[?1049l");
-    // Back on the primary phase the content target is restored exactly.
+    // Back on the primary phase the content target is restored exactly — but
+    // this exit flip forms a FRESH two-flip storm with the entry flip above,
+    // so the target FREEZES at the current grid (alt Full 80) until the storm
+    // goes quiet (v1.10.27). Expire it, then the constant is restored.
+    expire_alt_flip_history(&mut tab);
     assert_eq!(
         tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
         Some((rows, 77)),
@@ -577,56 +581,70 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
 }
 
 /// A burst of transient `?1049h/l` toggles must not become a winsize ioctl
-/// storm. v1.10.25 Batch 3 (B1) replaced the "value set ≤ 2" assertion
-/// (structurally unable to tell a 99↔102 storm from controlled behaviour)
-/// with an explicit hysteresis model: while the toggle storm is fresh, the
-/// mirror site locks the target to the Content constant (tab/resize.rs
-/// `burst_locked_cols`), so the drift check's desired stays Content —
-/// whatever phase each flip landed on — and the ioctl stream is bounded to
-/// the tiny constant count below.
+/// storm. v1.10.25 Batch 3 (B1) + v1.10.26 (D-1) locked the target to the
+/// Content constant; v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW) FREEZES it at the
+/// pane's current grid size instead (tab/resize.rs `burst_locked_cols`), so
+/// desired == current and the ioctl stream is bounded to the tiny constant
+/// count below.
 #[test]
 fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
     let mut tab = tab_with_terminal(100);
     drive_primary_tui(&mut tab);
 
-    // The pane has converged at the content target.
+    // The pane has converged at the content target — grid == last_sent, the
+    // production invariant from `apply_pty_resize_effect` (ioctl → grid
+    // commit keeps "current" == what was actually sent).
     let (rows, content_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(content_cols, 77);
+    let full_cols = 80;
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(rows, content_cols);
     let mut last_sent: Option<(usize, usize)> = Some((rows, content_cols));
     let mut emitted_ioctls = 0usize;
 
     // Walk 20 rounds of 1049h/l through the mirror site + the winsize ioctl
     // dedup rule exactly as `app_runtime::apply_pty_resize` does
-    // (Pane::should_send_winsize_ioctl). Each flip refreshes the flip
-    // history (tab/lifecycle.rs), keeping the burst window fresh for the
-    // whole storm — exactly the SIGWINCH feedback loop.
+    // (`Pane::should_send_winsize_ioctl`, committing the grid to the target
+    // on each ioctl). Each flip refreshes the flip history (tab/lifecycle.rs),
+    // keeping the burst window fresh for the whole storm — exactly the
+    // SIGWINCH feedback loop.
     for round in 0..20 {
         tab.process_pty_output(b"\x1b[?1049h");
-        let (_, alt_cols) = tab
+        let (r, cols) = tab
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
-        // v1.10.26 Batch D (D-1): round 0's `?1049h` is the FIRST flip of
-        // the storm — an isolated single flip has no burst signature yet, so
-        // it exposes the live alt Full target (one converging ioctl, allowed
-        // by the ≤2 bound). From the second flip on, the two-flip signature
-        // locks the target at Content for the rest of the burst — no
-        // Full↔Content alternation reaches the ioctl path.
+        assert_eq!(r, rows);
+        // v1.10.26 D-1: round 0's `?1049h` is the FIRST flip of the storm —
+        // an isolated single flip has no burst signature yet, so it exposes
+        // the live alt Full target (one converging ioctl, allowed by the ≤2
+        // bound). From the second flip on, the two-flip signature FREEZES the
+        // target at the current grid (the Full width just committed) for the
+        // rest of the burst — no Full↔Content alternation reaches the ioctl
+        // path, and no escape to the Content constant either.
         if round == 0 {
             assert_eq!(
-                alt_cols, 80,
+                cols, full_cols,
                 "round {round}: the storm's first flip is lone — the live alt Full target"
             );
         } else {
             assert_eq!(
-                alt_cols, content_cols,
-                "round {round}: the burst lock holds the alt phase at Content — an 80-col escape is what feeds the alternation"
+                cols, full_cols,
+                "round {round}: the freeze pins the current grid — never the Content constant"
             );
         }
-        if Pane::should_send_winsize_ioctl(last_sent, (rows, alt_cols)) {
-            last_sent = Some((rows, alt_cols));
+        if Pane::should_send_winsize_ioctl(last_sent, (rows, cols)) {
+            last_sent = Some((rows, cols));
             emitted_ioctls += 1;
+            tab.active_mut()
+                .terminal
+                .as_mut()
+                .unwrap()
+                .resize(rows, cols);
         }
 
         tab.process_pty_output(b"\x1b[?1049l");
@@ -634,29 +652,180 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
         assert_eq!(
-            primary_cols, content_cols,
-            "round {round}: primary phase stays on the Content constant"
+            primary_cols, full_cols,
+            "round {round}: the fresh storm pins the current grid on the primary phase too"
         );
         if Pane::should_send_winsize_ioctl(last_sent, (rows, primary_cols)) {
             last_sent = Some((rows, primary_cols));
             emitted_ioctls += 1;
+            tab.active_mut()
+                .terminal
+                .as_mut()
+                .unwrap()
+                .resize(rows, primary_cols);
         }
     }
 
     // Explicit-burst upper bound: a 20-round storm may emit at most a tiny
-    // constant. With the hysteresis lock every measured target is the
-    // already-sent Content size, so in practice zero; ≤2 tolerates one
-    // initial convergence + one final drift without ever resembling the
-    // v1.10.19 99↔102 storm (which emitted once per flip).
+    // constant. With the freeze every measured target is the already-sent
+    // current grid, so in practice the lone first-flip convergence = 1; ≤2
+    // tolerates one extra final drift without ever resembling the v1.10.19
+    // 99↔102 storm (which emitted once per flip).
     assert!(
         emitted_ioctls <= 2,
         "a 20-round toggle storm must emit ≤ 2 winsize ioctls, got {emitted_ioctls}"
     );
     // The pane ends on the primary Content constant — the pre-burst value.
+    // The last flip is still fresh (the middle of a live storm), so the
+    // freeze holds; expire the storm, then it converges to the pre-burst
+    // content target.
+    expire_alt_flip_history(&mut tab);
     assert_eq!(
         tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
         Some((rows, content_cols)),
         "the pane converges to the pre-burst content target"
+    );
+}
+
+/// v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): Deterministically expire the two-flip
+/// storm signature (simulate the 150ms debounce window elapsing) without
+/// sleeping.
+fn expire_alt_flip_history(tab: &mut Tab) {
+    let stale = std::time::Instant::now() - std::time::Duration::from_millis(300);
+    tab.alt_flip_history = Some(AltFlipHistory {
+        src_pane: tab.active_pane,
+        older: stale,
+        newer: stale,
+        count: 2,
+    });
+}
+
+/// v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): Simulate the resize path exactly as
+/// `app_runtime::apply_pty_resize_effect` does — dedup against `last_sent`
+/// (`Pane::should_send_winsize_ioctl`), record the ioctl when it fires, and
+/// ALWAYS commit the grid to the target (the in-memory Grid is committed even
+/// on a deduped ioctl). Keeps the test's grid == last_sent == the freeze's
+/// "current grid" source, which is the production invariant.
+fn apply_measured_target(
+    tab: &mut Tab,
+    target: (usize, usize),
+    last_sent: &mut Option<(usize, usize)>,
+    ioctls: &mut Vec<(usize, usize)>,
+) {
+    if Pane::should_send_winsize_ioctl(*last_sent, target) {
+        *last_sent = Some(target);
+        ioctls.push(target);
+    }
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(target.0, target.1);
+}
+
+/// v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): End-to-end double-click-zoom
+/// sequence — window resize → application alt-toggle pair (storm) → quiet —
+/// emits exactly TWO winsize ioctls (first resize + one final convergence)
+/// and never a Content intermediate mid-storm.
+///
+/// The old burst lock pinned the target to the Content constant recomputed
+/// from the NEW window size (91) while the grid already held the size first
+/// sent (94): the 91 ioctl fired mid-storm → SIGWINCH → omp repainted and
+/// toggled again (the second round trip), then the quiet convergence back to
+/// 94 repainted a SECOND time — the "抖动两下". Freezing the target at the
+/// pane's current grid size during the storm makes desired == current, so the
+/// mid-storm ioctl disappears and the app repaints exactly once, at the single
+/// post-quiet convergence.
+#[test]
+fn resize_followed_by_toggle_pair_emits_exactly_two_ioctls_no_intermediate() {
+    let mut tab = tab_with_terminal(100);
+    let src = tab.active_pane;
+
+    // Setup: an alt-screen TUI at the OLD geometry, converged.
+    tab.process_pty_output(b"\x1b[?1049h");
+    let old_rect: weft_core::pane_layout::Rect = [0.0, 0.0, 800.0, 600.0];
+    let (rows, old_full_cols) = tab
+        .active_pane_dimensions_for_rect(old_rect, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(old_full_cols, 80, "old geometry maps to full 80 cols");
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(rows, old_full_cols);
+    let mut last_sent: Option<(usize, usize)> = Some((rows, old_full_cols));
+    let mut ioctls: Vec<(usize, usize)> = Vec::new();
+    // The setup flip happened long ago — reset it to a stale lone record so
+    // ONLY the app's own dance flips drive the storm signature (a real
+    // double-click zoom is seconds after launch).
+    let stale = std::time::Instant::now() - std::time::Duration::from_secs(5);
+    tab.alt_flip_history = Some(AltFlipHistory {
+        src_pane: src,
+        older: stale,
+        newer: stale,
+        count: 1,
+    });
+
+    // (1) Window resize (double-click zoom): new geometry Full=94, Content=91.
+    // No flips have happened yet — the first target computes and ships
+    // normally (the "首个" ioctl; the fix leaves it untouched).
+    let new_rect: weft_core::pane_layout::Rect = [0.0, 0.0, 940.0, 600.0];
+    let first = tab
+        .active_pane_dimensions_for_rect(new_rect, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(first, (rows, 94), "the resize lands at the new full width");
+    apply_measured_target(&mut tab, first, &mut last_sent, &mut ioctls);
+    assert_eq!(
+        ioctls,
+        vec![(rows, 94)],
+        "exactly one resize ioctl before the flips"
+    );
+
+    // (2) Application alt-toggle pair (the storm): omp repaints → l/h/l in one
+    // PTY batch, three flips recorded at once → two-flip storm signature, ends
+    // on the PRIMARY phase (raw = Content = 91 — the old lock's wrong value).
+    tab.process_pty_output(b"\x1b[?1049l\x1b[?1049h\x1b[?1049l");
+    let during = tab
+        .active_pane_dimensions_for_rect(new_rect, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(
+        during,
+        (rows, 94),
+        "the burst must FREEZE the target at the current grid (94), never the Content 91"
+    );
+    // Exercise the real queue layer (review S1): the helper bypasses
+    // pending_pty_resize, so assert on resize_terminal_and_queue itself —
+    // it must decline because grid == target && nothing is pending.
+    assert!(
+        !tab.active_mut()
+            .resize_terminal_and_queue(during.0, during.1),
+        "desired == current grid → the queue layer declines → zero mid-storm ioctl"
+    );
+    assert!(
+        tab.active_mut().pending_pty_resize.is_none(),
+        "and nothing was queued as a side effect"
+    );
+    assert!(
+        !Pane::should_send_winsize_ioctl(last_sent, during),
+        "the frozen target equals the last-sent ioctl — the ioctl stream stays silent mid-storm"
+    );
+
+    // (3) Quiet — the debounce window expires; converge ONCE to the final
+    // value (the "最终" ioctl).
+    expire_alt_flip_history(&mut tab);
+    let final_dims = tab
+        .active_pane_dimensions_for_rect(new_rect, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(
+        final_dims,
+        (rows, 91),
+        "quiet convergence targets Content at the new width"
+    );
+    apply_measured_target(&mut tab, final_dims, &mut last_sent, &mut ioctls);
+    assert_eq!(
+        ioctls,
+        vec![(rows, 94), (rows, 91)],
+        "exactly two ioctls (first resize + final convergence), no intermediate"
     );
 }
 
@@ -723,12 +892,22 @@ fn single_alt_toggle_converges_to_full_immediately() {
         .unwrap();
     assert_eq!(
         fresh_cols, 80,
-        "an isolated single flip must converge to the live Full target immediately — no Content lock"
+        "an isolated single flip must converge to the live Full target immediately — no freeze"
     );
+    // Commit the grid to the alt Full width (production: ioctl → grid commit)
+    // so the freeze reads current == last_sent.
+    tab.active_mut()
+        .terminal
+        .as_mut()
+        .unwrap()
+        .resize(rows, fresh_cols);
 
     tab.process_pty_output(b"\x1b[?1049l");
-    // The exit flip is now a second flip (a stale two-flip storm signature),
-    // but it ends in the primary phase whose Content target is the constant.
+    // The exit flip is now a second flip — a FRESH two-flip storm signature,
+    // so the target FREEZES at the current grid (the alt Full width just
+    // committed) until the storm goes quiet. Expire it, then the primary
+    // Content target is restored exactly (v1.10.27 freeze semantics).
+    expire_alt_flip_history(&mut tab);
     assert_eq!(
         tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
         Some((rows, content_cols)),

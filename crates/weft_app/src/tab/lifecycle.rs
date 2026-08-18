@@ -54,9 +54,10 @@ impl Tab {
             // v1.10.19: arm the debounce window — take_pending_alt_rescale
             // holds the recompute while toggles repeat inside it so a burst
             // coalesces into one recompute (see tab/resize.rs).
-            // v1.10.26 (D-1/D-2): the flip history (last two instants +
-            // source pane) is driven off the counter diff — the burst-storm
-            // signature for the cols mirror lock (`burst_locked_cols`).
+            // v1.10.26 (D-1/D-2) + v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): the
+            // flip history (last two instants + source pane) is driven off the
+            // counter diff — the burst-storm signature for the cols mirror
+            // freeze (`burst_locked_cols`).
             self.record_alt_flip_instants(alt_flips);
         }
         if was_peeking

@@ -12,42 +12,51 @@ use weft_core::vt::{Terminal, TuiColsKind};
 /// hysteresis below.
 const ALT_RESCALE_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// v1.10.25 Batch 3 (B1) + v1.10.26 Batch D (D-1): effective cols kind under
-/// burst hysteresis.
+/// v1.10.25 Batch 3 (B1) + v1.10.26 Batch D (D-1) + v1.10.27
+/// (FIX_RESIZE_DOUBLE_REDRAW): burst hysteresis — FREEZE, not Content-lock.
 ///
-/// `raw` is the live `Terminal::tui_cols_kind()`. The "storm" signature is
-/// now the **two-flip** record in [`AltFlipHistory`]: two flips from the same
-/// source pane inside the debounce window, the most recent still fresh. While
-/// a DEC 1049 toggle storm is in progress the target is locked to
-/// [`TuiColsKind::Content`] (primary semantics), so the drift check's desired
-/// stays constant no matter which phase the current flip landed on.
+/// The "storm" signature is the **two-flip** record in [`AltFlipHistory`]:
+/// two flips from the same source pane inside the debounce window, the most
+/// recent still fresh. While a DEC 1049 toggle storm is in progress the
+/// effective target is **frozen at the pane's current grid size**
+/// (`terminal.grid()`, the same source the ioctl dedup compares against) —
+/// both rows and cols — so the drift check's desired == current and the PTY
+/// is not touched for the whole burst. Returns `Some((rows, cols))` while
+/// frozen; `None` lets the caller map the live `raw_kind` as usual.
 ///
-/// D-1 fixes the mis-fire the B1 single-fling window caused: a real alt TUI
-/// (vim/less) enters with ONE flip and goes quiet — a lone `count == 1`
-/// record never locks, so the live Full target converges immediately (no
-/// wrong-width flash). The omp repaint feedback loop (~130ms period) keeps
-/// two fresh flips on record and is locked to Content permanently — the
-/// Full↔Content alternation that fed the v1.10.19 SIGWINCH loop can no longer
-/// move the PTY cols. The lock is scoped to `src_pane == target_pane`, so
-/// pane A's storm cannot widen pane B's real vim (`burst_locked_cols`).
-fn cols_kind_with_burst_lock(
-    raw: TuiColsKind,
+/// v1.10.26 D-1 (two-flip signature, Content-lock) fixed the single-fling
+/// mis-fire but left a double redraw on the omp resize loop: the lock pinned
+/// cols to the *Content constant recomputed from the new window size* (91),
+/// which differed from the first size already sent (94) — one extra ioctl
+/// inside the burst (SIGWINCH → omp repaint → re-toggle), then another full
+/// repaint on the quiet convergence back to 94. v1.10.27 freezes at `current`
+/// instead: desired == current → zero ioctl mid-storm → the app repaints
+/// exactly once, on the single post-quiet jump to the final value.
+///
+/// Anti-oscillation invariant: with no storm the target follows the live
+/// kind; the instant a fresh same-pane burst forms, desired == current kills
+/// the drift energy that used to feed the Full↔Content alternation (no
+/// ioctl → no new SIGWINCH → no new flip). After the quiet convergence the
+/// grid holds the final value; if the app returns to toggling, the NEW burst
+/// freezes at that already-converged value — so a storm can never become
+/// self-sustaining, no weaker than the v1.10.26 Content-lock. A lone flip (a
+/// real alt TUI launch, `count == 1`) never forms the signature and
+/// converges to its live kind immediately; a different pane's storm never
+/// freezes this pane.
+fn cols_target_with_burst_freeze(
     now: Instant,
     history: Option<AltFlipHistory>,
     target_pane: weft_core::pane_layout::PaneId,
+    current_dim: (usize, usize),
     debounce: Duration,
-) -> TuiColsKind {
+) -> Option<(usize, usize)> {
     let storm = history.is_some_and(|h| {
         h.count >= 2
             && h.src_pane == target_pane
             && now.saturating_duration_since(h.newer) < debounce
             && h.newer.duration_since(h.older) < debounce
     });
-    if storm {
-        TuiColsKind::Content
-    } else {
-        raw
-    }
+    storm.then_some(current_dim)
 }
 
 impl Tab {
@@ -106,45 +115,61 @@ impl Tab {
         self.resize_output_probe.take().map(|armed| armed.elapsed())
     }
 
-    /// v1.10.19/25/26: PTY cols target for one pane — full width on the alt
-    /// screen (`Terminal::tui_cols_kind` → [Full][TuiColsKind::Full]),
-    /// gutter-subtracted content width otherwise. Sole shared implementation
-    /// for the two mirror sites (`Tab::active_pane_dimensions_for_rect` and
+    /// v1.10.19/25/26/27: PTY (rows, cols) target for one pane — full width
+    /// on the alt screen (`Terminal::tui_cols_kind` → [Full][TuiColsKind::Full]),
+    /// gutter-subtracted content width otherwise, geometry-derived rows. Sole
+    /// shared implementation for the two mirror sites
+    /// (`Tab::active_pane_dimensions_for_rect` and
     /// `Tab::resize_all_panes_for_rect`) so they can never diverge.
     ///
-    /// v1.10.25 Batch 3 (B1) + v1.10.26 (D-1): burst hysteresis is scoped per
-    /// pane. While the [two-flip storm signature](Self::alt_flip_history) is
-    /// fresh and belongs to `pane_id` (the pane being laid out), the kind is
-    /// locked to [Content][TuiColsKind::Content] before it maps to a width. A
-    /// toggle storm (omp repaint: SIGWINCH → redraw → toggle, ~130ms) keeps
-    /// the window fresh, so the drift check's desired stays Content == current
-    /// (the winding grid already holds it) and the Full↔Content alternation
-    /// that reseeded the v1.10.19 loop has no energy. A lone flip (a real alt
-    /// TUI launch) never forms the two-flip signature and converges to Full on
-    /// the first measurement; a different pane's storm never locks this pane.
+    /// v1.10.25 Batch 3 (B1) + v1.10.26 (D-1) + v1.10.27
+    /// (FIX_RESIZE_DOUBLE_REDRAW): burst hysteresis is scoped per pane. While
+    /// the [two-flip storm signature](Self::alt_flip_history) is fresh and
+    /// belongs to `pane_id` (the pane being laid out), the target is FROZEN at
+    /// the pane's current grid size — both rows and cols straight from
+    /// `terminal.grid()`, the same source the ioctl dedup compares against.
+    /// A toggle storm (omp repaint: SIGWINCH → redraw → toggle, ~130ms) keeps
+    /// the window fresh, so desired == current and the drift check queues
+    /// nothing — zero ioctl for the whole burst, the opposite of the v1.10.26
+    /// lock which pinned a *recomputed* Content constant a resize had already
+    /// moved past. The app repaints exactly once, on the single post-quiet
+    /// jump (no "抖动两下"). A lone flip (a real alt TUI launch) never forms
+    /// the two-flip signature and converges to Full on the first measurement;
+    /// a different pane's storm never freezes this pane.
     pub(super) fn burst_locked_cols(
         &self,
         pane_id: weft_core::pane_layout::PaneId,
         pane_width: f32,
+        pane_height: f32,
         cell_w: f32,
-    ) -> usize {
-        let raw = self
+        cell_h: f32,
+    ) -> (usize, usize) {
+        let Some(terminal) = self
             .panes
             .get(&pane_id)
             .and_then(|pane| pane.terminal.as_ref())
-            .map(Terminal::tui_cols_kind)
-            .unwrap_or(TuiColsKind::Content);
-        let kind = cols_kind_with_burst_lock(
-            raw,
+        else {
+            // No live terminal — fall back to the Content-width mapping (prior
+            // behaviour) so a phantom pane still reports a sane target.
+            let cols = crate::layout::terminal_content_cols(pane_width, cell_w);
+            return ((pane_height / cell_h).floor() as usize, cols);
+        };
+        let current = (terminal.grid().num_rows, terminal.grid().num_cols);
+        if let Some(frozen) = cols_target_with_burst_freeze(
             Instant::now(),
             self.alt_flip_history,
             pane_id,
+            current,
             ALT_RESCALE_DEBOUNCE,
-        );
-        match kind {
+        ) {
+            return frozen;
+        }
+        let cols = match terminal.tui_cols_kind() {
             TuiColsKind::Full => crate::layout::terminal_full_cols(pane_width, cell_w),
             TuiColsKind::Content => crate::layout::terminal_content_cols(pane_width, cell_w),
-        }
+        };
+        let rows = (pane_height / cell_h).floor() as usize;
+        (rows, cols)
     }
 
     /// v1.10.26 Batch D (D-1/D-2): record the alt-screen flips detected in
@@ -284,97 +309,107 @@ mod tests {
         assert!(tab.take_pending_alt_rescale());
     }
 
-    // ── v1.10.25 Batch 3 (B1) + v1.10.26 Batch D (D-1): burst hysteresis ──
+    // ── v1.10.25 (B1) + v1.10.26 (D-1) + v1.10.27: burst freeze ──
 
     const LOCK_DEBOUNCE: Duration = Duration::from_millis(150);
     const SRC_PANE: PaneId = PaneId(1);
     const OTHER_PANE: PaneId = PaneId(2);
+    const CURRENT: (usize, usize) = (30, 77);
 
-    /// D-1: an isolated single flip (a real vim/less launch) must NEVER lock
-    /// — the live alt Full kind applies immediately, no Content hold.
+    /// D-1: an isolated single flip (a real vim/less launch) must NEVER freeze
+    /// — the live alt Full kind applies immediately (the caller's raw mapping
+    /// converges, no Content hold).
     #[test]
-    fn lone_single_flip_never_locks_content() {
+    fn lone_single_flip_never_freezes_at_current() {
         let now = Instant::now();
         let fresh = now - Duration::from_millis(5);
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Full,
+            cols_target_with_burst_freeze(
                 now,
                 Some(single_flip(SRC_PANE, fresh)),
                 SRC_PANE,
+                CURRENT,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Full,
-            "a lone fresh flip must converge to the live Full kind"
+            None,
+            "a lone fresh flip must return no freeze — the live kind converges"
         );
         // Same even when the lone flip is stale.
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Full,
+            cols_target_with_burst_freeze(
                 now,
                 Some(single_flip(SRC_PANE, now - Duration::from_millis(500))),
                 SRC_PANE,
+                CURRENT,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Full
+            None
+        );
+        // No history at all (fresh tab) → never freeze.
+        assert_eq!(
+            cols_target_with_burst_freeze(now, None, SRC_PANE, CURRENT, LOCK_DEBOUNCE),
+            None
         );
     }
 
-    /// D-1: two flips from the SAME pane inside the window (the storm
-    /// signature, most recent fresh) lock to Content in either phase.
+    /// D-1 + v1.10.27: two flips from the SAME pane inside the window (the
+    /// storm signature, most recent fresh) FREEZE the target at the pane's
+    /// current grid size — in EITHER phase, rows AND cols together. The
+    /// freeze no longer depends on which phase the flips landed on; it pins
+    /// `current` so desired == current and the ioctl stream is silent.
     #[test]
-    fn double_flip_within_window_locks_content() {
+    fn double_flip_within_window_freezes_at_current_grid() {
         let now = Instant::now();
         let older = now - Duration::from_millis(110);
         let newer = now - Duration::from_millis(30);
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Full,
+            cols_target_with_burst_freeze(
                 now,
                 Some(double_flip(SRC_PANE, older, newer)),
                 SRC_PANE,
+                CURRENT,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Content,
-            "a fresh same-pane double flip must lock Content even on the alt phase"
+            Some(CURRENT),
+            "a fresh same-pane double flip must freeze rows+cols at the current grid"
         );
+        // Rows are frozen too — a vertically-changed window must not drift rows.
+        let current = (40, 100);
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Content,
+            cols_target_with_burst_freeze(
                 now,
                 Some(double_flip(SRC_PANE, older, newer)),
                 SRC_PANE,
+                current,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Content,
-            "primary phase is Content anyway"
+            Some(current),
+            "the freeze carries both rows and cols from the live grid"
         );
     }
 
-    /// D-1: the storm signature expires once the flips go quiet — the live
-    /// kind converges again (the TUI that just stopped toggling ends on its
-    /// real phase). No history → no lock.
+    /// D-1 + v1.10.27: the storm signature expires once the flips go quiet —
+    /// no freeze (the caller converges to the live kind again).
     #[test]
-    fn double_flip_goes_stale_and_unlocks() {
+    fn double_flip_goes_stale_and_unfreezes() {
         let now = Instant::now();
         // Both flips inside the window but long past — a quieted storm.
         let older = now - Duration::from_millis(700);
         let newer = now - Duration::from_millis(600);
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Full,
+            cols_target_with_burst_freeze(
                 now,
                 Some(double_flip(SRC_PANE, older, newer)),
                 SRC_PANE,
+                CURRENT,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Full,
-            "a quieted double flip must converge to the live alt Full target"
+            None,
+            "a quieted double flip must release the freeze — the live target converges"
         );
-        // Also: fresh join but a stale newest flip.
+        // Also: a fresh older flip but a stale newest flip.
         assert_eq!(
-            cols_kind_with_burst_lock(
-                TuiColsKind::Content,
+            cols_target_with_burst_freeze(
                 now,
                 Some(double_flip(
                     SRC_PANE,
@@ -382,21 +417,17 @@ mod tests {
                     now - Duration::from_millis(160)
                 )),
                 SRC_PANE,
+                CURRENT,
                 LOCK_DEBOUNCE,
             ),
-            TuiColsKind::Content
-        );
-        // Never recorded a flip (fresh tab): no lock.
-        assert_eq!(
-            cols_kind_with_burst_lock(TuiColsKind::Full, now, None, SRC_PANE, LOCK_DEBOUNCE),
-            TuiColsKind::Full
+            None
         );
     }
 
-    /// D-1 (v1.10.19 "A 面板风暴误伤 B 面板"): pane A's storm must not lock
-    /// pane B's cols — the signature is scoped to the source pane.
+    /// D-1 (v1.10.19 "A 面板风暴误伤 B 面板"): pane A's storm must not freeze
+    /// pane B's target — the signature is scoped to the source pane.
     #[test]
-    fn cross_pane_storm_does_not_lock_other_pane() {
+    fn cross_pane_storm_does_not_freeze_other_pane() {
         let now = Instant::now();
         let h = double_flip(
             SRC_PANE,
@@ -404,23 +435,27 @@ mod tests {
             now - Duration::from_millis(20),
         );
         assert_eq!(
-            cols_kind_with_burst_lock(TuiColsKind::Full, now, Some(h), OTHER_PANE, LOCK_DEBOUNCE),
-            TuiColsKind::Full,
-            "a storm from pane A must not widen pane B's real vim"
+            cols_target_with_burst_freeze(now, Some(h), OTHER_PANE, CURRENT, LOCK_DEBOUNCE),
+            None,
+            "a storm from pane A must not freeze pane B's target"
         );
-        // The same source pane is locked as expected.
+        // The same source pane is frozen as expected.
         assert_eq!(
-            cols_kind_with_burst_lock(TuiColsKind::Full, now, Some(h), SRC_PANE, LOCK_DEBOUNCE),
-            TuiColsKind::Content
+            cols_target_with_burst_freeze(now, Some(h), SRC_PANE, CURRENT, LOCK_DEBOUNCE),
+            Some(CURRENT)
         );
     }
 
+    /// v1.10.26 D-1 + v1.10.27: a 20-flip storm always pins the CURRENT grid —
+    /// no alternation, no escape to a recomputed constant mid-burst. The old
+    /// lock pinned Content (a value a resize had moved past); the freeze pins
+    /// whatever the grid already holds, so zero drift reaches the ioctl path.
     #[test]
-    fn burst_lock_20_flip_storm_stays_content_with_no_alternation() {
+    fn burst_20_flip_storm_pins_current_grid_with_no_alternation() {
         // A fresh two-flip record every 50ms — each new flip keeps the storm
         // signature (< 150ms interval, newest fresh), so every measurement
-        // must lock Content while the raw phase alternates Full/Content.
-        // Deterministic (synthetic clock, no sleeping).
+        // must freeze at `CURRENT`. Deterministic (synthetic clock, no
+        // sleeping).
         let start = Instant::now();
         for flip in 0..20u32 {
             let now = start + Duration::from_millis(u64::from(flip) * 50);
@@ -429,15 +464,54 @@ mod tests {
                 now - Duration::from_millis(40),
                 now - Duration::from_millis(10),
             );
-            let raw = if flip % 2 == 0 {
-                TuiColsKind::Full
-            } else {
-                TuiColsKind::Content
-            };
             assert_eq!(
-                cols_kind_with_burst_lock(raw, now, Some(h), SRC_PANE, LOCK_DEBOUNCE),
-                TuiColsKind::Content,
-                "flip {flip}: a storm must never let the target alternate"
+                cols_target_with_burst_freeze(now, Some(h), SRC_PANE, CURRENT, LOCK_DEBOUNCE),
+                Some(CURRENT),
+                "flip {flip}: a storm must hold the target at current for the whole burst"
+            );
+        }
+    }
+
+    /// v1.10.27 anti-oscillation: a burst that re-forms AFTER a quiet
+    /// convergence freezes at the CONVERGED value. The first burst pins the
+    /// pre-convergence current; after quiet the grid holds the final value,
+    /// and a returning fresh pair freezes at that already-converged value —
+    /// still zero additional drift, so the storm cannot become self-sustaining.
+    #[test]
+    fn burst_reforming_after_convergence_freezes_at_the_converged_value() {
+        let start = Instant::now();
+        // First burst: pinned at the pre-convergence current for the whole
+        // burst window (~150ms).
+        let first_burst = double_flip(SRC_PANE, start, start);
+        for flip in 0..4u32 {
+            let now = start + Duration::from_millis(u64::from(flip) * 40);
+            assert_eq!(
+                cols_target_with_burst_freeze(
+                    now,
+                    Some(first_burst),
+                    SRC_PANE,
+                    (30, 94),
+                    LOCK_DEBOUNCE
+                ),
+                Some((30, 94)),
+                "first burst pins current"
+            );
+        }
+        // Quiet: the live kind converges — the grid now holds the final size,
+        // say 91. The app then returns to toggling (another fresh pair inside
+        // the window): the new burst freezes at the already-converged 91, so
+        // there is still no further ioctl energy.
+        let second_burst = double_flip(
+            SRC_PANE,
+            start + Duration::from_millis(560),
+            start + Duration::from_millis(590),
+        );
+        for flip in 0..3u32 {
+            let now = start + Duration::from_millis(600 + u64::from(flip) * 40);
+            assert_eq!(
+                cols_target_with_burst_freeze(now, Some(second_burst), SRC_PANE, (30, 91), LOCK_DEBOUNCE),
+                Some((30, 91)),
+                "a returning burst pins the already-converged value — the storm cannot self-sustain"
             );
         }
     }
