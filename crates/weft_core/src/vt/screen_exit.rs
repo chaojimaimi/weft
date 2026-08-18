@@ -42,6 +42,15 @@ pub(in crate::vt) use ownership::PrimaryScreenOwnership;
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
 pub const PRIMARY_HISTORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): minimum *continuous* alternate-
+/// screen residency before `tui_cols_kind()` reports [`TuiColsKind::Full`].
+/// omp 17.3.7 wraps its SIGWINCH repaint in a 1049h → full redraw (~129ms) →
+/// 1049l excursion; a real alt TUI (vim/less) stays resident for seconds.
+/// 250ms ≈ 2x the omp residency and far below any real TUI, so transient
+/// excursions never flip the cols target and the ioctl → SIGWINCH → 1049
+/// feedback loop is broken at the source. See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
+pub(crate) const SUSTAINED_ALT_COLS_MS: u64 = 250;
+
 pub(in crate::vt) struct PendingPrimaryScreenExit {
     pub(in crate::vt) exit_code: Option<i32>,
     pub(in crate::vt) last_activity: Instant,
@@ -86,6 +95,35 @@ pub enum TuiColsKind {
     /// border `|]` never exceeds the renderable area and never folds to a
     /// continuation chunk after settle.
     Content,
+}
+
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): pure decision for the sustained-alt
+/// cols hysteresis feeding [`Terminal::tui_cols_kind`].
+///
+/// Only alt that has been *continuously* resident for at least
+/// [`SUSTAINED_ALT_COLS_MS`] (250ms) reports Full; anything shorter — omp
+/// 17.3.7's ~129ms 1049h→repaint→1049l excursion — stays Content, so a
+/// transient in-and-out can never flip the classification and feed the
+/// SIGWINCH feedback loop. A `None` entry time (unknown start) conservatively
+/// returns Full: the pre-hysteresis mapping, so an unknown state can never
+/// shrink a real alt TUI to content width. See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
+pub(crate) fn sustained_alt_cols_kind(
+    alt_active: bool,
+    alt_active_for: Option<Duration>,
+) -> TuiColsKind {
+    if !alt_active {
+        return TuiColsKind::Content;
+    }
+    match alt_active_for {
+        // Unknown start: conservatively keep the old alt→Full mapping.
+        None => TuiColsKind::Full,
+        // Below the sustained threshold — a transient excursion must not flip.
+        Some(elapsed) if elapsed < Duration::from_millis(SUSTAINED_ALT_COLS_MS) => {
+            TuiColsKind::Content
+        }
+        // Continuous residency at/over the threshold — a real alt TUI.
+        Some(_) => TuiColsKind::Full,
+    }
 }
 
 impl Terminal {
@@ -532,23 +570,37 @@ impl Terminal {
     /// continuation chunk at the settle transition. Content keeps the PTY
     /// target, the grid render width and the block wrap width identical.
     ///
-    /// Each phase maps to one constant target (alt → Full, everything else
-    /// → Content), so transient `?1049h/l` feedback replays the same two
-    /// constants instead of ratcheting into new values. That property alone
-    /// does NOT bound a Full↔Content alternation: the ioctl dedup (pane.rs
-    /// `should_send_winsize_ioctl`) only suppresses a repeat of the last
-    /// size sent, and the 150ms debounce (tab/resize.rs) is bypassed by the
-    /// active tab's per-frame drift check. v1.10.25 Batch 3 (B1) adds the
-    /// missing anti-cycle guard at the app-layer mirror sites — burst
-    /// hysteresis (`Tab::burst_locked_cols`) keeps the target at Content
-    /// while toggle flips stay fresh — so this pure mapping feeds a stable
-    /// desired; see FIX_SCROLL_SHIFT_AND_RESIZE_STORM.md 演进注记.
+    /// Each phase maps to one constant target, so transient `?1049h/l`
+    /// feedback replays the same two constants instead of ratcheting into
+    /// new values.
+    ///
+    /// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): sustained-alt hysteresis —
+    /// alt only maps to Full after [`SUSTAINED_ALT_COLS_MS`] (250ms) of
+    /// *continuous* residency ([`sustained_alt_cols_kind`]); an unknown
+    /// entry time (`None`) conservatively keeps the old Full mapping so an
+    /// unknown state can never shrink a real alt TUI. Reason for the
+    /// threshold: omp 17.3.7 wraps its SIGWINCH repaint in a 1049h → full
+    /// redraw (~129ms) → 1049l excursion, so the old constant alt→Full
+    /// mapping flipped the cols target (91↔94) every round, emitting a new
+    /// ioctl → SIGWINCH → feedback loop (~330ms/circle — continuous flashing
+    /// and side-to-side jitter). Transient in-and-out (<250ms) never flips
+    /// the classification, breaking the loop at the source; a real alt TUI
+    /// (vim/less) stays resident for seconds, crosses the threshold, and
+    /// still gets Full (entry Full-ization delayed ≤250ms + one repaint —
+    /// imperceptible). See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
+    ///
+    /// The mapping still never ratchets into a third value: sustained alt →
+    /// Full, everything else → Content. The ioctl dedup (pane.rs
+    /// `should_send_winsize_ioctl`) and the 150ms debounce (tab/resize.rs)
+    /// plus the v1.10.25 Batch 3 app-layer burst hysteresis
+    /// (`Tab::burst_locked_cols`) remain as defense in depth; see
+    /// FIX_SCROLL_SHIFT_AND_RESIZE_STORM.md 演进注记.
     pub fn tui_cols_kind(&self) -> TuiColsKind {
-        if self.capabilities.alt_active {
-            TuiColsKind::Full
-        } else {
-            TuiColsKind::Content
-        }
+        let alt_active_for = self
+            .capabilities
+            .alt_active_since
+            .map(|since| Instant::now().saturating_duration_since(since));
+        sustained_alt_cols_kind(self.capabilities.alt_active, alt_active_for)
     }
 
     /// v1.10.19: Whether a primary-screen TUI currently owns the live grid

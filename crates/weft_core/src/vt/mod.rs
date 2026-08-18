@@ -14,6 +14,10 @@ pub use capability::{ScreenOwner, SettleState};
 pub use screen_exit::{
     TuiColsKind, PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
 };
+// Test-only re-export: lib code reaches the hysteresis via `tui_cols_kind`,
+// the vt unit tests reach the pure decision + threshold directly.
+#[cfg(test)]
+pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
 use crate::blocks::{BlockTracker, CapturedStyle, ShellPhase};
 use crate::editor::Editor;
@@ -265,6 +269,10 @@ impl Terminal {
             self.alt_grid.cursor = Cursor::default();
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
             self.capabilities.alt_active = true;
+            // v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): stamp the entry instant so
+            // tui_cols_kind() can apply the sustained-alt hysteresis (continuous
+            // residency >= 250ms before reporting Full).
+            self.capabilities.alt_active_since = Some(std::time::Instant::now());
             // OSC 8 state is viewport-relative — entering the alt screen
             // invalidates any cell_map entries from the primary grid.
             self.hyperlinks.clear_cell_map();
@@ -277,6 +285,10 @@ impl Terminal {
                 }
             }
             self.capabilities.alt_active = false;
+            // v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): leaving the alt screen
+            // clears the sustained-residency stamp; the primary screen has no
+            // Full-width entitlement.
+            self.capabilities.alt_active_since = None;
             // v1.10.12: leaving the alt screen ends any in-progress history
             // peek so show_block_view() reverts to the primary-screen rules
             // and the renderer shows the restored primary grid, not a stale

@@ -549,10 +549,12 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
 
     // Contrast: an alt-screen TUI (vim) intentionally diverges from the
     // BlockView — full width, and the grid mirrors its own PTY target.
-    // v1.10.26 Batch D (D-1): an isolated single flip has no storm signature,
-    // so the mirror exposes the live alt Full target on the very first
-    // measurement — no Content hold to wait out.
+    // v1.10.26 Batch D (D-1): an isolated single flip has no storm signature.
+    // v1.10.28: Full requires *sustained* residency (>=250ms) — a real vim
+    // launch stays resident for seconds, so elapse the threshold before
+    // measuring (the acknowledged ≤250ms first Full-ization delay).
     tab.process_pty_output(b"\x1b[?1049h");
+    let_sustained_alt_residency_elapse();
     let (_, alt_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
@@ -586,6 +588,13 @@ fn primary_tui_pty_grid_and_block_widths_are_identical_at_same_geometry() {
 /// pane's current grid size instead (tab/resize.rs `burst_locked_cols`), so
 /// desired == current and the ioctl stream is bounded to the tiny constant
 /// count below.
+///
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): the sustained-alt hysteresis now
+/// breaks the storm at the SOURCE — every transient alt phase (<250ms
+/// residency) reads Content, so the target never leaves the initial Content
+/// constant at all, not even round 0's first "lone" flip (the old immediate-
+/// Full). The app-layer freeze (defense in depth) has nothing left to fight:
+/// the whole 20-round storm emits ZERO winsize ioctls.
 #[test]
 fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
     let mut tab = tab_with_terminal(100);
@@ -598,7 +607,6 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(content_cols, 77);
-    let full_cols = 80;
     tab.active_mut()
         .terminal
         .as_mut()
@@ -619,24 +627,18 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
         assert_eq!(r, rows);
-        // v1.10.26 D-1: round 0's `?1049h` is the FIRST flip of the storm —
-        // an isolated single flip has no burst signature yet, so it exposes
-        // the live alt Full target (one converging ioctl, allowed by the ≤2
-        // bound). From the second flip on, the two-flip signature FREEZES the
-        // target at the current grid (the Full width just committed) for the
-        // rest of the burst — no Full↔Content alternation reaches the ioctl
-        // path, and no escape to the Content constant either.
-        if round == 0 {
-            assert_eq!(
-                cols, full_cols,
-                "round {round}: the storm's first flip is lone — the live alt Full target"
-            );
-        } else {
-            assert_eq!(
-                cols, full_cols,
-                "round {round}: the freeze pins the current grid — never the Content constant"
-            );
-        }
+        // v1.10.28: every transient (sub-250ms) alt phase stays Content —
+        // never Full, so no width transition reaches the ioctl path and the
+        // loop cannot re-arm itself. (The old pre-hysteresis behavior exposed
+        // a live Full target on the first lone flip; that flip now needs
+        // sustained residency, which a storm never accumulates. Premise: the
+        // gap between the 1049h above and this read stays far below 250ms —
+        // swap_alt re-stamps every round, so inter-round scheduling delays
+        // cannot age the residency.)
+        assert_eq!(
+            cols, content_cols,
+            "round {round}: a transient alt phase never leaves Content"
+        );
         if Pane::should_send_winsize_ioctl(last_sent, (rows, cols)) {
             last_sent = Some((rows, cols));
             emitted_ioctls += 1;
@@ -652,8 +654,8 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
         assert_eq!(
-            primary_cols, full_cols,
-            "round {round}: the fresh storm pins the current grid on the primary phase too"
+            primary_cols, content_cols,
+            "round {round}: the primary phase holds the Content constant"
         );
         if Pane::should_send_winsize_ioctl(last_sent, (rows, primary_cols)) {
             last_sent = Some((rows, primary_cols));
@@ -666,19 +668,13 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
         }
     }
 
-    // Explicit-burst upper bound: a 20-round storm may emit at most a tiny
-    // constant. With the freeze every measured target is the already-sent
-    // current grid, so in practice the lone first-flip convergence = 1; ≤2
-    // tolerates one extra final drift without ever resembling the v1.10.19
-    // 99↔102 storm (which emitted once per flip).
-    assert!(
-        emitted_ioctls <= 2,
-        "a 20-round toggle storm must emit ≤ 2 winsize ioctls, got {emitted_ioctls}"
+    // With the loop broken at the source the storm emits nothing (0 ioctls);
+    // assert the exact count — no width change ever reaches the ioctl path.
+    assert_eq!(
+        emitted_ioctls, 0,
+        "a 20-round transient toggle storm must emit ZERO winsize ioctls"
     );
     // The pane ends on the primary Content constant — the pre-burst value.
-    // The last flip is still fresh (the middle of a live storm), so the
-    // freeze holds; expire the storm, then it converges to the pre-burst
-    // content target.
     expire_alt_flip_history(&mut tab);
     assert_eq!(
         tab.active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H),
@@ -698,6 +694,18 @@ fn expire_alt_flip_history(tab: &mut Tab) {
         newer: stale,
         count: 2,
     });
+}
+
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): let a real alt TUI's CONTINUOUS
+/// residency cross the 250ms sustained-alt cols hysteresis threshold
+/// (`Terminal::tui_cols_kind` only reports Full once alt has been resident
+/// for `SUSTAINED_ALT_COLS_MS`; see docs/FIX_TRANSIENT_ALT_COLS_FLIP.md).
+/// A 251ms wall-clock wait is deterministic: `tui_cols_kind` reads elapsed
+/// via `Instant::saturating_duration_since`, so crossing the threshold can
+/// only grow under load. Same wall-clock style as the debounce wait in the
+/// `resize.rs` burst-freeze tests.
+fn let_sustained_alt_residency_elapse() {
+    std::thread::sleep(std::time::Duration::from_millis(251));
 }
 
 /// v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): Simulate the resize path exactly as
@@ -741,8 +749,11 @@ fn resize_followed_by_toggle_pair_emits_exactly_two_ioctls_no_intermediate() {
     let mut tab = tab_with_terminal(100);
     let src = tab.active_pane;
 
-    // Setup: an alt-screen TUI at the OLD geometry, converged.
+    // Setup: an alt-screen TUI at the OLD geometry, converged. v1.10.28: a
+    // real alt TUI is *sustained* — elapse the 250ms cols hysteresis so the
+    // setup reads the live Full target at the old width.
     tab.process_pty_output(b"\x1b[?1049h");
+    let_sustained_alt_residency_elapse();
     let old_rect: weft_core::pane_layout::Rect = [0.0, 0.0, 800.0, 600.0];
     let (rows, old_full_cols) = tab
         .active_pane_dimensions_for_rect(old_rect, TUI_CELL_W, TUI_CELL_H)
@@ -869,10 +880,15 @@ fn batch_internal_h_l_pair_counts_two_flips_and_refreshes_history() {
 /// v1.10.26 Batch D (D-1): a SINGLE alt toggle (a real TUI launch) must NOT
 /// arm the burst Content lock — the burst signature needs TWO flips from the
 /// same pane inside the debounce window. An isolated single flip exposes the
-/// live alt Full target immediately (one width transition, no Content hold,
-/// no oscillation).
+/// live alt Full target with no Content-hold freeze and no oscillation.
+///
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): "live Full" now requires
+/// *sustained* residency (>=250ms), so a lone flip converges once the real
+/// TUI has been resident past the threshold — the fix document's acknowledged
+/// ≤250ms + one-repaint first Full-ization delay for vim/less, imperceptible
+/// to the user.
 #[test]
-fn single_alt_toggle_converges_to_full_immediately() {
+fn single_alt_toggle_converges_to_full_once_resident() {
     let mut tab = tab_with_terminal(100);
     drive_primary_tui(&mut tab);
 
@@ -881,18 +897,19 @@ fn single_alt_toggle_converges_to_full_immediately() {
         .unwrap();
     assert_eq!(content_cols, 77);
 
-    // Single flip: no second flip → no storm — the live alt kind (Full)
-    // applies on the very first measurement. Pre-Batch-D this mis-fired:
-    // any fresh flip held the 150ms Content lock, flashing the wrong width
-    // on a real vim/less launch.
+    // Single flip: no second flip → no storm — the live alt kind applies once
+    // residency crosses the sustained-alt hysteresis threshold. Pre-Batch-D
+    // this mis-fired: any fresh flip held the 150ms Content lock, flashing
+    // the wrong width on a real vim/less launch.
     tab.process_pty_output(b"\x1b[?1049h");
     assert!(tab.terminal.as_ref().unwrap().is_alt_screen_active());
+    let_sustained_alt_residency_elapse();
     let (_, fresh_cols) = tab
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(
         fresh_cols, 80,
-        "an isolated single flip must converge to the live Full target immediately — no freeze"
+        "an isolated single flip converges to Full once sustained residency is established — no Content freeze"
     );
     // Commit the grid to the alt Full width (production: ioctl → grid commit)
     // so the freeze reads current == last_sent.

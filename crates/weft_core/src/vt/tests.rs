@@ -1,6 +1,6 @@
 use super::*;
 use crate::blocks::ShellPhase;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn term() -> Terminal {
     Terminal::new(24, 80)
@@ -144,8 +144,7 @@ fn alt_screen_exit_clears_history_peek() {
 /// DEC 1049 toggles. The old is_alt-only selection produced 102↔99 col
 /// flapping (alt uses full width, primary uses gutter-subtracted width);
 /// every flip queued a TIOCSWINSZ → SIGWINCH → redraw → flip, the ~130ms
-/// resize oscillation. `tui_cols_kind` is a constant function of the alt
-/// flag: alt maps to Full, everything else to Content.
+/// resize oscillation.
 ///
 /// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): the primary-phase value
 /// is Content, not Full. omp draws its UI exactly at the PTY cols it receives,
@@ -156,6 +155,11 @@ fn alt_screen_exit_clears_history_peek() {
 /// Full↔Content *alternation*; the anti-cycle guard is the app-layer burst
 /// hysteresis, `Tab::burst_locked_cols` — see FIX_SCROLL_SHIFT_AND_
 /// RESIZE_STORM.md 演进注记.)
+///
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): the alt phase is now gated by the
+/// sustained-alt hysteresis — only alt *continuously* resident for
+/// `SUSTAINED_ALT_COLS_MS` reports Full, so a transient 1049h/l excursion
+/// (omp's ~129ms SIGWINCH repaint) stays Content and cannot feed the loop.
 #[test]
 fn primary_tui_content_cols_are_stable_across_transient_alt_toggles() {
     let mut t = term();
@@ -168,23 +172,28 @@ fn primary_tui_content_cols_are_stable_across_transient_alt_toggles() {
         "a screen-owning primary TUI uses content width"
     );
 
-    // Transient alt phase of the same TUI — the resize-loop feedback.
+    // A genuinely transient alt phase of the same TUI — the resize-loop
+    // feedback shape. Under the sustained-alt hysteresis this must NOT flip
+    // to Full: the loop is broken at the source
+    // (docs/FIX_TRANSIENT_ALT_COLS_FLIP.md).
     t.process(b"\x1b[?1049h");
     assert_eq!(
         t.tui_cols_kind(),
-        TuiColsKind::Full,
-        "alt phase is edge-to-edge full width"
+        TuiColsKind::Content,
+        "a transient (sub-250ms) alt phase stays at content width"
     );
     t.process(b"\x1b[?1049l");
     assert_eq!(
         t.tui_cols_kind(),
         TuiColsKind::Content,
-        "primary phase after a transient alt exit returns to content width"
+        "primary phase after a transient alt exit stays at content width"
     );
 
-    // A plain alt-screen TUI (vim) is full width while active; primary width
-    // is content after it exits.
+    // A plain, *sustained* alt-screen TUI (vim) is full width while active —
+    // once it has stayed resident past the 250ms threshold; primary width is
+    // content after it exits.
     t.process(b"\x1b[?1049h");
+    t.capabilities.alt_active_since = sustained_residency_stamp();
     assert_eq!(t.tui_cols_kind(), TuiColsKind::Full);
     t.process(b"\x1b[?1049l");
     assert_eq!(t.tui_cols_kind(), TuiColsKind::Content);
@@ -209,14 +218,18 @@ fn primary_tui_content_cols_are_stable_across_transient_alt_toggles() {
 }
 
 /// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): the cols mapping is a
-/// PURE function of the alt flag — each phase maps to one CONSTANT target
-/// (`Full` for alt, `Content` for primary), so N toggles replay the same
-/// pair and the primary target never drifts into a third value. This test
-/// locks ONLY that pure mapping; the mapping alone does NOT prevent a
-/// Full↔Content alternation from feeding the SIGWINCH feedback loop — the
-/// v1.10.25 Batch 3 app-layer burst hysteresis (tab/resize.rs
-/// `Tab::burst_locked_cols`, ioctl-count-bounded storm regression in
-/// tab/tests.rs) is the anti-cycle guard.
+/// PURE function of the alt flag — each phase maps to one CONSTANT target,
+/// so N toggles replay the same pair and the primary target never drifts
+/// into a third value. This test locks ONLY that pure mapping; the mapping
+/// alone does NOT prevent a Full↔Content alternation from feeding the
+/// SIGWINCH feedback loop — the v1.10.25 Batch 3 app-layer burst hysteresis
+/// (tab/resize.rs `Tab::burst_locked_cols`, ioctl-count-bounded storm
+/// regression in tab/tests.rs) is the anti-cycle guard.
+///
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): "alt maps to Full" now means
+/// *sustained* alt — residency past `SUSTAINED_ALT_COLS_MS`. Each toggle's
+/// alt half is faked to sustained residency so the pair stays the two
+/// constants Full/Content and no third value can ratchet in.
 #[test]
 fn repeated_transient_1049_toggles_keep_the_tui_cols_target_constant() {
     let mut t = term();
@@ -230,10 +243,15 @@ fn repeated_transient_1049_toggles_keep_the_tui_cols_target_constant() {
     // drives ~130ms-period bursts in the field.
     for flip in 0..50u32 {
         t.process(b"\x1b[?1049h");
+        // Faking sustained residency (past the 250ms hysteresis) locks in
+        // the Full constant for this half of the pair; a real transient
+        // excursion never crosses the threshold — that is exactly what the
+        // hysteresis guarantees.
+        t.capabilities.alt_active_since = sustained_residency_stamp();
         assert_eq!(
             t.tui_cols_kind(),
             TuiColsKind::Full,
-            "alt phase always Full (flip {flip})"
+            "sustained alt phase always Full (flip {flip})"
         );
         t.process(b"\x1b[?1049l");
         assert_eq!(
@@ -245,6 +263,77 @@ fn repeated_transient_1049_toggles_keep_the_tui_cols_target_constant() {
     // The burst leaves no residue: the settled target equals the pre-burst
     // value, so a pane already at that size emits no further winsize ioctl.
     assert_eq!(t.tui_cols_kind(), primary_target);
+}
+
+/// A residency stamp comfortably past the 250ms hysteresis threshold.
+/// `checked_sub` because `Instant - Duration` panics on underflow; the
+/// monotonic clock epoch is boot time, so a test process can never run
+/// within 300ms of it — the expect documents that impossibility.
+fn sustained_residency_stamp() -> Option<Instant> {
+    Instant::now().checked_sub(Duration::from_millis(SUSTAINED_ALT_COLS_MS + 50))
+}
+
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): omp 17.3.7 wraps its SIGWINCH
+/// repaint in 1049h → full redraw (~129ms) → 1049l. The old constant
+/// alt→Full mapping flipped the cols target (91↔94) each round, emitting a
+/// new ioctl → SIGWINCH → feedback loop (~330ms/circle). With the
+/// sustained-alt hysteresis, an in-and-out excursion (<250ms residency)
+/// keeps the target at Content the whole way — no Full, so no new SIGWINCH
+/// and the loop is broken at the source.
+#[test]
+fn transient_alt_excursion_does_not_flip_cols_kind() {
+    let mut t = term();
+    // Enter alt, do NOT wait past the threshold — the omp excursion shape.
+    t.process(b"\x1b[?1049h");
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Content,
+        "a transient alt entry must not flip cols to Full"
+    );
+    // A real sustained alt TUI (vim): fake 300ms residency → Full.
+    t.capabilities.alt_active_since = sustained_residency_stamp();
+    assert_eq!(t.tui_cols_kind(), TuiColsKind::Full);
+    // Leaving alt restores Content (and clears the residency stamp).
+    t.process(b"\x1b[?1049l");
+    assert_eq!(t.tui_cols_kind(), TuiColsKind::Content);
+}
+
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): the pure decision backing
+/// `tui_cols_kind` — alt continuously resident at/over `SUSTAINED_ALT_COLS_MS`
+/// is Full, transient (<250ms) is Content, and an unknown entry time (None)
+/// conservatively keeps the old Full mapping.
+#[test]
+fn sustained_alt_cols_kind_pure_decision() {
+    // Not alt: always Content.
+    assert_eq!(sustained_alt_cols_kind(false, None), TuiColsKind::Content);
+    assert_eq!(
+        sustained_alt_cols_kind(false, Some(Duration::from_secs(10))),
+        TuiColsKind::Content
+    );
+    // Alt resident for 0/100/249ms — transient, stays Content.
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(0))),
+        TuiColsKind::Content
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(100))),
+        TuiColsKind::Content
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS - 1))),
+        TuiColsKind::Content
+    );
+    // At/over the threshold — Full.
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS))),
+        TuiColsKind::Full
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_secs(2))),
+        TuiColsKind::Full
+    );
+    // Unknown entrance time — conservative old-behavior Full.
+    assert_eq!(sustained_alt_cols_kind(true, None), TuiColsKind::Full);
 }
 
 #[test]

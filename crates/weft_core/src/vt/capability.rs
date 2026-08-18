@@ -50,6 +50,16 @@ pub(in crate::vt) struct ScreenHistory {
 /// one storage location.
 pub(in crate::vt) struct CapabilityFlags {
     pub(in crate::vt) alt_active: bool,
+    /// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): `Instant` of the most recent
+    /// alternate-screen entry (set in `Terminal::swap_alt`). Drives the
+    /// sustained-alt cols hysteresis: `tui_cols_kind()` only returns
+    /// [`TuiColsKind::Full`] after alt has been *continuously* resident for
+    /// `SUSTAINED_ALT_COLS_MS`, so omp 17.3.7's ~129ms 1049h→repaint→1049l
+    /// SIGWINCH excursions never flip the cols target (breaks the ioctl →
+    /// SIGWINCH → 1049 toggle feedback loop; see
+    /// docs/FIX_TRANSIENT_ALT_COLS_FLIP.md). `None` while the primary screen
+    /// is active; cleared on alt exit.
+    pub(in crate::vt) alt_active_since: Option<Instant>,
     pub(in crate::vt) mouse_protocol: MouseProtocol,
     /// SGR-1006 selects the SGR vs legacy mouse-report encoding.
     pub(in crate::vt) sgr_mouse: bool,
@@ -152,6 +162,7 @@ impl Default for CapabilityFlags {
     fn default() -> Self {
         Self {
             alt_active: false,
+            alt_active_since: None,
             mouse_protocol: MouseProtocol::Off,
             sgr_mouse: false,
             app_cursor_keys: false,
@@ -427,6 +438,7 @@ mod tests {
     fn default_has_no_live_state() {
         let f = flags();
         assert!(!f.alt_active);
+        assert!(f.alt_active_since.is_none());
         assert_eq!(f.mouse_protocol, MouseProtocol::Off);
         assert!(!f.sgr_mouse);
         assert!(!f.app_cursor_keys);
