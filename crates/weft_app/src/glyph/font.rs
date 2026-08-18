@@ -64,10 +64,12 @@ pub(super) fn rasterize_emoji_rgba(
     use core_graphics::context::CGContext;
     use core_text::font::CTFont;
 
-    // font-kit loads CoreText fonts at a nominal 16pt. Unlike its own
-    // rasterizer, CTFontDrawGlyphs does not take a separate size, so drawing
-    // the native font directly made every color emoji stay near 16px even
-    // after terminal zoom. Clone it at the atlas's physical pixel size.
+    // The loader constructs CoreText fonts at a nominal size (16pt via
+    // from_handle, 12pt via the vendored from_path — CoreText's default for
+    // size 0). Unlike its own rasterizer, CTFontDrawGlyphs does not take a
+    // separate size, so drawing the native font directly made every color
+    // emoji stay near the nominal size even after terminal zoom. Clone it at
+    // the atlas's physical pixel size.
     let ct_font: CTFont = font.native_font().clone_with_font_size(scaled_size as f64);
 
     // Map character → CGGlyph via UTF-16 (astral-plane chars need surrogate pair).
