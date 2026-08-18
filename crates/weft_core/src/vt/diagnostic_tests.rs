@@ -731,3 +731,59 @@ fn caret_keeps_matching_stale_live_rows_when_prefix_grows_between_publishes() {
         lines[caret_line]
     );
 }
+
+/// v1.10.26 post-release forensics (omp preedit still invisible): the
+/// caret snapshot line is only ever SET, never cleared. When a screen-owned
+/// session SETTLES and the next command streams in block view WITHOUT screen
+/// ownership, `block_view_tui_cursor` (renderer.rs) prefers the stale
+/// tracked line over the formula — the anchor then points past the new live
+/// block and `tui_caret_row_matches` never fires, so the caret + IME preedit
+/// vanish together even though the Batch C anchor math is correct.
+#[test]
+fn caret_snapshot_line_must_not_leak_across_settled_command_boundary() {
+    let mut terminal = Terminal::new(24, 200);
+    activate_primary_screen_tui(&mut terminal);
+    stream_lines(&mut terminal, 1, 100, line_a);
+    terminal.process("\x1b[13;1H".as_bytes());
+    assert!(terminal.refresh_primary_history_snapshot_now());
+    let stale = terminal
+        .primary_screen_cursor_snapshot_line()
+        .expect("screen-owned snapshot tracked a caret line");
+    assert!(
+        stale > 0,
+        "setup: the settled session must leave a non-trivial line"
+    );
+
+    // The session settles (log: "settled primary-screen command finalization").
+    terminal.process(b"\x1b]133;D;0\x07");
+    assert!(terminal.settle_primary_screen_exit());
+    assert!(
+        terminal.block_tracker().in_flight().is_none(),
+        "setup: settle must finalize the in-flight block"
+    );
+
+    // A NEW command streams WITHOUT screen ownership (plain output; no CUP
+    // ops) — the omp input-box window in block view.
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07next\x1b]133;C\x07");
+    terminal.process(b"hello\r\nworld\r\n");
+    assert!(terminal.block_tracker().in_flight().is_some());
+    assert!(!terminal.primary_screen_app_active());
+    assert!(terminal.show_block_view());
+
+    // Every keystroke refreshes the caret anchor (the app calls this in
+    // tab.rs for block view). For a NON-screen-owned command it must not
+    // keep the settled session's line — the renderer prefers the tracked
+    // value over the formula, so a stale anchor never matches the new live
+    // rows and the preedit is never painted.
+    terminal.snapshot_primary_screen_output_for_caret();
+
+    let line = terminal.primary_screen_cursor_snapshot_line();
+    let live = terminal.block_tracker().in_flight().expect("live block");
+    let line_count = live.output.lines().count();
+    assert!(
+        line.is_none_or(|l| l < line_count),
+        "caret snapshot line {line:?} leaked from the settled session into the new block \
+         ({} lines): tui_caret_row_matches can never fire, caret + preedit invisible",
+        line_count
+    );
+}

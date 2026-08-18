@@ -20,6 +20,10 @@ mod surfaces;
 
 pub(crate) use actions::block_header_action_rects;
 pub(crate) use rows::sticky_block_id;
+
+#[cfg(test)]
+#[path = "block_view/b_path_tests.rs"]
+mod b_path_tests;
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
         &self,
@@ -980,7 +984,12 @@ impl MetalRenderer {
         }
 
         // v1.10.26 (FIX_IME_PREEDIT): B-path diagnostic — emitted once per
-        // frame while a BlockView-mode TUI preedit is active. Debug-only.
+        // frame while a BlockView-mode TUI preedit is active. The NORMAL
+        // drawn path ("B") stays debug to avoid hot-path noise; the abnormal
+        // "active but not painted" paths are promoted to info so a recurrence
+        // under the default log level leaves evidence without users needing
+        // `RUST_LOG=weft_app=debug`. "empty-text" is a macOS-internal marked-
+        // text lifecycle event, not a bug — keep it quiet.
         if let Some((preedit, _)) = tui_preedit {
             let empty = preedit.is_empty();
             let path = if empty {
@@ -992,18 +1001,34 @@ impl MetalRenderer {
             } else {
                 "B"
             };
-            tracing::debug!(
-                show_block_view = true,
-                is_alt,
-                cursor_col = tui_cursor.map(|c| c.1),
-                preedit_len = preedit.chars().count(),
-                expected_cursor_line = tui_cursor.map(|c| c.0),
-                first_live_line,
-                last_live_line,
-                caret_painted,
-                path,
-                "PREEDIT_DIAG"
-            );
+            let abnormal = !empty && (tui_cursor.is_none() || !caret_painted);
+            if abnormal {
+                tracing::info!(
+                    show_block_view = true,
+                    is_alt,
+                    cursor_col = tui_cursor.map(|c| c.1),
+                    preedit_len = preedit.chars().count(),
+                    expected_cursor_line = tui_cursor.map(|c| c.0),
+                    first_live_line,
+                    last_live_line,
+                    caret_painted,
+                    path,
+                    "PREEDIT_DIAG"
+                );
+            } else {
+                tracing::debug!(
+                    show_block_view = true,
+                    is_alt,
+                    cursor_col = tui_cursor.map(|c| c.1),
+                    preedit_len = preedit.chars().count(),
+                    expected_cursor_line = tui_cursor.map(|c| c.0),
+                    first_live_line,
+                    last_live_line,
+                    caret_painted,
+                    path,
+                    "PREEDIT_DIAG"
+                );
+            }
         }
 
         let sticky_block = rows::sticky_block_id(&bv_rows, clip_top, clip_bottom);

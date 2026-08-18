@@ -156,6 +156,31 @@ impl MetalRenderer {
             path = "A",
             "PREEDIT_DIAG"
         );
+        let rows = tui_preedit_rows(
+            params.text,
+            grid.cursor.row,
+            grid.cursor.col,
+            grid.num_rows,
+            grid.num_cols,
+        );
+        // v1.10.26 post-release: promote the "preedit active but nothing
+        // painted" A-path case to info. Today rows can only be empty when
+        // `start_row >= rows`/degenerate geometry — the marked text then
+        // vanishes silently at the default log level. Keeping the normal
+        // drawn path at debug avoids hot-path noise.
+        if !params.text.is_empty() && rows.is_empty() {
+            tracing::info!(
+                show_block_view = false,
+                is_alt,
+                cursor_row = grid.cursor.row,
+                cursor_col = grid.cursor.col,
+                preedit_len = params.text.chars().count(),
+                grid_rows = grid.num_rows,
+                grid_cols = grid.num_cols,
+                path = "A-no-rows",
+                "PREEDIT_DIAG"
+            );
+        }
         self.build_tui_preedit_vertices(
             params,
             (grid.cursor.row, grid.cursor.col),
