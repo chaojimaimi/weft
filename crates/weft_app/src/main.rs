@@ -13,6 +13,7 @@ mod accessibility_model;
 mod ai;
 // v1.8.2: Block diagnose controller — bridges block view ↔ AiState::spawn_diagnose.
 mod ai_block_controller;
+mod alloc_probe;
 // v1.10.21: alt-screen wheel routing + peek entry gate (pure logic).
 mod alt_peek;
 // v1.10.21: alt-screen wheel dispatch (route() wiring; controller stays lean).
@@ -85,6 +86,9 @@ mod transfer_controller;
 mod ui_tokens;
 mod window_event_controller;
 mod workspace_controller;
+// Allocation forensics gate — see `alloc_probe` for env vars / threshold.
+#[global_allocator]
+static GLOBAL_ALLOC: alloc_probe::ProbeAllocator = alloc_probe::ProbeAllocator;
 use app_state::{
     ConfigState, ContextMenu, DragState, DragTarget, FindState, InteractionState, NoteEditorState,
     PanelState, SessionManager, SettingsState, TabBarState, WindowRuntimeState,
