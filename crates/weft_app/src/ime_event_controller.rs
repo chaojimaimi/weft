@@ -48,6 +48,18 @@ impl App {
             input_mode,
             active_tab,
         };
+        if let event_replay::ImeInput::Preedit { text, .. } = &input {
+            // v1.10.26 probe: preedit events reaching the router (winit
+            // delivered them) with the routing inputs. Info-level: fires
+            // only while composing, and the ongoing symptom needs default-
+            // level evidence.
+            tracing::debug!(
+                len = text.chars().count(),
+                ?context.owner,
+                ?context.input_mode,
+                "IME_PREEDIT_ROUTE"
+            );
+        }
         for action in event_replay::route_ime_input(input, context) {
             match action {
                 event_replay::ImeRoutingAction::ClearActivePreedit => {
@@ -89,12 +101,23 @@ impl App {
                         tab.ime_preedit = text;
                         tab.ime_preedit_cursor = cursor;
                     }
+                    // v1.10.26 root cause of the omp pinyin regression: the
+                    // preedit string was updated but no redraw was scheduled,
+                    // so nothing ever painted it. Grid-mode TUIs used to get
+                    // away with this via the spinner's 80ms wake; v1.10.23
+                    // gated that wake to the block view, leaving composition
+                    // updates without a frame. IME events are low-frequency
+                    // (only while composing), so an explicit request is cheap.
+                    self.request_redraw();
                 }
                 event_replay::ImeRoutingAction::ClearAllPreedit => {
                     event_replay::clear_all_preedit(self.sessions.tabs_mut());
                     // v1.8.4: also clear palette preedit on full reset.
                     self.palette.ime_preedit.clear();
                     self.palette.ime_preedit_cursor = None;
+                    // Same contract as SetActivePreedit: a cleared preedit
+                    // must leave the screen, which needs a frame.
+                    self.request_redraw();
                 }
                 event_replay::ImeRoutingAction::Commit { target, text } => {
                     tracing::debug!(

@@ -603,6 +603,20 @@ pub fn build_overlay_stack<'a>(
     // marked text to Weft until the IME commits it. Paint that marked text at
     // the TUI cursor so applications such as OpenCode, vim and less get the
     // same inline composition feedback as the native editor.
+    let tui_preedit_mode = terminal.effective_input_mode();
+    if !ime_preedit.is_empty()
+        && !should_show_tui_preedit(tui_preedit_mode, ime_preedit, terminal_owns_ime)
+    {
+        // v1.10.26 probe: composing text exists but the TUI preedit overlay
+        // gate rejected it — the only silent failure left between the
+        // router and the renderer. Info: fires only while composing.
+        tracing::info!(
+            ?tui_preedit_mode,
+            terminal_owns_ime,
+            len = ime_preedit.chars().count(),
+            "IME_PREEDIT_GATE_REJECT"
+        );
+    }
     if should_show_tui_preedit(
         terminal.effective_input_mode(),
         ime_preedit,
