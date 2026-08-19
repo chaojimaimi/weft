@@ -2,11 +2,59 @@
 //! 旧公式 `0.35×accent + 0.65×bg`（α=0.6）实测 11 主题对比率 1.27–1.75，
 //! 均不足 WCAG 非文本 3:1。收口：base = `theme.selection`（死配置接线），
 //! 缺失回退旧公式；painted（α 合成到主题背景）不足 3:1 时沿亮度方向二分推至达标。
+//! P3b：结果按主题颜色指纹缓存（paint 每帧调用，内部二分对同一主题是纯重复）。
+
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 
 use weft_core::config::Theme;
 use weft_core::grid::Color;
 
 use super::primitives::{color_to_normalized, composite_color_over, text_contrast_ratio};
+
+/// 缓存条目：key 覆盖 `selection_colors_from` 的全部主题输入（见 `cache_key`）。
+struct CacheEntry {
+    key: [u8; 16],
+    value: SelectionColors,
+}
+
+// 单条目缓存（容量 1：paint 路径每帧只有一个主题，换主题时重算一次即可）。
+// 渲染只在主线程（winit 事件循环）运行，thread_local 无并发访问。
+thread_local! {
+    static SELECTION_COLORS_CACHE: RefCell<Option<CacheEntry>> = const { RefCell::new(None) };
+}
+
+/// 决定输出的全部主题输入的轻量字节指纹（4 色 × 4 通道）：
+/// selection（base）、background（raw bg）、foreground（经 stripe_blended_bg
+/// 派生第二条底色）、accent（None 回退分支）。任一遗漏都会在换主题后
+/// 返回陈旧颜色——这是本缓存唯一的功能风险点。
+fn cache_key(theme: &Theme) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    let mut offset = 0;
+    for color in [
+        theme.selection,
+        theme.background,
+        theme.foreground,
+        theme.accent,
+    ] {
+        key[offset..offset + 4].copy_from_slice(&[color.r, color.g, color.b, color.a]);
+        offset += 4;
+    }
+    key
+}
+
+// 测试探针：缓存重算计数（命中不增）——证明缓存生效的观测点。
+// 仅 cfg(test) 编译，生产构建零开销。
+#[cfg(test)]
+thread_local! {
+    static RECOMPUTE_COUNT: Cell<u32> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn recompute_count() -> u32 {
+    RECOMPUTE_COUNT.with(|c| c.get())
+}
 
 /// WCAG 非文本（G207）门槛，不新增用户设置（对比保障是配色正确性的一部分，
 /// 门槛常量写法同 `ui_tokens.rs` 面板选区）。
@@ -16,6 +64,7 @@ const SELECTION_QUAD_ALPHA: f32 = 0.60;
 
 /// 选区 quad 色（含 alpha）+ 文字对比用的 CPU 合成底色（painted 是 quad
 /// 合成到主题背景后的实画色，GPU 实画与 CPU 文字对比基准一致）。
+#[derive(Clone, Copy)]
 pub(crate) struct SelectionColors {
     pub quad: [f32; 4],
     pub painted: [f32; 4],
@@ -25,7 +74,22 @@ pub(crate) struct SelectionColors {
 /// 缺键时继承基础主题，此处仅兜底）。painted 对 theme.background 对比率
 /// < 3.0 时沿亮度方向（bg 亮→向黑、bg 暗→向白）二分推至 ≥3.0。
 pub(crate) fn selection_colors(theme: &Theme) -> SelectionColors {
-    selection_colors_from(Some(theme.selection), theme)
+    let key = cache_key(theme);
+    SELECTION_COLORS_CACHE.with(|cache| {
+        if let Some(entry) = cache.borrow().as_ref() {
+            if entry.key == key {
+                return entry.value;
+            }
+        }
+        // Compute outside the borrow: a future re-entrant call from inside
+        // selection_colors_from would degrade to a recompute instead of
+        // panicking on BorrowMutError (not reachable today — pure fn).
+        let value = selection_colors_from(Some(theme.selection), theme);
+        #[cfg(test)]
+        RECOMPUTE_COUNT.with(|c| c.set(c.get() + 1));
+        *cache.borrow_mut() = Some(CacheEntry { key, value });
+        value
+    })
 }
 
 /// 旧公式 fallback 基色：0.35×accent + 0.65×bg。
@@ -266,6 +330,64 @@ mod tests {
                 assert!((actual - baseline).abs() < 1e-5, "{name} quad≠painted");
             }
         }
+    }
+
+    // P3b 缓存行为：同主题重复调用必须命中（不重算）；key 任一颜色
+    // （selection/background/foreground/accent）变更必须触发重算。
+    #[test]
+    fn cache_hits_on_same_theme_and_recomputes_on_any_key_color_change() {
+        // Delta assertions (before/after counts), not absolute values: the
+        // thread_local counter is per-thread and other tests on this thread
+        // may have recomputed already — only the delta is this test's own.
+        let theme = Theme::solarized_dark();
+        let before = recompute_count();
+        let first = selection_colors(&theme);
+        assert_eq!(recompute_count() - before, 1, "first call must recompute");
+        let second = selection_colors(&theme);
+        assert_eq!(
+            recompute_count() - before,
+            1,
+            "same theme must hit cache, no recompute"
+        );
+        assert_eq!(first.quad, second.quad);
+        assert_eq!(first.painted, second.painted);
+
+        let mut bg_changed = theme.clone();
+        bg_changed.background = Color::rgb(0x00, 0x00, 0x00);
+        let after_bg = selection_colors(&bg_changed);
+        assert_eq!(
+            recompute_count() - before,
+            2,
+            "background change must recompute"
+        );
+        assert_ne!(
+            after_bg.painted, second.painted,
+            "painted composites over raw bg"
+        );
+
+        let mut fg_changed = theme.clone();
+        fg_changed.foreground = Color::rgb(0xff, 0x00, 0x00);
+        let _ = selection_colors(&fg_changed);
+        assert_eq!(
+            recompute_count() - before,
+            3,
+            "foreground (stripe derivation) must recompute"
+        );
+
+        let mut accent_changed = theme.clone();
+        accent_changed.accent = Color::rgb(0xff, 0x00, 0x00);
+        let _ = selection_colors(&accent_changed);
+        assert_eq!(recompute_count() - before, 4, "accent must recompute");
+
+        let mut selection_changed = theme.clone();
+        selection_changed.selection = Color::rgb(0xff, 0x00, 0x00);
+        let after_sel = selection_colors(&selection_changed);
+        assert_eq!(
+            recompute_count() - before,
+            5,
+            "selection change must recompute"
+        );
+        assert_ne!(after_sel.painted, second.painted);
     }
 
     // 灰底黑选区（rust-reviewer 反例）：推向白后 quad 反解 >1 越界，
