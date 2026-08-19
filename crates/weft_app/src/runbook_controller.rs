@@ -66,7 +66,7 @@ impl RunbookWorker {
         let stale_result_rx = result_rx.clone();
         let waker = Arc::new(waker);
         std::thread::Builder::new()
-            .name("weft-runbook-loader".to_string())
+            .name(String::from("weft-runbook"))
             .spawn(move || {
                 while let Ok((generation, path)) = worker_rx.recv() {
                     let result = read_runbook(&path).map_err(|error| error.to_string());

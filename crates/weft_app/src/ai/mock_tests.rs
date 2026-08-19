@@ -326,7 +326,11 @@ fn production_client_ignores_system_proxy_child() {
         return;
     }
     let target = std::env::var("WEFT_PROXY_TARGET").expect("child target URL");
-    let runtime = tokio::runtime::Runtime::new().expect("child runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("weft-tokio-test")
+        .enable_all()
+        .build()
+        .expect("child runtime");
     runtime.block_on(async move {
         let backend = production_backend_at(&target, 2);
         let result = backend.complete(simple_messages(), CancelFlag::new()).await;

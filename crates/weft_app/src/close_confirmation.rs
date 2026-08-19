@@ -158,8 +158,20 @@ impl App {
         effects.push(crate::effect::Effect::PersistTabs);
         self.drain_effects(effects);
         if let Some(workspace) = self.capture_workspace("recovery".into()) {
+            // v1.10.31: Final snapshot write is dispatched to a background thread
+            // ("weft-recovery-writer") and immediately followed by event_loop.exit(),
+            // creating a race. This is acceptable because:
+            // 1. The clean-shutdown marker (written below) supersedes the snapshot
+            //    on the next launch — no recovery prompt is shown.
+            // 2. If the write completes before exit, it's a best-effort final state.
+            // 3. If the write is racing exit, the worst case is a stale snapshot that
+            //    gets deleted by the clean marker anyway.
+            // An Err here is a synchronous setup failure (ensure_root/to_yaml)
+            // — the actionable diagnostic; keep the warn (review S3). The
+            // background write's own failure is flagged via dispatch_failed
+            // and retried by the next autosave tick (not reachable here).
             if let Err(error) = self.recovery.write_snapshot_if_changed(&workspace) {
-                tracing::warn!(%error, "final recovery snapshot write failed");
+                tracing::warn!(error = %error, "final recovery snapshot write failed");
             }
         }
         self.recovery.mark_clean_shutdown();

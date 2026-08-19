@@ -47,7 +47,7 @@ impl PaletteSearchWorker {
         let result_waker = waker.clone();
         let submit_query_rx = query_rx.clone();
         thread::Builder::new()
-            .name("weft-palette-search".to_string())
+            .name(String::from("weft-palette"))
             .spawn(move || {
                 Self::run(index, query_rx, result_tx, result_waker);
             })

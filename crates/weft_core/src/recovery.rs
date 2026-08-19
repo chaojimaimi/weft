@@ -222,13 +222,22 @@ fn bak_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Compute the `.tmp` path for a given snapshot path.
+/// Compute a unique `.tmp` path for a given snapshot path.
+/// v1.10.31: Append timestamp to prevent race conditions when multiple
+/// writes are dispatched concurrently (e.g., 1 Hz tick + manual save).
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
-    name.push(".tmp");
+    // v1.10.31: Add unique suffix (nanosecond timestamp) to avoid concurrent
+    // write races. The temp file is renamed atomically to the final path,
+    // so uniqueness only needs to hold for the duration of the write.
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    name.push(format!(".tmp.{}", timestamp));
     path.with_file_name(name)
 }
 
@@ -451,10 +460,28 @@ mod tests {
     }
 
     #[test]
-    fn tmp_path_appends_tmp_suffix() {
+    fn tmp_path_appends_unique_tmp_suffix() {
         let path = Path::new("/tmp/recovery/snapshot.yaml");
         let tmp = tmp_path(path);
-        assert_eq!(tmp, PathBuf::from("/tmp/recovery/snapshot.yaml.tmp"));
+        // v1.10.31: tmp_path now appends a unique timestamp suffix.
+        // Format: snapshot.yaml.tmp.<nanoseconds>
+        let tmp_str = tmp.to_string_lossy();
+        assert!(
+            tmp_str.contains("snapshot.yaml.tmp."),
+            "tmp path should contain original name + .tmp + timestamp"
+        );
+        // The timestamp suffix is numeric, so the path should contain .tmp. followed by digits
+        assert!(
+            tmp_str.contains(".tmp."),
+            "tmp path should contain .tmp. prefix before timestamp"
+        );
+        // Extract the suffix and verify it's a valid number
+        let suffix = tmp_str.split(".tmp.").last().unwrap_or("");
+        assert!(!suffix.is_empty(), "timestamp suffix should not be empty");
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_digit()),
+            "timestamp suffix should be numeric"
+        );
     }
 
     // ── RecoveryPaths tests ───────────────────────────────────────────

@@ -502,7 +502,11 @@ fn main() {
     info!("Starting Weft v1.0 \"Weave\"");
 
     // Create a tokio runtime for PTY async operations.
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("weft-tokio")
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
     let _guard = rt.enter();
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();

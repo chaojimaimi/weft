@@ -94,14 +94,14 @@ impl FindWorker {
         let next_generation = Arc::new(AtomicU64::new(0));
         let result_waker = waker.clone();
         thread::Builder::new()
-            .name("weft-find-worker".to_string())
+            .name(String::from("weft-find"))
             .spawn(move || {
                 Self::run(query_rx, result_tx, result_waker);
             })
             .expect("spawn find worker");
         let debounce_generation = next_generation.clone();
         thread::Builder::new()
-            .name("weft-find-debounce".to_string())
+            .name(String::from("weft-find-debounce"))
             .spawn(move || {
                 Self::run_debounce(debounce_rx, debounce_generation, waker);
             })

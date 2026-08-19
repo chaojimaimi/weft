@@ -884,10 +884,13 @@ impl App {
             {
                 if let Some(delay) = self.sessions.active_mut().take_tui_scroll_wake_delay() {
                     let proxy = self.proxy.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(delay);
-                        let _ = proxy.send_event(AppEvent::Wake);
-                    });
+                    std::thread::Builder::new()
+                        .name(String::from("weft-mouse"))
+                        .spawn(move || {
+                            std::thread::sleep(delay);
+                            let _ = proxy.send_event(AppEvent::Wake);
+                        })
+                        .ok();
                 }
                 return;
             }

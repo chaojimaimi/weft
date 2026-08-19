@@ -28,6 +28,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use tracing::{info, warn};
 
@@ -78,9 +80,15 @@ pub(crate) struct RecoveryController {
     /// Hash of the YAML serialization of the last successfully-written
     /// snapshot. Used for content-equality debouncing.
     last_written_hash: Option<u64>,
-    /// v1.6.3 §6 step 5: cumulative count of snapshot write failures
-    /// since startup. Logged on each failure for diagnostics.
-    write_failure_count: u64,
+    /// v1.10.31: Flag indicating whether a background write is currently
+    /// in-flight. Used to prevent concurrent writes stacking up.
+    write_in_flight: Arc<AtomicBool>,
+    /// v1.10.31: Flag indicating whether the last dispatched write failed.
+    /// When true, the next tick resets `last_written_hash` to retry.
+    dispatch_failed: Arc<AtomicBool>,
+    /// v1.10.31: Shared failure counter for background threads to increment.
+    /// Atomic so the main thread can see the updated count.
+    shared_failure_count: Arc<AtomicU32>,
 }
 
 impl RecoveryController {
@@ -96,7 +104,9 @@ impl RecoveryController {
         Self {
             paths,
             last_written_hash: None,
-            write_failure_count: 0,
+            write_in_flight: Arc::new(AtomicBool::new(false)),
+            dispatch_failed: Arc::new(AtomicBool::new(false)),
+            shared_failure_count: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -175,15 +185,20 @@ impl RecoveryController {
     /// v1.6.3: Write a recovery snapshot if the content has changed since
     /// the last successful write.
     ///
-    /// Called from the 1 Hz autosave poller. The snapshot is built from
-    /// the current session state via `App::capture_workspace`.
+    /// v1.10.31: This is the core write function that accepts a custom write
+    /// dispatcher closure. Production code uses a background thread dispatcher;
+    /// tests inject a synchronous dispatcher for observability and determinism.
     ///
-    /// Returns `true` if a write occurred, `false` if the content was
-    /// unchanged (debounced).
-    pub(crate) fn write_snapshot_if_changed(
+    /// Returns `true` if a write was dispatched, `false` if the content was
+    /// unchanged (debounced) or a write was already in-flight.
+    fn write_snapshot_if_changed_with_dispatch<F>(
         &mut self,
         workspace: &WorkspaceDocument,
-    ) -> Result<bool, RecoveryError> {
+        dispatcher: F,
+    ) -> Result<bool, RecoveryError>
+    where
+        F: FnOnce(&RecoverySnapshot, &Path) -> Result<(), RecoveryError>,
+    {
         // Skip if cache dir is the sentinel.
         if self.paths.root() == Path::new("/dev/null/recovery") {
             return Ok(false);
@@ -191,6 +206,19 @@ impl RecoveryController {
 
         // Ensure the recovery directory exists.
         self.paths.ensure_root()?;
+
+        // v1.10.31: If the last dispatch failed, reset the hash so we retry
+        // this content on the next tick (reuses reset_debounce semantics).
+        if self.dispatch_failed.swap(false, Ordering::AcqRel) {
+            self.last_written_hash = None;
+        }
+
+        // v1.10.31: Skip if a write is already in-flight to prevent concurrent
+        // writes from stacking up (1 Hz tick rate makes this unlikely but not
+        // impossible on slow I/O).
+        if self.write_in_flight.load(Ordering::Acquire) {
+            return Ok(false);
+        }
 
         // Content-equality debounce: hash ONLY the workspace content (not
         // the timestamp, which changes every call). This skips writes when
@@ -203,22 +231,100 @@ impl RecoveryController {
 
         // Build the full snapshot (with fresh timestamp) and write it.
         let snapshot = RecoverySnapshot::from_workspace(workspace.clone(), false);
-        let start = std::time::Instant::now();
-        if let Err(e) = snapshot.save(&self.paths.snapshot_path()) {
-            // v1.6.3 §6 step 5: track failure count for diagnostics.
-            self.write_failure_count += 1;
-            warn!(error = %e, failures = self.write_failure_count, "recovery snapshot write failed");
-            return Err(e);
-        }
-        let elapsed = start.elapsed();
+        let snapshot_path = self.paths.snapshot_path();
 
+        // Update hash BEFORE dispatching (prevents duplicate dispatches).
         self.last_written_hash = Some(hash);
-        info!(
-            elapsed_ms = elapsed.as_millis() as u64,
-            failures = self.write_failure_count,
-            "recovery snapshot written"
-        );
+
+        // Dispatch the write using the injected closure.
+        dispatcher(&snapshot, &snapshot_path)?;
         Ok(true)
+    }
+
+    /// v1.6.3: Production wrapper that dispatches snapshot writes to a
+    /// background thread ("weft-recovery-writer") to avoid blocking the main
+    /// thread during 5-14ms disk I/O.
+    ///
+    /// v1.10.31: Returns `true` if a write was dispatched, `false` if the
+    /// content was unchanged (debounced) or a write was already in-flight.
+    /// Returns `Err` only if the dispatch setup failed (e.g., cache directory
+    /// issue or YAML serialization error). The actual write happens
+    /// asynchronously on a background thread; write failures are tracked
+    /// internally and retried on the next tick.
+    pub(crate) fn write_snapshot_if_changed(
+        &mut self,
+        workspace: &WorkspaceDocument,
+    ) -> Result<bool, RecoveryError> {
+        // v1.10.31: Clone the Arcs before calling the core function to avoid
+        // borrow conflicts inside the closure.
+        let in_flight = self.write_in_flight.clone();
+        let failed = self.dispatch_failed.clone();
+        let failure_count = self.shared_failure_count.clone();
+
+        self.write_snapshot_if_changed_with_dispatch(workspace, |snapshot, snapshot_path| {
+            // v1.10.31: Mark write as in-flight before spawning the thread.
+            in_flight.store(true, Ordering::Release);
+
+            // v1.10.31: Move snapshot and snapshot_path into the thread closure
+            // to avoid lifetime issues. Clone failure_count for the thread.
+            let snapshot = snapshot.clone();
+            let snapshot_path = snapshot_path.to_path_buf();
+            let thread_failure_count = failure_count.clone();
+            // Review S1: rollback handles for the spawn-failure path — the
+            // `move` closure below takes ownership of the originals.
+            let rollback_in_flight = in_flight.clone();
+            let rollback_failed = failed.clone();
+
+            std::thread::Builder::new()
+                .name(String::from("weft-recovery-writer"))
+                .spawn(move || {
+                    let start = std::time::Instant::now();
+                    match snapshot.save(&snapshot_path) {
+                        Ok(()) => {
+                            let elapsed = start.elapsed();
+                            info!(
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "recovery snapshot written (background thread)"
+                            );
+                        }
+                        Err(e) => {
+                            // v1.10.31: Mark dispatch as failed so the next tick
+                            // retries this content. Increment the shared failure count.
+                            failed.store(true, Ordering::Release);
+                            thread_failure_count.fetch_add(1, Ordering::Release);
+                            warn!(
+                                error = %e,
+                                failures = thread_failure_count.load(Ordering::Acquire),
+                                "recovery snapshot write failed (background thread)"
+                            );
+                        }
+                    }
+                    // v1.10.31: Clear in-flight flag whether write succeeded or failed.
+                    in_flight.store(false, Ordering::Release);
+                    // A panic inside the thread body would leave in_flight stuck
+                    // true (every later tick skips dispatch). Accepted: the body
+                    // is `snapshot.save()` (fs + serde on an owned snapshot,
+                    // returns Result, no unwraps) plus atomics — nil panic
+                    // surface, and the clean-shutdown marker covers the
+                    // stale-snapshot case.
+                })
+                .map_err(|e| {
+                    // Review S1: spawn failed — the thread never ran, so nothing
+                    // would clear in_flight or set failed; every later tick would
+                    // silently skip. Roll both back (in_flight was set above),
+                    // flagging failed so the next tick retries this content.
+                    rollback_in_flight.store(false, Ordering::Release);
+                    rollback_failed.store(true, Ordering::Release);
+                    warn!(error = %e, "failed to spawn weft-recovery-writer");
+                })
+                .ok();
+
+            info!(
+                failures = failure_count.load(Ordering::Acquire),
+                "recovery snapshot write dispatched to background thread"
+            );
+            Ok(())
+        })
     }
 
     /// v1.6.3: Write the clean-shutdown marker.
@@ -567,16 +673,22 @@ mod tests {
         let ws = sample_workspace("test");
 
         // First write: should write.
-        let wrote = ctrl.write_snapshot_if_changed(&ws).unwrap();
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(wrote);
 
         // Second write (same content): should skip.
-        let wrote = ctrl.write_snapshot_if_changed(&ws).unwrap();
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(!wrote);
 
         // Third write (changed content): should write.
         let ws2 = sample_workspace("changed");
-        let wrote = ctrl.write_snapshot_if_changed(&ws2).unwrap();
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws2, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(wrote);
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -591,12 +703,14 @@ mod tests {
         let ws1 = sample_workspace("first");
 
         // First write: no .bak.
-        ctrl.write_snapshot_if_changed(&ws1).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws1, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(!ctrl.paths.snapshot_bak_path().exists());
 
         // Second write (changed): .bak should exist.
         let ws2 = sample_workspace("second");
-        ctrl.write_snapshot_if_changed(&ws2).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws2, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(ctrl.paths.snapshot_bak_path().exists());
 
         // .bak should contain the first snapshot's workspace.
@@ -647,15 +761,20 @@ mod tests {
         let ws = sample_workspace("test");
 
         // First write.
-        ctrl.write_snapshot_if_changed(&ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         // Same content — skipped.
-        let wrote = ctrl.write_snapshot_if_changed(&ws).unwrap();
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(!wrote);
 
         // Reset debounce — next write should happen even with same content.
         ctrl.reset_debounce();
-        let wrote = ctrl.write_snapshot_if_changed(&ws).unwrap();
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(wrote);
 
         std::fs::remove_dir_all(&tmp).ok();
@@ -668,7 +787,8 @@ mod tests {
 
         // 1. Session: write snapshot.
         let ws = sample_workspace("session");
-        ctrl.write_snapshot_if_changed(&ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
         assert!(ctrl.paths.snapshot_exists());
 
         // 2. Clean exit: write marker.
@@ -689,7 +809,8 @@ mod tests {
 
         // 1. Session: write snapshot.
         let ws = sample_workspace("session");
-        ctrl.write_snapshot_if_changed(&ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         // 2. Crash: no marker.
 
@@ -709,7 +830,8 @@ mod tests {
         // 5. After restore, new session writes overwrite the snapshot.
         ctrl.reset_debounce();
         let new_ws = sample_workspace("restored");
-        ctrl.write_snapshot_if_changed(&new_ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&new_ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         // 6. Clean exit.
         ctrl.mark_clean_shutdown();
@@ -728,7 +850,8 @@ mod tests {
 
         // 1. Session: write snapshot.
         let ws = sample_workspace("session");
-        ctrl.write_snapshot_if_changed(&ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         // 2. Crash.
 
@@ -742,7 +865,8 @@ mod tests {
 
         // 5. New session writes overwrite the snapshot.
         let new_ws = sample_workspace("fresh");
-        ctrl.write_snapshot_if_changed(&new_ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&new_ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -754,7 +878,8 @@ mod tests {
 
         // 1. Session: write snapshot.
         let ws = sample_workspace("session");
-        ctrl.write_snapshot_if_changed(&ws).unwrap();
+        ctrl.write_snapshot_if_changed_with_dispatch(&ws, |snapshot, path| snapshot.save(path))
+            .unwrap();
 
         // 2. Crash.
 
@@ -870,5 +995,188 @@ mod tests {
         let snapshot = RecoverySnapshot::from_workspace(sample_workspace("crash"), false);
         assert!(autosave_suppressed(&Some(snapshot)));
         assert!(!autosave_suppressed(&None));
+    }
+
+    /// v1.10.24: TDD test for off-main-thread snapshot writes.
+    /// This test verifies that:
+    /// 1. Unchanged content does NOT trigger a write dispatch
+    /// 2. Changed content triggers exactly ONE write dispatch
+    ///
+    /// The test uses an injected closure to count dispatches synchronously.
+    #[test]
+    fn write_snapshot_dispatches_write_only_when_content_changes() {
+        let tmp = test_tempdir("dispatch-count");
+        let mut ctrl = RecoveryController::new(Some(&tmp));
+        ctrl.paths.ensure_root().unwrap();
+
+        let ws = sample_workspace("test");
+
+        // Track how many times write is dispatched
+        let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // First write: should dispatch (content changed from None)
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(wrote, "First write should return true");
+        assert_eq!(
+            dispatch_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "First write should dispatch exactly once"
+        );
+
+        // Second write (same content): should NOT dispatch
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(!wrote, "Unchanged content write should return false");
+        assert_eq!(
+            dispatch_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Unchanged content should NOT dispatch (still 1)"
+        );
+
+        // Third write (changed content): should dispatch exactly once more
+        let ws2 = sample_workspace("changed");
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws2, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(wrote, "Changed content write should return true");
+        assert_eq!(
+            dispatch_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "Changed content should dispatch exactly once more (total 2)"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Review S2 (v1.10.31): a flagged dispatch failure must reset the
+    /// debounce so the SAME content is retried on the next tick — the write
+    /// thread's failure path sets `dispatch_failed`; this test pins the
+    /// retry semantics without spawning threads.
+    #[test]
+    fn dispatch_failure_resets_debounce_and_retries_same_content() {
+        let tmp = test_tempdir("failed-retry");
+        let mut ctrl = RecoveryController::new(Some(&tmp));
+        ctrl.paths.ensure_root().unwrap();
+
+        let ws = sample_workspace("retry-me");
+        let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Normal first write of this content.
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        // Same content: normally debounced (no dispatch)...
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(!wrote, "unchanged content must debounce");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        // ...but once the write thread flags failure, the SAME content must
+        // dispatch again on the next tick.
+        ctrl.dispatch_failed.store(true, Ordering::Release);
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&ws, {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(
+            wrote,
+            "a flagged dispatch failure must retry the same content"
+        );
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 2);
+        assert!(
+            !ctrl.dispatch_failed.load(Ordering::Acquire),
+            "the retry tick consumes the failure flag"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Review S2 (v1.10.31): while a write is in-flight, the next tick must
+    /// skip dispatching entirely (returning false) — the concurrency guard
+    /// against stacking writes with a fixed tmp name.
+    #[test]
+    fn in_flight_write_skips_dispatch() {
+        let tmp = test_tempdir("in-flight-skip");
+        let mut ctrl = RecoveryController::new(Some(&tmp));
+        ctrl.paths.ensure_root().unwrap();
+
+        let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Simulate an in-flight write; even CHANGED content must not dispatch.
+        ctrl.write_in_flight.store(true, Ordering::Release);
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&sample_workspace("in-flight"), {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(!wrote, "an in-flight write must skip the dispatch");
+        assert_eq!(
+            dispatch_count.load(Ordering::SeqCst),
+            0,
+            "the dispatcher closure must not run while in-flight"
+        );
+
+        // Once the write thread finishes (flag cleared), the pending content
+        // dispatches normally.
+        ctrl.write_in_flight.store(false, Ordering::Release);
+        let wrote = ctrl
+            .write_snapshot_if_changed_with_dispatch(&sample_workspace("in-flight"), {
+                let count = dispatch_count.clone();
+                move |snapshot: &RecoverySnapshot, path: &std::path::Path| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    snapshot.save(path)
+                }
+            })
+            .unwrap();
+        assert!(wrote, "after the write completes, dispatch resumes");
+        assert_eq!(dispatch_count.load(Ordering::SeqCst), 1);
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

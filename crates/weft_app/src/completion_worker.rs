@@ -72,7 +72,7 @@ impl CompletionWorker {
         let stale_result_rx = result_rx.clone();
         let waker = Arc::new(waker);
         std::thread::Builder::new()
-            .name("weft-completion".to_string())
+            .name(String::from("weft-completion"))
             .spawn(move || run_worker(worker_rx, result_tx, stale_result_rx, waker))
             .expect("spawn completion worker");
         Self {
@@ -166,7 +166,7 @@ fn run_worker(
             let cancel = request.cancel.clone();
             let filesystem_done = Arc::clone(&filesystem_in_flight);
             let spawned = std::thread::Builder::new()
-                .name("weft-completion-filesystem".to_string())
+                .name(String::from("weft-completion-fs"))
                 .spawn(move || {
                     let provider = FilesystemProvider;
                     let completion_request = CompletionRequest {
