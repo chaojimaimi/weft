@@ -416,6 +416,8 @@ impl vte::Perform for Terminal {
                     self.block_tracker.on_move_cursor_rows(-(n as isize));
                 }
                 self.capture_primary_screen_interrupt_cursor_position(false);
+                // v1.10.31: CUU counts as non-trivial addressing in DEC 2026 window
+                self.note_synchronized_frame_addressing();
             }
             'B' => {
                 let n = param(params, 0, 1) as usize;
@@ -424,6 +426,8 @@ impl vte::Perform for Terminal {
                     self.block_tracker.on_move_cursor_rows(n as isize);
                 }
                 self.capture_primary_screen_interrupt_cursor_position(false);
+                // v1.10.31: CUD counts as non-trivial addressing in DEC 2026 window
+                self.note_synchronized_frame_addressing();
             }
             'C' => {
                 let amount = param(params, 0, 1) as usize;
@@ -464,6 +468,8 @@ impl vte::Perform for Terminal {
                 let col = param(params, 1, 1) as usize;
                 self.grid.goto(row, col, self.origin_mode);
                 self.capture_primary_screen_interrupt_cursor_position(true);
+                // v1.10.31: CUP counts as non-trivial addressing in DEC 2026 window
+                self.note_synchronized_frame_addressing();
                 tracing::debug!(
                     req_row = row,
                     req_col = col,
@@ -478,11 +484,18 @@ impl vte::Perform for Terminal {
                 self.grid.set_cursor_col(col.saturating_sub(1));
                 self.capture_block_cursor_column(self.grid.cursor.col);
                 self.capture_primary_screen_interrupt_cursor_position(col == 1);
+                // v1.10.31: CHA counts as non-trivial addressing in DEC 2026 window
+                // ONLY when column > 1 (column 1 is just carriage return, brew uses it)
+                if col > 1 {
+                    self.note_synchronized_frame_addressing();
+                }
             }
             'd' => {
                 let row = param(params, 0, 1) as usize;
                 self.grid.set_cursor_row(row.saturating_sub(1));
                 self.capture_primary_screen_interrupt_cursor_position(false);
+                // v1.10.31: VPA counts as non-trivial addressing in DEC 2026 window
+                self.note_synchronized_frame_addressing();
             }
 
             // Erase

@@ -172,6 +172,12 @@ fn primary_tui_content_cols_are_stable_across_transient_alt_toggles() {
         "a screen-owning primary TUI uses content width"
     );
 
+    // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): Create a burst re-entry scenario
+    // by doing an initial alt enter/exit pair. This makes subsequent alt
+    // entries burst re-entries (< 400ms since last exit) rather than isolated.
+    t.process(b"\x1b[?1049h");
+    t.process(b"\x1b[?1049l");
+
     // A genuinely transient alt phase of the same TUI — the resize-loop
     // feedback shape. Under the sustained-alt hysteresis this must NOT flip
     // to Full: the loop is broken at the source
@@ -273,22 +279,22 @@ fn sustained_residency_stamp() -> Option<Instant> {
     Instant::now().checked_sub(Duration::from_millis(SUSTAINED_ALT_COLS_MS + 50))
 }
 
-/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): omp 17.3.7 wraps its SIGWINCH
-/// repaint in 1049h → full redraw (~129ms) → 1049l. The old constant
-/// alt→Full mapping flipped the cols target (91↔94) each round, emitting a
-/// new ioctl → SIGWINCH → feedback loop (~330ms/circle). With the
-/// sustained-alt hysteresis, an in-and-out excursion (<250ms residency)
-/// keeps the target at Content the whole way — no Full, so no new SIGWINCH
-/// and the loop is broken at the source.
+/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): omp burst re-entry test. After a recent
+/// alt exit (< 400ms), re-entering alt should NOT immediately flip to Full
+/// (must still satisfy 250ms sustained residency). This prevents omp from
+/// oscillating in its 1049h→repaint→1049l loop.
 #[test]
 fn transient_alt_excursion_does_not_flip_cols_kind() {
     let mut t = term();
-    // Enter alt, do NOT wait past the threshold — the omp excursion shape.
+    // First, create a recent exit by entering and immediately leaving alt.
+    t.process(b"\x1b[?1049h");
+    t.process(b"\x1b[?1049l");
+    // Now re-enter alt (burst re-entry < 400ms).
     t.process(b"\x1b[?1049h");
     assert_eq!(
         t.tui_cols_kind(),
         TuiColsKind::Content,
-        "a transient alt entry must not flip cols to Full"
+        "a burst re-entry must not flip cols to Full immediately"
     );
     // A real sustained alt TUI (vim): fake 300ms residency → Full.
     t.capabilities.alt_active_since = sustained_residency_stamp();
@@ -298,42 +304,128 @@ fn transient_alt_excursion_does_not_flip_cols_kind() {
     assert_eq!(t.tui_cols_kind(), TuiColsKind::Content);
 }
 
-/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): the pure decision backing
-/// `tui_cols_kind` — alt continuously resident at/over `SUSTAINED_ALT_COLS_MS`
-/// is Full, transient (<250ms) is Content, and an unknown entry time (None)
-/// conservatively keeps the old Full mapping.
+/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): isolated alt entry test. When there's
+/// no recent alt exit, entering alt should immediately flip to Full (fixes
+/// less/vim startup jump where the app draws before the first SIGWINCH).
+#[test]
+fn isolated_alt_entry_flips_to_full_immediately() {
+    let mut t = term();
+    // No prior alt exit in this session → isolated entry.
+    t.process(b"\x1b[?1049h");
+    assert_eq!(
+        t.tui_cols_kind(),
+        TuiColsKind::Full,
+        "an isolated alt entry must flip cols to Full immediately"
+    );
+    // Leaving alt restores Content.
+    t.process(b"\x1b[?1049l");
+    assert_eq!(t.tui_cols_kind(), TuiColsKind::Content);
+}
+
+/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP), v1.10.30 (FIX_LESS_ALT_COLS_JUMP):
+/// the pure decision backing `tui_cols_kind` — alt continuously resident
+/// at/over `SUSTAINED_ALT_COLS_MS` is Full, transient (<250ms) is Content,
+/// and an unknown entry time (None) conservatively keeps the old Full mapping.
+/// Isolated entries (no recent exit or >= 400ms since last exit) are Full
+/// immediately; burst re-entries (< 400ms) still need sustained residency.
 #[test]
 fn sustained_alt_cols_kind_pure_decision() {
     // Not alt: always Content.
-    assert_eq!(sustained_alt_cols_kind(false, None), TuiColsKind::Content);
     assert_eq!(
-        sustained_alt_cols_kind(false, Some(Duration::from_secs(10))),
-        TuiColsKind::Content
-    );
-    // Alt resident for 0/100/249ms — transient, stays Content.
-    assert_eq!(
-        sustained_alt_cols_kind(true, Some(Duration::from_millis(0))),
+        sustained_alt_cols_kind(false, None, None),
         TuiColsKind::Content
     );
     assert_eq!(
-        sustained_alt_cols_kind(true, Some(Duration::from_millis(100))),
+        sustained_alt_cols_kind(false, Some(Duration::from_secs(10)), None),
         TuiColsKind::Content
     );
+
+    // Isolated entry (no recent exit) → immediate Full, regardless of residency time.
     assert_eq!(
-        sustained_alt_cols_kind(true, Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS - 1))),
-        TuiColsKind::Content
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(0)), None),
+        TuiColsKind::Full,
+        "isolated entry with 0ms residency must be Full"
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(true, Some(Duration::from_millis(100)), None),
+        TuiColsKind::Full,
+        "isolated entry with 100ms residency must be Full"
+    );
+
+    // Isolated entry (>= 400ms since last exit) → immediate Full.
+    assert_eq!(
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(0)),
+            Some(Duration::from_millis(400))
+        ),
+        TuiColsKind::Full,
+        "isolated entry (400ms since exit) must be Full"
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(500)),
+            Some(Duration::from_millis(1000))
+        ),
+        TuiColsKind::Full,
+        "isolated entry (1000ms since exit) must be Full"
+    );
+
+    // Burst re-entry (< 400ms since last exit) — applies sustained residency threshold.
+    assert_eq!(
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(0)),
+            Some(Duration::from_millis(200))
+        ),
+        TuiColsKind::Content,
+        "burst re-entry with 0ms residency must be Content"
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(300))
+        ),
+        TuiColsKind::Content,
+        "burst re-entry with 100ms residency must be Content"
+    );
+    assert_eq!(
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS - 1)),
+            Some(Duration::from_millis(350))
+        ),
+        TuiColsKind::Content,
+        "burst re-entry with 249ms residency must be Content"
     );
     // At/over the threshold — Full.
     assert_eq!(
-        sustained_alt_cols_kind(true, Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS))),
-        TuiColsKind::Full
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_millis(SUSTAINED_ALT_COLS_MS)),
+            Some(Duration::from_millis(300))
+        ),
+        TuiColsKind::Full,
+        "burst re-entry with 250ms residency must be Full"
     );
     assert_eq!(
-        sustained_alt_cols_kind(true, Some(Duration::from_secs(2))),
+        sustained_alt_cols_kind(
+            true,
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(200))
+        ),
+        TuiColsKind::Full,
+        "burst re-entry with 2s residency must be Full"
+    );
+
+    // Unknown entrance time — conservative old-behavior Full.
+    assert_eq!(sustained_alt_cols_kind(true, None, None), TuiColsKind::Full);
+    assert_eq!(
+        sustained_alt_cols_kind(true, None, Some(Duration::from_millis(200))),
         TuiColsKind::Full
     );
-    // Unknown entrance time — conservative old-behavior Full.
-    assert_eq!(sustained_alt_cols_kind(true, None), TuiColsKind::Full);
 }
 
 #[test]
@@ -3422,4 +3514,73 @@ mod perf_benchmarks {
         let (ms, _) = bench("colored 5k lines", &bytes);
         let _ = ms;
     }
+}
+
+/// v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): brew progress streams with
+/// DEC 2026 synchronized output must NOT be classified as TUIs. They emit
+/// `?2026h/?2026l` on every frame but only use EL + CHA(column 1), which is
+/// not real TUI cursor addressing. This test reproduces the exact byte pattern
+/// from a real brew session (7 frames of "Downloading XKB...") and verifies
+/// that the block output contains exactly ONE final line, not 7 duplicates.
+#[test]
+fn brew_progress_stream_stays_single_row_in_capture() {
+    let mut t = term();
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+
+    // Simulate 7 frames of brew progress output. Each frame:
+    // - Prints the full line
+    // - Clears to end of line (EL, \x1b[K)
+    // - Moves cursor to column 1 (CHA with param 0, \x1b[0G)
+    // - Toggles DEC 2026 sync off/on (\x1b[?2026l\x1b[?2026h)
+    // - Prints a colored spinner character
+    // This is the exact pattern from real brew byte streams.
+    let spinners: &[&[u8]] = &[
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\xa0\x8b", // blue spinner
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\x0a\x8c",
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\xa0\x8d",
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\x0a\x8e",
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\xa0\x8f",
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\x0a\x90",
+        b"\x1b[34m\x1b[?2026l\x1b[?2026h\xe2\xa0\x91",
+    ];
+
+    let mut frame_count = 0;
+    for (i, spinner) in spinners.iter().enumerate() {
+        // Each frame: print the line with incrementing progress
+        let progress = format!("Bottle jq (1.8.2) ### Downloading  XKB/{}1KB", 440 + i);
+        t.process(progress.as_bytes());
+        // EL + CHA(0) + DEC 2026 toggle + spinner
+        t.process(b"\x1b[K\x1b[0G");
+        t.process(spinner);
+        frame_count += 1;
+    }
+
+    // End the command
+    t.process(b"\n\x1b]133;D;0\x07");
+
+    // Verify that the TUI was NOT detected (key assertion)
+    assert!(
+        !t.primary_screen_app_active(),
+        "brew progress with DEC 2026 should NOT trigger TUI detection"
+    );
+
+    // Verify the block output contains exactly ONE occurrence of "Downloading"
+    let block = t.block_tracker().blocks().last().unwrap();
+    let output = block.output.as_ref();
+
+    // Count occurrences of "Downloading" in the output
+    let downloading_count = output.matches("Downloading").count();
+
+    assert_eq!(
+        downloading_count, 1,
+        "brew progress must converge to a single line (got {} occurrences, expected 1). \
+         Before the fix, this would be {} (one per frame). Output: {:?}",
+        downloading_count, frame_count, output
+    );
+
+    // Verify the final state contains the completion marker
+    assert!(
+        output.contains("Downloading"),
+        "final output should contain the last progress state"
+    );
 }

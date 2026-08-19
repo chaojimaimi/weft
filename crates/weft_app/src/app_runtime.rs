@@ -142,21 +142,30 @@ fn schedule_primary_history_refresh_wakes(
     }
 }
 
-/// v1.7.6: Hydrate a terminal with persisted history. The editor's ↑-key
-/// recall gets the GLOBAL command list (all tabs, so ↑ can recall any
-/// previous command). The block tracker gets ONLY this tab's blocks
-/// (filtered by `tab_block_ids`) so the block view shows per-tab history
-/// instead of mixing all tabs' history together.
+/// v1.7.6 → FIX ② (2026-08-19): Hydrate a terminal with persisted history.
+///
+/// The editor's ↑-key recall gets ONLY this tab's commands (filtered by
+/// `tab_block_ids`), matching Warp's per-tab session-scoped history. The block
+/// tracker similarly gets ONLY this tab's blocks. See FIX_EDITOR_HISTORY_PER_TAB.md
+/// for Warp comparison and rationale.
+///
+/// Before the fix, editor ↑-key recall incorrectly used GLOBAL history (all tabs
+/// mixed together), while the block tracker was correctly per-tab — this mismatch
+/// meant "Cmd+Shift+B panel is per-tab, but ↑ arrows cross-tab".
 fn hydrate_persisted_history(
     terminal: &mut Terminal,
     global_newest_first: &[weft_core::blocks::Block],
     tab_block_ids: &[u64],
     block_id_allocator: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    // Editor ↑-key recall: global command history (across all tabs).
+    // Editor ↑-key recall: per-tab (this tab's own blocks), consistent with
+    // the block tracker / Cmd+Shift+B panel below and Warp's session-scoped
+    // up-arrow history. v1.7.6's global hydration mixed all tabs' commands
+    // into every tab's ↑ recall (user-visible cross-tab mixing).
     let commands = global_newest_first
         .iter()
         .rev()
+        .filter(|b| tab_block_ids.contains(&b.id.0))
         .map(|block| strip_prompt_prefix(&block.command))
         .filter(|command| !command.trim().is_empty())
         .collect();
@@ -913,8 +922,9 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_gives_editor_global_history_but_tracker_only_tab_blocks() {
-        // v1.7.6: editor ↑-key recall is global; block tracker is per-tab.
+    fn hydrate_gives_editor_and_tracker_only_tab_blocks() {
+        // FIX ② (2026-08-19): editor ↑-key recall is per-tab (consistent with
+        // block tracker and Warp semantics), not global.
         let mut newest_first = vec![block(2, "❯ echo newest"), block(1, "❯ echo oldest")];
         newest_first[0].output = "large persisted output".repeat(1024).into();
         let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
@@ -925,14 +935,14 @@ mod tests {
         hydrate_persisted_history(&mut terminal_a, &newest_first, &[1, 2], allocator.clone());
         hydrate_persisted_history(&mut terminal_b, &newest_first, &[1], allocator);
 
-        // Both editors see the full global command history (↑-key recall).
+        // Both editors now see only their tab's own commands (per-tab isolation).
         assert_eq!(
             terminal_a.editor().history(),
             ["echo newest", "echo oldest"]
         );
         assert_eq!(
             terminal_b.editor().history(),
-            ["echo newest", "echo oldest"]
+            ["echo oldest"] // block 2 is NOT in tab B's history
         );
 
         // Block trackers are per-tab isolated.
@@ -960,14 +970,14 @@ mod tests {
 
     #[test]
     fn hydrate_with_empty_block_ids_loads_nothing_into_tracker() {
-        // v1.7.6: legacy snapshots (no block_ids) → block tracker stays empty,
-        // but editor still gets global ↑-key history.
+        // FIX ② (2026-08-19): legacy snapshots (no block_ids) → both block tracker
+        // and editor history stay empty (per-tab isolation).
         let newest_first = vec![block(1, "❯ ls"), block(2, "❯ echo hi")];
         let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
         let mut terminal = Terminal::new(24, 80);
         hydrate_persisted_history(&mut terminal, &newest_first, &[], allocator);
         assert!(terminal.block_tracker().blocks().is_empty());
-        assert_eq!(terminal.editor().history().len(), 2);
+        assert_eq!(terminal.editor().history().len(), 0); // no block_ids → empty history
     }
 
     /// v1.8.9 regression test for the recovery-restore history bug.
@@ -993,6 +1003,11 @@ mod tests {
             2,
             "recovery restore with attached block_ids should hydrate the tracker"
         );
+        assert_eq!(
+            terminal.editor().history().len(),
+            2,
+            "editor history should also be populated (per-tab isolation)"
+        );
 
         // Contrast with the pre-fix recovery path: restored_snapshot was None,
         // yielding empty block_ids and an empty tracker.
@@ -1001,6 +1016,11 @@ mod tests {
         assert!(
             terminal_bare.block_tracker().blocks().is_empty(),
             "empty block_ids (pre-fix recovery path) leaves the tracker empty"
+        );
+        assert_eq!(
+            terminal_bare.editor().history().len(),
+            0,
+            "empty block_ids (pre-fix recovery path) also leaves editor history empty"
         );
     }
 
@@ -1067,5 +1087,40 @@ mod tests {
             2,
             "injected block_ids must hydrate the tracker (v1.8.9 chain)"
         );
+    }
+
+    /// FIX ② (2026-08-19): Verify that per-tab filtering preserves newest-first order.
+    /// When a tab has blocks [2, 5, 10] from a global list [1..20], the editor history
+    /// must still show them newest-first (10 → 5 → 2), not chronological (2 → 5 → 10).
+    #[test]
+    fn hydrate_preserves_newest_first_order_after_filtering() {
+        // Global history: blocks 1 (oldest) through 10 (newest)
+        let mut newest_first = Vec::new();
+        for i in (1..=10).rev() {
+            newest_first.push(block(i, &format!("❯ cmd{}", i)));
+        }
+
+        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(11));
+        let mut terminal = Terminal::new(24, 80);
+
+        // Tab only produced blocks [2, 5, 10] (non-contiguous, not the newest globally)
+        hydrate_persisted_history(&mut terminal, &newest_first, &[2, 5, 10], allocator);
+
+        // Editor history must preserve newest-first order among the tab's blocks:
+        // global order is 10→5→2 (since 10 is newest, 5 is middle, 2 is oldest among them)
+        assert_eq!(
+            terminal.editor().history(),
+            ["cmd10", "cmd5", "cmd2"],
+            "filtering must preserve newest-first order (not chronological)"
+        );
+
+        // Block tracker should also have the correct order
+        let ids: Vec<_> = terminal
+            .block_tracker()
+            .blocks()
+            .iter()
+            .map(|b| b.id.0)
+            .collect();
+        assert_eq!(ids, [2, 5, 10], "block tracker expects chronological order");
     }
 }

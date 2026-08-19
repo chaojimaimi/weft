@@ -51,6 +51,13 @@ pub const PRIMARY_HISTORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50
 /// feedback loop is broken at the source. See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
 pub(crate) const SUSTAINED_ALT_COLS_MS: u64 = 250;
 
+/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): burst re-entry detection window.
+/// omp flip-pairs 1049h→repaint→1049l toggle at ~130-330ms intervals.
+/// 400ms covers the burst window while treating isolated alt entries
+/// (less/vim startup, no recent exit) as immediate Full. See
+/// docs/FIX_LESS_ALT_COLS_JUMP.md.
+pub(crate) const ALT_REENTRY_BURST_MS: u64 = 400;
+
 pub(in crate::vt) struct PendingPrimaryScreenExit {
     pub(in crate::vt) exit_code: Option<i32>,
     pub(in crate::vt) last_activity: Instant,
@@ -97,23 +104,30 @@ pub enum TuiColsKind {
     Content,
 }
 
-/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): pure decision for the sustained-alt
+/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): pure decision for the sustained-alt
 /// cols hysteresis feeding [`Terminal::tui_cols_kind`].
 ///
-/// Only alt that has been *continuously* resident for at least
-/// [`SUSTAINED_ALT_COLS_MS`] (250ms) reports Full; anything shorter — omp
-/// 17.3.7's ~129ms 1049h→repaint→1049l excursion — stays Content, so a
-/// transient in-and-out can never flip the classification and feed the
-/// SIGWINCH feedback loop. A `None` entry time (unknown start) conservatively
-/// returns Full: the pre-hysteresis mapping, so an unknown state can never
-/// shrink a real alt TUI to content width. See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
+/// Distinguishes isolated vs burst re-entry:
+/// - Isolated entry (no recent exit or >= 400ms since last exit): immediately Full
+/// - Burst re-entry (< 400ms since last exit): requires sustained 250ms residency
+///
+/// This fixes less/vim startup jump (isolated entry gets Full immediately)
+/// while maintaining omp loop suppression (burst re-entries wait 250ms).
+/// A `None` entry time (unknown start) conservatively returns Full.
+/// See docs/FIX_LESS_ALT_COLS_JUMP.md.
 pub(crate) fn sustained_alt_cols_kind(
     alt_active: bool,
     alt_active_for: Option<Duration>,
+    since_last_exit: Option<Duration>,
 ) -> TuiColsKind {
     if !alt_active {
         return TuiColsKind::Content;
     }
+    // Isolated entry (no recent exit) → immediate Full (fixes less/vim startup)
+    if since_last_exit.map_or(true, |d| d >= Duration::from_millis(ALT_REENTRY_BURST_MS)) {
+        return TuiColsKind::Full;
+    }
+    // Burst re-entry: apply sustained residency threshold
     match alt_active_for {
         // Unknown start: conservatively keep the old alt→Full mapping.
         None => TuiColsKind::Full,
@@ -142,23 +156,18 @@ impl Terminal {
 
     pub(super) fn begin_primary_screen_synchronized_frame(&mut self) {
         self.synchronized_frame_cleared_rows = 0;
-        // v1.10.6: DEC 2026 synchronized output (`?2026h`) is strong TUI
-        // evidence — a plain shell command never emits it. pi and other
-        // modern TUIs use it on EVERY repaint; without counting it toward
-        // TUI detection, cursor_ops stays < 2 (pi only sends one CUU on
-        // startup + CHR per keystroke, neither reaching the threshold) and
-        // `primary_screen_app_active()` is never true. Count it the same
-        // way as cursor addressing, then start the output capture if the
-        // threshold is crossed.
-        if !self.capabilities.alt_active {
-            self.capabilities.primary_screen_cursor_ops = self
-                .capabilities
-                .primary_screen_cursor_ops
-                .saturating_add(1);
-            if self.primary_screen_app_active() {
-                self.begin_primary_screen_output_capture();
-            }
-        }
+        // v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): DEC 2026 synchronized
+        // output (`?2026h`) no longer unconditionally counts as TUI evidence.
+        // Brew's progress frames emit `?2026h/?2026l` on every repaint but only
+        // use EL + CHA(column 1), which is not real TUI cursor addressing.
+        // Now we reset the window flag and only count cursor_ops when non-trivial
+        // addressing (CUP `H`, CUU/CUD `A`/`B`, VPA `d`, CHA with parameter >1)
+        // is seen inside the window. This was validated by a controlled experiment:
+        // the same brew byte stream with DEC 2026 removed produces correct
+        // single-line block output, while with 2026 (old behavior) it produced 7
+        // duplicate lines. pi/openclaw compatibility is preserved because their
+        // repaint frames include genuine cursor addressing.
+        self.capabilities.synchronized_frame_addressing_seen = false;
     }
 
     pub(super) fn finish_primary_screen_synchronized_frame(&mut self) {
@@ -241,6 +250,37 @@ impl Terminal {
             // v1.10.12: relative moves mark a sparse repainter — it paints
             // incrementally, so row-boundary hiding must stay off.
             self.capabilities.primary_screen_relative_addressing_seen |= !absolute;
+            if self.primary_screen_app_active() {
+                self.begin_primary_screen_output_capture();
+            }
+        }
+    }
+
+    /// v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): check if non-trivial cursor
+    /// addressing has been seen in the current DEC 2026 synchronized output window.
+    /// If not, mark it as seen and count it toward TUI detection. This should be
+    /// called from cursor addressing operations (CUP, CUU, CUD, VPA, CHA with param >1).
+    /// Returns true if the addressing was just counted (first time in this window).
+    /// v1.10.31 invariant (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): the removed
+    /// per-`?2026h` +1 is compensated by the window-bonus double count on the
+    /// first addressing op inside the frame — an old frame counted `1 + k`
+    /// (2026 begin + k addressing ops), a new frame counts `k + 1` (k via the
+    /// generic hook + this window bonus). Do not "simplify" either side alone:
+    /// detection timing for pi/omp depends on this equivalence.
+    pub(super) fn note_synchronized_frame_addressing(&mut self) {
+        // Only count if we're in a synchronized window, not in alt screen,
+        // and haven't seen addressing yet in this window.
+        if self.synchronized_output_started.is_some()
+            && !self.capabilities.alt_active
+            && !self.capabilities.synchronized_frame_addressing_seen
+        {
+            self.capabilities.synchronized_frame_addressing_seen = true;
+            // Count this as a cursor operation for TUI detection
+            self.capabilities.primary_screen_cursor_ops = self
+                .capabilities
+                .primary_screen_cursor_ops
+                .saturating_add(1);
+            // Start capture if threshold crossed
             if self.primary_screen_app_active() {
                 self.begin_primary_screen_output_capture();
             }
@@ -574,6 +614,13 @@ impl Terminal {
     /// feedback replays the same two constants instead of ratcheting into
     /// new values.
     ///
+    /// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): isolated vs burst re-entry —
+    /// alt entries with no recent exit (or >= 400ms since last exit) are
+    /// isolated and immediately map to Full, fixing less/vim startup
+    /// jump. Burst re-entries (< 400ms) apply the 250ms sustained residency
+    /// threshold to break the omp feedback loop. See
+    /// docs/FIX_LESS_ALT_COLS_JUMP.md.
+    ///
     /// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): sustained-alt hysteresis —
     /// alt only maps to Full after [`SUSTAINED_ALT_COLS_MS`] (250ms) of
     /// *continuous* residency ([`sustained_alt_cols_kind`]); an unknown
@@ -600,7 +647,15 @@ impl Terminal {
             .capabilities
             .alt_active_since
             .map(|since| Instant::now().saturating_duration_since(since));
-        sustained_alt_cols_kind(self.capabilities.alt_active, alt_active_for)
+        let since_last_exit = self
+            .capabilities
+            .alt_last_exit
+            .map(|exit| Instant::now().saturating_duration_since(exit));
+        sustained_alt_cols_kind(
+            self.capabilities.alt_active,
+            alt_active_for,
+            since_last_exit,
+        )
     }
 
     /// v1.10.19: Whether a primary-screen TUI currently owns the live grid
@@ -1070,27 +1125,59 @@ mod tests {
 
     #[test]
     fn dec2026_synchronized_output_triggers_tui_detection() {
-        // v1.10.6: pi (coding-agent CLI) uses DEC 2026 synchronized output
-        // (?2026h) on every repaint. A plain shell command never emits it.
-        // Without counting it toward TUI detection, cursor_ops stays < 2
-        // (pi sends only one CUU at startup) and the TUI is never detected
-        // — it stays in the BlockView where IME/cursor/color are broken.
+        // v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): DEC 2026 alone no longer
+        // counts. pi (coding-agent CLI) uses DEC 2026 synchronized output
+        // (?2026h) on every repaint PLUS real cursor addressing (CUP/CUU). The
+        // synchronization window only counts when non-trivial addressing is seen.
         let mut t = Terminal::new(5, 20);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
         // Startup: one CUU + CHR 1 (<2 ops, not detected yet).
         t.process("\x1b[3A\x1b[1G".as_bytes());
         assert!(!t.primary_screen_app_active(), "<2 ops: not yet a TUI");
         assert!(t.show_block_view());
-        // First keystroke: synchronized output begins → TUI detected.
+
+        // First keystroke: synchronized output begins, but bare ?2026h doesn't count.
         t.process("\x1b[?2026h".as_bytes());
         assert!(
+            !t.primary_screen_app_active(),
+            "bare DEC 2026 must NOT count as TUI evidence (v1.10.31 fix)"
+        );
+        assert!(
+            t.show_block_view(),
+            "still in block view before real addressing"
+        );
+
+        // Now add real cursor addressing (CUP) inside the window → TUI detected.
+        t.process("\x1b[5;3Hxx".as_bytes());
+        assert!(
             t.primary_screen_app_active(),
-            "DEC 2026 synchronized output must count as TUI evidence"
+            "DEC 2026 + CUP must count as TUI evidence"
         );
         assert!(
             !t.show_block_view(),
             "a detected TUI owns the screen — the live grid renders it"
         );
+    }
+
+    #[test]
+    fn bare_2026_without_addressing_does_not_classify() {
+        // v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): verify that pure DEC 2026
+        // frames without real cursor addressing never trigger TUI detection.
+        let mut t = Terminal::new(5, 20);
+        t.process(b"\x1b]133;A\x07\x1b]133;B\x07test\x1b]133;C\x07");
+
+        // Emit several DEC 2026 frames with only print (no cursor addressing)
+        for _ in 0..5 {
+            t.process(b"\x1b[?2026h");
+            t.process(b"content");
+            t.process(b"\x1b[?2026l");
+        }
+
+        assert!(
+            !t.primary_screen_app_active(),
+            "bare DEC 2026 frames must NOT trigger TUI detection"
+        );
+        assert!(t.show_block_view(), "should stay in block view");
     }
 
     #[test]

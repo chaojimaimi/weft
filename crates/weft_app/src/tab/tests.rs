@@ -607,6 +607,8 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
         .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
         .unwrap();
     assert_eq!(content_cols, 77);
+    // Calculate the expected Full width for this pane geometry.
+    let full_cols = 80; // TUI_PANE_RECT (800.0) / TUI_CELL_W (10.0) = 80 cols
     tab.active_mut()
         .terminal
         .as_mut()
@@ -614,6 +616,24 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
         .resize(rows, content_cols);
     let mut last_sent: Option<(usize, usize)> = Some((rows, content_cols));
     let mut emitted_ioctls = 0usize;
+
+    // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): The first alt entry here is
+    // ISOLATED (no recent exit) — it must flip to Full immediately: the
+    // less/vim startup path gets its ioctl before the app paints.
+    tab.process_pty_output(b"\x1b[?1049h");
+    let (_, isolated_cols) = tab
+        .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
+        .unwrap();
+    assert_eq!(
+        isolated_cols, full_cols,
+        "an isolated alt entry flips to Full immediately (less/vim startup)"
+    );
+    // Exiting creates the recent-exit stamp; every re-entry below is then a
+    // burst re-entry, which is what this storm test validates. Premise: each
+    // round's gap since the previous \x1b[?1049l stays under the 400ms
+    // ALT_REENTRY_BURST_MS window — a CI stall beyond it would read as an
+    // isolated entry (Full) and fail the Content assertions below.
+    tab.process_pty_output(b"\x1b[?1049l");
 
     // Walk 20 rounds of 1049h/l through the mirror site + the winsize ioctl
     // dedup rule exactly as `app_runtime::apply_pty_resize` does
@@ -627,17 +647,13 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
             .active_pane_dimensions_for_rect(TUI_PANE_RECT, TUI_CELL_W, TUI_CELL_H)
             .unwrap();
         assert_eq!(r, rows);
-        // v1.10.28: every transient (sub-250ms) alt phase stays Content —
-        // never Full, so no width transition reaches the ioctl path and the
-        // loop cannot re-arm itself. (The old pre-hysteresis behavior exposed
-        // a live Full target on the first lone flip; that flip now needs
-        // sustained residency, which a storm never accumulates. Premise: the
-        // gap between the 1049h above and this read stays far below 250ms —
-        // swap_alt re-stamps every round, so inter-round scheduling delays
-        // cannot age the residency.)
+        // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): After the initial recent exit,
+        // all burst re-entries stay at Content (77 cols) - no Full, so no
+        // ioctl reaches the path and the loop cannot re-arm itself.
         assert_eq!(
             cols, content_cols,
-            "round {round}: a transient alt phase never leaves Content"
+            "round {}: burst re-entry must stay at Content",
+            round
         );
         if Pane::should_send_winsize_ioctl(last_sent, (rows, cols)) {
             last_sent = Some((rows, cols));
@@ -670,9 +686,12 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
 
     // With the loop broken at the source the storm emits nothing (0 ioctls);
     // assert the exact count — no width change ever reaches the ioctl path.
+    // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): Burst re-entries stay at Content
+    // throughout, so the storm remains bounded. Isolated entries (which now
+    // go immediately to Full) are tested separately.
     assert_eq!(
         emitted_ioctls, 0,
-        "a 20-round transient toggle storm must emit ZERO winsize ioctls"
+        "a 20-round burst re-entry toggle storm must emit ZERO winsize ioctls"
     );
     // The pane ends on the primary Content constant — the pre-burst value.
     expire_alt_flip_history(&mut tab);

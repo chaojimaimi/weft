@@ -285,6 +285,9 @@ impl Terminal {
                 }
             }
             self.capabilities.alt_active = false;
+            // v1.10.30 (FIX_LESS_ALT_COLS_JUMP): record the exit instant so
+            // subsequent re-entries can distinguish isolated vs burst entry.
+            self.capabilities.alt_last_exit = Some(std::time::Instant::now());
             // v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): leaving the alt screen
             // clears the sustained-residency stamp; the primary screen has no
             // Full-width entitlement.

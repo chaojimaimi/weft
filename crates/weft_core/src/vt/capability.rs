@@ -60,6 +60,11 @@ pub(in crate::vt) struct CapabilityFlags {
     /// docs/FIX_TRANSIENT_ALT_COLS_FLIP.md). `None` while the primary screen
     /// is active; cleared on alt exit.
     pub(in crate::vt) alt_active_since: Option<Instant>,
+    /// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): `Instant` of the most recent alternate-screen exit
+    /// (set in `Terminal::swap_alt`). Drives the isolated vs burst re-entry detection: an alt entry
+    /// that occurs >= `ALT_REENTRY_BURST_MS` after the last exit is considered isolated and immediately
+    /// flips to Full (fixing less/vim startup jump). `None` means no recent exit (isolated entry);
+    pub(in crate::vt) alt_last_exit: Option<Instant>,
     pub(in crate::vt) mouse_protocol: MouseProtocol,
     /// SGR-1006 selects the SGR vs legacy mouse-report encoding.
     pub(in crate::vt) sgr_mouse: bool,
@@ -156,6 +161,12 @@ pub(in crate::vt) struct CapabilityFlags {
     /// layer consumes it (`Terminal::take_pending_screen_split_heads`) to
     /// compensate a detached block-scroll anchor for the inserted chrome rows.
     pub(in crate::vt) pending_screen_split_heads: Option<usize>,
+    /// v1.10.31 (FIX_BREW_PROGRESS_TUI_MISCLASSIFY): whether non-trivial cursor
+    /// addressing (CUP `H`, CUU/CUD `A`/`B`, VPA `d`, CHA with parameter >1)
+    /// has been seen inside the current DEC 2026 synchronized output window.
+    /// Brew progress frames (EL + CHA to column 1) never set this, so they don't
+    /// count toward TUI detection. Reset at each `?2026h` (window start).
+    pub(in crate::vt) synchronized_frame_addressing_seen: bool,
 }
 
 impl Default for CapabilityFlags {
@@ -163,6 +174,7 @@ impl Default for CapabilityFlags {
         Self {
             alt_active: false,
             alt_active_since: None,
+            alt_last_exit: None,
             mouse_protocol: MouseProtocol::Off,
             sgr_mouse: false,
             app_cursor_keys: false,
@@ -183,6 +195,7 @@ impl Default for CapabilityFlags {
             primary_screen_ownership: PrimaryScreenOwnership::default(),
             screen_history: ScreenHistory::default(),
             pending_screen_split_heads: None,
+            synchronized_frame_addressing_seen: false,
         }
     }
 }
@@ -439,6 +452,7 @@ mod tests {
         let f = flags();
         assert!(!f.alt_active);
         assert!(f.alt_active_since.is_none());
+        assert!(f.alt_last_exit.is_none());
         assert_eq!(f.mouse_protocol, MouseProtocol::Off);
         assert!(!f.sgr_mouse);
         assert!(!f.app_cursor_keys);
@@ -446,5 +460,6 @@ mod tests {
         assert!(f.primary_screen_exit.is_none());
         assert!(f.primary_screen_interrupt_capture.is_none());
         assert!(!f.primary_history_view);
+        assert!(!f.synchronized_frame_addressing_seen);
     }
 }
