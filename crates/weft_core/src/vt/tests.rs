@@ -1601,7 +1601,8 @@ fn progress_rewrites_are_compacted_in_detached_block_output() {
     t.process(b"\nDone\n\x1b]133;D;0\x07");
 
     let block = t.block_tracker().blocks().last().unwrap();
-    assert_eq!(block.output.as_ref(), "Upgrading...\nDone\n");
+    // Trailing '\n' stripped at finalize (PROMPT_SP tail-strip).
+    assert_eq!(block.output.as_ref(), "Upgrading...\nDone");
 }
 
 #[test]
@@ -1612,7 +1613,8 @@ fn horizontal_cursor_progress_rewrites_are_compacted_in_block_output() {
     t.process(b"\nDone\n\x1b]133;D;0\x07");
 
     let block = t.block_tracker().blocks().last().unwrap();
-    assert_eq!(block.output.as_ref(), "Upgrading...\nDone\n");
+    // Trailing '\n' stripped at finalize (PROMPT_SP tail-strip).
+    assert_eq!(block.output.as_ref(), "Upgrading...\nDone");
 }
 
 #[test]
@@ -1629,8 +1631,8 @@ fn multiline_progress_bar_repaints_in_place_via_cursor_up() {
     let block = t.block_tracker().blocks().last().unwrap();
     assert_eq!(
         block.output.as_ref(),
-        "pulling a:  50%\npulling b:  30%\npulling c:  10%\n",
-        "multi-line progress via CSI A must not grow rows"
+        "pulling a:  50%\npulling b:  30%\npulling c:  10%",
+        "multi-line progress via CSI A must not grow rows (trailing newline stripped at finalize)"
     );
 }
 
@@ -1670,8 +1672,8 @@ fn multiline_progress_bar_repaints_via_cursor_down_e_and_up_f() {
     let block = t.block_tracker().blocks().last().unwrap();
     assert_eq!(
         block.output.as_ref(),
-        "row1: 50%\nrow2: 30%\n",
-        "CSI E/F progress repaint must not grow rows"
+        "row1: 50%\nrow2: 30%",
+        "CSI E/F progress repaint must not grow rows (trailing newline stripped at finalize)"
     );
 }
 
@@ -2521,7 +2523,8 @@ fn osc133_lifecycle_produces_block() {
     assert_eq!(blocks.len(), 1);
     let b = &blocks[0];
     assert_eq!(b.command, "$ ls -la", "command = prompt row at 133;B");
-    assert_eq!(b.output.as_ref(), "file1\nfile2\n", "output captured B..D");
+    // Trailing '\n' stripped at finalize (PROMPT_SP tail-strip).
+    assert_eq!(b.output.as_ref(), "file1\nfile2", "output captured B..D");
     assert_eq!(b.exit_code, Some(0));
     assert_eq!(t.block_tracker().phase(), ShellPhase::AtPrompt);
 }

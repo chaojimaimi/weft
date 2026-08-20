@@ -15,6 +15,8 @@ use super::style::{
 #[cfg(test)]
 mod crlf_tests;
 mod cursor;
+#[cfg(test)]
+mod prompt_sp_tests;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutputCapture {
@@ -285,7 +287,7 @@ impl OutputCapture {
     /// are extracted, so it never participates in the style RLE.
     pub(crate) fn take_styled(&mut self) -> (String, Option<StyledOutput>) {
         let mut text = std::mem::take(&mut self.text);
-        let runs = std::mem::take(&mut self.style_runs);
+        let mut runs = std::mem::take(&mut self.style_runs);
         let overflow = self.style_overflow;
         let truncated = self.truncated;
         self.cursor = 0;
@@ -293,6 +295,25 @@ impl OutputCapture {
         self.line_start_char = 0;
         self.truncated = false;
         self.style_overflow = false;
+
+        // WHY: zsh's PROMPT_SP prompt-cleanup mechanism emits a full line
+        // width of literal spaces + \r\r before every prompt; those bytes
+        // land inside the OSC 133;C→D capture window and used to be stored
+        // as trailing block output (cols=99 → exactly 99 trailing spaces).
+        // Strip the trailing whitespace run at finalize. See
+        // docs/FIX_CAPTURE_PROMPT_SP_SPACES.md.
+        let trimmed_len = text.trim_end().len();
+        if trimmed_len < text.len() {
+            text.truncate(trimmed_len);
+            // Style runs are char-indexed over the pre-strip buffer — drop
+            // runs that fall entirely inside the stripped tail and clamp
+            // the survivors so none index past the new text end.
+            let new_char_count = text.chars().count() as u32;
+            runs.retain(|run| run.start_char < new_char_count);
+            for run in &mut runs {
+                run.end_char = run.end_char.min(new_char_count);
+            }
+        }
 
         let styled = if overflow || runs.is_empty() {
             None
@@ -646,7 +667,8 @@ mod tests {
         output.carriage_return();
         output.erase_line(2);
         let (text, styled) = output.take_styled();
-        assert_eq!(text, "line1\n");
+        // PROMPT_SP tail-strip: the finalized text drops the trailing '\n'.
+        assert_eq!(text, "line1");
         let styled = styled.expect("styled");
         assert_eq!(
             styled.line(0).expect("line 0").foreground_at(0),

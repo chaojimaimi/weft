@@ -542,9 +542,10 @@ mod tests {
         let block = run_one(&mut t, "ls -la", "file_a\nfile_b", 0);
 
         assert_eq!(block.command, "ls -la");
-        // run_one splits on '\n' and appends a newline after each segment,
-        // so "file_a\nfile_b" → "file_a\nfile_b\n".
-        assert_eq!(block.output.as_ref(), "file_a\nfile_b\n");
+        // run_one splits on '\n' and appends a newline after each segment
+        // ("file_a\nfile_b\n"); take_styled's PROMPT_SP tail-strip drops the
+        // finalized block's trailing '\n'.
+        assert_eq!(block.output.as_ref(), "file_a\nfile_b");
         assert_eq!(block.exit_code, Some(0));
         assert!(block.finished_at.is_some());
         assert!(block.finished_at.unwrap() >= block.started_at);
@@ -917,7 +918,8 @@ mod tests {
         let mut t = BlockTracker::new();
         let block = run_one(&mut t, "", "some output", 0);
         assert_eq!(block.command, "");
-        assert_eq!(block.output.as_ref(), "some output\n");
+        // Trailing '\n' stripped at finalize (PROMPT_SP tail-strip).
+        assert_eq!(block.output.as_ref(), "some output");
         assert_eq!(block.exit_code, Some(0));
         assert_eq!(t.blocks().len(), 1);
     }
