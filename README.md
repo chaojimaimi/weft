@@ -15,7 +15,7 @@ A modern macOS terminal emulator with block-based command history, Metal GPU ren
 - **Settings UI** — Cmd+, opens Appearance/Font/Keybindings/Window/Local AI/Advanced settings with profiles
 - **Command palette** — Cmd+P fuzzy command runner + workflow execution
 - **History sidebar** — Cmd+Shift+B searchable, click-to-scroll command history
-- **Context menu** — F7 for Copy Command/Toggle Fold/Send to Input
+- **Context menu** — right-click a block for Copy Command / Copy Output / **Copy Block** (cwd + `$ command` + output in one paste) / Toggle Fold / Send to Input / Bookmark / Note / Export / AI Diagnose; keyboard navigation and mouse hover both track selection
 - **Logo variants** — 4 Dock icon variants (Cool/Warm/Light/Transparent) switchable in Settings
 - **IME + CJK** — full Unicode-width-aware glyph layout
 - **Smart Select** — Cmd+Shift+Click selects URLs, paths, locations, hosts and hashes consistently in Grid/Block view; Cmd+Option+Click explicitly opens safe http(s) URLs or reveals existing local paths
@@ -101,7 +101,7 @@ Settings UI (Cmd+,) writes changes back to disk, preserving comments.
 | History sidebar | Cmd+Shift+B |
 | Settings | Cmd+, |
 | Toggle theme | Cmd+Shift+T |
-| Context menu | F7 |
+| Block context menu | Right-click a block |
 | Copy/Paste | Cmd+C / Cmd+V |
 | Smart Select | Cmd+Shift+Click |
 | Open/reveal Smart target | Cmd+Option+Click |
