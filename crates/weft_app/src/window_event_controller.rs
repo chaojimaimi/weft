@@ -263,6 +263,14 @@ impl App {
                     self.handle_tab_drag_move(position.x, position.y);
                     return;
                 }
+                // v1.10.34: context menu hover — update the highlighted item
+                // as the pointer slides over the menu. The menu is modal
+                // (route_modal_pointer returns Consume below), so this is the
+                // only pointer handling that runs while it is open.
+                if self.interaction.context_menu.is_some() {
+                    self.update_context_menu_hover(position.x, position.y);
+                    return;
+                }
                 if crate::input_router::route_modal_pointer(
                     self.palette.open,
                     self.settings.open,

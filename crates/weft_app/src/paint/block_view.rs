@@ -111,7 +111,16 @@ impl MetalRenderer {
         if cwd_header_active {
             let cwd = cwd.expect("active fixed CWD has text");
             let fixed_y = layout.fixed_cwd_y;
-            let (sep_y0, sep_y1) = snap_physical_rect(fixed_y, fixed_y + 2.0);
+            // v1.10.34: draw the separator INSIDE the band the layout
+            // reserves for it ([clip_bottom, fixed_cwd_y) — one pitch), with
+            // a gap above the CWD text. It was previously drawn at
+            // [fixed_y, fixed_y+2.0] — flush against the text's top edge,
+            // which read as the CWD being visually cut off by the line.
+            // The gap (0.35*pitch above the text top, i.e. 0.65*pitch below
+            // the band top) keeps breathing room to the text while staying
+            // clear of the scrolled content above.
+            let gap = 0.35 * pitch;
+            let (sep_y0, sep_y1) = snap_physical_rect(fixed_y - gap - 2.0, fixed_y - gap);
             push_quad(
                 &mut verts,
                 [frame_left, sep_y0, frame_right, sep_y1],

@@ -126,6 +126,36 @@ pub struct InFlightBlock<'a> {
     pub screen_origin: bool,
 }
 
+/// v1.10.34: combined block copy ("Copy Block" context action) — format a
+/// block's cwd + command + output as one paste-ready snippet:
+///
+/// ```text
+/// ~/code/weft
+/// $ cargo test
+/// test result: ok. 2317 passed
+/// ```
+///
+/// Empty parts are skipped (no blank filler lines); the output is appended
+/// verbatim. Returns an empty string when all three parts are empty, letting
+/// callers decide whether an empty clipboard write makes sense (it doesn't —
+/// the caller keeps `clipboard_text` as `None`).
+pub fn format_block_for_copy(cwd: Option<&str>, command: &str, output: &str) -> String {
+    let mut out = String::new();
+    if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
+        out.push_str(cwd);
+        out.push('\n');
+    }
+    if !command.is_empty() {
+        out.push_str("$ ");
+        out.push_str(command);
+        if !output.is_empty() {
+            out.push('\n');
+        }
+    }
+    out.push_str(output);
+    out
+}
+
 /// Shell-phase state machine driven by OSC 133. v0.4 uses it only to
 /// gate output capture and mark integration readiness; the derived
 /// `InputMode` (AtPrompt → editor) is a v0.5 concern.
@@ -526,6 +556,34 @@ mod tests {
         assert!(!t.bootstrap_ready());
         assert!(t.blocks().is_empty());
         assert!(!t.is_capturing());
+    }
+
+    #[test]
+    fn format_block_for_copy_full_block() {
+        let s = format_block_for_copy(
+            Some("/Users/andylee/code"),
+            "cargo test",
+            "test result: ok. 2317 passed",
+        );
+        assert_eq!(s, "/Users/andylee/code\n$ cargo test\ntest result: ok. 2317 passed");
+    }
+
+    #[test]
+    fn format_block_for_copy_skips_empty_parts() {
+        // No cwd → starts at the command; no command → just the output.
+        assert_eq!(
+            format_block_for_copy(None, "ls", "file.txt"),
+            "$ ls\nfile.txt"
+        );
+        // Command-only block (empty output).
+        assert_eq!(format_block_for_copy(Some("~"), "cd ..", ""), "~\n$ cd ..");
+        // Empty-string cwd is treated like None (no blank line).
+        assert_eq!(format_block_for_copy(Some(""), "ls", "out"), "$ ls\nout");
+    }
+
+    #[test]
+    fn format_block_for_copy_all_empty_is_empty() {
+        assert_eq!(format_block_for_copy(None, "", ""), "");
     }
 
     #[test]

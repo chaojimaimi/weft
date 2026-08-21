@@ -267,6 +267,11 @@ struct App {
 const CONTEXT_MENU_ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
     ("Copy Command", "copy_command"),
     ("Copy Output", "copy_output"),
+    // v1.10.34: combined copy — cwd + command + output in one paste-ready
+    // snippet (see weft_core::blocks::format_block_for_copy). Solves the
+    // "analyze a command result" flow that previously needed 2-3 separate
+    // copies, since drag selection cannot cross block structural rows.
+    ("Copy Block", "copy_block"),
     ("Toggle Fold", "toggle_fold"),
     // v0.9 W4: send the block's command to the input box for re-editing
     // (Warp-style "rerun" — user can tweak parameters before pressing Enter).

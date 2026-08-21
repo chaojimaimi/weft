@@ -484,13 +484,13 @@ fn context_menu_basic_click() {
     let scale = 2.0;
     let layout = layout_context_menu(&ctx, x, y, scale);
 
-    // menu_w = 180 * 2 = 360; menu_h = 8 * (16.8*1.2) + 16.8*0.4
-    //                  = 8 * 20.16 + 6.72 = 161.28 + 6.72 = 168.0
+    // menu_w = 180 * 2 = 360; menu_h = 9 * (16.8*1.2) + 16.8*0.4
+    //                  = 9 * 20.16 + 6.72 = 181.44 + 6.72 = 188.16
     // 800 + 360 = 1160 ≤ 1600 - 4 → no clamp
     assert!((layout.menu_rect[0] - 800.0).abs() < 1e-3);
     assert!((layout.menu_rect[1] - 600.0).abs() < 1e-3);
     assert!((layout.menu_rect[2] - 1160.0).abs() < 1e-3);
-    assert!((layout.menu_rect[3] - 768.0).abs() < 1e-3);
+    assert!((layout.menu_rect[3] - 788.16).abs() < 1e-3);
     // item_y[0] = 600 + 0.2*16.8 = 603.36; each subsequent +20.16
     assert!((layout.item_y[0] - 603.36).abs() < 1e-3);
     assert!((layout.item_y[1] - 623.52).abs() < 1e-3);
@@ -506,8 +506,10 @@ fn context_menu_basic_click() {
     assert_eq!(layout.item_at(900.0, 630.0), Some(1));
     assert_eq!(layout.item_at(900.0, 670.0), Some(3));
     assert_eq!(layout.item_at(900.0, 730.0), Some(6));
+    assert_eq!(layout.item_at(900.0, 770.0), Some(8));
     assert_eq!(layout.item_at(700.0, 610.0), None);
-    assert_eq!(layout.item_at(900.0, 780.0), None);
+    // Below the 9-item menu bottom (788.16) — no item owns this point.
+    assert_eq!(layout.item_at(900.0, 795.0), None);
 }
 
 #[test]
@@ -551,11 +553,11 @@ fn context_menu_clamps_negative_x_to_zero() {
 #[test]
 fn context_menu_flips_upward_near_bottom() {
     let ctx = sample_ctx(); // vp_h = 1200
-    let scale = 2.0; // menu_h = 8 * (16.8*1.2) + 16.8*0.4 = 168.0
-                     // Click at y=1180 (near bottom): 1180 + 168.0 = 1348.0 > 1196 → flip.
+    let scale = 2.0; // menu_h = 9 * (16.8*1.2) + 16.8*0.4 = 188.16
+                     // Click at y=1180 (near bottom): 1180 + 188.16 = 1368.16 > 1196 → flip.
     let layout = layout_context_menu(&ctx, 100.0, 1180.0, scale);
-    // menu_y0 = 1180 - 168.0 = 1012.0
-    assert!((layout.menu_rect[1] - 1012.0).abs() < 1e-3);
+    // menu_y0 = 1180 - 188.16 = 991.84
+    assert!((layout.menu_rect[1] - 991.84).abs() < 1e-3);
     assert!(layout.menu_rect[3] <= 1200.0 - 4.0 + 1e-3);
 }
 
@@ -564,7 +566,7 @@ fn context_menu_flips_upward_near_bottom() {
 fn context_menu_opens_downward_with_space() {
     let ctx = sample_ctx();
     let scale = 2.0;
-    // Click at y=500: 500 + 168.0 = 668.0 < 1196 → no flip.
+    // Click at y=500: 500 + 188.16 = 688.16 < 1196 → no flip.
     let layout = layout_context_menu(&ctx, 100.0, 500.0, scale);
     assert!((layout.menu_rect[1] - 500.0).abs() < 1e-3);
 }

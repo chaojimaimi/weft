@@ -485,14 +485,7 @@ impl App {
 
     /// Execute a context menu action based on click position.
     pub(super) fn execute_context_menu(&mut self, menu: &ContextMenu, click_x: f32, click_y: f32) {
-        let hit = self.renderer.as_ref().and_then(|renderer| {
-            let ctx = renderer.layout_ctx?;
-            let layout =
-                crate::layout::layout_context_menu(&ctx, menu.x, menu.y, renderer.scale() as f32);
-            let scene =
-                crate::context_menu_component::build_context_menu_scene(layout, CONTEXT_MENU_ITEMS);
-            crate::context_menu_component::context_menu_item_at(&scene, click_x, click_y)
-        });
+        let hit = self.context_menu_hit_at_anchor(menu.x, menu.y, click_x, click_y);
         if let Some(i) = hit {
             let action = CONTEXT_MENU_ITEMS[i].1;
             self.run_context_action(menu.block_id, action);
@@ -501,6 +494,45 @@ impl App {
         }
         // Click outside menu items — just close (already taken).
         self.request_redraw();
+    }
+
+    /// v1.10.34: context menu hover — move the highlighted item as the
+    /// pointer slides across the menu, mirroring the keyboard `Select` path
+    /// (context_menu_key_action). Before this, the highlight stayed on the
+    /// initial item because CursorMoved with an open menu was consumed by
+    /// route_modal_pointer and never reached any hover logic.
+    pub(super) fn update_context_menu_hover(&mut self, x: f64, y: f64) {
+        let Some((menu_x, menu_y)) = self
+            .interaction
+            .context_menu
+            .as_ref()
+            .map(|m| (m.x, m.y))
+        else {
+            return;
+        };
+        let hit = self.context_menu_hit_at_anchor(menu_x, menu_y, x as f32, y as f32);
+        if let Some(i) = hit {
+            if let Some(menu) = self.interaction.context_menu.as_mut() {
+                if menu.selection != i {
+                    menu.selection = i;
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Shared hit-test: rebuild the context menu Scene from the menu's
+    /// anchor + renderer geometry and resolve which item (if any) contains
+    /// the given point. Used by both the click executor and the hover path.
+    fn context_menu_hit_at_anchor(&self, menu_x: f32, menu_y: f32, x: f32, y: f32) -> Option<usize> {
+        self.renderer.as_ref().and_then(|renderer| {
+            let ctx = renderer.layout_ctx?;
+            let layout =
+                crate::layout::layout_context_menu(&ctx, menu_x, menu_y, renderer.scale() as f32);
+            let scene =
+                crate::context_menu_component::build_context_menu_scene(layout, CONTEXT_MENU_ITEMS);
+            crate::context_menu_component::context_menu_item_at(&scene, x, y)
+        })
     }
 
     /// Run a context menu action on the target block.
@@ -522,17 +554,26 @@ impl App {
             };
 
             match action {
-                "copy_command" | "copy_output" if block_id.is_none() => {
+                "copy_command" | "copy_output" | "copy_block" if block_id.is_none() => {
                     if let Some(live) = terminal.block_tracker().in_flight() {
                         let text = if action == "copy_command" {
                             live.command.to_string()
-                        } else {
+                        } else if action == "copy_output" {
                             live.output.to_string()
+                        } else {
+                            // v1.10.34: combined copy — cwd + command + output.
+                            weft_core::blocks::format_block_for_copy(
+                                live.cwd,
+                                live.command,
+                                live.output,
+                            )
                         };
-                        clipboard_text = Some(text);
+                        if !text.is_empty() {
+                            clipboard_text = Some(text);
+                        }
                     }
                 }
-                "copy_command" | "copy_output" => {
+                "copy_command" | "copy_output" | "copy_block" => {
                     let bid = block_id.expect("copy branch has a finalized block id");
                     let block = terminal
                         .block_tracker()
@@ -540,11 +581,20 @@ impl App {
                         .iter()
                         .find(|b| b.id == bid);
                     if let Some(block) = block {
-                        clipboard_text = Some(if action == "copy_command" {
+                        let text = if action == "copy_command" {
                             block.command.clone()
-                        } else {
+                        } else if action == "copy_output" {
                             block.output.to_string()
-                        });
+                        } else {
+                            weft_core::blocks::format_block_for_copy(
+                                block.cwd.as_deref(),
+                                &block.command,
+                                &block.output,
+                            )
+                        };
+                        if !text.is_empty() {
+                            clipboard_text = Some(text);
+                        }
                     }
                 }
                 "toggle_fold" => {

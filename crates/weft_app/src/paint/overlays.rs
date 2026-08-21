@@ -97,6 +97,7 @@ impl MetalRenderer {
         let items = [
             "Copy Command",
             "Copy Output",
+            "Copy Block",
             "Toggle Fold",
             "Send to Input",
             "Toggle Bookmark",
@@ -121,9 +122,11 @@ impl MetalRenderer {
         // Items.
         let selected =
             crate::context_menu_component::clamped_context_menu_selection(selection, items.len());
-        // v1.7.3-C: last 3 items (Bookmark / Add Note / Export) in accent
-        // to set them apart from the original 4 editing actions.
-        let accent_start = items.len() - 3;
+        // v1.7.3-C: the reuse group (Bookmark / Add Note / Export) renders in
+        // accent to set it apart from the editing actions. v1.10.34: fixed
+        // semantic anchor — `len - 3` drifted when "Copy Block" (index 2) was
+        // inserted and "Diagnose with AI" (last) must stay normal-fg.
+        let accent_start = 5;
         for (i, label) in items.iter().enumerate() {
             let item_y = layout.item_y[i];
             if selected == Some(i) {

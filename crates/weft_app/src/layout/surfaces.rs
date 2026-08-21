@@ -237,7 +237,8 @@ pub fn layout_palette_form_rect(ctx: &LayoutCtx, n_fields: usize, popup_width_sc
 /// v1.7.3-C: Number of items in the block context menu. Update this and
 /// `CONTEXT_MENU_ITEMS` in `main.rs` together.
 /// v1.8.2: Added "Diagnose with AI" as the 8th item.
-pub const CONTEXT_MENU_ITEM_COUNT: usize = 8;
+/// v1.10.34: Added "Copy Block" (cwd+command+output) as the 3rd item.
+pub const CONTEXT_MENU_ITEM_COUNT: usize = 9;
 
 /// Layout for the block context menu.
 #[derive(Clone, Copy, Debug)]

@@ -106,6 +106,7 @@ mod tests {
     const ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
         ("Copy Command", "copy_command"),
         ("Copy Output", "copy_output"),
+        ("Copy Block", "copy_block"),
         ("Toggle Fold", "toggle_fold"),
         ("Send to Input", "send_to_input"),
         ("Toggle Bookmark", "toggle_bookmark"),
@@ -190,7 +191,7 @@ mod tests {
         );
         assert_eq!(
             context_menu_key_action(KeyCode::Tab, Modifiers::SHIFT, 0, ITEMS.len()),
-            ContextMenuKeyAction::Select(7)
+            ContextMenuKeyAction::Select(ITEMS.len() - 1)
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageUp, Modifiers::empty(), 2, ITEMS.len()),
@@ -198,7 +199,7 @@ mod tests {
         );
         assert_eq!(
             context_menu_key_action(KeyCode::PageDown, Modifiers::empty(), 1, ITEMS.len()),
-            ContextMenuKeyAction::Select(7)
+            ContextMenuKeyAction::Select(ITEMS.len() - 1)
         );
     }
 }
