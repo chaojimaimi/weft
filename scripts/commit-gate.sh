@@ -18,7 +18,14 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# v1.10.34 修复：hook 经符号链接 .git/hooks/pre-commit 调用时 $0 是链接路径，
+# `dirname $0/..` 解析到 .git/ 并 cd 进去——.git 内无 work tree，git diff --cached
+# 静默返回空，Check 1/2 全部漏检（07-28 装 hook 起所有 .rs 提交绕过审查门）。
+# 改用 git rev-parse 定位 worktree 根（hook 启动时 cwd 即仓库根），保留原逻辑回退。
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$ROOT" ]; then
+  ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fi
 cd "$ROOT"
 
 MARKER=".zcode/review-passed"
