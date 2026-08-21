@@ -28,3 +28,7 @@ weft.log
 
 # Icon generation intermediate files (kept .icns only)
 assets/icon.iconset/
+
+# Internal engineering docs (kept local, not for the public repo)
+# 2026-08-21: untracked via `git rm -r --cached docs/` — see analysis before force-purge
+/docs/
