@@ -32,6 +32,8 @@ mod output_capture;
 mod screen_capture;
 
 #[cfg(test)]
+mod orphan_finalize_tests;
+#[cfg(test)]
 mod screen_capture_tests;
 mod semantic;
 mod style;
@@ -565,7 +567,10 @@ mod tests {
             "cargo test",
             "test result: ok. 2317 passed",
         );
-        assert_eq!(s, "/Users/andylee/code\n$ cargo test\ntest result: ok. 2317 passed");
+        assert_eq!(
+            s,
+            "/Users/andylee/code\n$ cargo test\ntest result: ok. 2317 passed"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{Block, BlockId, BlockTracker};
+use super::{Block, BlockId, BlockTracker, OutputCapture};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -40,6 +40,41 @@ impl BlockTracker {
             block_id = candidate.0,
             "activated primary-screen continuation"
         );
+    }
+
+    /// FIX_ORPHAN_PARSE_ERROR_OUTPUT: synthesize a finished block for a
+    /// command whose `133;D` arrived WITHOUT any preceding `133;B` — zsh
+    /// reported a parse error before preexec could fire, so the error output
+    /// was staged on the `Terminal` (never captured in-flight) and the plain
+    /// [`Self::on_command_end`] path would have been a noop.
+    ///
+    /// Replays the missing `on_command_start` bookkeeping (pending metadata +
+    /// swapping the staged capture in as the block output), then delegates to
+    /// the SAME [`Self::finalize`] path as a normal command: identical Block
+    /// construction, dirty marking, and unpersisted queue, so persistence /
+    /// history stay uniform. `phase` is never touched — the caller arrives at
+    /// AtPrompt (B never flipped it) and stays there, matching
+    /// `on_command_end`'s end state.
+    ///
+    /// `pub(crate)` (not `pub`) because the signature carries the
+    /// crate-private [`OutputCapture`]; the only caller lives in
+    /// `crate::vt::perform`.
+    pub(crate) fn on_orphan_command_end(
+        &mut self,
+        exit_code: i32,
+        command: String,
+        mut staged: OutputCapture,
+    ) {
+        self.pending_command = Some(command);
+        self.pending_started = Some(SystemTime::now());
+        self.pending_cwd = self.current_cwd.clone();
+        self.styled_output = None;
+        self.screen_document_start = None;
+        // After the swap `staged` only holds the previous in-flight capture
+        // (empty on every real path — finalize always drained it); the local
+        // drops at function end, so no explicit clear is needed.
+        std::mem::swap(&mut self.output, &mut staged);
+        self.finalize(Some(exit_code));
     }
 
     /// Finalize the in-flight command. Screen sessions that explicitly link

@@ -9,6 +9,7 @@ mod grapheme;
 mod osc;
 mod perform;
 mod screen_exit;
+mod staging;
 pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
 pub use screen_exit::{
@@ -19,7 +20,7 @@ pub use screen_exit::{
 #[cfg(test)]
 pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
-use crate::blocks::{BlockTracker, CapturedStyle, ShellPhase};
+use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture, ShellPhase};
 use crate::editor::Editor;
 use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
@@ -40,6 +41,14 @@ pub struct Terminal {
     git_branch: Option<String>,
     /// Editor command awaiting `133;B`; keeps the preexec window passthrough.
     command_from_editor: Option<String>,
+    /// FIX_ORPHAN_PARSE_ERROR_OUTPUT: bytes printed between editor submission
+    /// and `133;B` (ZLE repaints, or a whole parse-error report when zsh
+    /// rejects the line before preexec). Routed here because the in-flight
+    /// capture gate requires `phase == CommandExecuting`, which does not hold
+    /// before `133;B`. A normal `133;B` discards it (the ZLE echo must never
+    /// enter a block); an orphan `133;D` (B missing — parse error) becomes a
+    /// synthesized block's output via `BlockTracker::on_orphan_command_end`.
+    preexec_staging: OutputCapture,
     pub bracketed_paste: bool,
     /// Origin mode (DECOM, CSI ?6h/l).
     origin_mode: bool,
@@ -97,6 +106,7 @@ impl Terminal {
             cwd: None,
             git_branch: None,
             command_from_editor: None,
+            preexec_staging: OutputCapture::default(),
             bracketed_paste: false,
             origin_mode: false,
             cursor_visible: true,
@@ -192,6 +202,13 @@ impl Terminal {
         self.command_from_editor.is_some()
     }
 
+    /// Test observability for the preexec staging buffer (see
+    /// `blocks::orphan_finalize_tests`): byte length of staged content.
+    #[cfg(test)]
+    pub(crate) fn preexec_staging_len(&self) -> usize {
+        self.preexec_staging.as_str().len()
+    }
+
     /// Whether the alternate screen buffer is currently active.
     pub fn is_alt_screen_active(&self) -> bool {
         self.capabilities.alt_active
@@ -277,6 +294,10 @@ impl Terminal {
             // invalidates any cell_map entries from the primary grid.
             self.hyperlinks.clear_cell_map();
             self.active_hyperlink_id = None;
+            // FIX_ORPHAN_PARSE_ERROR_OUTPUT: a TUI taking the alt screen
+            // invalidates the staged pre-exec line bytes — drop them so no
+            // later orphan `133;D` can synthesize a block from dead context.
+            self.preexec_staging.clear();
         } else {
             std::mem::swap(&mut self.grid, &mut self.alt_grid);
             if save_cursor_and_clear {
@@ -418,7 +439,6 @@ impl Terminal {
         if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
             self.grid.scroll_offset = 0;
         }
-        let capturing = !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting;
         let num_cols = self.grid.num_cols;
         let num_rows = self.grid.num_rows;
         let fg = self.attrs.fg;
@@ -483,14 +503,17 @@ impl Terminal {
             let count = remaining_in_row.min(remaining_bytes);
             let chunk = &bytes[offset..offset + count];
 
-            // Batch capture to block tracker — one push_str instead of N pushes.
+            // Batch capture to the active sink — one push instead of N pushes.
             // v1.7.0-A: capture the current VT SGR attrs for the whole ASCII
             // run — all bytes share one style since the fast path only fires
             // when no SGR change occurred mid-run.
-            if capturing {
+            // FIX_ORPHAN_PARSE_ERROR_OUTPUT: sink selection lives in
+            // staging.rs — in-flight capture while CommandExecuting, preexec
+            // staging between editor submit and 133;B.
+            {
                 let style =
                     CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
-                self.block_tracker.on_print_ascii_run(chunk, style);
+                self.capture_print_ascii_run(chunk, style);
             }
             {
                 let style =

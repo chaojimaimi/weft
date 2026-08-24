@@ -26,14 +26,14 @@ impl vte::Perform for Terminal {
             self.grid.scroll_offset = 0;
         }
 
-        // Feed the printed char to the active command block's output capture.
-        // v1.0 perf: check is_capturing() here to skip the function call
-        // overhead when not capturing (e.g. AtPrompt, NotIntegrated).
+        // Feed the printed char to the active sink: in-flight block capture
+        // while CommandExecuting, preexec staging between editor submit and
+        // `133;B` (FIX_ORPHAN_PARSE_ERROR_OUTPUT), nothing otherwise.
         // v1.7.0-A: capture the current VT SGR attrs so the block preserves
         // program-emitted colors after the live grid scrolls away.
-        if !self.capabilities.alt_active && phase == ShellPhase::CommandExecuting {
+        {
             let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
-            self.block_tracker.on_print(c, style);
+            self.capture_print(c, style);
         }
         {
             let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
@@ -296,30 +296,23 @@ impl vte::Perform for Terminal {
             0x07 => { /* BEL — bell, ignored in v0.1 */ }
             0x08 => {
                 self.grid.backspace();
-                if !self.capabilities.alt_active {
-                    self.block_tracker.on_backspace();
-                }
+                self.capture_backspace();
                 self.capture_primary_screen_interrupt_backspace();
             }
             0x09 => {
                 // Tab is a C0 control, so the print path never sees it — but
                 // columnar tools (ls, etc.) separate fields with tabs. Mirror
-                // the cursor's tab advance into the captured block output as
-                // spaces, otherwise the block view concatenates the fields.
+                // the cursor's tab advance into the active sink as spaces,
+                // otherwise the block view concatenates the fields.
                 let prev_col = self.grid.cursor.col;
                 self.grid.advance_tab(1);
-                // v1.0 perf: skip on_print calls when not capturing.
-                if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
+                {
                     let advanced = self.grid.cursor.col.saturating_sub(prev_col);
                     let style =
                         CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
                     for _ in 0..advanced {
-                        self.block_tracker.on_print(' ', style);
+                        self.capture_print(' ', style);
                     }
-                }
-                {
-                    let style =
-                        CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
                     for _ in 0..self.grid.cursor.col.saturating_sub(prev_col) {
                         self.capture_primary_screen_interrupt_print(' ', style);
                     }
@@ -329,10 +322,7 @@ impl vte::Perform for Terminal {
                 // LF, VT, FF → move to next line (CR+LF on Unix terminals).
                 // The raw VT `index()` only moves down; Unix terminals
                 // treat LF as newline (carriage return + index).
-                // v1.0 perf: skip on_newline call when not capturing.
-                if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
-                    self.block_tracker.on_newline();
-                }
+                self.capture_newline();
                 self.capture_primary_screen_interrupt_newline();
                 self.grid.carriage_return();
                 if self.index_primary_screen() {
@@ -341,9 +331,7 @@ impl vte::Perform for Terminal {
             }
             0x0D => {
                 self.grid.carriage_return();
-                if !self.capabilities.alt_active {
-                    self.block_tracker.on_carriage_return();
-                }
+                self.capture_carriage_return();
                 self.capture_primary_screen_interrupt_carriage_return();
             }
             _ => tracing::trace!(byte, "unhandled execute"),
@@ -524,9 +512,7 @@ impl vte::Perform for Terminal {
                     }
                     _ => {}
                 }
-                if !self.capabilities.alt_active {
-                    self.block_tracker.on_erase_line(mode);
-                }
+                self.capture_erase_line(mode);
                 self.capture_primary_screen_interrupt_erase_line(mode);
             }
             'X' => {
@@ -849,8 +835,34 @@ impl vte::Perform for Terminal {
                             // (crashed / non-integrated sub-shell) can't pin the
                             // editor in passthrough forever.
                             self.command_from_editor = None;
+                            // FIX_ORPHAN_PARSE_ERROR_OUTPUT: same staleness
+                            // guard for the staging buffer — a D-less sequence
+                            // (interrupted / crashed shell) must not leak its
+                            // staged bytes into a LATER command's block.
+                            let stale = self.drop_preexec_staging();
+                            if stale > 0 {
+                                tracing::warn!(
+                                    bytes = stale,
+                                    "133;A without 133;B/D: dropped stale pre-exec staging"
+                                );
+                            }
                         }
                         b"B" => {
+                            // FIX_ORPHAN_PARSE_ERROR_OUTPUT (normal path): the
+                            // ZLE repaint of the accepted line staged between
+                            // editor submit and preexec must never enter a
+                            // block — discard it here. This is also the timing
+                            // mutex with the orphan-D synthesis below: B both
+                            // clears the staging and consumes
+                            // `command_from_editor`, so a later D can only
+                            // synthesize when THIS branch did not run.
+                            let staged = self.drop_preexec_staging();
+                            if staged > 0 {
+                                tracing::trace!(
+                                    bytes = staged,
+                                    "133;B discarded pre-exec staging (ZLE echo)"
+                                );
+                            }
                             // v1.10.7: nested-shell guard. A screen-owned TUI
                             // session (pi/openclaw) whose shell integration runs
                             // inside the app (pi spawns interactive zsh) emits
@@ -958,6 +970,22 @@ impl vte::Perform for Terminal {
                                         pending.exit_code = Some(exit_code);
                                     }
                                 }
+                            } else if let Some((command, staged)) = self.take_orphan_staging() {
+                                // FIX_ORPHAN_PARSE_ERROR_OUTPUT (parse-error
+                                // path): zsh rejected the line before preexec,
+                                // so no `133;B` ever opened a capture window.
+                                // Build the block retroactively from the
+                                // staged error output instead of dropping it
+                                // on the floor (previously this arm was a bare
+                                // noop — blocks.db had no record at all).
+                                tracing::info!(
+                                    rc = exit_code,
+                                    bytes = staged.as_str().len(),
+                                    command = %command,
+                                    "orphan 133;D: synthesizing block from pre-exec staging"
+                                );
+                                self.block_tracker
+                                    .on_orphan_command_end(exit_code, command, staged);
                             } else {
                                 self.block_tracker.on_command_end(exit_code);
                             }
