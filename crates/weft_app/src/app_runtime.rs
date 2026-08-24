@@ -87,6 +87,13 @@ pub(super) fn terminal_capability_env() -> Vec<(String, String)> {
     vec![
         ("TERM".into(), "xterm-256color".into()),
         ("COLORTERM".into(), "truecolor".into()),
+        // v1.10: BSD `ls` only colorizes with `-G` or CLICOLOR=1. Setting it
+        // here makes plain `ls` color directories (SGR 34 → theme palette[4])
+        // while regular files keep the default foreground, so directory tint
+        // follows the active theme automatically. LSCOLORS is deliberately
+        // NOT set: the macOS default already matches, keeping us minimally
+        // invasive — user dotfiles stay free to override either variable.
+        ("CLICOLOR".into(), "1".into()),
         ("TERM_PROGRAM".into(), "Weft".into()),
         (
             "TERM_PROGRAM_VERSION".into(),
@@ -894,6 +901,7 @@ mod tests {
         let value = |key: &str| env.iter().find(|(name, _)| name == key).map(|(_, v)| v);
         assert_eq!(value("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(value("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert_eq!(value("CLICOLOR").map(String::as_str), Some("1"));
         assert_eq!(value("TERM_PROGRAM").map(String::as_str), Some("Weft"));
     }
 
@@ -906,6 +914,9 @@ mod tests {
         assert!(env
             .iter()
             .any(|pair| pair == &("COLORTERM".into(), "truecolor".into())));
+        assert!(env
+            .iter()
+            .any(|pair| pair == &("CLICOLOR".into(), "1".into())));
     }
 
     use std::time::SystemTime;
