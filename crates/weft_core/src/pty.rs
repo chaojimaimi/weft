@@ -4,9 +4,11 @@
 //! and handles window resize via `TIOCSWINSZ`.
 
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::time::{Duration, Instant};
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::{forkpty, ForkptyResult, Winsize};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{self, Pid};
@@ -231,23 +233,35 @@ impl Pty {
 
     /// Write bytes synchronously (for use before tokio runtime or in tests).
     ///
-    /// v1.0 fix: does NOT retry on EAGAIN. The PTY master fd is non-blocking,
-    /// and retrying would block the event loop for up to 1 second — freezing
-    /// the UI when the PTY write buffer is full (e.g. a command is producing
-    /// heavy output and weft hasn't drained its read side yet). Instead, EAGAIN
-    /// returns immediately and the caller can decide on a fallback (e.g.
-    /// `send_interrupt` for Ctrl+C).
+    /// FIX_TERMINAL_CAPABILITY_HARDENING: bounded retry on EAGAIN. The PTY
+    /// master fd is non-blocking (set in `spawn_with_args`), so a full kernel
+    /// write buffer surfaces as EAGAIN instead of blocking. The v1.0 behavior
+    /// dropped the data silently at debug level the moment the buffer filled —
+    /// a heavy-output command with an undrained read side loses keystrokes
+    /// with no trace. Now `write_all_nonblocking` polls `POLLOUT` and retries
+    /// within a ~50ms budget: long enough to ride out a transient full buffer,
+    /// short enough that the UI thread never freezes (the v1.0 reason for not
+    /// retrying was a 1s blocking retry). If the budget is exhausted the
+    /// remaining bytes are dropped, but loudly — warn! reports the dropped
+    /// count. The caller keeps deciding on fallbacks (e.g. `send_interrupt`
+    /// for Ctrl+C).
     pub fn write_sync(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
-        match nix::unistd::write(&self.master, data) {
-            Ok(_) => Ok(()),
-            Err(nix::errno::Errno::EAGAIN) => {
-                tracing::debug!("pty write_sync EAGAIN — data dropped");
+        let fd = self.master.as_raw_fd();
+        let mut write_one =
+            |buf: &[u8]| nix::unistd::write(&self.master, buf).map_err(io::Error::from);
+        match write_all_nonblocking(&mut write_one, fd, data, WRITE_RETRY_BUDGET) {
+            WriteOutcome::WrittenAll => Ok(()),
+            WriteOutcome::TimedOut { written } => {
+                tracing::warn!(
+                    dropped = data.len() - written,
+                    "pty write_sync budget exhausted — dropped remaining bytes"
+                );
                 Ok(())
             }
-            Err(e) => Err(PtyError::Write(io::Error::from(e))),
+            WriteOutcome::Error(e) => Err(PtyError::Write(e)),
         }
     }
 
@@ -333,6 +347,103 @@ impl Pty {
     /// Get the master file descriptor (raw).
     pub fn master_fd(&self) -> std::os::unix::io::RawFd {
         self.master.as_raw_fd()
+    }
+}
+
+/// Total time a non-blocking synchronous write may spend poll-waiting and
+/// retrying after EAGAIN before giving up (FIX_TERMINAL_CAPABILITY_HARDENING).
+const WRITE_RETRY_BUDGET: Duration = Duration::from_millis(50);
+
+/// Outcome of a bounded non-blocking write loop, observable by callers and
+/// unit tests (FIX_TERMINAL_CAPABILITY_HARDENING).
+#[derive(Debug)]
+#[must_use]
+pub(crate) enum WriteOutcome {
+    /// All bytes reached the fd.
+    WrittenAll,
+    /// Budget exhausted before everything was written; `written` bytes made
+    /// it out, the rest were dropped (caller should warn with the count).
+    TimedOut { written: usize },
+    /// A non-EAGAIN write/poll error.
+    Error(io::Error),
+}
+
+/// Bounded EAGAIN/EWOULDBLOCK retry for a non-blocking writer.
+///
+/// Calls `write_fn` with the unsent remainder; on EAGAIN/EWOULDBLOCK waits
+/// on `poll(fd, POLLOUT)` for the remaining `budget` before retrying, so a
+/// transient full kernel buffer is ridden out while a permanently-full
+/// buffer can never stall the caller beyond `budget`. EINTR is retried like
+/// EWOULDBLOCK (a signal interrupted the syscall — mirrors the poll loop's
+/// own EINTR handling). Partial writes advance (the remainder is re-issued
+/// in the same loop); `Ok(0)` with data remaining fails fast with `WriteZero`
+/// (std `write_all` contract). Any other error is returned as
+/// `WriteOutcome::Error`.
+///
+/// The fd and the writer are injected separately so unit tests can fake a
+/// writer that would-block N times (success path) or forever (timeout
+/// path) against a real always-writable fd.
+pub(crate) fn write_all_nonblocking<W>(
+    mut write_fn: W,
+    fd: RawFd,
+    data: &[u8],
+    budget: Duration,
+) -> WriteOutcome
+where
+    W: FnMut(&[u8]) -> io::Result<usize>,
+{
+    let deadline = Instant::now() + budget;
+    let mut written = 0;
+    let mut rest = data;
+    loop {
+        match write_fn(rest) {
+            Ok(n) => {
+                written += n;
+                rest = &rest[n..];
+                if rest.is_empty() {
+                    return WriteOutcome::WrittenAll;
+                }
+                if n == 0 {
+                    // std `write_all` contract: zero bytes with data
+                    // remaining can never make progress — fail fast
+                    // instead of spinning the budget away.
+                    return WriteOutcome::Error(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned 0 with data remaining",
+                    ));
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                // EWOULDBLOCK (buffer full → poll for writability below) and
+                // EINTR (signal interrupted the syscall → retry, mirroring
+                // the poll loop's own EINTR continue) are both retried.
+            }
+            Err(e) => return WriteOutcome::Error(e),
+        }
+        // Wait for writability with whatever budget remains; never wait
+        // past `deadline`.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return WriteOutcome::TimedOut { written };
+        }
+        // SAFETY: `fd` outlives this call (callers pass their own live fd,
+        // held for the duration), so borrowing it for the poll is sound.
+        let mut fds = [PollFd::new(
+            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) },
+            PollFlags::POLLOUT,
+        )];
+        let timeout = PollTimeout::try_from(remaining).unwrap_or(PollTimeout::ZERO);
+        match poll(&mut fds, timeout) {
+            Ok(0) => return WriteOutcome::TimedOut { written },
+            // Ready (or POLLERR/POLLNVAL) — retry; the write itself
+            // surfaces the real error.
+            Ok(_) => {}
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return WriteOutcome::Error(io::Error::from(e)),
+        }
     }
 }
 
@@ -547,6 +658,7 @@ impl From<nix::sys::wait::WaitStatus> for ChildStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn resize_ioctl_failure_is_propagated() {
@@ -745,6 +857,131 @@ mod tests {
 
         let err = PtyError::ChildSignaled("SIGHUP".into());
         assert!(err.to_string().contains("SIGHUP"));
+    }
+
+    // ── FIX_TERMINAL_CAPABILITY_HARDENING: bounded-EAGAIN write loop ──
+
+    /// EWOULDBLOCK twice, then success → the loop must poll-wait and retry,
+    /// ending in WrittenAll with all three calls observed.
+    #[test]
+    fn write_all_nonblocking_retries_wouldblock_then_succeeds() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut calls = 0;
+        let outcome = write_all_nonblocking(
+            &mut |buf: &[u8]| {
+                calls += 1;
+                if calls <= 2 {
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                } else {
+                    Ok(buf.len())
+                }
+            },
+            devnull.as_raw_fd(),
+            b"hello",
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::WrittenAll),
+            "expected WrittenAll, got {outcome:?}"
+        );
+        assert_eq!(calls, 3, "must retry after each EWOULDBLOCK");
+    }
+
+    /// A writer that stays blocked must burn through the whole budget and
+    /// then give up with an observable TimedOut result (the caller warns
+    /// about the dropped bytes).
+    #[test]
+    fn write_all_nonblocking_gives_up_after_budget() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let started = std::time::Instant::now();
+        let outcome = write_all_nonblocking(
+            &mut |_buf: &[u8]| Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            devnull.as_raw_fd(),
+            b"data",
+            Duration::from_millis(40),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::TimedOut { written: 0 }),
+            "continuously-blocked writer must time out, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "must spend the budget waiting before giving up"
+        );
+    }
+
+    /// Partial writes must advance and re-issue with the unsent remainder.
+    #[test]
+    fn write_all_nonblocking_chains_partial_writes() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let outcome = write_all_nonblocking(
+            &mut |buf: &[u8]| {
+                seen.push(buf.to_vec());
+                Ok(buf.len().min(3)) // claim 3 bytes written per call
+            },
+            devnull.as_raw_fd(),
+            b"hello",
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::WrittenAll),
+            "partial writes must converge, got {outcome:?}"
+        );
+        assert_eq!(
+            seen,
+            vec![b"hello".to_vec(), b"lo".to_vec()],
+            "remainder must be re-issued"
+        );
+    }
+
+    /// A writer claiming `Ok(0)` with data remaining must fail fast with a
+    /// WriteZero error (std `write_all` contract) instead of spinning out
+    /// the whole budget.
+    #[test]
+    fn write_all_nonblocking_fails_fast_on_zero_write() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let started = std::time::Instant::now();
+        let outcome = write_all_nonblocking(
+            &mut |_buf: &[u8]| Ok(0),
+            devnull.as_raw_fd(),
+            b"data",
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::Error(ref e) if e.kind() == io::ErrorKind::WriteZero),
+            "zero-write must fail fast with WriteZero, got {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(30),
+            "zero-write must not spin to the budget deadline"
+        );
+    }
+
+    /// EINTR is retried like EWOULDBLOCK (asymmetric with the poll loop's
+    /// EINTR handling, which already continues).
+    #[test]
+    fn write_all_nonblocking_retries_interrupted_like_wouldblock() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut calls = 0;
+        let outcome = write_all_nonblocking(
+            &mut |buf: &[u8]| {
+                calls += 1;
+                if calls <= 2 {
+                    Err(io::Error::from(io::ErrorKind::Interrupted))
+                } else {
+                    Ok(buf.len())
+                }
+            },
+            devnull.as_raw_fd(),
+            b"hi",
+            Duration::from_millis(50),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::WrittenAll),
+            "Interrupted must be retried, got {outcome:?}"
+        );
+        assert_eq!(calls, 3, "must retry after each Interrupted");
     }
 
     // ── T4: additional PTY coverage ────────────────────────────────────

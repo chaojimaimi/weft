@@ -8,6 +8,7 @@ mod capture_cursor;
 mod grapheme;
 mod osc;
 mod perform;
+mod replies;
 mod screen_exit;
 mod staging;
 pub use attrs::{Attrs, ShellMarker};
@@ -86,6 +87,10 @@ pub struct Terminal {
     /// boolean to zero but still counts as two flips here, so the debounce /
     /// burst windows can't be silently skipped by even-count batches.
     alt_flip_count: u64,
+    /// In-flight XTGETTCAP request collector (`DCS + q ... ST`), payload
+    /// capped at 1KiB so an introducer without ST cannot grow memory
+    /// without bound (FIX_TERMINAL_CAPABILITY_HARDENING, review M1).
+    dcs_xtgettcap: replies::XtgettcapCollector,
 }
 
 impl Terminal {
@@ -125,6 +130,7 @@ impl Terminal {
             suppress_joined_scalar: false,
             capabilities: capability::CapabilityFlags::default(),
             alt_flip_count: 0,
+            dcs_xtgettcap: replies::XtgettcapCollector::default(),
         }
     }
 

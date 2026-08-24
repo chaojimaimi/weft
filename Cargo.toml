@@ -24,7 +24,7 @@ rust-version = "1.75"
 # bound memory at the application level.
 vte = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["full"] }
-nix = { version = "0.29", features = ["term", "process", "signal", "fs"] }
+nix = { version = "0.29", features = ["term", "process", "signal", "fs", "poll"] }
 
 # Rendering
 metal = "0.29"

@@ -502,11 +502,7 @@ impl App {
     /// initial item because CursorMoved with an open menu was consumed by
     /// route_modal_pointer and never reached any hover logic.
     pub(super) fn update_context_menu_hover(&mut self, x: f64, y: f64) {
-        let Some((menu_x, menu_y)) = self
-            .interaction
-            .context_menu
-            .as_ref()
-            .map(|m| (m.x, m.y))
+        let Some((menu_x, menu_y)) = self.interaction.context_menu.as_ref().map(|m| (m.x, m.y))
         else {
             return;
         };
@@ -524,7 +520,13 @@ impl App {
     /// Shared hit-test: rebuild the context menu Scene from the menu's
     /// anchor + renderer geometry and resolve which item (if any) contains
     /// the given point. Used by both the click executor and the hover path.
-    fn context_menu_hit_at_anchor(&self, menu_x: f32, menu_y: f32, x: f32, y: f32) -> Option<usize> {
+    fn context_menu_hit_at_anchor(
+        &self,
+        menu_x: f32,
+        menu_y: f32,
+        x: f32,
+        y: f32,
+    ) -> Option<usize> {
         self.renderer.as_ref().and_then(|renderer| {
             let ctx = renderer.layout_ctx?;
             let layout =

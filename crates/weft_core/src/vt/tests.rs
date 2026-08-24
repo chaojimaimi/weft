@@ -3629,3 +3629,141 @@ fn brew_progress_stream_stays_single_row_in_capture() {
         "final output should contain the last progress state"
     );
 }
+
+// ── Terminal capability hardening (FIX_TERMINAL_CAPABILITY_HARDENING) ──
+
+/// Kitty keyboard-protocol push/set/pop (`CSI >flags u` / `CSI =mode u` /
+/// `CSI <u`) must be ignored, NOT dispatched to the bare-`CSI u` DECRC
+/// restore path. opencode pushes kitty modes at startup; a restore would
+/// jump the cursor back to the last DECSC-saved position mid-TUI.
+#[test]
+fn kitty_keyboard_mode_ops_do_not_run_decrc_restore() {
+    let mut t = term();
+    t.process(b"\x1b[5;10H"); // cursor → (4, 9)
+    t.process(b"\x1b7"); // DECSC save
+    t.process(b"\x1b[3;3H"); // cursor → (2, 2)
+    t.process(b"\x1b[>1u"); // kitty push
+    t.process(b"\x1b[=2u"); // kitty set
+    t.process(b"\x1b[<u"); // kitty pop
+    assert_eq!(
+        (t.grid().cursor.row, t.grid().cursor.col),
+        (2, 2),
+        "kitty keyboard-mode ops must not restore the saved cursor"
+    );
+    assert_eq!(t.take_response(), b"", "kitty mode ops must not reply");
+}
+
+/// Bare `CSI u` keeps its SCO DECRC alias: it restores the cursor saved by
+/// DECSC (`ESC 7`). Regression anchor so the intermediates guard cannot
+/// silently break the alias.
+#[test]
+fn bare_csi_u_restores_cursor_after_decsc() {
+    let mut t = term();
+    t.process(b"\x1b[5;10H");
+    t.process(b"\x1b7"); // DECSC save (4, 9)
+    t.process(b"\x1b[10;20H");
+    t.process(b"\x1b[u"); // bare CSI u → DECRC
+    assert_eq!((t.grid().cursor.row, t.grid().cursor.col), (4, 9));
+}
+
+/// `CSI ? u` — kitty keyboard enhancement query. Deliberately unanswered:
+/// zero-reply is the standard non-supporter signal (consumers fall back on
+/// DA1); answering `?0u` would advertise a protocol we never implement.
+#[test]
+fn csi_question_u_kitty_query_stays_silent() {
+    let mut t = term();
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"", "kitty query must stay unanswered");
+}
+
+/// XTVERSION (`CSI > 0 q` / `CSI > q`): reply `DCS > | weft <ver> ST` — the
+/// form xterm answers with. DECSCUSR (`CSI q` / `CSI SP q`) is not a query
+/// and must produce no reply.
+#[test]
+fn xtversion_replies_with_dcs_banner() {
+    let mut t = term();
+    t.process(b"\x1b[>0q");
+    let resp = t.take_response();
+    let s = String::from_utf8_lossy(&resp);
+    assert!(s.starts_with("\x1bP>|weft "), "XTVERSION prefix: {s:?}");
+    assert!(s.ends_with("\x1b\\"), "XTVERSION must end with ST: {s:?}");
+    assert!(
+        s.contains(env!("CARGO_PKG_VERSION")),
+        "XTVERSION must carry CARGO_PKG_VERSION: {s:?}"
+    );
+
+    t.process(b"\x1b[>q"); // param-less form
+    assert_eq!(t.take_response(), resp, "CSI >q must answer like CSI >0q");
+
+    t.process(b"\x1b[2q"); // DECSCUSR — not a query
+    assert_eq!(t.take_response(), b"", "DECSCUSR must not reply");
+}
+
+/// XTGETTCAP (`DCS + q <hex>;<hex>... ST`): exactly one negative answer
+/// (`DCS 0 + r <hex> ST`) per requested capability name. opencode queries
+/// the `Ms` capability (`4d73`) this way at startup.
+#[test]
+fn xtgettcap_answers_each_requested_name_negatively() {
+    let mut t = term();
+    t.process(b"\x1bP+q4d73;636f6c6f72\x1b\\"); // Ms; color
+    assert_eq!(
+        t.take_response(),
+        b"\x1bP0+r4d73\x1b\\\x1bP0+r636f6c6f72\x1b\\",
+        "one negative XTGETTCAP answer per requested name"
+    );
+}
+
+/// Malformed XTGETTCAP payloads (odd-length hex, non-hex chars, empty
+/// segments, empty payload) are skipped without panicking and without
+/// emitting garbage; non-request DCS sequences stay ignored.
+#[test]
+fn xtgettcap_malformed_payloads_are_tolerated() {
+    let mut t = term();
+    t.process(b"\x1bP+q4d7;zz;636f6c6f72;x;;\x1b\\");
+    assert_eq!(
+        t.take_response(),
+        b"\x1bP0+r636f6c6f72\x1b\\",
+        "only the valid hex name should be answered"
+    );
+    t.process(b"\x1bP+q\x1b\\"); // empty payload
+    assert_eq!(t.take_response(), b"", "empty payload answers nothing");
+    t.process(b"\x1bP1+r4d73\x1b\\"); // an XTGETTCAP response aimed at us
+    t.process(b"\x1bP!u01234567\x1b\\"); // unrelated DCS
+    assert_eq!(t.take_response(), b"", "non-request DCS stays ignored");
+}
+
+/// A `DCS + q` introducer whose payload never hits ST must not grow memory
+/// without bound (vte Puts every passthrough byte) — the collector caps at
+/// 1KiB and the whole overflowed request is dropped, silently.
+#[test]
+fn xtgettcap_overlong_payload_is_capped_and_discarded() {
+    let mut t = term();
+    let mut seq = Vec::with_capacity(5200);
+    seq.extend_from_slice(b"\x1bP+q");
+    seq.extend(std::iter::repeat(b'4').take(5000)); // 5000 bytes, no ST yet
+    seq.extend_from_slice(b"\x1b\\");
+    t.process(&seq); // must not panic; memory bounded by the 1KiB cap
+    assert_eq!(
+        t.take_response(),
+        b"",
+        "overflowed XTGETTCAP request must be dropped whole"
+    );
+    // the collector must re-arm cleanly for the next request
+    t.process(b"\x1bP+q4d73\x1b\\");
+    assert_eq!(t.take_response(), b"\x1bP0+r4d73\x1b\\");
+}
+
+/// `CSI ? 1 u` (kitty keyboard op carrying the private marker) must not be
+/// mis-dispatched as DEC private mode set/unset: mode 1 is DECCKM and a
+/// bogus `u` final used to toggle it off via handle_dec_private_mode(1, false).
+#[test]
+fn csi_question_1_u_does_not_toggle_decckm() {
+    let mut t = term();
+    t.process(b"\x1b[?1h"); // DECCKM on
+    assert!(t.app_cursor_keys(), "?1h must enable DECCKM");
+    t.process(b"\x1b[?1u"); // kitty op with private marker — not DECSET
+    assert!(t.app_cursor_keys(), "CSI ?1u must not clear DECCKM");
+    assert_eq!(t.take_response(), b"", "kitty op must not reply");
+    t.process(b"\x1b[?1l"); // real DECSET off still works
+    assert!(!t.app_cursor_keys(), "?1l must disable DECCKM");
+}

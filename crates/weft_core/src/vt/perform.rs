@@ -1,6 +1,7 @@
 use super::attrs::ShellMarker;
 use super::osc::{parse_osc7_cwd, parse_x11_color};
 use super::param;
+use super::replies;
 use super::Terminal;
 use super::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
 use crate::blocks::{CapturedStyle, ShellPhase};
@@ -361,8 +362,13 @@ impl vte::Perform for Terminal {
             return;
         }
 
-        // DEC private mode: CSI ? <params> h/l
-        if intermediates == [b'?'] {
+        // DEC private mode set/unset: `CSI ? <params> h/l` only. Earlier this
+        // block matched every `CSI ?` action, so `CSI ? 1 u` (a kitty
+        // keyboard-mode op carrying the private marker) mis-ran
+        // handle_dec_private_mode(1, false) and silently toggled DECCKM off.
+        // Non-h/l actions fall through to the match below, where the per-arm
+        // intermediates guards swallow them (see the 'u' arm).
+        if intermediates == [b'?'] && matches!(action, 'h' | 'l') {
             let set = action == 'h';
             for sub in params.iter() {
                 if let &[mode] = sub {
@@ -607,6 +613,22 @@ impl vte::Perform for Terminal {
                     "DECSC save"
                 );
             }
+            // Kitty keyboard-protocol push/set/pop (`CSI >flags u`,
+            // `CSI =mode u`, `CSI <u`) arrive with the leading byte in
+            // intermediates (vte collects `<=>?` there). They must NOT fall
+            // through to the bare-`CSI u` DECRC restore below: restore_cursor
+            // would jump back to the last DECSC-saved position every time the
+            // app flips a mode (opencode pushes several at startup, clobbering
+            // the TUI's cursor mid-paint). Ignore the mode operations; bare
+            // `CSI u` keeps its SCO DECRC alias behavior. `CSI ? u` (kitty
+            // keyboard enhancement query) is swallowed here too
+            // (intermediates [b'?']). Zero reply is the standard
+            // non-supporter signal — crossterm, Nix etc. fall back on DA1
+            // to detect the terminal; answering `?0u` would advertise a
+            // protocol we never implement. Deliberate — do NOT "fix".
+            'u' if !intermediates.is_empty() => {
+                tracing::trace!(?intermediates, ?params, "kitty keyboard mode op ignored");
+            }
             'u' => {
                 self.grid.restore_cursor();
                 tracing::debug!(
@@ -634,6 +656,13 @@ impl vte::Perform for Terminal {
                 }
             }
 
+            // XTVERSION (CSI > 0 q / CSI > q) — xterm's version query; opencode
+            // sends it at startup. Reply `DCS > | weft <ver> ST`. Split by
+            // exact intermediates so it cannot collide with DECSCUSR below
+            // (empty or SP intermediates) nor DA2 (`CSI > c`).
+            'q' if intermediates == [b'>'] => {
+                self.respond(&replies::xtversion_reply());
+            }
             // Cursor style (DECSCUSR — CSI <n> q)
             'q' => {
                 if intermediates.is_empty() || intermediates == [b' '] {
@@ -1014,18 +1043,37 @@ impl vte::Perform for Terminal {
         }
     }
 
-    fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, action: char) {
+    fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.suppress_joined_scalar = false;
-        tracing::trace!(action = ?action, "DCS hook (ignored in v0.1)");
+        // XTGETTCAP (`DCS + q ... ST`) — the only DCS we answer; opencode
+        // queries the `Ms` capability (`DCS +q4d73`) at startup. The
+        // collector gets the introducer here, `put()` feeds capped payload
+        // bytes, `unhook()` answers. Everything else stays ignored.
+        if action == 'q' && intermediates == [b'+'] {
+            self.dcs_xtgettcap.begin(action, intermediates);
+            return;
+        }
+        tracing::trace!(action = ?action, "DCS hook (ignored)");
     }
 
-    fn put(&mut self, _byte: u8) {
+    fn put(&mut self, byte: u8) {
         self.suppress_joined_scalar = false;
-        // DCS data — ignored in v0.1
+        // DCS data — fed to the collector (capped at 1KiB) only inside an
+        // XTGETTCAP request.
+        self.dcs_xtgettcap.push(byte);
     }
 
     fn unhook(&mut self) {
         self.suppress_joined_scalar = false;
-        // DCS end — ignored in v0.1
+        // DCS end: answer an accumulated XTGETTCAP request. We support none
+        // of the queried capabilities, so every well-formed name gets a
+        // negative `DCS 0 + r <hex> ST`; malformed segments are skipped. A
+        // request that overflowed the collector's 1KiB cap is dropped whole
+        // (`finish()` → None), silently.
+        if let Some(payload) = self.dcs_xtgettcap.finish() {
+            for reply in replies::xtgettcap_negative_replies(&payload) {
+                self.respond(&reply);
+            }
+        }
     }
 }
