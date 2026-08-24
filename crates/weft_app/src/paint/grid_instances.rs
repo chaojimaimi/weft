@@ -24,6 +24,8 @@ use weft_core::selection::SelectionHandler;
 
 #[cfg(test)]
 mod contrast_tests;
+#[cfg(test)]
+mod startup_replay_tests;
 mod style_tests;
 
 // ── Data structures ───────────────────────────────────────────────────

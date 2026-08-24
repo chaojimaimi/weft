@@ -1593,6 +1593,48 @@ fn decrqm_reports_synchronized_output_support_and_state() {
     assert_eq!(t.take_response(), b"\x1b[?2026;1$y");
 }
 
+/// FIX_OPENCODE_STARTUP_FLASH: xterm's modifyOtherKeys enable
+/// (`CSI > 4 ; 1 m`) is a PRIVATE SGR — the `>` intermediate must not be
+/// dropped. It was previously dispatched to `handle_sgr` as SGR 4;1, which
+/// set UNDERLINE|BOLD on every subsequent cell: opencode's startup clears
+/// (`38;2;255;255;255m 48;2;15;15;15m` + 80 spaces, no `0m` between rows)
+/// then painted full-width near-white underline rails across the cleared
+/// rows — the "several white horizontal bars" flash. Private SGRs are
+/// terminal-behaviour controls (modifyOtherKeys), never text attributes.
+#[test]
+fn csi_gt_private_sgr_is_not_text_attributes() {
+    // opencode's exact startup shape: modifyOtherKeys ON, then a white-fg
+    // clear row without an intervening SGR reset.
+    let mut t = term();
+    t.process(b"\x1b[>4;1m\x1b[38;2;255;255;255m\x1b[48;2;15;15;15m ");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(
+        cell.flags
+            .intersection(CellFlags::UNDERLINE | CellFlags::BOLD),
+        CellFlags::empty(),
+        "private SGR `>4;1m` leaked text attributes: {cell:?}"
+    );
+
+    // The disable form (`>4;2m`) must behave identically.
+    let mut t = term();
+    t.process(b"\x1b[>4;2mX");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(
+        cell.flags
+            .intersection(CellFlags::UNDERLINE | CellFlags::BOLD),
+        CellFlags::empty(),
+        "private SGR `>4;2m` leaked text attributes: {cell:?}"
+    );
+
+    // A real SGR 4;1 (underline + bold) must still work — only the private
+    // (intermediate-bearing) form is ignored.
+    let mut t = term();
+    t.process(b"\x1b[4;1mY");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::UNDERLINE));
+    assert!(cell.flags.contains(CellFlags::BOLD));
+}
+
 #[test]
 fn progress_rewrites_are_compacted_in_detached_block_output() {
     let mut t = term();

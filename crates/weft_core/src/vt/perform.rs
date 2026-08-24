@@ -521,6 +521,20 @@ impl vte::Perform for Terminal {
             }
 
             // SGR
+            //
+            // FIX_OPENCODE_STARTUP_FLASH: private SGR forms (`CSI > … m`,
+            // xterm's modifyOtherKeys enable/disable) carry an intermediate
+            // byte that vte keeps out of `Params`. Dispatching them to
+            // `handle_sgr` as if the params were bare (`>4;1m` → SGR 4;1)
+            // leaked UNDERLINE|BOLD onto every later cell: opencode enables
+            // modifyOtherKeys at startup, then clears rows with white-fg
+            // spaces (no intervening `0m`) — the leaked attributes painted
+            // full-width near-white underline rails across the cleared rows
+            // (the "white horizontal bars" flash). Private SGRs are
+            // terminal-behaviour controls, never text attributes: ignore.
+            'm' if !intermediates.is_empty() => {
+                tracing::trace!(?intermediates, ?params, "private SGR ignored");
+            }
             'm' => self.handle_sgr(params),
 
             // ── Terminal queries (must respond, else TUIs degrade) ──
