@@ -56,6 +56,16 @@ __weft_real_zshenv=\"${ZDOTDIR:-$HOME}/.zshenv\"
 # `[[ -o interactive ]]` (not `[ -o interactive ]`, whose `-o` zsh parses as a
 # binary OR inside `[`, yielding a too-many-arguments error).
 if [[ -n \"${WEFT_SHELL_INTEGRATION:-}\" ]] && [[ -o interactive ]]; then
+    # weft owns the input editor: every Enter reaches zsh as a bracketed
+    # paste + newline (Ctrl-U + ESC[200~ cmd ESC[201~ + \\n). ZLE's default
+    # zle_highlight styles pasted regions with standout, so the accepted line
+    # repaints in inverted video for a few frames mid-submit — the reported
+    # command-briefly-shows-wrong-colors flash. Append-mode += keeps any
+    # zle_highlight roles the user's own .zshenv above may have customized;
+    # unset means this is simply the whole value. Set here (before ~/.zshrc
+    # runs) so the FIRST submission is already covered; a user framework may
+    # still override it later — accepted trade-off.
+    zle_highlight+=(paste:none)
     __weft_precmd() {
         local __weft_rc=$?
         printf '\\033]133;D;%d;weft-shell\\007' \"$__weft_rc\"
@@ -270,6 +280,22 @@ mod tests {
         assert!(snippet.contains("133;B"));
         assert!(snippet.contains("133;C"));
         assert!(snippet.contains("weft-shell"));
+    }
+
+    #[test]
+    fn zsh_body_suppresses_zle_paste_highlight() {
+        // FIX_ZLE_PASTE_FLASH: weft submits every command as a bracketed
+        // paste + newline, so ZLE's default paste styling (standout) repaints
+        // the accepted line in inverted video for a few frames mid-submit.
+        // The generated .zshenv must disable exactly that role — before the
+        // first submission runs — while leaving every other zle_highlight
+        // role at its default.
+        let (_, file) = Integration::Zsh.rc_redirect().unwrap();
+        let guard = file.body.find("[[ -o interactive ]]").expect("guard");
+        assert!(
+            file.body[guard..].contains("zle_highlight+=(paste:none)"),
+            "paste highlight must be suppressed inside the interactive guard"
+        );
     }
 
     #[test]
