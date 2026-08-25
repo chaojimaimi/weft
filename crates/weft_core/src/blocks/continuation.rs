@@ -69,6 +69,10 @@ impl BlockTracker {
         self.pending_started = Some(SystemTime::now());
         self.pending_cwd = self.current_cwd.clone();
         self.styled_output = None;
+        // FIX_LIVE_STYLED_OUTPUT: mirror on_command_start's throttle reset so
+        // the orphan path never inherits a previous command's publish anchor.
+        self.last_live_styled_publish = None;
+        self.live_styled_snapshot = None;
         self.screen_document_start = None;
         // After the swap `staged` only holds the previous in-flight capture
         // (empty on every real path — finalize always drained it); the local
@@ -104,6 +108,11 @@ impl BlockTracker {
             self.styled_output = None;
             None
         };
+        // FIX_LIVE_STYLED_OUTPUT: drop the throttle anchor with the capture —
+        // the next command's first print publishes immediately (the anchor is
+        // also reset at on_command_start; this covers the resume/clear paths).
+        self.last_live_styled_publish = None;
+        self.live_styled_snapshot = None;
 
         let continuation = self.continuation_base.take();
         let replayed = continuation
@@ -164,6 +173,8 @@ impl BlockTracker {
         self.pending_cwd = None;
         self.output.clear();
         self.styled_output = None;
+        self.last_live_styled_publish = None;
+        self.live_styled_snapshot = None;
         self.screen_document_start = None;
         self.continuation_candidate = None;
         if let Some(base) = self.continuation_base.take() {

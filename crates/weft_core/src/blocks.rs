@@ -22,7 +22,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 pub mod annotations;
 mod continuation;
@@ -31,6 +31,9 @@ pub mod export;
 mod output_capture;
 mod screen_capture;
 
+#[cfg(test)]
+#[path = "blocks/live_styled_tests.rs"]
+mod live_styled_tests;
 #[cfg(test)]
 mod orphan_finalize_tests;
 #[cfg(test)]
@@ -63,6 +66,10 @@ pub use style::{
 /// capped at 2000 visible lines per block in the renderer, so raising this
 /// doesn't affect rendering perf.
 pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+
+/// FIX_LIVE_STYLED_OUTPUT: live styled snapshots are rebuilt at most at this
+/// interval; per-char rebuilds would be O(text) on every printed byte.
+const LIVE_STYLED_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Monotonically-increasing block identifier. Assigned by [`BlockTracker`],
 /// reused as the SQLite primary key (phase 3).
@@ -115,6 +122,9 @@ pub struct InFlightBlock<'a> {
     /// v1.10.5: borrow the `Arc<StyledOutput>` itself (not the dereferenced
     /// `&StyledOutput`) so callers can cheap-clone the Arc instead of deep-
     /// copying the styled lines on the render hot path.
+    /// FIX_LIVE_STYLED_OUTPUT: on the plain capture path this is the 100ms-
+    /// throttled streaming snapshot (cleared when a rewrite removes all
+    /// styles); on screen-owned paths it is the caller-supplied snapshot.
     pub styled_output: Option<&'a Arc<StyledOutput>>,
     /// v1.10.23: live-output content version (LiveLayoutCache key) — bumped
     /// on every mutation, so version equality ⇔ byte-identical output.
@@ -198,6 +208,18 @@ pub struct BlockTracker {
     current_cwd: Option<String>,
     output: OutputCapture,
     styled_output: Option<Arc<StyledOutput>>,
+    /// FIX_LIVE_STYLED_OUTPUT review M1: the streaming snapshot lives in its
+    /// OWN field, never in `styled_output` — that field's only writers remain
+    /// the screen-snapshot paths plus finalize, so the finalize fallback
+    /// `styled_output.take()` can never resurrect a stale live snapshot (and
+    /// persist it) for blocks whose styles were cleared mid-stream. Consumed
+    /// exclusively via [`in_flight`](Self::in_flight).
+    live_styled_snapshot: Option<Arc<StyledOutput>>,
+    /// FIX_LIVE_STYLED_OUTPUT: last instant a live styled snapshot was
+    /// published — the throttle anchor for [`Self::maybe_publish_live_styled`].
+    /// Reset at command start so the 100ms interval never leaks across
+    /// commands.
+    last_live_styled_publish: Option<Instant>,
     /// v1.10.23: live-output content version, exposed via
     /// [`in_flight`](Self::in_flight); bumped on every mutation.
     live_output_version: u64,
@@ -245,6 +267,8 @@ impl BlockTracker {
             current_cwd: None,
             output: OutputCapture::default(),
             styled_output: None,
+            live_styled_snapshot: None,
+            last_live_styled_publish: None,
             live_output_version: 0,
             screen_document_start: None,
             screen_owned_blocks: HashSet::new(),
@@ -281,6 +305,12 @@ impl BlockTracker {
     pub fn begin_screen_owned_output(&mut self, document_start: u64) {
         if self.phase == ShellPhase::CommandExecuting && self.screen_document_start.is_none() {
             self.output.clear();
+            // FIX_LIVE_STYLED_OUTPUT review m2: a plain-phase snapshot must not
+            // survive the screen takeover — the cleared capture no longer
+            // matches its line indices, and finalize's screen-snapshot fallback
+            // would otherwise persist it.
+            self.live_styled_snapshot = None;
+            self.last_live_styled_publish = None;
             self.live_output_version = self.live_output_version.wrapping_add(1);
             self.screen_document_start = Some(document_start);
             self.activate_screen_continuation();
@@ -359,7 +389,15 @@ impl BlockTracker {
                 .and_then(|block| block.cwd.as_deref())
                 .or(self.pending_cwd.as_deref()),
             output: self.output.as_str(),
-            styled_output: self.styled_output.as_ref(),
+            // FIX_LIVE_STYLED_OUTPUT: plain-path commands read the throttled
+            // streaming snapshot; screen-owned commands keep reading the
+            // caller-supplied screen-snapshot field (publishes never fire
+            // while `is_capturing()` is false, so neither can clobber the
+            // other).
+            styled_output: self
+                .live_styled_snapshot
+                .as_ref()
+                .or(self.styled_output.as_ref()),
             version: self.live_output_version,
             screen_origin: self.screen_document_start.is_some(),
         })
@@ -440,6 +478,10 @@ impl BlockTracker {
         self.pending_cwd = self.current_cwd.clone();
         self.output.clear();
         self.styled_output = None;
+        self.live_styled_snapshot = None;
+        // FIX_LIVE_STYLED_OUTPUT: the throttle must not leak across commands —
+        // the next command's first printed byte publishes immediately.
+        self.last_live_styled_publish = None;
         self.screen_document_start = None;
         self.live_output_version = self.live_output_version.wrapping_add(1);
         self.phase = ShellPhase::CommandExecuting;
@@ -467,6 +509,7 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.print(c, style, MAX_OUTPUT_BYTES);
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.maybe_publish_live_styled(Instant::now());
         }
     }
 
@@ -483,6 +526,7 @@ impl BlockTracker {
         }
         self.output.print_ascii(bytes, style, MAX_OUTPUT_BYTES);
         self.live_output_version = self.live_output_version.wrapping_add(1);
+        self.maybe_publish_live_styled(Instant::now());
     }
 
     /// Append a newline to the in-flight block's output. No-op unless a command
@@ -491,6 +535,11 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.newline(MAX_OUTPUT_BYTES);
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            // Line terminators are rewrite boundaries (spinner frame → "done"
+            // line): a snapshot-category flip here publishes immediately, so
+            // a de-styled rewrite can't end the stream with stale colors
+            // still on the live view.
+            self.boundary_publish_live_styled();
         }
     }
 
@@ -498,6 +547,7 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.carriage_return();
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
         }
     }
 
@@ -505,6 +555,7 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.backspace();
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
         }
     }
 
@@ -512,6 +563,7 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.erase_line(mode);
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.boundary_publish_live_styled();
         }
     }
 
@@ -522,6 +574,57 @@ impl BlockTracker {
         if self.is_capturing() {
             self.output.move_cursor_rows(delta);
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.maybe_publish_live_styled(Instant::now());
+        }
+    }
+
+    // ── Live styled publish (FIX_LIVE_STYLED_OUTPUT) ─────────────────────
+
+    /// Whether enough time has elapsed since the last live styled publish to
+    /// rebuild the snapshot. Pure — unit-anchored in live_styled_tests.rs.
+    fn live_styled_publish_due(last: Option<Instant>, now: Instant) -> bool {
+        !last.is_some_and(|t| now.duration_since(t) < LIVE_STYLED_PUBLISH_MIN_INTERVAL)
+    }
+
+    /// Publish a styled snapshot of the in-flight output so the live block
+    /// renders program-emitted SGR attributes before finalize (Warp-parity:
+    /// colors visible while streaming, not only after 133;D). Three states:
+    /// runs present → fresh snapshot; run-cap overflow → freeze the LAST good
+    /// snapshot instead of flickering to unstyled; runs cleared by an
+    /// all-default rewrite (`\r` + reprint) → clear, so the live view drops
+    /// stale colors immediately (review m1). Writes only
+    /// `live_styled_snapshot` — never `styled_output` (review M1).
+    fn publish_live_styled(&mut self) {
+        match self.output.peek_styled() {
+            Some(styled) => self.live_styled_snapshot = Some(Arc::new(styled)),
+            None if self.output.style_overflow() => {}
+            None => self.live_styled_snapshot = None,
+        }
+    }
+
+    fn maybe_publish_live_styled(&mut self, now: Instant) {
+        if Self::live_styled_publish_due(self.last_live_styled_publish, now) {
+            self.last_live_styled_publish = Some(now);
+            self.publish_live_styled();
+        }
+    }
+
+    /// Boundary publish for rewrite events (`\r`, EL, backspace, newline).
+    /// Review round 2 MAJOR: an UNTHROTTLED rebuild here re-introduced the
+    /// O(text) cost on every newline — newlines are the highest-frequency
+    /// event in streamed output, so a 1 MiB colored stream paid ~6.7s of
+    /// main-thread rebuilds. The m1 guarantee only needs immediacy when the
+    /// snapshot's CATEGORY flips (first colors appear / all colors cleared),
+    /// and that flip is O(1)-detectable from the run counters; Some→Some
+    /// refreshes stay on the 100ms throttle like the print paths.
+    fn boundary_publish_live_styled(&mut self) {
+        let peek_some = !(self.output.style_overflow() || self.output.style_runs_empty());
+        let now = Instant::now();
+        if peek_some != self.live_styled_snapshot.is_some()
+            || Self::live_styled_publish_due(self.last_live_styled_publish, now)
+        {
+            self.last_live_styled_publish = Some(now);
+            self.publish_live_styled();
         }
     }
 }

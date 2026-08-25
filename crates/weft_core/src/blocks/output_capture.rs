@@ -327,6 +327,35 @@ impl OutputCapture {
         (text, styled)
     }
 
+    /// Non-consuming twin of [`Self::take_styled`]'s StyledOutput construction:
+    /// builds a snapshot from the CURRENT text + style runs without draining
+    /// anything. Returns None when no non-default runs were captured or the
+    /// run cap overflowed (mirroring take_styled's semantics).
+    /// Deliberately does NOT apply take_styled's finalize-only transforms
+    /// (PROMPT_SP tail strip, truncation marker) — those stay finalize-only.
+    pub(crate) fn peek_styled(&self) -> Option<StyledOutput> {
+        if self.style_overflow || self.style_runs.is_empty() {
+            return None;
+        }
+        build_styled_output_from_runs(&self.text, &self.style_runs)
+    }
+
+    /// Whether the per-block style-run cap has overflowed. `peek_styled`
+    /// conflates "no styles" and "overflow" into None; the live publisher
+    /// needs them apart — overflow freezes the last good snapshot, a genuine
+    /// runs-clear (all-default rewrite) must drop it.
+    pub(crate) fn style_overflow(&self) -> bool {
+        self.style_overflow
+    }
+
+    /// O(1) twin used by the boundary publisher's category pre-check:
+    /// whether any non-default style runs exist. Together with
+    /// [`Self::style_overflow`] this predicts `peek_styled().is_some()`
+    /// without building a snapshot.
+    pub(crate) fn style_runs_empty(&self) -> bool {
+        self.style_runs.is_empty()
+    }
+
     // ── Screen prefix (v1.10.25: scroll-out incremental capture) ────────
 
     /// Append one scroll-captured segment (owned rows pushed out of the

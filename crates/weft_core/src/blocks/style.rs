@@ -268,6 +268,12 @@ pub(crate) fn build_styled_output_from_runs(
     let mut run_idx = 0usize;
 
     for (line_index, line_text) in (0u32..).zip(text.split('\n')) {
+        // FIX_LIVE_STYLED_OUTPUT (review s1): peek_styled makes this a ~10Hz
+        // hot path; once every run is consumed no later line can produce a
+        // span, so stop instead of char-counting a MiB-scale plain tail.
+        if run_idx >= runs.len() {
+            break;
+        }
         let line_char_len = line_text.chars().count() as u32;
         let line_end_char = line_start_char + line_char_len;
         let mut foregrounds: Vec<ForegroundSpan> = Vec::new();

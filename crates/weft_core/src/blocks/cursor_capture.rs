@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::{BlockTracker, MAX_OUTPUT_BYTES};
 
 impl BlockTracker {
@@ -8,6 +10,7 @@ impl BlockTracker {
             // so the LiveLayoutCache version must bump — version equality
             // ⇔ byte-identical output (live_cache.rs).
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.maybe_publish_live_styled(Instant::now());
         }
     }
 
@@ -17,6 +20,7 @@ impl BlockTracker {
             // Same contract as above; no production caller today, but keep the
             // bump so a future call site can't corrupt the layout cache key.
             self.live_output_version = self.live_output_version.wrapping_add(1);
+            self.maybe_publish_live_styled(Instant::now());
         }
     }
 }
