@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.10.38"
+version = "1.10.39"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
