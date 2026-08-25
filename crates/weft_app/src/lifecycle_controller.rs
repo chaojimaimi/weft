@@ -686,6 +686,13 @@ impl App {
     /// exec (Pty::spawn_with_args `cwd` param), NOT by sending a `cd`
     /// command. Sending `cd` polluted the terminal, shell history, and
     /// block tracker with a spurious `cd <cwd>` block.
+    ///
+    /// v1.10.36 fix: the chdir-target filter is now
+    /// `crate::pane::restore_spawn_cwd` (an absent/empty saved cwd yields
+    /// `None`; everything else is honored verbatim). The old filter also
+    /// dropped a saved cwd equal to `$HOME` and equal to the Weft process's
+    /// cwd, so a Finder-launched Weft (process cwd `/`) restored
+    /// home-directory tabs at the filesystem root.
     pub(super) fn restore_tab_snapshots(&mut self) {
         let Some(store) = self.sessions.block_store() else {
             return;
@@ -696,15 +703,9 @@ impl App {
                 info!(count = snaps.len(), "restoring saved tab snapshots");
                 let (rows, cols) = self.current_size();
                 let total = snaps.len();
-                let home = std::env::var("HOME").unwrap_or_default();
-                let weft_cwd = std::env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
                 for (i, snap) in snaps.iter().enumerate() {
                     let saved_cwd = snap.cwd.clone();
-                    let cwd_to_apply = saved_cwd
-                        .as_deref()
-                        .filter(|c| !c.is_empty() && *c != home && *c != weft_cwd);
+                    let cwd_to_apply = crate::pane::restore_spawn_cwd(saved_cwd.as_deref());
                     if i == 0 {
                         if cwd_to_apply.is_some() {
                             let mut tab = Tab::new(
@@ -712,7 +713,7 @@ impl App {
                                 cols,
                                 self.config_state.config.scrollback.lines,
                                 &self.proxy,
-                                cwd_to_apply,
+                                cwd_to_apply.as_deref(),
                             );
                             if let Some(t) = &mut tab.terminal {
                                 if let Some(r) = &self.renderer {
@@ -731,7 +732,7 @@ impl App {
                             cols,
                             self.config_state.config.scrollback.lines,
                             &self.proxy,
-                            cwd_to_apply,
+                            cwd_to_apply.as_deref(),
                         );
                         tab.restore_from_snapshot(snap);
                         if let Some(t) = &mut tab.terminal {

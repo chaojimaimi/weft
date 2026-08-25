@@ -413,6 +413,16 @@ impl Pane {
     fn _tui_scroll_resolution_link(_: TuiScrollResolution) {}
 }
 
+/// Decide the chdir target for a restored tab's fresh shell.
+///
+/// Only an absent/empty snapshot cwd yields `None` (inherit the Weft
+/// process's cwd). Everything else is honored verbatim — including `$HOME`.
+/// The pre-v1.10.36 filter also dropped `$HOME`, so a Finder-launched Weft
+/// (process cwd `/`) restored home-directory tabs at the filesystem root.
+pub(crate) fn restore_spawn_cwd(saved_cwd: Option<&str>) -> Option<String> {
+    saved_cwd.filter(|c| !c.is_empty()).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +483,35 @@ mod tests {
             pane.last_sent_winsize,
             Some((24, 80)),
             "failed ioctl must not record the requested size"
+        );
+    }
+
+    // ── v1.10.36: restored-tab chdir target filter ──────────────────────
+
+    #[test]
+    fn restore_spawn_cwd_none_and_empty_inherit_weft_cwd() {
+        assert_eq!(restore_spawn_cwd(None), None);
+        assert_eq!(restore_spawn_cwd(Some("")), None);
+    }
+
+    #[test]
+    fn restore_spawn_cwd_honors_non_home_paths_verbatim() {
+        assert_eq!(
+            restore_spawn_cwd(Some("/Users/me")),
+            Some("/Users/me".to_string())
+        );
+    }
+
+    #[test]
+    fn restore_spawn_cwd_keeps_home_verbatim() {
+        // Regression guard for the production bug: a saved cwd equal to
+        // $HOME was filtered out, so a Finder-launched Weft (process cwd `/`)
+        // restored home tabs at the filesystem root. The pure function takes
+        // a literal so the guard runs even in a HOME-less CI environment.
+        assert_eq!(
+            restore_spawn_cwd(Some("/Users/andy")),
+            Some("/Users/andy".to_string()),
+            "a saved cwd equal to $HOME must be honored, not dropped"
         );
     }
 }
