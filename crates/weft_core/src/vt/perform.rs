@@ -378,7 +378,11 @@ impl vte::Perform for Terminal {
             return;
         }
 
-        // Diagnostic: trace cursor-moving CSIs to pin down TUI cursor desync.
+        // Primary-screen TUI classification: every counted addressing op
+        // feeds `primary_screen_cursor_ops` (the >= 2 takeover/scroll
+        // threshold). v1.10.38 excludes horizontal hops C/D here — see
+        // capture_cursor::is_primary_screen_addressing for the byte-level
+        // rationale. Also traces cursor-moving CSIs for cursor-desync forensics.
         if super::capture_cursor::is_primary_screen_addressing(action, param(params, 0, 1)) {
             let absolute = super::capture_cursor::is_absolute_primary_screen_addressing(
                 action,

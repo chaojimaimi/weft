@@ -3767,3 +3767,126 @@ fn csi_question_1_u_does_not_toggle_decckm() {
     t.process(b"\x1b[?1l"); // real DECSET off still works
     assert!(!t.app_cursor_keys(), "?1l must disable DECCKM");
 }
+
+// ── FIX_SPINNER_TOPJUMP_MISCLASSIFY (v1.10.38) ──
+//
+// `opencode upgrade`'s status line rewrites its spinner in place via
+// `CSI 999D` + `CSI J` (byte-captured: ~1000× per install, no other cursor
+// addressing). Horizontal relative hops never change rows, so v1.10.38
+// excludes `C`/`D` from `is_primary_screen_addressing`: they no longer feed
+// `cursor_ops`, and a pure-spinner stream therefore never crosses the
+// `cursor_ops >= 2` takeover threshold. Row-capable evidence (`H`/`f`/`d`,
+// `A`/`B`, `G`>1) is untouched, so omp/pi/openclaw-style repainters still
+// engage exactly as before.
+
+/// The red regression: opencode's real spinner signature (`CSI 999D` +
+/// `CSI J`, zero counting ops — horizontal hops are excluded) must NOT
+/// become a screen document, and its
+/// finalized block must stay `screen_origin = false` with its banner +
+/// spinner text intact as an ordinary streaming block.
+#[test]
+fn spinner_rewrite_stream_does_not_become_screen_document() {
+    let mut t = Terminal::new(10, 60);
+    // Ordinary command start: prompt boundary, then the echo line + preexec.
+    t.process(b"\x1b]133;A\x07opencode upgrade\x1b]133;B\x07\x1b]133;C\x07");
+    // Streaming command's initial banner.
+    t.process("\r\nfetching metadata\r\nchecking version\r\n".as_bytes());
+    // The byte-captured opencode signature: hop back to column 0 and erase
+    // through end-of-screen before rewriting the status line. Two frames,
+    // zero row-capable addressing — the old rule counted both `D`s and took
+    // over mid-run.
+    t.process("\x1b[999D\x1b[J\u{25D3} Upgrading.\x1b[999D\x1b[J\u{25D2} Upgrading.".as_bytes());
+    assert!(
+        !t.primary_screen_app_active(),
+        "horizontal hops alone must not cross the cursor_ops threshold"
+    );
+    assert!(
+        t.block_tracker().screen_document_start().is_none(),
+        "spinner-only rewrites must not take over the viewport as a screen document"
+    );
+    // Finalize like a normal command; the block stays an ordinary streaming
+    // block (screen_origin = false) with the banner and the spinner line.
+    t.process(b"\x1b]133;D;0\x07");
+    t.settle_primary_screen_exit(); // no-op unless a screen exit was deferred
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert!(
+        !block.screen_origin,
+        "spinner-only stream must finalize soft-wrappable, not screen_origin"
+    );
+    let output = block.output.as_ref();
+    assert!(
+        output.contains("fetching metadata"),
+        "banner line 1 must survive ordinary capture: {output:?}"
+    );
+    assert!(
+        output.contains("checking version"),
+        "banner line 2 must survive ordinary capture: {output:?}"
+    );
+    // Ordinary capture rewrites in place (OutputCapture), so the surviving
+    // spinner line holds the last frame's text — not both frame characters.
+    assert!(
+        output.contains("Upgrading."),
+        "the spinner status line must survive ordinary capture: {output:?}"
+    );
+    // MINOR-3: pin the in-place rewrite for real — the first frame's glyph
+    // must have been overwritten by the second frame, not concatenated.
+    assert!(
+        !output.contains('\u{25D3}'),
+        "the first spinner frame must be rewritten away, not appended: {output:?}"
+    );
+}
+
+/// Regression guard (green before and after): a full-viewport TUI that
+/// repaints with absolute CUP/VPA addressing must still take over the screen
+/// document.
+#[test]
+fn absolute_addressing_still_takes_over_screen_document() {
+    let mut t = Terminal::new(10, 60);
+    t.process(b"\x1b]133;A\x07claude\x1b]133;B\x07\x1b]133;C\x07");
+    t.process("\r\nbanner line\r\n".as_bytes());
+    // Claude Code owns the viewport with repeated absolute CUP addressing.
+    t.process(b"\x1b[8;5Hframe row one\x1b[9;5Hframe row two");
+    assert!(
+        t.block_tracker().screen_document_start().is_some(),
+        "absolute addressing must still begin a screen document"
+    );
+    t.process(b"\x1b]133;D;0\x07");
+    t.settle_primary_screen_exit();
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert!(
+        block.screen_origin,
+        "an absolute-addressed TUI block must stay screen_origin"
+    );
+}
+
+/// Regression guard (green before and after): a COMPLETED DEC 2026
+/// synchronized full frame archives `primary_screen_synchronized_frame_seen`
+/// (read back via `primary_screen_repaint_capable()`), and the window's
+/// relative addressing counts toward `cursor_ops` — the first `1B` alone
+/// contributes two ops (the generic note + the v1.10.31 window bonus), so
+/// ownership begins mid-window exactly as it did before v1.10.38. There is
+/// no separate evidence gate at the takeover entry (that design was
+/// superseded); this test pins the window-counting + archival mechanics that
+/// full-frame repainters rely on.
+#[test]
+fn synchronized_full_frame_still_takes_over_screen_document() {
+    let mut t = Terminal::new(3, 40);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    // One synchronized window that clears and repaints every row with
+    // relative moves (no CUP) — cursor_ops cross the threshold mid-window,
+    // and the completion (`?2026l`) archives the atomic full frame.
+    t.process(b"\x1b[?2026h");
+    t.process(b"\x1b[2K\x1b[1B\x1b[2K\x1b[1B\x1b[2Kframe row");
+    t.process(b"\x1b[?2026l");
+    assert!(
+        t.primary_screen_repaint_capable(),
+        "every row cleared inside one window must prove atomic repaint"
+    );
+    // Ownership is already established by the window's row ops; the extra
+    // op merely documents that streaming continues inside the document.
+    t.process(b"\x1b[1B");
+    assert!(
+        t.block_tracker().screen_document_start().is_some(),
+        "a completed synchronized full frame must begin a screen document"
+    );
+}

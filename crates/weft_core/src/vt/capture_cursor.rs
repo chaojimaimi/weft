@@ -2,16 +2,31 @@ use super::Terminal;
 
 /// `CSI 1G` is a progress rewrite; other absolute addresses remain evidence.
 ///
-/// v1.10.4: relative cursor moves (`A`/`B`/`C`/`D` — CUU/CUD/CUF/CUB) are
-/// also TUI evidence. Primary-screen TUIs like openclaw redraw their whole
-/// viewport with relative moves + EL/ED (they never use absolute CUP),
-/// whereas a plain shell command streams text without repeated cursor
-/// addressing. Counting relative moves (reset by each OSC 133;A/B prompt
-/// marker) lets such TUIs take the TUI-safe scroll path.
+/// v1.10.4: relative cursor moves (`A`/`B` — CUU/CUD) are also TUI evidence.
+/// Primary-screen TUIs like openclaw redraw their whole viewport with
+/// relative moves + EL/ED (they never use absolute CUP), whereas a plain
+/// shell command streams text without repeated cursor addressing. Counting
+/// relative moves (reset by each OSC 133;A/B prompt marker) lets such TUIs
+/// take the TUI-safe scroll path.
+///
+/// v1.10.38 (FIX_SPINNER_TOPJUMP_MISCLASSIFY): horizontal RELATIVE hops
+/// (`C`/`D` — CUF/CUB) no longer count. They never change rows, so they
+/// carry no viewport-ownership evidence; their real-world driver is in-place
+/// line rewrites — opencode upgrade's spinner emits `CSI 999D` + `CSI J`
+/// ~1000× per install (byte-captured), which crossed the old ops >= 2
+/// threshold and flipped ordinary streaming commands into top-anchored
+/// screen-document mode mid-run ("jump to viewport top / stacked copies").
+///
+/// Deliberate exception: `G`>1 still counts even though CHA is also
+/// horizontal (v1.10.5: "positions only the cursor column, never rows").
+/// pi's per-keystroke redraws are exactly EL + `CSI <col>G`, and pi sessions
+/// legitimately own the viewport — dropping `G` would demote them. The
+/// accepted risk is a spinner built on `G`>1 alone would still misclassify;
+/// none is known in the wild, and the byte-captured offender uses `D`.
 pub(super) fn is_primary_screen_addressing(action: char, first_param: u16) -> bool {
     matches!(action, 'H' | 'f' | 'd')
         || (action == 'G' && first_param > 1)
-        || matches!(action, 'A' | 'B' | 'C' | 'D')
+        || matches!(action, 'A' | 'B')
 }
 
 /// v1.10.4: whether a primary-screen addressing op positions the cursor
@@ -55,16 +70,27 @@ mod tests {
 
     #[test]
     fn relative_moves_are_primary_screen_evidence() {
-        // v1.10.4: TUIs like openclaw redraw with relative moves (CUU/CUD/
-        // CUB) + EL/ED, never absolute CUP. These must count as TUI
-        // addressing so the TUI-safe scroll path engages.
+        // v1.10.4: TUIs like openclaw redraw with relative moves (CUU/CUD)
+        // + EL/ED, never absolute CUP. These must count as TUI addressing so
+        // the TUI-safe scroll path engages.
         assert!(is_primary_screen_addressing('A', 3));
         assert!(is_primary_screen_addressing('B', 1));
-        assert!(is_primary_screen_addressing('C', 6));
-        assert!(is_primary_screen_addressing('D', 999));
         // Column-positioning G to column 1 is a progress rewrite, not TUI
         // evidence (unchanged from before).
         assert!(!is_primary_screen_addressing('G', 1));
+    }
+
+    #[test]
+    fn horizontal_relative_hops_are_not_tui_evidence() {
+        // v1.10.38 (FIX_SPINNER_TOPJUMP_MISCLASSIFY): CUB/CUF never change
+        // rows. opencode upgrade's spinner emits `CSI 999D` + `CSI J` ~1000×
+        // per install, which used to cross the ops >= 2 threshold and flip
+        // ordinary streaming commands into top-anchored screen documents.
+        assert!(!is_primary_screen_addressing('C', 6));
+        assert!(!is_primary_screen_addressing('D', 999));
+        // Row-capable evidence is untouched.
+        assert!(is_primary_screen_addressing('A', 1));
+        assert!(is_primary_screen_addressing('G', 6));
     }
 
     #[test]

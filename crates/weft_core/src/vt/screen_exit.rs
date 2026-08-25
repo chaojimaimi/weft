@@ -1202,12 +1202,14 @@ mod tests {
 
     #[test]
     fn relative_addressing_tui_uses_live_grid() {
-        // openclaw/pi pattern — relative cursor moves only (A/B/D, CHR).
-        // v1.10.12: a screen-owned TUI (any addressing style) renders in
-        // the live grid; the BlockView appears only while history browsing.
+        // openclaw/pi pattern — row-capable relative moves only (CUU; the
+        // v1.10.38 rule drops horizontal hops C/D from the count). Two row
+        // ops cross the >= 2 threshold. v1.10.12: a screen-owned TUI (any
+        // addressing style) renders in the live grid; the BlockView appears
+        // only while history browsing.
         let mut t = Terminal::new(5, 20);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
-        t.process("\x1b[999D\x1b[915A".as_bytes());
+        t.process("\x1b[999D\x1b[915A\x1b[1A".as_bytes());
         assert_eq!(t.screen_owner(), ScreenOwner::PrimaryScreenApp);
         assert!(
             !t.show_block_view(),
@@ -1266,7 +1268,7 @@ mod tests {
         // browsing (show_block_view → true via primary_history_view).
         let mut t = Terminal::new(5, 48);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
-        t.process("\x1b[999D\x1b[915A".as_bytes());
+        t.process("\x1b[999D\x1b[915A\x1b[1A".as_bytes());
         assert!(t.primary_screen_app_active());
         assert!(!t.show_block_view(), "screen-owned TUI uses the live grid");
         assert!(
