@@ -101,13 +101,41 @@ pub(crate) fn visible_panel_rows(viewport_h: f32, cell_h: u32) -> usize {
 /// Abbreviate an absolute path for display: replace a `$HOME` prefix with `~`
 /// (e.g. `/Users/andylee/proj` → `~/proj`). Falls back to the raw path when
 /// `$HOME` is unset or isn't a prefix.
+///
+/// v1.10.36: `$HOME` itself keeps its absolute form — a bare `~` is
+/// indistinguishable from the block header's "cwd unknown" placeholder.
+/// The prefix match also requires a `/` boundary, so a sibling directory
+/// whose name merely starts with `$HOME` (e.g. `/Users/andyleex`) is not
+/// mis-abbreviated to `~x`.
 pub(crate) fn abbreviate_path(path: &str) -> String {
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(h) = home.to_str() {
-            if !h.is_empty() && path.starts_with(h) {
-                return format!("~{}", &path[h.len()..]);
-            }
-        }
+    let home = std::env::var_os("HOME");
+    abbreviate_path_with(path, home.as_deref().and_then(|h| h.to_str()))
+}
+
+/// Pure core of [`abbreviate_path`] with an injectable `$HOME`, so tests can
+/// drive the boundary branches (`None`, `/`, trailing slash) deterministically
+/// instead of skipping when the environment lacks `HOME`.
+fn abbreviate_path_with(path: &str, home: Option<&str>) -> String {
+    let Some(h) = home else {
+        return path.to_string();
+    };
+    // A trailing slash in $HOME (abnormal but seen in the wild) would leave
+    // `rest` without its leading `/` and defeat every abbreviation below;
+    // trimming also makes HOME=`/` a no-op instead of the old `~opt` mangling.
+    let h = h.trim_end_matches('/');
+    if h.is_empty() {
+        return path.to_string();
+    }
+    let Some(rest) = path.strip_prefix(h) else {
+        return path.to_string();
+    };
+    if rest.is_empty() {
+        // A bare `~` is indistinguishable from the "cwd unknown" header
+        // placeholder, so $HOME itself keeps its absolute form.
+        return path.to_string();
+    }
+    if rest.starts_with('/') {
+        return format!("~{rest}");
     }
     path.to_string()
 }
@@ -254,6 +282,72 @@ mod tests {
         // even if they contain % or $ characters.
         assert_eq!(strip_prompt_prefix("echo 50% done"), "echo 50% done");
         assert_eq!(strip_prompt_prefix("# comment line"), "# comment line");
+    }
+
+    // ── v1.10.36: abbreviate_path — bare-`~` disambiguation + prefix boundary ──
+    // Deterministic: inject HOME via `abbreviate_path_with` instead of reading
+    // the environment, so no branch silently skips in a HOME-less CI.
+
+    #[test]
+    fn abbreviate_path_without_home_returns_path_verbatim() {
+        assert_eq!(abbreviate_path_with("/Users/me", None), "/Users/me");
+        assert_eq!(abbreviate_path_with("relative/path", None), "relative/path");
+    }
+
+    #[test]
+    fn abbreviate_path_root_home_never_abbreviates() {
+        // The pre-v1.10.36 starts_with check turned "/opt" into "~opt".
+        assert_eq!(abbreviate_path_with("/opt", Some("/")), "/opt");
+    }
+
+    #[test]
+    fn abbreviate_path_trailing_slash_home_still_abbreviates() {
+        assert_eq!(
+            abbreviate_path_with("/Users/me/proj", Some("/Users/me/")),
+            "~/proj"
+        );
+        assert_eq!(
+            abbreviate_path_with("/Users/me", Some("/Users/me/")),
+            "/Users/me"
+        );
+    }
+
+    #[test]
+    fn abbreviate_path_keeps_exact_home_absolute() {
+        assert_eq!(
+            abbreviate_path_with("/Users/me", Some("/Users/me")),
+            "/Users/me",
+            "a bare `~` is indistinguishable from the 'cwd unknown' header placeholder"
+        );
+    }
+
+    #[test]
+    fn abbreviate_path_abbreviates_home_subdirectory() {
+        assert_eq!(
+            abbreviate_path_with("/Users/me/proj", Some("/Users/me")),
+            "~/proj"
+        );
+        assert_eq!(
+            abbreviate_path_with("/Users/me/proj/deep", Some("/Users/me")),
+            "~/proj/deep"
+        );
+    }
+
+    #[test]
+    fn abbreviate_path_leaves_home_sibling_unchanged() {
+        assert_eq!(
+            abbreviate_path_with("/Users/mex", Some("/Users/me")),
+            "/Users/mex",
+            "a directory whose name merely starts with $HOME must not be abbreviated"
+        );
+    }
+
+    #[test]
+    fn abbreviate_path_leaves_unrelated_paths_unchanged() {
+        assert_eq!(
+            abbreviate_path_with("/opt/weft-unrelated-dir", Some("/Users/me")),
+            "/opt/weft-unrelated-dir"
+        );
     }
 
     // ── block_matches_query (v0.9 round 5: command-name substring match) ──
