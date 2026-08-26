@@ -38,6 +38,12 @@ pub struct MetalRenderer {
     pub(crate) theme: Theme,
     pub(crate) minimum_contrast: f32,
     pub(crate) semantic_output_enabled: bool,
+    /// v1.11.3 (PLAN_v1113 §3.3): SGR 1 bold on ANSI fg indexes 0-7
+    /// resolves to the bright variants (palette[i+8]) when enabled.
+    /// Origin-level substitution happens at the two fg resolve points
+    /// (grid_instances / block_view), so flipping it needs BOTH cache
+    /// invalidations (see `set_bold_is_bright`).
+    pub(crate) bold_is_bright: bool,
     /// Content padding in **physical** pixels (logical config value × scale).
     /// Cells are positioned `pad_x + col·cw`, `pad_y + row·ch`; the usable
     /// area for row/col math is the viewport minus `2·pad`.

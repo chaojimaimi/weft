@@ -529,23 +529,33 @@ mod tests {
     use crate::blocks::MAX_OUTPUT_BYTES;
     use crate::grid::{CellColor, CellFlags, Color};
 
+    fn owned(fg: CellColor, flags: CellFlags, bg: CellColor) -> CapturedStyle {
+        CapturedStyle {
+            fg,
+            bg,
+            flags,
+            ansi_owned: true,
+            ..CapturedStyle::default()
+        }
+    }
+
     fn fg_style(palette: u8) -> CapturedStyle {
-        CapturedStyle::from_attrs(
+        owned(
             CellColor::Palette(palette),
-            CellColor::Default,
             CellFlags::empty(),
+            CellColor::Default,
         )
     }
 
     fn bold_style() -> CapturedStyle {
-        CapturedStyle::from_attrs(CellColor::Default, CellColor::Default, CellFlags::BOLD)
+        owned(CellColor::Default, CellFlags::BOLD, CellColor::Default)
     }
 
     fn rgb_style(r: u8, g: u8, b: u8) -> CapturedStyle {
-        CapturedStyle::from_attrs(
+        owned(
             CellColor::Rgb(Color::rgb(r, g, b)),
-            CellColor::Default,
             CellFlags::empty(),
+            CellColor::Default,
         )
     }
 
@@ -785,10 +795,10 @@ mod tests {
     #[test]
     fn background_and_foreground_coexist_in_one_run() {
         let mut output = OutputCapture::default();
-        let style = CapturedStyle::from_attrs(
+        let style = owned(
             CellColor::Palette(2),
-            CellColor::Palette(5),
             CellFlags::UNDERLINE,
+            CellColor::Palette(5),
         );
         output.print('x', style, 1024);
         let (text, styled) = output.take_styled();
@@ -880,14 +890,14 @@ mod tests {
         // Feed alternating palette colors + bold to maximize the chance of
         // any escape leakage (there should be none).
         for i in 0..200u8 {
-            let style = CapturedStyle::from_attrs(
+            let style = owned(
                 CellColor::Palette(i % 8),
-                CellColor::Default,
                 if i % 2 == 0 {
                     CellFlags::BOLD
                 } else {
                     CellFlags::empty()
                 },
+                CellColor::Default,
             );
             output.print_ascii(&[b'a' + (i % 26)], style, 1024);
         }
@@ -926,10 +936,10 @@ mod tests {
         // RLE to its 16,384-run cap. After the cap, additional styles are
         // dropped but text continues.
         for i in 0..(MAX_STYLE_RUNS_PER_BLOCK + 100) {
-            let style = CapturedStyle::from_attrs(
+            let style = owned(
                 CellColor::Palette((i % 255) as u8),
-                CellColor::Default,
                 CellFlags::empty(),
+                CellColor::Default,
             );
             output.print_ascii(b"X", style, MAX_OUTPUT_BYTES);
         }

@@ -131,6 +131,8 @@ struct ConfigApplyDelta {
     update_opacity: bool,
     update_padding: bool,
     resize_window: bool,
+    /// v1.11.3 (PLAN_v1113 §3.3): [compat] bold_is_bright flip.
+    update_bold_is_bright: bool,
 }
 
 fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> ConfigApplyDelta {
@@ -147,6 +149,7 @@ fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> Confi
             || current.window.padding_y != next.window.padding_y,
         resize_window: current.window.width != next.window.width
             || current.window.height != next.window.height,
+        update_bold_is_bright: current.compat.bold_is_bright != next.compat.bold_is_bright,
     }
 }
 
@@ -316,6 +319,15 @@ impl App {
                 r.set_padding((config.window.padding_x, config.window.padding_y));
             }
             self.recompute_layout();
+        }
+
+        // v1.11.3 (PLAN_v1113 §3.3): bold→bright compat switch. The
+        // renderer setter invalidates BOTH caches (grid rows bake resolved
+        // colors too — R8).
+        if delta.update_bold_is_bright {
+            if let Some(r) = &mut self.renderer {
+                r.set_bold_is_bright(config.compat.bold_is_bright);
+            }
         }
 
         // Keybindings.
@@ -521,6 +533,7 @@ mod tests {
                 update_opacity: true,
                 update_padding: true,
                 resize_window: true,
+                update_bold_is_bright: false,
             }
         );
         assert_eq!(
@@ -530,6 +543,7 @@ mod tests {
                 update_opacity: false,
                 update_padding: false,
                 resize_window: false,
+                update_bold_is_bright: false,
             },
             "committing loaded state before apply would hide every runtime delta"
         );
@@ -541,6 +555,31 @@ mod tests {
         let mut emoji = current.clone();
         emoji.font.emoji_family = "Noto Color Emoji".into();
         assert!(config_apply_delta(&current, &emoji, 1.0).rebuild_font);
+    }
+
+    /// v1.11.3 (PLAN_v1113 §3.3): the [compat] flip arms
+    /// `update_bold_is_bright` — the renderer setter then invalidates BOTH
+    /// caches (force_full_grid + styled bump, R8). A missed delta here
+    /// would leave stale palette colors after a config/profile change.
+    #[test]
+    fn apply_delta_arms_bold_is_bright_on_compat_flip() {
+        let current = Config::default();
+        assert!(!current.compat.bold_is_bright);
+        let mut next = current.clone();
+        next.compat.bold_is_bright = true;
+        assert!(
+            config_apply_delta(&current, &next, 1.0).update_bold_is_bright,
+            "false → true must arm the renderer setter"
+        );
+        let third = current.clone();
+        assert!(
+            config_apply_delta(&next, &third, 1.0).update_bold_is_bright,
+            "true → false must re-arm it"
+        );
+        assert!(
+            !config_apply_delta(&next, &next, 1.0).update_bold_is_bright,
+            "no flip → no invalidation"
+        );
     }
 
     // ── apply_palette_to_all_panes ──────────────────────────────────

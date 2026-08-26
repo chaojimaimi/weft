@@ -4,7 +4,7 @@ use super::param;
 use super::replies;
 use super::Terminal;
 use super::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
-use crate::blocks::{CapturedStyle, ShellPhase};
+use crate::blocks::ShellPhase;
 use crate::grid::{terminal_char_width, CellFlags, CellWidth, CursorStyle};
 
 impl vte::Perform for Terminal {
@@ -33,11 +33,11 @@ impl vte::Perform for Terminal {
         // v1.7.0-A: capture the current VT SGR attrs so the block preserves
         // program-emitted colors after the live grid scrolls away.
         {
-            let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+            let style = self.capture_style();
             self.capture_print(c, style);
         }
         {
-            let style = CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+            let style = self.capture_style();
             self.capture_primary_screen_interrupt_print(c, style);
         }
 
@@ -156,6 +156,9 @@ impl vte::Perform for Terminal {
                 cell.bg = self.attrs.bg;
                 cell.flags = self.attrs.flags | CellFlags::DIRTY;
                 cell.width = CellWidth::Full;
+                // v1.11.3 (§1.1): carry underline fields (field-assigned).
+                cell.underline_style = self.attrs.underline_style;
+                cell.underline_color = self.attrs.underline_color;
                 // OSC 8: tag the wrapped wide-char cell with the active hyperlink.
                 if self.active_hyperlink_id.is_some() {
                     cell.flags |= CellFlags::HYPERLINK;
@@ -249,6 +252,9 @@ impl vte::Perform for Terminal {
                 cell.bg = self.attrs.bg;
                 cell.flags = self.attrs.flags | CellFlags::DIRTY;
                 cell.width = width;
+                // v1.11.3 (§1.1): carry underline style/color (see wrap site).
+                cell.underline_style = self.attrs.underline_style;
+                cell.underline_color = self.attrs.underline_color;
 
                 // OSC 8: tag the cell with HYPERLINK and record its (row,col)→id
                 // in the registry side-map. When the active hyperlink is None
@@ -309,8 +315,7 @@ impl vte::Perform for Terminal {
                 self.grid.advance_tab(1);
                 {
                     let advanced = self.grid.cursor.col.saturating_sub(prev_col);
-                    let style =
-                        CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                    let style = self.capture_style();
                     for _ in 0..advanced {
                         self.capture_print(' ', style);
                     }
@@ -1049,12 +1054,11 @@ impl vte::Perform for Terminal {
 
     fn hook(&mut self, _params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         self.suppress_joined_scalar = false;
-        // XTGETTCAP (`DCS + q ... ST`) — the only DCS we answer; opencode
-        // queries the `Ms` capability (`DCS +q4d73`) at startup. The
-        // collector gets the introducer here, `put()` feeds capped payload
-        // bytes, `unhook()` answers. Everything else stays ignored.
-        if action == 'q' && intermediates == [b'+'] {
-            self.dcs_xtgettcap.begin(action, intermediates);
+        // DCS queries we answer: XTGETTCAP (`+q`, opencode `Ms` probe) and
+        // v1.11.3 DECRQSS (`$q`, nvim `ESC P $ q m ST` probe, §2.2); the
+        // rest stays ignored.
+        if action == 'q' && (intermediates == [b'+'] || intermediates == [b'$']) {
+            self.dcs_query.begin(action, intermediates);
             return;
         }
         tracing::trace!(action = ?action, "DCS hook (ignored)");
@@ -1062,20 +1066,16 @@ impl vte::Perform for Terminal {
 
     fn put(&mut self, byte: u8) {
         self.suppress_joined_scalar = false;
-        // DCS data — fed to the collector (capped at 1KiB) only inside an
-        // XTGETTCAP request.
-        self.dcs_xtgettcap.push(byte);
+        // DCS data — collected only inside `+q` / `$q` requests.
+        self.dcs_query.push(byte);
     }
 
     fn unhook(&mut self) {
         self.suppress_joined_scalar = false;
-        // DCS end: answer an accumulated XTGETTCAP request. We support none
-        // of the queried capabilities, so every well-formed name gets a
-        // negative `DCS 0 + r <hex> ST`; malformed segments are skipped. A
-        // request that overflowed the collector's 1KiB cap is dropped whole
-        // (`finish()` → None), silently.
-        if let Some(payload) = self.dcs_xtgettcap.finish() {
-            for reply in replies::xtgettcap_negative_replies(&payload) {
+        // DCS end: answer an accumulated query (replies.rs shapes the
+        // bytes; a 1KiB-cap overflow is dropped whole, silently).
+        if let Some((kind, payload)) = self.dcs_query.finish() {
+            for reply in replies::dcs_query_replies(kind, &payload, &self.attrs) {
                 self.respond(&reply);
             }
         }

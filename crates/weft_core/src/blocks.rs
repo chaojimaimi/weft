@@ -52,19 +52,19 @@ pub use semantic::{
     MAX_SEMANTIC_SPANS_PER_BLOCK, MAX_SEMANTIC_SPANS_PER_LINE,
 };
 pub use style::{
-    AttributeSpan, CapturedStyle, CapturedStyleRun, ForegroundSpan, LinkSpan, StyledLine,
-    StyledOutput, ANSI_ATTRIBUTE_MASK, MAX_STYLE_RUNS_PER_BLOCK, MAX_STYLE_RUNS_PER_LINE,
+    compat_underline_style, encode_underline_style, AttributeSpan, CapturedStyle, CapturedStyleRun,
+    ColorSpan, ForegroundSpan, LinkSpan, StyledLine, StyledOutput, ANSI_ATTRIBUTE_MASK,
+    MAX_STYLE_RUNS_PER_BLOCK, MAX_STYLE_RUNS_PER_LINE,
 };
 
 /// Hard cap on captured output to bound memory for commands like
 /// `cat huge.log`. Beyond this the capture stops and the block is marked
 /// truncated. The grid already holds the full output for display; this only
 /// guards the detached snapshot used by search / persistence.
-/// v0.9 fix: raised from 64 KiB to 1 MiB. The 64 KiB cap was too aggressive
-/// for real-world commands (e.g. `for i in $(seq 1 20000); do echo ...; done`
-/// hits it at ~3000 lines). 1 MiB covers typical log dumps / build outputs
-/// while keeping memory bounded (a 100-block session = 100 MiB worst case,
-/// acceptable for a desktop terminal). Block view layout is independently
+/// v0.9 fix: raised from 64 KiB to 1 MiB (64 KiB was too aggressive for
+/// real-world commands, e.g. `for i in $(seq 1 20000); do echo ...; done`
+/// hits it at ~3000 lines); a 100-block session = 100 MiB worst case,
+/// acceptable for a desktop terminal. Block view layout is independently
 /// capped at 2000 visible lines per block in the renderer, so raising this
 /// doesn't affect rendering perf.
 pub(crate) const MAX_OUTPUT_BYTES: usize = 1024 * 1024;

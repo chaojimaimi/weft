@@ -1418,6 +1418,72 @@ fn save_only_writes_non_default_fields() {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 
+/// v1.11.3 (PLAN_v1113 §3.3): `[compat] bold_is_bright = true` survives a
+/// save → reload round-trip; the default (false) writes nothing.
+#[test]
+fn compat_bold_is_bright_roundtrip_and_default_omission() {
+    let path = unique_tmp_path("compat");
+    let cfg = Config {
+        compat: CompatConfig {
+            bold_is_bright: true,
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("bold_is_bright = true"), "text: {text}");
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert!(reloaded.compat.bold_is_bright, "round-trip keeps the flag");
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+    // Default config: the [compat] section must not appear on disk.
+    let path2 = unique_tmp_path("compat-default");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    let text2 = std::fs::read_to_string(&path2).unwrap();
+    assert!(!text2.contains("compat"), "default compat omitted: {text2}");
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}
+
+/// v1.11.3 (PLAN_v1113 §3.3): profile-level `[profiles.x.compat]` override
+/// survives save → reload and applies to the effective config.
+#[test]
+fn compat_profile_override_roundtrips_and_applies() {
+    let path = unique_tmp_path("compat-profile");
+    let mut cfg = Config::default();
+    cfg.profiles.insert(
+        "bright".into(),
+        ProfileConfig {
+            compat: Some(CompatConfig {
+                bold_is_bright: true,
+            }),
+            ..Default::default()
+        },
+    );
+    cfg.active_profile = Some("bright".into());
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("bold_is_bright = true"), "text: {text}");
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert_eq!(
+        reloaded.profiles["bright"]
+            .compat
+            .as_ref()
+            .map(|c| c.bold_is_bright),
+        Some(true)
+    );
+    let base = Config::default();
+    let (effective, diagnostics) = reloaded.resolve_active_profile().unwrap();
+    assert!(diagnostics.is_empty());
+    assert_ne!(effective.compat.bold_is_bright, base.compat.bold_is_bright);
+    assert!(
+        effective.compat.bold_is_bright,
+        "override reaches effective config"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
 #[test]
 fn save_creates_parent_dir() {
     // v1.0 S2: save should create the parent directory if it doesn't

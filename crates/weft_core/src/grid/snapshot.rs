@@ -1,22 +1,23 @@
-use super::{snapshot_line_map::snapshot_row_extent, CellColor, CellFlags, Color, Grid, Row};
-use crate::blocks::{
-    AttributeSpan, ForegroundSpan, LinkSpan, StyledLine, StyledOutput, ANSI_ATTRIBUTE_MASK,
-    MAX_OUTPUT_BYTES,
-};
+#[path = "snapshot_row.rs"]
+mod snapshot_row; // v1.11.3: gate budget
+
+use self::snapshot_row::{mark_snapshot_truncated, push_snapshot_text, styled_row};
+use super::{CellColor, CellFlags, Color, Grid, Row};
+use crate::blocks::{StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
 use std::sync::Arc;
 
 const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
 /// v1.6.1: Maximum link spans per captured row. Prevents a malicious TUI
 /// from spamming tiny links that bloat the snapshot. 256 is generous — a
 /// typical line has 0-2 links.
-const MAX_SNAPSHOT_LINK_SPANS: usize = 256;
+pub(crate) const MAX_SNAPSHOT_LINK_SPANS: usize = 256;
 
 /// v1.10.20: snapshot text budget — shared with `grid/snapshot_line_map.rs` (single bound for both walks).
 pub(crate) const SNAPSHOT_TEXT_BUDGET: usize = MAX_OUTPUT_BYTES + 4;
 
 /// v1.6.1: Convert a resolved URL `Arc<str>` to the `String` that `LinkSpan`
 /// stores. Centralized so the conversion is consistent across all call sites.
-fn url_to_string(url: Arc<str>) -> String {
+pub(crate) fn url_to_string(url: Arc<str>) -> String {
     url.to_string()
 }
 
@@ -396,7 +397,8 @@ impl Grid {
                 && (!row.foregrounds.is_empty()
                     || !row.backgrounds.is_empty()
                     || !row.links.is_empty()
-                    || !row.attributes.is_empty())
+                    || !row.attributes.is_empty()
+                    || !row.underline_colors.is_empty())
             {
                 span_count = span_count
                     .saturating_add(row.foregrounds.len())
@@ -407,6 +409,7 @@ impl Grid {
                     backgrounds: row.backgrounds,
                     links: row.links,
                     attributes: row.attributes,
+                    underline_colors: row.underline_colors,
                 });
             }
         }
@@ -441,7 +444,8 @@ impl Grid {
                 let styled = if snap.style_overflow
                     || (snap.foregrounds.is_empty()
                         && snap.backgrounds.is_empty()
-                        && snap.attributes.is_empty())
+                        && snap.attributes.is_empty()
+                        && snap.underline_colors.is_empty())
                 {
                     None
                 } else {
@@ -451,216 +455,12 @@ impl Grid {
                         backgrounds: snap.backgrounds,
                         links: snap.links,
                         attributes: snap.attributes,
+                        underline_colors: snap.underline_colors,
                     })
                 };
                 Some((snap.text, styled))
             })
             .collect()
-    }
-}
-
-struct SnapshotRow {
-    text: String,
-    foregrounds: Vec<ForegroundSpan>,
-    backgrounds: Vec<ForegroundSpan>,
-    /// v1.6.1: OSC 8 hyperlink spans.
-    links: Vec<LinkSpan>,
-    /// v1.7.0-A: ANSI attribute spans (bold/italic/underline/etc) captured
-    /// from the live grid cells' flags. Drives glyph selection and decoration
-    /// rendering in the Block view when the primary-screen TUI scrolls away.
-    attributes: Vec<AttributeSpan>,
-    text_overflow: bool,
-    style_overflow: bool,
-}
-
-fn push_snapshot_text(text: &mut String, source: &str) -> bool {
-    let remaining = SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len());
-    if source.len() <= remaining {
-        text.push_str(source);
-        return true;
-    }
-    let mut end = remaining.min(source.len());
-    while end > 0 && !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.push_str(&source[..end]);
-    false
-}
-
-fn mark_snapshot_truncated(text: &mut String) {
-    if text.len() <= MAX_OUTPUT_BYTES {
-        text.push(' ');
-    }
-}
-
-fn push_color_span(
-    spans: &mut Vec<ForegroundSpan>,
-    color: crate::grid::CellColor,
-    char_index: u32,
-    used: &mut usize,
-    budget: usize,
-) -> bool {
-    if color == crate::grid::CellColor::Default {
-        return true;
-    }
-    if let Some(span) = spans.last_mut() {
-        if span.end == char_index && span.color == color {
-            span.end += 1;
-            return true;
-        }
-    }
-    if *used >= budget {
-        return false;
-    }
-    spans.push(ForegroundSpan {
-        start: char_index,
-        end: char_index + 1,
-        color,
-    });
-    *used += 1;
-    true
-}
-
-fn styled_row<F>(
-    row: &Row,
-    num_cols: usize,
-    text_budget: usize,
-    style_budget: Option<usize>,
-    url_resolver: &F,
-) -> SnapshotRow
-where
-    F: Fn(u32) -> Option<Arc<str>>,
-{
-    let last = snapshot_row_extent(row, num_cols);
-    let mut text = String::with_capacity(last.min(text_budget));
-    let mut foregrounds: Vec<ForegroundSpan> = Vec::new();
-    let mut backgrounds: Vec<ForegroundSpan> = Vec::new();
-    // v1.6.1: collect link spans. Coalesce adjacent cells with the same URL
-    // into a single span to keep the span count small.
-    let mut links: Vec<LinkSpan> = Vec::new();
-    // v1.7.0-A: collect ANSI attribute spans (bold/italic/underline/etc).
-    // Coalesce adjacent cells with the same masked flags into a single span.
-    let mut attributes: Vec<AttributeSpan> = Vec::new();
-    let mut char_index = 0_u32;
-    let mut text_overflow = false;
-    let mut style_overflow = false;
-    let mut style_spans_used = 0_usize;
-    for (col, cell) in row.cells.iter().take(last).enumerate() {
-        if !cell.flags.contains(CellFlags::WIDE_SPACER) {
-            // v1.6.0: contribute the full cluster string when EXTRA is set so
-            // block-captured output preserves combining marks, ZWJ emoji, and
-            // regional flags. Falls back to the lead `char` when extras are
-            // missing (defensive — should not happen if EXTRA is set).
-            let cluster: &str = if cell.flags.contains(CellFlags::EXTRA) {
-                row.extras.grapheme_at(col).unwrap_or("")
-            } else {
-                ""
-            };
-            let push_len = if cluster.is_empty() {
-                let c = if cell.character == '\0' {
-                    ' '
-                } else {
-                    cell.character
-                };
-                c.len_utf8()
-            } else {
-                cluster.len()
-            };
-            if text.len() + push_len > text_budget {
-                text_overflow = true;
-                break;
-            }
-            if cluster.is_empty() {
-                let c = if cell.character == '\0' {
-                    ' '
-                } else {
-                    cell.character
-                };
-                text.push(c);
-            } else {
-                text.push_str(cluster);
-            }
-            if let Some(style_budget) = style_budget.filter(|_| !style_overflow) {
-                style_overflow = !push_color_span(
-                    &mut foregrounds,
-                    cell.fg,
-                    char_index,
-                    &mut style_spans_used,
-                    style_budget,
-                ) || !push_color_span(
-                    &mut backgrounds,
-                    cell.bg,
-                    char_index,
-                    &mut style_spans_used,
-                    style_budget,
-                );
-            }
-            // v1.7.0-A: capture ANSI attribute spans (bold/italic/underline/etc).
-            // Mask out grid-internal flags (DIRTY/WIDE_SPACER/CURSOR/etc) —
-            // only program-emitted SGR attributes belong in the snapshot.
-            // Coalesce with the preceding span when flags match and are
-            // adjacent, mirroring the color span coalescing logic.
-            let masked_flags = cell.flags & ANSI_ATTRIBUTE_MASK;
-            if !masked_flags.is_empty() {
-                if let Some(last) = attributes.last_mut() {
-                    if last.end == char_index && last.flags == masked_flags {
-                        last.end = char_index + 1;
-                    } else {
-                        attributes.push(AttributeSpan {
-                            start: char_index,
-                            end: char_index + 1,
-                            flags: masked_flags,
-                        });
-                    }
-                } else {
-                    attributes.push(AttributeSpan {
-                        start: char_index,
-                        end: char_index + 1,
-                        flags: masked_flags,
-                    });
-                }
-            }
-            // v1.6.1: capture hyperlink spans. Resolve the id via the url_resolver
-            // closure (backed by HyperlinkRegistry). Coalesce adjacent cells
-            // pointing at the same URL into a single span.
-            if cell.flags.contains(CellFlags::HYPERLINK) {
-                if let Some(hyperlink_id) = row.extras.hyperlink_id_at(col) {
-                    if let Some(url) = url_resolver(hyperlink_id) {
-                        if links.len() < MAX_SNAPSHOT_LINK_SPANS {
-                            let url_string = url_to_string(url);
-                            // Coalesce: extend the last span if it has the same URL.
-                            if let Some(last_link) = links.last_mut() {
-                                if last_link.end == char_index && last_link.url == url_string {
-                                    last_link.end = char_index + 1;
-                                } else {
-                                    links.push(LinkSpan {
-                                        start: char_index,
-                                        end: char_index + 1,
-                                        url: url_string,
-                                    });
-                                }
-                            } else {
-                                links.push(LinkSpan {
-                                    start: char_index,
-                                    end: char_index + 1,
-                                    url: url_string,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            char_index += 1;
-        }
-    }
-    SnapshotRow {
-        text,
-        foregrounds,
-        backgrounds,
-        links,
-        attributes,
-        text_overflow,
-        style_overflow,
     }
 }
 

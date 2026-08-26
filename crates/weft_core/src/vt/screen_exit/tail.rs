@@ -161,7 +161,7 @@ pub(super) fn space_primary_screen_exit_tail(
 mod tests {
     use super::*;
     use crate::blocks::{CapturedStyle, StyledLine, MAX_OUTPUT_BYTES};
-    use crate::grid::{CellColor, CellFlags};
+    use crate::grid::{CellColor, CellFlags, UnderlineStyle};
 
     fn empty_styled_line(line: u32) -> StyledLine {
         StyledLine {
@@ -170,6 +170,7 @@ mod tests {
             backgrounds: Vec::new(),
             links: Vec::new(),
             attributes: Vec::new(),
+            underline_colors: Vec::new(),
         }
     }
 
@@ -240,7 +241,13 @@ mod tests {
     fn primary_screen_resume_tail_compacts_gap_and_preserves_style_hierarchy() {
         let mut tail = OutputCapture::default();
         let plain = CapturedStyle::default();
-        let dim = CapturedStyle::from_attrs(CellColor::Default, CellColor::Default, CellFlags::DIM);
+        let dim = CapturedStyle::from_attrs(
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::DIM,
+            UnderlineStyle::Single,
+            None,
+        );
         tail.print_ascii(b"repainted footer", plain, MAX_OUTPUT_BYTES);
         for _ in 0..3 {
             tail.newline(MAX_OUTPUT_BYTES);
@@ -267,7 +274,13 @@ mod tests {
     #[test]
     fn semantic_tail_without_frozen_document_has_no_leading_gap() {
         let mut tail = OutputCapture::default();
-        let dim = CapturedStyle::from_attrs(CellColor::Default, CellColor::Default, CellFlags::DIM);
+        let dim = CapturedStyle::from_attrs(
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::DIM,
+            UnderlineStyle::Single,
+            None,
+        );
         tail.print_ascii(b"To resume this session:", dim, MAX_OUTPUT_BYTES);
         tail.print_ascii(
             b" agent --session id",

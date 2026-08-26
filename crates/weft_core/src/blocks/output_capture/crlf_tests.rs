@@ -1,8 +1,14 @@
 use super::{CapturedStyle, OutputCapture};
-use crate::grid::{CellColor, CellFlags, Color};
+use crate::grid::{CellColor, CellFlags, Color, UnderlineStyle};
 
 fn foreground(color: CellColor) -> CapturedStyle {
-    CapturedStyle::from_attrs(color, CellColor::Default, CellFlags::empty())
+    CapturedStyle::from_attrs(
+        color,
+        CellColor::Default,
+        CellFlags::empty(),
+        UnderlineStyle::Single,
+        None,
+    )
 }
 
 #[test]

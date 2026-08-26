@@ -238,6 +238,9 @@ impl MetalRenderer {
                 minimum_contrast,
             ),
             semantic_output_enabled,
+            // v1.11.3 (PLAN_v1113 §3.3): default false; the setter is wired
+            // through config_controller.apply_config on config/profile change.
+            bold_is_bright: false,
             padding_x,
             padding_y,
             opacity,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::blocks::ShellPhase;
+use crate::grid::{CellColor, UnderlineStyle};
 use std::time::{Duration, Instant};
 
 fn term() -> Terminal {
@@ -2711,6 +2712,257 @@ fn sgr_21_sets_double_underline_without_touching_bold() {
     );
 }
 
+// ── v1.11.3 SGR capability matrix (PLAN_v1113 §4.2) ────────────
+
+/// v1.11.3: colon-form `4:x` sets the corresponding underline style
+/// (PLAN_v1113 §2.1). Each style lands in both the UnderlineStyle field and
+/// the legacy UNDERLINE flag.
+#[test]
+fn sgr_4_colon_styles_map_all_five() {
+    for (seq, style) in [
+        ("\x1b[4:1m", UnderlineStyle::Single),
+        ("\x1b[4:2m", UnderlineStyle::Double),
+        ("\x1b[4:3m", UnderlineStyle::Wavy),
+        ("\x1b[4:4m", UnderlineStyle::Dotted),
+        ("\x1b[4:5m", UnderlineStyle::Dashed),
+    ] {
+        let mut t = term();
+        t.process(seq.as_bytes());
+        t.process(b"X");
+        let cell = t.grid().cell(0, 0);
+        assert_eq!(cell.underline_style, style, "sequence {seq}");
+        assert!(
+            cell.flags.contains(CellFlags::UNDERLINE),
+            "sequence {seq} must set UNDERLINE"
+        );
+    }
+}
+
+/// v1.11.3: `4:0` is kitty-style "no underline" = SGR 24, and the probe
+/// verdict (PLAN_v1113 step 1) extends it: vte materializes the empty tail
+/// as a 0 subparam, so `4:` arrives as `[4,0]` — identical to `4:0`. Both
+/// clear the underline entirely and return the style to Single.
+#[test]
+fn sgr_4_colon_zero_and_empty_tail_clear_underline() {
+    for seq in ["\x1b[4:0m", "\x1b[4:m"] {
+        let mut t = term();
+        t.process(b"\x1b[4:3m"); // wavy first — must be fully cleared
+        t.process(seq.as_bytes());
+        t.process(b"X");
+        let cell = t.grid().cell(0, 0);
+        assert!(
+            !cell.flags.contains(CellFlags::UNDERLINE),
+            "sequence {seq} must clear UNDERLINE"
+        );
+        assert!(
+            !cell.flags.contains(CellFlags::DOUBLE_UNDER),
+            "sequence {seq} must clear DOUBLE_UNDER"
+        );
+        assert_eq!(cell.underline_style, UnderlineStyle::Single, "{seq}");
+    }
+}
+
+/// v1.11.3: plain SGR `4` in semicolon form re-sets the underline but 归位s
+/// the style to Single — `4:3` followed by a plain `4` must not leave wavy
+/// residue (kitty/wezterm/Ghostty consensus, PLAN_v1113 §2.1).
+#[test]
+fn sgr_plain_4_resets_style_to_single() {
+    let mut t = term();
+    t.process(b"\x1b[4:3m\x1b[4mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::UNDERLINE));
+    assert_eq!(cell.underline_style, UnderlineStyle::Single);
+}
+
+/// v1.11.3: semicolon `4;3` stays the classic "underline + italic" pair —
+/// the colon/group-view dispatch must not alter the semicolon form.
+#[test]
+fn sgr_semicolon_4_3_is_underline_plus_italic() {
+    let mut t = term();
+    t.process(b"\x1b[4;3mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::UNDERLINE));
+    assert!(cell.flags.contains(CellFlags::ITALIC));
+    assert_eq!(cell.underline_style, UnderlineStyle::Single);
+}
+
+/// v1.11.3: unknown style values (kitty 4:6..4:9 etc.) are ignored without
+/// panicking — the underline flag still lands, style stays as-is
+/// (PLAN_v1113 §2.1 "不得裸索引").
+#[test]
+fn sgr_4_colon_unknown_style_ignored() {
+    for seq in ["\x1b[4:6m", "\x1b[4:9m", "\x1b[4:15m"] {
+        let mut t = term();
+        t.process(b"\x1b[4:2m"); // double first: unknown must not clobber
+        t.process(seq.as_bytes());
+        t.process(b"X");
+        let cell = t.grid().cell(0, 0);
+        assert!(cell.flags.contains(CellFlags::UNDERLINE), "{seq}");
+        assert_eq!(cell.underline_style, UnderlineStyle::Double, "{seq}");
+    }
+}
+
+/// v1.11.3: SGR 21/24 write both carriers (dual-track, PLAN_v1113 §1.2):
+/// 21 keeps the historical DOUBLE_UNDER-only flag write (维持现状) and adds
+/// style Double; 24 clears the flags + 归位 Single.
+#[test]
+fn sgr_21_24_write_both_underline_carriers() {
+    let mut t = term();
+    t.process(b"\x1b[21mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::DOUBLE_UNDER));
+    assert_eq!(cell.underline_style, UnderlineStyle::Double);
+
+    t.process(b"\x1b[24mB");
+    let cell = t.grid().cell(0, 1);
+    assert!(!cell.flags.contains(CellFlags::DOUBLE_UNDER));
+    assert!(!cell.flags.contains(CellFlags::UNDERLINE));
+    assert_eq!(cell.underline_style, UnderlineStyle::Single);
+}
+
+/// rust-reviewer v1.11.3 Major-1: the mirror-sync contract — `4:x` must
+/// REMOVE the DOUBLE_UNDER bit when the style is not double, otherwise a
+/// stale `21` followed by any other underline style keeps rendering as
+/// double (the bit outranks the style field on the read side). Locks all
+/// four non-double styles.
+#[test]
+fn sgr_21_then_4x_clears_stale_double_under_bit() {
+    for (seq, style) in [
+        (b"\x1b[4:1m", UnderlineStyle::Single),
+        (b"\x1b[4:3m", UnderlineStyle::Wavy),
+        (b"\x1b[4:4m", UnderlineStyle::Dotted),
+        (b"\x1b[4:5m", UnderlineStyle::Dashed),
+    ] {
+        let mut t = term();
+        t.process(b"\x1b[21m");
+        t.process(seq);
+        t.process(b"X");
+        let cell = t.grid().cell(0, 0);
+        assert!(
+            !cell.flags.contains(CellFlags::DOUBLE_UNDER),
+            "{seq:?}: stale DOUBLE_UNDER bit must be removed"
+        );
+        assert_eq!(cell.underline_style, style, "{seq:?}");
+        assert!(cell.flags.contains(CellFlags::UNDERLINE), "{seq:?}");
+    }
+}
+
+/// rust-reviewer v1.11.3 Minor-1 regression: unknown 4:x values are ignored
+/// WHOLE-GROUP (kitty/WezTerm/Ghostty consensus) — no UNDERLINE insertion,
+/// so a capability probe like `4:9` never paints an unexpected underline.
+#[test]
+fn sgr_4_colon_unknown_value_is_fully_ignored() {
+    let mut t = term();
+    // Style request alone: nothing may appear (the stream has no prior
+    // attribute state in a fresh terminal).
+    t.process(b"\x1b[4:9m\x1b[4:65535mX");
+    let cell = t.grid().cell(0, 0);
+    assert!(!cell.flags.contains(CellFlags::UNDERLINE));
+
+    // But an existing wavy stays untouched by an unknown probe following it.
+    let mut t2 = term();
+    t2.process(b"\x1b[4:3mA\x1b[4:9mB");
+    let b = t2.grid().cell(0, 1);
+    assert_eq!(b.underline_style, UnderlineStyle::Wavy);
+}
+
+/// v1.11.3: `58:x` colon form stores the underline color on the cell — all
+/// three shapes per PLAN_v1113 §2.1: truecolor, nvim's empty-colorspace
+/// truecolor, and palette. Malformed groups are dropped whole.
+#[test]
+fn sgr_58_colon_stores_underline_color() {
+    // Truecolor `58:2:R:G:B`
+    let mut t = term();
+    t.process(b"\x1b[4\x1b[58:2:255:0:128mX");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(
+        cell.underline_color,
+        Some(CellColor::Rgb(Color::rgb(255, 0, 128)))
+    );
+
+    // nvim empty colorspace `58:2::R:G:B` → probe shape [58,2,0,R,G,B]
+    let mut t2 = term();
+    t2.process(b"\x1b[4\x1b[58:2::10:20:30mY");
+    let cell2 = t2.grid().cell(0, 0);
+    assert_eq!(
+        cell2.underline_color,
+        Some(CellColor::Rgb(Color::rgb(10, 20, 30)))
+    );
+
+    // Palette `58:5:N`
+    let mut t3 = term();
+    t3.process(b"\x1b[4\x1b[58:5:196mZ");
+    let cell3 = t3.grid().cell(0, 0);
+    assert_eq!(cell3.underline_color, Some(CellColor::Palette(196)));
+
+    // Malformed (`58:2:1:2` short, `58:7` odd): ignore whole group, and the
+    // group's elements must NOT leak into the flat walk (`2` would enable
+    // DIM — the AUDIT_v1.10.39 P0-1 regression).
+    for seq in ["\x1b[58:2:1:2m", "\x1b[58:7m"] {
+        let mut t4 = term();
+        t4.process(seq.as_bytes());
+        t4.process(b"W");
+        let cell4 = t4.grid().cell(0, 0);
+        assert_eq!(cell4.underline_color, None, "{seq}");
+        assert!(!cell4.flags.contains(CellFlags::DIM), "{seq} leaked `2`");
+        assert!(!cell4.flags.contains(CellFlags::ITALIC), "{seq} leaked `5`");
+    }
+}
+
+/// v1.11.3: semicolon `58;2;R;G;B` also stores the underline color (the
+/// flat-walk path), and `59` resets it. SGR 0 (reset) returns it to None.
+#[test]
+fn sgr_58_semicolon_stores_and_59_resets_underline_color() {
+    let mut t = term();
+    t.process(b"\x1b[4;58;2;1;2;3mX");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(
+        cell.underline_color,
+        Some(CellColor::Rgb(Color::rgb(1, 2, 3)))
+    );
+    assert!(
+        !cell.flags.contains(CellFlags::DIM),
+        "`2` must not leak as DIM"
+    );
+
+    t.process(b"\x1b[59mY");
+    assert_eq!(t.grid().cell(0, 1).underline_color, None);
+
+    let mut t2 = term();
+    t2.process(b"\x1b[58;5;196m\x1b[0mZ");
+    assert_eq!(t2.grid().cell(0, 0).underline_color, None, "SGR 0 resets");
+}
+
+/// v1.11.3 (PLAN_v1113 §2.1 S5): REVERSE swaps fg/bg only — the underline
+/// color is application-owned and must survive REVERSE untouched.
+#[test]
+fn sgr_reverse_does_not_swap_underline_color() {
+    let mut t = term();
+    t.process(b"\x1b[4\x1b[58:2:10:20:30m\x1b[7mX");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::REVERSE));
+    assert_eq!(
+        cell.underline_color,
+        Some(CellColor::Rgb(Color::rgb(10, 20, 30))),
+        "REVERSE must not touch underline_color"
+    );
+}
+
+/// v1.11.3: style surviving an overwrite — a wavy cell overwritten by plain
+/// text (after an SGR reset) must lose the style/color (the field-assignment
+/// write path carries the NEW attrs, never leaves stale cell values).
+#[test]
+fn sgr_style_and_color_overwrite_resets_cleanly() {
+    let mut t = term();
+    t.process(b"\x1b[4:3m\x1b[58:2:1:2:3mA");
+    t.process(b"\r\x1b[K\x1b[0m");
+    t.process(b"B");
+    let cell = t.grid().cell(0, 0);
+    assert_eq!(cell.underline_style, UnderlineStyle::Single);
+    assert_eq!(cell.underline_color, None);
+    assert!(!cell.flags.contains(CellFlags::UNDERLINE));
+}
+
 // ── Insert/delete ────────────────────────────────────────────
 
 #[test]
@@ -3798,6 +4050,92 @@ fn xtgettcap_overlong_payload_is_capped_and_discarded() {
     // the collector must re-arm cleanly for the next request
     t.process(b"\x1bP+q4d73\x1b\\");
     assert_eq!(t.take_response(), b"\x1bP0+r4d73\x1b\\");
+}
+
+// ── v1.11.3 DECRQSS / XTGETTCAP Su (PLAN_v1113 §2.2/§2.3) ──────
+
+/// v1.11.3 (PLAN_v1113 §4.3): the nvim probe — `ESC[0m ESC[4:3m` followed by
+/// `DCS $ q m ST` — must answer EXACTLY `1$r4:3m`. nvim's
+/// `tui_query_extended_underline` / `handle_term_response` byte-match the
+/// body between DCS and ST; this is the real vim/neovim spell-check wavy
+/// underline unlock path.
+#[test]
+fn decrqss_sgr_probe_after_wavy_answers_exactly_1_dollar_r_4_colon_3() {
+    let mut t = term();
+    t.process(b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\");
+    assert_eq!(
+        t.take_response(),
+        b"\x1bP1$r4:3m\x1b\\",
+        "nvim DECRQSS probe must receive the exact 1$r4:3m body"
+    );
+}
+
+/// v1.11.3: double underline state answers `1$r4:2m`.
+#[test]
+fn decrqss_sgr_after_double_answers_4_colon_2() {
+    let mut t = term();
+    t.process(b"\x1b[0m\x1b[21m\x1bP$qm\x1b\\");
+    assert_eq!(t.take_response(), b"\x1bP1$r4:2m\x1b\\");
+}
+
+/// v1.11.3: an unanswerable DECRQSS payload (anything but `m`) gets the
+/// refused answer `DCS 0 $ r <pt> ST`.
+#[test]
+fn decrqss_unknown_payload_gets_refused_answer() {
+    let mut t = term();
+    t.process(b"\x1bP$qr\x1b\\"); // e.g. DECTABSR-style query
+    assert_eq!(t.take_response(), b"\x1bP0$rr\x1b\\");
+}
+
+/// v1.11.3: default attrs contain no underline segment (explicit `0` reset
+/// body), and `$q` with an empty payload is refused like any unknown.
+#[test]
+fn decrqss_default_attrs_answer_has_no_underline() {
+    let mut t = term();
+    t.process(b"\x1b[0m\x1bP$qm\x1b\\");
+    let bytes = t.take_response();
+    let resp = String::from_utf8_lossy(&bytes);
+    assert_eq!(resp, "\x1bP1$r0m\x1b\\");
+    assert!(!resp.contains('4'), "no underline segment in {resp}");
+}
+
+/// v1.11.3 (PLAN_v1113 §4.4): XTGETTCAP `Su` (hex `5375`) gets a positive
+/// `1+r` answer carrying the base64-encoded mintty-style value; unknown
+/// names keep the negative `0+r` answer.
+#[test]
+fn xtgettcap_su_gets_positive_answer_at_terminal_level() {
+    let mut t = term();
+    t.process(b"\x1bP+q5375;4d73\x1b\\"); // Su; Ms
+    assert_eq!(
+        t.take_response(),
+        b"\x1bP1+r5375=G1s0OiVkbQ\x1b\\\x1bP0+r4d73\x1b\\",
+        "Su positive + Ms negative in request order"
+    );
+}
+
+/// v1.11.3 (PLAN_v1113 §4.6): screen snapshot round-trip — a cell written
+/// with `4:3` + `58:2:...` must surface as a Wavy style + explicit color in
+/// the captured StyledLine (parser → cell → snapshot chain end-to-end).
+#[test]
+fn snapshot_roundtrip_preserves_wavy_style_and_underline_color() {
+    use crate::blocks::StyledOutput;
+    use crate::grid::UnderlineStyle;
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b[4:3m\x1b[58:2:200:100:50mwave");
+    let (_text, styled, _): (String, StyledOutput, Option<usize>) = t
+        .grid()
+        .document_snapshot_from_position_with_resolver(0, |_| None);
+    let line = styled.line(0).expect("line 0 in snapshot");
+    assert_eq!(line.underline_style_at(0), UnderlineStyle::Wavy);
+    assert_eq!(line.underline_style_at(3), UnderlineStyle::Wavy);
+    assert_eq!(
+        line.underline_color_at(0),
+        Some(CellColor::Rgb(Color::rgb(200, 100, 50)))
+    );
+    assert_eq!(
+        line.underline_color_at(3),
+        Some(CellColor::Rgb(Color::rgb(200, 100, 50)))
+    );
 }
 
 /// `CSI ? 1 u` (kitty keyboard op carrying the private marker) must not be

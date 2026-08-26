@@ -39,6 +39,7 @@ fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowIn
         20.0,
         0.0,
         0.0,
+        false,
     )
 }
 
@@ -67,6 +68,7 @@ fn terminal_grid_applies_minimum_contrast_without_touching_background() {
         20.0,
         0.0,
         0.0,
+        false,
     );
     assert_eq!(result.bg_instances[0].bg, BACKGROUND);
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
@@ -125,6 +127,7 @@ fn grid_explicit_terminal_color_preserves_application_hierarchy() {
         20.0,
         0.0,
         0.0,
+        false,
     );
     let GlyphInstance::Text { fg, .. } = &instances.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -300,6 +303,7 @@ fn build_high_contrast_cell(cell: &Cell) -> super::GridRowInstances {
         20.0,
         0.0,
         0.0,
+        false,
     )
 }
 
@@ -355,4 +359,307 @@ fn graphic_char_classification_covers_box_drawing_and_block_elements() {
     assert!(!super::is_terminal_graphic_char('A'));
     assert!(!super::is_terminal_graphic_char('·'));
     assert!(!super::is_terminal_graphic_char('中'));
+}
+
+// ── v1.11.3: styled underline instance counts (PLAN_v1113 §4.5) ────────
+
+fn decos(result: &super::GridRowInstances) -> Vec<[f32; 4]> {
+    result
+        .glyph_instances
+        .iter()
+        .filter_map(|g| match g {
+            GlyphInstance::Decoration { dst, .. } => Some(*dst),
+            _ => None,
+        })
+        .collect()
+}
+
+/// v1.11.3: Wavy emits 8 step quads (2 periods on a standard cell) with the
+/// ±1px staircase levels.
+#[test]
+fn grid_wavy_under_emits_eight_step_quads() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::UNDERLINE;
+    cell.underline_style = weft_core::grid::UnderlineStyle::Wavy;
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let decos = decos(&result);
+    // Text + 8 decorations (cursor hidden → no cursor/selection decorations).
+    assert_eq!(decos.len(), 8, "wavy = 8 step quads");
+    let y0s: Vec<f32> = decos.iter().map(|d| d[1]).collect();
+    assert!(y0s.contains(&(20.0 - UNDERLINE_HEIGHT - 1.0)), "{y0s:?}");
+    assert!(y0s.contains(&(20.0 - UNDERLINE_HEIGHT + 1.0)), "{y0s:?}");
+}
+
+/// v1.11.3: Dotted emits thickness-sized dots on the baseline.
+#[test]
+fn grid_dotted_under_emits_two_to_three_dots() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::UNDERLINE;
+    cell.underline_style = weft_core::grid::UnderlineStyle::Dotted;
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let decos = decos(&result);
+    assert!(
+        (2..=3).contains(&decos.len()),
+        "dotted = 2-3 dots, got {}",
+        decos.len()
+    );
+    for d in &decos {
+        assert!(
+            (d[3] - d[1]).abs() - UNDERLINE_HEIGHT < 1e-4,
+            "dot height = thickness"
+        );
+        assert!((d[1] - (20.0 - UNDERLINE_HEIGHT)).abs() < 1e-4);
+    }
+}
+
+/// v1.11.3: one dash per standard cell (phase 0).
+#[test]
+fn grid_dashed_under_emits_single_dash_on_default_phase() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::UNDERLINE;
+    cell.underline_style = weft_core::grid::UnderlineStyle::Dashed;
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let decos = decos(&result);
+    assert_eq!(decos.len(), 1, "phase 0 → exactly one dash");
+    assert!(
+        (decos[0][2] - decos[0][0] - 6.0).abs() < 1e-4,
+        "dash = 0.6cw"
+    );
+}
+
+/// v1.11.3 (PLAN_v1113 §3.2 R7): OSC 8 hyperlink + SGR wavy in the same
+/// cell → only the wavy decoration renders; the HYPERLINK_COLOR underline
+/// is suppressed.
+#[test]
+fn grid_hyperlink_decoration_suppressed_by_sgr_wavy() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::UNDERLINE | CellFlags::HYPERLINK;
+    cell.underline_style = weft_core::grid::UnderlineStyle::Wavy;
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let decos = decos(&result);
+    assert_eq!(decos.len(), 8, "wavy quads only — no HYPERLINK_COLOR line");
+    assert!(
+        result.glyph_instances.iter().all(|g| !matches!(
+            g,
+            GlyphInstance::Decoration { color, .. }
+                if *color == super::HYPERLINK_COLOR
+        )),
+        "hyperlink decoration must be suppressed by the SGR underline"
+    );
+}
+
+/// v1.11.3: hyperlink WITHOUT SGR underline keeps the HYPERLINK_COLOR line.
+#[test]
+fn grid_hyperlink_without_sgr_underline_keeps_hyperlink_color() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::HYPERLINK;
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    assert!(
+        result.glyph_instances.iter().any(|g| matches!(
+            g,
+            GlyphInstance::Decoration { color, .. }
+                if *color == super::HYPERLINK_COLOR
+        )),
+        "plain hyperlink keeps its decoration"
+    );
+    let decos = decos(&result);
+    assert_eq!(decos.len(), 1, "exactly the hyperlink line");
+}
+
+/// v1.11.3: SGR 58 underline color wins as the decoration color and eats
+/// DIM×0.5 (no contrast boost).
+#[test]
+fn grid_sgr_58_color_dimmed_like_text() {
+    let mut cell = Cell::with_char('A');
+    cell.flags = CellFlags::UNDERLINE | CellFlags::DIM;
+    cell.underline_color = Some(CellColor::Rgb(Color::rgb(100, 100, 100)));
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let decos = decos(&result);
+    assert_eq!(decos.len(), 1);
+    let GlyphInstance::Decoration { color, .. } = result
+        .glyph_instances
+        .iter()
+        .find(|g| matches!(g, GlyphInstance::Decoration { .. }))
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let expected = (100.0 / 255.0) * 0.5;
+    assert!((color[0] - expected).abs() < 1e-6, "dimmed underline color");
+    assert_eq!(color[3], 1.0);
+}
+
+// ── v1.11.3: [compat] bold_is_bright (PLAN_v1113 §3.3/§4.7) ────────────
+
+/// Default OFF: SGR 1 bold keeps the base palette color — the verts are
+/// bit-identical to the pre-v1.11.3 resolution ("色彩与现状逐位一致").
+#[test]
+fn grid_bold_is_bright_off_keeps_base_palette_color() {
+    let mut cell = Cell::with_char('A');
+    cell.fg = CellColor::Palette(1);
+    cell.flags = CellFlags::BOLD;
+    // build_attr_cell passes bold_is_bright=false (default).
+    let result = build_attr_cell(&cell, &Cursor::default(), false);
+    let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    let palette = Color::standard_palette();
+    let expected = crate::paint::primitives::color_to_normalized(palette[1]);
+    assert_eq!(*fg, expected, "bold+default stays base red");
+}
+
+/// Switched ON: Palette(1)+BOLD resolves to palette[9] (bright red).
+#[test]
+fn grid_bold_is_bright_on_maps_ansi_to_bright_variant() {
+    let palette = Color::standard_palette();
+    let mut grid = Grid::new(1, 1);
+    let mut cell = Cell::with_char('A');
+    cell.fg = CellColor::Palette(1);
+    cell.flags = CellFlags::BOLD;
+    grid.viewport[0].cells[0] = cell.clone();
+    let result = build_row_instances(
+        &grid,
+        &palette,
+        0,
+        FG_FULL,
+        BG_DARK,
+        [1.0; 4],
+        [0.3, 0.5, 0.7, 0.6],
+        [0.22, 0.34, 0.50, 1.0],
+        &Cursor::default(),
+        CursorStyle::Block,
+        false,
+        &SelectionHandler::new(),
+        1.0,
+        1.0,
+        10.0,
+        20.0,
+        0.0,
+        0.0,
+        true, // bold_is_bright
+    );
+    let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    let expected = crate::paint::primitives::color_to_normalized(palette[9]);
+    assert_eq!(*fg, expected, "bold maps palette[1] → palette[9]");
+}
+
+/// Switched ON: palette indexes ≥ 8 and explicit Rgb colors are untouched.
+#[test]
+fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
+    let palette = Color::standard_palette();
+    for (fg, expected_idx) in [
+        (CellColor::Palette(9), 9usize),
+        (CellColor::Palette(196), 196usize),
+    ] {
+        let mut grid = Grid::new(1, 1);
+        let mut cell = Cell::with_char('A');
+        cell.fg = fg;
+        cell.flags = CellFlags::BOLD;
+        grid.viewport[0].cells[0] = cell.clone();
+        let result = build_row_instances(
+            &grid,
+            &palette,
+            0,
+            FG_FULL,
+            BG_DARK,
+            [1.0; 4],
+            [0.3, 0.5, 0.7, 0.6],
+            [0.22, 0.34, 0.50, 1.0],
+            &Cursor::default(),
+            CursorStyle::Block,
+            false,
+            &SelectionHandler::new(),
+            1.0,
+            1.0,
+            10.0,
+            20.0,
+            0.0,
+            0.0,
+            true,
+        );
+        let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
+            panic!("expected text glyph");
+        };
+        let expected = crate::paint::primitives::color_to_normalized(palette[expected_idx]);
+        assert_eq!(*fg, expected, "palette[{expected_idx}] + BOLD unchanged");
+    }
+    // Rgb: unaffected by the switch.
+    let mut grid = Grid::new(1, 1);
+    let mut cell = Cell::with_char('A');
+    cell.fg = CellColor::Rgb(Color::rgb(9, 8, 7));
+    cell.flags = CellFlags::BOLD;
+    grid.viewport[0].cells[0] = cell.clone();
+    let result = build_row_instances(
+        &grid,
+        &palette,
+        0,
+        FG_FULL,
+        BG_DARK,
+        [1.0; 4],
+        [0.3, 0.5, 0.7, 0.6],
+        [0.22, 0.34, 0.50, 1.0],
+        &Cursor::default(),
+        CursorStyle::Block,
+        false,
+        &SelectionHandler::new(),
+        1.0,
+        1.0,
+        10.0,
+        20.0,
+        0.0,
+        0.0,
+        true,
+    );
+    let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    let expected = crate::paint::primitives::color_to_normalized(Color::rgb(9, 8, 7));
+    assert_eq!(*fg, expected, "Rgb + BOLD unchanged");
+}
+
+/// Switched ON: REVERSE + DIM ordering does not drift — the substitution
+/// happens at the origin before resolve, so the swap still applies to the
+/// resolved colors and DIM still halves the visible fg afterwards.
+#[test]
+fn grid_bold_is_bright_reverse_dim_order_stable() {
+    let palette = Color::standard_palette();
+    let mut grid = Grid::new(1, 1);
+    let mut cell = Cell::with_char('A');
+    cell.fg = CellColor::Palette(1); // text color → after REVERSE becomes bg
+    cell.bg = CellColor::Palette(2); // → after REVERSE becomes text
+    cell.flags = CellFlags::BOLD | CellFlags::REVERSE | CellFlags::DIM;
+    grid.viewport[0].cells[0] = cell.clone();
+    let result = build_row_instances(
+        &grid,
+        &palette,
+        0,
+        FG_FULL,
+        BG_DARK,
+        [1.0; 4],
+        [0.3, 0.5, 0.7, 0.6],
+        [0.22, 0.34, 0.50, 1.0],
+        &Cursor::default(),
+        CursorStyle::Block,
+        false,
+        &SelectionHandler::new(),
+        1.0,
+        1.0,
+        10.0,
+        20.0,
+        0.0,
+        0.0,
+        true,
+    );
+    let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    // Visible text = original bg palette[2] × DIM (swap after resolve,
+    // DIM last) — the brightened fg went to the background bar.
+    let green = crate::paint::primitives::color_to_normalized(palette[2]);
+    let expected = [green[0] * 0.5, green[1] * 0.5, green[2] * 0.5, green[3]];
+    for (actual, exp) in fg.iter().zip(expected.iter()) {
+        assert!((actual - exp).abs() < 1e-6, "fg={fg:?} exp={expected:?}");
+    }
 }

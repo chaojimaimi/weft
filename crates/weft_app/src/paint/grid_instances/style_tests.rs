@@ -35,6 +35,7 @@ fn build_row(cells: &[Cell]) -> super::GridRowInstances {
         20.0,
         0.0,
         0.0,
+        false,
     )
 }
 

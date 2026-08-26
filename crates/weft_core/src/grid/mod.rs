@@ -10,7 +10,7 @@ mod snapshot;
 mod snapshot_line_map;
 pub use cell::{
     terminal_char_width, terminal_grapheme_glyph, terminal_text_width, Cell, CellColor, CellFlags,
-    CellWidth, Color,
+    CellWidth, Color, UnderlineStyle,
 };
 pub use cursor::{Cursor, CursorStyle};
 pub use row::Row;
@@ -319,6 +319,11 @@ impl Grid {
             cell.bg = bg;
             cell.flags = flags | CellFlags::DIRTY;
             cell.width = width;
+            // rust-reviewer v1.11.3 Minor-4: overwrite must reset ALL content
+            // fields — leaving underline_style/color stale would make a
+            // future caller inherit the previous cell's decoration.
+            cell.underline_style = UnderlineStyle::Single;
+            cell.underline_color = None;
 
             self.viewport[row].mark_dirty(col);
             self.cursor.col += width as usize;

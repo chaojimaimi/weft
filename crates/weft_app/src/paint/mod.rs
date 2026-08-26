@@ -27,6 +27,8 @@ pub(crate) mod pane_dividers;
 pub(crate) mod panel;
 pub(crate) mod preedit;
 pub(crate) mod primitives;
+// v1.11.3 (PLAN_v1113 §3.1): underline geometry + bold→bright helpers —
+// own module so primitives.rs stays within the gate's 800-line budget.
 pub(crate) mod prompt;
 pub(crate) mod selection_color;
 pub(crate) mod settings;
@@ -36,3 +38,4 @@ pub(crate) mod styled_line_cache;
 pub(crate) mod tab_bar;
 pub(crate) mod text;
 pub(crate) mod ui_helpers;
+pub(crate) mod underline;

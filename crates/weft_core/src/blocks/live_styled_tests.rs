@@ -18,7 +18,7 @@
 //!   flickering the live block back to unstyled.
 
 use crate::blocks::{BlockTracker, CapturedStyle, ShellPhase, MAX_STYLE_RUNS_PER_BLOCK};
-use crate::grid::{CellColor, CellFlags};
+use crate::grid::{CellColor, CellFlags, UnderlineStyle};
 use crate::vt::Terminal;
 
 /// Untagged `133;A` bootstraps shell integration (no tagged marker seen yet),
@@ -119,6 +119,8 @@ fn style_overflow_freezes_last_snapshot() {
             CellColor::Palette(1),
             CellColor::Default,
             CellFlags::empty(),
+            UnderlineStyle::Single,
+            None,
         ),
     );
     // Alternating palettes force a new run per char; exhaust the run cap.
@@ -130,6 +132,8 @@ fn style_overflow_freezes_last_snapshot() {
                 CellColor::Palette(palette),
                 CellColor::Default,
                 CellFlags::empty(),
+                UnderlineStyle::Single,
+                None,
             ),
         );
     }
@@ -165,6 +169,8 @@ fn destyle_rewrite_drops_stale_colors_live_and_final() {
         CellColor::Palette(1),
         CellColor::Default,
         CellFlags::empty(),
+        UnderlineStyle::Single,
+        None,
     );
     // Red "ERROR" publishes a snapshot on the first mutation...
     for ch in "ERROR".chars() {
@@ -213,6 +219,8 @@ fn screen_takeover_clears_plain_phase_snapshot() {
             CellColor::Palette(1),
             CellColor::Default,
             CellFlags::empty(),
+            UnderlineStyle::Single,
+            None,
         ),
     );
     assert!(

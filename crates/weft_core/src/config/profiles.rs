@@ -21,8 +21,8 @@ use bitflags::bitflags;
 use serde::Deserialize;
 
 use super::{
-    Action, AiConfig, BlocksConfig, EditorConfig, FontConfig, KeyBindings, LogoConfig, PasteConfig,
-    ScrollbackConfig, ThemeConfig, WindowConfig,
+    Action, AiConfig, BlocksConfig, CompatConfig, EditorConfig, FontConfig, KeyBindings,
+    LogoConfig, PasteConfig, ScrollbackConfig, ThemeConfig, WindowConfig,
 };
 
 // ── ProfileConfig ──────────────────────────────────────────────────────
@@ -48,6 +48,8 @@ pub struct ProfileConfig {
     /// v1.11.2 X4 (PLAN_v1112 §1.2): block retention cap is
     /// profile-overridable like `[scrollback]`.
     pub blocks: Option<BlocksConfig>,
+    /// v1.11.3 (PLAN_v1113 §3.3): `[compat]` is profile-overridable.
+    pub compat: Option<CompatConfig>,
     pub logo: Option<LogoConfig>,
     /// `keybindings` is also a full-section override (no per-key merge).
     pub keybindings: Option<HashMap<String, Action>>,
@@ -67,6 +69,7 @@ impl ProfileConfig {
             && self.editor.is_none()
             && self.paste.is_none()
             && self.blocks.is_none()
+            && self.compat.is_none()
             && self.logo.is_none()
             && self.keybindings.is_none()
     }
@@ -95,6 +98,8 @@ bitflags! {
         /// v1.11.1 (PLAN_v1111 §4.6): large-paste protection switches
         /// (`[paste]`, Settings Input page rows 2-4).
         const PASTE        = 1 << 8;
+        /// v1.11.3 (PLAN_v1113 §3.3): `[compat]` terminal-compat switches.
+        const COMPAT       = 1 << 9;
     }
 }
 
@@ -195,6 +200,9 @@ pub fn apply_overrides(base: &mut super::Config, profile: &ProfileConfig) {
     }
     if let Some(blocks) = &profile.blocks {
         base.blocks = blocks.clone();
+    }
+    if let Some(compat) = &profile.compat {
+        base.compat = compat.clone();
     }
     if let Some(logo) = &profile.logo {
         base.logo = logo.clone();

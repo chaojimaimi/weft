@@ -6,10 +6,11 @@ use crate::paint::primitives::{
 use crate::paint::styled_line_cache::{
     palette_fingerprint, translate_and_append_shifts_only_xy, StyledLineCache, StyledLineCacheKey,
 };
+use crate::paint::underline::{underline_rects, MAX_UNDERLINE_RECTS};
 use crate::renderer::MetalRenderer;
 use weft_core::blocks::{OutputSemanticRole, SemanticSpan, StyledLine};
 use weft_core::config::Theme;
-use weft_core::grid::{CellFlags, Color};
+use weft_core::grid::{CellColor, CellFlags, Color, UnderlineStyle};
 
 pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) x: f32,
@@ -277,18 +278,27 @@ impl MetalRenderer {
                 .and_then(|line| line.background_at(source_index))
                 .map(|origin| resolve_cell_color(origin, [0.0; 4], paint.palette));
             let ansi_owned = explicit_fg.is_some() || bg.is_some() || !flags.is_empty();
-            let fg = explicit_fg
-                .map(|origin| resolve_cell_color(origin, paint.fallback, paint.palette))
-                .unwrap_or_else(|| {
-                    semantic_fallback_at(
-                        &self.theme,
-                        self.semantic_output_enabled,
-                        &semantic_spans,
-                        source_index,
-                        ansi_owned,
-                        paint.fallback,
-                    )
-                });
+            // v1.11.3 (PLAN_v1113 §3.2): bold→bright origin substitution
+            // before resolve (mirrors the live-grid path; REVERSE swaps the
+            // resolved colors afterwards).
+            let fg_origin = crate::paint::underline::bold_to_bright_origin(
+                explicit_fg.unwrap_or(CellColor::Default),
+                flags,
+                self.bold_is_bright,
+            );
+            let explicit_fg_active = explicit_fg.is_some();
+            let fg = if explicit_fg_active {
+                resolve_cell_color(fg_origin, paint.fallback, paint.palette)
+            } else {
+                semantic_fallback_at(
+                    &self.theme,
+                    self.semantic_output_enabled,
+                    &semantic_spans,
+                    source_index,
+                    ansi_owned,
+                    paint.fallback,
+                )
+            };
 
             // SGR reverse video: swap fg and bg before emitting quads.
             let (fg_final, bg_final) = if flags.contains(CellFlags::REVERSE) {
@@ -361,25 +371,48 @@ impl MetalRenderer {
             }
 
             // v1.7.0-A: Draw decoration quads for underline/strikethrough.
+            // v1.11.3 (PLAN_v1113 §3.1/§3.2): underline geometry comes from
+            // the shared underline_rects kernel (styles 4:2..4:5 + SGR 58
+            // colors), same as the live-grid path — the DOUBLE_UNDER flag
+            // wins over the style field (dual-track §1.2), and the style
+            // resolves via StyledLine::underline_style_at with the bit
+            // compat mapping. The SGR 58 color eats DIM×0.5 like text, no
+            // contrast boost (application-owned).
             let cell_width = width as f32 * cw;
             if flags.contains(CellFlags::UNDERLINE) || flags.contains(CellFlags::DOUBLE_UNDER) {
-                let underline_y = paint.y + paint.row_pitch - 2.0;
-                push_quad(
-                    vertices,
-                    [x, underline_y, x + cell_width, underline_y + 2.0],
+                let style = if flags.contains(CellFlags::DOUBLE_UNDER) {
+                    UnderlineStyle::Double
+                } else {
+                    paint
+                        .style
+                        .map(|line| line.underline_style_at(source_index))
+                        .unwrap_or(UnderlineStyle::Single)
+                };
+                let thickness = 2.0;
+                let baseline = paint.y + paint.row_pitch - thickness;
+                let (rects, n) = underline_rects(
+                    style,
+                    x,
+                    cell_width,
+                    baseline,
+                    thickness,
+                    self.cell_width() as f32,
+                    col,
+                );
+                debug_assert!(n <= MAX_UNDERLINE_RECTS);
+                // Explicit SGR 58 color wins; otherwise follow the
+                // (already DIM'd) fg — shared §3.2 resolver.
+                let underline_color = crate::paint::underline::underline_color(
+                    paint
+                        .style
+                        .and_then(|line| line.underline_color_at(source_index)),
+                    flags,
                     [0.0; 4],
-                    [0.0; 4],
+                    paint.palette,
                     fg_final,
                 );
-                if flags.contains(CellFlags::DOUBLE_UNDER) {
-                    let second_y = underline_y - 3.0;
-                    push_quad(
-                        vertices,
-                        [x, second_y, x + cell_width, second_y + 2.0],
-                        [0.0; 4],
-                        [0.0; 4],
-                        fg_final,
-                    );
+                for rect in rects.iter().take(n) {
+                    push_quad(vertices, *rect, [0.0; 4], [0.0; 4], underline_color);
                 }
             }
             if flags.contains(CellFlags::STRIKETHROUGH) {

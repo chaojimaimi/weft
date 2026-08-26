@@ -19,6 +19,7 @@
 //! the builder itself does not depend on the glyph atlas.
 
 use crate::paint::primitives::{push_cell_instance, resolve_cell_color};
+use crate::paint::underline::underline_color;
 use weft_core::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use weft_core::selection::SelectionHandler;
 
@@ -273,6 +274,8 @@ pub(crate) fn build_row_instances(
     ch: f32,
     origin_x: f32,
     origin_y: f32,
+    // v1.11.3 (§3.2): `[compat] bold_is_bright` — bold fg palette 0-7 → bright.
+    bold_is_bright: bool,
 ) -> GridRowInstances {
     let num_cols = grid.num_cols;
     let mut result = GridRowInstances::default();
@@ -295,7 +298,11 @@ pub(crate) fn build_row_instances(
         }
 
         // ── Resolve cell colors ────────────────────────────────────
-        let mut fg = resolve_cell_color(cell.fg, default_fg, palette);
+        // v1.11.3 (§3.2): bold→bright substitution at the fg origin (REVERSE
+        // swaps resolved colors afterwards, xterm-style).
+        let fg_origin =
+            crate::paint::underline::bold_to_bright_origin(cell.fg, cell.flags, bold_is_bright);
+        let mut fg = resolve_cell_color(fg_origin, default_fg, palette);
         let mut bg = resolve_cell_color(cell.bg, default_bg, palette);
 
         // SGR reverse video: swap fg/bg before cursor/selection overrides
@@ -463,33 +470,51 @@ pub(crate) fn build_row_instances(
         }
 
         // ── Glyph stream: hyperlink underline ──────────────────────
-        if cell.flags.contains(CellFlags::HYPERLINK) {
+        // v1.11.3 (§3.2 R7): SGR underline suppresses the link decoration.
+        if cell.flags.contains(CellFlags::HYPERLINK)
+            && !cell
+                .flags
+                .intersects(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDER)
+        {
             result.glyph_instances.push(GlyphInstance::Decoration {
                 dst: [x0, y1 - UNDERLINE_HEIGHT, x1, y1],
                 color: HYPERLINK_COLOR,
             });
         }
 
-        // ── Glyph stream: SGR text attribute decorations ──────────
-        // v1.10.4: honor UNDERLINE / DOUBLE_UNDER / STRIKETHROUGH on the
-        // alt-screen (grid) path, mirroring block_view/style.rs:331-360 so
-        // TUIs (less/man/vim/opencode) render text decorations identically
-        // to shell output. Colors follow final_fg so DIM'd decorations stay
-        // visually grouped with their text.
-        if cell.flags.contains(CellFlags::UNDERLINE) || cell.flags.contains(CellFlags::DOUBLE_UNDER)
+        if cell
+            .flags
+            .intersects(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDER)
         {
-            let underline_y = y1 - UNDERLINE_HEIGHT;
-            result.glyph_instances.push(GlyphInstance::Decoration {
-                dst: [x0, underline_y, x1, underline_y + UNDERLINE_HEIGHT],
-                color: final_fg,
-            });
-            if cell.flags.contains(CellFlags::DOUBLE_UNDER) {
-                let second_y = underline_y - 3.0;
-                result.glyph_instances.push(GlyphInstance::Decoration {
-                    dst: [x0, second_y, x1, second_y + UNDERLINE_HEIGHT],
-                    color: final_fg,
-                });
-            }
+            // Bit beats style (§1.2); geometry + color via underline.rs.
+            let style = if cell.flags.contains(CellFlags::DOUBLE_UNDER) {
+                weft_core::grid::UnderlineStyle::Double
+            } else {
+                cell.underline_style
+            };
+            let (rects, n) = crate::paint::underline::underline_rects(
+                style,
+                x0,
+                cell_w,
+                y1 - UNDERLINE_HEIGHT,
+                UNDERLINE_HEIGHT,
+                cw,
+                col,
+            );
+            debug_assert!(n <= crate::paint::underline::MAX_UNDERLINE_RECTS);
+            let deco_color = underline_color(
+                cell.underline_color,
+                cell.flags,
+                default_fg,
+                palette,
+                final_fg,
+            );
+            result.glyph_instances.extend(rects[..n].iter().map(|&dst| {
+                GlyphInstance::Decoration {
+                    dst,
+                    color: deco_color,
+                }
+            }));
         }
         if cell.flags.contains(CellFlags::STRIKETHROUGH) {
             let strike_y = y0 + ch * 0.5 - 1.0;
@@ -570,6 +595,7 @@ mod tests {
             CH,
             0.0,
             0.0,
+            false,
         )
     }
 

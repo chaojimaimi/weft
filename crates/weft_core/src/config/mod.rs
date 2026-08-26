@@ -71,7 +71,7 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, BlocksConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant,
+    AiConfig, BlocksConfig, CompatConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant,
     OutputSemanticConfig, PasteConfig, ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig,
     PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
@@ -99,6 +99,9 @@ pub struct Config {
     /// v1.11.2 X4 (PLAN_v1112 §1.2): per-tab in-memory block retention cap.
     /// Config-file power-user key — no Settings UI row by design.
     pub blocks: BlocksConfig,
+    /// v1.11.3 (PLAN_v1113 §3.3): terminal compatibility switches
+    /// (`bold_is_bright`). Config-file key — no Settings UI row.
+    pub compat: CompatConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -436,6 +439,24 @@ impl Config {
 
         // [blocks] section — v1.11.2 X4 retention cap (PLAN_v1112 §1.2).
         save::write_blocks_section(&mut doc, &self.blocks);
+
+        // [compat] section — v1.11.3 (PLAN_v1113 §3.3). Inline like the
+        // [logo] block above (save.rs is at its gate budget): only
+        // non-default values are persisted.
+        if self.compat.bold_is_bright != CompatConfig::default().bold_is_bright {
+            let compat_entry = doc.entry("compat").or_insert_with(toml_edit::table);
+            if compat_entry.is_none() {
+                *compat_entry = toml_edit::table();
+            }
+            match compat_entry.as_table_mut() {
+                Some(t) => {
+                    t["bold_is_bright"] = toml_edit::value(self.compat.bold_is_bright);
+                }
+                None => {
+                    tracing::warn!("[compat] section is not a table; skipping compat write");
+                }
+            }
+        }
 
         // [keybindings] section.
         if !self.keybindings.is_empty() {

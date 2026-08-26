@@ -8,13 +8,15 @@
 //! a phantom line of `cols` spaces.
 
 use super::{CapturedStyle, OutputCapture};
-use crate::grid::{CellColor, CellFlags};
+use crate::grid::{CellColor, CellFlags, UnderlineStyle};
 
 fn fg_style(palette: u8) -> CapturedStyle {
     CapturedStyle::from_attrs(
         CellColor::Palette(palette),
         CellColor::Default,
         CellFlags::empty(),
+        UnderlineStyle::Single,
+        None,
     )
 }
 

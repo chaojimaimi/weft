@@ -42,6 +42,23 @@ impl MetalRenderer {
         self.styled_line_cache.borrow_mut().bump_generation();
     }
 
+    /// v1.11.3 (PLAN_v1113 §3.3, R8): flip bold→bright resolution.
+    ///
+    /// **Must invalidate BOTH caches** — this is not just a styled-line
+    /// concern (the `set_semantic_output_enabled` precedent only bumps the
+    /// styled cache): the grid-row instance cache bakes resolved colors via
+    /// `build_row_instances`, so a stale grid cache would keep old palette
+    /// colors on the live grid while block history flipped. The semantic
+    /// precedent (runtime.rs:40-43) is insufficient here by design.
+    pub fn set_bold_is_bright(&mut self, flag: bool) {
+        if self.bold_is_bright == flag {
+            return;
+        }
+        self.bold_is_bright = flag;
+        self.force_full_grid_redraw();
+        self.styled_line_cache.borrow_mut().bump_generation();
+    }
+
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
     /// tab switch, selection change, or any event that invalidates the
     /// per-row vertex cache. Takes `&self` (not `&mut self`) because it only

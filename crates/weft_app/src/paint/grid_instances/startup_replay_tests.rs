@@ -141,6 +141,7 @@ fn painted_row(t: &Terminal, cfg: &ReplayConfig, row: usize) -> super::GridRowIn
         20.0,
         0.0,
         0.0,
+        false,
     )
 }
 

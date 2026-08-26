@@ -11,6 +11,9 @@ mod osc_guard;
 mod perform;
 mod replies;
 mod screen_exit;
+// v1.11.3 (PLAN_v1113 §2.1): colon-form SGR group handlers — extracted so
+// the facade stays within its architecture-gate budget.
+mod sgr_underline;
 mod staging;
 pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
@@ -24,7 +27,7 @@ pub(crate) use screen_exit::{sustained_alt_cols_kind, SUSTAINED_ALT_COLS_MS};
 
 use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture, ShellPhase};
 use crate::editor::Editor;
-use crate::grid::{CellColor, CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
+use crate::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
 use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
 pub const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -88,10 +91,11 @@ pub struct Terminal {
     /// boolean to zero but still counts as two flips here, so the debounce /
     /// burst windows can't be silently skipped by even-count batches.
     alt_flip_count: u64,
-    /// In-flight XTGETTCAP request collector (`DCS + q ... ST`), payload
-    /// capped at 1KiB so an introducer without ST cannot grow memory
-    /// without bound (FIX_TERMINAL_CAPABILITY_HARDENING, review M1).
-    dcs_xtgettcap: replies::XtgettcapCollector,
+    /// In-flight DCS query collector (`DCS + q ...` XTGETTCAP, `DCS $ q
+    /// ...` DECRQSS since v1.11.3, PLAN_v1113 §2.2), payload capped at 1KiB
+    /// so an introducer without ST cannot grow memory without bound
+    /// (FIX_TERMINAL_CAPABILITY_HARDENING, review M1).
+    dcs_query: replies::DcsQueryCollector,
     /// v1.11.2 X1 (PLAN_v1112 §3): OSC accumulation guard observer state.
     /// Shadow-mirrors vte's OscString state across `process()` batches so an
     /// unterminated OSC can be cut off at [`osc_guard::OSC_GUARD_PAYLOAD_CAP`]
@@ -143,7 +147,7 @@ impl Terminal {
             suppress_joined_scalar: false,
             capabilities: capability::CapabilityFlags::default(),
             alt_flip_count: 0,
-            dcs_xtgettcap: replies::XtgettcapCollector::default(),
+            dcs_query: replies::DcsQueryCollector::default(),
             osc_watch: osc_guard::OscWatch::default(),
             osc_watch_prev_esc: false,
             // v1.11.2 X1: guard defaults ON for every production constructor.
@@ -588,13 +592,11 @@ impl Terminal {
             // staging.rs — in-flight capture while CommandExecuting, preexec
             // staging between editor submit and 133;B.
             {
-                let style =
-                    CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                let style = self.capture_style();
                 self.capture_print_ascii_run(chunk, style);
             }
             {
-                let style =
-                    CapturedStyle::from_attrs(self.attrs.fg, self.attrs.bg, self.attrs.flags);
+                let style = self.capture_style();
                 self.capture_primary_screen_interrupt_ascii(chunk, style);
             }
 
@@ -618,6 +620,11 @@ impl Terminal {
                         cells[c].bg = bg;
                         cells[c].flags = link_flags;
                         cells[c].width = CellWidth::Half;
+                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
+                        // style/color (cells are field-assigned, not
+                        // default-constructed — stale values would survive).
+                        cells[c].underline_style = self.attrs.underline_style;
+                        cells[c].underline_color = self.attrs.underline_color;
                     }
                     // Batch-link all cells at once (borrow released).
                     for i in 0..count {
@@ -652,6 +659,10 @@ impl Terminal {
                         cells[c].bg = bg;
                         cells[c].flags = base_flags;
                         cells[c].width = CellWidth::Half;
+                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
+                        // style/color (see hyperlink path).
+                        cells[c].underline_style = self.attrs.underline_style;
+                        cells[c].underline_color = self.attrs.underline_color;
                     }
                     for &c in to_unlink.iter().take(unlink_n) {
                         self.hyperlinks.unlink_cell(row, c);
@@ -675,6 +686,10 @@ impl Terminal {
                         cells[c].bg = bg;
                         cells[c].flags = base_flags;
                         cells[c].width = CellWidth::Half;
+                        // v1.11.3 (PLAN_v1113 §1.1): carry underline
+                        // style/color (see hyperlink path).
+                        cells[c].underline_style = self.attrs.underline_style;
+                        cells[c].underline_color = self.attrs.underline_color;
                     }
                     // v1.6.0 review C1: clear orphaned grapheme extras for the
                     // overwritten range. Common case: extras is empty (no
@@ -826,12 +841,30 @@ impl Terminal {
 
     // ── SGR helpers ──────────────────────────────────────────────
 
+    /// Current capture style — the batch-sink twin of the per-char sites
+    /// in perform.rs (v1.11.3: includes underline style/color carriers).
+    pub(crate) fn capture_style(&self) -> CapturedStyle {
+        CapturedStyle::from_attrs(
+            self.attrs.fg,
+            self.attrs.bg,
+            self.attrs.flags,
+            self.attrs.underline_style,
+            self.attrs.underline_color,
+        )
+    }
+
     /// Handle SGR (Select Graphic Rendition) — CSI m.
     ///
     /// vte parses `CSI 38;5;196m` as three separate param groups:
     ///   iter → [38], [5], [196]
     /// We flatten all sub-param first-values into a `Vec<u16>`, then walk it
     /// with an index so we can consume 1–4 values for color sequences.
+    ///
+    /// v1.11.3 (PLAN_v1113 §2.1): colon groups (`4:x`, `58:x`) are dispatched
+    /// whole BEFORE flattening (handlers in `sgr_underline.rs`). Probe
+    /// verdict (PLAN_v1113 step 1): vte materializes an empty `:` tail as
+    /// an explicit `0` subparam — `4:` ≡ `4:0` ≡ clear underline; there is
+    /// no "missing subparam" shape.
     fn handle_sgr(&mut self, params: &vte::Params) {
         if params.is_empty() {
             self.attrs = Attrs::default();
@@ -849,115 +882,25 @@ impl Terminal {
             if len >= MAX_SGR_PARAMS {
                 break;
             }
+            // v1.11.3: whole-group semantics so `4:3` never misparses as
+            // `4` + DIM(`3`); handlers live in sgr_underline.rs.
+            if sub.len() > 1 && sub[0] == 4 {
+                sgr_underline::handle_underline_group(&mut self.attrs, sub);
+                continue;
+            }
+            if sub.len() > 1 && sub[0] == 58 {
+                sgr_underline::handle_underline_color_group(&mut self.attrs, sub);
+                continue;
+            }
             buf[len] = sub.first().copied().unwrap_or(0);
             len += 1;
         }
         let vals: &[u16] = &buf[..len];
 
-        let mut i = 0;
-        while i < vals.len() {
-            let v = vals[i];
-            match v {
-                0 => self.attrs = Attrs::default(),
-                1 => self.attrs.flags.insert(CellFlags::BOLD),
-                2 => self.attrs.flags.insert(CellFlags::DIM),
-                3 => self.attrs.flags.insert(CellFlags::ITALIC),
-                4 => self.attrs.flags.insert(CellFlags::UNDERLINE),
-                7 => self.attrs.flags.insert(CellFlags::REVERSE),
-                8 => self.attrs.flags.insert(CellFlags::HIDDEN),
-                9 => self.attrs.flags.insert(CellFlags::STRIKETHROUGH),
-                // ECMA-48 and the modern-terminal consensus (Ghostty,
-                // WezTerm, Alacritty, current xterm): SGR 21 = doubly
-                // underlined. The old "clear bold" reading is Linux-console
-                // legacy — it also left DOUBLE_UNDER (which block_view/style.rs
-                // fully renders) unreachable from the parser.
-                21 => self.attrs.flags.insert(CellFlags::DOUBLE_UNDER),
-                22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::DIM),
-                23 => self.attrs.flags.remove(CellFlags::ITALIC),
-                24 => {
-                    self.attrs
-                        .flags
-                        .remove(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDER);
-                }
-                27 => self.attrs.flags.remove(CellFlags::REVERSE),
-                28 => self.attrs.flags.remove(CellFlags::HIDDEN),
-                29 => self.attrs.flags.remove(CellFlags::STRIKETHROUGH),
-                // Standard foreground 30-37
-                30..=37 => {
-                    self.attrs.fg = CellColor::Palette((v - 30) as u8);
-                }
-                // 256-color / truecolor foreground
-                38 => {
-                    if let Some((color, skip)) = self.parse_sgr_color(vals, i + 1) {
-                        self.attrs.fg = color;
-                        i += skip;
-                    }
-                }
-                // Default foreground
-                39 => self.attrs.fg = CellColor::Default,
-                // Standard background 40-47
-                40..=47 => {
-                    self.attrs.bg = CellColor::Palette((v - 40) as u8);
-                }
-                // 256-color / truecolor background
-                48 => {
-                    if let Some((color, skip)) = self.parse_sgr_color(vals, i + 1) {
-                        self.attrs.bg = color;
-                        i += skip;
-                    }
-                }
-                // Default background
-                49 => self.attrs.bg = CellColor::Default,
-                // Underline color set/reset (AUDIT_v1.10.39 P0-1). Weft does
-                // not yet render a distinct underline color, but 58 carries
-                // its own 38/48-style color grammar (`58;2;R;G;B`,
-                // `58;5;N`) and those payload bytes must be consumed here —
-                // leaving them in the stream let `2` enable DIM, `5` enable
-                // ITALIC and trailing `0`s trigger full attribute resets.
-                58 => {
-                    if let Some((_color, skip)) = self.parse_sgr_color(vals, i + 1) {
-                        i += skip;
-                    }
-                }
-                59 => {}
-                // Bright foreground 90-97
-                90..=97 => {
-                    self.attrs.fg = CellColor::Palette((v - 90 + 8) as u8);
-                }
-                // Bright background 100-107
-                100..=107 => {
-                    self.attrs.bg = CellColor::Palette((v - 100 + 8) as u8);
-                }
-                _ => {
-                    tracing::trace!(v, "unhandled SGR param");
-                }
-            }
-            i += 1;
-        }
-    }
-
-    /// Parse SGR color starting after the 38/48 marker.
-    /// Returns `(CellColor, skip_count)` where skip_count is how many extra
-    /// values (beyond the 38/48) were consumed. Stores the *origin* (palette
-    /// index or explicit RGB) rather than resolving against the palette, so a
-    /// theme/palette change can recolor already-written cells.
-    fn parse_sgr_color(&self, vals: &[u16], start: usize) -> Option<(CellColor, usize)> {
-        let kind = vals.get(start).copied()?;
-        match kind {
-            // Indexed 256-color: 38;5;N
-            5 => {
-                let idx = vals.get(start + 1).copied()?.min(255) as u8;
-                Some((CellColor::Palette(idx), 2))
-            }
-            // Truecolor: 38;2;R;G;B
-            2 => {
-                let r = vals.get(start + 1).copied()? as u8;
-                let g = vals.get(start + 2).copied()? as u8;
-                let b = vals.get(start + 3).copied()? as u8;
-                Some((CellColor::Rgb(Color::rgb(r, g, b)), 4))
-            }
-            _ => None,
-        }
+        // v1.11.3: the flat walk (38/48/58 colors, attribute arms) lives in
+        // sgr_underline.rs with the colon-group handlers — one SGR home,
+        // and this facade stays within its architecture-gate budget.
+        sgr_underline::apply_flat_sgr(&mut self.attrs, vals);
     }
 
     /// Handle DEC private mode set/reset (CSI ? <n> h/l).

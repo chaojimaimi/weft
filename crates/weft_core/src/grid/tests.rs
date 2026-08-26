@@ -2,15 +2,29 @@ use super::*;
 
 #[test]
 fn cell_struct_stays_at_24_bytes() {
-    // v0.8 OSC 8 design constraint: hyperlink metadata lives in an
-    // external side-map (HyperlinkRegistry), NOT on Cell. If a future
-    // change pushes Cell past 24 bytes, this test fails — re-evaluate
-    // before adjusting the target. See docs/v0.8_PLAN.md §5.
-    assert!(
-        std::mem::size_of::<Cell>() <= 24,
-        "Cell must stay ≤ 24 bytes (HYPERLINK flag is a 1-bit side-state); got {}",
+    // v1.11.3 (PLAN_v1113 §1.1): budget tightened from `<= 24` to `== 24`
+    // — raw = char4 + fg5 + bg5 + flags2 + width1 + style1 + color5 = 23B,
+    // one padding byte remains; adding another >1B field must trigger an
+    // explicit budget re-evaluation (v0.8_PLAN §5) rather than silently
+    // growing into 28B. The `Option<CellColor>` 5B niche is pinned by
+    // `option_cell_color_is_5_bytes` in this file.
+    assert_eq!(
+        std::mem::size_of::<Cell>(),
+        24,
+        "Cell must stay exactly 24 bytes (PLAN_v1113 §1.1); got {}",
         std::mem::size_of::<Cell>()
     );
+}
+
+#[test]
+fn option_cell_color_is_5_bytes() {
+    // PLAN_v1113 §1.1 (audit S1): the `#[repr(u8)]` niche makes the Option
+    // wrapper 5B instead of 6B — the Cell 24B budget depends on it. This
+    // test locks that compiler-optimization contract explicitly.
+    // (CellColor itself is 5B: 1B repr(u8) tag + 4B Rgb(Color) payload.)
+    assert_eq!(std::mem::size_of::<CellColor>(), 5);
+    assert_eq!(std::mem::size_of::<Option<CellColor>>(), 5);
+    assert_eq!(std::mem::size_of::<UnderlineStyle>(), 1);
 }
 
 #[test]

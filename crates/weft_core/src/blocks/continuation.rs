@@ -378,6 +378,7 @@ mod tests {
                     backgrounds: Vec::new(),
                     links: Vec::new(),
                     attributes: Vec::new(),
+                    underline_colors: Vec::new(),
                 }],
             },
         );

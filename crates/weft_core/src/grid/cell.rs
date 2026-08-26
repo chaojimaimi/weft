@@ -93,9 +93,27 @@ impl Color {
     }
 }
 
+/// Underline shape stored per cell (v1.11.3, PLAN_v1113 §1.1).
+///
+/// `#[repr(u8)]`: the enum niche (the unused discriminant patterns) is what
+/// makes `Option<CellColor>` 5 bytes instead of 6 (PLAN_v1113 §1.1) — that
+/// niche is a compiler optimization contract, so both enums pin their
+/// representation explicitly instead of relying on layout inference.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub enum UnderlineStyle {
+    #[default]
+    Single,
+    Double,
+    Wavy,
+    Dotted,
+    Dashed,
+}
+
 /// Where a cell's color comes from. Stored on the cell so a theme/palette
 /// change can recolor the whole screen instantly: cells remember their origin
 /// (default / palette index / explicit RGB) rather than a pre-resolved color.
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub enum CellColor {
     /// Use the theme default (foreground or background depending on slot).
@@ -164,8 +182,15 @@ pub fn terminal_grapheme_glyph(grapheme: &str) -> char {
     }
 }
 
-/// Terminal cell (~24 bytes).
+/// Terminal cell (exactly 24 bytes; see the size contract test in
+/// grid/tests.rs `cell_struct_stays_at_24_bytes`).
 /// Design reference: Warp 24-byte Cell + Alacritty sparse extra.
+///
+/// Field budget (PLAN_v1113 §1.1): char4 + fg5 + bg5 + flags2 + width1 +
+/// style1 + color5 = 23B → align 4 → 24B. One padding byte remains; adding
+/// another >1B field must trigger an explicit budget re-evaluation
+/// (v0.8_PLAN §5). `Option<CellColor>` is 5B (not 6) via the `#[repr(u8)]`
+/// niche on [`CellColor`] — pinned by a size test.
 #[derive(Clone, Debug)]
 pub struct Cell {
     pub character: char,
@@ -173,6 +198,14 @@ pub struct Cell {
     pub bg: CellColor,
     pub flags: CellFlags,
     pub width: CellWidth,
+    /// v1.11.3: underline shape (PLAN_v1113 §1.1). The DOUBLE_UNDER flag
+    /// remains alongside during the dual-track transition: the renderer
+    /// reads the flag first when both are set (mirror-sync note, v1.12
+    /// retirement backlog).
+    pub underline_style: UnderlineStyle,
+    /// v1.11.3: explicit underline color (SGR 58), application-owned and
+    /// never touched by REVERSE swapping (PLAN_v1113 §2.1 S5).
+    pub underline_color: Option<CellColor>,
 }
 
 impl Default for Cell {
@@ -183,6 +216,8 @@ impl Default for Cell {
             bg: CellColor::Default,
             flags: CellFlags::empty(),
             width: CellWidth::Half,
+            underline_style: UnderlineStyle::Single,
+            underline_color: None,
         }
     }
 }
@@ -198,6 +233,8 @@ pub(crate) static BLANK_CELL: Cell = Cell {
     bg: CellColor::Default,
     flags: CellFlags::empty(),
     width: CellWidth::Half,
+    underline_style: UnderlineStyle::Single,
+    underline_color: None,
 };
 
 impl Cell {

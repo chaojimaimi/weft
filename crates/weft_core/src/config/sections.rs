@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -270,6 +270,24 @@ impl Default for BlocksConfig {
             retained_limit: crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
         }
     }
+}
+
+/// v1.11.3 (PLAN_v1113 §3.3): terminal compatibility switches.
+///
+/// `bold_is_bright` (X11/XTerm convention): SGR 1 bold on an ANSI fg
+/// palette index < 8 resolves to the bright variant (palette[i+8]) instead
+/// of a separate bold weight/fake-bold. Default **false** — Weft keeps bold
+/// as a weight so `ls --color` directories stay deep blue while text is
+/// genuinely bold. No Settings UI row in v1.11.3 (deliberate — the plan's
+/// (c) item is config-first); hand-edit the TOML or use a profile.
+///
+/// No validation/clamp: it's a plain bool.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CompatConfig {
+    /// Default false (derive) — Weft keeps bold as a weight, matching the
+    /// pre-v1.11.3 rendering bit-for-bit.
+    pub bold_is_bright: bool,
 }
 
 #[cfg(test)]

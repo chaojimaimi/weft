@@ -55,6 +55,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "editor",
         "paste",
         "blocks",
+        "compat",
         "logo",
         "ai",
         "keybindings",
@@ -524,6 +525,16 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
                 b.retained_limit,
                 default.retained_limit,
             );
+        }
+    });
+    // v1.11.3: `[compat]` is profile-overridable like `[blocks]`.
+    write_profile_section(table, "compat", profile.compat.is_some(), |t| {
+        if let Some(c) = &profile.compat {
+            if c.bold_is_bright != super::CompatConfig::default().bold_is_bright {
+                t["bold_is_bright"] = toml_edit::value(c.bold_is_bright);
+            } else if t.contains_key("bold_is_bright") {
+                t.remove("bold_is_bright");
+            }
         }
     });
     write_profile_section(table, "editor", profile.editor.is_some(), |t| {

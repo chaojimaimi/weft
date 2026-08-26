@@ -1,5 +1,5 @@
 use super::{BlockTracker, ShellPhase, MAX_OUTPUT_BYTES};
-use crate::grid::{CellColor, CellFlags};
+use crate::grid::{CellColor, CellFlags, UnderlineStyle};
 use std::sync::Arc;
 
 /// v1.7.0-A: Mask of `CellFlags` bits captured into the ANSI style RLE.
@@ -28,20 +28,37 @@ pub struct CapturedStyle {
     /// range (fg/bg/flags non-default). Drives the semantic-fallback skip in
     /// v1.7.0-C: the classifier must not recolor ANSI-owned ranges.
     pub ansi_owned: bool,
+    /// v1.11.3 (PLAN_v1113 §2.4): underline shape (4:x colon subparam).
+    /// Wavy/Dotted/Dashed have no flag bit — this field is their carrier.
+    pub underline_style: UnderlineStyle,
+    /// v1.11.3 (PLAN_v1113 §2.4): explicit underline color from SGR 58.
+    pub underline_color: Option<CellColor>,
 }
 
 impl CapturedStyle {
     /// Build a `CapturedStyle` from current VT `Attrs`, masking out
     /// grid-internal flags. `ansi_owned` is true when any captured field is
     /// non-default.
-    pub(crate) fn from_attrs(fg: CellColor, bg: CellColor, flags: CellFlags) -> Self {
+    pub(crate) fn from_attrs(
+        fg: CellColor,
+        bg: CellColor,
+        flags: CellFlags,
+        underline_style: UnderlineStyle,
+        underline_color: Option<CellColor>,
+    ) -> Self {
         let flags = flags & ANSI_ATTRIBUTE_MASK;
-        let ansi_owned = fg != CellColor::Default || bg != CellColor::Default || !flags.is_empty();
+        let ansi_owned = fg != CellColor::Default
+            || bg != CellColor::Default
+            || !flags.is_empty()
+            || underline_style != UnderlineStyle::Single
+            || underline_color.is_some();
         Self {
             fg,
             bg,
             flags,
             ansi_owned,
+            underline_style,
+            underline_color,
         }
     }
 
@@ -52,6 +69,8 @@ impl CapturedStyle {
             && self.bg == CellColor::Default
             && self.flags.is_empty()
             && !self.ansi_owned
+            && self.underline_style == UnderlineStyle::Single
+            && self.underline_color.is_none()
     }
 }
 
@@ -117,6 +136,11 @@ pub struct StyledLine {
     /// deserialize as empty.
     #[serde(default)]
     pub attributes: Vec<AttributeSpan>,
+    /// v1.11.3 (PLAN_v1113 §2.4): explicit SGR 58 underline colors captured
+    /// alongside the text. `#[serde(default)]` keeps old SQLite snapshots
+    /// loadable — lines without underline colors deserialize as empty.
+    #[serde(default)]
+    pub underline_colors: Vec<ColorSpan>,
 }
 
 impl StyledLine {
@@ -128,19 +152,41 @@ impl StyledLine {
         Self::color_at(&self.backgrounds, index)
     }
 
+    /// v1.11.3 (PLAN_v1113 §2.4): resolve the underline shape for the char at
+    /// `index`. Returns `UnderlineStyle::Single` when no attribute span
+    /// covers the index (default attrs). Read-side compat entry point:
+    /// legacy snapshots stored only the DOUBLE_UNDER flag bit — the bit wins
+    /// whenever the u8 style is absent/Single (see [`compat_underline_style`]).
+    pub fn underline_style_at(&self, index: usize) -> UnderlineStyle {
+        let Some(span) = self.attribute_span_at(index) else {
+            return UnderlineStyle::Single;
+        };
+        compat_underline_style(span.flags, span.underline_style)
+    }
+
+    /// v1.11.3 (PLAN_v1113 §2.4): resolve the explicit SGR 58 underline color
+    /// for the char at `index` (None when unset).
+    pub fn underline_color_at(&self, index: usize) -> Option<CellColor> {
+        Self::color_at_cs(&self.underline_colors, index)
+    }
+
     /// v1.7.0-A: Resolve the ANSI attribute flags for the char at `index`.
     /// Returns `CellFlags::empty()` when no attribute span covers the index
     /// (i.e. the char has default attributes).
     pub fn attributes_at(&self, index: usize) -> CellFlags {
+        self.attribute_span_at(index)
+            .map(|span| span.flags)
+            .unwrap_or(CellFlags::empty())
+    }
+
+    fn attribute_span_at(&self, index: usize) -> Option<&AttributeSpan> {
         let Ok(index) = u32::try_from(index) else {
-            return CellFlags::empty();
+            return None;
         };
         let position = self.attributes.partition_point(|span| span.end <= index);
         self.attributes
             .get(position)
             .filter(|span| span.start <= index && index < span.end)
-            .map(|span| span.flags)
-            .unwrap_or(CellFlags::empty())
     }
 
     /// v1.6.1: Resolve the URL for the char at `index`, if any.
@@ -153,6 +199,14 @@ impl StyledLine {
     }
 
     fn color_at(spans: &[ForegroundSpan], index: usize) -> Option<CellColor> {
+        let index = u32::try_from(index).ok()?;
+        let position = spans.partition_point(|span| span.end <= index);
+        spans
+            .get(position)
+            .and_then(|span| (span.start <= index && index < span.end).then_some(span.color))
+    }
+
+    fn color_at_cs(spans: &[ColorSpan], index: usize) -> Option<CellColor> {
         let index = u32::try_from(index).ok()?;
         let position = spans.partition_point(|span| span.end <= index);
         spans
@@ -177,7 +231,52 @@ pub struct AttributeSpan {
     pub start: u32,
     pub end: u32,
     pub flags: CellFlags,
+    /// v1.11.3 (PLAN_v1113 §2.4): underline shape in SGR numbering — 1=Single,
+    /// 2=Double, 3=Wavy, 4=Dotted, 5=Dashed; 0 = absent/legacy and reads as
+    /// Single. u8 keeps the persisted JSON shape stable across releases;
+    /// `#[serde(default)]` keeps old snapshots (no field → 0) loadable.
+    #[serde(default)]
+    pub underline_style: u8,
 }
+
+/// v1.11.3 (PLAN_v1113 §2.4): read-side compat mapping for persisted
+/// underline styles — the single entry point for AttributeSpan reads.
+/// Legacy data stored only the DOUBLE_UNDER flag bit (no style field): the
+/// bit wins whenever the u8 says Single/absent, mirroring the renderer's
+/// dual-track priority (PLAN_v1113 §1.2: DOUBLE_UNDER 位优先).
+#[must_use]
+pub fn compat_underline_style(flags: CellFlags, style: u8) -> UnderlineStyle {
+    if flags.contains(CellFlags::DOUBLE_UNDER) {
+        return UnderlineStyle::Double;
+    }
+    match style {
+        2 => UnderlineStyle::Double,
+        3 => UnderlineStyle::Wavy,
+        4 => UnderlineStyle::Dotted,
+        5 => UnderlineStyle::Dashed,
+        // 0 (legacy/absent) and 1 (explicit Single) both mean Single.
+        _ => UnderlineStyle::Single,
+    }
+}
+
+/// v1.11.3 (PLAN_v1113 §2.4): SGR-numbering encoding for the style carrier
+/// stored in [`AttributeSpan`] (inverse of [`compat_underline_style`]).
+#[must_use]
+pub fn encode_underline_style(style: UnderlineStyle) -> u8 {
+    match style {
+        UnderlineStyle::Single => 1,
+        UnderlineStyle::Double => 2,
+        UnderlineStyle::Wavy => 3,
+        UnderlineStyle::Dotted => 4,
+        UnderlineStyle::Dashed => 5,
+    }
+}
+
+/// v1.11.3 (PLAN_v1113 §2.4): a run of explicit underline colors over a
+/// char-indexed range. Type alias of `ForegroundSpan` — the plan's
+/// "span 结构复制 ForegroundSpan 模式" taken literally, so the snapshot
+/// color pusher and serde JSON shape are shared, guaranteed identical.
+pub type ColorSpan = ForegroundSpan;
 
 /// v1.6.1: A hyperlink span in a captured [`StyledLine`]. `start`/`end` are
 /// char indices into the line's text (same coordinate as `ForegroundSpan`).
@@ -279,6 +378,8 @@ pub(crate) fn build_styled_output_from_runs(
         let mut foregrounds: Vec<ForegroundSpan> = Vec::new();
         let mut backgrounds: Vec<ForegroundSpan> = Vec::new();
         let mut attributes: Vec<AttributeSpan> = Vec::new();
+        // v1.11.3 (PLAN_v1113 §2.4): parallel underline-color spans.
+        let mut underline_colors: Vec<ColorSpan> = Vec::new();
         let mut line_run_count = 0usize;
 
         // Consume runs that overlap this line's char range.
@@ -304,7 +405,14 @@ pub(crate) fn build_styled_output_from_runs(
                         local_start,
                         local_end,
                         run.style.flags,
+                        // v1.11.3 (PLAN_v1113 §2.4): the style joins the
+                        // coalesce key so Wavy and Dotted runs with equal
+                        // flags stay distinct spans.
+                        encode_underline_style(run.style.underline_style),
                     );
+                }
+                if let Some(color) = run.style.underline_color {
+                    push_or_coalesce_color_cs(&mut underline_colors, local_start, local_end, color);
                 }
                 line_run_count += 1;
                 if line_run_count > MAX_STYLE_RUNS_PER_LINE {
@@ -313,6 +421,7 @@ pub(crate) fn build_styled_output_from_runs(
                     foregrounds.clear();
                     backgrounds.clear();
                     attributes.clear();
+                    underline_colors.clear();
                     // Advance past all runs in this line.
                     while run_idx < runs.len() && runs[run_idx].start_char < line_end_char {
                         run_idx += 1;
@@ -328,13 +437,18 @@ pub(crate) fn build_styled_output_from_runs(
             }
         }
 
-        if !foregrounds.is_empty() || !backgrounds.is_empty() || !attributes.is_empty() {
+        if !foregrounds.is_empty()
+            || !backgrounds.is_empty()
+            || !attributes.is_empty()
+            || !underline_colors.is_empty()
+        {
             lines.push(StyledLine {
                 line: line_index,
                 foregrounds,
                 backgrounds,
                 links: Vec::new(),
                 attributes,
+                underline_colors,
             });
         }
         line_start_char = line_end_char + 1; // +1 for the `\n` separator
@@ -357,31 +471,60 @@ fn push_or_coalesce_color(spans: &mut Vec<ForegroundSpan>, start: u32, end: u32,
     spans.push(ForegroundSpan { start, end, color });
 }
 
-fn push_or_coalesce_flags(spans: &mut Vec<AttributeSpan>, start: u32, end: u32, flags: CellFlags) {
+fn push_or_coalesce_color_cs(spans: &mut Vec<ColorSpan>, start: u32, end: u32, color: CellColor) {
     if let Some(last) = spans.last_mut() {
-        if last.end == start && last.flags == flags {
+        if last.end == start && last.color == color {
             last.end = end;
             return;
         }
     }
-    spans.push(AttributeSpan { start, end, flags });
+    spans.push(ColorSpan { start, end, color });
+}
+
+fn push_or_coalesce_flags(
+    spans: &mut Vec<AttributeSpan>,
+    start: u32,
+    end: u32,
+    flags: CellFlags,
+    underline_style: u8,
+) {
+    if let Some(last) = spans.last_mut() {
+        if last.end == start && last.flags == flags && last.underline_style == underline_style {
+            last.end = end;
+            return;
+        }
+    }
+    spans.push(AttributeSpan {
+        start,
+        end,
+        flags,
+        underline_style,
+    });
 }
 
 #[cfg(test)]
 mod style_rle_tests {
     use super::*;
-    use crate::grid::{CellColor, CellFlags, Color};
+    use crate::grid::{CellColor, CellFlags, Color, UnderlineStyle};
 
     fn fg(palette: u8) -> CapturedStyle {
         CapturedStyle::from_attrs(
             CellColor::Palette(palette),
             CellColor::Default,
             CellFlags::empty(),
+            UnderlineStyle::Single,
+            None,
         )
     }
 
     fn bold() -> CapturedStyle {
-        CapturedStyle::from_attrs(CellColor::Default, CellColor::Default, CellFlags::BOLD)
+        CapturedStyle::from_attrs(
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::BOLD,
+            UnderlineStyle::Single,
+            None,
+        )
     }
 
     fn run(start: u32, end: u32, style: CapturedStyle) -> CapturedStyleRun {
@@ -442,6 +585,8 @@ mod style_rle_tests {
             CellColor::Rgb(Color::rgb(200, 100, 50)),
             CellColor::Default,
             CellFlags::empty(),
+            UnderlineStyle::Single,
+            None,
         );
         let runs = vec![run(0, 1, style)];
         let styled = build_styled_output_from_runs("x", &runs).expect("styled");
@@ -499,6 +644,7 @@ mod tests {
             }],
             links: Vec::new(),
             attributes: Vec::new(),
+            underline_colors: Vec::new(),
         };
 
         assert_eq!(line.foreground_at(0), None);
@@ -522,6 +668,7 @@ mod tests {
                     backgrounds: Vec::new(),
                     links: Vec::new(),
                     attributes: Vec::new(),
+                    underline_colors: Vec::new(),
                 },
                 StyledLine {
                     line: 7,
@@ -529,6 +676,7 @@ mod tests {
                     backgrounds: Vec::new(),
                     links: Vec::new(),
                     attributes: Vec::new(),
+                    underline_colors: Vec::new(),
                 },
             ],
         };
@@ -536,5 +684,88 @@ mod tests {
         assert!(styled.line(1).is_none());
         assert_eq!(styled.line(2).map(|line| line.line), Some(2));
         assert_eq!(styled.line(7).map(|line| line.line), Some(7));
+    }
+}
+
+#[cfg(test)]
+mod v1113_compat_tests {
+    use super::*;
+
+    /// v1.11.3 (PLAN_v1113 §4.6): the exact JSON shape v1.10-1.11.2 wrote
+    /// (bitflags serde = bit-value integer) must load and read as
+    /// Single/None. Pins the real on-disk shape, not a hypothetical one.
+    #[test]
+    fn legacy_json_without_underline_fields_reads_single_and_none() {
+        let old_json = r#"{"lines":[{"line":0,"foregrounds":[],"backgrounds":[],"links":[],"attributes":[{"start":0,"end":3,"flags":"UNDERLINE","underline_style":0}]}]}"#;
+        let styled: StyledOutput = serde_json::from_str(old_json).unwrap();
+        let line = styled.line(0).unwrap();
+        assert_eq!(line.attributes_at(0), CellFlags::UNDERLINE, "flags kept");
+        assert_eq!(line.underline_style_at(0), UnderlineStyle::Single);
+        assert_eq!(line.underline_color_at(0), None, "no field → None");
+    }
+
+    /// v1.11.3: the legacy DOUBLE_UNDER bit-only capture (old cells set only
+    /// the flag; no style carrier) maps to Double at read time.
+    #[test]
+    fn legacy_double_under_bit_reads_as_double_style() {
+        let old_json = r#"{"lines":[{"line":0,"foregrounds":[],"backgrounds":[],"links":[],"attributes":[{"start":0,"end":2,"flags":"DOUBLE_UNDER","underline_style":0}]}]}"#;
+        let styled: StyledOutput = serde_json::from_str(old_json).unwrap();
+        let line = styled.line(0).unwrap();
+        assert_eq!(
+            line.underline_style_at(0),
+            UnderlineStyle::Double,
+            "DOUBLE_UNDER bit alone must map to Double (PLAN_v1113 §2.4)"
+        );
+    }
+
+    /// v1.11.3 (PLAN_v1113 §4.6): new JSON round-trips Wavy style and the
+    /// underline color through serde.
+    #[test]
+    fn new_json_roundtrip_preserves_wavy_and_color() {
+        let line = StyledLine {
+            line: 0,
+            foregrounds: Vec::new(),
+            backgrounds: Vec::new(),
+            links: Vec::new(),
+            attributes: vec![AttributeSpan {
+                start: 0,
+                end: 4,
+                flags: CellFlags::UNDERLINE,
+                underline_style: 3, // Wavy
+            }],
+            underline_colors: vec![ColorSpan {
+                start: 0,
+                end: 4,
+                color: CellColor::Rgb(crate::grid::Color::rgb(9, 8, 7)),
+            }],
+        };
+        let json = serde_json::to_string(&line).unwrap();
+        let back: StyledLine = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.underline_style_at(0), UnderlineStyle::Wavy);
+        assert_eq!(
+            back.underline_color_at(0),
+            Some(CellColor::Rgb(crate::grid::Color::rgb(9, 8, 7)))
+        );
+        assert!(json.contains("\"underline_style\":3"), "json: {json}");
+        assert!(json.contains("underline_colors"), "json: {json}");
+    }
+
+    /// kd: the bit must also win when an (impossible-in-practice) Wavy u8
+    /// conflicts with the bit — the renderer's bit-first priority is
+    /// mirrored on the read side (PLAN_v1113 §1.2).
+    #[test]
+    fn compat_bit_wins_over_style_value() {
+        assert_eq!(
+            compat_underline_style(CellFlags::DOUBLE_UNDER, 3),
+            UnderlineStyle::Double
+        );
+        assert_eq!(
+            compat_underline_style(CellFlags::empty(), 0),
+            UnderlineStyle::Single
+        );
+        assert_eq!(
+            compat_underline_style(CellFlags::empty(), 1),
+            UnderlineStyle::Single
+        );
     }
 }
