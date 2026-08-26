@@ -3,6 +3,8 @@
 use super::*;
 
 mod resize_transaction;
+#[cfg(test)]
+mod retention_tests;
 use resize_transaction::commit_pty_resize_result;
 
 pub(crate) fn install_runtime_diagnostics() {
@@ -271,21 +273,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // table and overwrite the on-disk crash snapshot with
                 // the fresh single-tab session before the user chooses,
                 // destroying both recovery sources.
-                if crate::recovery_controller::autosave_suppressed(&self.pending_recovery) {
-                    tracing::debug!("skipping autosave while recovery prompt is pending");
-                } else {
-                    self.save_changed_tabs();
-                    // v1.6.3: Also write a recovery snapshot if the session
-                    // state has changed. The debounce check inside the
-                    // controller skips the write when nothing changed.
-                    if let Some(ws) = self.capture_workspace("recovery".into()) {
-                        if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
-                            warn!(error = %e, "recovery snapshot write failed");
-                        }
-                    }
-                }
-                // v1.11.1: paste-toast expiry rides this tick.
-                self.expire_paste_toast_tick();
+                //
+                // Body (save + recovery snapshot + X6 timing metric +
+                // paste-toast expiry) lives in effect_dispatch.rs next to
+                // `expire_paste_toast_tick` — same 1 Hz tick domain.
+                self.run_tabs_autosave_tick();
             }
             AppEvent::PerformanceProbeStart => self.performance_probe.start(),
             AppEvent::PerformanceProbeFinish => {

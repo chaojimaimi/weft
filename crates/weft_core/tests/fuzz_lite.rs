@@ -364,6 +364,112 @@ seed_property_tests! {
     45 => property_seed_45, 46 => property_seed_46, 47 => property_seed_47,
 }
 
+// ── OSC guard differential harness (v1.11.2 X1 / PLAN_v1112 §3.2) ─────
+
+/// Compare the observable text/geometry state of two terminals fed the same
+/// byte stream. Colors are deliberately NOT compared: over-cap OSC 4
+/// truncation legally changes palette-derived colors in the guarded instance
+/// while text, geometry and scroll volume must match bit-for-bit (the
+/// whitelist is limited to palette-origin colors — PLAN_v1112 §8).
+fn assert_same_observable_state(guarded: &Terminal, unguarded: &Terminal, context: &str) {
+    let (g, u) = (guarded.grid(), unguarded.grid());
+    assert_eq!(g.num_rows, u.num_rows, "rows diverged ({context})");
+    for row in 0..g.num_rows {
+        assert_eq!(
+            g.row_text(row),
+            u.row_text(row),
+            "row {row} text diverged ({context})"
+        );
+    }
+    let (gc, uc) = (&g.cursor, &u.cursor);
+    assert_eq!(gc.row, uc.row, "cursor row diverged ({context})");
+    assert_eq!(gc.col, uc.col, "cursor col diverged ({context})");
+    assert_eq!(
+        gc.wrap_pending, uc.wrap_pending,
+        "wrap_pending diverged ({context})"
+    );
+    assert_eq!(
+        g.scrollback_len(),
+        u.scrollback_len(),
+        "scrollback length diverged ({context})"
+    );
+}
+
+/// One differential run for a seed: 200 chunks of 1..=4096 bytes fed to a
+/// guard-ON instance (default constructor) and a guard-OFF instance (the
+/// pre-guard behavior anchor). After every chunk the two must agree on all
+/// row texts, cursor position, scrollback depth; wide pairs must hold in
+/// each independently. Any divergence means the FSM lost sync with vte.
+fn run_guard_differential_seed(seed: u64) {
+    const ROWS: usize = 24;
+    const COLS: usize = 80;
+    const STEPS: usize = 200;
+
+    let mut rng = XorShift64(seed);
+    let mut guarded = Terminal::with_scrollback(ROWS, COLS, 1_000);
+    let mut unguarded = Terminal::with_osc_guard(ROWS, COLS, 1_000, false);
+
+    for step in 0..STEPS {
+        let chunk_len = 1 + rng.below(4096) as usize;
+        let chunk = gen_chunk(&mut rng, chunk_len);
+        guarded.process(&chunk);
+        unguarded.process(&chunk);
+
+        let ctx = format!("seed {seed} step {step}");
+        assert_same_observable_state(&guarded, &unguarded, &ctx);
+        assert_no_orphaned_wide_cells(&guarded, &ctx);
+        assert_no_orphaned_wide_cells(&unguarded, &ctx);
+    }
+}
+
+macro_rules! guard_differential_tests {
+    ($($index:literal => $name:ident),+ $(,)?) => {
+        $(
+            /// v1.11.2 X1 differential harness for one fixed seed: the OSC
+            /// guard must be observationally invisible except for over-cap
+            /// payload truncation (which cannot change text/geometry here).
+            #[test]
+            fn $name() {
+                run_guard_differential_seed(seed_for($index));
+            }
+        )+
+    };
+}
+
+guard_differential_tests! {
+    0  => guard_diff_seed_00, 1  => guard_diff_seed_01, 2  => guard_diff_seed_02,
+    3  => guard_diff_seed_03, 4  => guard_diff_seed_04, 5  => guard_diff_seed_05,
+    6  => guard_diff_seed_06, 7  => guard_diff_seed_07,
+    8  => guard_diff_seed_08, 9  => guard_diff_seed_09, 10 => guard_diff_seed_10,
+    11 => guard_diff_seed_11, 12 => guard_diff_seed_12, 13 => guard_diff_seed_13,
+    14 => guard_diff_seed_14, 15 => guard_diff_seed_15,
+}
+
+/// Directed differential companion to the seeded harness: the seeded chunks
+/// never exceed the 1 MiB OSC cap (OSC atoms are ≤64 payload bytes), so this
+/// test drives the Swallowing state through the real process() path and
+/// asserts the guard stays observationally invisible on text/geometry even
+/// while truncating a 3 MiB payload.
+#[test]
+fn guard_differential_over_cap_osc_no_text_divergence() {
+    const PAYLOAD_SIZE: usize = 3 * 1024 * 1024;
+    let mut chunk = Vec::with_capacity(PAYLOAD_SIZE + 32);
+    chunk.extend_from_slice(b"\x1b]52;c;");
+    chunk.resize(chunk.len() + PAYLOAD_SIZE, b'A');
+    chunk.extend_from_slice(b"\x07visible-after");
+
+    let mut guarded = Terminal::with_scrollback(24, 80, 1_000);
+    let mut unguarded = Terminal::with_osc_guard(24, 80, 1_000, false);
+    guarded.process(&chunk);
+    unguarded.process(&chunk);
+
+    assert_same_observable_state(&guarded, &unguarded, "over-cap OSC");
+    assert!(
+        guarded.grid().row_text(0).contains("visible-after"),
+        "guarded parser must resync at the BEL after swallowing"
+    );
+}
+
 // ── Directed extreme-input tests (AUDIT_v1.10.39) ──────────────────────
 
 /// AUDIT_v1.10.39 (OSC raw accumulation): vte 0.13 with `no_std` disabled
@@ -389,6 +495,26 @@ fn unterminated_osc_four_mib_then_bel_recovers() {
         terminal.grid().row_text(0),
         "OK",
         "parser must recover from a 4 MiB unterminated OSC"
+    );
+
+    // v1.11.2 X1 (PLAN_v1112 §3.2): with the guard ON (default), the OSC is
+    // truncated at 1 MiB so vte's raw buffer stops growing — the semantic
+    // anchor for "memory cannot explode". The parser must still be fully
+    // usable after the BEL resync.
+    terminal.process(b"after-truncation");
+    let text = terminal.grid().row_text(0);
+    assert!(
+        text.contains("after-truncation"),
+        "parser must keep printing normally after a truncated OSC: {text}"
+    );
+    // And the truncated OSC 52 payload must not leak into downstream state:
+    // the hyperlink registry stays empty and no cell is tagged HYPERLINK.
+    assert!(
+        !terminal.grid().viewport.iter().any(|row| row
+            .cells
+            .iter()
+            .any(|c| c.flags.contains(CellFlags::HYPERLINK))),
+        "truncated OSC payload must not tag cells as hyperlinks"
     );
 }
 

@@ -365,6 +365,48 @@ impl MetalRenderer {
             }
         }
 
+        // v1.11.2 X4 (PLAN_v1112 §1.3): footer「加载更早」button — paged
+        // history out of SQLite when retention has evicted older blocks.
+        // Hidden entirely when the tab has no blocks (PLAN_v1112 §8: the
+        // button must not render for an empty list). Shares footer_rect with
+        // the scene builder so paint and hit-testing cannot drift.
+        if !p.blocks.is_empty() {
+            let [fx0, fy0, fx1, fy1] = panel_layout.footer_rect;
+            // Hairline separator above the footer so it reads as a distinct
+            // action zone, not a stray row.
+            push_quad(
+                &mut vertices,
+                [
+                    panel_x + cw * 0.5,
+                    fy0 - ch * 0.25,
+                    panel_x + width_px - cw * 0.5,
+                    fy0 - ch * 0.25 + 1.0,
+                ],
+                bg_uv,
+                [0.0; 4],
+                separator_color,
+            );
+            let label = "加载更早";
+            // Reviewer Minor-7: CJK glyphs render at double cell width —
+            // count terminal columns, not chars, or the label centers
+            // ~one CJK width off to the right.
+            let label_cols: usize = label
+                .chars()
+                .map(weft_core::grid::terminal_char_width)
+                .sum();
+            let label_w = label_cols as f32 * cw;
+            let center_x = (fx0 + fx1) * 0.5 - label_w * 0.5;
+            let center_y = (fy0 + fy1) * 0.5 - ch * 0.5;
+            self.push_text(
+                &mut vertices,
+                center_x,
+                center_y,
+                label,
+                dim,
+                ((fx1 - fx0) / cw) as usize,
+            );
+        }
+
         vertices
     }
 }

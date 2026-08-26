@@ -249,10 +249,32 @@ impl Default for PasteConfig {
 /// at consumption time (`runtime_paste_config`, PLAN_v1111 §4.2).
 pub const PASTE_SIZE_TIERS_KIB: [u32; 6] = [8, 16, 32, 64, 128, 256];
 
+/// v1.11.2 X4 (PLAN_v1112 §1.2): in-memory command-block retention cap per
+/// tab. Blocks beyond the limit are evicted from memory (oldest first) but
+/// stay in SQLite and remain referenced by per-tab snapshots; the panel's
+/// "load older" action pages them back in. `0` disables retention entirely.
+///
+/// This is a config-file power-user key on purpose: there is NO Settings UI
+/// row in v1.11.2 (deliberate scope cut — PLAN_v1112 §1.2), so hand-editing
+/// the TOML is the only way to change it. A value outside sane bounds is not
+/// rejected at parse time; `0..2000` simply evicts more aggressively.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BlocksConfig {
+    pub retained_limit: usize,
+}
+
+impl Default for BlocksConfig {
+    fn default() -> Self {
+        Self {
+            retained_limit: crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
+        }
+    }
+}
+
 #[cfg(test)]
 mod paste_config_tests {
     use super::{PasteConfig, PASTE_SIZE_TIERS_KIB};
-
     #[test]
     fn defaults_confirm_both_risks_at_16kib() {
         let cfg = PasteConfig::default();
@@ -273,6 +295,32 @@ mod paste_config_tests {
         // The default must be one of the cycle steps so the Settings row can
         // round-trip its position.
         assert!(PASTE_SIZE_TIERS_KIB.contains(&PasteConfig::default().size_threshold_kib));
+    }
+}
+
+#[cfg(test)]
+mod blocks_config_tests {
+    use super::BlocksConfig;
+
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): default matches the tracker default and
+    /// the section is optional in TOML.
+    #[test]
+    fn defaults_to_tracker_retention_cap() {
+        assert_eq!(
+            BlocksConfig::default().retained_limit,
+            crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT
+        );
+        let cfg: BlocksConfig = toml::from_str("[blocks]").unwrap();
+        assert_eq!(cfg, BlocksConfig::default());
+    }
+
+    #[test]
+    fn parses_hand_written_value_including_zero_disable() {
+        // Deserialize from the section's own table body.
+        let cfg: BlocksConfig = toml::from_str("retained_limit = 500").unwrap();
+        assert_eq!(cfg.retained_limit, 500);
+        let cfg: BlocksConfig = toml::from_str("retained_limit = 0").unwrap();
+        assert_eq!(cfg.retained_limit, 0, "0 = retention disabled");
     }
 }
 

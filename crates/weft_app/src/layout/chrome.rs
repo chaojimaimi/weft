@@ -196,6 +196,10 @@ pub struct PanelLayout {
     pub list_top: f32,
     /// Per-row height (pitch).
     pub row_height: f32,
+    /// v1.11.2 X4 (PLAN_v1112 §1.3): bottom footer strip — the "load older"
+    /// button target. Drawn/clickable only when the tab has blocks; the
+    /// renderer and scene builder share this rect so they cannot drift.
+    pub footer_rect: Rect,
 }
 
 /// Compute panel geometry from a layout context + sidebar width.
@@ -227,10 +231,20 @@ pub fn layout_panel(
     ];
     let list_top = field_y1 + cell_h * 0.4;
     let row_height = cell_h * 1.1;
+    // v1.11.2 X4: footer strip anchored just above the viewport bottom.
+    let footer_h = cell_h * 1.6;
+    let footer_y1 = viewport_h - cell_h * 0.5;
+    let footer_rect = [
+        panel_x + field_pad_x,
+        footer_y1 - footer_h,
+        panel_x + sidebar_width - field_pad_x,
+        footer_y1,
+    ];
     PanelLayout {
         panel_rect,
         search_field_rect,
         list_top,
         row_height,
+        footer_rect,
     }
 }

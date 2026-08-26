@@ -148,6 +148,13 @@ impl Pane {
             }
         };
 
+        // v1.11.2 X3 defensive clamp (PLAN_v1112 §5): config values are
+        // normalized at load time, but Pane can also be built from programmatic
+        // paths — never let an out-of-range depth reach the Terminal.
+        let scrollback_lines = scrollback_lines.clamp(
+            weft_core::config::SCROLLBACK_MIN_LINES,
+            weft_core::config::SCROLLBACK_MAX_LINES,
+        );
         let terminal = Terminal::with_scrollback(rows, cols, scrollback_lines);
         tracing::info!(rows, cols, "initial terminal size");
 
@@ -252,6 +259,15 @@ impl Pane {
         let next = NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed);
         self.input_seq = next;
         next
+    }
+
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): apply the `[blocks] retained_limit`
+    /// config to this pane's terminal. Called by every tab/pane creation
+    /// site that already reads config (same chokepoints as scrollback).
+    pub(crate) fn set_blocks_retained_limit(&mut self, limit: usize) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.set_blocks_retained_limit(limit);
+        }
     }
 
     /// Queue a geometry transaction without resizing the Grid ahead of its PTY.

@@ -809,12 +809,21 @@ impl App {
             renderer.viewport().1,
             renderer.cell_height(),
         );
+        // v1.11.2 X4: the footer button exists only when this tab has blocks.
+        let footer = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .filter(|t| !t.block_tracker().blocks().is_empty())
+            .map(|_| layout.footer_rect);
         let scene = crate::panel_component::build_panel_scene(
             layout.panel_rect,
             layout.search_field_rect,
             layout.list_top,
             layout.row_height,
             max_rows,
+            footer,
         );
         crate::panel_component::panel_target_at(&scene, x, y)
     }

@@ -12,6 +12,12 @@
       "pitch": 18.0
     },
     "panel": {
+      "footer": [
+        4.5,
+        562.2,
+        235.5,
+        591.0
+      ],
       "list_top": 97.2,
       "rect": [
         0.0,
@@ -21,7 +27,7 @@
       ],
       "row_height": 19.8,
       "scene": {
-        "hit_count": 13,
+        "hit_count": 14,
         "hits": [
           {
             "bounds": [
@@ -139,9 +145,18 @@
               334.8
             ],
             "target": "Row(11)"
+          },
+          {
+            "bounds": [
+              4.5,
+              562.2,
+              235.5,
+              591.0
+            ],
+            "target": "LoadOlder"
           }
         ],
-        "semantic_count": 13,
+        "semantic_count": 14,
         "semantics": [
           {
             "bounds": [
@@ -297,6 +312,18 @@
             "focus": null,
             "label": "History row 12",
             "role": "ListItem",
+            "state": ""
+          },
+          {
+            "bounds": [
+              4.5,
+              562.2,
+              235.5,
+              591.0
+            ],
+            "focus": null,
+            "label": "加载更早",
+            "role": "Button",
             "state": ""
           }
         ]

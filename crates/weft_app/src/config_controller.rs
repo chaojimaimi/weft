@@ -100,12 +100,28 @@ pub(super) fn apply_palette_to_all_panes(
 /// Extracted for the same testability reasons as
 /// [`apply_palette_to_all_panes`].
 pub(super) fn apply_scrollback_to_all_panes(tabs: &mut [Tab], max_lines: usize) {
+    // v1.11.2 X3 defensive clamp (PLAN_v1112 §5): the entry point is reachable
+    // from live-reload and profile switches, not only the normalized load path.
+    let max_lines = max_lines.clamp(
+        weft_core::config::SCROLLBACK_MIN_LINES,
+        weft_core::config::SCROLLBACK_MAX_LINES,
+    );
     for tab in tabs.iter_mut() {
         for pane in tab.panes_mut() {
             if let Some(t) = pane.terminal.as_mut() {
                 t.set_scrollback_max_lines(max_lines);
             }
         }
+    }
+}
+
+/// v1.11.2 X4 (PLAN_v1112 §1.2): apply the `[blocks] retained_limit` config
+/// to every pane's terminal of one tab. A free function next to
+/// `apply_scrollback_to_all_panes` (same config-propagation domain); called
+/// by each tab creation site that already reads `[scrollback] lines`.
+pub(super) fn apply_blocks_retained_limit(tab: &mut Tab, limit: usize) {
+    for pane in tab.panes_mut() {
+        pane.set_blocks_retained_limit(limit);
     }
 }
 

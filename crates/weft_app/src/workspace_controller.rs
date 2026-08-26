@@ -308,6 +308,8 @@ impl App {
     ) {
         let (rows, cols) = self.current_size();
         let scrollback = self.config_state.config.scrollback.lines;
+        // v1.11.2 X4: retention cap for the restored tab and its split panes.
+        let blocks_limit = self.config_state.config.blocks.retained_limit;
 
         // Find the root leaf's cwd to open the initial tab.
         let root_cwd = root_leaf_cwd(panes);
@@ -317,6 +319,10 @@ impl App {
         let tab_idx =
             self.sessions
                 .open_tab(rows, cols, scrollback, &self.proxy, root_cwd.as_deref());
+        // v1.11.2 X4: propagate the block retention cap to the restored tab.
+        if let Some(tab) = self.sessions.tab_mut(tab_idx) {
+            crate::config_controller::apply_blocks_retained_limit(tab, blocks_limit);
+        }
 
         // Apply block_id_allocator + palette (mirrors new_tab).
         if let Some(block_id_allocator) = self
@@ -376,7 +382,9 @@ impl App {
             let proxy = self.proxy.clone();
             let mut split_fn =
                 |tab: &mut Tab, leaf: PaneId, dir: SplitDirection, ratio: f32, cwd: &str| {
-                    let new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
+                    let mut new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
+                    // v1.11.2 X4: retention cap on workspace-restored splits.
+                    new_pane.set_blocks_retained_limit(blocks_limit);
                     tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
                         .map_err(|e| {
                             warn!(?e, "workspace restore: split failed, skipping subtree");

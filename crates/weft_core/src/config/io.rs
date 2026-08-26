@@ -20,6 +20,37 @@ use std::path::{Path, PathBuf};
 use super::profiles::ConfigDiagnostic;
 use super::{Config, ProfileError};
 
+// ── Scrollback normalization (v1.11.2 X3 / PLAN_v1112 §5) ──────────────
+
+/// Lower bound for `[scrollback] lines`. Below this a terminal is unusable
+/// (scroll commands do nothing), so tiny/zero user values are lifted to it.
+pub const SCROLLBACK_MIN_LINES: usize = 100;
+/// Upper bound for `[scrollback] lines`. A hostile or typo'd config value
+/// (`lines = 10^9`) would otherwise let each pane's scrollback grow without
+/// a practical memory ceiling; 1M lines × ~cols cells is already far beyond
+/// interactive use.
+pub const SCROLLBACK_MAX_LINES: usize = 1_000_000;
+
+/// Clamp `config.scrollback.lines` into `[SCROLLBACK_MIN_LINES,
+/// SCROLLBACK_MAX_LINES]`, warning when the on-disk value was out of range.
+///
+/// v1.11.2 X3 canonical clamp point: called on the parsed `source` and again
+/// on the profile-resolved `effective` config (a profile override can
+/// reintroduce an out-of-range value after the source was normalized).
+pub fn normalize_scrollback(config: &mut Config) {
+    let raw = config.scrollback.lines;
+    if !(SCROLLBACK_MIN_LINES..=SCROLLBACK_MAX_LINES).contains(&raw) {
+        tracing::warn!(
+            raw,
+            clamped = raw.clamp(SCROLLBACK_MIN_LINES, SCROLLBACK_MAX_LINES),
+            "[scrollback] lines out of range; clamping"
+        );
+    }
+    // PLAN_v1112 §5 formula: min first, then max — lifts small values to the
+    // floor and caps large ones at the ceiling.
+    config.scrollback.lines = raw.clamp(SCROLLBACK_MIN_LINES, SCROLLBACK_MAX_LINES);
+}
+
 // ── LoadedConfig ───────────────────────────────────────────────────────
 
 /// The result of loading and resolving a config document.
@@ -145,8 +176,14 @@ pub fn load_resolved_from_path(path: &Path) -> Result<LoadedConfig, ConfigLoadEr
         // an opaque io error.
         ConfigLoadError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
-    let source: Config = toml::from_str(text)?;
-    let (effective, diagnostics) = source.resolve_active_profile()?;
+    let mut source: Config = toml::from_str(text)?;
+    // v1.11.2 X3: normalize before the profile overlay so the stored source
+    // view is always in range.
+    normalize_scrollback(&mut source);
+    let (mut effective, diagnostics) = source.resolve_active_profile()?;
+    // A profile's [scrollback] override is applied inside
+    // resolve_active_profile and can reintroduce an out-of-range value.
+    normalize_scrollback(&mut effective);
     Ok(LoadedConfig {
         source,
         effective,
@@ -312,6 +349,99 @@ size = 18.0
         let loaded = load_resolved_from_path(&path).unwrap();
         assert!(loaded.diagnostics.is_empty());
         assert_eq!(loaded.effective.font.family, "X");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── v1.11.2 X4: [blocks] retained_limit round-trip (PLAN_v1112 §1.2)
+
+    #[test]
+    fn blocks_retained_limit_round_trips_through_save_and_profile() {
+        let path = tmp("blocks-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let toml = r#"
+[blocks]
+retained_limit = 500
+
+[profiles.big.blocks]
+retained_limit = 42
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        assert_eq!(loaded.source.blocks.retained_limit, 500);
+
+        // Save the source back out and reload — the key must survive.
+        let path2 = tmp("blocks-roundtrip-2");
+        let _ = std::fs::remove_file(&path2);
+        loaded.source.save_to_path(&path2).unwrap();
+        let reloaded = load_resolved_from_path(&path2).unwrap();
+        assert_eq!(reloaded.source.blocks.retained_limit, 500);
+
+        // Profile override applies to effective.
+        let with_active = r#"
+active_profile = "big"
+
+[profiles.big.blocks]
+retained_limit = 42
+"#;
+        let path3 = tmp("blocks-roundtrip-3");
+        let _ = std::fs::remove_file(&path3);
+        std::fs::write(&path3, with_active).unwrap();
+        let active = load_resolved_from_path(&path3).unwrap();
+        assert_eq!(active.effective.blocks.retained_limit, 42);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_file(&path3);
+    }
+
+    // ── v1.11.2 X3: [scrollback] lines clamp (PLAN_v1112 §5) ───────────
+    #[test]
+    fn normalize_scrollback_clamps_default_into_range() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.scrollback.lines, 10_000);
+        normalize_scrollback(&mut cfg);
+        assert_eq!(cfg.scrollback.lines, 10_000, "in-range value untouched");
+    }
+
+    #[test]
+    fn load_huge_scrollback_lines_is_clamped_to_max() {
+        let path = tmp("scroll-huge");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "[scrollback]\nlines = 1_000_000_000\n").unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        assert_eq!(loaded.source.scrollback.lines, SCROLLBACK_MAX_LINES);
+        assert_eq!(loaded.effective.scrollback.lines, SCROLLBACK_MAX_LINES);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_zero_scrollback_lines_is_lifted_to_min() {
+        let path = tmp("scroll-zero");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "[scrollback]\nlines = 0\n").unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        assert_eq!(loaded.source.scrollback.lines, SCROLLBACK_MIN_LINES);
+        assert_eq!(loaded.effective.scrollback.lines, SCROLLBACK_MIN_LINES);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_profile_scrollback_override_is_clamped_too() {
+        let path = tmp("scroll-profile");
+        let _ = std::fs::remove_file(&path);
+        let toml = r#"
+active_profile = "big"
+
+[profiles.big.scrollback]
+lines = 500_000_000
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        // Base source was in-range (default), only the overlay went wild.
+        assert_eq!(loaded.source.scrollback.lines, 10_000);
+        assert_eq!(
+            loaded.effective.scrollback.lines, SCROLLBACK_MAX_LINES,
+            "profile override must be clamped after resolve_active_profile"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

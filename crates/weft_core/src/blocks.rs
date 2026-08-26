@@ -28,14 +28,16 @@ pub mod annotations;
 mod continuation;
 mod cursor_capture;
 pub mod export;
-mod output_capture;
-mod screen_capture;
-
 #[cfg(test)]
 #[path = "blocks/live_styled_tests.rs"]
 mod live_styled_tests;
 #[cfg(test)]
 mod orphan_finalize_tests;
+mod output_capture;
+pub mod retention;
+#[cfg(test)]
+mod retention_tests;
+mod screen_capture;
 #[cfg(test)]
 mod screen_capture_tests;
 mod semantic;
@@ -245,6 +247,18 @@ pub struct BlockTracker {
     /// (new block, collapse toggle) since the last [`take_dirty_blocks`].
     /// The renderer can skip unchanged blocks when rebuilding vertices.
     dirty_blocks: HashSet<u64>,
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): in-memory cap; 0 disables. See retention.rs.
+    retained_limit: usize,
+    /// v1.11.2 X4: ids evicted by [`Self::enforce_retention`] — folded into
+    /// `session_produced_block_ids()` so eviction never changes restore.
+    evicted_ids: HashSet<u64>,
+    /// v1.11.2 X4 review Minor-4: ids the USER explicitly paged back in via
+    /// the panel's "load older" path. `enforce_retention` never evicts them
+    /// (otherwise the next command finalize would immediately drop the page
+    /// the user just asked for). Startup hydrate (`load_blocks`) does NOT
+    /// pin — only explicit user action grows this set, bounding memory at
+    /// `retained_limit + user_pinned` by construction.
+    user_pinned_ids: HashSet<u64>,
 }
 
 impl Default for BlockTracker {
@@ -277,6 +291,9 @@ impl BlockTracker {
             session_start: 0,
             loaded_ids: HashSet::new(),
             dirty_blocks: HashSet::new(),
+            retained_limit: retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
+            evicted_ids: HashSet::new(),
+            user_pinned_ids: HashSet::new(),
         }
     }
 
@@ -422,18 +439,6 @@ impl BlockTracker {
         // session_start 保持为初始值 0，让 session_blocks() 包含加载的历史。
         // 之前这里设为 self.blocks.len() 是为了"避免显示 phantom pre-session
         // history"，但用户期望 Restore 后能看到历史命令记录。
-    }
-
-    /// v1.7.6: IDs of blocks produced THIS session only (excludes blocks
-    /// loaded via [`load_blocks`] on startup/Restore). Used by the app-layer
-    /// `Tab::to_snapshot` to persist per-tab block ownership so each tab
-    /// can restore only its own history on next launch.
-    pub fn session_produced_block_ids(&self) -> Vec<u64> {
-        self.blocks
-            .iter()
-            .filter(|b| !self.loaded_ids.contains(&b.id.0))
-            .map(|b| b.id.0)
-            .collect()
     }
 
     /// Share persisted IDs across tabs; isolated trackers remain local.

@@ -32,6 +32,11 @@ pub(crate) enum Effect {
     PersistBlocks {
         blocks: Vec<weft_core::blocks::Block>,
     },
+    /// v1.11.2 X4 (PLAN_v1112 §1.3): load one page of pre-retention history
+    /// from SQLite and prepend it to the active tab's in-memory block list.
+    /// Dispatch queries `BlockStore::older_than`, feeds
+    /// `BlockTracker::load_older_to_front`, and reports via toast.
+    LoadOlderBlocks,
     /// Read the system clipboard and apply the text to `tab` (Editor inserts
     /// into the prompt buffer; Passthrough writes to the PTY with optional
     /// bracketed-paste wrapping). Synchronous on the main thread because

@@ -54,6 +54,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "scrollback",
         "editor",
         "paste",
+        "blocks",
         "logo",
         "ai",
         "keybindings",
@@ -281,6 +282,34 @@ pub(super) fn write_paste_section(doc: &mut toml_edit::DocumentMut, paste: &supe
     write_paste_keys(doc, paste, &default);
 }
 
+/// v1.11.2 X4 (PLAN_v1112 §1.2): write the `[blocks]` section (retention
+/// cap). Mirrors [`write_paste_section`]: only non-default values are
+/// persisted; an all-default config leaves the file untouched.
+pub(super) fn write_blocks_section(doc: &mut toml_edit::DocumentMut, blocks: &super::BlocksConfig) {
+    let default = super::BlocksConfig::default();
+    let dirty = blocks.retained_limit != default.retained_limit;
+    if !dirty && !doc.contains_key("blocks") {
+        return;
+    }
+    let entry = doc.entry("blocks").or_insert_with(toml_edit::table);
+    if entry.is_none() {
+        *entry = toml_edit::table();
+    }
+    let Some(blocks_entry) = doc
+        .get_mut("blocks")
+        .and_then(toml_edit::Item::as_table_mut)
+    else {
+        tracing::warn!("[blocks] section is not a table; skipping blocks section write");
+        return;
+    };
+    if blocks.retained_limit != default.retained_limit {
+        blocks_entry["retained_limit"] =
+            toml_edit::value(i64::try_from(blocks.retained_limit).unwrap_or(0));
+    } else if blocks_entry.contains_key("retained_limit") {
+        blocks_entry.remove("retained_limit");
+    }
+}
+
 /// Write (or clear) the individual `[paste]` keys on an existing document.
 fn write_paste_keys(
     doc: &mut toml_edit::DocumentMut,
@@ -483,6 +512,18 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
         if let Some(s) = &profile.scrollback {
             let default = super::ScrollbackConfig::default();
             set_usize_if_diff(t, "lines", s.lines, default.lines);
+        }
+    });
+    // v1.11.2 X4: `[blocks]` is profile-overridable like `[scrollback]`.
+    write_profile_section(table, "blocks", profile.blocks.is_some(), |t| {
+        if let Some(b) = &profile.blocks {
+            let default = super::BlocksConfig::default();
+            set_usize_if_diff(
+                t,
+                "retained_limit",
+                b.retained_limit,
+                default.retained_limit,
+            );
         }
     });
     write_profile_section(table, "editor", profile.editor.is_some(), |t| {

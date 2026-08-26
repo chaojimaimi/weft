@@ -21,7 +21,7 @@ use bitflags::bitflags;
 use serde::Deserialize;
 
 use super::{
-    Action, AiConfig, EditorConfig, FontConfig, KeyBindings, LogoConfig, PasteConfig,
+    Action, AiConfig, BlocksConfig, EditorConfig, FontConfig, KeyBindings, LogoConfig, PasteConfig,
     ScrollbackConfig, ThemeConfig, WindowConfig,
 };
 
@@ -45,6 +45,9 @@ pub struct ProfileConfig {
     /// v1.11.1 (PLAN_v1111 §4.2): large-paste protection switches are
     /// profile-overridable like `[editor]`.
     pub paste: Option<PasteConfig>,
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): block retention cap is
+    /// profile-overridable like `[scrollback]`.
+    pub blocks: Option<BlocksConfig>,
     pub logo: Option<LogoConfig>,
     /// `keybindings` is also a full-section override (no per-key merge).
     pub keybindings: Option<HashMap<String, Action>>,
@@ -63,6 +66,7 @@ impl ProfileConfig {
             && self.scrollback.is_none()
             && self.editor.is_none()
             && self.paste.is_none()
+            && self.blocks.is_none()
             && self.logo.is_none()
             && self.keybindings.is_none()
     }
@@ -188,6 +192,9 @@ pub fn apply_overrides(base: &mut super::Config, profile: &ProfileConfig) {
     }
     if let Some(paste) = &profile.paste {
         base.paste = paste.clone();
+    }
+    if let Some(blocks) = &profile.blocks {
+        base.blocks = blocks.clone();
     }
     if let Some(logo) = &profile.logo {
         base.logo = logo.clone();

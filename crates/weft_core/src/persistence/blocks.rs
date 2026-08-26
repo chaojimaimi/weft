@@ -144,6 +144,29 @@ impl BlockStore {
         rows.map(|r| r.map_err(PersistenceError::from)).collect()
     }
 
+    /// v1.11.2 X4 (PLAN_v1112 §1.3): keyset-paginated history for the panel's
+    /// "load older" action. Returns up to `limit` blocks strictly OLDER than
+    /// `started_ms_exclusive`, newest first — uses idx_blocks_started so a
+    /// deep page scan never degenerates into a full-table sort. Strict `<`
+    /// makes repeated pages disjoint: a block whose started_ms equals the
+    /// caller's cursor is never returned twice.
+    pub fn older_than(
+        &self,
+        started_ms_exclusive: i64,
+        limit: usize,
+    ) -> Result<Vec<Block>, PersistenceError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, command, cwd, output, \
+                    CASE WHEN length(CAST(styled_output AS BLOB)) <= 262144 THEN styled_output END, \
+                    exit_code, started_ms, finished_ms, collapsed, screen_origin \
+             FROM blocks \
+             WHERE started_ms < ?1 \
+             ORDER BY started_ms DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![started_ms_exclusive, limit as i64], row_to_block)?;
+        rows.map(|r| r.map_err(PersistenceError::from)).collect()
+    }
+
     /// Delete every stored block.
     pub fn clear(&self) -> Result<(), PersistenceError> {
         self.conn.execute("DELETE FROM blocks", [])?;
@@ -348,6 +371,85 @@ mod tests {
         let loaded = store.recent(1).unwrap().pop().unwrap();
         assert_eq!(loaded.exit_code, None);
         assert_eq!(loaded.finished_at, None);
+    }
+
+    // ── v1.11.2 X4: keyset pagination (older_than) ─────────────────────
+
+    #[test]
+    fn older_than_returns_strictly_older_newest_first() {
+        let store = temp_store();
+        for id in 1..=5u64 {
+            store
+                .insert(&block(id, &format!("c{id}"), "", Some(0)))
+                .unwrap();
+        }
+        // Cursor between blocks 3 and 4 → pages 3, 2, 1 (newest first).
+        let cursor = SystemTime::UNIX_EPOCH + Duration::from_secs(3 * 1000 + 1);
+        let page = store
+            .older_than(
+                cursor
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                10,
+            )
+            .unwrap();
+        let ids: Vec<u64> = page.iter().map(|b| b.id.0).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn older_than_excludes_cursor_equal_started_ms() {
+        // PLAN_v1112 §7.1: boundary started_ms equal must NOT be re-fetched —
+        // repeated pages stay disjoint.
+        let store = temp_store();
+        for id in 1..=3u64 {
+            store
+                .insert(&block(id, &format!("c{id}"), "", Some(0)))
+                .unwrap();
+        }
+        // Cursor exactly at block 2's started_ms.
+        let cursor_ms = 2 * 1000 * 1000;
+        let first = store.older_than(cursor_ms, 10).unwrap();
+        assert_eq!(
+            first.iter().map(|b| b.id.0).collect::<Vec<_>>(),
+            vec![1],
+            "block at the cursor is excluded"
+        );
+        // Paging further from the last returned row never repeats block 1.
+        if let Some(last) = first.last() {
+            let next_cursor = last.started_at;
+            let second = store
+                .older_than(
+                    next_cursor
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64,
+                    10,
+                )
+                .unwrap();
+            assert!(second.is_empty(), "no duplicates across pages");
+        }
+    }
+
+    #[test]
+    fn older_than_respects_limit() {
+        let store = temp_store();
+        for id in 1..=5u64 {
+            store
+                .insert(&block(id, &format!("c{id}"), "", Some(0)))
+                .unwrap();
+        }
+        let page = store.older_than(i64::MAX, 2).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].id, BlockId(5));
+        assert_eq!(page[1].id, BlockId(4));
+    }
+
+    #[test]
+    fn older_than_on_empty_store_is_empty() {
+        let store = temp_store();
+        assert!(store.older_than(i64::MAX, 10).unwrap().is_empty());
     }
 
     #[test]

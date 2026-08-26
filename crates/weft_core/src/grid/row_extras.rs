@@ -26,6 +26,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// v1.11.2 X2 (PLAN_v1112 §4): upper bound on UTF-8 BYTES stored per
+/// grapheme cluster (`g.len()` is byte length — reviewer Minor-6: the plan
+/// said "scalars" but the check is bytes; ≈16–32 non-ASCII scalars). Real
+/// content never approaches this — a VS16 head is 3–6 bytes, ZWJ emoji
+/// sequences ≤100 bytes — so the cap only fires on hostile or pathological
+/// combining-mark floods and bounds `RowExtras` memory per cell. Copy/a11y
+/// output truncation past the cap is an accepted degradation.
+const GRAPHEME_CLUSTER_CAP: usize = 64;
+
 /// Per-cell extension data. Stored sparsely in [`RowExtras`] — only cells
 /// with at least one of {multi-scalar grapheme, hyperlink id} have an entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -179,6 +188,19 @@ impl RowExtras {
             entry.grapheme = Some(Arc::from(base_char.to_string().as_str()));
         }
         if let Some(g) = entry.grapheme.take() {
+            // v1.11.2 X2 (PLAN_v1112 §4): refuse to grow a cluster past
+            // GRAPHEME_CLUSTER_CAP. The scalar is dropped (not buffered), the
+            // existing cluster is put back untouched, and the overflow is
+            // logged once per event at trace level.
+            if g.len() + scalar.len_utf8() > GRAPHEME_CLUSTER_CAP {
+                tracing::trace!(
+                    col,
+                    cap = GRAPHEME_CLUSTER_CAP,
+                    "grapheme cluster cap reached; dropping appended scalar"
+                );
+                entry.grapheme = Some(g);
+                return;
+            }
             let mut s = g.to_string();
             s.push(scalar);
             entry.grapheme = Some(Arc::from(s.as_str()));
@@ -379,6 +401,63 @@ mod tests {
         e.append_scalar(1, 'a', '\u{0301}');
         // Decomposed form, not precomposed á (U+00E1).
         assert_eq!(e.grapheme_at(1), Some("a\u{0301}"));
+    }
+
+    // ── v1.11.2 X2: GRAPHEME_CLUSTER_CAP boundary tests (PLAN_v1112 §4) ──
+
+    /// Grow a cluster with single-byte ASCII scalars so scalar count ==
+    /// byte count and the cap boundary is exact.
+    fn grow_cluster(e: &mut RowExtras, col: usize, base: char, extra: usize) {
+        for i in 0..extra {
+            let filler = char::from_u32('a' as u32 + (i % 26) as u32).unwrap();
+            e.append_scalar(col, base, filler);
+        }
+    }
+
+    #[test]
+    fn append_scalar_cap_63_scalars_still_accepted() {
+        let mut e = RowExtras::new();
+        // Seed + 62 fillers = 63 scalars (63 bytes) — one under the cap.
+        grow_cluster(&mut e, 0, 'a', 62);
+        assert_eq!(e.grapheme_at(0).map(str::len), Some(63));
+        // One more still fits: exactly at the cap.
+        e.append_scalar(0, 'a', 'z');
+        assert_eq!(e.grapheme_at(0).map(str::len), Some(64));
+    }
+
+    #[test]
+    fn append_scalar_cap_rejects_65th_scalar_and_keeps_cluster() {
+        let mut e = RowExtras::new();
+        grow_cluster(&mut e, 0, 'a', 62);
+        e.append_scalar(0, 'a', 'z'); // now exactly 64 — at the cap
+        let at_cap = e.grapheme_at(0).map(str::len);
+        assert_eq!(at_cap, Some(64));
+        // The next append would exceed the cap: dropped, cluster unchanged.
+        e.append_scalar(0, 'a', '\u{0301}');
+        assert_eq!(
+            e.grapheme_at(0).map(str::len),
+            Some(64),
+            "over-cap scalar must be dropped without mutating the cluster"
+        );
+    }
+
+    #[test]
+    fn append_scalar_vs16_head_unaffected_by_cap() {
+        let mut e = RowExtras::new();
+        // VS16 sequences sit at 1-3 scalars far below the cap.
+        e.append_scalar(0, '\u{2764}', '\u{FE0F}'); // heart + VS16
+        assert_eq!(e.grapheme_at(0), Some("\u{2764}\u{FE0F}"));
+    }
+
+    #[test]
+    fn append_scalar_base_char_preserved_when_seeding_empty_entry() {
+        let mut e = RowExtras::new();
+        e.append_scalar(4, 'Q', '\u{0301}');
+        assert_eq!(
+            e.grapheme_at(4),
+            Some("Q\u{0301}"),
+            "base_char seeds the cluster"
+        );
     }
 
     #[test]

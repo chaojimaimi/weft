@@ -212,6 +212,7 @@ fn layout_scene_snapshot() -> Value {
         panel.list_top,
         panel.row_height,
         12,
+        Some(panel.footer_rect),
     );
 
     let footer_widths = settings_footer_widths(9.0);
@@ -302,6 +303,7 @@ fn layout_scene_snapshot() -> Value {
                 "search": rect32(panel.search_field_rect),
                 "list_top": rounded(f64::from(panel.list_top)),
                 "row_height": rounded(f64::from(panel.row_height)),
+                "footer": rect32(panel.footer_rect),
                 "scene": scene_snapshot(&panel_scene),
             },
         },

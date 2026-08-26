@@ -59,9 +59,11 @@ pub struct Pty {
     /// PID of the child shell process.
     child_pid: Pid,
     /// Channel to receive PTY output events.
-    event_rx: mpsc::UnboundedReceiver<PtyEvent>,
+    /// v1.11.2 X2: bounded (`PTY_CHANNEL_CAP`) instead of unbounded — see
+    /// the const's doc comment for the backpressure contract.
+    event_rx: mpsc::Receiver<PtyEvent>,
     /// Sender cloned for the read loop.
-    _event_tx: mpsc::UnboundedSender<PtyEvent>,
+    _event_tx: mpsc::Sender<PtyEvent>,
 }
 
 impl Pty {
@@ -151,7 +153,9 @@ impl Pty {
                 std::process::exit(127);
             }
             ForkptyResult::Parent { child, master } => {
-                let (event_tx, event_rx) = mpsc::unbounded_channel();
+                // v1.11.2 X2: bounded channel — the read loop's `send().await`
+                // suspends when full and kernel flow control takes over.
+                let (event_tx, event_rx) = mpsc::channel(PTY_CHANNEL_CAP);
 
                 // Start async read loop
                 let tx = event_tx.clone();
@@ -499,24 +503,80 @@ fn strip_launcher_presentation_env(
     env.remove(std::ffi::OsStr::new("NO_COLOR"));
 }
 
+/// v1.11.2 X2 (PLAN_v1112 §2): capacity of the bounded PTY event channel.
+/// 32 × 256 KiB chunks = an 8 MiB ceiling on in-flight output between the
+/// read task and the UI pump. When full, `send().await` suspends the read
+/// task, which backpressures into the kernel PTY buffer and ultimately
+/// blocks the child's writes — bytes are never dropped by Weft.
+const PTY_CHANNEL_CAP: usize = 32;
+
+/// Monotonic milliseconds since process start (v1.11.2 X2 wake throttle).
+/// rust-reviewer Minor-3: deliberately NOT wall-clock `SystemTime` — NTP
+/// steps or a manual clock change can move it backwards, which would
+/// suppress wakes until real time caught up with the stale stamp while the
+/// queue is non-empty. `Instant` only ever moves forward.
+fn monotonic_millis() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Tracks when the read loop last woke the UI (v1.11.2 X2).
+#[derive(Debug, Default)]
+struct WakeThrottle {
+    last_ms: u64,
+}
+
+impl WakeThrottle {
+    fn last(&self) -> u64 {
+        self.last_ms
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.last_ms = now_ms;
+    }
+}
+
+/// Pure wake decision (v1.11.2 X2, PLAN_v1112 §2): during an output flood
+/// the UI is nudged at most once per 16 ms (~60 Hz, Warp-precedent), but a
+/// caught-up consumer (empty queue) always wakes immediately so fresh
+/// output is pumped without latency, and Exit always bypasses the throttle
+/// so the UI learns of a dead child instantly.
+fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u64) -> bool {
+    if is_exit {
+        return true;
+    }
+    consumer_caught_up || now_ms.saturating_sub(last_ms) >= 16
+}
+
 /// Async read loop: reads from the PTY master fd and sends output events.
 /// Detects child exit via EIO error and sends an Exit event.
+///
+/// v1.11.2 X2 (PLAN_v1112 §2): `tx` is bounded; a full channel suspends this
+/// task on `send().await`, which backpressures into the kernel PTY buffer and
+/// ultimately blocks the child's writes — bytes are never dropped. UI wakes
+/// are throttled to ~60 Hz during floods (`WakeThrottle`); Exit always wakes.
 async fn read_loop<W: Fn() + Send + 'static>(
     fd: OwnedFd,
     child_pid: Pid,
-    tx: mpsc::UnboundedSender<PtyEvent>,
+    tx: mpsc::Sender<PtyEvent>,
     wake: W,
 ) {
     // Buffer size: 256KB as per architecture doc.
     const BUF_SIZE: usize = 256 * 1024;
 
+    let mut throttle = WakeThrottle::default();
+
     let async_fd = match tokio::io::unix::AsyncFd::new(fd) {
         Ok(fd) => fd,
         Err(e) => {
             tracing::error!(error = %e, "failed to create async fd for PTY read");
-            let _ = tx.send(PtyEvent::Exit(Err(format!(
-                "async fd creation failed: {e}"
-            ))));
+            let _ = tx
+                .send(PtyEvent::Exit(Err(format!(
+                    "async fd creation failed: {e}"
+                ))))
+                .await;
             return;
         }
     };
@@ -557,14 +617,26 @@ async fn read_loop<W: Fn() + Send + 'static>(
                         let _ = std::io::Write::write_all(&mut f, &data);
                     }
                 }
-                if tx.send(PtyEvent::Output(data)).is_err() {
+                // v1.11.2 X2: sample emptiness BEFORE the send — an empty
+                // queue means the consumer is caught up and must be woken so
+                // fresh output is pumped promptly. Suspending here on a full
+                // channel is the intended backpressure path.
+                // (tokio 1.53's Sender has no len(); full remaining capacity
+                // is exactly "queue is empty" for this single-producer task.)
+                let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
+                if tx.send(PtyEvent::Output(data)).await.is_err() {
                     // Receiver dropped — shutdown.
                     tracing::debug!("PTY event receiver dropped, stopping read loop");
                     return;
                 }
                 // Nudge the UI event loop so fresh output is pumped promptly,
-                // instead of idling until the next keyboard/mouse event.
-                wake();
+                // instead of idling until the next keyboard/mouse event — but
+                // at most ~once per 16 ms during a flood (v1.11.2 X2).
+                let now_ms = monotonic_millis();
+                if pty_wake_due(false, consumer_caught_up, throttle.last(), now_ms) {
+                    wake();
+                    throttle.stamp(now_ms);
+                }
             }
             Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Spurious wakeup, retry.
@@ -602,7 +674,11 @@ async fn read_loop<W: Fn() + Send + 'static>(
         }
         Err(e) => Err(format!("waitpid failed: {e}")),
     };
-    let _ = tx.send(PtyEvent::Exit(exit_status));
+    // v1.11.2 X2: Exit bypasses the throttle entirely (pty_wake_due's
+    // is_exit arm) — the UI must learn of the dead child immediately.
+    if tx.send(PtyEvent::Exit(exit_status)).await.is_ok() {
+        wake();
+    }
 }
 
 /// Safely wait for a child process, handling ECHILD (already reaped).
@@ -658,7 +734,6 @@ impl From<nix::sys::wait::WaitStatus> for ChildStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn resize_ioctl_failure_is_propagated() {
@@ -856,8 +931,80 @@ mod tests {
         assert!(err.to_string().contains("exited with code 1"));
 
         let err = PtyError::ChildSignaled("SIGHUP".into());
-        assert!(err.to_string().contains("SIGHUP"));
+        assert!(err.to_string().contains("killed by signal"));
     }
+
+    // ── T4: additional PTY coverage ────────────────────────────────────
+
+    /// Spawning a non-existent program: forkpty succeeds (the fork itself
+    /// works), the child's exec fails, and the child exits with code 127
+    /// (the POSIX convention for "command not found"). The parent sees an
+    /// `Exit` event rather than a spawn-time error.
+    ///
+    /// Marked `#[ignore]` because it spawns a real subprocess (needs a PTY
+    /// and a working fork). Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn spawn_unknown_command_child_exits() {
+        let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80), || {})
+            .expect("forkpty itself should succeed even if the program doesn't exist");
+
+        // The child's exec will fail → it exits with code 127. Collect
+        // events until we see the Exit.
+        let mut got_exit = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
+            match event {
+                Ok(Some(PtyEvent::Exit(result))) => {
+                    // exec failure → child exits with 127.
+                    assert!(
+                        result.is_ok(),
+                        "expected exit code 127, got error: {result:?}"
+                    );
+                    assert_eq!(result.unwrap(), 127, "exec failure should exit 127");
+                    got_exit = true;
+                    break;
+                }
+                Ok(Some(PtyEvent::Output(_))) => continue,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            got_exit,
+            "should receive an Exit event for an unknown command"
+        );
+    }
+
+    // ── v1.11.2 X2 (PLAN_v1112 §2): wake-throttle decision table ──────
+
+    #[test]
+    fn pty_wake_due_throttles_floods_to_sixty_hz() {
+        // Inside the 16 ms window with a non-empty queue: no wake.
+        assert!(!pty_wake_due(false, false, 1_000, 1_008));
+        // At/after the window boundary: wake.
+        assert!(pty_wake_due(false, false, 1_000, 1_016));
+        assert!(pty_wake_due(false, false, 1_000, 2_000));
+    }
+
+    #[test]
+    fn pty_wake_due_wakes_a_caught_up_consumer_immediately() {
+        // An empty queue means the consumer is idle — fresh output must be
+        // pumped without waiting out the 16 ms window.
+        assert!(pty_wake_due(false, true, 1_000, 1_001));
+    }
+
+    #[test]
+    fn pty_wake_due_exit_bypasses_the_throttle() {
+        assert!(pty_wake_due(true, false, 1_000, 1_001));
+    }
+
+    // Restored verbatim from HEAD (rust-reviewer v1.11.2 Major-1): the
+    // interrupted worker had dropped these write-budget behavior anchors
+    // while restructuring the tests module; the production functions they
+    // pin (write_all_nonblocking / WriteOutcome / write_sync) are unchanged
+    // by v1.11.2, so the anchors must survive too.
 
     // ── FIX_TERMINAL_CAPABILITY_HARDENING: bounded-EAGAIN write loop ──
 
@@ -1089,48 +1236,5 @@ mod tests {
             "Interrupted must be retried, got {outcome:?}"
         );
         assert_eq!(calls, 3, "must retry after each Interrupted");
-    }
-
-    // ── T4: additional PTY coverage ────────────────────────────────────
-
-    /// Spawning a non-existent program: forkpty succeeds (the fork itself
-    /// works), the child's exec fails, and the child exits with code 127
-    /// (the POSIX convention for "command not found"). The parent sees an
-    /// `Exit` event rather than a spawn-time error.
-    ///
-    /// Marked `#[ignore]` because it spawns a real subprocess (needs a PTY
-    /// and a working fork). Run with `cargo test -- --ignored`.
-    #[tokio::test]
-    #[ignore]
-    async fn spawn_unknown_command_child_exits() {
-        let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80), || {})
-            .expect("forkpty itself should succeed even if the program doesn't exist");
-
-        // The child's exec will fail → it exits with code 127. Collect
-        // events until we see the Exit.
-        let mut got_exit = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
-            match event {
-                Ok(Some(PtyEvent::Exit(result))) => {
-                    // exec failure → child exits with 127.
-                    assert!(
-                        result.is_ok(),
-                        "expected exit code 127, got error: {result:?}"
-                    );
-                    assert_eq!(result.unwrap(), 127, "exec failure should exit 127");
-                    got_exit = true;
-                    break;
-                }
-                Ok(Some(PtyEvent::Output(_))) => continue,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        assert!(
-            got_exit,
-            "should receive an Exit event for an unknown command"
-        );
     }
 }

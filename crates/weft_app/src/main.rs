@@ -421,12 +421,17 @@ impl App {
     }
 
     fn spawn_pty(&mut self, rows: usize, cols: usize) {
-        let tab = Tab::new(
+        let mut tab = Tab::new(
             rows,
             cols,
             self.config_state.config.scrollback.lines,
             &self.proxy,
             None,
+        );
+        // v1.11.2 X4: propagate the block retention cap to the fresh pane.
+        crate::config_controller::apply_blocks_retained_limit(
+            &mut tab,
+            self.config_state.config.blocks.retained_limit,
         );
         // v1.0 V13: On first launch, inject a welcome banner via PTY.
         // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it

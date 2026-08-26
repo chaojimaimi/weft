@@ -166,6 +166,10 @@ impl BlockTracker {
         self.dirty_blocks.insert(block.id.0);
         self.blocks.push(block.clone());
         self.unpersisted.push(block);
+        // v1.11.2 X4 (PLAN_v1112 §1.2): retention runs after BOTH pushes —
+        // see the timing note on `enforce_retention` for why a popped block
+        // may still sit in `unpersisted` (benign; the drain persists it).
+        self.enforce_retention();
     }
 
     fn clear_pending_capture(&mut self) {

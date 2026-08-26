@@ -177,6 +177,7 @@ impl crate::App {
                 Effect::CopyClipboard { text } => clipboard_copy(&text),
                 Effect::PersistTabs => self.save_all_tabs(),
                 Effect::PersistBlocks { blocks } => self.persist_blocks(&blocks),
+                Effect::LoadOlderBlocks => self.apply_load_older_blocks(),
                 Effect::Paste { tab } => self.apply_paste(tab),
                 Effect::Exit => self.should_exit = true,
                 Effect::TabClosed {
@@ -230,6 +231,65 @@ impl crate::App {
                 }
             }
         }
+    }
+
+    /// v1.11.2 X4 (PLAN_v1112 §1.3): the panel footer's「加载更早」action.
+    /// Pages one batch of pre-retention history out of SQLite via keyset
+    /// pagination, prepends it to the active tab's tracker (time order
+    /// preserved), and reports the outcome through the toast channel.
+    /// Blocks already in memory are unaffected; an exhausted DB answers with
+    /// 「没有更早的历史」.
+    pub(crate) fn apply_load_older_blocks(&mut self) {
+        const LOAD_OLDER_PAGE: usize = 200;
+
+        let oldest_started_ms = self
+            .sessions
+            .active()
+            .terminal
+            .as_ref()
+            .and_then(|t| t.block_tracker().blocks().first())
+            .map(|b| b.started_at)
+            .map(|started| {
+                started
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+        let Some(oldest_started_ms) = oldest_started_ms else {
+            // No blocks at all: the footer button is not even rendered, so
+            // reaching here means a stale click — answer with the empty hint.
+            self.show_block_history_toast("没有更早的历史");
+            return;
+        };
+        let Some(store) = self.sessions.block_store() else {
+            return;
+        };
+        match store.older_than(oldest_started_ms, LOAD_OLDER_PAGE) {
+            Ok(blocks) if blocks.is_empty() => {
+                self.show_block_history_toast("没有更早的历史");
+            }
+            Ok(blocks) => {
+                let loaded = blocks.len();
+                if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
+                    t.block_tracker_mut().load_older_to_front(blocks);
+                }
+                info!(loaded, "loaded older block history from store");
+                self.show_block_history_toast(&format!("已加载 {loaded} 条"));
+                self.request_redraw();
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to load older block history");
+            }
+        }
+    }
+
+    /// v1.11.2 X4: reuse the paste-toast surface for generic feedback text.
+    /// Same 3s TTL and 1 Hz expiry tick apply.
+    fn show_block_history_toast(&mut self, message: &str) {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_paste_toast(Some((message.to_string(), std::time::Instant::now())));
+        }
+        self.request_redraw();
     }
 
     /// Read the system clipboard (synchronous — NSPasteboard has AppKit main
@@ -383,6 +443,55 @@ impl crate::App {
         if expired {
             self.request_redraw();
         }
+    }
+
+    /// The 1 Hz `AppEvent::TabsAutoSave` body, extracted from app_runtime.rs
+    /// (architecture-gate ceiling) so the whole tick — save, recovery
+    /// snapshot, timing metric, toast expiry — lives in one effect-domain fn.
+    pub(crate) fn run_tabs_autosave_tick(&mut self) {
+        // v1.10.23: suppressed while the recovery prompt is pending — an
+        // autosave would DELETE-and-replace the tabs table and overwrite the
+        // on-disk crash snapshot before the user chooses.
+        let tick_started = std::time::Instant::now();
+        if crate::recovery_controller::autosave_suppressed(&self.pending_recovery) {
+            tracing::debug!("skipping autosave while recovery prompt is pending");
+        } else {
+            self.save_changed_tabs();
+            // v1.6.3: debounced recovery snapshot write alongside the tabs
+            // autosave (skipped internally when nothing changed).
+            if let Some(ws) = self.capture_workspace("recovery".into()) {
+                if let Err(e) = self.recovery.write_snapshot_if_changed(&ws) {
+                    warn!(error = %e, "recovery snapshot write failed");
+                }
+            }
+        }
+        // v1.11.2 X6 (PLAN_v1112 §6): observe every tick for the probe's p95
+        // line; warn when a tick visibly eats the frame budget (>5 ms),
+        // including scale so slow ticks are attributable.
+        let tick_elapsed = tick_started.elapsed();
+        self.performance_probe.record_autosave_tick(tick_elapsed);
+        if tick_elapsed > std::time::Duration::from_millis(5) {
+            let tabs = self.sessions.tabs().len();
+            let total_blocks: usize = self
+                .sessions
+                .tabs()
+                .iter()
+                .map(|tab| {
+                    tab.panes()
+                        .filter_map(|(_, pane)| pane.terminal.as_ref())
+                        .map(|t| t.block_tracker().blocks().len())
+                        .sum::<usize>()
+                })
+                .sum();
+            tracing::warn!(
+                elapsed_ms = tick_elapsed.as_secs_f64() * 1000.0,
+                tabs,
+                total_blocks,
+                "autosave tick exceeded 5ms"
+            );
+        }
+        // v1.11.1: paste-toast expiry rides this tick.
+        self.expire_paste_toast_tick();
     }
 
     /// v1.11.1: apply an already-approved paste and surface the post-paste

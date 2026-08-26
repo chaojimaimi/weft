@@ -500,12 +500,20 @@ impl App {
                     )
                 })
                 .unwrap_or_default();
+            // v1.11.2 X4: footer button only when the tab actually has blocks.
+            let has_blocks = self
+                .sessions
+                .active()
+                .terminal
+                .as_ref()
+                .is_some_and(|t| !t.block_tracker().blocks().is_empty());
             let mut scene = crate::panel_component::build_panel_scene(
                 layout.panel_rect,
                 layout.search_field_rect,
                 layout.list_top,
                 layout.row_height,
                 display.len(),
+                has_blocks.then_some(layout.footer_rect),
             );
             if let Some(search) = scene.semantics.first_mut() {
                 search.state = self.panel.query.clone();
@@ -536,6 +544,16 @@ impl App {
                         item,
                         true,
                     );
+                }
+            }
+            // v1.11.2 X4: expose the footer button (last node when present).
+            if scene
+                .semantics
+                .last()
+                .is_some_and(|n| n.role == SemanticRole::Button)
+            {
+                if let Some(footer) = scene.semantics.last() {
+                    push_semantic(&mut semantics, "panel/load-older", None, footer, false);
                 }
             }
         }

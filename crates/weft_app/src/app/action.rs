@@ -187,6 +187,12 @@ impl crate::App {
                 match tab.split_active_pane(direction, 0.5, scrollback, &self.proxy, geo) {
                     Ok(id) => {
                         tracing::info!(?id, ?direction, ?old_active, "pane split");
+                        // v1.11.2 X4: retention cap on the newly spawned pane.
+                        if let Some(pane) = self.sessions.active_mut().pane_mut(id) {
+                            pane.set_blocks_retained_limit(
+                                self.config_state.config.blocks.retained_limit,
+                            );
+                        }
                         let tab2 = self.sessions.active();
                         tracing::info!(
                             panes = ?tab2.split_tree().panes(),

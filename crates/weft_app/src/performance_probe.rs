@@ -83,6 +83,12 @@ pub(crate) struct PerformanceProbe {
     wakes: u64,
     redraws: u64,
     cpu_frames: Vec<Duration>,
+    /// v1.11.2 X6 (PLAN_v1112 §6): wall-clock duration of each 1 Hz
+    /// TabsAutoSave handler run observed while measuring. Observational
+    /// only — feeds the `autosave_tick_p95_ms` report line so the .9
+    /// performance re-test can decide whether an epoch short-circuit is
+    /// needed; it does NOT participate in pass/fail.
+    autosave_ticks: Vec<Duration>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -93,6 +99,7 @@ pub(crate) struct ProbeReport {
     pub(crate) wake_hz: f64,
     pub(crate) redraw_hz: f64,
     pub(crate) cpu_frame_p95_ms: f64,
+    pub(crate) autosave_tick_p95_ms: f64,
     pub(crate) resident_bytes: u64,
     pub(crate) writable_resident_bytes: u64,
 }
@@ -117,6 +124,7 @@ impl PerformanceProbe {
         self.wakes = 0;
         self.redraws = 0;
         self.cpu_frames.clear();
+        self.autosave_ticks.clear();
     }
 
     pub(crate) fn record_wake(&mut self) {
@@ -132,6 +140,13 @@ impl PerformanceProbe {
         }
     }
 
+    /// v1.11.2 X6: observe one TabsAutoSave handler run.
+    pub(crate) fn record_autosave_tick(&mut self, elapsed: Duration) {
+        if self.measuring_since.is_some() {
+            self.autosave_ticks.push(elapsed);
+        }
+    }
+
     pub(crate) fn finish(&mut self) -> Option<ProbeReport> {
         let elapsed = self.measuring_since.take()?.elapsed();
         let report = ProbeReport::new(
@@ -139,10 +154,12 @@ impl PerformanceProbe {
             self.wakes,
             self.redraws,
             &self.cpu_frames,
+            &self.autosave_ticks,
             instant_resident_bytes(),
             writable_resident_bytes(),
         );
         self.cpu_frames.clear();
+        self.autosave_ticks.clear();
         Some(report)
     }
 }
@@ -153,6 +170,7 @@ impl ProbeReport {
         wakes: u64,
         redraws: u64,
         frames: &[Duration],
+        autosave_ticks: &[Duration],
         resident_bytes: u64,
         writable_resident_bytes: u64,
     ) -> Self {
@@ -164,6 +182,7 @@ impl ProbeReport {
             wake_hz: wakes as f64 / seconds,
             redraw_hz: redraws as f64 / seconds,
             cpu_frame_p95_ms: percentile_95_ms(frames),
+            autosave_tick_p95_ms: percentile_95_ms(autosave_ticks),
             resident_bytes,
             writable_resident_bytes,
         }
@@ -178,7 +197,7 @@ impl ProbeReport {
 
     pub(crate) fn line(&self) -> String {
         format!(
-            "WEFT_GUI_PERF status={} seconds={:.3} wakes={} wake_hz={:.3} redraws={} redraw_hz={:.3} cpu_frame_p95_ms={:.3} resident_bytes={} writable_resident_bytes={}",
+            "WEFT_GUI_PERF status={} seconds={:.3} wakes={} wake_hz={:.3} redraws={} redraw_hz={:.3} cpu_frame_p95_ms={:.3} autosave_tick_p95_ms={:.3} resident_bytes={} writable_resident_bytes={}",
             if self.passes() { "PASS" } else { "FAIL" },
             self.seconds,
             self.wakes,
@@ -186,6 +205,7 @@ impl ProbeReport {
             self.redraws,
             self.redraw_hz,
             self.cpu_frame_p95_ms,
+            self.autosave_tick_p95_ms,
             self.resident_bytes,
             self.writable_resident_bytes,
         )
@@ -310,16 +330,20 @@ mod tests {
             10,
             12,
             &[Duration::from_millis(4), Duration::from_millis(8)],
+            &[Duration::from_micros(800)],
             80 * 1024 * 1024,
             60 * 1024 * 1024,
         );
         assert!(pass.passes());
         assert!(pass.line().contains("status=PASS"));
+        // v1.11.2 X6: autosave tick p95 is part of the report line.
+        assert!(pass.line().contains("autosave_tick_p95_ms=0.800"));
 
         let busy = ProbeReport::new(
             Duration::from_secs(5),
             16,
             12,
+            &[],
             &[],
             80 * 1024 * 1024,
             60 * 1024 * 1024,
@@ -332,10 +356,44 @@ mod tests {
             10,
             12,
             &[],
+            &[],
             700 * 1024 * 1024,
             101 * 1024 * 1024,
         );
         assert!(!heavy.passes());
+    }
+
+    /// v1.11.2 X6 (PLAN_v1112 §6): autosave tick samples feed the p95 line
+    /// but never the pass/fail gate — the metric exists to inform the .9
+    /// decision on an epoch short-circuit, not to fail runs.
+    #[test]
+    fn slow_autosave_ticks_report_but_do_not_fail() {
+        let report = ProbeReport::new(
+            Duration::from_secs(30),
+            40,
+            40,
+            &[Duration::from_millis(4)],
+            &[Duration::from_millis(1), Duration::from_millis(20)],
+            u64::MAX - 1,
+            u64::MAX - 1,
+        );
+        assert_eq!(report.autosave_tick_p95_ms, 20.0);
+        assert!(report.line().contains("autosave_tick_p95_ms=20.000"));
+    }
+
+    /// v1.11.2 X6: record_autosave_tick only collects while measuring.
+    #[test]
+    fn autosave_tick_recording_requires_active_measurement() {
+        // enabled=true so start() actually begins a measurement window.
+        let mut probe = PerformanceProbe {
+            enabled: true,
+            ..PerformanceProbe::default()
+        };
+        probe.record_autosave_tick(Duration::from_millis(9));
+        probe.start();
+        probe.record_autosave_tick(Duration::from_millis(3));
+        let report = probe.finish().expect("measuring");
+        assert_eq!(report.autosave_tick_p95_ms, 3.0);
     }
 
     #[test]

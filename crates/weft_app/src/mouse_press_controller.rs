@@ -353,6 +353,12 @@ impl App {
                     self.request_redraw();
                     return;
                 }
+                Some(crate::panel_component::PanelTarget::LoadOlder) => {
+                    // v1.11.2 X4 (PLAN_v1112 §1.3): footer「加载更早」— page
+                    // older history out of SQLite into the panel.
+                    self.drain_effects([Effect::LoadOlderBlocks]);
+                    return;
+                }
                 None => {
                     // Click outside the panel (or below the last row):
                     // unfocus search (but keep panel open).

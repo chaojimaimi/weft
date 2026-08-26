@@ -60,8 +60,8 @@ use crate::input::{KeyCode, Modifiers};
 
 pub use action::Action;
 pub use io::{
-    atomic_write, fingerprint_bytes, load_resolved, load_resolved_from_path, ConfigLoadError,
-    LoadedConfig,
+    atomic_write, fingerprint_bytes, load_resolved, load_resolved_from_path, normalize_scrollback,
+    ConfigLoadError, LoadedConfig, SCROLLBACK_MAX_LINES, SCROLLBACK_MIN_LINES,
 };
 pub use keybindings::KeyBindings;
 pub use parsers::{parse_binding, parse_hex};
@@ -71,9 +71,9 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, OutputSemanticConfig, PasteConfig,
-    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AiConfig, BlocksConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant,
+    OutputSemanticConfig, PasteConfig, ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig,
+    PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
@@ -96,6 +96,9 @@ pub struct Config {
     pub editor: EditorConfig,
     /// v1.11.1 (PLAN_v1111 §4.2): large-paste protection switches.
     pub paste: PasteConfig,
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): per-tab in-memory block retention cap.
+    /// Config-file power-user key — no Settings UI row by design.
+    pub blocks: BlocksConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -133,6 +136,9 @@ impl Config {
                 if let Some(w) = cfg.window.sidebar_width {
                     cfg.window.sidebar_width = Some(w.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH));
                 }
+                // v1.11.2 X3: same scrollback clamp as the v1.5 load path so
+                // both entry points produce in-range values.
+                io::normalize_scrollback(&mut cfg);
                 cfg
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
@@ -427,6 +433,9 @@ impl Config {
         // [paste] section — v1.11.1 large-paste protection
         // (PLAN_v1111 §4.2). Same line-budget rationale as [ai].
         save::write_paste_section(&mut doc, &self.paste);
+
+        // [blocks] section — v1.11.2 X4 retention cap (PLAN_v1112 §1.2).
+        save::write_blocks_section(&mut doc, &self.blocks);
 
         // [keybindings] section.
         if !self.keybindings.is_empty() {

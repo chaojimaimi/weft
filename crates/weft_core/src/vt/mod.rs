@@ -7,6 +7,7 @@ mod capability;
 mod capture_cursor;
 mod grapheme;
 mod osc;
+mod osc_guard;
 mod perform;
 mod replies;
 mod screen_exit;
@@ -91,6 +92,18 @@ pub struct Terminal {
     /// capped at 1KiB so an introducer without ST cannot grow memory
     /// without bound (FIX_TERMINAL_CAPABILITY_HARDENING, review M1).
     dcs_xtgettcap: replies::XtgettcapCollector,
+    /// v1.11.2 X1 (PLAN_v1112 §3): OSC accumulation guard observer state.
+    /// Shadow-mirrors vte's OscString state across `process()` batches so an
+    /// unterminated OSC can be cut off at [`osc_guard::OSC_GUARD_PAYLOAD_CAP`]
+    /// instead of growing vte's internal buffer forever.
+    osc_watch: osc_guard::OscWatch,
+    /// "Last Ground byte was ESC" bit for [`Self::osc_watch`]. Separate field
+    /// per the plan's two-field state layout.
+    osc_watch_prev_esc: bool,
+    /// Guard enable switch. Default ON; test-only off mode is the
+    /// pre-guard behavior regression anchor (differential harness in
+    /// fuzz_lite.rs).
+    osc_guard_enabled: bool,
 }
 
 impl Terminal {
@@ -131,7 +144,36 @@ impl Terminal {
             capabilities: capability::CapabilityFlags::default(),
             alt_flip_count: 0,
             dcs_xtgettcap: replies::XtgettcapCollector::default(),
+            osc_watch: osc_guard::OscWatch::default(),
+            osc_watch_prev_esc: false,
+            // v1.11.2 X1: guard defaults ON for every production constructor.
+            osc_guard_enabled: true,
         }
+    }
+
+    /// v1.11.2 X1 (PLAN_v1112 §3.2): construct with an explicit OSC guard
+    /// switch. `false` yields the exact pre-guard behavior — the regression
+    /// anchor used by the fuzz_lite differential harness.
+    pub fn with_osc_guard(
+        rows: usize,
+        cols: usize,
+        scrollback_lines: usize,
+        enabled: bool,
+    ) -> Self {
+        let mut term = Self::with_scrollback(rows, cols, scrollback_lines);
+        term.osc_guard_enabled = enabled;
+        term
+    }
+
+    /// Toggle the OSC accumulation guard at runtime (tests / rollback path).
+    pub fn set_osc_guard(&mut self, enabled: bool) {
+        self.osc_guard_enabled = enabled;
+    }
+
+    /// v1.11.2 X4 (PLAN_v1112 §1.2): configure this terminal's block-history
+    /// retention cap (`[blocks] retained_limit`). `0` disables retention.
+    pub fn set_blocks_retained_limit(&mut self, limit: usize) {
+        self.block_tracker_mut().set_retained_limit(limit);
     }
 
     pub fn grid(&self) -> &Grid {
@@ -382,11 +424,16 @@ impl Terminal {
         let mut parser = std::mem::take(&mut self.parser);
         let mut i = 0;
         while i < bytes.len() {
-            // Fast path: only when parser is in ground state. Scan a run
-            // of printable ASCII (0x20..=0x7E) that doesn't start with an
-            // escape/C0 control. These bytes map 1:1 to chars and are all
-            // width-1, so they bypass vte entirely.
-            if self.parser_in_ground_state && !self.suppress_joined_scalar {
+            // Fast path: only when parser is in ground state AND the OSC
+            // guard observer is in Ground (v1.11.2 X1 — inside an OSC even
+            // printable payload must reach the slow path so the guard can
+            // count it). Scan a run of printable ASCII (0x20..=0x7E) that
+            // doesn't start with an escape/C0 control. These bytes map 1:1 to
+            // chars and are all width-1, so they bypass vte entirely.
+            if self.osc_guard_fast_path_allowed()
+                && self.parser_in_ground_state
+                && !self.suppress_joined_scalar
+            {
                 let run_start = i;
                 while i < bytes.len() && bytes[i] >= 0x20 && bytes[i] <= 0x7E {
                     i += 1;
@@ -401,6 +448,14 @@ impl Terminal {
             // sequences internally via its state machine.
             if i < bytes.len() {
                 let b = bytes[i];
+                // v1.11.2 X1 (PLAN_v1112 §3.1): OSC guard decides BEFORE the
+                // advance whether this byte reaches vte at all. Over-cap OSC
+                // payload is withheld here; terminators always pass so both
+                // machines resynchronize.
+                if !self.osc_guard_forwards(b) {
+                    i += 1;
+                    continue;
+                }
                 // v1.0 P1.5-C3: Only ESC (0x1B) transitions vte OUT of ground
                 // state. C0 controls (0x00-0x1F except 0x1B) are "execute"
                 // actions that stay in ground per the VT500 state machine, so
@@ -420,6 +475,22 @@ impl Terminal {
         }
         self.parser = parser;
         self.note_primary_screen_exit_activity();
+    }
+
+    /// v1.11.2 X1: printable-ASCII fast path is allowed only when the OSC
+    /// observer sits in Ground (or the guard is off). Inside InOsc/Swallowing
+    /// every byte — including plain ASCII payload — must take the slow path.
+    fn osc_guard_fast_path_allowed(&self) -> bool {
+        !self.osc_guard_enabled || matches!(self.osc_watch, osc_guard::OscWatch::Ground)
+    }
+
+    /// v1.11.2 X1: run `b` through the observer FSM; returns false when the
+    /// byte must be withheld from vte (over-cap OSC payload only).
+    fn osc_guard_forwards(&mut self, b: u8) -> bool {
+        if !self.osc_guard_enabled {
+            return true;
+        }
+        osc_guard::observe(&mut self.osc_watch, &mut self.osc_watch_prev_esc, b)
     }
 
     /// v1.0 perf: Bulk-write a run of printable ASCII bytes (0x20..=0x7E)
