@@ -270,6 +270,11 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         sidebar_width: None,
         submit_on_ctrl_enter: false,
         smart_select: true,
+        paste_rows: crate::settings_validation::PasteRowsView {
+            confirm_large: true,
+            confirm_control_chars: true,
+            size_threshold_kib: 16,
+        },
         keybindings: &kbs,
         logo_variant: weft_core::config::LogoVariant::Cool,
         error: None,
@@ -324,6 +329,11 @@ fn settings_overlay_is_modal_and_highest_z() {
                     sidebar_width: None,
                     submit_on_ctrl_enter: false,
                     smart_select: true,
+                    paste_rows: crate::settings_validation::PasteRowsView {
+                        confirm_large: true,
+                        confirm_control_chars: true,
+                        size_threshold_kib: 16,
+                    },
                     keybindings: &[],
                     logo_variant: weft_core::config::LogoVariant::Cool,
                     error: None,

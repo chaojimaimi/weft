@@ -337,13 +337,13 @@ impl MetalRenderer {
                     }
                 }
                 SettingsTab::Input => {
-                    let rows = [
-                        (
-                            "Submit on Ctrl+Enter:",
-                            if s.submit_on_ctrl_enter { "On" } else { "Off" },
-                        ),
-                        ("Smart Select:", if s.smart_select { "On" } else { "Off" }),
-                    ];
+                    // v1.11.1 (PLAN_v1111 §4.6): row model shared with the
+                    // adjust path in settings_validation.
+                    let rows = crate::settings_validation::input_page_row_values(
+                        s.submit_on_ctrl_enter,
+                        s.smart_select,
+                        s.paste_rows,
+                    );
                     for (i, (label, value)) in rows.iter().enumerate() {
                         self.push_settings_row(
                             &mut verts,

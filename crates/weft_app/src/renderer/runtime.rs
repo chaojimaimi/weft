@@ -374,4 +374,27 @@ impl MetalRenderer {
     pub fn set_config_status_hint(&mut self, hint: Option<String>) {
         self.config_status_hint = hint;
     }
+
+    /// v1.11.1 (PLAN_v1111 §4.5): set/clear the transient paste toast shown
+    /// at the bottom-right of the content area. `Some((text, shown_at))`
+    /// after an approved large paste; the caller owns expiry via
+    /// [`Self::clear_expired_paste_toast`] on the 1 Hz autosave tick.
+    pub fn set_paste_toast(&mut self, toast: Option<(String, std::time::Instant)>) {
+        self.paste_toast = toast;
+    }
+
+    /// v1.11.1: drop the paste toast once its TTL elapsed. Returns `true`
+    /// when a toast was removed so the caller requests a redraw. The
+    /// boundary judgment delegates to
+    /// `app::effect_dispatch::paste_toast_expired` so tests and production
+    /// share one definition of the 3s boundary.
+    pub fn clear_expired_paste_toast(&mut self, now: std::time::Instant) -> bool {
+        let due = self.paste_toast.as_ref().is_some_and(|(_, shown_at)| {
+            crate::app::effect_dispatch::paste_toast_expired(*shown_at, now)
+        });
+        if due {
+            self.paste_toast = None;
+        }
+        due
+    }
 }

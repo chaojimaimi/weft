@@ -53,6 +53,7 @@ pub(super) fn parse_existing(existing: &str) -> Result<toml_edit::DocumentMut, C
         "window",
         "scrollback",
         "editor",
+        "paste",
         "logo",
         "ai",
         "keybindings",
@@ -255,6 +256,58 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
     }
 }
 
+/// v1.11.1 (PLAN_v1111 §4.2): write the `[paste]` section.
+///
+/// Only non-default values are persisted; an all-default config removes any
+/// existing keys so stale switches can't survive a "reset to defaults" save
+/// (same semantics as `[editor]` / `[ai]`). Lives here instead of `mod.rs`
+/// to keep the parent file within its architecture-gate budget, mirroring
+/// [`write_ai_section`].
+pub(super) fn write_paste_section(doc: &mut toml_edit::DocumentMut, paste: &super::PasteConfig) {
+    let default = super::PasteConfig::default();
+    let dirty = paste.confirm_large != default.confirm_large
+        || paste.confirm_control_chars != default.confirm_control_chars
+        || paste.size_threshold_kib != default.size_threshold_kib;
+    if !dirty && !doc.contains_key("paste") {
+        return;
+    }
+    // v1.11.0-style tolerance: ensure the table exists and skip gracefully
+    // if a hand-written `paste = "x"` scalar can't be turned into one
+    // (write_paste_keys warns and leaves the disk value untouched).
+    let entry = doc.entry("paste").or_insert_with(toml_edit::table);
+    if entry.is_none() {
+        *entry = toml_edit::table();
+    }
+    write_paste_keys(doc, paste, &default);
+}
+
+/// Write (or clear) the individual `[paste]` keys on an existing document.
+fn write_paste_keys(
+    doc: &mut toml_edit::DocumentMut,
+    paste: &super::PasteConfig,
+    default: &super::PasteConfig,
+) {
+    let Some(paste_entry) = doc.get_mut("paste").and_then(toml_edit::Item::as_table_mut) else {
+        tracing::warn!("[paste] section is not a table; skipping paste section write");
+        return;
+    };
+    if paste.confirm_large != default.confirm_large {
+        paste_entry["confirm_large"] = toml_edit::value(paste.confirm_large);
+    } else if paste_entry.contains_key("confirm_large") {
+        paste_entry.remove("confirm_large");
+    }
+    if paste.confirm_control_chars != default.confirm_control_chars {
+        paste_entry["confirm_control_chars"] = toml_edit::value(paste.confirm_control_chars);
+    } else if paste_entry.contains_key("confirm_control_chars") {
+        paste_entry.remove("confirm_control_chars");
+    }
+    if paste.size_threshold_kib != default.size_threshold_kib {
+        paste_entry["size_threshold_kib"] = toml_edit::value(i64::from(paste.size_threshold_kib));
+    } else if paste_entry.contains_key("size_threshold_kib") {
+        paste_entry.remove("size_threshold_kib");
+    }
+}
+
 // ── v1.5.0: active_profile + profiles ───────────────────────────────────
 
 /// v1.5.0: Write the top-level `active_profile = "name"` scalar. Writes
@@ -443,6 +496,33 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
                 t["smart_select"] = toml_edit::value(e.smart_select);
             } else if t.contains_key("smart_select") {
                 t.remove("smart_select");
+            }
+        }
+    });
+    // v1.11.1 (PLAN_v1111 §4.2): `[profiles.x.paste]` follows the editor
+    // pattern — full-section override, only non-default keys persisted.
+    write_profile_section(table, "paste", profile.paste.is_some(), |t| {
+        if let Some(p) = &profile.paste {
+            let default = super::PasteConfig::default();
+            // rust-reviewer v1.11.1 M-1: confirm_large defaults to TRUE, so
+            // persist only when it differs from that default (the original
+            // copy of this arm from submit_on_ctrl_enter — whose default is
+            // false — had the predicate inverted and silently restored a
+            // user's explicit `false` back to `true` on reload).
+            if !p.confirm_large {
+                t["confirm_large"] = toml_edit::value(false);
+            } else if t.contains_key("confirm_large") {
+                t.remove("confirm_large");
+            }
+            if !p.confirm_control_chars {
+                t["confirm_control_chars"] = toml_edit::value(false);
+            } else if t.contains_key("confirm_control_chars") {
+                t.remove("confirm_control_chars");
+            }
+            if p.size_threshold_kib != default.size_threshold_kib {
+                t["size_threshold_kib"] = toml_edit::value(i64::from(p.size_threshold_kib));
+            } else if t.contains_key("size_threshold_kib") {
+                t.remove("size_threshold_kib");
             }
         }
     });

@@ -5,7 +5,10 @@ use std::collections::{HashMap, HashSet};
 use font_kit::family_name::FamilyName;
 use font_kit::properties::Properties;
 use font_kit::source::SystemSource;
-use weft_core::config::{Action, Config, FontConfig, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH};
+use weft_core::config::{
+    Action, Config, ConfigSectionMask, EditorConfig, FontConfig, PasteConfig, PASTE_SIZE_TIERS_KIB,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+};
 use weft_core::input::{KeyCode, Modifiers};
 
 pub(crate) type FieldError = (String, String);
@@ -106,6 +109,115 @@ pub(crate) fn runtime_minimum_contrast(minimum_contrast: f32) -> f32 {
 
 pub(crate) fn runtime_sidebar_width(width: Option<f32>) -> Option<f32> {
     width.filter(|value| (SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH).contains(value))
+}
+
+/// v1.11.1 (PLAN_v1111 §4.2): clamp a hand-edited `[paste]` section to safe
+/// runtime values. A `size_threshold_kib` outside the legal tier list
+/// (hand-edited TOML — the Settings row only cycles the six documented
+/// steps) falls back to 16 KiB instead of being rejected, matching the
+/// fallback-not-reject philosophy of `runtime_font_config`.
+pub(crate) fn runtime_paste_config(config: &PasteConfig) -> PasteConfig {
+    let mut safe = config.clone();
+    if !PASTE_SIZE_TIERS_KIB.contains(&safe.size_threshold_kib) {
+        safe.size_threshold_kib = weft_core::input::DEFAULT_PASTE_SIZE_THRESHOLD_KIB;
+    }
+    safe
+}
+
+/// v1.11.1 (PLAN_v1111 §4.6): next `size_threshold_kib` after cycling `delta`
+/// steps through the six legal tiers. An out-of-tier stored value (hand-edited
+/// TOML) re-anchors at the default tier first so the cycle stays predictable.
+pub(crate) fn cycled_paste_threshold(current_kib: u32, delta: i32) -> u32 {
+    let tiers = PASTE_SIZE_TIERS_KIB;
+    let idx = tiers
+        .iter()
+        .position(|tier| *tier == current_kib)
+        .unwrap_or_else(|| {
+            tiers
+                .iter()
+                .position(|tier| *tier == weft_core::input::DEFAULT_PASTE_SIZE_THRESHOLD_KIB)
+                .unwrap_or(0)
+        });
+    let next = (idx as i32 + delta).rem_euclid(tiers.len() as i32) as usize;
+    tiers[next]
+}
+
+/// v1.11.1 (PLAN_v1111 §4.6): the Input page's paste-protection values,
+/// grouped so the (already huge) `SettingsDrawParams` /
+/// `build_overlay_stack` signatures gain one member instead of three.
+#[derive(Clone, Copy)]
+pub(crate) struct PasteRowsView {
+    pub confirm_large: bool,
+    pub confirm_control_chars: bool,
+    pub size_threshold_kib: u32,
+}
+
+/// v1.11.1 (PLAN_v1111 §4.6): the Input page's five (label, value) rows in
+/// display order — the read model whose indices match `adjust_input_row`'s
+/// write mapping (asserted together in the tests below).
+pub(crate) fn input_page_row_values(
+    submit_on_ctrl_enter: bool,
+    smart_select: bool,
+    paste: PasteRowsView,
+) -> [(&'static str, String); 5] {
+    let on_off = |on: bool| if on { "On" } else { "Off" };
+    [
+        (
+            "Submit on Ctrl+Enter:",
+            on_off(submit_on_ctrl_enter).to_string(),
+        ),
+        ("Smart Select:", on_off(smart_select).to_string()),
+        (
+            "Confirm large paste:",
+            on_off(paste.confirm_large).to_string(),
+        ),
+        (
+            "Confirm control-char paste:",
+            on_off(paste.confirm_control_chars).to_string(),
+        ),
+        (
+            "Paste size threshold:",
+            format!("{} KiB", paste.size_threshold_kib),
+        ),
+    ]
+}
+
+/// v1.11.1 (PLAN_v1111 §4.6): adjust the Settings Input-page row `row` by
+/// `delta`. Rows 0-1 are the `[editor]` toggles; rows 2-3 are the `[paste]`
+/// confirmation toggles; row 4 cycles the size threshold through the legal
+/// tiers. Returns the config section to mark dirty, or `None` when the row is
+/// unknown or the value did not change.
+pub(crate) fn adjust_input_row(
+    editor: &mut EditorConfig,
+    paste: &mut PasteConfig,
+    row: usize,
+    delta: i32,
+) -> Option<ConfigSectionMask> {
+    let toggle = |value: &mut bool| {
+        let next = directional_bool(*value, delta);
+        if next != *value {
+            *value = next;
+            true
+        } else {
+            false
+        }
+    };
+    match row {
+        0 => toggle(&mut editor.submit_on_ctrl_enter).then_some(ConfigSectionMask::EDITOR),
+        1 => toggle(&mut editor.smart_select).then_some(ConfigSectionMask::EDITOR),
+        2 => toggle(&mut paste.confirm_large).then_some(ConfigSectionMask::PASTE),
+        3 => toggle(&mut paste.confirm_control_chars).then_some(ConfigSectionMask::PASTE),
+        4 => {
+            let next = cycled_paste_threshold(paste.size_threshold_kib, delta);
+            if next != paste.size_threshold_kib {
+                paste.size_threshold_kib = next;
+                Some(ConfigSectionMask::PASTE)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn adjust_finite_value(
@@ -431,5 +543,138 @@ mod tests {
             0.95
         );
         assert_eq!(adjust_finite_value(24.0, 1, 0.5, 8.0, 24.0, 14.0), 24.0);
+    }
+
+    // ── v1.11.1 runtime_paste_config (PLAN_v1111 §4.2) ─────────────────
+
+    #[test]
+    fn paste_config_every_legal_tier_is_preserved() {
+        for kib in PASTE_SIZE_TIERS_KIB {
+            let cfg = runtime_paste_config(&PasteConfig {
+                size_threshold_kib: kib,
+                ..PasteConfig::default()
+            });
+            assert_eq!(cfg.size_threshold_kib, kib, "tier {kib} must pass through");
+        }
+    }
+
+    #[test]
+    fn paste_config_out_of_tier_thresholds_fall_back_to_16kib_without_mutating_source() {
+        for bad in [0u32, 7, 12, 17, 300, u32::MAX] {
+            let source = PasteConfig {
+                size_threshold_kib: bad,
+                confirm_large: false,
+                confirm_control_chars: true,
+            };
+            let safe = runtime_paste_config(&source);
+            assert_eq!(safe.size_threshold_kib, 16, "{bad} KiB is not a legal tier");
+            assert!(!safe.confirm_large);
+            assert!(safe.confirm_control_chars);
+            assert_eq!(
+                source.size_threshold_kib, bad,
+                "the stored config value must not be mutated"
+            );
+        }
+    }
+
+    #[test]
+    fn cycled_paste_threshold_walks_all_tiers_and_wraps_both_ways() {
+        // Forward from the default walks the documented order.
+        assert_eq!(cycled_paste_threshold(16, 1), 32);
+        assert_eq!(cycled_paste_threshold(256, 1), 8, "wraps at the top");
+        // Backward wraps at the bottom.
+        assert_eq!(cycled_paste_threshold(8, -1), 256);
+        assert_eq!(cycled_paste_threshold(64, -1), 32);
+        // An out-of-tier stored value re-anchors at the default step.
+        assert_eq!(cycled_paste_threshold(12, 1), 32);
+        assert_eq!(cycled_paste_threshold(12, -1), 8);
+    }
+
+    #[test]
+    fn adjust_input_rows_map_to_their_config_sections() {
+        let mut editor = EditorConfig::default();
+        let mut paste = PasteConfig {
+            confirm_large: false,
+            ..PasteConfig::default()
+        };
+
+        // Rows 0-1 are the [editor] toggles.
+        assert_eq!(
+            adjust_input_row(&mut editor, &mut paste, 0, 1),
+            Some(ConfigSectionMask::EDITOR)
+        );
+        assert!(editor.submit_on_ctrl_enter);
+        // Smart Select defaults On, so ← flips it off while → would be a
+        // no-op (covered by the noop test below).
+        assert_eq!(
+            adjust_input_row(&mut editor, &mut paste, 1, -1),
+            Some(ConfigSectionMask::EDITOR)
+        );
+        assert!(!editor.smart_select);
+
+        // Rows 2-3 are the [paste] toggles; row 2 flips its off default on,
+        // row 3 flips its On default off.
+        assert_eq!(
+            adjust_input_row(&mut editor, &mut paste, 2, 1),
+            Some(ConfigSectionMask::PASTE)
+        );
+        assert!(paste.confirm_large);
+        assert_eq!(
+            adjust_input_row(&mut editor, &mut paste, 3, -1),
+            Some(ConfigSectionMask::PASTE)
+        );
+        assert!(!paste.confirm_control_chars);
+
+        // Row 4 cycles the threshold.
+        assert_eq!(
+            adjust_input_row(&mut editor, &mut paste, 4, 1),
+            Some(ConfigSectionMask::PASTE)
+        );
+        assert_eq!(paste.size_threshold_kib, 32);
+    }
+
+    #[test]
+    fn adjust_input_row_is_a_noop_when_the_value_already_matches() {
+        let mut editor = EditorConfig::default();
+        let mut paste = PasteConfig::default();
+        // Smart Select defaults On; → on an already-On row changes nothing.
+        assert_eq!(adjust_input_row(&mut editor, &mut paste, 1, 1), None);
+        assert!(editor.smart_select);
+        // Unknown rows never dirty anything.
+        assert_eq!(adjust_input_row(&mut editor, &mut paste, 5, 1), None);
+        assert_eq!(adjust_input_row(&mut editor, &mut paste, 99, -1), None);
+        assert_eq!(paste, PasteConfig::default());
+        assert!(!editor.submit_on_ctrl_enter);
+        assert!(editor.smart_select);
+    }
+
+    #[test]
+    fn input_page_read_model_and_write_model_stay_aligned() {
+        // The painted labels and the ←/→ write mapping must cover the same
+        // five rows in the same order (paint/settings renders row i from
+        // input_page_row_values()[i]; adjust_input_row writes row i).
+        let paste = PasteRowsView {
+            confirm_large: false,
+            confirm_control_chars: true,
+            size_threshold_kib: 16,
+        };
+        let rows = input_page_row_values(false, true, paste);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[4], ("Paste size threshold:", "16 KiB".to_string()));
+        for (row, (label, value)) in rows.iter().take(4).enumerate() {
+            assert!(
+                value == "On" || value == "Off",
+                "row {row} ({label}) must render an On/Off value"
+            );
+            // Each toggle row is adjustable in at least one direction.
+            let mut editor = EditorConfig::default();
+            let mut paste_cfg = PasteConfig {
+                confirm_large: false,
+                ..PasteConfig::default()
+            };
+            let changed = adjust_input_row(&mut editor, &mut paste_cfg, row, -1).is_some()
+                || adjust_input_row(&mut editor, &mut paste_cfg, row, 1).is_some();
+            assert!(changed, "toggle row {row} ({label}) must be adjustable");
+        }
     }
 }

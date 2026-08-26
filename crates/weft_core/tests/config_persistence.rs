@@ -145,3 +145,115 @@ fn unreadable_target_fails_without_replacing_it() {
     assert!(!path.with_extension("toml.tmp").exists());
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+// ── v1.11.1 [paste] section (PLAN_v1111 §4.2) ──────────────────────────
+
+#[test]
+fn paste_section_round_trips_non_default_values() {
+    let path = config_path("paste-roundtrip");
+    std::fs::write(
+        &path,
+        "[paste]\nconfirm_large = false\nsize_threshold_kib = 64\n",
+    )
+    .unwrap();
+
+    let cfg: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(!cfg.paste.confirm_large);
+    assert!(
+        cfg.paste.confirm_control_chars,
+        "absent key keeps default true"
+    );
+    assert_eq!(cfg.paste.size_threshold_kib, 64);
+
+    // Save back with defaults: stale non-default keys must be removed so
+    // the defaults take effect on reload (same semantics as [editor]).
+    Config::default().save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert_eq!(reloaded.paste, weft_core::config::PasteConfig::default());
+    let document: toml_edit::DocumentMut = text.parse().unwrap();
+    let table = document.get("paste").and_then(toml_edit::Item::as_table);
+    assert!(
+        table.is_none_or(|t| t.iter().count() == 0),
+        "all-default [paste] must not persist any key"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn paste_section_profile_override_round_trip() {
+    use weft_core::config::ProfileConfig;
+
+    let mut cfg = Config::default();
+    cfg.profiles.insert(
+        "quiet".into(),
+        ProfileConfig {
+            paste: Some(weft_core::config::PasteConfig {
+                confirm_control_chars: false,
+                ..weft_core::config::PasteConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    cfg.active_profile = Some("quiet".into());
+
+    let path = config_path("paste-profile");
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("[profiles.quiet.paste]"),
+        "profile override persisted:\n{text}"
+    );
+
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    let profile = reloaded.profiles.get("quiet").unwrap();
+    let paste = profile.paste.as_ref().unwrap();
+    assert!(!paste.confirm_control_chars);
+    assert!(paste.confirm_large);
+    assert_eq!(paste.size_threshold_kib, 16);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+/// rust-reviewer v1.11.1 M-1 regression: `confirm_large` defaults to TRUE,
+/// so an explicit `false` in a profile override is the non-default value
+/// that MUST be persisted (the original predicate was inverted and dropped
+/// the key, silently restoring `true` on reload).
+#[test]
+fn paste_profile_confirm_large_false_survives_round_trip() {
+    use weft_core::config::ProfileConfig;
+
+    let mut cfg = Config::default();
+    cfg.profiles.insert(
+        "noprompt".into(),
+        ProfileConfig {
+            paste: Some(weft_core::config::PasteConfig {
+                confirm_large: false,
+                ..weft_core::config::PasteConfig::default()
+            }),
+            ..ProfileConfig::default()
+        },
+    );
+    cfg.active_profile = Some("noprompt".into());
+
+    let path = config_path("paste-profile-false");
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("confirm_large = false"),
+        "explicit false must be persisted:\n{text}"
+    );
+
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    let paste = reloaded
+        .profiles
+        .get("noprompt")
+        .unwrap()
+        .paste
+        .as_ref()
+        .unwrap();
+    assert!(
+        !paste.confirm_large,
+        "explicit confirm_large=false lost in round-trip"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

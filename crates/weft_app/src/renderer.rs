@@ -112,6 +112,12 @@ pub struct MetalRenderer {
     /// v1.5.3: Brief config error shown in the bottom-left status badge
     /// when Settings is closed. See `set_config_status_hint` for semantics.
     pub(crate) config_status_hint: Option<String>,
+    /// v1.11.1 (PLAN_v1111 §4.5): transient post-paste feedback
+    /// ("已粘贴 …") drawn at the bottom-right of the content area.
+    /// Cleared by `clear_expired_paste_toast` on the 1 Hz autosave tick
+    /// after `PASTE_TOAST_TTL`. Suppressed while a config error hint is
+    /// showing (config error takes priority).
+    pub(crate) paste_toast: Option<(String, std::time::Instant)>,
     /// v0.9: cached cursor-blink state for the current frame, so overlay
     /// builders (palette, panel) can draw a blinking caret without it being
     /// threaded through every helper signature.
@@ -863,6 +869,12 @@ impl MetalRenderer {
         if prompt.is_none() {
             vertices.extend_from_slice(&self.build_status_hint_vertices(terminal));
         }
+
+        // v1.11.1 (PLAN_v1111 §4.5): transient paste feedback. Drawn
+        // regardless of editor/prompt state — a toast often fires right
+        // after an editor-mode paste, where the prompt suppresses the
+        // left-side hints above.
+        vertices.extend_from_slice(&self.build_paste_toast_vertices());
 
         // v1.10.6: only draw the grid-path TUI preedit in grid view. In
         // BlockView the preedit is painted inside `build_block_view_vertices`

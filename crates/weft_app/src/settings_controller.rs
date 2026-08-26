@@ -492,19 +492,17 @@ impl App {
                 _ => {}
             },
             SettingsTab::Input => {
-                let value = match self.settings.selection {
-                    0 => Some(&mut self.settings.draft.editor.submit_on_ctrl_enter),
-                    1 => Some(&mut self.settings.draft.editor.smart_select),
-                    _ => None,
-                };
-                if let Some(value) = value {
-                    let current = *value;
-                    let next = directional_bool(current, delta);
-                    if next != current {
-                        *value = next;
-                        self.settings
-                            .mark_dirty(weft_core::config::ConfigSectionMask::EDITOR);
-                    }
+                // v1.11.1 (PLAN_v1111 §4.6): the row→field mapping lives in
+                // `settings_validation::adjust_input_row` so all five rows
+                // stay headless-tested; rows 0-1 mark EDITOR dirty and rows
+                // 2-4 mark PASTE.
+                if let Some(mask) = crate::settings_validation::adjust_input_row(
+                    &mut self.settings.draft.editor,
+                    &mut self.settings.draft.paste,
+                    self.settings.selection,
+                    delta,
+                ) {
+                    self.settings.mark_dirty(mask);
                 }
             }
             SettingsTab::Keybindings => {
@@ -750,7 +748,8 @@ impl App {
                     + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS
             }
             SettingsTab::Terminal => 4, // Scrollback + padding + minimum contrast.
-            SettingsTab::Input => 2,    // Submit on Ctrl+Enter + Smart Select.
+            // v1.11.1 (PLAN_v1111 §4.6): 2 editor rows + 3 paste rows.
+            SettingsTab::Input => 5,
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
             SettingsTab::Window => 3, // Width + Height + Sidebar Width.
             // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +

@@ -160,6 +160,114 @@ pub fn show_recovery_prompt(
     Ok(map_modal_response(response))
 }
 
+/// v1.11.1 (PLAN_v1111 §4.3): the user's response to the large-paste
+/// confirmation. Mirrors [`RecoveryChoice`]'s role: the finalized decision
+/// delivered back through `AppEvent::PasteDecided`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PastePromptResponse {
+    /// Paste this one time only.
+    Once,
+    /// Paste and suppress further prompts for this session (both risk
+    /// classes; resets when the app quits — PLAN_v1111 §7).
+    AlwaysSession,
+    /// Drop the paste without writing anywhere (also Esc / any failure).
+    Cancel,
+}
+
+/// v1.11.1: Pure modal-code → response mapping so the button/Esc contract is
+/// headless-testable (same pattern as `map_modal_response` +
+/// `recovery_choice_from_response`).
+///
+/// Button order (added left-to-right; AppKit renders right-to-left):
+///   1000 "Paste Once"        → Once   (first = default = Return)
+///   1001 "Cancel"            → Cancel (second = Esc per the AppKit cancel
+///                                       heuristic documented on
+///                                       `show_recovery_prompt`)
+///   1002 "Always This Session" → AlwaysSession
+///
+/// Fail-closed: ANY other code (including the recovery-style Esc fallback)
+/// lands on Cancel — an unrecognized response must never write to the PTY.
+pub fn paste_response_from_modal(code: NSModalResponse) -> PastePromptResponse {
+    const NS_ALERT_FIRST_BUTTON_RETURN: NSModalResponse = 1000;
+    const NS_ALERT_SECOND_BUTTON_RETURN: NSModalResponse = 1001;
+    const NS_ALERT_THIRD_BUTTON_RETURN: NSModalResponse = 1002;
+
+    match code {
+        NS_ALERT_FIRST_BUTTON_RETURN => PastePromptResponse::Once,
+        // Explicit (not fall-through) so the Esc contract stays greppable:
+        // the second button is "Cancel" per AppKit's cancel heuristic.
+        NS_ALERT_SECOND_BUTTON_RETURN => PastePromptResponse::Cancel,
+        NS_ALERT_THIRD_BUTTON_RETURN => PastePromptResponse::AlwaysSession,
+        _ => PastePromptResponse::Cancel,
+    }
+}
+
+/// v1.11.1: informative text for the paste confirmation — the preview as a
+/// monospace-feel quote block plus a key legend. Pure function (tested).
+fn paste_alert_informative_text(preview: &str) -> String {
+    let mut text = String::new();
+    for line in preview.lines() {
+        text.push_str("> ");
+        text.push_str(line);
+        text.push('\n');
+    }
+    text.push('\n');
+    text.push_str("回车：粘贴一次 · Esc：取消");
+    text
+}
+
+/// Sanitize a raw preview for display inside the NSAlert: control characters
+/// are rendered as visible placeholders so a control-char-flagged paste
+/// shows WHY it was flagged instead of corrupting the dialog layout.
+fn sanitize_preview_for_display(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            '\n' | '\r' => ch,
+            '\t' => ' ',
+            c if c.is_control() => '\u{2400}', // ␀-style control pictures
+            c => c,
+        })
+        .collect()
+}
+
+/// v1.11.1 (PLAN_v1111 §4.3): show the large/dangerous-paste confirmation.
+///
+/// MUST be invoked from a `dispatch2::DispatchQueue::main().exec_async`
+/// block (never directly inside a winit handler — see
+/// docs/FIX_RECOVERY_MODAL_SPIN.md); the choice returns through the event
+/// loop proxy as `AppEvent::PasteDecided`. Esc maps to Cancel and Enter
+/// (default button) maps to Once.
+pub fn show_large_paste_prompt(
+    mtm: MainThreadMarker,
+    headline: String,
+    preview: String,
+) -> Result<PastePromptResponse, AlertError> {
+    let alert = unsafe { NSAlert::new(mtm) };
+    unsafe {
+        alert.setMessageText(&NSString::from_str(&headline));
+        alert.setInformativeText(&NSString::from_str(&paste_alert_informative_text(
+            &sanitize_preview_for_display(&preview),
+        )));
+        alert.setAlertStyle(NSAlertStyle::Warning);
+
+        // Order matters: first button = default (Return) = "Paste Once";
+        // second = "Cancel" so AppKit's cancel heuristic routes Esc there
+        // (see map_modal_response / show_recovery_prompt comments);
+        // third = session-wide allowance.
+        alert.addButtonWithTitle(&NSString::from_str("Paste Once"));
+        alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+        alert.addButtonWithTitle(&NSString::from_str("Always This Session"));
+
+        // Belt-and-braces: bind Escape explicitly to the Cancel button in
+        // case AppKit's implicit heuristic changes across macOS versions.
+        if let Some(cancel) = alert.buttons().get(1) {
+            cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        }
+    }
+
+    Ok(paste_response_from_modal(unsafe { alert.runModal() }))
+}
+
 pub fn show_block_export_preview(mtm: MainThreadMarker, markdown: &str) -> bool {
     let alert = unsafe { NSAlert::new(mtm) };
     unsafe {
@@ -358,5 +466,66 @@ mod export_preview_tests {
         assert!(!text.contains('\r'));
         assert!(!text.contains('\t'));
         assert!(!text.contains('\u{7}'));
+    }
+
+    // ── v1.11.1 paste confirmation (PLAN_v1111 §4.3 / §5.3) ────────────
+
+    use super::{paste_alert_informative_text, paste_response_from_modal, PastePromptResponse};
+
+    #[test]
+    fn paste_modal_codes_map_to_the_three_documented_buttons() {
+        // 1000 = default (Return) → Once; 1001 = Cancel (Esc);
+        // 1002 = Always This Session.
+        assert_eq!(paste_response_from_modal(1000), PastePromptResponse::Once);
+        assert_eq!(paste_response_from_modal(1001), PastePromptResponse::Cancel);
+        assert_eq!(
+            paste_response_from_modal(1002),
+            PastePromptResponse::AlwaysSession
+        );
+    }
+
+    #[test]
+    fn paste_modal_unknown_codes_fail_closed_to_cancel() {
+        // Fail-closed contract: any unrecognized response must NOT paste.
+        for code in [-1000, -1, 0, 42, 999, 1003] {
+            assert_eq!(
+                paste_response_from_modal(code),
+                PastePromptResponse::Cancel,
+                "response {code} must fail closed to Cancel"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_informative_text_quotes_each_line_and_documents_keys() {
+        let text = paste_alert_informative_text("first\nsecond");
+        assert!(text.starts_with("> first\n> second\n"));
+        assert!(text.ends_with("回车：粘贴一次 · Esc：取消"));
+        // Single-line preview still gets the quote prefix + legend.
+        let single = paste_alert_informative_text("only");
+        assert!(single.starts_with("> only\n"));
+        assert!(single.contains("Esc"));
+    }
+
+    #[test]
+    fn paste_preview_display_sanitizes_control_chars() {
+        use super::sanitize_preview_for_display;
+        let sanitized = sanitize_preview_for_display("ok\u{1b}[2J\tend");
+        assert!(sanitized.starts_with("ok"));
+        assert!(
+            !sanitized.contains('\u{1b}'),
+            "ESC must not reach the dialog"
+        );
+        assert!(
+            sanitized.contains('\u{2400}'),
+            "control chars become visible pictures"
+        );
+        assert!(sanitized.contains(' '), "tab renders as a space");
+        // Newlines survive so multi-line previews keep their shape.
+        assert_eq!(
+            sanitize_preview_for_display("a\nb"),
+            "a\nb",
+            "newlines are structural, not dangerous"
+        );
     }
 }

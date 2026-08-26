@@ -284,6 +284,8 @@ impl ApplicationHandler<AppEvent> for App {
                         }
                     }
                 }
+                // v1.11.1: paste-toast expiry rides this tick.
+                self.expire_paste_toast_tick();
             }
             AppEvent::PerformanceProbeStart => self.performance_probe.start(),
             AppEvent::PerformanceProbeFinish => {
@@ -312,6 +314,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // `resumed()` — the handler operates on the state as it
                 // actually is.
                 self.apply_recovery_choice(choice);
+            }
+            AppEvent::PasteDecided(response) => {
+                // v1.11.1: deferred paste prompt closed (same
+                // FIX_RECOVERY_MODAL_SPIN discipline as RecoveryChosen).
+                self.apply_paste_decision(response);
             }
             AppEvent::AccessibilityPress {
                 generation,

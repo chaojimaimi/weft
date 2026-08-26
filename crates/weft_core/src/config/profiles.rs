@@ -21,8 +21,8 @@ use bitflags::bitflags;
 use serde::Deserialize;
 
 use super::{
-    Action, AiConfig, EditorConfig, FontConfig, KeyBindings, LogoConfig, ScrollbackConfig,
-    ThemeConfig, WindowConfig,
+    Action, AiConfig, EditorConfig, FontConfig, KeyBindings, LogoConfig, PasteConfig,
+    ScrollbackConfig, ThemeConfig, WindowConfig,
 };
 
 // ── ProfileConfig ──────────────────────────────────────────────────────
@@ -42,6 +42,9 @@ pub struct ProfileConfig {
     pub window: Option<WindowConfig>,
     pub scrollback: Option<ScrollbackConfig>,
     pub editor: Option<EditorConfig>,
+    /// v1.11.1 (PLAN_v1111 §4.2): large-paste protection switches are
+    /// profile-overridable like `[editor]`.
+    pub paste: Option<PasteConfig>,
     pub logo: Option<LogoConfig>,
     /// `keybindings` is also a full-section override (no per-key merge).
     pub keybindings: Option<HashMap<String, Action>>,
@@ -59,6 +62,7 @@ impl ProfileConfig {
             && self.window.is_none()
             && self.scrollback.is_none()
             && self.editor.is_none()
+            && self.paste.is_none()
             && self.logo.is_none()
             && self.keybindings.is_none()
     }
@@ -84,6 +88,9 @@ bitflags! {
         /// The merge writes `draft.ai` directly to the base config regardless
         /// of whether a profile is active (ProfileConfig has no `ai` field).
         const AI           = 1 << 7;
+        /// v1.11.1 (PLAN_v1111 §4.6): large-paste protection switches
+        /// (`[paste]`, Settings Input page rows 2-4).
+        const PASTE        = 1 << 8;
     }
 }
 
@@ -178,6 +185,9 @@ pub fn apply_overrides(base: &mut super::Config, profile: &ProfileConfig) {
     }
     if let Some(editor) = &profile.editor {
         base.editor = editor.clone();
+    }
+    if let Some(paste) = &profile.paste {
+        base.paste = paste.clone();
     }
     if let Some(logo) = &profile.logo {
         base.logo = logo.clone();

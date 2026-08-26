@@ -214,6 +214,68 @@ impl Default for EditorConfig {
     }
 }
 
+/// v1.11.1 (PLAN_v1111 §4.2): large-paste protection switches.
+///
+/// Both confirmations default ON; turning both off is the documented
+/// one-switch rollback to the pre-v1.11.1 pass-through behavior. A
+/// hand-edited `size_threshold_kib` outside [`PASTE_SIZE_TIERS_KIB`] is not
+/// rejected at parse time — `weft_app::settings_validation::runtime_paste_config`
+/// falls back to 16 KiB when the value is consumed (same philosophy as the
+/// other `runtime_*` clamps).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PasteConfig {
+    /// Ask for confirmation when a paste exceeds `size_threshold_kib`.
+    pub confirm_large: bool,
+    /// Ask for confirmation when a paste contains dangerous control chars
+    /// (ESC/NUL/DEL — see `weft_core::input::contains_dangerous_control_chars`).
+    pub confirm_control_chars: bool,
+    /// Size threshold in KiB. Legal tiers: [`PASTE_SIZE_TIERS_KIB`].
+    pub size_threshold_kib: u32,
+}
+
+impl Default for PasteConfig {
+    fn default() -> Self {
+        Self {
+            confirm_large: true,
+            confirm_control_chars: true,
+            size_threshold_kib: 16,
+        }
+    }
+}
+
+/// v1.11.1: legal Settings-UI steps for the paste size threshold (KiB).
+/// The ←/→ row cycles this list; out-of-list stored values fall back to 16
+/// at consumption time (`runtime_paste_config`, PLAN_v1111 §4.2).
+pub const PASTE_SIZE_TIERS_KIB: [u32; 6] = [8, 16, 32, 64, 128, 256];
+
+#[cfg(test)]
+mod paste_config_tests {
+    use super::{PasteConfig, PASTE_SIZE_TIERS_KIB};
+
+    #[test]
+    fn defaults_confirm_both_risks_at_16kib() {
+        let cfg = PasteConfig::default();
+        assert!(cfg.confirm_large);
+        assert!(cfg.confirm_control_chars);
+        assert_eq!(cfg.size_threshold_kib, 16);
+    }
+
+    #[test]
+    fn missing_section_deserializes_to_defaults() {
+        let cfg: PasteConfig = toml::from_str("[paste]").unwrap();
+        assert_eq!(cfg, PasteConfig::default());
+    }
+
+    #[test]
+    fn threshold_tier_list_is_the_six_documented_steps() {
+        assert_eq!(PASTE_SIZE_TIERS_KIB, [8, 16, 32, 64, 128, 256]);
+        // The default must be one of the cycle steps so the Settings row can
+        // round-trip its position.
+        assert!(PASTE_SIZE_TIERS_KIB.contains(&PasteConfig::default().size_threshold_kib));
+    }
+}
+
 /// v1.0 Logo variant — the app icon shown in the Dock / app switcher.
 /// Not theme-bound: the user picks a preferred variant in Settings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

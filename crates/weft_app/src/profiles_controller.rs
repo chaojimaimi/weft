@@ -178,6 +178,12 @@ pub(super) fn merge_settings_draft(
         if dirty.contains(weft_core::config::ConfigSectionMask::EDITOR) {
             profile.editor = Some(draft.editor.clone());
         }
+        // v1.11.1 (PLAN_v1111 §4.6): paste protection switches follow the
+        // editor pattern — full-section override when the Input page was
+        // touched (ConfigSectionMask::PASTE).
+        if dirty.contains(weft_core::config::ConfigSectionMask::PASTE) {
+            profile.paste = Some(draft.paste.clone());
+        }
         if dirty.contains(weft_core::config::ConfigSectionMask::LOGO) {
             profile.logo = Some(draft.logo.clone());
         }
@@ -199,6 +205,10 @@ pub(super) fn merge_settings_draft(
         }
         if dirty.contains(weft_core::config::ConfigSectionMask::EDITOR) {
             candidate.editor = draft.editor.clone();
+        }
+        // v1.11.1: base-config paste switches (PLAN_v1111 §4.6).
+        if dirty.contains(weft_core::config::ConfigSectionMask::PASTE) {
+            candidate.paste = draft.paste.clone();
         }
         if dirty.contains(weft_core::config::ConfigSectionMask::LOGO) {
             candidate.logo = draft.logo.clone();

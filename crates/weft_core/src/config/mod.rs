@@ -71,9 +71,9 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, OutputSemanticConfig,
-    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, SIDEBAR_MAX_WIDTH,
-    SIDEBAR_MIN_WIDTH,
+    AiConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant, OutputSemanticConfig, PasteConfig,
+    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
@@ -94,6 +94,8 @@ pub struct Config {
     pub window: WindowConfig,
     pub scrollback: ScrollbackConfig,
     pub editor: EditorConfig,
+    /// v1.11.1 (PLAN_v1111 §4.2): large-paste protection switches.
+    pub paste: PasteConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -421,6 +423,10 @@ impl Config {
         // `save::write_ai_section` to keep this file within its
         // architecture-gate line budget.
         save::write_ai_section(&mut doc, &self.ai);
+
+        // [paste] section — v1.11.1 large-paste protection
+        // (PLAN_v1111 §4.2). Same line-budget rationale as [ai].
+        save::write_paste_section(&mut doc, &self.paste);
 
         // [keybindings] section.
         if !self.keybindings.is_empty() {

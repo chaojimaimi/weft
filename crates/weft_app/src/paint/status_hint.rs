@@ -91,6 +91,52 @@ impl MetalRenderer {
         self.push_text(&mut verts, x, y, hint, fg, max_cols);
         verts
     }
+
+    /// v1.11.1 (PLAN_v1111 §4.5): build vertices for the transient
+    /// post-paste toast — same badge styling as the status hints but drawn
+    /// at the BOTTOM-RIGHT in the warning color so it reads as feedback,
+    /// not as a mode indicator.
+    ///
+    /// Mutual-exclusion rule: a config error badge wins ("config error
+    /// priority") — while `config_status_hint` is showing, the toast is
+    /// suppressed for that frame; the 1 Hz tick clears it on schedule and
+    /// nothing is lost because the paste itself already succeeded.
+    ///
+    /// Unlike [`Self::build_status_hint_vertices`] this is drawn in Editor
+    /// mode too (the toast frequently fires right after an editor-mode
+    /// paste, where the prompt box suppresses the left-side hints).
+    pub(crate) fn build_paste_toast_vertices(&self) -> Vec<f32> {
+        let mut verts = Vec::new();
+        let Some((toast, _)) = self.paste_toast.as_ref() else {
+            return verts;
+        };
+        if self.config_status_hint.is_some() {
+            return verts;
+        }
+        let cw = self.cell_width() as f32;
+        let ch = self.cell_height() as f32;
+        let vp_h = self.viewport.1;
+        if cw <= 0.0 || ch <= 0.0 || vp_h <= 0.0 {
+            return verts;
+        }
+        let Some(ctx) = self.layout_ctx else {
+            return verts;
+        };
+        let ui = crate::ui_tokens::UiColors::from_theme(&self.theme)
+            .with_increase_contrast(self.increase_contrast);
+        let fg = color_to_normalized(ui.warning);
+        // Bottom-right of the content area, same row as the left-side hints.
+        let y = (ctx.bottom() - ch).max(ctx.top());
+        // Cap at half the content width so a long toast never collides with
+        // the passthrough badge on narrow windows.
+        let content_cols = ((ctx.right() - ctx.left()) / cw).max(0.0) as usize;
+        let max_cols = (content_cols / 2).clamp(8, 40);
+        let display = truncate_with_ellipsis(toast, max_cols);
+        let text_cols = display.chars().count();
+        let x = (ctx.right() - text_cols as f32 * cw).max(ctx.left());
+        self.push_text(&mut verts, x, y, &display, fg, text_cols.max(1));
+        verts
+    }
 }
 
 /// Truncate `s` to at most `max_cols` visible columns (char count, since

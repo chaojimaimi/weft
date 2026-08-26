@@ -13,7 +13,11 @@ pub use handler::InputHandler;
 pub use keys::{KeyCode, Modifiers};
 pub use mode::{effective_mode, InputMode};
 pub use mouse::{MouseAction, MouseButton, MouseProtocol};
-pub use paste::{bracketed_paste_end, bracketed_paste_start, build_submit_bytes, encode_paste};
+pub use paste::{
+    bracketed_paste_end, bracketed_paste_start, build_submit_bytes, classify_paste,
+    contains_dangerous_control_chars, encode_paste, format_byte_count, paste_preview,
+    PasteGuardCfg, PasteRisk, DEFAULT_PASTE_SIZE_THRESHOLD_KIB,
+};
 
 #[cfg(test)]
 mod tests {

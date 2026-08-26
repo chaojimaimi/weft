@@ -261,6 +261,7 @@ impl MetalRenderer {
             increase_contrast: false,
             sidebar_width_override: None,
             config_status_hint: None,
+            paste_toast: None,
             cursor_blink_on: true,
             block_layout_cache: RefCell::new(BlockLayoutCache::default()),
             live_layout_cache: RefCell::new(crate::paint::live_cache::LiveLayoutCache::default()),

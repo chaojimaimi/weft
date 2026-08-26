@@ -530,6 +530,12 @@ impl App {
                 self.settings.draft.window.sidebar_width,
                 self.settings.draft.editor.submit_on_ctrl_enter,
                 self.settings.draft.editor.smart_select,
+                // v1.11.1 (PLAN_v1111 §4.6): paste protection rows.
+                crate::settings_validation::PasteRowsView {
+                    confirm_large: self.settings.draft.paste.confirm_large,
+                    confirm_control_chars: self.settings.draft.paste.confirm_control_chars,
+                    size_threshold_kib: self.settings.draft.paste.size_threshold_kib,
+                },
                 &settings_keybindings,
                 self.settings.draft.logo.variant,
                 self.settings.error.as_deref(),

@@ -170,6 +170,14 @@ pub(crate) enum AppEvent {
     /// path. Handled in `App::apply_recovery_choice`, which consumes
     /// `App.pending_recovery` (a duplicated event is a no-op).
     RecoveryChosen(crate::macos_alert::RecoveryChoice),
+    /// v1.11.1 (PLAN_v1111 §3/§4.4): the large-paste confirmation (deferred
+    /// to a main-queue block, same FIX_RECOVERY_MODAL_SPIN discipline)
+    /// closed. Carries the full three-way choice — Cancel / Once /
+    /// AlwaysSession — because a bare bool cannot express "paste once"
+    /// versus "discard" (both would be `false`). Handled in
+    /// `App::apply_paste_decision`, which consumes
+    /// `App.pending_paste_confirm` exactly once.
+    PasteDecided(crate::macos_alert::PastePromptResponse),
     PerformanceProbeStart,
     PerformanceProbeFinish,
 }
@@ -231,6 +239,16 @@ struct App {
     /// arrives; `None` means no prompt is in flight (a stray choice event
     /// is ignored). See docs/FIX_RECOVERY_MODAL_SPIN.md.
     pending_recovery: Option<weft_core::recovery::RecoverySnapshot>,
+    /// v1.11.1 (PLAN_v1111 §4.4): a large/dangerous paste parked while its
+    /// deferred confirmation dialog is on screen. Consumed exactly once by
+    /// `App::apply_paste_decision` when `AppEvent::PasteDecided` arrives;
+    /// `None` means no prompt is in flight (a stray decision event is a
+    /// logged no-op).
+    pending_paste_confirm: Option<crate::app::effect_dispatch::PendingPaste>,
+    /// v1.11.1 (PLAN_v1111 §4.4): session-wide "always allow" granted from
+    /// the paste dialog. Exempts BOTH risk classes and resets only when the
+    /// process exits — deliberately never persisted.
+    paste_allow_for_session: bool,
     /// v1.7.1: Main-thread search index for upsert/delete (index maintenance).
     /// The background PaletteSearchWorker owns its own SearchIndex for queries.
     search_index: Option<weft_core::search::SearchIndex>,
@@ -378,6 +396,8 @@ impl App {
             should_exit: false,
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
             pending_recovery: None,
+            pending_paste_confirm: None,
+            paste_allow_for_session: false,
             search_index: None,
             note_editor: NoteEditorState::default(),
             completion_worker: completion_worker::CompletionWorker::new(move || {

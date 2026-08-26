@@ -247,6 +247,9 @@ pub struct SettingsDrawParams<'a> {
     pub submit_on_ctrl_enter: bool,
     /// v1.10: Semantic target selection/opening gestures.
     pub smart_select: bool,
+    /// v1.11.1 (PLAN_v1111 §4.6): paste-protection values (rows 2-4);
+    /// grouped to keep this struct's field list from growing further.
+    pub paste_rows: crate::settings_validation::PasteRowsView,
     /// Keybindings to display (with F5 conflict flag).
     pub keybindings: &'a [SettingsKeybindingView],
     /// v1.0 Logo: currently-applied Dock icon variant (Appearance category
@@ -576,6 +579,7 @@ pub fn build_overlay_stack<'a>(
     settings_sidebar_width: Option<f32>,
     settings_submit_on_ctrl_enter: bool,
     settings_smart_select: bool,
+    settings_paste_rows: crate::settings_validation::PasteRowsView,
     settings_keybindings: &'a [SettingsKeybindingView],
     settings_logo_variant: weft_core::config::LogoVariant,
     settings_error: Option<&'a str>,
@@ -765,6 +769,7 @@ pub fn build_overlay_stack<'a>(
                 sidebar_width: settings_sidebar_width,
                 submit_on_ctrl_enter: settings_submit_on_ctrl_enter,
                 smart_select: settings_smart_select,
+                paste_rows: settings_paste_rows,
                 keybindings: settings_keybindings,
                 logo_variant: settings_logo_variant,
                 error: settings_error,
