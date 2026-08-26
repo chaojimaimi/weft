@@ -345,8 +345,19 @@ impl Pane {
         };
         let tx = self.msg_tx.clone();
         const MAX_EVENTS_PER_FRAME: usize = 64;
+        // AUDIT_v1.10.39: stop feeding the bounded(1024) channel before it
+        // fills. Producer (this pump) and consumer (process_messages) run on
+        // the SAME main thread in a fixed pump→process order, so a blocking
+        // `tx.send` on a full channel would wait for "ourselves" and hang the
+        // UI thread forever. The high-water check is race-free for exactly
+        // that reason — nothing else sends between check and send. Events
+        // left behind simply stay in the PTY's own queue until next frame.
+        const CHANNEL_HIGH_WATER: usize = 768;
         let mut count = 0usize;
         loop {
+            if tx.len() >= CHANNEL_HIGH_WATER {
+                break;
+            }
             match pty.try_recv() {
                 Ok(PtyEvent::Output(data)) => {
                     if tx.send(AppMsg::PtyOutput(data)).is_err() {

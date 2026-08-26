@@ -109,6 +109,28 @@ fn direct_wide_write_creates_valid_pair() {
     assert_row_has_valid_wide_pairs(&grid, 0);
 }
 
+/// AUDIT_v1.10.39 fuzz-lite finding: a full-width char on a 1-column grid
+/// used to recurse forever in `write_char_with_attrs` (the wrap arm could
+/// not change any state once the cursor sat on the bottom row of a 1-col
+/// grid). Post-fix the wrap walk is bounded: the cursor descends to the
+/// bottom row, one scroll_up fires, then the guard stops the recursion and
+/// the char lands truncated in the single column of the bottom row.
+#[test]
+fn wide_char_on_single_column_grid_writes_truncated_without_hanging() {
+    let mut grid = Grid::new(4, 1);
+    grid.write_char_with_attrs(
+        '中',
+        CellColor::Default,
+        CellColor::Default,
+        CellFlags::empty(),
+    );
+
+    // Terminated, and the char was written into the only column of the
+    // bottom row (after the bounded wrap walk), not dropped silently.
+    assert_eq!(grid.cell(3, 0).character, '中');
+    assert_eq!(grid.cell(3, 0).width, CellWidth::Full);
+}
+
 #[test]
 fn newline_moves_cursor_down() {
     let mut grid = Grid::new(24, 80);

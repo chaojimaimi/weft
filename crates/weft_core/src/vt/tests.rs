@@ -2664,6 +2664,53 @@ fn background_color() {
     assert_eq!(t.grid().cell(0, 0).bg, CellColor::Palette(4)); // SGR 44 → palette[4]
 }
 
+/// SGR 58 (set underline color) / 59 (reset) carry their own sub-params
+/// (`58;2;R;G;B`, `58;5;N`) just like 38/48. AUDIT_v1.10.39 P0-1: they used to
+/// fall into the unhandled arm without consuming those params, so `2` was
+/// misparsed as DIM, `5` as ITALIC, and trailing `0;0` bytes as two full
+/// attribute resets — wiping the underline the sequence asked for.
+#[test]
+fn sgr_underline_color_58_does_not_leak_params_into_attributes() {
+    // Truecolor variant: `ESC[4;58;2;255;0;0m`.
+    let mut t = term();
+    t.process(b"\x1b[4;58;2;255;0;0mX");
+    let cell = t.grid().cell(0, 0);
+    assert!(
+        cell.flags.contains(CellFlags::UNDERLINE),
+        "underline must survive a 58;2;R;G;B sequence"
+    );
+    assert!(
+        !cell.flags.contains(CellFlags::DIM),
+        "the `2` inside 58;2;R;G;B must not enable DIM"
+    );
+
+    // Indexed variant followed by another attribute: `ESC[58;5;196;4m`.
+    let mut t2 = term();
+    t2.process(b"\x1b[58;5;196;4mY");
+    let cell2 = t2.grid().cell(0, 0);
+    assert!(cell2.flags.contains(CellFlags::UNDERLINE));
+    assert!(
+        !cell2.flags.contains(CellFlags::ITALIC),
+        "the `5` inside 58;5;N must not enable ITALIC"
+    );
+}
+
+/// AUDIT_v1.10.39 P1: SGR 21 now means "doubly underlined" (ECMA-48, and the
+/// Ghostty/WezTerm/Alacritty/xterm consensus) instead of the Linux-console
+/// legacy "clear bold". This also makes the DOUBLE_UNDER render path
+/// reachable from the parser for the first time.
+#[test]
+fn sgr_21_sets_double_underline_without_touching_bold() {
+    let mut t = term();
+    t.process(b"\x1b[1m\x1b[21mA");
+    let cell = t.grid().cell(0, 0);
+    assert!(cell.flags.contains(CellFlags::DOUBLE_UNDER));
+    assert!(
+        cell.flags.contains(CellFlags::BOLD),
+        "SGR 21 must not clear bold — SGR 22 does that"
+    );
+}
+
 // ── Insert/delete ────────────────────────────────────────────
 
 #[test]

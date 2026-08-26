@@ -101,11 +101,19 @@ declare_class!(
         /// `tag` (= `Action as isize`) and forwards it as `MenuAction`.
         #[method(weftAction:)]
         fn weft_action(&self, sender: &AnyObject) {
-            let tag: isize = unsafe { msg_send![sender, tag] };
-            if let Some(action) = action_from_isize(tag) {
-                if let Some(proxy) = MENU_PROXY.get() {
-                    let _ = proxy.send_event(AppEvent::MenuAction(action));
+            // Project rule: msg_send! inside an ObjC callback must be
+            // catch_unwind-guarded — a panic escaping into AppKit's dispatch
+            // is a nounwind abort (see set_dock_icon lesson).
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let tag: isize = unsafe { msg_send![sender, tag] };
+                if let Some(action) = action_from_isize(tag) {
+                    if let Some(proxy) = MENU_PROXY.get() {
+                        let _ = proxy.send_event(AppEvent::MenuAction(action));
+                    }
                 }
+            }));
+            if dispatched.is_err() {
+                tracing::error!("weft_action panicked; menu action dropped");
             }
         }
 

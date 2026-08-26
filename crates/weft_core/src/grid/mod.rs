@@ -293,8 +293,19 @@ impl Grid {
             if self.cursor.row > 0 {
                 self.viewport[self.cursor.row - 1].wrapped = true;
             }
-            // Recalculate row/col after wrap
-            return self.write_char_with_attrs(ch, fg, bg, flags);
+            // AUDIT_v1.10.39: when the cursor already sits on the bottom
+            // row of a 1-column grid, the wrap above changes nothing (col
+            // stays 0, no row can advance), so recursing would re-enter
+            // this arm forever — stack overflow through the pub Grid API
+            // (fuzz-lite finding; the VT print path has its own inline
+            // wrap and never hits this). When position DID change (any
+            // multi-column grid, or rows left to descend), keep recursing
+            // as before; otherwise fall through and write the char
+            // truncated into the current cell — the spacer has nowhere
+            // to go.
+            if self.cursor.col != col || self.cursor.row != row {
+                return self.write_char_with_attrs(ch, fg, bg, flags);
+            }
         }
 
         if col < self.num_cols {

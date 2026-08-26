@@ -795,7 +795,12 @@ impl Terminal {
                 7 => self.attrs.flags.insert(CellFlags::REVERSE),
                 8 => self.attrs.flags.insert(CellFlags::HIDDEN),
                 9 => self.attrs.flags.insert(CellFlags::STRIKETHROUGH),
-                21 => self.attrs.flags.remove(CellFlags::BOLD),
+                // ECMA-48 and the modern-terminal consensus (Ghostty,
+                // WezTerm, Alacritty, current xterm): SGR 21 = doubly
+                // underlined. The old "clear bold" reading is Linux-console
+                // legacy — it also left DOUBLE_UNDER (which block_view/style.rs
+                // fully renders) unreachable from the parser.
+                21 => self.attrs.flags.insert(CellFlags::DOUBLE_UNDER),
                 22 => self.attrs.flags.remove(CellFlags::BOLD | CellFlags::DIM),
                 23 => self.attrs.flags.remove(CellFlags::ITALIC),
                 24 => {
@@ -832,6 +837,18 @@ impl Terminal {
                 }
                 // Default background
                 49 => self.attrs.bg = CellColor::Default,
+                // Underline color set/reset (AUDIT_v1.10.39 P0-1). Weft does
+                // not yet render a distinct underline color, but 58 carries
+                // its own 38/48-style color grammar (`58;2;R;G;B`,
+                // `58;5;N`) and those payload bytes must be consumed here —
+                // leaving them in the stream let `2` enable DIM, `5` enable
+                // ITALIC and trailing `0`s trigger full attribute resets.
+                58 => {
+                    if let Some((_color, skip)) = self.parse_sgr_color(vals, i + 1) {
+                        i += skip;
+                    }
+                }
+                59 => {}
                 // Bright foreground 90-97
                 90..=97 => {
                     self.attrs.fg = CellColor::Palette((v - 90 + 8) as u8);

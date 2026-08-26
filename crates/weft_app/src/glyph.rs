@@ -1,5 +1,8 @@
 //! Glyph atlas: rasterize glyphs with font-kit, pack into a Metal texture.
-//! v0.2: Dynamic atlas with LRU eviction for CJK support.
+//! v0.2: Dynamic atlas for CJK support. Linear fill with NO eviction — when
+//! the texture is exhausted, rasterization fails and those glyphs render
+//! blank until the next atlas rebuild. (AUDIT_v1.10.39: this header used to
+//! claim "LRU eviction", which the implementation never had.)
 //! On-demand rasterization of any character, not just ASCII.
 //!
 //! Module structure (Batch 6 Step 4 split):

@@ -958,6 +958,113 @@ mod tests {
         );
     }
 
+    /// A writer that makes partial progress and THEN blocks forever must
+    /// report `TimedOut` with the bytes that actually made it out — the
+    /// caller (`write_sync`) warns with the dropped remainder, so partial
+    /// drops must stay observable via `written`, never masked as success.
+    #[test]
+    fn write_all_nonblocking_times_out_with_partial_writes() {
+        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let mut writes = 0;
+        let outcome = write_all_nonblocking(
+            &mut |buf: &[u8]| {
+                writes += 1;
+                if writes == 1 {
+                    Ok(buf.len().min(4)) // claim the first 4 bytes
+                } else {
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                }
+            },
+            devnull.as_raw_fd(),
+            b"abcdef",
+            Duration::from_millis(30),
+        );
+        match outcome {
+            WriteOutcome::TimedOut { written } => {
+                assert_eq!(written, 4, "partial progress must survive the timeout");
+            }
+            other => panic!("expected TimedOut with partial write, got {other:?}"),
+        }
+    }
+
+    /// A REAL kernel-backed EAGAIN, no fake closures: a Unix pipe whose
+    /// buffer is full and whose reader never drains. `write_all_nonblocking`
+    /// must burn its budget waiting for POLLOUT (which cannot fire) and
+    /// report `TimedOut { written: 0 }`.
+    #[test]
+    fn write_all_nonblocking_times_out_against_real_full_pipe() {
+        let (reader, writer) = nix::unistd::pipe().expect("pipe");
+        let _reader = reader; // held open so the pipe stays full for the whole test
+        nix::fcntl::fcntl(
+            writer.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("set pipe write end non-blocking");
+
+        // Saturate: write 4 KiB chunks until the kernel refuse (EAGAIN).
+        let mut accepted = 0usize;
+        loop {
+            match nix::unistd::write(&writer, &[0u8; 4096]) {
+                Ok(n) => accepted += n,
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(error) => panic!("unexpected pipe fill error: {error}"),
+            }
+            if accepted > 4 * 1024 * 1024 {
+                panic!("pipe never filled; unexpected kernel behavior");
+            }
+        }
+        assert!(accepted > 0, "pipe must accept then refuse writes");
+
+        let mut kernel_writes = 0usize;
+        let outcome = write_all_nonblocking(
+            &mut |buf: &[u8]| match nix::unistd::write(&writer, buf) {
+                Ok(n) => {
+                    kernel_writes += n;
+                    Ok(n)
+                }
+                Err(nix::errno::Errno::EAGAIN) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                Err(error) => Err(io::Error::from(error)),
+            },
+            writer.as_raw_fd(),
+            b"overflow payload that can never fit",
+            Duration::from_millis(40),
+        );
+        match outcome {
+            WriteOutcome::TimedOut { written } => {
+                assert_eq!(written, 0, "full pipe must accept nothing");
+            }
+            other => panic!("expected TimedOut against a real full pipe, got {other:?}"),
+        }
+        assert_eq!(kernel_writes, 0, "no byte may sneak into a full pipe");
+    }
+
+    /// AUDIT_v1.10.39 (write-budget behavior anchor): `write_sync` maps a
+    /// budget-exhausted write to `Ok(())` — dropping the overflow with
+    /// only a warn! (see the doc comment on `write_sync`). The plan was
+    /// to trigger that arm with a real PTY, but on macOS it is
+    /// unreachable: the n_tty line discipline silently DISCARDS input
+    /// overflow instead of holding the queue full (probed empirically:
+    /// 512 MiB into a never-reading child returned full-count writes,
+    /// never EAGAIN), so the real kernel never surfaces a persistent
+    /// full buffer to the master fd. The `TimedOut → Ok(())` mapping is
+    /// therefore pinned by the injected-writer unit tests above, and this
+    /// test pins what IS reachable on real hardware — the audit's
+    /// "silent drop": a huge write into a saturated child returns Ok(())
+    /// with the overflow invisible to the caller. Both pieces document,
+    /// not endorse, the status quo.
+    #[tokio::test]
+    async fn write_sync_large_write_into_saturated_child_reports_ok() {
+        // `/bin/sleep` never reads stdin, so the child's input queue is
+        // permanently saturated; the kernel discards the overflow.
+        let pty = Pty::spawn("/bin/sleep", (24, 80), || {}).expect("failed to spawn PTY");
+        let payload = vec![0x55u8; 1024 * 1024];
+        let result = pty.write_sync(&payload);
+        assert!(
+            result.is_ok(),
+            "write_sync must stay Ok() into a saturated child, got {result:?}"
+        );
+    }
+
     /// EINTR is retried like EWOULDBLOCK (asymmetric with the poll loop's
     /// EINTR handling, which already continues).
     #[test]
