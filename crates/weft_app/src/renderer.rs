@@ -401,9 +401,8 @@ impl MetalRenderer {
         // macOS traffic-light buttons float over the Metal content. Even with
         // a single tab we now always render the tab bar (for the "+" button),
         // so chrome_top always reserves tab_bar_height.
-        // Whether a standalone titlebar strip (no tab bar) needs painting.
-        // v1.2: always false now — the tab bar is always drawn.
-        let single_tab_titlebar = false;
+        // v1.11.0: `single_tab_titlebar` removed — it was hardcoded `false`
+        // since v1.2 (dead branch, see AUDIT_v1.10.39 / PLAN_v111).
 
         // v0.9 W5: compute chrome_left (sidebar width) when the history panel
         // is open — the panel becomes a left sidebar that pushes content right.
@@ -967,34 +966,10 @@ impl MetalRenderer {
         if tab_bar.tab_count >= 1 {
             let tab_verts = self.build_tab_bar_vertices(tab_bar);
             vertices.extend_from_slice(&tab_verts);
-        } else {
-            // v1.1: single-tab mode — still paint a theme-color strip at the
-            // top (titlebar_height tall) so the transparent titlebar's traffic
-            // lights sit on a themed background instead of overlapping text.
-            // No tabs/dividers/close buttons; just the background quad.
-            if single_tab_titlebar {
-                let bg = color_to_normalized(self.theme.background);
-                let strip_bg = if bg[0] + bg[1] + bg[2] < 1.5 {
-                    [bg[0] * 0.85, bg[1] * 0.85, bg[2] * 0.85, 1.0]
-                } else {
-                    [
-                        bg[0] + (1.0 - bg[0]) * 0.5,
-                        bg[1] + (1.0 - bg[1]) * 0.5,
-                        bg[2] + (1.0 - bg[2]) * 0.5,
-                        1.0,
-                    ]
-                };
-                let h = self.titlebar_height();
-                let vp_w = self.viewport.0;
-                push_quad(
-                    &mut vertices,
-                    [0.0, 0.0, vp_w, h],
-                    [0.0; 4],
-                    [0.0; 4],
-                    strip_bg,
-                );
-            }
         }
+        // v1.11.0: the `else` branch (single-tab titlebar strip with a bg
+        // brightness heuristic) was removed — it was unreachable since the
+        // flag was hardcoded false (AUDIT_v1.10.39 / PLAN_v111).
 
         // v1.3.1 Batch 7: pane dividers + active-pane focus ring, drawn last
         // so they stay visible atop the panes. No-op in single-pane tabs.

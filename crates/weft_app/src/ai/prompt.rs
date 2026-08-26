@@ -5,16 +5,14 @@
 //! or a tokio runtime. The caller is responsible for:
 //!
 //! 1. Pulling the raw command/output/cwd out of the terminal state.
-//! 2. Calling [`mask_secrets`] (or `secrets::mask` from weft_core) *before*
-//!    passing strings here — defence in depth, but the AI client also masks
-//!    on its way out.
+//! 2. Calling [`redact_for_prompt`] (or `secrets::mask` from weft_core)
+//!    *before* passing strings here — defence in depth, but the AI client
+//!    also masks on its way out.
 //! 3. Spawning the request on a background tokio task.
 //!
 //! All prompts are intentionally short (Wellft is generating shell commands,
 //! not writing essays) and use a deterministic structure so the model is
 //! steered toward plain-shell output rather than chatty prose.
-
-use weft_core::secrets;
 
 use super::redact::redact_secrets;
 
@@ -64,8 +62,8 @@ pub struct ChatMessage {
 pub enum ChatRole {
     System,
     User,
-    #[allow(dead_code)]
-    Assistant,
+    // v1.11.0: `Assistant` variant removed — never constructed at runtime
+    // or in tests (AUDIT_v1.10.39 / PLAN_v111).
 }
 
 impl ChatRole {
@@ -73,19 +71,11 @@ impl ChatRole {
         match self {
             ChatRole::System => "system",
             ChatRole::User => "user",
-            ChatRole::Assistant => "assistant",
         }
     }
 }
 
-/// Mask any secret patterns in `text`. Thin wrapper around `weft_core::secrets`
-/// so prompt builders don't pull in the regex crate directly.
-#[allow(dead_code)]
-pub fn mask_secrets(text: &str) -> String {
-    secrets::mask(text)
-}
-
-/// v1.8: Broader redaction for AI-bound text. Use this (not `mask_secrets`)
+/// v1.8: Broader redaction for AI-bound text. Use this (not `secrets::mask`)
 /// when building prompts that will be sent to the local Ollama model. Catches
 /// Bearer tokens, `password=`, `api_key=`, URL userinfo, and export SECRET=
 /// in addition to the known token formats.
@@ -401,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_secrets_strips_openai_keys_from_history() {
+    fn prompt_redaction_strips_openai_keys_from_history() {
         let p = CommandGenPrompt {
             user_query: "find my key".into(),
             cwd: "/home/me".into(),

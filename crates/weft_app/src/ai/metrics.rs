@@ -24,7 +24,10 @@ pub struct AiMetrics {
     /// Requests cancelled by the user (superseded or UI closed).
     cancellations_total: u64,
     /// Requests whose input was truncated before sending (prompt builder
-    /// clipped history/output to stay within the byte budget).
+    /// clipped history/output to stay within the byte budget). v1.11.0:
+    /// `record_truncation` was removed as dead code — nothing calls it, so
+    /// this counter stays 0 until a recorder actually exists
+    /// (AUDIT_v1.10.39 / PLAN_v111).
     truncations_total: u64,
     /// Ring buffer of recent request latencies (milliseconds). Oldest entry
     /// is overwritten when the buffer is full. Kept small so `snapshot()` is
@@ -65,13 +68,6 @@ impl AiMetrics {
         self.cancellations_total += 1;
     }
 
-    /// Record that a request's input was truncated before sending. Called
-    /// from the prompt builders when they clip history/output.
-    #[allow(dead_code)]
-    pub(crate) fn record_truncation(&mut self) {
-        self.truncations_total += 1;
-    }
-
     fn push_latency(&mut self, latency: Duration) {
         let ms = latency.as_millis().min(u32::MAX as u128) as u64;
         if self.latencies_ms.len() < LATENCY_RING_SIZE {
@@ -100,7 +96,9 @@ impl AiMetrics {
             errors_total: self.errors_total,
             cancellations_total: self.cancellations_total,
             truncations_total: self.truncations_total,
-            samples: count,
+            // v1.11.0: `samples` field removed — nothing read it at
+            // runtime (AUDIT_v1.10.39 / PLAN_v111). `count` above still
+            // drives the p95 computation.
             p95_latency_ms: p95,
         }
     }
@@ -115,9 +113,6 @@ pub struct AiMetricsSnapshot {
     pub errors_total: u64,
     pub cancellations_total: u64,
     pub truncations_total: u64,
-    /// Number of latency samples currently in the ring buffer.
-    #[allow(dead_code)]
-    pub samples: usize,
     /// p95 latency in milliseconds (0 when no samples).
     pub p95_latency_ms: u64,
 }
@@ -134,8 +129,9 @@ mod tests {
         }
         let snap = m.snapshot();
         assert_eq!(snap.successes_total, LATENCY_RING_SIZE as u64 + 5);
-        assert_eq!(snap.samples, LATENCY_RING_SIZE);
         // p95 should be one of the recent values (>= the smallest after wrap).
+        // (v1.11.0: the `samples` count field was removed as dead data —
+        // AUDIT_v1.10.39 / PLAN_v111.)
         assert!(snap.p95_latency_ms > 0);
     }
 
@@ -145,7 +141,6 @@ mod tests {
         let s = m.snapshot();
         assert_eq!(s.requests_total, 0);
         assert_eq!(s.p95_latency_ms, 0);
-        assert_eq!(s.samples, 0);
     }
 
     #[test]
@@ -155,6 +150,6 @@ mod tests {
         m.record_cancellation();
         let s = m.snapshot();
         assert_eq!(s.cancellations_total, 1);
-        assert_eq!(s.samples, 0);
+        assert_eq!(s.p95_latency_ms, 0);
     }
 }

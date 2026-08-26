@@ -293,7 +293,11 @@ impl Config {
                 None => {}
             }
             set_opt_string_clear(ot, "output_default", &out.output_default);
-            set_opt_string_clear(ot, "cwd", &out.cwd);
+            // v1.11.0: `cwd` key removed — dead config (painter derives CWD
+            // gray from fg×0.65). A stale `cwd = "..."` a user wrote earlier
+            // is deliberately NOT cleaned here: unknown keys on the doc are
+            // preserved by the save flow, and removing it would fight the
+            // "preserve unknown fields" contract. See AUDIT_v1.10.39 / PLAN_v111.
             set_opt_string_clear(ot, "metadata", &out.metadata);
             set_opt_string_clear(ot, "success", &out.success);
             set_opt_string_clear(ot, "failure", &out.failure);

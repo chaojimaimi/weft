@@ -54,25 +54,6 @@ pub use prompt::{
 #[allow(unused_imports)]
 pub use prompt::{MAX_HISTORY_ENTRIES, MAX_OUTPUT_BYTES};
 
-/// A pending or completed AI request. The `id` lets the caller correlate
-/// results with the UI entry that issued them (so a stale palette entry
-/// doesn't pick up a newer result).
-#[derive(Debug)]
-#[allow(dead_code)]
-pub struct AiRequest {
-    pub id: u64,
-    pub kind: AiRequestKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum AiRequestKind {
-    /// Natural-language → shell command. Issued from the palette.
-    CommandGen,
-    /// Failed-block diagnosis. Issued from the block action button.
-    Diagnose,
-}
-
 /// Result of a completed AI request. Returned by [`AiState::poll`].
 #[derive(Debug, Clone)]
 pub enum AiResultEvent {
@@ -105,10 +86,10 @@ pub enum AiResultEvent {
 /// `crossbeam` (also cheap). The main `App` struct can hold this by value
 /// without indirection.
 pub struct AiState {
-    /// Snapshot of the `[ai]` config at construction time. The Settings UI
-    /// rebuilds `AiState` when the user changes provider / model.
-    #[allow(dead_code)]
-    config: AiConfig,
+    /// v1.11.0: the `config` snapshot field + `config()`/`in_flight()`/`new()`
+    /// accessors were removed — dead code (only `new_with_waker` is used at
+    /// runtime; the Settings UI re-resolves values from the draft config
+    /// directly). See AUDIT_v1.10.39 / PLAN_v111.
     /// `None` when AI is not configured (`provider = None` or construction
     /// failed). Callers should hide the "✨ Ask AI" UI in that case.
     backend: Option<Arc<dyn AiBackend>>,
@@ -142,17 +123,12 @@ pub struct AiState {
 }
 
 impl AiState {
-    /// Build a new state from the current config. Returns a state with
-    /// `backend = None` when AI is not configured (no error surfaced —
-    /// the caller checks `is_configured()` to decide whether to show AI UI).
-    #[allow(dead_code)]
-    pub fn new(config: AiConfig) -> Self {
-        Self::new_with_waker(config, None)
-    }
-
-    /// v1.8.7: Like `new` but with a wake callback that background tasks
+    /// v1.8.7: Build a new state with a wake callback that background tasks
     /// invoke after sending a result. The waker should trigger an
     /// `AppEvent::Wake` so `poll_ai_results` runs promptly.
+    ///
+    /// v1.11.0: this is now the only constructor — `new()` (plain, no waker)
+    /// was removed as dead code (tests use `new_with_waker(config, None)`).
     pub fn new_with_waker(
         config: AiConfig,
         waker: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
@@ -166,7 +142,6 @@ impl AiState {
         };
         let (tx, rx) = unbounded();
         Self {
-            config,
             backend,
             rx,
             tx,
@@ -183,19 +158,6 @@ impl AiState {
     /// `AiConfig::is_configured()` plus a successful backend build.
     pub fn is_configured(&self) -> bool {
         self.backend.is_some()
-    }
-
-    /// Reference to the active config snapshot (for the Settings UI to
-    /// display the current provider/model without re-parsing the file).
-    #[allow(dead_code)]
-    pub fn config(&self) -> &AiConfig {
-        &self.config
-    }
-
-    /// Number of requests currently awaiting a response.
-    #[allow(dead_code)]
-    pub fn in_flight(&self) -> usize {
-        self.in_flight
     }
 
     /// Cancel all in-flight requests. Called when the user closes the
@@ -460,9 +422,6 @@ mod tests {
     }
 
     impl AiBackend for MockBackend {
-        fn provider_id(&self) -> &'static str {
-            "mock"
-        }
         fn complete(
             &self,
             _messages: Vec<prompt::ChatMessage>,
@@ -475,7 +434,7 @@ mod tests {
     }
 
     fn state_with_mock(response: &str) -> AiState {
-        let mut state = AiState::new(AiConfig::default());
+        let mut state = AiState::new_with_waker(AiConfig::default(), None);
         state.backend = Some(Arc::new(MockBackend {
             response: response.to_string(),
         }));
@@ -484,16 +443,16 @@ mod tests {
 
     #[test]
     fn new_state_with_default_config_has_no_backend() {
-        let state = AiState::new(AiConfig::default());
+        let state = AiState::new_with_waker(AiConfig::default(), None);
         assert!(!state.is_configured());
-        assert_eq!(state.in_flight(), 0);
+        assert_eq!(state.in_flight, 0);
     }
 
     #[test]
     fn spawn_returns_none_when_not_configured() {
         // No tokio runtime needed here: spawn_command_gen exits early when
         // backend is None, before reaching tokio::spawn.
-        let mut state = AiState::new(AiConfig::default());
+        let mut state = AiState::new_with_waker(AiConfig::default(), None);
         let id = state.spawn_command_gen(CommandGenPrompt {
             user_query: "list files".into(),
             cwd: "/tmp".into(),
@@ -511,7 +470,7 @@ mod tests {
             recent_history: vec![],
         });
         assert!(id.is_some());
-        assert_eq!(state.in_flight(), 1);
+        assert_eq!(state.in_flight, 1);
         // Drain the pending result so the channel doesn't deadlock.
         for _ in 0..50 {
             if !state.poll().is_empty() {
@@ -567,7 +526,7 @@ mod tests {
                     }
                     other => panic!("expected CommandGen, got {other:?}"),
                 }
-                assert_eq!(state.in_flight(), 0);
+                assert_eq!(state.in_flight, 0);
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -684,7 +643,7 @@ mod tests {
     // v1.8.3: Settings "Test Connection" → spawn_list_models.
     #[test]
     fn spawn_list_models_returns_none_when_not_configured() {
-        let mut state = AiState::new(AiConfig::default());
+        let mut state = AiState::new_with_waker(AiConfig::default(), None);
         assert!(state.spawn_list_models(&AiConfig::default()).is_none());
     }
 
@@ -696,7 +655,7 @@ mod tests {
             base_url: Some("https://example.com".into()),
             ..Default::default()
         };
-        let mut state = AiState::new(cfg.clone());
+        let mut state = AiState::new_with_waker(cfg.clone(), None);
         assert!(state.spawn_list_models(&cfg).is_none());
     }
 
@@ -707,7 +666,7 @@ mod tests {
             base_url: Some("http://192.168.1.5:11434".into()),
             ..Default::default()
         };
-        let mut state = AiState::new(cfg.clone());
+        let mut state = AiState::new_with_waker(cfg.clone(), None);
         assert!(state.spawn_list_models(&cfg).is_none());
     }
 
@@ -722,19 +681,19 @@ mod tests {
             timeout_secs: Some(1), // fail fast
             ..Default::default()
         };
-        let mut state = AiState::new(cfg.clone());
+        let mut state = AiState::new_with_waker(cfg.clone(), None);
         let id = state.spawn_list_models(&cfg);
         assert!(id.is_some(), "loopback URL should be accepted");
-        assert_eq!(state.in_flight(), 1);
+        assert_eq!(state.in_flight, 1);
         // Drain the eventual error event so the tokio task completes.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let _ = state.poll();
-        assert_eq!(state.in_flight(), 0);
+        assert_eq!(state.in_flight, 0);
     }
 
     #[test]
     fn metrics_snapshot_starts_zero() {
-        let state = AiState::new(AiConfig::default());
+        let state = AiState::new_with_waker(AiConfig::default(), None);
         let snap = state.metrics_snapshot();
         assert_eq!(snap.requests_total, 0);
         assert_eq!(snap.successes_total, 0);

@@ -114,10 +114,6 @@ impl CancelFlag {
 /// a tokio runtime. The main `App` spawns requests via `tokio::spawn` on
 /// its multi-thread runtime and drains results through a `crossbeam-channel`.
 pub trait AiBackend: Send + Sync {
-    /// Provider id (`"ollama"`). Used in error messages.
-    #[allow(dead_code)]
-    fn provider_id(&self) -> &'static str;
-
     /// Send `messages` to the model and return the assistant's full reply.
     /// The caller passes a [`CancelFlag`] so it can abort mid-stream.
     fn complete(
@@ -128,14 +124,13 @@ pub trait AiBackend: Send + Sync {
 }
 
 /// A discovered model from `/api/tags`.
+/// v1.11.0: `size`/`modified_at` fields removed — neither was read at
+/// runtime (only `name` feeds the Settings model dropdown); keeping them
+/// required a dead_code allow (AUDIT_v1.10.39 / PLAN_v111). A `/api/tags`
+/// payload containing those keys still parses (serde ignores unknown keys).
 #[derive(Debug, Clone, serde::Deserialize, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TagModel {
     pub name: String,
-    #[serde(default)]
-    pub size: u64,
-    #[serde(default)]
-    pub modified_at: String,
 }
 
 /// Shared builder for every Ollama HTTP client.
@@ -275,20 +270,6 @@ impl OllamaBackend {
             model,
             max_tokens: cfg.effective_max_tokens(),
         })
-    }
-
-    /// `/api/tags` — list installed models. Used by the Settings AI panel.
-    /// Not part of the `AiBackend` trait because it's a discovery call, not
-    /// a completion call. Delegates to [`fetch_ollama_models`].
-    ///
-    /// v1.8.3: Currently unused — the Settings "Test Connection" flow calls
-    /// `fetch_ollama_models` directly (via `AiState::spawn_list_models`) so
-    /// it can build a temporary HTTP client from a draft config without
-    /// constructing a full `OllamaBackend`. Retained as a convenience method
-    /// for future callers that already hold a backend handle.
-    #[allow(dead_code)]
-    pub async fn list_models(&self) -> AiResult<Vec<TagModel>> {
-        fetch_ollama_models(&self.http, &self.base_url).await
     }
 
     /// `/api/chat` with `stream: true`. Returns the accumulated assistant
@@ -523,10 +504,6 @@ impl OllamaBackend {
 }
 
 impl AiBackend for OllamaBackend {
-    fn provider_id(&self) -> &'static str {
-        "ollama"
-    }
-
     fn complete(
         &self,
         messages: Vec<ChatMessage>,
@@ -589,7 +566,6 @@ mod tests {
         };
         let backend = build_backend(&cfg).expect("ollama needs no api_key");
         assert!(backend.is_some());
-        assert_eq!(backend.unwrap().provider_id(), "ollama");
     }
 
     #[test]

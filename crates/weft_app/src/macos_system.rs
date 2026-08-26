@@ -1,5 +1,18 @@
 //! macOS system integration kept outside the application orchestrator.
 
+use objc2::msg_send;
+use objc2::runtime::AnyObject;
+
+/// v1.11.0 (M5, AUDIT_v1.10.39): run an AppKit call inside catch_unwind.
+/// A panic is logged and replaced with a caller-chosen safe default (dark
+/// for appearance, false/None for flags and clipboard).
+fn guarded_unwind<T>(action: &str, default: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        tracing::error!(action, "macOS system call panicked; using safe default");
+        default
+    })
+}
+
 /// v0.9 U-D1: Query macOS system appearance via `NSUserDefaults`.
 /// Returns `true` when the user has Dark mode selected in System
 /// Settings, `false` for Light (the macOS default — `AppleInterfaceStyle`
@@ -11,39 +24,39 @@
 /// We poll rather than register a distributed-notification observer because
 /// winit owns the `NSApplication` and its delegate, making selector-based
 /// callbacks awkward; a 1Hz poll is cheap and matches the existing
-/// config-mtime poller pattern.
+/// config-mtime poller pattern. v1.11.0 (M5): panic-safe default is dark;
+/// the body runs inside `guarded_unwind` (catch_unwind, AUDIT_v1.10.39).
 pub(super) unsafe fn system_appearance_is_dark() -> bool {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let defaults_cls = objc2::ffi::objc_getClass(c"NSUserDefaults".as_ptr());
-    let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
-    if defaults_cls.is_null() || str_cls.is_null() {
-        return false;
-    }
-    let defaults: *mut AnyObject =
-        msg_send![defaults_cls as *const AnyObject, standardUserDefaults];
-    if defaults.is_null() {
-        return false;
-    }
-    let c_key = std::ffi::CString::new("AppleInterfaceStyle").unwrap_or_default();
-    let key_ns: *mut AnyObject =
-        msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_key.as_ptr()];
-    if key_ns.is_null() {
-        return false;
-    }
-    // stringForKey: returns nil for absent keys (Light mode default).
-    let value_ns: *mut AnyObject = msg_send![defaults, stringForKey: key_ns];
-    if value_ns.is_null() {
-        return false;
-    }
-    let c_str: *const i8 = msg_send![value_ns, UTF8String];
-    if c_str.is_null() {
-        return false;
-    }
-    let raw = std::ffi::CStr::from_ptr(c_str);
-    let s = raw.to_str().unwrap_or("").trim().to_ascii_lowercase();
-    s == "dark"
+    guarded_unwind("system_appearance_is_dark", true, || unsafe {
+        let defaults_cls = objc2::ffi::objc_getClass(c"NSUserDefaults".as_ptr());
+        let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
+        if defaults_cls.is_null() || str_cls.is_null() {
+            return false;
+        }
+        let defaults: *mut AnyObject =
+            msg_send![defaults_cls as *const AnyObject, standardUserDefaults];
+        if defaults.is_null() {
+            return false;
+        }
+        let c_key = std::ffi::CString::new("AppleInterfaceStyle").unwrap_or_default();
+        let key_ns: *mut AnyObject =
+            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_key.as_ptr()];
+        if key_ns.is_null() {
+            return false;
+        }
+        // stringForKey: returns nil for absent keys (Light mode default).
+        let value_ns: *mut AnyObject = msg_send![defaults, stringForKey: key_ns];
+        if value_ns.is_null() {
+            return false;
+        }
+        let c_str: *const i8 = msg_send![value_ns, UTF8String];
+        if c_str.is_null() {
+            return false;
+        }
+        let raw = std::ffi::CStr::from_ptr(c_str);
+        let s = raw.to_str().unwrap_or("").trim().to_ascii_lowercase();
+        s == "dark"
+    })
 }
 
 /// F3-2: Query the macOS "Reduce Motion" accessibility setting.
@@ -52,19 +65,18 @@ pub(super) unsafe fn system_appearance_is_dark() -> bool {
 /// static `●` instead of the animated braille glyphs. Polled at 1Hz alongside
 /// `system_appearance_is_dark` (see `poll_system_appearance`).
 pub(super) unsafe fn system_reduce_motion() -> bool {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
-    if workspace_cls.is_null() {
-        return false;
-    }
-    let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
-    if shared.is_null() {
-        return false;
-    }
-    let reduce: bool = msg_send![shared, accessibilityDisplayShouldReduceMotion];
-    reduce
+    guarded_unwind("system_reduce_motion", false, || unsafe {
+        let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
+        if workspace_cls.is_null() {
+            return false;
+        }
+        let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
+        if shared.is_null() {
+            return false;
+        }
+        let reduce: bool = msg_send![shared, accessibilityDisplayShouldReduceMotion];
+        reduce
+    })
 }
 
 /// F6: Query the macOS "Increase Contrast" accessibility setting.
@@ -74,27 +86,25 @@ pub(super) unsafe fn system_reduce_motion() -> bool {
 /// relying on subtle color differences. Polled at 1Hz alongside
 /// `system_appearance_is_dark` (see `poll_system_appearance`).
 pub(super) unsafe fn system_increase_contrast() -> bool {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
-
-    let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
-    if workspace_cls.is_null() {
-        return false;
-    }
-    let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
-    if shared.is_null() {
-        return false;
-    }
-    let contrast: bool = msg_send![shared, accessibilityDisplayShouldIncreaseContrast];
-    contrast
+    guarded_unwind("system_increase_contrast", false, || unsafe {
+        let workspace_cls = objc2::ffi::objc_getClass(c"NSWorkspace".as_ptr());
+        if workspace_cls.is_null() {
+            return false;
+        }
+        let shared: *mut AnyObject = msg_send![workspace_cls as *const AnyObject, sharedWorkspace];
+        if shared.is_null() {
+            return false;
+        }
+        let contrast: bool = msg_send![shared, accessibilityDisplayShouldIncreaseContrast];
+        contrast
+    })
 }
 
 /// Copy text to macOS system clipboard using NSPasteboard.
+///
+/// v1.11.0 (M5, AUDIT_v1.10.39): panic → log + drop; `guarded_unwind`.
 pub(super) fn clipboard_copy(text: &str) {
-    unsafe {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-
+    guarded_unwind("clipboard_copy", (), || unsafe {
         let pb_cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
         let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
         if pb_cls.is_null() || str_cls.is_null() {
@@ -126,15 +136,14 @@ pub(super) fn clipboard_copy(text: &str) {
         // `setString:forType:` returns BOOL (arm64 macOS: `_Bool` = type code
         // 'B', matching Rust `bool`); we ignore it.
         let _: bool = msg_send![pasteboard, setString: value_ns forType: type_ns];
-    }
+    })
 }
 
 /// Paste text from macOS system clipboard using NSPasteboard.
+///
+/// v1.11.0 (M5, AUDIT_v1.10.39): panic → log + `None`; `guarded_unwind`.
 pub(super) fn clipboard_paste() -> Option<String> {
-    unsafe {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-
+    guarded_unwind("clipboard_paste", None, || unsafe {
         let pb_cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
         let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
         if pb_cls.is_null() || str_cls.is_null() {
@@ -165,7 +174,7 @@ pub(super) fn clipboard_paste() -> Option<String> {
             .to_str()
             .ok()
             .map(|s| s.to_owned())
-    }
+    })
 }
 
 /// Error returned by [`open_url`]. Carries enough context for the caller

@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::client::{is_loopback_url, AiBackend, CancelFlag, OllamaBackend};
+use super::client::{fetch_ollama_models, is_loopback_url, AiBackend, CancelFlag, OllamaBackend};
 use super::prompt::{ChatMessage, ChatRole};
 use weft_core::config::AiConfig;
 
@@ -32,19 +32,22 @@ async fn real_ollama_lists_models_and_completes() {
             .expect("build local Ollama client"),
     );
     let backend = OllamaBackend::new(
-        http,
+        http.clone(),
         AiConfig {
             provider: Some("ollama".into()),
             model: Some(model.clone()),
-            base_url: Some(base_url),
+            base_url: Some(base_url.clone()),
             max_tokens: Some(64),
             ..Default::default()
         },
     )
     .expect("construct local Ollama backend");
 
-    let models = backend
-        .list_models()
+    // v1.11.0: `OllamaBackend::list_models` was removed as dead code
+    // (AUDIT_v1.10.39 / PLAN_v111); the discovery flow calls
+    // `fetch_ollama_models` directly — the real-Ollama smoke test does
+    // the same.
+    let models = fetch_ollama_models(&http, &base_url)
         .await
         .expect("list models from local Ollama");
     assert!(

@@ -95,6 +95,10 @@ pub struct SyntaxConfig {
 /// `false`, the classifier is skipped and unstyled output uses
 /// `output_default` only. ANSI-styled output is NEVER affected by this
 /// toggle. Defaults to `true` (enabled).
+///
+/// v1.11.0: the `cwd` field was removed — dead config (painter derives
+/// CWD gray from fg×0.65). A leftover `cwd = "..."` in user TOML is
+/// silently ignored (serde's default unknown-key behavior).
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct OutputSemanticConfig {
@@ -102,7 +106,6 @@ pub struct OutputSemanticConfig {
     /// `false` disables the classifier; ANSI styling is always preserved.
     pub enabled: Option<bool>,
     pub output_default: Option<String>,
-    pub cwd: Option<String>,
     pub metadata: Option<String>,
     pub success: Option<String>,
     pub failure: Option<String>,

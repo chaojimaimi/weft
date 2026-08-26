@@ -851,7 +851,8 @@ fn output_semantic_override_applies() {
     assert_eq!(theme.output.success, Color::rgb(0x00, 0xff, 0x00));
     assert_eq!(theme.output.failure, Color::rgb(0xff, 0x00, 0x00));
     // Unspecified fields inherit from base.
-    assert_eq!(theme.output.cwd, warm.output.cwd);
+    // v1.11.0: `cwd` was a dead key (painter derives CWD gray from fg×0.65)
+    // and is removed from the resolved theme — see AUDIT_v1.10.39.
     assert_eq!(theme.output.output_default, warm.output.output_default);
     assert_eq!(theme.output.metadata, warm.output.metadata);
 }
@@ -863,7 +864,6 @@ fn output_semantic_override_all_fields() {
         output: Some(OutputSemanticConfig {
             enabled: None,
             output_default: Some("#111111".into()),
-            cwd: Some("#222222".into()),
             metadata: Some("#333333".into()),
             success: Some("#444444".into()),
             failure: Some("#555555".into()),
@@ -872,7 +872,6 @@ fn output_semantic_override_all_fields() {
     };
     let theme = Theme::resolve(&cfg);
     assert_eq!(theme.output.output_default, Color::rgb(0x11, 0x11, 0x11));
-    assert_eq!(theme.output.cwd, Color::rgb(0x22, 0x22, 0x22));
     assert_eq!(theme.output.metadata, Color::rgb(0x33, 0x33, 0x33));
     assert_eq!(theme.output.success, Color::rgb(0x44, 0x44, 0x44));
     assert_eq!(theme.output.failure, Color::rgb(0x55, 0x55, 0x55));
@@ -1182,12 +1181,11 @@ fn output_section_removed_from_disk_when_set_to_none() {
 #[test]
 fn semantic_output_toggle_preserves_color_overrides() {
     // v1.7.0-D review fix regression: toggling `enabled` must NOT wipe
-    // sibling color-override fields (output_default/cwd/metadata/success/
+    // sibling color-override fields (output_default/metadata/success/
     // failure). Simulates the settings_controller case-5 toggle path.
     let mut output = OutputSemanticConfig {
         enabled: Some(true),
         output_default: Some("#aaaaaa".into()),
-        cwd: Some("#bbbbbb".into()),
         metadata: Some("#cccccc".into()),
         success: Some("#00ff00".into()),
         failure: Some("#ff0000".into()),
@@ -1201,7 +1199,6 @@ fn semantic_output_toggle_preserves_color_overrides() {
     // Assert siblings survived.
     assert_eq!(output.enabled, Some(false));
     assert_eq!(output.output_default.as_deref(), Some("#aaaaaa"));
-    assert_eq!(output.cwd.as_deref(), Some("#bbbbbb"));
     assert_eq!(output.metadata.as_deref(), Some("#cccccc"));
     assert_eq!(output.success.as_deref(), Some("#00ff00"));
     assert_eq!(output.failure.as_deref(), Some("#ff0000"));

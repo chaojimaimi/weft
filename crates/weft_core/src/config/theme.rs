@@ -46,18 +46,18 @@ pub struct SyntaxColors {
 
 /// v1.7.0-B: Output semantic color roles for unstyled (no-ANSI) command
 /// output. The semantic fallback classifier (v1.7.0-C) maps tokens to these
-/// roles; they are also used directly for CWD, block metadata, and exit-code
-/// status rendering. All roles must be visually distinguishable from each
+/// roles; they are also used directly for block metadata and exit-code
+/// status rendering. The CWD color, by contrast, is deliberately NOT a theme
+/// role: the painter derives a neutral gray from the foreground (`fg × 0.65`,
+/// `weft_app::paint::primitives::derive_cwd_gray`) so it stays theme-agnostic
+/// (v1.11.0 removed the dead `output.cwd` key — see AUDIT_v1.10.39 / PLAN_v111).
+/// All roles must be visually distinguishable from each
 /// other and from `SyntaxColors::command`/`argument`/`default` in every
 /// built-in theme (V17 §2.4 visual hierarchy contract).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputSemanticColors {
-    /// Plain output text with no semantic role and no ANSI styling. Must NOT
-    /// equal `cwd` (V17 §2.4: "普通结果不得等于 CWD 色").
+    /// Plain output text with no semantic role and no ANSI styling.
     pub output_default: Color,
-    /// CWD / execution time / exit code — weakened context color for
-    ///定位信息. Must be weaker (lower contrast or dimmer) than `command`.
-    pub cwd: Color,
     /// Label / metadata key — secondary semantic color. Weaker than `command`
     /// but distinguishable from `output_default`.
     pub metadata: Color,
@@ -160,7 +160,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xe0, 0xd4, 0xc4), // == syntax.default
-                cwd: Color::rgb(0x7a, 0x6a, 0x58),            // == accent_dim
                 metadata: Color::rgb(0xa8, 0x90, 0x70),       // muted amber
                 success: Color::rgb(0xb8, 0xc8, 0x78),        // ANSI 2 green (olive)
                 failure: Color::rgb(0xc8, 0x68, 0x58),        // ANSI 1 red (brick)
@@ -215,7 +214,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0x3a, 0x32, 0x28), // == syntax.default
-                cwd: Color::rgb(0x8a, 0x78, 0x68),            // == accent_dim
                 metadata: Color::rgb(0x70, 0x58, 0x40),       // muted brown
                 success: Color::rgb(0x6a, 0x80, 0x40),        // ANSI 2 green
                 failure: Color::rgb(0xa8, 0x48, 0x38),        // ANSI 1 red
@@ -277,7 +275,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xd9, 0xd9, 0xe3), // == syntax.default
-                cwd: Color::rgb(0x7a, 0x4a, 0x3a),            // == accent_dim
                 metadata: Color::rgb(0xa8, 0x6a, 0x5a),       // muted coral
                 success: Color::rgb(0x3e, 0xd9, 0xa4),        // ANSI 2 green (mint)
                 failure: Color::rgb(0xff, 0x5d, 0x38),        // ANSI 1 red (coral)
@@ -337,7 +334,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xf8, 0xf8, 0xf2), // == syntax.default
-                cwd: Color::rgb(0x62, 0x72, 0xa4),            // == accent_dim
                 metadata: Color::rgb(0x8a, 0x7a, 0xc4),       // muted purple
                 success: Color::rgb(0x50, 0xfa, 0x7b),        // ANSI 2 green
                 failure: Color::rgb(0xff, 0x55, 0x55),        // ANSI 1 red
@@ -397,7 +393,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0x93, 0xa1, 0xa1), // == syntax.default
-                cwd: Color::rgb(0x58, 0x6e, 0x75),            // == accent_dim
                 metadata: Color::rgb(0x4a, 0x6a, 0x8a),       // muted blue
                 success: Color::rgb(0x85, 0x99, 0x00),        // ANSI 2 green
                 failure: Color::rgb(0xdc, 0x32, 0x2f),        // ANSI 1 red
@@ -457,7 +452,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xeb, 0xdb, 0xb2), // == syntax.default
-                cwd: Color::rgb(0x92, 0x83, 0x74),            // == accent_dim
                 metadata: Color::rgb(0xb5, 0x80, 0x40),       // muted orange
                 success: Color::rgb(0x98, 0x97, 0x1a),        // ANSI 2 green
                 failure: Color::rgb(0xcc, 0x24, 0x1d),        // ANSI 1 red
@@ -517,7 +511,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xd8, 0xde, 0xe9), // == syntax.default
-                cwd: Color::rgb(0x4c, 0x56, 0x6a),            // == accent_dim
                 metadata: Color::rgb(0x6a, 0x88, 0x98),       // muted frost
                 success: Color::rgb(0xa3, 0xbe, 0x8c),        // ANSI 2 green (nord14)
                 failure: Color::rgb(0xbf, 0x61, 0x6a),        // ANSI 1 red (nord11)
@@ -576,7 +569,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xa9, 0xb1, 0xd6), // == syntax.default
-                cwd: Color::rgb(0x56, 0x5f, 0x89),            // == accent_dim
                 metadata: Color::rgb(0x6a, 0x7a, 0xa8),       // muted blue
                 success: Color::rgb(0x9e, 0xce, 0x6a),        // ANSI 2 green
                 failure: Color::rgb(0xf7, 0x76, 0x8e),        // ANSI 1 red
@@ -635,7 +627,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xcd, 0xd6, 0xf4), // == syntax.default
-                cwd: Color::rgb(0x6c, 0x70, 0x86),            // == accent_dim
                 metadata: Color::rgb(0x8a, 0x8a, 0xa8),       // muted mauve
                 success: Color::rgb(0xa6, 0xe3, 0xa1),        // ANSI 2 green
                 failure: Color::rgb(0xf3, 0x8b, 0xa8),        // ANSI 1 red
@@ -693,7 +684,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xab, 0xb2, 0xbf), // == syntax.default
-                cwd: Color::rgb(0x5c, 0x63, 0x70),            // == accent_dim
                 metadata: Color::rgb(0x6a, 0x88, 0xa8),       // muted blue
                 success: Color::rgb(0x98, 0xc3, 0x79),        // ANSI 2 green
                 failure: Color::rgb(0xe0, 0x6c, 0x75),        // ANSI 1 red
@@ -751,7 +741,6 @@ impl Theme {
             },
             output: OutputSemanticColors {
                 output_default: Color::rgb(0xfc, 0xfc, 0xfa), // == syntax.default
-                cwd: Color::rgb(0x72, 0x70, 0x72),            // == accent_dim
                 metadata: Color::rgb(0xa8, 0xa8, 0x70),       // muted yellow
                 success: Color::rgb(0xa9, 0xdc, 0x76),        // ANSI 2 green
                 failure: Color::rgb(0xff, 0x61, 0x88),        // ANSI 1 red
@@ -867,12 +856,12 @@ impl Theme {
             }
         }
         // v1.7.0-B: apply output semantic color overrides.
+        // v1.11.0: the `cwd` override was removed — that key was dead
+        // config (the painter derives CWD gray from fg×0.65); see
+        // AUDIT_v1.10.39 / PLAN_v111.
         if let Some(out) = cfg.output.as_ref() {
             if let Some(c) = out.output_default.as_deref().and_then(parse_hex) {
                 theme.output.output_default = c;
-            }
-            if let Some(c) = out.cwd.as_deref().and_then(parse_hex) {
-                theme.output.cwd = c;
             }
             if let Some(c) = out.metadata.as_deref().and_then(parse_hex) {
                 theme.output.metadata = c;

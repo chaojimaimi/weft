@@ -65,6 +65,15 @@ impl super::CompletionProvider for FilesystemProvider {
         request: &CompletionRequest,
         cancel: &CancelToken,
     ) -> Vec<CompletionCandidate> {
+        // v1.11.0 (P1-5, AUDIT_v1.10.39): position gate — at a command
+        // position (cursor inside the first word) with a bare-word prefix
+        // (e.g. "pnp"), file candidates must NOT surface: the user is
+        // typing a command, and history/PATH-executable sources already
+        // cover that slot. A path-like prefix ("./x", "/usr/...", "~/d")
+        // or an argument position keeps the previous behavior.
+        if request.position == CompletePosition::Command && !request.prefix.contains('/') {
+            return Vec::new();
+        }
         let matches = complete::path_matches(request.prefix, request.cwd);
         // Check cancellation after filesystem I/O.
         if cancel.is_cancelled() {
@@ -220,10 +229,85 @@ mod tests {
 
     #[test]
     fn filesystem_provider_returns_empty_for_invalid_cwd() {
-        let r = req("x", "/nonexistent/path/weft_test", &[], &[]);
+        // v1.11.0: prefix contains '/' so it passes the command-position
+        // gate (P1-5) — this test keeps exercising the invalid-cwd path,
+        // not the gate.
+        let r = req(
+            "/weft_complete_nonexistent/x",
+            "/nonexistent/path/weft_test",
+            &[],
+            &[],
+        );
         let cancel = CancelToken::new();
         let candidates = FilesystemProvider.complete(&r, &cancel);
         assert!(candidates.is_empty());
+    }
+
+    // ── v1.11.0 P1-5: command-position filesystem gate ────────────────
+
+    /// A scratch cwd dir unique to this test process (see complete.rs for
+    /// the same pattern).
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "weft_providers_{}_{name}_{}",
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn filesystem_provider_hides_files_at_command_position_with_bare_prefix() {
+        // Cursor in the first word, prefix has no '/' → the user is typing
+        // a command; file candidates must NOT surface (AUDIT_v1.10.39 P1-5).
+        // The cwd is a real scratch dir with a matching file, so an empty
+        // result can only come from the gate.
+        let d = scratch_dir("fs_gate_bare");
+        std::fs::write(d.join("pnux"), "").unwrap();
+        let r = req("pn", d.to_str().unwrap(), &[], &[]);
+        let cancel = CancelToken::new();
+        assert!(FilesystemProvider.complete(&r, &cancel).is_empty());
+    }
+
+    #[test]
+    fn filesystem_provider_lists_paths_at_command_position_with_slash_prefix() {
+        // Command position but the prefix is path-like (contains '/') →
+        // filesystem completion stays enabled (e.g. `./re` or `/usr/lo`).
+        let d = scratch_dir("fs_gate_slash");
+        std::fs::write(d.join("report.md"), "").unwrap();
+        let abs_prefix = format!("{}/re", d.to_str().unwrap());
+        let r = req(&abs_prefix, d.to_str().unwrap(), &[], &[]);
+        let cancel = CancelToken::new();
+        let candidates = FilesystemProvider.complete(&r, &cancel);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "report.md");
+        assert_eq!(candidates[0].source, CompletionSource::Filesystem);
+    }
+
+    #[test]
+    fn filesystem_provider_lists_files_at_argument_position() {
+        // After `cd ` (argument position) a bare prefix still completes
+        // files — the gate only applies at command position.
+        let d = scratch_dir("fs_gate_arg");
+        std::fs::write(d.join("notes.txt"), "").unwrap();
+        let r = CompletionRequest {
+            prefix: "not",
+            cwd: d.to_str().unwrap(),
+            history: &[],
+            path_bins: &[],
+            position: CompletePosition::Argument,
+        };
+        let cancel = CancelToken::new();
+        let candidates = FilesystemProvider.complete(&r, &cancel);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].label, "notes.txt");
+        assert_eq!(candidates[0].source, CompletionSource::Filesystem);
     }
 
     #[test]
@@ -258,8 +342,10 @@ mod tests {
         let cancel = CancelToken::new();
         cancel.cancel();
         assert!(cancel.is_cancelled());
-        // FilesystemProvider checks cancellation after I/O.
-        let r = req("x", "/tmp", &[], &[]);
+        // FilesystemProvider checks cancellation after I/O. v1.11.0: prefix
+        // "/" passes the command-position gate (P1-5) so this still
+        // exercises the cancellation check, not the gate.
+        let r = req("/", "/tmp", &[], &[]);
         let candidates = FilesystemProvider.complete(&r, &cancel);
         assert!(candidates.is_empty());
     }

@@ -161,11 +161,12 @@ pub(crate) fn color_to_normalized(color: Color) -> [f32; 4] {
 
 /// CWD gray: a theme-independent dimmed version of the command foreground.
 ///
-/// Deliberately NOT `theme.output.cwd` — that key is a per-theme "coordinated
-/// accent" (warp_dark is a dark coral, dracula a dark violet), so switching
-/// themes changes the CWD hue. Deriving from `foreground` × 0.65 gives every
-/// theme the same neutral gray, keeps the "CWD dim < command bright" hierarchy,
-/// and auto-adapts to light themes (dark fg → darker gray, still readable).
+/// Deliberately NOT a theme role — v1.11.0 removed the dead `output.cwd`
+/// key (it was a per-theme "coordinated accent", so switching themes changed
+/// the CWD hue; the painter never used it). Deriving from `foreground` × 0.65
+/// gives every theme the same neutral gray, keeps the "CWD dim < command
+/// bright" hierarchy, and auto-adapts to light themes (dark fg → darker
+/// gray, still readable). See AUDIT_v1.10.39 / PLAN_v111.
 pub(crate) fn derive_cwd_gray(fg: [f32; 4]) -> [f32; 4] {
     [fg[0] * 0.65, fg[1] * 0.65, fg[2] * 0.65, 1.0]
 }
@@ -449,7 +450,8 @@ mod tests {
 
     #[test]
     fn derive_cwd_gray_dims_foreground_uniformly_and_theme_independently() {
-        // 每个主题用同一公式(fg × 0.65),CWD 不随主题 `output.cwd` 键变。
+        // v1.11.0: 每个主题用同一公式(fg × 0.65)，CWD 不随主题变——原 `output.cwd`
+        // 键已删除（死配置，见 AUDIT_v1.10.39 / PLAN_v111）。
         for theme in [
             weft_core::config::Theme::weft_warm(),
             weft_core::config::Theme::warp_dark(),
@@ -556,9 +558,14 @@ mod tests {
     /// theme, command ≠ argument ≠ default, and output_default ≠ cwd.
     /// Also verifies success ≠ failure (status colors must be distinguishable).
     ///
-    /// v1.7.0-E: Extended to also assert metadata ≠ output_default/cwd and
+    /// v1.7.0-E: Extended to also assert metadata ≠ output_default and
     /// warning ≠ success/failure, closing the §2.5 "角色间满足固定的感知
     /// 差异门槛" gap for the full OutputSemanticColors role set.
+    ///
+    /// v1.11.0: the `cwd` role assertions were removed with the dead
+    /// `output.cwd` key (AUDIT_v1.10.39 / PLAN_v111) — CWD contrast is now
+    /// structural: `derive_cwd_gray` (fg × 0.65) guarantees the dimming,
+    /// covered by `derive_cwd_gray_dims_foreground_uniformly_and_theme_independently`.
     #[test]
     fn all_themes_satisfy_visual_hierarchy_contract() {
         let themes: Vec<(&str, weft_core::config::Theme)> = vec![
@@ -584,18 +591,17 @@ mod tests {
             assert_ne!(s.command, s.argument, "{name}: command == argument");
             assert_ne!(s.command, s.default, "{name}: command == default");
             assert_ne!(s.argument, s.default, "{name}: argument == default");
-            // V17 §2.4: output_default ≠ cwd ("普通结果不得等于 CWD 色")
-            assert_ne!(o.output_default, o.cwd, "{name}: output_default == cwd");
-            // Status colors must be distinguishable
+            // V17 §2.4: output_default ≠ cwd ("普通结果不得等于 CWD 色") —
+            // v1.11.0: CWD is derived (fg × 0.65), not a theme role; see
+            // `derive_cwd_gray_dims_foreground_uniformly_and_theme_independently`.
             assert_ne!(o.success, o.failure, "{name}: success == failure");
-            // v1.7.0-E: metadata must be distinct from output_default and cwd
+            // v1.7.0-E: metadata must be distinct from output_default
             // ("label 与 value 可分，但整体弱于命令名" — metadata is a weaker
             // structural role and must not collapse into default or cwd).
             assert_ne!(
                 o.metadata, o.output_default,
                 "{name}: metadata == output_default"
             );
-            assert_ne!(o.metadata, o.cwd, "{name}: metadata == cwd");
         }
     }
 

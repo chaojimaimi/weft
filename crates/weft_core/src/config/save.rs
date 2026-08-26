@@ -185,7 +185,13 @@ pub(super) fn write_ai_section(doc: &mut toml_edit::DocumentMut, ai: &super::AiC
         if ai_entry.is_none() {
             *ai_entry = toml_edit::table();
         }
-        let table = ai_entry.as_table_mut().expect("ai is a table");
+        // v1.11.0 (M6, AUDIT_v1.10.39): 用户手写的畸形 TOML（如 `ai = "x"`
+        // 标量，或 toml_edit 宽容解析出的非表条目）不能再 panic——
+        // 保存路径必须容错：跳过该段写回并告警，保留磁盘原样。
+        let Some(table) = ai_entry.as_table_mut() else {
+            tracing::warn!("[ai] section is not a table; skipping AI section write");
+            return;
+        };
         // v1.8.9 fix: provider must use _clear variant so that turning AI off
         // (provider = None) actually removes the key from the TOML. The
         // non-clear variant preserves the old value when None, which caused
@@ -292,7 +298,12 @@ pub(super) fn write_profiles(doc: &mut toml_edit::DocumentMut, source: &super::C
     if profiles_entry.is_none() {
         *profiles_entry = toml_edit::table();
     }
-    let profiles_table = profiles_entry.as_table_mut().expect("profiles is a table");
+    // v1.11.0 (M6, AUDIT_v1.10.39): `profiles = "x"`（标量而非表）不再
+    // panic——跳过整个 profiles 写回并告警，保留磁盘原样。
+    let Some(profiles_table) = profiles_entry.as_table_mut() else {
+        tracing::warn!("[profiles] section is not a table; skipping profiles write");
+        return;
+    };
 
     // Remove profiles that no longer exist in source.
     let stale: Vec<String> = profiles_table
@@ -311,15 +322,16 @@ pub(super) fn write_profiles(doc: &mut toml_edit::DocumentMut, source: &super::C
 
     // Write/update each profile. BTreeMap → alphabetical order.
     for (name, profile) in &source.profiles {
-        let entry = profiles_entry
-            .as_table_mut()
-            .unwrap()
-            .entry(name)
-            .or_insert_with(toml_edit::table);
+        let entry = profiles_table.entry(name).or_insert_with(toml_edit::table);
         if entry.is_none() {
             *entry = toml_edit::table();
         }
-        let table = entry.as_table_mut().expect("profile is a table");
+        // v1.11.0 (M6): 单个 profile 条目被写成标量（如 `[profiles]` 下的
+        // `work = "x"`）时跳过该 profile 的写回，不再 panic。
+        let Some(table) = entry.as_table_mut() else {
+            tracing::warn!(profile = %name, "profile entry is not a table; skipping profile write");
+            continue;
+        };
         write_profile_sections(table, profile);
     }
 }
@@ -383,7 +395,9 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
                         ot.remove("enabled");
                     }
                     set_opt_string(ot, "output_default", &output.output_default);
-                    set_opt_string(ot, "cwd", &output.cwd);
+                    // v1.11.0: `cwd` key removed — dead config (painter
+                    // derives CWD gray from fg×0.65); see AUDIT_v1.10.39 /
+                    // PLAN_v111. Not written, never cleaned.
                     set_opt_string(ot, "metadata", &output.metadata);
                     set_opt_string(ot, "success", &output.success);
                     set_opt_string(ot, "failure", &output.failure);
@@ -451,7 +465,14 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
                 return;
             }
             let mut kb_table = toml_edit::table();
-            let kt = kb_table.as_table_mut().unwrap();
+            // v1.11.0 (M6): `kb_table` 是刚新建的表，as_table_mut 理论不会
+            // 失败；仍改为容错形式（defense in depth，AUDIT_v1.10.39）。
+            let Some(kt) = kb_table.as_table_mut() else {
+                tracing::warn!(
+                    "keybindings table construction failed; skipping profile keybindings write"
+                );
+                return;
+            };
             for (binding, action) in kb {
                 let action_str = super::action::action_to_str(action);
                 kt.insert(binding, toml_edit::value(action_str));
@@ -480,7 +501,15 @@ where
     if entry.is_none() {
         *entry = toml_edit::table();
     }
-    let section = entry.as_table_mut().expect("profile section is a table");
+    // v1.11.0 (M6, AUDIT_v1.10.39): 段被写成标量（如 `[profiles.x]` 下的
+    // `font = "y"`）时跳过该段写回并告警，不再 panic。
+    let Some(section) = entry.as_table_mut() else {
+        tracing::warn!(
+            section = name,
+            "profile section is not a table; skipping section write"
+        );
+        return;
+    };
     f(section);
 }
 
@@ -529,6 +558,95 @@ mod tests {
             table["provider"].as_str(),
             Some("ollama"),
             "provider must be written when AI is on"
+        );
+    }
+
+    // ── v1.11.0 M6: malformed hand-written TOML must not panic the save
+    // path (AUDIT_v1.10.39). Each test feeds the writer a doc where a
+    // section/entry is a scalar instead of a table; the writer must skip
+    // that segment (with a warn) and leave the document untouched. ──────
+
+    #[test]
+    fn write_ai_skips_non_table_ai_section_without_panic() {
+        let mut doc = toml_edit::DocumentMut::new();
+        // User wrote `ai = "x"` (scalar). The save path must not panic.
+        doc["ai"] = toml_edit::value("x");
+        let ai_on = AiConfig {
+            provider: Some("ollama".into()),
+            ..Default::default()
+        };
+        write_ai_section(&mut doc, &ai_on);
+        assert_eq!(
+            doc["ai"].as_str(),
+            Some("x"),
+            "malformed [ai] section must be left untouched"
+        );
+    }
+
+    #[test]
+    fn write_profiles_skips_non_table_profiles_without_panic() {
+        let mut doc = toml_edit::DocumentMut::new();
+        // User wrote `profiles = "x"` (scalar, not a table).
+        doc["profiles"] = toml_edit::value("x");
+        let cfg = crate::config::Config {
+            profiles: std::collections::BTreeMap::from([(
+                "work".into(),
+                crate::config::ProfileConfig::default(),
+            )]),
+            ..crate::config::Config::default()
+        };
+        write_profiles(&mut doc, &cfg);
+        assert_eq!(
+            doc["profiles"].as_str(),
+            Some("x"),
+            "malformed [profiles] section must be left untouched"
+        );
+    }
+
+    #[test]
+    fn write_profiles_skips_scalar_profile_entry_without_panic() {
+        let mut doc = toml_edit::DocumentMut::new();
+        // `[profiles]` exists but `work` is a scalar.
+        doc["profiles"] = toml_edit::table();
+        doc["profiles"]["work"] = toml_edit::value("x");
+        let cfg = crate::config::Config {
+            profiles: std::collections::BTreeMap::from([(
+                "work".into(),
+                crate::config::ProfileConfig::default(),
+            )]),
+            ..crate::config::Config::default()
+        };
+        write_profiles(&mut doc, &cfg);
+        assert_eq!(
+            doc["profiles"]["work"].as_str(),
+            Some("x"),
+            "scalar profile entry must be left untouched"
+        );
+    }
+
+    #[test]
+    fn write_profile_sections_skips_scalar_section_without_panic() {
+        let mut doc = toml_edit::DocumentMut::new();
+        // `[profiles.work]` with `font = "y"` (scalar where a table is
+        // expected) — the section writer must skip instead of panicking.
+        doc["profiles"] = toml_edit::table();
+        doc["profiles"]["work"] = toml_edit::table();
+        doc["profiles"]["work"]["font"] = toml_edit::value("y");
+        let cfg = crate::config::Config {
+            profiles: std::collections::BTreeMap::from([(
+                "work".into(),
+                crate::config::ProfileConfig {
+                    font: Some(crate::config::FontConfig::default()),
+                    ..crate::config::ProfileConfig::default()
+                },
+            )]),
+            ..crate::config::Config::default()
+        };
+        write_profiles(&mut doc, &cfg);
+        assert_eq!(
+            doc["profiles"]["work"]["font"].as_str(),
+            Some("y"),
+            "scalar profile section must be left untouched"
         );
     }
 }

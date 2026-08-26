@@ -14,7 +14,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use super::client::{
-    build_backend, is_loopback_url, AiBackend, AiError, CancelFlag, OllamaBackend,
+    build_backend, fetch_ollama_models, is_loopback_url, AiBackend, AiError, CancelFlag,
+    OllamaBackend,
 };
 use super::prompt::{ChatMessage, ChatRole};
 use weft_core::config::AiConfig;
@@ -23,6 +24,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build an OllamaBackend pointing at `base_url` with model `test-model`.
+/// v1.11.0: the /api/tags tests no longer go through `OllamaBackend` —
+/// the `list_models` convenience method was removed as dead code
+/// (AUDIT_v1.10.39 / PLAN_v111); they call `fetch_ollama_models` directly.
 fn backend_at(base_url: &str) -> OllamaBackend {
     let http = Arc::new(
         reqwest::Client::builder()
@@ -37,6 +41,16 @@ fn backend_at(base_url: &str) -> OllamaBackend {
         ..Default::default()
     };
     OllamaBackend::new(http, cfg).expect("backend construction should succeed")
+}
+
+/// Plain HTTP client for /api/tags tests (the discovery flow builds its
+/// own client from the draft config, so a bare reqwest client matches it).
+fn tags_http_client(base_url: &str) -> (reqwest::Client, String) {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    (http, base_url.to_string())
 }
 
 fn simple_messages() -> Vec<ChatMessage> {
@@ -135,15 +149,13 @@ async fn list_models_returns_models_on_success() {
         is_loopback_url(&base_url),
         "wiremock URI should be loopback: {base_url}"
     );
-    let backend = backend_at(&base_url);
-    let models = backend
-        .list_models()
+    let (http, base_url) = tags_http_client(&base_url);
+    let models = fetch_ollama_models(&http, &base_url)
         .await
-        .expect("list_models should succeed");
+        .expect("fetch_ollama_models should succeed");
     assert_eq!(models.len(), 2);
     assert_eq!(models[0].name, "llama3.1");
     assert_eq!(models[1].name, "qwen2.5");
-    assert_eq!(models[0].size, 4932946240);
 }
 
 #[tokio::test]
@@ -155,8 +167,10 @@ async fn list_models_returns_empty_when_no_models() {
         .mount(&server)
         .await;
 
-    let backend = backend_at(&server.uri());
-    let models = backend.list_models().await.expect("should succeed");
+    let (http, base_url) = tags_http_client(&server.uri());
+    let models = fetch_ollama_models(&http, &base_url)
+        .await
+        .expect("should succeed");
     assert!(models.is_empty());
 }
 
@@ -169,8 +183,8 @@ async fn list_models_errors_on_non_200() {
         .mount(&server)
         .await;
 
-    let backend = backend_at(&server.uri());
-    match backend.list_models().await {
+    let (http, base_url) = tags_http_client(&server.uri());
+    match fetch_ollama_models(&http, &base_url).await {
         Err(AiError::Status { status, body }) => {
             assert_eq!(status, 500);
             assert!(body.contains("internal error"));
@@ -189,8 +203,8 @@ async fn list_models_errors_on_malformed_json() {
         .mount(&server)
         .await;
 
-    let backend = backend_at(&server.uri());
-    match backend.list_models().await {
+    let (http, base_url) = tags_http_client(&server.uri());
+    match fetch_ollama_models(&http, &base_url).await {
         Err(AiError::Network(_)) | Err(AiError::Parse(_)) => {}
         Err(other) => panic!("expected Network or Parse error, got {other:?}"),
         Ok(_) => panic!("expected error, got models"),
@@ -208,8 +222,8 @@ async fn list_models_errors_when_models_field_missing() {
         .mount(&server)
         .await;
 
-    let backend = backend_at(&server.uri());
-    match backend.list_models().await {
+    let (http, base_url) = tags_http_client(&server.uri());
+    match fetch_ollama_models(&http, &base_url).await {
         Err(AiError::Parse(msg)) => assert!(msg.contains("models")),
         Err(other) => panic!("expected Parse error, got {other:?}"),
         Ok(_) => panic!("expected error, got models"),
@@ -224,8 +238,8 @@ async fn list_models_errors_on_connection_refused() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let backend = backend_at(&format!("http://127.0.0.1:{port}"));
-    match backend.list_models().await {
+    let (http, base_url) = tags_http_client(&format!("http://127.0.0.1:{port}"));
+    match fetch_ollama_models(&http, &base_url).await {
         Err(AiError::Network(_)) => {}
         Err(other) => panic!("expected Network error, got {other:?}"),
         Ok(_) => panic!("expected error, got models"),

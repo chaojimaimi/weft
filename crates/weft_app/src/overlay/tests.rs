@@ -202,22 +202,26 @@ fn settings_tab_labels_are_distinct() {
     assert!(labels.contains(&"Input"));
     assert!(labels.contains(&"Keybindings"));
     assert!(labels.contains(&"Window"));
-    assert!(labels.contains(&"Advanced"));
+    // v1.11.0: Advanced is hidden from the visible tab list (no config
+    // backing — see SettingsTab::Advanced doc), so its label must NOT
+    // appear among the visible sidebar categories.
+    assert!(!labels.contains(&"Advanced"));
 }
 
 #[test]
-fn settings_tab_all_has_seven_categories() {
+fn settings_tab_all_has_six_visible_categories() {
     // F5: Logo merged into Appearance; Font merged into Appearance.
     // v1.8.3: LocalAi added as the 7th category (between Window and Advanced).
-    // Categories: Appearance, Terminal, Input, Keybindings, Window, LocalAi, Advanced.
-    assert_eq!(SettingsTab::ALL.len(), 7);
+    // v1.11.0: Advanced removed from the visible list — placeholder rows have
+    // no real config backing (PLAN_v111 item 1); the enum variant is kept.
+    // Visible: Appearance, Terminal, Input, Keybindings, Window, LocalAi.
+    assert_eq!(SettingsTab::ALL.len(), 6);
     assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
     assert_eq!(SettingsTab::ALL[1], SettingsTab::Terminal);
     assert_eq!(SettingsTab::ALL[2], SettingsTab::Input);
     assert_eq!(SettingsTab::ALL[3], SettingsTab::Keybindings);
     assert_eq!(SettingsTab::ALL[4], SettingsTab::Window);
     assert_eq!(SettingsTab::ALL[5], SettingsTab::LocalAi);
-    assert_eq!(SettingsTab::ALL[6], SettingsTab::Advanced);
 }
 
 #[test]

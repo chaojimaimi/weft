@@ -101,20 +101,27 @@ pub enum SettingsTab {
     /// v1.8.3: Local Ollama AI integration (enable, model, test connection,
     /// data-range toggles, max_tokens, timeout). AI config is global only.
     LocalAi,
-    /// Debug logging, experimental features (restart-required badges).
+    /// v1.11.0 隐藏入口：Debug logging / experimental / Import-Export 行均为
+    /// 无真实配置支撑的 placeholder（无配置支撑，补实后恢复，见
+    /// docs/PLAN_v111.md 第 1 项）。枚举变体与全部 match 臂**保留**，仅从
+    /// `ALL` 可见列表移除，避免大面积 match 改动；如未来补实配置即加回。
     Advanced,
 }
 
 impl SettingsTab {
-    /// All categories in sidebar display order.
-    pub const ALL: [SettingsTab; 7] = [
+    /// All visible categories in sidebar display order.
+    ///
+    /// v1.11.0: `Advanced` 从可见列表移除（空壳 placeholder 无配置支撑，
+    /// 见 AUDIT_v1.10.39 P2-M7 / PLAN_v111 第 1 项）。变体仍存在以满足
+    /// 各 match 的穷尽性；键盘导航（Tab/↑/↓）与绘制/命中区全部由本列表
+    /// 驱动，故移除即全局隐藏。
+    pub const ALL: [SettingsTab; 6] = [
         SettingsTab::Appearance,
         SettingsTab::Terminal,
         SettingsTab::Input,
         SettingsTab::Keybindings,
         SettingsTab::Window,
         SettingsTab::LocalAi,
-        SettingsTab::Advanced,
     ];
 
     /// Human-readable label for the sidebar.
@@ -424,9 +431,10 @@ impl OverlayWarmup for OverlayContent<'_> {
             }
             OverlayContent::Settings(s) => {
                 // F5: sidebar category labels + status text + theme names + keybinding strings.
+                // v1.11.0: "Advanced" removed from the warmup — the tab is
+                // hidden from the sidebar (see SettingsTab::ALL).
                 missing.extend(
-                    "Settings Appearance Terminal Input Keybindings Window Local AI Advanced"
-                        .chars(),
+                    "Settings Appearance Terminal Input Keybindings Window Local AI".chars(),
                 );
                 missing.extend(
                     "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing"

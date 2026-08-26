@@ -908,7 +908,7 @@
       "footer_y": 596.0,
       "max_rows": 25,
       "scene": {
-        "hit_count": 8,
+        "hit_count": 7,
         "hits": [
           {
             "bounds": [
@@ -966,15 +966,6 @@
           },
           {
             "bounds": [
-              70.0,
-              230.0,
-              430.0,
-              248.0
-            ],
-            "target": "SidebarCategory(Advanced)"
-          },
-          {
-            "bounds": [
               205.9,
               596.0,
               272.05,
@@ -983,7 +974,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 9,
+        "semantic_count": 8,
         "semantics": [
           {
             "bounds": [
@@ -1071,18 +1062,6 @@
           },
           {
             "bounds": [
-              70.0,
-              230.0,
-              430.0,
-              248.0
-            ],
-            "focus": "Settings",
-            "label": "Advanced",
-            "role": "Tab",
-            "state": ""
-          },
-          {
-            "bounds": [
               205.9,
               596.0,
               272.05,
@@ -1119,7 +1098,7 @@
       "footer_y": 774.0,
       "max_rows": 33,
       "scene": {
-        "hit_count": 29,
+        "hit_count": 28,
         "hits": [
           {
             "bounds": [
@@ -1174,15 +1153,6 @@
               252.0
             ],
             "target": "SidebarCategory(LocalAi)"
-          },
-          {
-            "bounds": [
-              201.6,
-              252.0,
-              491.904,
-              270.0
-            ],
-            "target": "SidebarCategory(Advanced)"
           },
           {
             "bounds": [
@@ -1383,7 +1353,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 29,
+        "semantic_count": 28,
         "semantics": [
           {
             "bounds": [
@@ -1466,18 +1436,6 @@
             ],
             "focus": "Settings",
             "label": "Local AI",
-            "role": "Tab",
-            "state": ""
-          },
-          {
-            "bounds": [
-              201.6,
-              252.0,
-              491.904,
-              270.0
-            ],
-            "focus": "Settings",
-            "label": "Advanced",
             "role": "Tab",
             "state": ""
           },
