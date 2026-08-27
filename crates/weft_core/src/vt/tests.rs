@@ -4436,3 +4436,106 @@ fn synchronized_full_frame_still_takes_over_screen_document() {
         "a completed synchronized full frame must begin a screen document"
     );
 }
+
+// ── v1.11.5 OSC 52 / 9 / 777 UiEvent channel (PLAN_v1115 §M1) ──────────
+
+/// End-to-end fixture: a single `process()` batch with mixed OSC sequences
+/// drains to exactly the events the dispatcher pushed, in order.
+#[test]
+fn ui_events_drain_end_to_end_fixture() {
+    use crate::vt::DockProgress;
+
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]52;c;Zm9vYmFy\x07"); // write "foobar"
+    t.process(b"\x1b]777;notify;Title;multi;part body\x07");
+    t.process(b"\x1b]9;4;3;47\x07"); // progress 47%
+    t.process(b"\x1b]52;c;?\x07"); // read request
+    t.process(b"\x1b]9;plain message\x07"); // iTerm2-style notify
+
+    let events = t.take_ui_events();
+    assert_eq!(
+        events.len(),
+        5,
+        "exactly the five pushed events: {events:?}"
+    );
+    assert_eq!(
+        events[0],
+        crate::vt::UiEvent::ClipboardWrite {
+            data: b"foobar".to_vec(),
+            truncated: false
+        }
+    );
+    assert_eq!(
+        events[1],
+        crate::vt::UiEvent::RemoteNotify {
+            title: "Title".into(),
+            body: "multi;part body".into(),
+        }
+    );
+    assert_eq!(
+        events[2],
+        crate::vt::UiEvent::DockProgress(DockProgress::Percent(47))
+    );
+    assert_eq!(events[3], crate::vt::UiEvent::ClipboardReadRequest);
+    assert_eq!(
+        events[4],
+        crate::vt::UiEvent::RemoteNotify {
+            title: String::new(),
+            body: "plain message".into(),
+        }
+    );
+
+    // FIFO drain: second take is empty (the queue was mem::taken).
+    assert!(t.take_ui_events().is_empty(), "drain is FIFO + destructive");
+}
+
+/// Unknown OSC codes and non-notify 777 subcommands produce no events.
+#[test]
+fn ui_events_unknown_osc_produces_nothing() {
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]100;x\x07\x1b]777;scrollback;+1\x07\x1b]52;q;Zm9v\x07");
+    assert!(t.take_ui_events().is_empty());
+}
+
+/// The OSC 9 `git=` prefix stays on the legacy branch: its payload is never
+/// misread as a notification (git fixture priority, PLAN_v1115 §M1).
+#[test]
+fn ui_events_osc9_git_prefix_never_notifies() {
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]9;git=main\x07");
+    assert!(
+        t.take_ui_events().is_empty(),
+        "git= is a branch report, not a notify"
+    );
+    assert_eq!(t.git_branch(), Some("main"));
+
+    // but a non-git 9 payload IS a notify
+    t.process(b"\x1b]9;build done\x07");
+    assert_eq!(t.take_ui_events().len(), 1);
+}
+
+/// RIS (ESC c) replaces the whole Terminal, so the ui_events queue is
+/// cleared without an explicit reset hook (PLAN_v1115 D-a).
+#[test]
+fn ui_events_ris_clears_queue_by_object_replace() {
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]52;c;Zm9v\x07");
+    assert_eq!(t.take_ui_events().len(), 1);
+    t.process(b"\x1b]52;c;Zm9v\x07");
+    t.process(b"\x1bc"); // RIS
+    assert!(
+        t.take_ui_events().is_empty(),
+        "RIS must clear queued ui events"
+    );
+}
+
+/// OSC 9;4 progress with a missing/illegal param is ignored — no event,
+/// no panic, and the grid stays untouched.
+#[test]
+fn ui_events_progress_missing_params_ignored() {
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b]9;4\x07"); // no state at all
+    t.process(b"\x1b]9;4;3\x07"); // state 3 without progress
+    t.process(b"\x1b]9;4;9;5\x07"); // unknown state 9
+    assert!(t.take_ui_events().is_empty(), "all three must be ignored");
+}

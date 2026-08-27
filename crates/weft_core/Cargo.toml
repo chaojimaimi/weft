@@ -25,6 +25,9 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
+# v1.11.5 OSC52: base64 decode (Indifferent padding) / encode (Pad::None) for
+# clipboard exchange payloads.
+base64.workspace = true
 rusqlite.workspace = true
 regex.workspace = true
 pulldown-cmark.workspace = true

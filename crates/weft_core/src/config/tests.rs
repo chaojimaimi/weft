@@ -2500,3 +2500,160 @@ fn weft_config_unset_falls_through_to_xdg_then_home() {
         "HOME must be used when WEFT_CONFIG and XDG_CONFIG_HOME are both unset"
     );
 }
+
+// ── v1.11.5 [clipboard] / [notifications] (PLAN_v1115 §M8) ──────────────
+
+/// `[clipboard] osc52 = "unrestricted"` survives save → reload; the default
+/// writes nothing to disk (a stale key must not resurrect later).
+#[test]
+fn clipboard_osc52_roundtrip_and_default_omission() {
+    use crate::config::Osc52Mode;
+
+    let path = unique_tmp_path("clipboard-osc52");
+    let cfg = Config {
+        clipboard: crate::config::ClipboardConfig {
+            osc52: Osc52Mode::Unrestricted,
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("osc52 = \"unrestricted\""), "text: {text}");
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert_eq!(
+        reloaded.clipboard.osc52,
+        Osc52Mode::Unrestricted,
+        "round-trip keeps the mode"
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+    // Default config: no [clipboard] section on disk.
+    let path2 = unique_tmp_path("clipboard-default");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    let text2 = std::fs::read_to_string(&path2).unwrap();
+    assert!(
+        !text2.contains("clipboard"),
+        "default clipboard omitted: {text2}"
+    );
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}
+
+/// Illegal OSC 52 values fall back to `Default` — a typo must never fail
+/// the whole config parse (PLAN_v1115 §M8 serde rule).
+#[test]
+fn clipboard_osc52_illegal_value_falls_back_to_default() {
+    use crate::config::Osc52Mode;
+
+    let cfg: Config = toml::from_str("[clipboard]\nosc52 = \"garbage\"\n").unwrap();
+    assert_eq!(cfg.clipboard.osc52, Osc52Mode::Default);
+    assert!(cfg.notifications.enabled, "rest of config still parses");
+
+    let cfg: Config = toml::from_str("[clipboard]\nosc52 = \"OFF\"\n").unwrap();
+    assert_eq!(
+        cfg.clipboard.osc52,
+        Osc52Mode::Default,
+        "values are lowercase-only; uppercase is illegal → default"
+    );
+}
+
+/// `[notifications]` non-default keys round-trip; all-default writes nothing.
+#[test]
+fn notifications_roundtrip_and_default_omission() {
+    let path = unique_tmp_path("notifications");
+    let cfg = Config {
+        notifications: crate::config::NotificationsConfig {
+            enabled: false,
+            threshold_secs: 120,
+            sound: true,
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("enabled = false"), "text: {text}");
+    assert!(text.contains("threshold_secs = 120"), "text: {text}");
+    assert!(text.contains("sound = true"), "text: {text}");
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert!(!reloaded.notifications.enabled);
+    assert_eq!(reloaded.notifications.threshold_secs, 120);
+    assert!(reloaded.notifications.sound);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+    // Default config: no [notifications] section on disk.
+    let path2 = unique_tmp_path("notifications-default");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    let text2 = std::fs::read_to_string(&path2).unwrap();
+    assert!(
+        !text2.contains("notifications"),
+        "default notifications omitted: {text2}"
+    );
+    let _ = std::fs::remove_dir_all(path2.parent().unwrap());
+}
+
+/// Defaults per PLAN_v1115 §M8 TOML: enabled=true, threshold 30s, sound off.
+#[test]
+fn notifications_defaults_match_plan() {
+    let d = crate::config::NotificationsConfig::default();
+    assert!(d.enabled, "总闸 default on per plan");
+    assert_eq!(d.threshold_secs, 30, "X7 threshold");
+    assert!(!d.sound, "no surprise sound");
+}
+
+/// Section-level profile overrides for both new sections survive save →
+/// reload and apply to the effective config.
+#[test]
+fn clipboard_and_notifications_profile_override_applies() {
+    use crate::config::{ClipboardConfig, NotificationsConfig, Osc52Mode};
+
+    let mut cfg = Config::default();
+    cfg.profiles.insert(
+        "silent".into(),
+        ProfileConfig {
+            clipboard: Some(ClipboardConfig {
+                osc52: Osc52Mode::Off,
+            }),
+            notifications: Some(NotificationsConfig {
+                enabled: false,
+                ..NotificationsConfig::default()
+            }),
+            ..Default::default()
+        },
+    );
+    cfg.active_profile = Some("silent".into());
+    let (effective, diagnostics) = cfg.resolve_active_profile().unwrap();
+    assert!(diagnostics.is_empty());
+    assert_eq!(effective.clipboard.osc52, Osc52Mode::Off);
+    assert!(!effective.notifications.enabled);
+    assert_eq!(
+        effective.notifications.threshold_secs, 30,
+        "unlisted section keys inherit the base defaults"
+    );
+
+    // save → reload keeps the profile overrides
+    let path = unique_tmp_path("clipboard-notify-profile");
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("osc52 = \"off\""), "text: {text}");
+    assert!(text.contains("enabled = false"), "text: {text}");
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert_eq!(
+        reloaded.profiles["silent"]
+            .clipboard
+            .as_ref()
+            .unwrap()
+            .osc52,
+        Osc52Mode::Off
+    );
+    assert!(
+        !reloaded.profiles["silent"]
+            .notifications
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}

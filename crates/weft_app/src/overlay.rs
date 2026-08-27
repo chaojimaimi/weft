@@ -283,6 +283,13 @@ pub struct SettingsDrawParams<'a> {
     /// v1.8.3: LocalAi tab parameters. Always provided; the renderer only
     /// reads it when `active_tab == SettingsTab::LocalAi`.
     pub ai: AiSettingsView<'a>,
+    /// v1.11.5 (PLAN_v1115 §M8): notification + clipboard draft values
+    /// (Advanced rows 4-7). Grouped like `paste_rows` to keep the field
+    /// list flat.
+    pub notify_enabled: bool,
+    pub notify_threshold_secs: u64,
+    pub notify_sound: bool,
+    pub osc52_mode: weft_core::config::Osc52Mode,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -590,6 +597,11 @@ pub fn build_overlay_stack<'a>(
     settings_profiles: &'a [SettingsProfileView<'a>],
     settings_semantic_output_enabled: bool,
     settings_ai: AiSettingsView<'a>,
+    // v1.11.5 (PLAN_v1115 §M8): Advanced rows 4-7 draw values.
+    settings_notify_enabled: bool,
+    settings_notify_threshold_secs: u64,
+    settings_notify_sound: bool,
+    settings_osc52_mode: weft_core::config::Osc52Mode,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
@@ -780,6 +792,10 @@ pub fn build_overlay_stack<'a>(
                 profiles: settings_profiles,
                 semantic_output_enabled: settings_semantic_output_enabled,
                 ai: settings_ai,
+                notify_enabled: settings_notify_enabled,
+                notify_threshold_secs: settings_notify_threshold_secs,
+                notify_sound: settings_notify_sound,
+                osc52_mode: settings_osc52_mode,
             }),
         });
     }

@@ -190,6 +190,14 @@ pub(super) fn merge_settings_draft(
         if dirty.contains(weft_core::config::ConfigSectionMask::KEYBINDINGS) {
             profile.keybindings = Some(draft.keybindings.clone());
         }
+        // v1.11.5 (PLAN_v1115 §M8): clipboard / notifications are
+        // profile-overridable like the other sections.
+        if dirty.contains(weft_core::config::ConfigSectionMask::CLIPBOARD) {
+            profile.clipboard = Some(draft.clipboard); // Copy
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::NOTIFICATIONS) {
+            profile.notifications = Some(draft.notifications); // Copy
+        }
     } else {
         if dirty.contains(weft_core::config::ConfigSectionMask::FONT) {
             candidate.font = draft.font.clone();
@@ -215,6 +223,13 @@ pub(super) fn merge_settings_draft(
         }
         if dirty.contains(weft_core::config::ConfigSectionMask::KEYBINDINGS) {
             candidate.keybindings = draft.keybindings.clone();
+        }
+        // v1.11.5 (PLAN_v1115 §M8): clipboard / notifications base edits.
+        if dirty.contains(weft_core::config::ConfigSectionMask::CLIPBOARD) {
+            candidate.clipboard = draft.clipboard; // Copy
+        }
+        if dirty.contains(weft_core::config::ConfigSectionMask::NOTIFICATIONS) {
+            candidate.notifications = draft.notifications; // Copy
         }
     }
 

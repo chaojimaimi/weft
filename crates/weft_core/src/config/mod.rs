@@ -71,9 +71,10 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, BlocksConfig, CompatConfig, EditorConfig, FontConfig, LogoConfig, LogoVariant,
-    OutputSemanticConfig, PasteConfig, ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig,
-    PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, FontConfig, LogoConfig,
+    LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig, PasteConfig,
+    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
+    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
@@ -102,6 +103,12 @@ pub struct Config {
     /// v1.11.3 (PLAN_v1113 §3.3): terminal compatibility switches
     /// (`bold_is_bright`). Config-file key — no Settings UI row.
     pub compat: CompatConfig,
+    /// v1.11.5 (PLAN_v1115 §M8): OSC 52 clipboard access mode
+    /// (`[clipboard].osc52`).
+    pub clipboard: ClipboardConfig,
+    /// v1.11.5 (PLAN_v1115 §M8): notification gates
+    /// (`[notifications]` enabled/threshold_secs/sound).
+    pub notifications: NotificationsConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -458,6 +465,76 @@ impl Config {
                 }
                 None => {
                     tracing::warn!("[compat] section is not a table; skipping compat write");
+                }
+            }
+        }
+
+        // [clipboard] section — v1.11.5 (PLAN_v1115 §M8): only write when
+        // the mode differs from `default`; clear a stale key otherwise so a
+        // previously saved non-default value can't resurrect on reload.
+        if self.clipboard.osc52 != ClipboardConfig::default().osc52 {
+            let cb_entry = doc.entry("clipboard").or_insert_with(toml_edit::table);
+            if cb_entry.is_none() {
+                *cb_entry = toml_edit::table();
+            }
+            match cb_entry.as_table_mut() {
+                Some(t) => {
+                    t["osc52"] = toml_edit::value(self.clipboard.osc52.as_str());
+                }
+                None => {
+                    tracing::warn!("[clipboard] section is not a table; skipping write");
+                }
+            }
+        } else if let Some(t) = doc.get_mut("clipboard").and_then(|i| i.as_table_mut()) {
+            t.remove("osc52");
+            if t.iter().count() == 0 {
+                doc.remove("clipboard");
+            }
+        }
+
+        // [notifications] section — v1.11.5 (PLAN_v1115 §M8): write only
+        // non-default keys; remove the whole table when all-default so a
+        // stale file never pins a changed default.
+        {
+            let default_notify = NotificationsConfig::default();
+            let dirty = self.notifications != default_notify;
+            if dirty {
+                let n_entry = doc.entry("notifications").or_insert_with(toml_edit::table);
+                if n_entry.is_none() {
+                    *n_entry = toml_edit::table();
+                }
+                match n_entry.as_table_mut() {
+                    Some(t) => {
+                        if self.notifications.enabled != default_notify.enabled {
+                            t["enabled"] = toml_edit::value(self.notifications.enabled);
+                        } else {
+                            t.remove("enabled");
+                        }
+                        if self.notifications.threshold_secs != default_notify.threshold_secs {
+                            t["threshold_secs"] =
+                                toml_edit::value(self.notifications.threshold_secs as i64);
+                        } else {
+                            t.remove("threshold_secs");
+                        }
+                        if self.notifications.sound != default_notify.sound {
+                            t["sound"] = toml_edit::value(self.notifications.sound);
+                        } else {
+                            t.remove("sound");
+                        }
+                        if t.iter().count() == 0 {
+                            doc.remove("notifications");
+                        }
+                    }
+                    None => {
+                        tracing::warn!("[notifications] section is not a table; skipping write");
+                    }
+                }
+            } else if let Some(t) = doc.get_mut("notifications").and_then(|i| i.as_table_mut()) {
+                t.remove("enabled");
+                t.remove("threshold_secs");
+                t.remove("sound");
+                if t.iter().count() == 0 {
+                    doc.remove("notifications");
                 }
             }
         }

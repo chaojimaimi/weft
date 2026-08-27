@@ -513,13 +513,40 @@ impl MetalRenderer {
                     // The first two rows (Debug Logging, Experimental) carry
                     // restart-required badges; the action rows carry a "▶"
                     // glyph to signal that Enter triggers a panel.
-                    let rows: [(&str, &str); 4] = [
-                        ("Debug Logging:", "Off"),
-                        ("Experimental:", "Disabled"),
-                        ("Import Config:", "\u{25b6} Open\u{2026}"),
-                        ("Export Config:", "\u{25b6} Save\u{2026}"),
+                    // v1.11.5 (PLAN_v1115 §M8): rows 4-7 read the LIVE
+                    // draft values (Notified Enabled / Threshold / Sound /
+                    // OSC52 Clipboard). `unrestricted` renders with a
+                    // warning suffix (silent clipboard reads by remote
+                    // programs). The Import / Export action rows carry the
+                    // "▶" glyph; those stay at rows 2/3.
+                    let notify_enabled = s.notify_enabled;
+                    let notify_sound = s.notify_sound;
+                    let osc52_label = match s.osc52_mode {
+                        weft_core::config::Osc52Mode::Default => "Default",
+                        weft_core::config::Osc52Mode::Off => "Off",
+                        weft_core::config::Osc52Mode::Unrestricted => "Unrestricted \u{26a0}",
+                    };
+                    let rows: [(&str, String); crate::settings_validation::ADVANCED_ROW_COUNT] = [
+                        ("Debug Logging:", "Off".to_string()),
+                        ("Experimental:", "Disabled".to_string()),
+                        ("Import Config:", "\u{25b6} Open\u{2026}".to_string()),
+                        ("Export Config:", "\u{25b6} Save\u{2026}".to_string()),
+                        (
+                            "Notify Enabled:",
+                            if notify_enabled { "On" } else { "Off" }.to_string(),
+                        ),
+                        (
+                            "Notify Threshold:",
+                            format!("{} s", s.notify_threshold_secs),
+                        ),
+                        (
+                            "Notify Sound:",
+                            if notify_sound { "On" } else { "Off" }.to_string(),
+                        ),
+                        ("OSC52 Clipboard:", osc52_label.to_string()),
                     ];
                     for (i, (label, value)) in rows.iter().enumerate() {
+                        let value = value.as_str();
                         let row_y = content_top + i as f32 * ch;
                         let is_sel = i == s.selection;
                         self.push_settings_row(

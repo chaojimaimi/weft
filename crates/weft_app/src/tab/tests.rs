@@ -31,7 +31,7 @@ fn empty_tab_pump_pty_is_noop() {
 #[test]
 fn empty_tab_process_messages_returns_empty() {
     let mut t = Tab::empty();
-    let (alive, drained, need_redraw) = t.process_messages();
+    let (alive, drained, need_redraw, _) = t.process_messages();
     assert!(alive);
     assert!(drained.is_empty());
     assert!(!need_redraw);

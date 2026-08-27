@@ -50,6 +50,11 @@ pub struct ProfileConfig {
     pub blocks: Option<BlocksConfig>,
     /// v1.11.3 (PLAN_v1113 §3.3): `[compat]` is profile-overridable.
     pub compat: Option<CompatConfig>,
+    /// v1.11.5 (PLAN_v1115 §M8): `[clipboard]` is profile-overridable
+    /// (whole-section replace, same rule as the others).
+    pub clipboard: Option<super::ClipboardConfig>,
+    /// v1.11.5 (PLAN_v1115 §M8): `[notifications]` is profile-overridable.
+    pub notifications: Option<super::NotificationsConfig>,
     pub logo: Option<LogoConfig>,
     /// `keybindings` is also a full-section override (no per-key merge).
     pub keybindings: Option<HashMap<String, Action>>,
@@ -70,6 +75,8 @@ impl ProfileConfig {
             && self.paste.is_none()
             && self.blocks.is_none()
             && self.compat.is_none()
+            && self.clipboard.is_none()
+            && self.notifications.is_none()
             && self.logo.is_none()
             && self.keybindings.is_none()
     }
@@ -100,6 +107,12 @@ bitflags! {
         const PASTE        = 1 << 8;
         /// v1.11.3 (PLAN_v1113 §3.3): `[compat]` terminal-compat switches.
         const COMPAT       = 1 << 9;
+        /// v1.11.5 (PLAN_v1115 §M8): `[clipboard].osc52` (Settings
+        /// Advanced row: OSC52 Clipboard).
+        const CLIPBOARD    = 1 << 10;
+        /// v1.11.5 (PLAN_v1115 §M8): `[notifications]` (Settings Advanced
+        /// rows: Notify Enabled / Threshold / Sound).
+        const NOTIFICATIONS = 1 << 11;
     }
 }
 
@@ -203,6 +216,12 @@ pub fn apply_overrides(base: &mut super::Config, profile: &ProfileConfig) {
     }
     if let Some(compat) = &profile.compat {
         base.compat = compat.clone();
+    }
+    if let Some(clipboard) = &profile.clipboard {
+        base.clipboard = *clipboard; // Copy
+    }
+    if let Some(notifications) = &profile.notifications {
+        base.notifications = *notifications; // Copy
     }
     if let Some(logo) = &profile.logo {
         base.logo = logo.clone();

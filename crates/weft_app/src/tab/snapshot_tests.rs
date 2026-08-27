@@ -174,7 +174,7 @@ fn queued_alt_screen_teardown_output_is_preserved() {
         .send(AppMsg::PtyOutput(b"\x1b[?1049lresume hint".to_vec()))
         .unwrap();
 
-    let (_, _, need_redraw) = tab.process_messages();
+    let (_, _, need_redraw, _) = tab.process_messages();
 
     assert!(need_redraw);
     assert!(!tab.terminal.as_ref().unwrap().is_alt_screen_active());
@@ -204,7 +204,7 @@ fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
         ))
         .unwrap();
 
-    let (_, blocks, need_redraw) = tab.process_messages();
+    let (_, blocks, need_redraw, _) = tab.process_messages();
 
     assert!(need_redraw);
     assert!(
@@ -213,7 +213,7 @@ fn queued_primary_tui_teardown_becomes_a_screen_snapshot() {
     );
     assert!(tab.terminal.as_ref().unwrap().primary_screen_exit_pending());
     tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
-    let (_, blocks, _) = tab.process_messages();
+    let (_, blocks, _, _) = tab.process_messages();
     assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].command, "screen-app");
     assert_eq!(
@@ -240,7 +240,7 @@ fn failed_interrupt_does_not_drop_queued_output_or_reset_shell_phase() {
         !tab.interrupt_pty(),
         "a tab without a PTY cannot deliver ETX"
     );
-    let (_, _, need_redraw) = tab.process_messages();
+    let (_, _, need_redraw, _) = tab.process_messages();
 
     assert!(need_redraw);
     assert_eq!(
@@ -298,7 +298,7 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
         .unwrap();
     tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
 
-    let (alive, blocks, need_redraw) = tab.process_messages();
+    let (alive, blocks, need_redraw, _) = tab.process_messages();
 
     assert!(!alive);
     assert!(need_redraw);
@@ -321,7 +321,7 @@ fn pty_exit_resets_kitty_keyboard_flags() {
     assert_eq!(terminal.keyboard_protocol_flags(), 3);
 
     tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
-    let (alive, _, _) = tab.process_messages();
+    let (alive, _, _, _) = tab.process_messages();
     assert!(!alive, "PtyExit must be processed");
     let terminal = tab.terminal.as_mut().unwrap();
     assert_eq!(terminal.keyboard_protocol_flags(), 0, "main stack cleared");
@@ -377,12 +377,12 @@ fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
     tab.msg_tx.send(AppMsg::PtyOutput(output)).unwrap();
     tab.msg_tx.send(AppMsg::PtyExit(Ok(130))).unwrap();
 
-    let (alive, blocks, _) = tab.process_messages();
+    let (alive, blocks, _, _) = tab.process_messages();
     assert!(alive);
     assert!(blocks.is_empty());
     assert!(tab.pending_pty_output.is_some());
 
-    let (alive, blocks, _) = tab.process_messages();
+    let (alive, blocks, _, _) = tab.process_messages();
     assert!(!alive);
     assert_eq!(blocks.len(), 1);
     assert!(blocks[0]
@@ -442,13 +442,13 @@ fn synchronized_output_suppresses_partial_frame_until_commit() {
     tab.msg_tx
         .send(AppMsg::PtyOutput(b"\x1b[?2026hpartial".to_vec()))
         .unwrap();
-    let (_, _, partial_redraw) = tab.process_messages();
+    let (_, _, partial_redraw, _) = tab.process_messages();
     assert!(!partial_redraw);
 
     tab.msg_tx
         .send(AppMsg::PtyOutput(b" frame\x1b[?2026l".to_vec()))
         .unwrap();
-    let (_, _, committed_redraw) = tab.process_messages();
+    let (_, _, committed_redraw, _) = tab.process_messages();
     assert!(committed_redraw);
     assert!(tab
         .terminal

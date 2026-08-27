@@ -183,8 +183,9 @@ fn emit_esc_atom(rng: &mut XorShift64, out: &mut Vec<u8>) {
             _ => unreachable!("rng.below(5) < 5"),
         },
         // OSC fragment — half terminate with BEL, half with ST. Codes 0
-        // (title, exercised by state) and 52 (clipboard, unhandled but
-        // still accumulated in vte's raw buffer).
+        // (title, exercised by state) and 52 (clipboard; v1.11.5 the payload
+        // is parsed — decodes to a ClipboardWrite UiEvent or, for garbage
+        // base64, is ignored with a trace — never a panic).
         14 => {
             out.extend_from_slice(if rng.below(2) == 0 {
                 b"\x1b]0;"
@@ -478,13 +479,15 @@ fn guard_differential_over_cap_osc_no_text_divergence() {
 /// ArrayVec → Vec change for OSC 8 URLs; nothing caps the Vec afterwards).
 /// `ESC]52;c;` + 4 MiB of payload is the audit's worst-case single OSC:
 /// memory grows ~4 MiB, but parsing must survive and resume immediately
-/// after the BEL — the trailing "OK" must land on the grid.
+/// after the BEL — the trailing "OK" must land on the grid. v1.11.5: OSC 52
+/// is now parsed — the guard-capped payload (≤ 1 MiB raw) decodes into a
+/// single in-bounds ClipboardWrite UiEvent (asserted below).
 #[test]
 fn unterminated_osc_four_mib_then_bel_recovers() {
     const PAYLOAD_SIZE: usize = 4 * 1024 * 1024;
 
     let mut bytes = Vec::with_capacity(PAYLOAD_SIZE + 16);
-    bytes.extend_from_slice(b"\x1b]52;c;"); // OSC 52 — unhandled, but vte still accumulates the raw payload
+    bytes.extend_from_slice(b"\x1b]52;c;"); // OSC 52 — vte accumulates the raw payload
     bytes.resize(PAYLOAD_SIZE, b'A');
     bytes.extend_from_slice(b"\x07OK"); // BEL terminates the OSC; ground state resumes with "OK"
 
@@ -496,6 +499,21 @@ fn unterminated_osc_four_mib_then_bel_recovers() {
         "OK",
         "parser must recover from a 4 MiB unterminated OSC"
     );
+
+    // v1.11.5: the guard-capped payload parses as one in-bounds
+    // ClipboardWrite UiEvent (never panics, never exceeds OSC52_MAX_BYTES).
+    let events = terminal.take_ui_events();
+    assert_eq!(events.len(), 1, "exactly one event from the 52;c; payload");
+    match &events[0] {
+        weft_core::vt::UiEvent::ClipboardWrite { data, truncated } => {
+            assert!(
+                data.len() <= weft_core::vt::OSC52_MAX_BYTES,
+                "decoded payload must stay within the business cap"
+            );
+            assert!(!truncated, "guard-capped raw ≤ 1MiB decodes below the cap");
+        }
+        other => panic!("expected ClipboardWrite, got {other:?}"),
+    }
 
     // v1.11.2 X1 (PLAN_v1112 §3.2): with the guard ON (default), the OSC is
     // truncated at 1 MiB so vte's raw buffer stops growing — the semantic

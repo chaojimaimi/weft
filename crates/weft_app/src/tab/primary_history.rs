@@ -272,7 +272,7 @@ mod tests {
             .expect("follow after browsing must schedule its own refresh wake");
         std::thread::sleep(delay + Duration::from_millis(5));
 
-        let (_, _, need_redraw) = tab.process_messages();
+        let (_, _, need_redraw, _) = tab.process_messages();
         assert!(need_redraw);
         assert_eq!(
             tab.terminal

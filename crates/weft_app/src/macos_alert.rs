@@ -368,6 +368,43 @@ fn format_snapshot_age(secs: u64) -> String {
     }
 }
 
+/// v1.11.5 (PLAN_v1115 §M3): show the OSC 52 clipboard-read permission
+/// prompt.
+///
+/// MUST be invoked from a `dispatch2::DispatchQueue::main().exec_async`
+/// block (same FIX_RECOVERY_MODAL_SPIN discipline as
+/// `show_large_paste_prompt` / `show_recovery_prompt`); the answer returns
+/// through the event-loop proxy as `AppEvent::Osc52ReadDecided`.
+///
+/// The headline deliberately says 「终端中的程序」 — weft cannot distinguish
+/// a local child from an ssh remote, so claiming "SSH/远端" would be false
+/// certainty (PLAN_v1115 §M3). Esc maps to Deny (the cancel heuristic);
+/// Enter (default button) allows.
+pub fn show_osc52_read_prompt(mtm: MainThreadMarker) -> Result<bool, AlertError> {
+    let alert = unsafe { NSAlert::new(mtm) };
+    unsafe {
+        alert.setMessageText(&NSString::from_str("终端中的程序请求读取剪贴板"));
+        alert.setInformativeText(&NSString::from_str(
+            "允许后，剪贴板内容将被发送给终端里正在请求的程序（含 ssh 远端）。\n\
+             拒绝后 30 秒内的读取请求不会再询问。",
+        ));
+        alert.setAlertStyle(NSAlertStyle::Warning);
+
+        // First button = default (Return) = allow; second = Deny so Esc
+        // routes there via AppKit's cancel heuristic (same order rationale
+        // as show_large_paste_prompt).
+        alert.addButtonWithTitle(&NSString::from_str("允许"));
+        alert.addButtonWithTitle(&NSString::from_str("拒绝"));
+        if let Some(cancel) = alert.buttons().get(1) {
+            cancel.setKeyEquivalent(&NSString::from_str("\u{1b}"));
+        }
+    }
+
+    // Button 0 = allow (NSAlertFirstButtonReturn = 1000), 1 = deny;
+    // any other response fails closed to deny.
+    Ok(unsafe { alert.runModal() } == 1000)
+}
+
 #[cfg(test)]
 mod export_preview_tests {
     use super::{

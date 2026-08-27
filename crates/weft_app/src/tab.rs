@@ -727,7 +727,23 @@ impl Tab {
     /// buffer, we process ~8ms worth, yield to the renderer, then resume next
     /// frame. The byte budget (`MAX_BYTES_PER_MESSAGE`) only governs splitting
     /// a single oversized message so one message can't monopolize a frame.
-    pub fn process_messages(&mut self) -> (bool, Vec<weft_core::blocks::Block>, bool) {
+    ///
+    /// Returns `(alive, drained_blocks, need_redraw, ui_events)`. v1.11.5
+    /// (PLAN_v1115 §M2): the 4th element drains `Terminal::take_ui_events()`
+    /// (OSC 52 / 9 / 777 app-facing events) at the same point where
+    /// `take_response` is consumed inside `process_pty_output`. Note (F18):
+    /// only the ACTIVE pane is pumped (`pump_pty`), so every drained ui
+    /// event comes from the active pane — would-be producers in background
+    /// panes simply don't run, same as their output; the app layer needs no
+    /// source disambiguation. Do not "fix" this by pumping every pane here.
+    pub fn process_messages(
+        &mut self,
+    ) -> (
+        bool,
+        Vec<weft_core::blocks::Block>,
+        bool,
+        Vec<weft_core::vt::UiEvent>,
+    ) {
         let mut need_redraw = false;
         // Split threshold for a single oversized message (matches the PTY
         // read buffer size). Messages larger than this are split: head is
@@ -795,6 +811,7 @@ impl Tab {
             self.refresh_primary_history_snapshot(processed_pty_output)
         };
         let mut drained = Vec::new();
+        let mut ui_events = Vec::new();
         let mut reset_scroll = false;
         let mut split_heads = 0usize;
         if let Some(terminal) = &mut self.terminal {
@@ -807,6 +824,9 @@ impl Tab {
                 need_redraw = true;
             }
             drained = terminal.block_tracker_mut().drain_unpersisted();
+            // v1.11.5 (PLAN_v1115 §M2): drain app-facing ui events at the
+            // response drain point (see the fn doc for the F18 note).
+            ui_events = terminal.take_ui_events();
             // v1.10.26 Batch D (D-3): collect any 1MiB history-split head
             // count settled this frame; the anchor compensation runs after
             // the terminal borrow ends (disjoint-pane field).
@@ -824,7 +844,7 @@ impl Tab {
             self.snap_to_bottom();
         }
 
-        (alive, drained, need_redraw)
+        (alive, drained, need_redraw, ui_events)
     }
 
     /// Whether this tab's terminal + pty are initialized.

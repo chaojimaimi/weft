@@ -45,12 +45,17 @@ mod layout;
 mod lifecycle_controller;
 mod macos_alert;
 mod macos_file_dialog;
+// v1.11.5 (PLAN_v1115 §M4): native notification sink (UNUserNotificationCenter
+// + bundle-identity hard gate).
+mod macos_notifications;
 mod macos_system;
 mod macos_window;
 mod menu;
 mod mouse_controller;
 mod mouse_press_controller;
 mod mouse_protocol_controller;
+// v1.11.5 (PLAN_v1115 §M5): pure notify / OSC52-deny decision logic.
+mod notify_policy;
 mod overlay;
 mod paint;
 mod palette_activation;
@@ -178,6 +183,17 @@ pub(crate) enum AppEvent {
     /// `App::apply_paste_decision`, which consumes
     /// `App.pending_paste_confirm` exactly once.
     PasteDecided(crate::macos_alert::PastePromptResponse),
+    /// v1.11.5 (PLAN_v1115 §M3): the deferred OSC 52 read prompt closed. The
+    /// user's answer pairs with the parked request ONLY when `seq` matches
+    /// (peek-compare-take — a stale decision never consumes a newer slot).
+    Osc52ReadDecided {
+        allowed: bool,
+        seq: u64,
+    },
+    /// v1.11.5 (PLAN_v1115 §M6): a posted notification was clicked (default
+    /// action). `block_id` routes back to the command block; `None`/stale
+    /// ids only front the window.
+    NotificationActivated(i64),
     PerformanceProbeStart,
     PerformanceProbeFinish,
 }
@@ -233,6 +249,26 @@ struct App {
     /// v1.6.3: Crash recovery controller. Manages debounced snapshot
     /// writes, clean-shutdown markers, and startup detection.
     recovery: recovery_controller::RecoveryController,
+    // ── v1.11.5 (PLAN_v1115 §M2): notification / OSC 52 plumbing ────────
+    /// Window focus state, maintained by the `WindowEvent::Focused` arm
+    /// (window_event_controller.rs). Initial `true` — conservative: a
+    /// not-yet-focused launch window posts fewer notifications, never more.
+    window_focused: bool,
+    /// Notify throttle shared by block-completion and remote (OSC 9/777)
+    /// notifications: at most one per `NOTIFY_MIN_GAP` (1s).
+    notify_limiter: crate::notify_policy::RateLimiter,
+    /// OSC 9;4 Dock badge debounce (200 ms latest-wins; Clear immediate).
+    dock_badge_debounce: crate::app::ui_events::DockBadgeDebounce,
+    /// v1.11.5 (PLAN_v1115 §M4): the process's notification sink (built in
+    /// `resumed` after the bundle-identity gate; NoopSink outside .app).
+    notification_sink: Box<dyn crate::macos_notifications::NotificationSink>,
+    /// v1.11.5 (PLAN_v1115 §M3): parked OSC 52 read request — single slot
+    /// (H-i). `Park` carries the seq handed to the modal and the PaneId the
+    /// answer must reach (tab indices shift; pane ids don't, D-g).
+    pending_osc52_read: Option<crate::app::ui_events::Osc52ReadPark>,
+    /// v1.11.5 (PLAN_v1115 D-c): after a user deny, read requests inside
+    /// the 30 s window are treated as deny without prompting again.
+    osc52_deny_cooldown: crate::notify_policy::DenyCooldown,
     /// v1.10.23: The recovery snapshot detected at startup, parked while
     /// the deferred recovery prompt is on screen. Consumed exactly once by
     /// `App::apply_recovery_choice` when `AppEvent::RecoveryChosen`
@@ -395,6 +431,19 @@ impl App {
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
             recovery: recovery_controller::RecoveryController::new(weft_cache_dir().as_deref()),
+            window_focused: true,
+            notify_limiter: crate::notify_policy::RateLimiter::new(
+                crate::notify_policy::NOTIFY_MIN_GAP,
+            ),
+            dock_badge_debounce: crate::app::ui_events::DockBadgeDebounce::default(),
+            // v1.11.5: the sink is replaced by `build_sink` in `resumed`
+            // (needs a MainThreadMarker there); the placeholder is safe —
+            // it drops everything with a debug trail.
+            notification_sink: Box::new(crate::macos_notifications::NoopSink),
+            pending_osc52_read: None,
+            osc52_deny_cooldown: crate::notify_policy::DenyCooldown::new(
+                crate::notify_policy::OSC52_DENY_COOLDOWN,
+            ),
             pending_recovery: None,
             pending_paste_confirm: None,
             paste_allow_for_session: false,
@@ -460,11 +509,16 @@ impl App {
         let mut had_pty_output = false;
         let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
+        let mut drained_ui_events: Vec<weft_core::vt::UiEvent> = Vec::new();
         let mut exit_requested = false;
         for i in 0..self.sessions.len() {
-            let (alive, drained, need_redraw) = self.sessions.tabs_mut()[i].process_messages();
+            let (alive, drained, need_redraw, ui_events) =
+                self.sessions.tabs_mut()[i].process_messages();
             // Collect final blocks before handling a shell exit.
             drained_blocks.extend(drained);
+            // v1.11.5 (PLAN_v1115 §M2): app-facing ui events (OSC 52 / 9 /
+            // 777) — dispatch after the loop, once tab borrows are released.
+            drained_ui_events.extend(ui_events);
             if !alive {
                 // Exit the app only when the last shell exits; Cmd+W is separate.
                 let dead_session_id = self.sessions.tab(i).map(|tab| tab.session_id);
@@ -514,6 +568,22 @@ impl App {
         if deferred_local_scroll != 0 {
             self.scroll_local_view(deferred_local_scroll);
         }
+        // v1.11.5 (PLAN_v1115 §M2): app-facing ui events (OSC 52 clipboard,
+        // OSC 9/777 notify, OSC 9;4 Dock progress) — dispatched after all
+        // tab borrows are released. Each arm gates against config + state;
+        // the sink calls land in later modules (M3 read prompt, M4 notify
+        // sink, M7 Dock badge).
+        if !drained_ui_events.is_empty() {
+            self.dispatch_ui_events(drained_ui_events);
+        }
+        // v1.11.5 (PLAN_v1115 §M5): finished command blocks → completion
+        // notifications (threshold + focus gate + rate limiter inside).
+        if !drained_blocks.is_empty() {
+            self.dispatch_block_completion_notifications(&drained_blocks);
+        }
+        // v1.11.5: land a debounced Dock badge whose window elapsed (a
+        // stalled OSC 9;4 stream still reaches its final value ~200ms late).
+        self.flush_dock_badge();
         let effects = effect::process_message_effects(exit_requested, drained_blocks, any_redraw);
         self.drain_effects(effects);
         had_pty_output

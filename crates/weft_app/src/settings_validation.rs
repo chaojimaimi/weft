@@ -142,6 +142,44 @@ pub(crate) fn cycled_paste_threshold(current_kib: u32, delta: i32) -> u32 {
     tiers[next]
 }
 
+/// v1.11.5 (PLAN_v1115 §M8): legal Settings cycles for the Advanced page.
+/// Notify threshold tiers (seconds, X7). An out-of-tier stored value
+/// (hand-edited TOML, e.g. 45) re-anchors at the default (30) so the cycle
+/// stays predictable.
+pub(crate) const NOTIFY_THRESHOLD_TIERS_SECS: [u64; 4] = [10, 30, 60, 120];
+
+/// v1.11.5 (PLAN_v1115 §M8, reviewer P2-5): single source for the Advanced
+/// tab's row count (4 legacy rows + 4 notification/clipboard rows). Every
+/// site that lays out, paints, hit-tests, or key-navigates the tab must
+/// consume THIS — numeric literals drifted across five call sites were the
+/// exact coupling hazard F15 warned about.
+pub(crate) const ADVANCED_ROW_COUNT: usize = 8;
+
+/// v1.11.5 (PLAN_v1115 §M8): next notify threshold after cycling `delta`
+/// steps through the four tiers (10s/30s/60s/120s).
+pub(crate) fn cycled_notify_threshold(current_secs: u64, delta: i32) -> u64 {
+    let idx = NOTIFY_THRESHOLD_TIERS_SECS
+        .iter()
+        .position(|tier| *tier == current_secs)
+        .unwrap_or(1); // 30 = default tier
+    let next = (idx as i32 + delta).rem_euclid(NOTIFY_THRESHOLD_TIERS_SECS.len() as i32) as usize;
+    NOTIFY_THRESHOLD_TIERS_SECS[next]
+}
+
+/// v1.11.5 (PLAN_v1115 §M8): next OSC 52 mode after cycling `delta` steps
+/// through the three states (default → off → unrestricted). `unrestricted`
+/// carries the silent-read warning in the UI rendering, not here.
+pub(crate) fn cycled_osc52_mode(
+    current: weft_core::config::Osc52Mode,
+    delta: i32,
+) -> weft_core::config::Osc52Mode {
+    use weft_core::config::Osc52Mode;
+    const MODES: [Osc52Mode; 3] = [Osc52Mode::Default, Osc52Mode::Off, Osc52Mode::Unrestricted];
+    let idx = MODES.iter().position(|m| *m == current).unwrap_or(0);
+    let next = (idx as i32 + delta).rem_euclid(MODES.len() as i32) as usize;
+    MODES[next]
+}
+
 /// v1.11.1 (PLAN_v1111 §4.6): the Input page's paste-protection values,
 /// grouped so the (already huge) `SettingsDrawParams` /
 /// `build_overlay_stack` signatures gain one member instead of three.
@@ -676,5 +714,43 @@ mod tests {
                 || adjust_input_row(&mut editor, &mut paste_cfg, row, 1).is_some();
             assert!(changed, "toggle row {row} ({label}) must be adjustable");
         }
+    }
+
+    // ── v1.11.5 (PLAN_v1115 §M8): Advanced-page cycles ────────────────
+
+    #[test]
+    fn notify_threshold_cycles_through_four_tiers() {
+        // 30 → 60 (right) / 30 → 10 (left), wrapping both ends.
+        assert_eq!(cycled_notify_threshold(30, 1), 60);
+        assert_eq!(cycled_notify_threshold(30, -1), 10);
+        assert_eq!(cycled_notify_threshold(120, 1), 10, "wrap around top");
+        assert_eq!(cycled_notify_threshold(10, -1), 120, "wrap around bottom");
+        assert_eq!(cycled_notify_threshold(30, 0), 30, "no-op");
+        // Hand-edited out-of-tier value re-anchors at the default (30).
+        assert_eq!(cycled_notify_threshold(45, 1), 60);
+        assert_eq!(cycled_notify_threshold(0, 1), 60);
+        // The exact tiers the Settings UI promises.
+        assert_eq!(NOTIFY_THRESHOLD_TIERS_SECS, [10, 30, 60, 120]);
+    }
+
+    #[test]
+    fn osc52_mode_cycles_through_three_states() {
+        use weft_core::config::Osc52Mode;
+        assert_eq!(cycled_osc52_mode(Osc52Mode::Default, 1), Osc52Mode::Off);
+        assert_eq!(
+            cycled_osc52_mode(Osc52Mode::Off, 1),
+            Osc52Mode::Unrestricted
+        );
+        assert_eq!(
+            cycled_osc52_mode(Osc52Mode::Unrestricted, 1),
+            Osc52Mode::Default,
+            "wrap around"
+        );
+        assert_eq!(
+            cycled_osc52_mode(Osc52Mode::Default, -1),
+            Osc52Mode::Unrestricted,
+            "wrap around backwards"
+        );
+        assert_eq!(cycled_osc52_mode(Osc52Mode::Off, 0), Osc52Mode::Off);
     }
 }

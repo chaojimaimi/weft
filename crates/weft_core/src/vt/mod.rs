@@ -16,11 +16,21 @@ mod screen_exit;
 // the facade stays within its architecture-gate budget.
 mod sgr_underline;
 mod staging;
+mod ui_events;
 pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
 pub use screen_exit::{
     TuiColsKind, PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
 };
+// v1.11.5 (PLAN_v1115 §M1): app-facing events drained via
+// `Terminal::take_ui_events()` at the same point as `take_response()`, plus
+// the shared caps the app layer re-checks (notify texts, OSC 52 replies).
+pub use ui_events::{
+    DockProgress, UiEvent, NOTIFY_BODY_MAX, NOTIFY_TITLE_MAX, OSC52_MAX_BYTES, OSC52_READ_REPLY_MAX,
+};
+// v1.11.5 (PLAN_v1115 §M3): OSC 52 read-answer byte builder (None = too
+// large, answer as deny) — app-side writes it straight to the pane PTY.
+pub use osc::osc52_read_reply;
 // Test-only re-export: lib code reaches the hysteresis via `tui_cols_kind`,
 // the vt unit tests reach the pure decision + threshold directly.
 #[cfg(test)]
@@ -75,6 +85,10 @@ pub struct Terminal {
     saved_cursor: Option<Cursor>,
     /// Bytes written back for DA/DSR/size and capability queries.
     pending_output: Vec<u8>,
+    /// v1.11.5 (PLAN_v1115 §M1): app-facing events discovered during parsing
+    /// (OSC 52 clipboard / OSC 9+777 notify / OSC 9;4 progress). Drained by
+    /// `take_ui_events()` at the same drain point as `take_response()`.
+    ui_events: Vec<UiEvent>,
     /// Active OSC 8 hyperlink; printed cells are tagged in the side-map.
     active_hyperlink_id: Option<u32>,
     /// OSC 8 hyperlink registry — maps cell coords → id → URL. External to
@@ -150,6 +164,7 @@ impl Terminal {
             alt_grid: Grid::with_scrollback(rows, cols, 0),
             saved_cursor: None,
             pending_output: Vec::new(),
+            ui_events: Vec::new(),
             active_hyperlink_id: None,
             hyperlinks: HyperlinkRegistry::new(),
             parser_in_ground_state: true,
@@ -761,6 +776,20 @@ impl Terminal {
     /// these to the PTY after each `process` batch.
     pub fn take_response(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending_output)
+    }
+
+    /// v1.11.5 (PLAN_v1115 §M1): queue an app-facing event discovered during
+    /// parsing. Internal — `osc_dispatch` is the only producer.
+    pub(crate) fn push_ui_event(&mut self, event: UiEvent) {
+        self.ui_events.push(event);
+    }
+
+    /// Take any pending app-facing ui events (OSC 52 clipboard access,
+    /// OSC 9/777 notifications, OSC 9;4 Dock progress). The app drains this
+    /// at the same point as `take_response()`. `reset()` replaces the whole
+    /// object, so RIS (ESC c) automatically clears the queue.
+    pub fn take_ui_events(&mut self) -> Vec<UiEvent> {
+        std::mem::take(&mut self.ui_events)
     }
 
     /// Resize the terminal grid (and alternate screen to match).

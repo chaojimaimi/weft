@@ -544,6 +544,42 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
             }
         }
     });
+    // v1.11.5 (PLAN_v1115 §M8): `[clipboard]` / `[notifications]` are
+    // profile-overridable — same only-non-default pattern as [compat].
+    write_profile_section(table, "clipboard", profile.clipboard.is_some(), |t| {
+        if let Some(c) = &profile.clipboard {
+            if c.osc52 != super::ClipboardConfig::default().osc52 {
+                t["osc52"] = toml_edit::value(c.osc52.as_str());
+            } else if t.contains_key("osc52") {
+                t.remove("osc52");
+            }
+        }
+    });
+    write_profile_section(
+        table,
+        "notifications",
+        profile.notifications.is_some(),
+        |t| {
+            if let Some(n) = &profile.notifications {
+                let default = super::NotificationsConfig::default();
+                if n.enabled != default.enabled {
+                    t["enabled"] = toml_edit::value(n.enabled);
+                } else if t.contains_key("enabled") {
+                    t.remove("enabled");
+                }
+                if n.threshold_secs != default.threshold_secs {
+                    t["threshold_secs"] = toml_edit::value(n.threshold_secs as i64);
+                } else if t.contains_key("threshold_secs") {
+                    t.remove("threshold_secs");
+                }
+                if n.sound != default.sound {
+                    t["sound"] = toml_edit::value(n.sound);
+                } else if t.contains_key("sound") {
+                    t.remove("sound");
+                }
+            }
+        },
+    );
     write_profile_section(table, "editor", profile.editor.is_some(), |t| {
         if let Some(e) = &profile.editor {
             if e.submit_on_ctrl_enter {

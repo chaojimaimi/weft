@@ -285,6 +285,10 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         profiles: &[],
         semantic_output_enabled: true,
         ai: test_ai_view(),
+        notify_enabled: true,
+        notify_threshold_secs: 30,
+        notify_sound: false,
+        osc52_mode: weft_core::config::Osc52Mode::Default,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -344,6 +348,10 @@ fn settings_overlay_is_modal_and_highest_z() {
                     profiles: &[],
                     semantic_output_enabled: true,
                     ai: test_ai_view(),
+                    notify_enabled: true,
+                    notify_threshold_secs: 30,
+                    notify_sound: false,
+                    osc52_mode: weft_core::config::Osc52Mode::Default,
                 }),
             },
         ],

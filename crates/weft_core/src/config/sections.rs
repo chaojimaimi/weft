@@ -306,6 +306,97 @@ impl Default for CompatConfig {
     }
 }
 
+/// v1.11.5 (PLAN_v1115 §M8): OSC 52 clipboard access mode.
+///
+/// - `Default` — writes to the system clipboard pass through; read
+///   requests prompt once per deny-cooldown window.
+/// - `Off` — both directions are swallowed at the app gate (parsing still
+///   happens; the events are dropped with a trace).
+/// - `Unrestricted` — writes AND reads pass through silently. Warning: any
+///   program inside the terminal (including an ssh remote) can then read
+///   the clipboard without asking.
+///
+/// Unknown/illegal TOML values fall back to `Default` — a typo must never
+/// fail the whole config parse (same philosophy as other runtime_* clamps).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Osc52Mode {
+    #[default]
+    Default,
+    Off,
+    Unrestricted,
+}
+
+impl Osc52Mode {
+    /// Canonical TOML spelling (lowercase).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Off => "off",
+            Self::Unrestricted => "unrestricted",
+        }
+    }
+
+    /// Parse a TOML value; anything unrecognized → `Default` (never fails).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "off" => Self::Off,
+            "unrestricted" => Self::Unrestricted,
+            _ => Self::Default,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Osc52Mode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
+/// v1.11.5 (PLAN_v1115 §M8): `[clipboard]` section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    pub osc52: Osc52Mode,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            osc52: Osc52Mode::Default,
+        }
+    }
+}
+
+/// v1.11.5 (PLAN_v1115 §M8): `[notifications]` section.
+///
+/// - `enabled` — master switch (总闸). All four notification paths
+///   (block completion, OSC 9, OSC 777) honor it.
+/// - `threshold_secs` — minimum command runtime (block completion) before
+///   a notification may post; exact equality hits (X7 window gate is
+///   focus-based: only while the window is out of focus).
+/// - `sound` — play the system sound alongside the banner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    pub threshold_secs: u64,
+    pub sound: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_secs: 30,
+            sound: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod paste_config_tests {
     use super::{PasteConfig, PASTE_SIZE_TIERS_KIB};

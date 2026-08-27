@@ -14,3 +14,5 @@ pub(crate) mod effect_dispatch;
 pub(crate) mod focus;
 pub(crate) mod helpers;
 pub(crate) mod keyboard;
+// v1.11.5 (PLAN_v1115 §M2): UI-event dispatch table + Dock badge debounce.
+pub(crate) mod ui_events;

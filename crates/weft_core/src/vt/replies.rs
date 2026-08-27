@@ -9,6 +9,7 @@
 
 use super::attrs::Attrs;
 use crate::grid::{CellColor, CellFlags, UnderlineStyle};
+use base64::Engine;
 
 /// XTVERSION reply (`CSI > 0 q` / `CSI > q`): `DCS > | weft <version> ST`,
 /// the form xterm answers with. Applications (opencode, etc.) parse the
@@ -72,28 +73,16 @@ pub fn xtgettcap_reply(hex_name: &[u8]) -> Option<Vec<u8>> {
     Some(reply)
 }
 
-/// RFC 4648 standard alphabet, no padding (xterm's XTGETTCAP answers omit
-/// padding). No external dependency — this is the only base64 use in the
-/// tree; the kitty graphics path stores encoded bytes but never encodes.
+/// RFC 4648 standard alphabet, no padding — xterm's XTGETTCAP answers omit
+/// padding. v1.11.5 (PLAN_v1115 D-b): replaced the handwritten encoder with
+/// the promoted `base64` crate (locked at 0.22.1); `Pad::None` keeps the
+/// `Su` golden answer byte-identical (`G1s0OiVkbQ`, asserted in tests).
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        out.push(ALPHABET[(b[0] >> 2) as usize] as char);
-        out.push(ALPHABET[((b[0] & 0x03) << 4 | b[1] >> 4) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((b[1] & 0x0f) << 2 | b[2] >> 6) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(b[2] & 0x3f) as usize] as char);
-        }
-    }
-    out
+    base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new().with_encode_padding(false),
+    )
+    .encode(input)
 }
 
 /// Negative XTGETTCAP answers: `DCS 0 + r <hex-name> ST` per requested name.

@@ -357,6 +357,10 @@ impl App {
             }
             WindowEvent::Ime(ime_event) => self.handle_ime_event(ime_event),
             WindowEvent::Focused(focused) => {
+                // v1.11.5 (PLAN_v1115 §M2): focus drives the notification
+                // gate — long commands notify only while the window is out
+                // of focus. Initial state is `true` (see `App::new`).
+                self.window_focused = focused;
                 // Reset blink timer on focus change
                 if focused {
                     self.window_runtime.cursor_blink_on = true;

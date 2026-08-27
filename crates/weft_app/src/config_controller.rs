@@ -149,6 +149,11 @@ struct ConfigApplyDelta {
     update_bold_is_bright: bool,
     /// v1.11.4 (PLAN_v1114 §3): [compat] kitty_keyboard flip.
     update_kitty_keyboard: bool,
+    /// v1.11.5 (PLAN_v1115 §M8): [clipboard] osc52 mode diff (3-state).
+    update_osc52_mode: bool,
+    /// v1.11.5 (PLAN_v1115 §M8): [notifications] diff — any of
+    /// enabled / threshold_secs / sound.
+    update_notifications: bool,
 }
 
 fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> ConfigApplyDelta {
@@ -167,6 +172,8 @@ fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> Confi
             || current.window.height != next.window.height,
         update_bold_is_bright: current.compat.bold_is_bright != next.compat.bold_is_bright,
         update_kitty_keyboard: current.compat.kitty_keyboard != next.compat.kitty_keyboard,
+        update_osc52_mode: current.clipboard.osc52 != next.clipboard.osc52,
+        update_notifications: current.notifications != next.notifications,
     }
 }
 
@@ -356,6 +363,14 @@ impl App {
                 config.compat.kitty_keyboard,
             );
         }
+
+        // v1.11.5 (PLAN_v1115 §M8): [clipboard].osc52 / [notifications]
+        // need NO runtime walk — both gates are consumed LIVE from
+        // `config_state.config` at event time (OSC 52 dispatch /
+        // notification policy), and `self.config_state.config = config`
+        // below atomically swaps the value every consumer sees next.
+        // The delta flags exist so the settings save/reload tests can
+        // assert the exact keys that changed (see tests below).
 
         // Keybindings.
         self.config_state.keybindings = config.keybindings();
@@ -587,6 +602,8 @@ mod tests {
                 resize_window: true,
                 update_bold_is_bright: false,
                 update_kitty_keyboard: false,
+                update_osc52_mode: false,
+                update_notifications: false,
             }
         );
         assert_eq!(
@@ -598,6 +615,8 @@ mod tests {
                 resize_window: false,
                 update_bold_is_bright: false,
                 update_kitty_keyboard: false,
+                update_osc52_mode: false,
+                update_notifications: false,
             },
             "committing loaded state before apply would hide every runtime delta"
         );
@@ -795,4 +814,51 @@ mod tests {
     // dedicated multi-pane-within-one-tab test would need either a test
     // constructor that builds a multi-pane `Tab` without a proxy, or a
     // main-thread test harness — both are out of scope for v1.5.0.
+}
+
+/// v1.11.5 (PLAN_v1115 §M8): the [clipboard].osc52 mode diff arms
+/// `update_osc52_mode` (3-state: default→off→unrestricted both ways).
+/// Consumption is live from config_state, but the delta flag pins the
+/// keys the settings save/reload tests must exercise.
+#[test]
+fn apply_delta_arms_osc52_mode_on_mode_change() {
+    use weft_core::config::Osc52Mode;
+    let current = Config::default();
+    assert_eq!(current.clipboard.osc52, Osc52Mode::Default);
+    let mut next = current.clone();
+    next.clipboard.osc52 = Osc52Mode::Off;
+    assert!(config_apply_delta(&current, &next, 1.0).update_osc52_mode);
+    next.clipboard.osc52 = Osc52Mode::Unrestricted;
+    assert!(config_apply_delta(&current, &next, 1.0).update_osc52_mode);
+    assert!(
+        !config_apply_delta(&next, &next, 1.0).update_osc52_mode,
+        "same mode → no change"
+    );
+}
+
+/// v1.11.5 (PLAN_v1115 §M8): any [notifications] key change arms
+/// `update_notifications`.
+#[test]
+fn apply_delta_arms_notifications_on_any_key_change() {
+    use weft_core::config::NotificationsConfig;
+    let current = Config::default();
+    let mut next = current.clone();
+    next.notifications = NotificationsConfig {
+        enabled: false,
+        ..current.notifications
+    };
+    assert!(
+        config_apply_delta(&current, &next, 1.0).update_notifications,
+        "enabled flip arms"
+    );
+    let mut next2 = current.clone();
+    next2.notifications.threshold_secs = 120;
+    assert!(config_apply_delta(&current, &next2, 1.0).update_notifications);
+    let mut next3 = current.clone();
+    next3.notifications.sound = true;
+    assert!(config_apply_delta(&current, &next3, 1.0).update_notifications);
+    assert!(
+        !config_apply_delta(&current, &current, 1.0).update_notifications,
+        "identical → no change"
+    );
 }

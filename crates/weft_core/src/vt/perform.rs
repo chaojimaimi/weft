@@ -1,7 +1,10 @@
 use super::attrs::ShellMarker;
-use super::osc::{parse_osc7_cwd, parse_x11_color};
+use super::osc::{
+    parse_osc52, parse_osc7_cwd, parse_osc_notify, parse_osc_progress, parse_x11_color, Osc52Result,
+};
 use super::param;
 use super::replies;
+use super::ui_events::UiEvent;
 use super::Terminal;
 use super::PRIMARY_SCREEN_EXIT_SETTLE_DELAY;
 use crate::blocks::ShellPhase;
@@ -780,13 +783,53 @@ impl vte::Perform for Terminal {
                 }
             }
             "9" => {
-                // Custom OSC 9;git=<branch> — shell hook reports the git branch.
-                if let Some(payload) = params.get(1) {
+                // OSC 9 has three faces:
+                //   1. `9;4;state[;progress]` — Dock progress (iTerm2 family,
+                //      PLAN_v1115 §M1; state semantics in osc.rs).
+                //   2. `9;git=<branch>` — Weft shell-hook branch report
+                //      (legacy, kept; the git fixture must stay green).
+                //   3. `9;message` — remote notification request (iTerm2).
+                if params.get(1).is_some_and(|p| *p == b"4") {
+                    if let Some(progress) = parse_osc_progress(
+                        params.get(2).copied().unwrap_or(b""),
+                        params.get(3).copied().unwrap_or(b""),
+                    ) {
+                        self.push_ui_event(UiEvent::DockProgress(progress));
+                    }
+                } else if let Some(payload) = params.get(1) {
                     if let Ok(s) = std::str::from_utf8(payload) {
                         if let Some(branch) = s.strip_prefix("git=") {
                             self.git_branch = Some(branch.to_string());
+                        } else if let Some(text) = parse_osc_notify(params) {
+                            self.push_ui_event(UiEvent::RemoteNotify {
+                                title: text.title,
+                                body: text.body,
+                            });
                         }
                     }
+                }
+            }
+            "52" => {
+                // OSC 52 — clipboard exchange (PLAN_v1115 §M1). Parsed pure:
+                // the app layer gates + answers in its own feature modules.
+                match parse_osc52(params) {
+                    Osc52Result::Read => self.push_ui_event(UiEvent::ClipboardReadRequest),
+                    Osc52Result::Write { data, truncated } => {
+                        self.push_ui_event(UiEvent::ClipboardWrite { data, truncated });
+                    }
+                    Osc52Result::Ignore => {
+                        tracing::trace!("OSC 52 ignored (non-clipboard selection or malformed)")
+                    }
+                }
+            }
+            "777" => {
+                // OSC 777;notify;title;body — remote notification
+                // (rxvt/wezterm family; non-notify subcommands → no event).
+                if let Some(text) = parse_osc_notify(params) {
+                    self.push_ui_event(UiEvent::RemoteNotify {
+                        title: text.title,
+                        body: text.body,
+                    });
                 }
             }
             "8" => {

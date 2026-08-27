@@ -367,6 +367,24 @@ pub(crate) fn build_settings_scene(
                 state: String::new(),
             });
         }
+        // v1.11.5 (PLAN_v1115 §M8): rows 4..ADVANCED_ROW_COUNT are the new
+        // notification / clipboard rows — clickable like standard rows
+        // (select; then ←/→ adjusts; Enter saves).
+        for row in 4..crate::settings_validation::ADVANCED_ROW_COUNT {
+            let row_y = layout.content_top + row as f32 * cell_h;
+            let row_rect: Rect = [layout.content_x0, row_y, layout.content_x1, row_y + cell_h];
+            scene.hits.push(HitRegion::from_rect(
+                row_rect,
+                SettingsTarget::ContentRow(row),
+            ));
+            scene.semantics.push(SemanticNode {
+                role: SemanticRole::ListItem,
+                label: format!("Setting row {}", row + 1),
+                bounds: row_rect,
+                focus: Some(FocusId::Settings),
+                state: String::new(),
+            });
+        }
     }
 
     // Footer buttons.
@@ -802,6 +820,36 @@ mod tests {
         assert_eq!(
             settings_target_at(&scene, content_x, 265.0),
             Some(SettingsTarget::AdvancedExport),
+        );
+    }
+
+    /// v1.11.5 (PLAN_v1115 §M8): the Advanced tab's new rows 4-7 (Notify
+    /// Enabled / Threshold / Sound / OSC52 Clipboard) register ContentRow
+    /// hit targets so click-to-select works like every standard row.
+    #[test]
+    fn advanced_rows_4_to_7_register_content_row_hits() {
+        let tabs = SettingsTab::ALL.to_vec();
+        let layout = sample_layout();
+        let scene =
+            build_settings_scene(&layout, &tabs, SettingsTab::Advanced, (0, 8, 0), CELL_H, 0);
+        let content_x = (layout.content_x0 + layout.content_x1) / 2.0;
+        // Labels sit above cell centers in sample_layout (content_top=200):
+        // row 4 → y≈285, row 5 → y≈305, row 6 → y≈325, row 7 → y≈345.
+        assert_eq!(
+            settings_target_at(&scene, content_x, 285.0),
+            Some(SettingsTarget::ContentRow(4)),
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 305.0),
+            Some(SettingsTarget::ContentRow(5)),
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 325.0),
+            Some(SettingsTarget::ContentRow(6)),
+        );
+        assert_eq!(
+            settings_target_at(&scene, content_x, 345.0),
+            Some(SettingsTarget::ContentRow(7)),
         );
     }
 

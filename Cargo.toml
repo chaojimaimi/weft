@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "1.11.4"
+version = "1.11.5"
 edition = "2021"
 license = "MIT"
 authors = ["Weft Contributors"]
@@ -25,14 +25,24 @@ rust-version = "1.75"
 vte = { version = "0.13", default-features = false }
 tokio = { version = "1", features = ["full"] }
 nix = { version = "0.29", features = ["term", "process", "signal", "fs", "poll"] }
+# v1.11.5 OSC52: already in Cargo.lock as a transitive dep (0.22.1) — promote
+# to a direct dependency pinned at the locked version (zero drift).
+base64 = "=0.22.1"
 
 # Rendering
+# NOTE (v1.11.5): objc2 family is pinned at the lockfile's current values
+# (objc2 0.5.2 / block2 0.5.1 / objc2-* 0.2.2) — dispatch2's `std` feature is
+# default-features=false precisely to keep objc2 0.6.x / block2 0.6.x out of
+# the tree. Do not bump these casually; the `exception` feature on objc2 lets
+# macOS_notifications wrap `NSException` foreign unwinds in `objc2::exception::catch`.
 metal = "0.29"
-objc2 = "0.5"
+objc2 = { version = "0.5", features = ["exception"] }
 objc2-metal = "0.2"
-objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry", "NSString"] }
-objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton"] }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry", "NSString", "NSObject"] }
+objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton", "NSDockTile"] }
 objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer"] }
+objc2-user-notifications = { version = "=0.2.2", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSound", "UNNotification", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
+block2 = "=0.5.1"
 winit = "0.30"
 # `block` backs the `Block<...>` callback type used by Metal's
 # `add_completed_handler` (frame-trace GPU timing) and other Objective-C APIs.

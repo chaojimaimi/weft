@@ -615,9 +615,46 @@ impl App {
                 // triggers it, ←/→ is a no-op.
                 _ => {}
             },
-            SettingsTab::Advanced => {
-                // Placeholder rows — no real config backing yet.
-            }
+            SettingsTab::Advanced => match self.settings.selection {
+                // v1.11.5 (PLAN_v1115 §M8): rows 4-7 are the new
+                // notification / clipboard rows; rows 0-3 (Debug Logging,
+                // Experimental, Import, Export) stay non-adjustable.
+                4 => {
+                    // Notify Enabled: toggle.
+                    self.settings.draft.notifications.enabled =
+                        directional_bool(self.settings.draft.notifications.enabled, delta);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::NOTIFICATIONS);
+                }
+                5 => {
+                    // Notify Threshold: cycle 10s/30s/60s/120s.
+                    self.settings.draft.notifications.threshold_secs =
+                        crate::settings_validation::cycled_notify_threshold(
+                            self.settings.draft.notifications.threshold_secs,
+                            delta,
+                        );
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::NOTIFICATIONS);
+                }
+                6 => {
+                    // Notify Sound: toggle.
+                    self.settings.draft.notifications.sound =
+                        directional_bool(self.settings.draft.notifications.sound, delta);
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::NOTIFICATIONS);
+                }
+                7 => {
+                    // OSC52 Clipboard: cycle default/off/unrestricted.
+                    self.settings.draft.clipboard.osc52 =
+                        crate::settings_validation::cycled_osc52_mode(
+                            self.settings.draft.clipboard.osc52,
+                            delta,
+                        );
+                    self.settings
+                        .mark_dirty(weft_core::config::ConfigSectionMask::CLIPBOARD);
+                }
+                _ => {}
+            },
         }
         if self.settings.dirty {
             self.refresh_settings_validation();
@@ -755,7 +792,10 @@ impl App {
             // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
             // Cmd Generation + Error Diagnosis + Test Connection.
             SettingsTab::LocalAi => 8,
-            SettingsTab::Advanced => 4, // Debug Logging + Experimental + Import + Export (v1.5.2).
+            // v1.11.5 (PLAN_v1115 §M8): 4 rows added (Notify Enabled /
+            // Threshold / Notify Sound / OSC52 Clipboard); Import/Export
+            // stay at rows 2/3 so the v1.5.2 Enter mapping never moves.
+            SettingsTab::Advanced => crate::settings_validation::ADVANCED_ROW_COUNT,
         }
     }
 

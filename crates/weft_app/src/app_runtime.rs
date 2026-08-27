@@ -312,6 +312,17 @@ impl ApplicationHandler<AppEvent> for App {
                 // FIX_RECOVERY_MODAL_SPIN discipline as RecoveryChosen).
                 self.apply_paste_decision(response);
             }
+            AppEvent::Osc52ReadDecided { allowed, seq } => {
+                // v1.11.5 (PLAN_v1115 §M3): deferred OSC 52 read permission
+                // prompt closed. Peek-compare-take pairs it with the parked
+                // request (stale decisions never consume newer slots).
+                self.apply_osc52_read_decision(allowed, seq);
+            }
+            AppEvent::NotificationActivated(block_id) => {
+                // v1.11.5 (PLAN_v1115 §M6): notification clicked — front +
+                // jump (implemented in effect_dispatch).
+                self.handle_notification_activated(block_id);
+            }
             AppEvent::AccessibilityPress {
                 generation,
                 node_id,
@@ -332,6 +343,16 @@ impl ApplicationHandler<AppEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
+        }
+
+        // v1.11.5 (PLAN_v1115 §M4): build the notification sink once the
+        // event loop is up (bundle-identity gate inside; NoopSink for dev
+        // binaries). Requires a MainThreadMarker — we are on main here.
+        if let Some(mtm) = objc2_foundation::MainThreadMarker::new() {
+            self.notification_sink =
+                crate::macos_notifications::build_sink(mtm, self.proxy.clone());
+        } else {
+            tracing::warn!("notification sink: not on main thread at resumed; keeping NoopSink");
         }
 
         let win = &self.config_state.config.window;

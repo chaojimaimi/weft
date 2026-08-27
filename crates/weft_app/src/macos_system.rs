@@ -1,4 +1,4 @@
-//! macOS system integration kept outside the application orchestrator.
+//! macOS system integration kept outside the application orchestrator. ⚠ AT the 800-line architecture ceiling — new logic goes to a sibling module first (v1.11.5 set_dock_badge → macos_notifications.rs is the model).
 
 use objc2::msg_send;
 use objc2::runtime::AnyObject;
@@ -100,9 +100,8 @@ pub(super) unsafe fn system_increase_contrast() -> bool {
     })
 }
 
-/// Copy text to macOS system clipboard using NSPasteboard.
-///
-/// v1.11.0 (M5, AUDIT_v1.10.39): panic → log + drop; `guarded_unwind`.
+/// Copy text to macOS system clipboard using NSPasteboard. v1.11.0 (M5):
+/// panic → log + drop; `guarded_unwind`.
 pub(super) fn clipboard_copy(text: &str) {
     guarded_unwind("clipboard_copy", (), || unsafe {
         let pb_cls = objc2::ffi::objc_getClass(c"NSPasteboard".as_ptr());
@@ -118,8 +117,10 @@ pub(super) fn clipboard_copy(text: &str) {
         // NSPasteboardTypeString == "public.utf8-plain-text". Build NSStrings
         // for the value and the type, then use the real setters (the old code
         // called non-existent `setString:` and `string` selectors, so the
-        // clipboard never actually worked).
-        let c_text = std::ffi::CString::new(text).unwrap_or_default();
+        // clipboard never actually worked). v1.11.5 (F13): NUL must not EMPTY it.
+        let Ok(c_text) = std::ffi::CString::new(text.replace('\x00', "").as_str()) else {
+            return tracing::warn!("clipboard_copy: invalid C string");
+        };
         let value_ns: *mut AnyObject =
             msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_text.as_ptr()];
         let c_type = std::ffi::CString::new("public.utf8-plain-text").unwrap();

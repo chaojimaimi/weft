@@ -546,6 +546,12 @@ impl App {
                 &settings_profiles,
                 self.settings.draft.theme.semantic_output_enabled(),
                 settings_ai,
+                // v1.11.5 (PLAN_v1115 §M8): Advanced notification/clipboard
+                // rows (order matches build_overlay_stack's tail params).
+                self.settings.draft.notifications.enabled,
+                self.settings.draft.notifications.threshold_secs,
+                self.settings.draft.notifications.sound,
+                self.settings.draft.clipboard.osc52,
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid
