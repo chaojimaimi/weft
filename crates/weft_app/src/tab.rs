@@ -767,9 +767,7 @@ impl Tab {
                     bytes_since_check += data.len();
                     need_redraw |= self.process_pty_output(&data);
                     processed_pty_output = true;
-                    // Cooperative yield: if we've spent the frame's time
-                    // budget, stop draining and let the renderer draw. The
-                    // remaining messages stay queued for next frame.
+                    // Cooperative yield: over budget, drain stops (queued).
                     if bytes_since_check >= MIN_BYTES_FOR_TIME_CHECK
                         && frame_start.elapsed() >= FRAME_TIME_BUDGET
                     {
@@ -778,15 +776,17 @@ impl Tab {
                 }
                 AppMsg::PtyExit(code) => {
                     tracing::info!("Shell exited: {:?}", code);
+                    // v1.11.4: flags die with the shell.
+                    if let Some(t) = self.terminal.as_mut() {
+                        t.kitty_reset();
+                    }
                     alive = false;
                     break;
                 }
             }
         }
 
-        // v1.10.4: a keypress opened the bypass window — publish the snapshot
-        // now that this frame's repaint bytes are processed. Gated on
-        // `processed_pty_output` so wakeups with no pty data skip the scan.
+        // v1.10.4: keypress bypass window — publish now (gated).
         need_redraw |= if processed_pty_output && self.primary_history_refresh.take_force() {
             self.terminal
                 .as_mut()

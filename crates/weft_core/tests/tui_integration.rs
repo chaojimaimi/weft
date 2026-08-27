@@ -7,6 +7,7 @@
 
 mod support;
 
+use std::path::Path;
 use std::time::Duration;
 
 use support::{require_command, require_path_command, sandbox, TuiSession};
@@ -469,6 +470,81 @@ async fn tmux_panes_mouse_scrollback_resize_and_exit_roundtrip() {
     assert!(
         session.wait_until(UPDATE_TIMEOUT, |s| s.exited).await,
         "tmux did not exit after kill-session; status={:?}, screen:\n{}",
+        session.exit_status,
+        session.visible_text()
+    );
+    assert!(!session.terminal.is_alt_screen_active());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// v1.11.4 (PLAN_v1114 §4.9): kitty keyboard protocol against a real
+/// editor (nvim when installed, else macOS system vim). The editor binary
+/// does the "opens without corruption" half — spawn, alt screen, clean
+/// rows, keys still land, `:q!` exits — while the negotiation half runs
+/// Weft's side through the LIVE session: a TUI-style push (`CSI >31u`) is
+/// masked to the supported bits and the query answers EXACT `CSI ? 31u`.
+/// (The editor's own output stream continues to pump during the asserts.)
+#[tokio::test(flavor = "current_thread")]
+async fn editor_kitty_keyboard_protocol_negotiates_without_corruption() {
+    let editor = ["nvim", "/usr/local/bin/nvim", "/usr/bin/vim"]
+        .iter()
+        .find(|name| Path::new(name).is_file())
+        .copied()
+        .unwrap_or_else(|| {
+            eprintln!("skipping: neither nvim nor vim is installed");
+            std::process::exit(0);
+        });
+    let dir = sandbox("kitty-editor");
+    let mut session = TuiSession::spawn(editor, &[], 24, 80, &dir);
+    assert!(
+        session
+            .wait_until(START_TIMEOUT, |s| s.terminal.is_alt_screen_active())
+            .await,
+        "{editor} did not enter alt screen; output={:?}",
+        String::from_utf8_lossy(&session.raw_output)
+    );
+
+    // Editor is healthy before negotiation — no escaped garbage.
+    assert!(
+        !session.visible_text().contains('\x1b'),
+        "editor opened with raw escape garbage on screen: {:?}",
+        session.visible_text()
+    );
+
+    // Drain any startup negotiation answers (XTVERSION etc.) so the reply
+    // assertion below is exact, then run the push — masked to supported
+    // bits (0b100 ReportAlternateKeys is cut).
+    let _ = session.terminal.take_response();
+    session.terminal.process(b"\x1b[>31u");
+    let flags = session.terminal.keyboard_protocol_flags();
+    assert_eq!(flags, 31 & 0b1_0011, "push must register masked");
+    session.terminal.process(b"\x1b[?u");
+    let reply = session.terminal.take_response();
+    assert_eq!(
+        reply,
+        format!("\x1b[?{flags}u").into_bytes(),
+        "kitty query answer must be exact bytes"
+    );
+
+    // The editor still lives around the negotiation — alt screen held and
+    // keys land (typing into the empty buffer echoes on screen).
+    assert!(
+        session.terminal.is_alt_screen_active(),
+        "editor must survive negotiation in the alt screen"
+    );
+    session.send(b"i kitty ok\x1b");
+    assert!(
+        session
+            .wait_until(UPDATE_TIMEOUT, |s| s.visible_text().contains("kitty ok"))
+            .await,
+        "editor must still take keys after negotiation; screen:\n{}",
+        session.visible_text()
+    );
+
+    session.send(b":q!\r");
+    assert!(
+        session.wait_until(UPDATE_TIMEOUT, |s| s.exited).await,
+        "editor did not exit after :q!; status={:?}, screen:\n{}",
         session.exit_status,
         session.visible_text()
     );

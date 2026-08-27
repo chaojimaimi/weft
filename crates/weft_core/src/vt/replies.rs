@@ -18,6 +18,16 @@ pub fn xtversion_reply() -> Vec<u8> {
     format!("\x1bP>|weft {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
 }
 
+/// v1.11.4 (PLAN_v1114 §1.2): kitty keyboard-protocol query answer —
+/// `CSI ? <flags> u` (no space). Always answered with the CURRENT flags
+/// (stack top); a request parameter (`CSI ? 1 u`) is ignored — the
+/// protocol has no conditional-answer concept and 0 is a legitimate state,
+/// not a "no support" signal.
+#[must_use]
+pub fn kitty_flags_reply(flags: u8) -> Vec<u8> {
+    format!("\x1b[?{flags}u").into_bytes()
+}
+
 /// Split an XTGETTCAP request payload into its `;`-separated hex names.
 ///
 /// A name is well-formed iff it is non-empty, even-length, and all ASCII
@@ -306,6 +316,16 @@ mod tests {
         assert!(s.starts_with("\x1bP>|weft "), "banner prefix: {s:?}");
         assert!(s.ends_with("\x1b\\"), "ST terminator: {s:?}");
         assert!(s.contains(env!("CARGO_PKG_VERSION")), "version: {s:?}");
+    }
+
+    /// v1.11.4 (PLAN_v1114 §4.2): exact answer bytes — `?0u` is a
+    /// legitimate answer (empty stack), never the "silent" signal.
+    #[test]
+    fn kitty_flags_reply_exact_bytes() {
+        assert_eq!(kitty_flags_reply(0), b"\x1b[?0u");
+        assert_eq!(kitty_flags_reply(1), b"\x1b[?1u");
+        assert_eq!(kitty_flags_reply(0b1_1011), b"\x1b[?27u");
+        assert!(!kitty_flags_reply(1).contains(&b' '), "no space in answer");
     }
 
     #[test]

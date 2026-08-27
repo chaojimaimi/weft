@@ -310,6 +310,57 @@ fn pty_exit_force_settles_the_late_primary_tui_resume_tail() {
     );
 }
 
+/// v1.11.4 (PLAN_v1114 §1.3/§4.8): AppMsg::PtyExit (the main-message-pump
+/// hook in tab.rs) clears BOTH kitty keyboard stacks — a dead shell must
+/// never leave negotiated flags behind for whatever respawns.
+#[test]
+fn pty_exit_resets_kitty_keyboard_flags() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11→masked 3
+    assert_eq!(terminal.keyboard_protocol_flags(), 3);
+
+    tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
+    let (alive, _, _) = tab.process_messages();
+    assert!(!alive, "PtyExit must be processed");
+    let terminal = tab.terminal.as_mut().unwrap();
+    assert_eq!(terminal.keyboard_protocol_flags(), 0, "main stack cleared");
+    terminal.process(b"\x1b[?1049l");
+    assert_eq!(
+        terminal.keyboard_protocol_flags(),
+        0,
+        "alt stack cleared too"
+    );
+}
+
+/// v1.11.4 (PLAN_v1114 §1.3): the close-tail path (drain_bounded_close_tail,
+/// lifecycle.rs — AppMsg::PtyExit while a primary-screen tail is pending)
+/// applies the same kitty reset a dying shell triggers while a tab closes.
+#[test]
+fn close_tail_pty_exit_resets_kitty_keyboard_flags() {
+    let mut tab = tab_with_terminal();
+    let terminal = tab.terminal.as_mut().unwrap();
+    terminal.process(b"\x1b]133;A\x07");
+    terminal.editor_mut().buffer.set_text("screen-app");
+    terminal.submit_command();
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07\x1b[2;1H\x1b[3;1H");
+    assert!(
+        terminal.primary_screen_app_active(),
+        "close-tail precondition"
+    );
+    terminal.process(b"\x1b[>27u");
+    assert_eq!(terminal.keyboard_protocol_flags(), 27 & 0b1_0011);
+
+    tab.msg_tx.send(AppMsg::PtyExit(Ok(0))).unwrap();
+    tab.finish_pending_blocks();
+    let terminal = tab.terminal.as_ref().unwrap();
+    assert_eq!(
+        terminal.keyboard_protocol_flags(),
+        0,
+        "close-tail PtyExit must clear kitty flags"
+    );
+}
+
 #[test]
 fn oversized_output_remainder_stays_ahead_of_queued_pty_exit() {
     let mut tab = tab_with_terminal();

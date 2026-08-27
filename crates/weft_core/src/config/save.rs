@@ -535,6 +535,13 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
             } else if t.contains_key("bold_is_bright") {
                 t.remove("bold_is_bright");
             }
+            // v1.11.4 (PLAN_v1114 §3): kitty_keyboard — persist the
+            // non-default (false) only.
+            if c.kitty_keyboard != super::CompatConfig::default().kitty_keyboard {
+                t["kitty_keyboard"] = toml_edit::value(c.kitty_keyboard);
+            } else if t.contains_key("kitty_keyboard") {
+                t.remove("kitty_keyboard");
+            }
         }
     });
     write_profile_section(table, "editor", profile.editor.is_some(), |t| {

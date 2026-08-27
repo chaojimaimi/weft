@@ -5,12 +5,14 @@
 
 pub mod handler;
 pub mod keys;
+pub mod kitty;
 pub mod mode;
 pub mod mouse;
 pub mod paste;
 
 pub use handler::InputHandler;
 pub use keys::{KeyCode, Modifiers};
+pub use kitty::{encode_kitty_key, KittyEventKind};
 pub use mode::{effective_mode, InputMode};
 pub use mouse::{MouseAction, MouseButton, MouseProtocol};
 pub use paste::{

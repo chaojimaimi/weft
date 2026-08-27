@@ -126,6 +126,11 @@ impl Tab {
                 }
                 AppMsg::PtyExit(code) => {
                     tracing::info!(?code, "shell exited while closing tab");
+                    // v1.11.4 (PLAN_v1114 §1.3): close-tail reset — a dying
+                    // shell must not leave negotiated kitty flags behind.
+                    if let Some(t) = &mut self.terminal {
+                        t.kitty_reset();
+                    }
                     exited = true;
                     break;
                 }
@@ -153,6 +158,11 @@ impl Tab {
                 }
                 PtyEvent::Exit(code) => {
                     tracing::info!(?code, "shell exited while closing tab");
+                    // v1.11.4 (PLAN_v1114 §1.3): close-tail reset (PtyEvent
+                    // side — same contract as AppMsg::PtyExit above).
+                    if let Some(t) = &mut self.terminal {
+                        t.kitty_reset();
+                    }
                     break;
                 }
             }

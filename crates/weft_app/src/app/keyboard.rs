@@ -25,6 +25,7 @@ impl crate::App {
 
     pub(crate) fn handle_key_event(
         &mut self,
+        kind: weft_core::input::KittyEventKind,
         key_code: WinitKeyCode,
         mods: WinitModifiers,
         text: Option<&str>,
@@ -45,6 +46,40 @@ impl crate::App {
         }
         if mods.state().super_key() {
             m |= Modifiers::SUPER;
+        }
+
+        // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): the kitty negotiation state of
+        // the ACTIVE terminal gates how far a non-Press event travels.
+        // Releases (winit state=Released) never drove the app pipeline
+        // before (the winit arm filtered Pressed) and still must not: only
+        // a negotiated event-types (0b10) passthrough app sees them, and
+        // then via a dedicated fast path that bypasses every app-side
+        // consumer (note editor / keybindings / overlays / editor box) —
+        // a Cmd+V Release must never paste into the find bar.
+        let kitty_flags = self
+            .tab()
+            .terminal
+            .as_ref()
+            .map(|t| t.keyboard_protocol_flags())
+            .unwrap_or(0);
+        if kind == weft_core::input::KittyEventKind::Release {
+            if (kitty_flags & weft_core::input::kitty::FLAG_REPORT_EVENT_TYPES) == 0 {
+                return;
+            }
+            if !self.tab().terminal.as_ref().is_some_and(|t| {
+                t.effective_input_mode() == weft_core::input::InputMode::Passthrough
+            }) {
+                return;
+            }
+            self.forward_key_to_pty(
+                key,
+                m,
+                text,
+                kind,
+                kitty_flags,
+                weft_core::input::InputMode::Passthrough,
+            );
+            return;
         }
 
         // v1.7.3-C: Note editor captures all keyboard input when open.
@@ -197,13 +232,40 @@ impl crate::App {
             }
         }
 
+        self.forward_key_to_pty(key, m, text, kind, kitty_flags, input_mode);
+    }
+
+    /// v1.11.4 (PLAN_v1114 §2.1): the sync + encode + effects tail shared by
+    /// the normal key path and the L2 release fast path. The kitty branch
+    /// applies ONLY in passthrough — the editor/overlay branches consume
+    /// their keys first ("天然在前"), but a non-consumed key while the editor
+    /// is open must never leak kitty bytes into the PTY. DECCKM precedent
+    /// (:200-206): re-read the terminal state per key event.
+    fn forward_key_to_pty(
+        &mut self,
+        key: KeyCode,
+        m: Modifiers,
+        text: Option<&str>,
+        kind: weft_core::input::KittyEventKind,
+        kitty_flags: u8,
+        input_mode: weft_core::input::InputMode,
+    ) {
         let app_cursor_keys = self
             .tab()
             .terminal
             .as_ref()
             .map(|t| t.app_cursor_keys())
             .unwrap_or(false);
-        self.tab_mut().input_handler.app_cursor_keys = app_cursor_keys;
+        {
+            let ih = &mut self.tab_mut().input_handler;
+            ih.app_cursor_keys = app_cursor_keys;
+            ih.kitty_flags = if input_mode == weft_core::input::InputMode::Passthrough {
+                kitty_flags
+            } else {
+                0
+            };
+            ih.kitty_event_kind = kind;
+        }
 
         let bytes = crate::ime::encode_passthrough_key(&self.tab().input_handler, key, m, text);
         // Diagnostic (set RUST_LOG=weft_app=debug to see): the exact bytes we

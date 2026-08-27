@@ -6,6 +6,7 @@ mod attrs;
 mod capability;
 mod capture_cursor;
 mod grapheme;
+pub(crate) mod kitty_keyboard;
 mod osc;
 mod osc_guard;
 mod perform;
@@ -108,6 +109,14 @@ pub struct Terminal {
     /// pre-guard behavior regression anchor (differential harness in
     /// fuzz_lite.rs).
     osc_guard_enabled: bool,
+    /// v1.11.4 (PLAN_v1114 §1): kitty keyboard-protocol negotiation state —
+    /// per-screen (main/alt) flag stacks; `keyboard_protocol_flags()` feeds
+    /// the app's InputHandler encoder.
+    kitty: kitty_keyboard::KittyKeyboardState,
+    /// v1.11.4 (PLAN_v1114 §3): master switch — `[compat] kitty_keyboard`
+    /// (default true). `false` swallows all four `CSI ...u` ops AND forces
+    /// `keyboard_protocol_flags()` to 0 — a one-click rollback.
+    kitty_protocol_enabled: bool,
 }
 
 impl Terminal {
@@ -152,6 +161,8 @@ impl Terminal {
             osc_watch_prev_esc: false,
             // v1.11.2 X1: guard defaults ON for every production constructor.
             osc_guard_enabled: true,
+            kitty: kitty_keyboard::KittyKeyboardState::default(),
+            kitty_protocol_enabled: true,
         }
     }
 
@@ -287,6 +298,31 @@ impl Terminal {
     /// Application cursor key mode (DECCKM, CSI ?1h/l).
     pub fn app_cursor_keys(&self) -> bool {
         self.capabilities.app_cursor_keys
+    }
+
+    /// v1.11.4 (PLAN_v1114 §1.1): current kitty keyboard-protocol flags for
+    /// the ACTIVE screen (stack top; 0 when the stack is empty or the
+    /// protocol is disabled). The app re-reads this on every key event,
+    /// mirroring the `app_cursor_keys` sync precedent.
+    pub fn keyboard_protocol_flags(&self) -> u8 {
+        if !self.kitty_protocol_enabled {
+            return 0;
+        }
+        self.kitty.flags(self.capabilities.alt_active)
+    }
+
+    /// v1.11.4 (PLAN_v1114 §1.3): reset hook target — clear BOTH stacks.
+    /// Called at OSC 133;D (command end / back at the prompt) and on
+    /// PtyExit, so a crash-killed TUI cannot leave negotiated flags
+    /// poisoning the shell that comes back.
+    pub fn kitty_reset(&mut self) {
+        self.kitty.reset();
+    }
+
+    /// v1.11.4 (PLAN_v1114 §3): master switch from
+    /// `[compat] kitty_keyboard`; apply_config walks every pane's terminal.
+    pub fn set_kitty_protocol_enabled(&mut self, enabled: bool) {
+        self.kitty_protocol_enabled = enabled;
     }
 
     /// Whether DEC synchronized-output mode (`CSI ?2026h`) is active.
@@ -786,7 +822,13 @@ impl Terminal {
     pub fn reset(&mut self) {
         let rows = self.grid.num_rows;
         let cols = self.grid.num_cols;
+        // rust-reviewer v1.11.4 Major-1: RIS clears the negotiated keyboard
+        // stacks (via the fresh struct) but must NOT resurrect the user's
+        // `[compat] kitty_keyboard = false` switch — an app-sent `ESC c`
+        // would otherwise override the config-level kill switch.
+        let kitty_enabled = self.kitty_protocol_enabled;
         *self = Self::new(rows, cols);
+        self.kitty_protocol_enabled = kitty_enabled;
     }
 
     /// Snapshot the command line at OSC 133;B (preexec). Real shells emit a

@@ -17,6 +17,14 @@ pub struct InputHandler {
     pub sgr_mouse: bool,
     /// Mouse coordinate origin (0 or 1 based, SGR uses 1-based).
     mouse_coord_base: u8,
+    /// v1.11.4 (PLAN_v1114 §2.1): kitty keyboard-protocol flags for the
+    /// ACTIVE screen, synced from `Terminal::keyboard_protocol_flags()` on
+    /// every key event (DECCKM precedent). 0 = protocol off → the legacy
+    /// byte stream, untouched.
+    pub kitty_flags: u8,
+    /// v1.11.4 (PLAN_v1114 §2.2): class of the current winit key event;
+    /// drives the `:N` event sub-segment when 0b10 is negotiated.
+    pub kitty_event_kind: super::kitty::KittyEventKind,
 }
 
 impl InputHandler {
@@ -26,11 +34,40 @@ impl InputHandler {
             mouse_protocol: MouseProtocol::Off,
             sgr_mouse: false,
             mouse_coord_base: 1, // SGR uses 1-based
+            kitty_flags: 0,
+            kitty_event_kind: super::kitty::KittyEventKind::Press,
         }
     }
 
-    /// Encode a key event into bytes to send to the PTY.
+    /// Encode a key event into bytes to send to the PTY (no layout text).
     pub fn encode_key(&self, key: KeyCode, mods: Modifiers) -> Vec<u8> {
+        self.encode_key_text(key, mods, None)
+    }
+
+    /// v1.11.4 (PLAN_v1114 §2.1): the single encoding choke point — the
+    /// kitty keyboard-protocol branch runs first (whenever the app
+    /// negotiated flags) and is given winit's layout text (raw-text rows at
+    /// L1, associated-text segment at L5). Keys the kitty branch doesn't
+    /// claim (C0 Ctrl+letter, L1/L2 arrows, plain Enter/Tab/BS …) fall back
+    /// to the legacy encoders, so `flags == 0` output is byte-for-byte the
+    /// pre-v1.11.4 stream (legacy-twin invariance, PLAN_v1114 §4.5).
+    pub fn encode_key_text(&self, key: KeyCode, mods: Modifiers, text: Option<&str>) -> Vec<u8> {
+        if self.kitty_flags != 0 {
+            if let Some(bytes) = super::kitty::encode_kitty_key(
+                self.kitty_flags,
+                self.kitty_event_kind,
+                key,
+                mods,
+                text,
+            ) {
+                return bytes;
+            }
+        }
+        self.encode_legacy(key, mods)
+    }
+
+    /// The pre-v1.11.4 key encoder (VT100/VT220 sequences).
+    fn encode_legacy(&self, key: KeyCode, mods: Modifiers) -> Vec<u8> {
         match key {
             KeyCode::Char(c) => self.encode_char(c, mods),
             KeyCode::Enter => self.encode_enter(mods),
@@ -224,7 +261,7 @@ impl InputHandler {
     fn encode_char(&self, c: char, mods: Modifiers) -> Vec<u8> {
         // Ctrl+A through Ctrl+Z → 0x01 through 0x1A
         if mods.contains(Modifiers::CONTROL) {
-            if let Some(byte) = self.ctrl_char(c) {
+            if let Some(byte) = Self::ctrl_char_for(c) {
                 return vec![byte];
             }
         }
@@ -278,8 +315,10 @@ impl InputHandler {
         s.as_bytes().to_vec()
     }
 
-    /// Ctrl+letter → control byte (Ctrl+A = 0x01, Ctrl+Z = 0x1A).
-    fn ctrl_char(&self, c: char) -> Option<u8> {
+    /// v1.11.4 (PLAN_v1114 §2.3): the C0-mappable character table, shared
+    /// with the kitty encoder — Ctrl+letters/`[]\^_@` stay C0 at every
+    /// protocol level (Weft explicit deviation; module doc in kitty.rs).
+    pub(crate) fn ctrl_char_for(c: char) -> Option<u8> {
         let c = c.to_ascii_lowercase();
         if c.is_ascii_lowercase() {
             Some((c as u8) - b'a' + 1)

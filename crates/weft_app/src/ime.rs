@@ -140,6 +140,13 @@ pub fn encode_passthrough_key(
     mods: Modifiers,
     text: Option<&str>,
 ) -> Vec<u8> {
+    if input.kitty_flags != 0 {
+        // v1.11.4 (PLAN_v1114 §2.1): negotiated kitty protocol — the kitty
+        // branch inside encode_key_text gets the layout text (L1 raw-text
+        // rows, L5 associated-text segment); legacy delegation inside still
+        // produces the pre-v1.11.4 bytes for C0 etc.
+        return input.encode_key_text(key, mods, text);
+    }
     if matches!(key, KeyCode::Char(_)) {
         if let Some(bytes) = direct_keyboard_text(text, mods) {
             return bytes;
@@ -243,6 +250,39 @@ mod tests {
         assert_eq!(
             encode_passthrough_key(&input, KeyCode::Char('c'), Modifiers::CONTROL, Some("c")),
             b"\x03"
+        );
+    }
+
+    /// v1.11.4 (PLAN_v1114 §2.1): with negotiated kitty flags the passthrough
+    /// route hands the layout text to the encoder's kitty branch — the L4
+    /// u-form replaces the raw text, C0 Ctrl+letter still wins.
+    #[test]
+    fn kitty_negotiated_passthrough_uses_the_encoder_branch() {
+        let mut input = InputHandler::new();
+        input.kitty_flags = 0b1000;
+        // L4 plain printable → CSI kc u (raw text would be wrong now)
+        assert_eq!(
+            encode_passthrough_key(&input, KeyCode::Char('a'), Modifiers::empty(), Some("a")),
+            b"\x1b[97u",
+            "kitty branch runs before the raw-text path"
+        );
+        // InterruptPty invariant through the real PTY route
+        input.kitty_flags = 0b11011;
+        assert_eq!(
+            encode_passthrough_key(&input, KeyCode::Char('c'), Modifiers::CONTROL, Some("c")),
+            b"\x03",
+            "ctrl+c stays [0x03] at full flags"
+        );
+        // L1 raw text still passes through unchanged (no CSI)
+        input.kitty_flags = 0b1;
+        assert_eq!(
+            encode_passthrough_key(&input, KeyCode::Char('a'), Modifiers::empty(), Some("a")),
+            b"a"
+        );
+        // non-US layout text survives the L1 raw-text row
+        assert_eq!(
+            encode_passthrough_key(&input, KeyCode::Char('z'), Modifiers::empty(), Some("y")),
+            b"y"
         );
     }
 

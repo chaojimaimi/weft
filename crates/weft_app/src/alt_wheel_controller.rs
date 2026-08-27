@@ -43,12 +43,24 @@ impl App {
             crate::alt_peek::AltWheelAction::ForwardArrows { up } => {
                 // Plain wheel, no peek: Up/Down arrow keys let the TUI
                 // scroll its own content natively (less/vim/omp).
-                let key = if up { KeyCode::Up } else { KeyCode::Down };
-                let single = self
+                // v1.11.4 (PLAN_v1114 §2.1, §6): re-sync the handler's
+                // kitty flags from the active terminal (the DECCKM
+                // precedent) — the L1/L2 arrow rows stay legacy bytes, so
+                // wheel-forwarded arrows are byte-identical until an L4 app
+                // negotiates events. Super never applies here.
+                let kitty_flags = self
                     .sessions
-                    .active_mut()
-                    .input_handler
-                    .encode_key(key, Modifiers::empty());
+                    .active()
+                    .terminal
+                    .as_ref()
+                    .map(|t| t.keyboard_protocol_flags())
+                    .unwrap_or(0);
+                let key = if up { KeyCode::Up } else { KeyCode::Down };
+                let single = {
+                    let ih = &mut self.sessions.active_mut().input_handler;
+                    ih.kitty_flags = kitty_flags;
+                    ih.encode_key(key, Modifiers::empty())
+                };
                 if !single.is_empty() {
                     let mut batch = Vec::with_capacity(single.len() * lines);
                     for _ in 0..lines {

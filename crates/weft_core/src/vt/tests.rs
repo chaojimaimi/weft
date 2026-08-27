@@ -3931,10 +3931,12 @@ fn brew_progress_stream_stays_single_row_in_capture() {
 
 // ── Terminal capability hardening (FIX_TERMINAL_CAPABILITY_HARDENING) ──
 
-/// Kitty keyboard-protocol push/set/pop (`CSI >flags u` / `CSI =mode u` /
-/// `CSI <u`) must be ignored, NOT dispatched to the bare-`CSI u` DECRC
-/// restore path. opencode pushes kitty modes at startup; a restore would
-/// jump the cursor back to the last DECSC-saved position mid-TUI.
+/// Kitty keyboard-protocol ops (`CSI >flags u` / `CSI =flags;mode u` /
+/// `CSI <u`) negotiate the protocol AND must NOT be dispatched to the
+/// bare-`CSI u` DECRC restore path. opencode pushes kitty modes at startup;
+/// a restore would jump the cursor back to the last DECSC-saved position
+/// mid-TUI. Every op is answered with exact bytes (v2 plan §4.2: replies
+/// are asserted, not assumed silent).
 #[test]
 fn kitty_keyboard_mode_ops_do_not_run_decrc_restore() {
     let mut t = term();
@@ -3942,14 +3944,19 @@ fn kitty_keyboard_mode_ops_do_not_run_decrc_restore() {
     t.process(b"\x1b7"); // DECSC save
     t.process(b"\x1b[3;3H"); // cursor → (2, 2)
     t.process(b"\x1b[>1u"); // kitty push
-    t.process(b"\x1b[=2u"); // kitty set
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?1u", "push 1 ⇒ flags 1");
+    t.process(b"\x1b[=2u"); // kitty set (mode default 1: full assignment)
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?2u", "set 2 rewrites the top");
     t.process(b"\x1b[<u"); // kitty pop
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?0u", "pop ⇒ empty stack ⇒ 0");
     assert_eq!(
         (t.grid().cursor.row, t.grid().cursor.col),
         (2, 2),
         "kitty keyboard-mode ops must not restore the saved cursor"
     );
-    assert_eq!(t.take_response(), b"", "kitty mode ops must not reply");
 }
 
 /// Bare `CSI u` keeps its SCO DECRC alias: it restores the cursor saved by
@@ -3965,14 +3972,162 @@ fn bare_csi_u_restores_cursor_after_decsc() {
     assert_eq!((t.grid().cursor.row, t.grid().cursor.col), (4, 9));
 }
 
-/// `CSI ? u` — kitty keyboard enhancement query. Deliberately unanswered:
-/// zero-reply is the standard non-supporter signal (consumers fall back on
-/// DA1); answering `?0u` would advertise a protocol we never implement.
+/// `CSI ? u` — kitty keyboard enhancement query. v1.11.4 implements the
+/// protocol, so the empty-stack query answers EXACTLY `CSI ? 0 u`: 0 is a
+/// legitimate negotiated state (stack empty = no flags), never the old
+/// silence. Consumers (nvim/Helix) must be able to distinguish "did not
+/// speak kitty" from "spoke kitty with zero flags".
 #[test]
-fn csi_question_u_kitty_query_stays_silent() {
+fn csi_question_u_kitty_query_answers_current_flags() {
     let mut t = term();
     t.process(b"\x1b[?u");
-    assert_eq!(t.take_response(), b"", "kitty query must stay unanswered");
+    assert_eq!(t.take_response(), b"\x1b[?0u", "empty stack ⇒ ?0u");
+    t.process(b"\x1b[>27u\x1b[?u"); // 27 = 0b11011 → masked to 0b10011
+    assert_eq!(t.take_response(), b"\x1b[?19u", "masked push ⇒ ?19u");
+    // a parameter on a query changes nothing (no conditional answers)
+    t.process(b"\x1b[?2u");
+    assert_eq!(t.take_response(), b"\x1b[?19u", "query param ignored");
+}
+
+/// v1.11.4 (PLAN_v1114 §4.1): `CSI > u` pushes 0 (`CSI >flags u` with an
+/// omitted flags parameter defaults to 0); `CSI < 2 u` pops twice — the
+/// pop count is the FIRST parameter, not a prefix marker.
+#[test]
+fn kitty_push_omitted_flags_is_zero_and_pop_count_is_first_param() {
+    let mut t = term();
+    t.process(b"\x1b[>u"); // push with omitted flags ⇒ 0
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?0u", "CSI >u ⇒ flags 0");
+    t.process(b"\x1b[>1u\x1b[>5u\x1b[>27u"); // stack: [0], then 1, 5, 27
+    t.process(b"\x1b[<2u"); // pop count 2
+    t.process(b"\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?1u",
+        "two pops leave the first real push (1)"
+    );
+    t.process(b"\x1b[<u");
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?0u", "final pop ⇒ 0");
+}
+
+/// v1.11.4 (PLAN_v1114 §4.1): set modes 2/3 (set-bits / clear-bits) at
+/// terminal level; the stack top is rewritten in place (M1).
+#[test]
+fn kitty_set_modes_two_and_three_are_bitwise() {
+    let mut t = term();
+    t.process(b"\x1b[>11u"); // 11 = 0b1011
+    t.process(b"\x1b[=16;2u"); // set mode 2: add the text-bit (16)
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?19u", "set-bits → masked 0b10011");
+    t.process(b"\x1b[=18;3u"); // clear mode 3: drop bits 1 and 4 (18 = 0b10010)
+    t.process(b"\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?1u",
+        "clear-bits → 0b10011 & !0b10010 = 0b1"
+    );
+    // M1 depth invariant survives mode flips
+    t.process(b"\x1b[<u");
+    t.process(b"\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?0u",
+        "one pop drains the whole stack"
+    );
+}
+
+/// rust-reviewer v1.11.4 Major-1: the user's `[compat] kitty_keyboard =
+/// false` switch must survive RIS (`ESC c` replaces the whole Terminal via
+/// `*self = Self::new()`); only the negotiated stacks reset.
+#[test]
+fn ris_preserves_kitty_protocol_enabled_switch() {
+    let mut t = term();
+    t.set_kitty_protocol_enabled(false);
+    t.process(b"\x1b[>1u\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"",
+        "disabled terminal swallows negotiation"
+    );
+    assert_eq!(t.keyboard_protocol_flags(), 0);
+
+    t.process(b"\x1bc"); // RIS
+    assert!(
+        !t.kitty_protocol_enabled,
+        "the config switch must survive RIS"
+    );
+    assert_eq!(t.keyboard_protocol_flags(), 0, "RIS still clears the stack");
+}
+
+/// v1.11.4 (PLAN_v1114 §1.1, §4.1): the two screens keep independent
+/// stacks; DEC 1049 swaps move nothing between them.
+#[test]
+fn kitty_double_stack_is_isolated_across_alt_swap() {
+    let mut t = term();
+    t.process(b"\x1b[>1u"); // main: 1
+    t.process(b"\x1b[?1049h"); // enter alt screen
+    t.process(b"\x1b[>11u"); // alt: 11 → masked to 0b11
+    t.process(b"\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?3u",
+        "alt screen sees its own push (masked)"
+    );
+    t.process(b"\x1b[?1049l"); // back to main
+    t.process(b"\x1b[?u");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?1u",
+        "main stack untouched by alt ops"
+    );
+}
+
+/// v1.11.4 (PLAN_v1114 §3): `[compat] kitty_keyboard = false` swallows ALL
+/// four ops — the pre-v1.11.4 silence — and zeroes the encoder feed.
+#[test]
+fn kitty_disabled_swallows_all_ops_and_zeroes_flags() {
+    let mut t = term();
+    t.set_kitty_protocol_enabled(false);
+    t.process(b"\x1b[>1u");
+    t.process(b"\x1b[=2;1u");
+    t.process(b"\x1b[<u");
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"", "disabled: every op stays silent");
+    assert_eq!(t.keyboard_protocol_flags(), 0, "encoder feed forced to 0");
+    // re-enable: the state machine was never touched, so it starts clean
+    t.set_kitty_protocol_enabled(true);
+    t.process(b"\x1b[?u");
+    assert_eq!(t.take_response(), b"\x1b[?0u");
+}
+
+/// v1.11.4 (PLAN_v1114 §1.3, §4.8): OSC 133;D (command end — back at the
+/// prompt) clears BOTH stacks — the crash-residue hook for `kill -9 nvim`
+/// (a TUI crash produces no PtyExit, only this prompt boundary).
+#[test]
+fn osc_133_d_command_end_resets_kitty_stacks() {
+    let mut t = term();
+    t.process(b"\x1b[>1u\x1b[?1049h\x1b[>11u"); // main=1, alt=11→masked 3
+    assert_eq!(t.keyboard_protocol_flags(), 3);
+    t.process(b"\x1b]133;D;0\x07");
+    assert_eq!(t.keyboard_protocol_flags(), 0, "main stack reset");
+    t.process(b"\x1b[?1049l");
+    assert_eq!(
+        t.keyboard_protocol_flags(),
+        0,
+        "alt stack reset too — no stale flags after a crash"
+    );
+}
+
+/// v1.11.4: RIS (`ESC c`) also clears the negotiation state (fresh
+/// terminal contract), matching every other terminal-mode reset.
+#[test]
+fn ris_clears_kitty_stacks() {
+    let mut t = term();
+    t.process(b"\x1b[>1u\x1b[>11u"); // 11 → masked to 0b11
+    assert_eq!(t.keyboard_protocol_flags(), 3);
+    t.process(b"\x1bc");
+    assert_eq!(t.keyboard_protocol_flags(), 0);
 }
 
 /// XTVERSION (`CSI > 0 q` / `CSI > q`): reply `DCS > | weft <ver> ST` — the
@@ -4141,14 +4296,20 @@ fn snapshot_roundtrip_preserves_wavy_style_and_underline_color() {
 /// `CSI ? 1 u` (kitty keyboard op carrying the private marker) must not be
 /// mis-dispatched as DEC private mode set/unset: mode 1 is DECCKM and a
 /// bogus `u` final used to toggle it off via handle_dec_private_mode(1, false).
+/// v1.11.4 answers the query with the CURRENT flags (here `?0u` — no push
+/// yet); the DECCKM assertions pin the gate.
 #[test]
 fn csi_question_1_u_does_not_toggle_decckm() {
     let mut t = term();
     t.process(b"\x1b[?1h"); // DECCKM on
     assert!(t.app_cursor_keys(), "?1h must enable DECCKM");
-    t.process(b"\x1b[?1u"); // kitty op with private marker — not DECSET
+    t.process(b"\x1b[?1u"); // kitty query with private marker — not DECSET
     assert!(t.app_cursor_keys(), "CSI ?1u must not clear DECCKM");
-    assert_eq!(t.take_response(), b"", "kitty op must not reply");
+    assert_eq!(
+        t.take_response(),
+        b"\x1b[?0u",
+        "kitty query answers current flags (?0u before any push)"
+    );
     t.process(b"\x1b[?1l"); // real DECSET off still works
     assert!(!t.app_cursor_keys(), "?1l must disable DECCKM");
 }

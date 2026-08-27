@@ -440,10 +440,13 @@ impl Config {
         // [blocks] section — v1.11.2 X4 retention cap (PLAN_v1112 §1.2).
         save::write_blocks_section(&mut doc, &self.blocks);
 
-        // [compat] section — v1.11.3 (PLAN_v1113 §3.3). Inline like the
-        // [logo] block above (save.rs is at its gate budget): only
-        // non-default values are persisted.
-        if self.compat.bold_is_bright != CompatConfig::default().bold_is_bright {
+        // [compat] section — v1.11.3 (PLAN_v1113 §3.3); v1.11.4 adds
+        // `kitty_keyboard` (PLAN_v1114 §3). Inline like the [logo] block
+        // above (save.rs is at its gate budget): only non-default values
+        // are persisted.
+        if self.compat.bold_is_bright != CompatConfig::default().bold_is_bright
+            || self.compat.kitty_keyboard != CompatConfig::default().kitty_keyboard
+        {
             let compat_entry = doc.entry("compat").or_insert_with(toml_edit::table);
             if compat_entry.is_none() {
                 *compat_entry = toml_edit::table();
@@ -451,6 +454,7 @@ impl Config {
             match compat_entry.as_table_mut() {
                 Some(t) => {
                     t["bold_is_bright"] = toml_edit::value(self.compat.bold_is_bright);
+                    t["kitty_keyboard"] = toml_edit::value(self.compat.kitty_keyboard);
                 }
                 None => {
                     tracing::warn!("[compat] section is not a table; skipping compat write");

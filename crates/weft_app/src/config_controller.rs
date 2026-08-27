@@ -95,6 +95,20 @@ pub(super) fn apply_palette_to_all_panes(
     }
 }
 
+/// v1.11.4 (PLAN_v1114 §3): flip the kitty keyboard-protocol master
+/// switch on EVERY pane's terminal in every tab. Background panes keep the
+/// old switch otherwise — same walk precedent as the palette reseed and
+/// scrollback capacity.
+pub(super) fn apply_kitty_protocol_to_all_panes(tabs: &mut [Tab], enabled: bool) {
+    for tab in tabs.iter_mut() {
+        for pane in tab.panes_mut() {
+            if let Some(t) = pane.terminal.as_mut() {
+                t.set_kitty_protocol_enabled(enabled);
+            }
+        }
+    }
+}
+
 /// Update the scrollback capacity on every pane's terminal in every tab.
 /// Called by `apply_config` when the `[scrollback] lines` value changes.
 /// Extracted for the same testability reasons as
@@ -133,6 +147,8 @@ struct ConfigApplyDelta {
     resize_window: bool,
     /// v1.11.3 (PLAN_v1113 §3.3): [compat] bold_is_bright flip.
     update_bold_is_bright: bool,
+    /// v1.11.4 (PLAN_v1114 §3): [compat] kitty_keyboard flip.
+    update_kitty_keyboard: bool,
 }
 
 fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> ConfigApplyDelta {
@@ -150,6 +166,7 @@ fn config_apply_delta(current: &Config, next: &Config, font_scale: f32) -> Confi
         resize_window: current.window.width != next.window.width
             || current.window.height != next.window.height,
         update_bold_is_bright: current.compat.bold_is_bright != next.compat.bold_is_bright,
+        update_kitty_keyboard: current.compat.kitty_keyboard != next.compat.kitty_keyboard,
     }
 }
 
@@ -330,6 +347,16 @@ impl App {
             }
         }
 
+        // v1.11.4 (PLAN_v1114 §3): [compat] kitty_keyboard flip — walk
+        // EVERY pane in EVERY tab (background panes keep the old switch
+        // until focused otherwise, exactly like the palette reseed).
+        if delta.update_kitty_keyboard {
+            apply_kitty_protocol_to_all_panes(
+                self.sessions.tabs_mut(),
+                config.compat.kitty_keyboard,
+            );
+        }
+
         // Keybindings.
         self.config_state.keybindings = config.keybindings();
 
@@ -414,6 +441,31 @@ mod tests {
     /// scrollback tests without spawning a shell.
     fn tab_with_terminal(scrollback_lines: usize) -> Tab {
         Tab::with_single_pane(Pane::with_terminal_only(scrollback_lines))
+    }
+
+    /// v1.11.4 (PLAN_v1114 §3): the compat flip walk reaches EVERY pane —
+    /// background panes must not keep the old kitty_keyboard switch.
+    #[test]
+    fn kitty_protocol_walk_touches_every_pane() {
+        let mut tabs = vec![tab_with_terminal(100), tab_with_terminal(100)];
+        for tab in tabs.iter_mut() {
+            tab.terminal.as_mut().unwrap().process(b"\x1b[>27u");
+        }
+        apply_kitty_protocol_to_all_panes(&mut tabs, false);
+        for tab in tabs.iter_mut() {
+            let t = tab.terminal.as_mut().unwrap();
+            assert_eq!(t.keyboard_protocol_flags(), 0, "disabled ⇒ flags 0");
+            t.process(b"\x1b[?u");
+            assert_eq!(t.take_response(), b"", "disabled ⇒ ops swallowed");
+        }
+        apply_kitty_protocol_to_all_panes(&mut tabs, true);
+        let t = tabs[0].terminal.as_mut().unwrap();
+        t.process(b"\x1b[?u");
+        assert_eq!(
+            t.take_response(),
+            b"\x1b[?19u",
+            "re-enabled ⇒ previous negotiation is still live"
+        );
     }
 
     // ── decide_reload ────────────────────────────────────────────────
@@ -534,6 +586,7 @@ mod tests {
                 update_padding: true,
                 resize_window: true,
                 update_bold_is_bright: false,
+                update_kitty_keyboard: false,
             }
         );
         assert_eq!(
@@ -544,6 +597,7 @@ mod tests {
                 update_padding: false,
                 resize_window: false,
                 update_bold_is_bright: false,
+                update_kitty_keyboard: false,
             },
             "committing loaded state before apply would hide every runtime delta"
         );
@@ -579,6 +633,31 @@ mod tests {
         assert!(
             !config_apply_delta(&next, &next, 1.0).update_bold_is_bright,
             "no flip → no invalidation"
+        );
+    }
+
+    /// v1.11.4 (PLAN_v1114 §3): the [compat] kitty_keyboard flip arms
+    /// `update_kitty_keyboard` — apply_config then walks every pane's
+    /// terminal (set_kitty_protocol_enabled). A missed delta here would
+    /// leave background panes on the old switch until focused.
+    #[test]
+    fn apply_delta_arms_kitty_keyboard_on_compat_flip() {
+        let current = Config::default();
+        assert!(current.compat.kitty_keyboard, "default is on");
+        let mut next = current.clone();
+        next.compat.kitty_keyboard = false;
+        assert!(
+            config_apply_delta(&current, &next, 1.0).update_kitty_keyboard,
+            "true → false must arm the pane walk"
+        );
+        let third = current.clone();
+        assert!(
+            config_apply_delta(&next, &third, 1.0).update_kitty_keyboard,
+            "false → true must re-arm it"
+        );
+        assert!(
+            !config_apply_delta(&next, &next, 1.0).update_kitty_keyboard,
+            "no flip → no walk"
         );
     }
 

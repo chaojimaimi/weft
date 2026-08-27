@@ -103,6 +103,10 @@ impl Tab {
         let app_cursor_keys = terminal_state.app_cursor_keys();
         let mouse_protocol = terminal_state.mouse_protocol();
         let sgr_mouse = terminal_state.sgr_mouse();
+        // v1.11.4 (PLAN_v1114 §2.1): kitty flags ride the same per-gesture
+        // sync (DECCKM precedent) so wheel-forwarded arrows at L1/L2 stay
+        // legacy bytes, and an L4+ app gets its arrow rows.
+        let kitty_flags = terminal_state.keyboard_protocol_flags();
         let mouse_protocol_off = mouse_protocol == weft_core::input::MouseProtocol::Off;
         // NLL releases the immutable `pane.terminal` borrow at the end of the
         // last expression above, so the mutations below are free to take a
@@ -111,6 +115,7 @@ impl Tab {
         self.input_handler.app_cursor_keys = app_cursor_keys;
         self.input_handler.mouse_protocol = mouse_protocol;
         self.input_handler.sgr_mouse = sgr_mouse;
+        self.input_handler.kitty_flags = kitty_flags;
         self.tui_scroll_deadline = None;
         let count = pending.rows.unsigned_abs() as usize;
         let mut bytes = Vec::new();

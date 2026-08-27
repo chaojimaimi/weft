@@ -622,21 +622,16 @@ impl vte::Perform for Terminal {
                     "DECSC save"
                 );
             }
-            // Kitty keyboard-protocol push/set/pop (`CSI >flags u`,
-            // `CSI =mode u`, `CSI <u`) arrive with the leading byte in
-            // intermediates (vte collects `<=>?` there). They must NOT fall
-            // through to the bare-`CSI u` DECRC restore below: restore_cursor
-            // would jump back to the last DECSC-saved position every time the
-            // app flips a mode (opencode pushes several at startup, clobbering
-            // the TUI's cursor mid-paint). Ignore the mode operations; bare
-            // `CSI u` keeps its SCO DECRC alias behavior. `CSI ? u` (kitty
-            // keyboard enhancement query) is swallowed here too
-            // (intermediates [b'?']). Zero reply is the standard
-            // non-supporter signal — crossterm, Nix etc. fall back on DA1
-            // to detect the terminal; answering `?0u` would advertise a
-            // protocol we never implement. Deliberate — do NOT "fix".
+            // Kitty keyboard-protocol ops (`CSI >flags u` push / `CSI <u`
+            // pop / `CSI =flags;mode u` set / `CSI ? u` query) arrive with
+            // the leading byte in intermediates (vte collects `<=>?` there)
+            // and must NOT fall through to the bare-`CSI u` DECRC restore
+            // below. The dispatch (enabled gate, dual-stack, M1 in-place
+            // set) lives in kitty_keyboard.rs (PLAN_v1114 §1.2); the DEC
+            // private-mode gate above is h/l-only, so `CSI ? u` never leaks
+            // into handle_dec_private_mode.
             'u' if !intermediates.is_empty() => {
-                tracing::trace!(?intermediates, ?params, "kitty keyboard mode op ignored");
+                self.kitty_keyboard_op(intermediates, params);
             }
             'u' => {
                 self.grid.restore_cursor();
@@ -976,6 +971,11 @@ impl vte::Perform for Terminal {
                             self.block_tracker.on_command_output_start();
                         }
                         b"D" => {
+                            // v1.11.4 (PLAN_v1114 §1.3): back at the prompt —
+                            // SIGKILL'd TUIs emit no PtyExit, so this marker
+                            // clears negotiated kitty flags; the exit paths
+                            // (tab.rs / lifecycle.rs) hook the shell-death case.
+                            self.kitty_reset();
                             // v1.10.7: see `133;A` — a `133;D` arriving while an
                             // exit is already pending is the shell integration's
                             // precmd pair (`133;D;rc → 133;A`) or the closing of

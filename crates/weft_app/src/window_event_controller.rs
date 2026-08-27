@@ -142,17 +142,31 @@ impl App {
                 self.performance_probe.record_redraw(started.elapsed());
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == winit::event::ElementState::Pressed {
-                    if let PhysicalKey::Code(key_code) = event.physical_key {
-                        // `event.text` already reflects Shift (and the keymap),
-                        // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
-                        // so typed commands keep their case / shifted symbols.
-                        self.handle_key_event(
-                            key_code,
-                            self.interaction.mods,
-                            event.text.as_deref(),
-                        );
+                // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): winit 0.30 delivers
+                // Pressed (first), Pressed+repeat (macOS hold-to-repeat) and
+                // Released. The kind flows to the InputHandler so a kitty
+                // event-types (0b10) app receives `:N` sub-segments — the
+                // handling below stays behavior-identical at flags=0 (the
+                // encoder ignores the kind; Releases were dropped before).
+                let kind = match event.state {
+                    winit::event::ElementState::Pressed if event.repeat => {
+                        weft_core::input::KittyEventKind::Repeat
                     }
+                    winit::event::ElementState::Pressed => weft_core::input::KittyEventKind::Press,
+                    winit::event::ElementState::Released => {
+                        weft_core::input::KittyEventKind::Release
+                    }
+                };
+                if let PhysicalKey::Code(key_code) = event.physical_key {
+                    // `event.text` already reflects Shift (and the keymap),
+                    // e.g. Shift+A -> "A", Shift+1 -> "!". The editor uses it
+                    // so typed commands keep their case / shifted symbols.
+                    self.handle_key_event(
+                        kind,
+                        key_code,
+                        self.interaction.mods,
+                        event.text.as_deref(),
+                    );
                 }
             }
             WindowEvent::ModifiersChanged(new_mods) => {

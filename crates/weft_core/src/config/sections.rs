@@ -281,13 +281,29 @@ impl Default for BlocksConfig {
 /// genuinely bold. No Settings UI row in v1.11.3 (deliberate — the plan's
 /// (c) item is config-first); hand-edit the TOML or use a profile.
 ///
-/// No validation/clamp: it's a plain bool.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+/// v1.11.4 (PLAN_v1114 §3): `kitty_keyboard` — the kitty keyboard protocol
+/// master switch. Default **true**; `false` swallows all four `CSI ...u`
+/// negotiation ops AND zeroes the encoder feed — a one-click rollback to
+/// the pre-v1.11.4 byte stream (config_controller walks every pane).
+///
+/// No validation/clamp: plain bools.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CompatConfig {
     /// Default false (derive) — Weft keeps bold as a weight, matching the
     /// pre-v1.11.3 rendering bit-for-bit.
     pub bold_is_bright: bool,
+    /// Default true — the protocol is on unless the user disables it.
+    pub kitty_keyboard: bool,
+}
+
+impl Default for CompatConfig {
+    fn default() -> Self {
+        Self {
+            bold_is_bright: false,
+            kitty_keyboard: true,
+        }
+    }
 }
 
 #[cfg(test)]
