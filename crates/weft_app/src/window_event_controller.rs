@@ -138,6 +138,23 @@ impl App {
             }
             WindowEvent::RedrawRequested => {
                 let started = std::time::Instant::now();
+                // v1.11.6 (PLAN_v1116 M2 step 3): poll the macOS live-resize
+                // state right before the redraw. While true the renderer
+                // presents through the current Core Animation transaction
+                // (presentsWithTransaction), committing the resized layer
+                // bounds and the new frame atomically instead of CA stretching
+                // the previous drawable. `self.window` / `self.renderer` are
+                // disjoint fields, so the borrows coexist. Polled here (the
+                // winit dispatch point) rather than at the draw call site in
+                // redraw_controller.rs because that file sits at its audited
+                // 866-line ceiling; same frame, same result.
+                let live_resize = self
+                    .window
+                    .as_ref()
+                    .is_some_and(crate::macos_window::window_in_live_resize);
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_live_resize(live_resize);
+                }
                 self.handle_redraw_requested();
                 self.performance_probe.record_redraw(started.elapsed());
             }

@@ -66,6 +66,14 @@ pub struct ThemeConfig {
     /// hex string; when present it overrides the base theme's
     /// `OutputSemanticColors` field. Applied after syntax overrides.
     pub output: Option<OutputSemanticConfig>,
+    /// v1.11.6 (PLAN_v1116 M6/D-f): OSC 8 hyperlink underline color
+    /// override (`"#rrggbb"`). Parsed to `Color` then /255-normalized into
+    /// the f32-domain `Theme::link` — u8-granular by nature (architect
+    /// P1-4). Invalid hex silently falls back to the base theme's value.
+    pub link: Option<String>,
+    /// v1.11.6 (PLAN_v1116 M6/D-f): `[theme.ui]` seed-color overrides.
+    /// `None` keys keep the `UiColors` light/dark dual-branch defaults.
+    pub ui: Option<UiConfig>,
 }
 
 /// v1.0 S5: TOML-facing syntax color overrides. All fields optional; absent
@@ -111,6 +119,21 @@ pub struct OutputSemanticConfig {
     pub failure: Option<String>,
 }
 
+/// v1.11.6 (PLAN_v1116 M6/D-f): TOML-facing `[theme.ui]` seed-color
+/// overrides — mirrors the keys of `ThemeUi`. All fields optional; absent
+/// keys fall back to the `UiColors::from_theme` light/dark dual-branch
+/// hardcodes (zero-config visuals unchanged). Present values replace the
+/// dual-branch INPUT and still pass through the `ensure_contrast(4.5)`
+/// gate — a user hex is not necessarily the final painted color.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub success: Option<String>,
+    pub warning: Option<String>,
+    pub error: Option<String>,
+    pub find_match: Option<String>,
+}
+
 // Manual Default (deriving would give name = "").
 impl Default for ThemeConfig {
     fn default() -> Self {
@@ -130,6 +153,8 @@ impl Default for ThemeConfig {
             dark_name: None,
             syntax: None,
             output: None,
+            link: None,
+            ui: None,
         }
     }
 }

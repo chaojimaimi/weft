@@ -84,28 +84,14 @@ impl MetalRenderer {
         let accent = color_to_normalized(ui.focus);
         let separator = color_to_normalized(ui.border_subtle);
         // Muted secondary text: 70% fg + 30% bg — always readable.
-        let label_c = [
-            fg[0] * 0.70 + theme_bg[0] * 0.30,
-            fg[1] * 0.70 + theme_bg[1] * 0.30,
-            fg[2] * 0.70 + theme_bg[2] * 0.30,
-            1.0,
-        ];
+        let label_c = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.30);
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
         let border_c = [0.5, 0.5, 0.5, 0.20];
-        let popup_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
+        // v1.11.6 (C2): merged popup/sidebar lighten expressions.
+        let popup_bg = crate::paint::color_math::lighten_to_white(theme_bg, 0.08);
         // Sidebar is 4% lighter than canvas (subtly distinct from popup bg).
-        let sidebar_bg = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.04,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.04,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.04,
-            1.0,
-        ];
+        let sidebar_bg = crate::paint::color_math::lighten_to_white(theme_bg, 0.04);
         let selection_bg = [
             accent[0] * 0.35 + theme_bg[0] * 0.65,
             accent[1] * 0.35 + theme_bg[1] * 0.65,

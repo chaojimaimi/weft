@@ -63,12 +63,7 @@ impl MetalRenderer {
         let theme_bg = color_to_normalized(ui.canvas);
         let fg = color_to_normalized(ui.text_primary);
         let accent = color_to_normalized(ui.focus);
-        let prompt_c = [
-            fg[0] * 0.70 + theme_bg[0] * 0.30,
-            fg[1] * 0.70 + theme_bg[1] * 0.30,
-            fg[2] * 0.70 + theme_bg[2] * 0.30,
-            1.0,
-        ];
+        let prompt_c = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.30);
         let dim = prompt_c;
         let separator = color_to_normalized(ui.border_subtle);
         let (su, sv, suw, svh) = self.space_uv();
@@ -225,12 +220,7 @@ impl MetalRenderer {
         let surface_state = palette_surface_state(p.query, p.entries.len(), true);
         if !surface_state.shows_results() && !p.query.is_empty() {
             let status = surface_state.status_text();
-            let status_color = [
-                fg[0] * 0.50 + theme_bg[0] * 0.50,
-                fg[1] * 0.50 + theme_bg[1] * 0.50,
-                fg[2] * 0.50 + theme_bg[2] * 0.50,
-                1.0,
-            ];
+            let status_color = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.50);
             let status_w = Self::text_col_width(&status);
             self.push_text(
                 &mut verts,
@@ -243,12 +233,7 @@ impl MetalRenderer {
         }
 
         // Results rows.
-        let suffix_color = [
-            fg[0] * 0.50 + theme_bg[0] * 0.50,
-            fg[1] * 0.50 + theme_bg[1] * 0.50,
-            fg[2] * 0.50 + theme_bg[2] * 0.50,
-            1.0,
-        ];
+        let suffix_color = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.50);
         let mut y = layout.results_y;
         for i in start..end {
             if y + ch > popup_bottom {

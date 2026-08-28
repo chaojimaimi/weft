@@ -68,8 +68,22 @@ pub struct OutputSemanticColors {
     pub failure: Color,
 }
 
+/// v1.11.6 (PLAN_v1116 M6/D-f): per-theme UI seed colors consumed by
+/// `UiColors::from_theme` (weft_app). All `None` by default — the UiColors
+/// light/dark dual-branch hardcodes stay as the fallback, so zero-config
+/// visuals are unchanged. A user `Some(...)` value replaces the dual-branch
+/// INPUT and still passes through the existing `ensure_contrast(..., 4.5)`
+/// accessibility gate — the stored hex is NOT the final painted color.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThemeUi {
+    pub success: Option<Color>,
+    pub warning: Option<Color>,
+    pub error: Option<Color>,
+    pub find_match: Option<Color>,
+}
+
 /// A fully-resolved theme: the colors the renderer paints with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Theme {
     pub foreground: Color,
     pub background: Color,
@@ -95,7 +109,37 @@ pub struct Theme {
     pub syntax: SyntaxColors,
     /// v1.7.0-B: output semantic color roles for unstyled command output.
     pub output: OutputSemanticColors,
+    /// v1.11.6 (PLAN_v1116 M6/D-f): OSC 8 hyperlink underline color. The
+    /// default is the f32 literal `[0.36, 0.62, 0.94, 1.0]` (the old
+    /// `HYPERLINK_COLOR` const in grid_instances.rs) — architect P1-4:
+    /// must NOT be carried as a u8 `Color`, because 0.36/0.62 have no
+    /// integer-byte representation. TOML overrides (`[theme] link = "#hex"`)
+    /// are u8-granular by nature (parsed to `Color`, then /255-normalized).
+    pub link: [f32; 4],
+    /// v1.11.6 (PLAN_v1116 M6/D-f): UI seed colors; all `None` by default.
+    pub ui: ThemeUi,
 }
+
+// f32 `link` has no `Eq`, so the derived impls are replaced by a manual
+// `PartialEq` with identical field-by-field semantics + a marker `Eq`.
+impl PartialEq for Theme {
+    fn eq(&self, other: &Self) -> bool {
+        self.foreground == other.foreground
+            && self.background == other.background
+            && self.cursor == other.cursor
+            && self.selection == other.selection
+            && self.palette == other.palette
+            && self.accent == other.accent
+            && self.accent_dim == other.accent_dim
+            && self.separator == other.separator
+            && self.syntax == other.syntax
+            && self.output == other.output
+            && self.link == other.link
+            && self.ui == other.ui
+    }
+}
+
+impl Eq for Theme {}
 
 impl Theme {
     /// Built-in dark theme — **weft-warm** (v0.8 default).
@@ -164,6 +208,8 @@ impl Theme {
                 success: Color::rgb(0xb8, 0xc8, 0x78),        // ANSI 2 green (olive)
                 failure: Color::rgb(0xc8, 0x68, 0x58),        // ANSI 1 red (brick)
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -218,6 +264,8 @@ impl Theme {
                 success: Color::rgb(0x6a, 0x80, 0x40),        // ANSI 2 green
                 failure: Color::rgb(0xa8, 0x48, 0x38),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -279,6 +327,8 @@ impl Theme {
                 success: Color::rgb(0x3e, 0xd9, 0xa4),        // ANSI 2 green (mint)
                 failure: Color::rgb(0xff, 0x5d, 0x38),        // ANSI 1 red (coral)
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -338,6 +388,8 @@ impl Theme {
                 success: Color::rgb(0x50, 0xfa, 0x7b),        // ANSI 2 green
                 failure: Color::rgb(0xff, 0x55, 0x55),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -397,6 +449,8 @@ impl Theme {
                 success: Color::rgb(0x85, 0x99, 0x00),        // ANSI 2 green
                 failure: Color::rgb(0xdc, 0x32, 0x2f),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -456,6 +510,8 @@ impl Theme {
                 success: Color::rgb(0x98, 0x97, 0x1a),        // ANSI 2 green
                 failure: Color::rgb(0xcc, 0x24, 0x1d),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -515,6 +571,8 @@ impl Theme {
                 success: Color::rgb(0xa3, 0xbe, 0x8c),        // ANSI 2 green (nord14)
                 failure: Color::rgb(0xbf, 0x61, 0x6a),        // ANSI 1 red (nord11)
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -573,6 +631,8 @@ impl Theme {
                 success: Color::rgb(0x9e, 0xce, 0x6a),        // ANSI 2 green
                 failure: Color::rgb(0xf7, 0x76, 0x8e),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -631,6 +691,8 @@ impl Theme {
                 success: Color::rgb(0xa6, 0xe3, 0xa1),        // ANSI 2 green
                 failure: Color::rgb(0xf3, 0x8b, 0xa8),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -688,6 +750,8 @@ impl Theme {
                 success: Color::rgb(0x98, 0xc3, 0x79),        // ANSI 2 green
                 failure: Color::rgb(0xe0, 0x6c, 0x75),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -745,6 +809,8 @@ impl Theme {
                 success: Color::rgb(0xa9, 0xdc, 0x76),        // ANSI 2 green
                 failure: Color::rgb(0xff, 0x61, 0x88),        // ANSI 1 red
             },
+            link: [0.36, 0.62, 0.94, 1.0], // v1.11.6 M6: OSC 8 hyperlink underline (old HYPERLINK_COLOR)
+            ui: ThemeUi::default(),
         }
     }
 
@@ -871,6 +937,35 @@ impl Theme {
             }
             if let Some(c) = out.failure.as_deref().and_then(parse_hex) {
                 theme.output.failure = c;
+            }
+        }
+        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme] link` — OSC 8 hyperlink
+        // underline color. Hex is u8-granular: parsed to Color then
+        // /255-normalized into the f32 domain, so a user value can never
+        // reproduce the exact 0.36/0.62/0.94 default (documented; P1-4).
+        if let Some(c) = cfg.link.as_deref().and_then(parse_hex) {
+            theme.link = [
+                c.r as f32 / 255.0,
+                c.g as f32 / 255.0,
+                c.b as f32 / 255.0,
+                1.0,
+            ];
+        }
+        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme.ui]` seed colors — a present
+        // key replaces the UiColors dual-branch input downstream (the
+        // 4.5-contrast gate still applies there); invalid hex falls back.
+        if let Some(ui) = cfg.ui.as_ref() {
+            if let Some(c) = ui.success.as_deref().and_then(parse_hex) {
+                theme.ui.success = Some(c);
+            }
+            if let Some(c) = ui.warning.as_deref().and_then(parse_hex) {
+                theme.ui.warning = Some(c);
+            }
+            if let Some(c) = ui.error.as_deref().and_then(parse_hex) {
+                theme.ui.error = Some(c);
+            }
+            if let Some(c) = ui.find_match.as_deref().and_then(parse_hex) {
+                theme.ui.find_match = Some(c);
             }
         }
         theme

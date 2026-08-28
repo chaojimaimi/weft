@@ -486,6 +486,17 @@ fn write_profile_sections(table: &mut toml_edit::Table, profile: &super::Profile
                     set_opt_string(ot, "failure", &output.failure);
                 }
             });
+            // v1.11.6 (PLAN_v1116 M6/D-f): profile-level `[profiles.x.theme]`
+            // link + `[theme.ui]` override round-trip.
+            set_opt_string(t, "link", &th.link);
+            write_profile_section(t, "ui", th.ui.is_some(), |ut| {
+                if let Some(ui) = &th.ui {
+                    set_opt_string(ut, "success", &ui.success);
+                    set_opt_string(ut, "warning", &ui.warning);
+                    set_opt_string(ut, "error", &ui.error);
+                    set_opt_string(ut, "find_match", &ui.find_match);
+                }
+            });
         }
     });
     write_profile_section(table, "window", profile.window.is_some(), |t| {

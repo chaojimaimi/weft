@@ -1,10 +1,8 @@
-//! Layout context and spacing tokens (v0.8 "Plisse" stage 1).
+//! Layout context (v0.8 "Plisse" stage 1).
 //!
 //! All overlay vertex builders share a single [`LayoutCtx`] so coordinates
 //! are derived from semantic methods (`left()`, `col_x(n)`, …) instead of
-//! hand-rolled `f32` arithmetic (`* 0.5`, `* 0.65`, …). [`Spacing`] provides
-//! the named spacing scale (xs/sm/md/lg/xl) so every overlay uses the same
-//! rhythm and spacing scales with the font size.
+//! hand-rolled `f32` arithmetic (`* 0.5`, `* 0.65`, …).
 //!
 //! See `docs/v0.8_PLAN.md` §4.1 (stage 1 — layout infrastructure).
 
@@ -189,67 +187,6 @@ impl LayoutCtx {
             Some([cx0, cy0, cx1, cy1]) => x1 > cx0 && x0 < cx1 && y1 > cy0 && y0 < cy1,
             None => true,
         }
-    }
-}
-
-/// Named spacing scale. Every overlay pulls gaps/padding from these helpers
-/// so spacing is uniform and scales with the font size (cell dimensions).
-///
-/// Conventions:
-/// - `xs` / `sm` / `md` / `lg` / `xl` — horizontal (character-width based)
-/// - `row_xs` / `row_sm` / `row_md` — vertical (line-height based)
-///
-/// Replace ad-hoc `* 0.5`, `* 0.65`, `* 0.3` with the closest token.
-pub struct Spacing;
-
-#[allow(dead_code)] // methods are adopted incrementally as overlays migrate
-impl Spacing {
-    /// Extra-small horizontal gap: 0.25 cell.
-    #[inline]
-    pub fn xs(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_w * 0.25
-    }
-
-    /// Small horizontal gap: 0.5 cell (replaces most `* 0.5`).
-    #[inline]
-    pub fn sm(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_w * 0.5
-    }
-
-    /// Medium horizontal gap: 1 cell (the default rhythm unit).
-    #[inline]
-    pub fn md(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_w
-    }
-
-    /// Large horizontal gap: 1.5 cells (replaces most `* 0.65` + slack).
-    #[inline]
-    pub fn lg(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_w * 1.5
-    }
-
-    /// Extra-large horizontal gap: 2 cells.
-    #[inline]
-    pub fn xl(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_w * 2.0
-    }
-
-    /// Extra-small vertical gap: 0.25 line.
-    #[inline]
-    pub fn row_xs(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_h * 0.25
-    }
-
-    /// Small vertical gap: 0.5 line.
-    #[inline]
-    pub fn row_sm(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_h * 0.5
-    }
-
-    /// Medium vertical gap: 1 line (block separator rhythm).
-    #[inline]
-    pub fn row_md(ctx: &LayoutCtx) -> f32 {
-        ctx.cell_h
     }
 }
 

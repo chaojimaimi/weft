@@ -651,19 +651,9 @@ impl MetalRenderer {
         let (su, sv, suw, svh) = self.space_uv();
         let bg_uv = [su, sv + svh, su + suw, sv];
 
-        let label_color = [
-            fg[0] * 0.85 + theme_bg[0] * 0.15,
-            fg[1] * 0.85 + theme_bg[1] * 0.15,
-            fg[2] * 0.85 + theme_bg[2] * 0.15,
-            1.0,
-        ];
+        let label_color = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.15);
         let sel_label_color = fg;
-        let suffix_color = [
-            fg[0] * 0.50 + theme_bg[0] * 0.50,
-            fg[1] * 0.50 + theme_bg[1] * 0.50,
-            fg[2] * 0.50 + theme_bg[2] * 0.50,
-            1.0,
-        ];
+        let suffix_color = crate::paint::color_math::mix_fg_over_bg(fg, theme_bg, 0.50);
 
         let [popup_x0, popup_top, popup_x1, popup_bottom] = layout.popup_rect;
         let icon_x = layout.icon_x;

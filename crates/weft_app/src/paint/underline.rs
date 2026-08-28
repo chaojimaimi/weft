@@ -140,7 +140,7 @@ pub(crate) fn underline_color(
         Some(origin) => {
             let c = resolve_cell_color(origin, default, palette);
             if flags.contains(CellFlags::DIM) {
-                [c[0] * 0.5, c[1] * 0.5, c[2] * 0.5, c[3]]
+                crate::paint::color_math::dim_half(c)
             } else {
                 c
             }

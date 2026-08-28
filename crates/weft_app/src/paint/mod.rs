@@ -9,7 +9,19 @@
 
 pub(crate) mod alt_peek_pill;
 pub(crate) mod block_view;
+// v1.11.6 (PLAN_v1116 M3/D-a): vertex goldens for
+// `build_block_view_vertices` — the pre-split byte baseline the M4
+// structural move kept byte-equal (now also pinning M5/M6 value-preserving
+// consolidation and the M7 selection flip via the S4 scene). Mounted here
+// (not inside block_view.rs, which the M4 split brought back under 800)
+// to keep the paint-ordering module free of test fixtures.
+#[cfg(test)]
+#[path = "block_view/golden_tests.rs"]
+mod block_view_golden_tests;
 pub(crate) mod block_view_model;
+// v1.11.6 (PLAN_v1116 M5 / C2): single source for ratio-based color
+// derivations (bit-exact ports of the inline expressions they replace).
+pub(crate) mod color_math;
 pub(crate) mod command_surface;
 pub(crate) mod grid;
 #[cfg(test)]

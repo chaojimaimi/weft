@@ -61,12 +61,7 @@ impl CommandSurfaceShell {
         theme_bg: [f32; 4],
         bg_uv: [f32; 4],
     ) -> Self {
-        let bg_color = [
-            theme_bg[0] + (1.0 - theme_bg[0]) * 0.08,
-            theme_bg[1] + (1.0 - theme_bg[1]) * 0.08,
-            theme_bg[2] + (1.0 - theme_bg[2]) * 0.08,
-            1.0,
-        ];
+        let bg_color = crate::paint::color_math::lighten_to_white(theme_bg, 0.08);
         Self {
             popup_rect,
             shadow_pad,
@@ -235,12 +230,7 @@ impl CommandSurfaceRowState {
         }
         if self.hovered {
             // Hover: bg lifted 4% toward white — subtle.
-            return Some([
-                theme_bg[0] + (1.0 - theme_bg[0]) * 0.04,
-                theme_bg[1] + (1.0 - theme_bg[1]) * 0.04,
-                theme_bg[2] + (1.0 - theme_bg[2]) * 0.04,
-                1.0,
-            ]);
+            return Some(crate::paint::color_math::lighten_to_white(theme_bg, 0.04));
         }
         None
     }

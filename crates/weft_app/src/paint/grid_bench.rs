@@ -157,6 +157,8 @@ struct CollectParams<'a> {
     cursor_row: usize,
     cursor_col: usize,
     show_cursor: bool,
+    /// v1.11.6 (M6): OSC 8 hyperlink underline color — Theme::link.
+    hyperlink_color: [f32; 4],
 }
 
 /// Collect the resolved cell grid for a scenario. Returns a 2D Vec indexed
@@ -173,6 +175,7 @@ fn collect_resolved_cells(p: &CollectParams<'_>) -> Vec<Vec<Option<ResolvedCell>
         cursor_row,
         cursor_col,
         show_cursor,
+        hyperlink_color,
     } = *p;
     let mut out = Vec::with_capacity(grid.num_rows);
     for row in 0..grid.num_rows {
@@ -210,7 +213,7 @@ fn collect_resolved_cells(p: &CollectParams<'_>) -> Vec<Vec<Option<ResolvedCell>
             if is_hyperlink {
                 // Hyperlink underline: a thin cyan line. Counts as a bg-only
                 // decoration run (no glyph needed for the line itself).
-                decorations.push([0.36, 0.62, 0.94, 1.0]);
+                decorations.push(hyperlink_color);
             }
 
             // has_glyph: non-space character AND not HIDDEN.
@@ -418,6 +421,7 @@ fn make_streaming_grid() -> Grid {
 }
 
 /// Run one scenario: build single-stream + dual-stream counts and measure time.
+#[allow(clippy::too_many_arguments)] // v1.11.6: hyperlink_color (Theme::link)
 fn run_scenario(
     name: &str,
     grid: &Grid,
@@ -426,6 +430,7 @@ fn run_scenario(
     cursor_row: usize,
     cursor_col: usize,
     show_cursor: bool,
+    hyperlink_color: [f32; 4],
 ) -> ScenarioReport {
     let default_fg = [
         Color::DEFAULT_FG.r as f32 / 255.0,
@@ -453,6 +458,7 @@ fn run_scenario(
         cursor_row,
         cursor_col,
         show_cursor,
+        hyperlink_color,
     });
     let single_build_us = single_start.elapsed().as_micros() as u64;
 
@@ -497,36 +503,39 @@ fn run_scenario(
 #[ignore = "v1.4.2 Phase A benchmark; run with --release --ignored --nocapture"]
 fn bench_build_grid_instances() {
     let palette = Color::standard_palette();
+    // v1.11.6 (M6): hyperlink underline color from the same single source
+    // the grid path uses (Theme::link) instead of a duplicated literal.
+    let link_color = weft_core::config::Theme::weft_warm().link;
 
     let scenarios: Vec<ScenarioReport> = vec![
         // Scenario 1: default bg (empty grid, all spaces)
         {
             let g = make_default_bg_grid();
             let sh = SelectionHandler::new();
-            run_scenario("default_bg", &g, &palette, &sh, 0, 0, false)
+            run_scenario("default_bg", &g, &palette, &sh, 0, 0, false, link_color)
         },
         // Scenario 2: prompt + command output (~500 chars of text)
         {
             let g = make_prompt_grid();
             let sh = SelectionHandler::new();
-            run_scenario("prompt", &g, &palette, &sh, 31, 2, true)
+            run_scenario("prompt", &g, &palette, &sh, 31, 2, true, link_color)
         },
         // Scenario 3: colorful TUI (vim, ~50% cells colored)
         {
             let g = make_colorful_tui_grid();
             let sh = SelectionHandler::new();
-            run_scenario("colorful_tui", &g, &palette, &sh, 0, 0, false)
+            run_scenario("colorful_tui", &g, &palette, &sh, 0, 0, false, link_color)
         },
         // Scenario 4: selection active over 6 rows
         {
             let (g, sh) = make_selection_grid();
-            run_scenario("selection", &g, &palette, &sh, 31, 2, true)
+            run_scenario("selection", &g, &palette, &sh, 31, 2, true, link_color)
         },
         // Scenario 5: streaming output (new content, mostly default bg)
         {
             let g = make_streaming_grid();
             let sh = SelectionHandler::new();
-            run_scenario("streaming", &g, &palette, &sh, 239, 2, true)
+            run_scenario("streaming", &g, &palette, &sh, 239, 2, true, link_color)
         },
     ];
 

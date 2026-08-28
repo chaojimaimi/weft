@@ -125,6 +125,23 @@ impl MetalRenderer {
         self.resize_present_probe.take()
     }
 
+    /// v1.11.6 (PLAN_v1116 M2/D-i): live-resize present mode. While macOS
+    /// live-resizes the window, present the frame inside the current Core
+    /// Animation transaction so the resized layer bounds and the new pixels
+    /// commit atomically (Warp precedent) — kills the "old frame stretched
+    /// to new bounds" artifact. Async present resumes when the resize ends.
+    ///
+    /// Early-returns when the state is unchanged (polled every frame); the
+    /// layer property flips only on the transition.
+    pub(crate) fn set_live_resize(&mut self, active: bool) {
+        if self.live_resize_active == active {
+            return;
+        }
+        self.live_resize_active = active;
+        self.layer.set_presents_with_transaction(active); // metal-rs typed API
+        tracing::debug!(active, "live resize present mode");
+    }
+
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
         // Use physical pixels for viewport to match drawable_size and grid dimensions
         let vp_w = size.width as f32;

@@ -44,6 +44,13 @@ else
     echo "==> Using existing ${APP_DIR}"
 fi
 
+# v1.11.6 (PLAN_v1116 M1/D-h): the .app must carry a signature before the
+# DMG is assembled — ad-hoc or Developer ID. UNUserNotificationCenter is
+# silently disabled on unsigned bundles (the v1.11.5 notification root
+# cause), so this gate prevents packaging a stale unsigned .app again.
+# --strict also rejects ad-hoc signatures that only cover part of the bundle.
+codesign --verify --strict "${APP_DIR}"
+
 echo "==> Preparing DMG staging directory"
 STAGING_DIR="${OSX_DIR}/dmg-staging"
 rm -rf "${STAGING_DIR}"

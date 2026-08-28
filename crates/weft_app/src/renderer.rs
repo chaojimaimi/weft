@@ -141,6 +141,12 @@ pub struct MetalRenderer {
     /// stage-4 gate — armed on resize(), consumed once at the next draw to
     /// log the first present after a Resized.
     pub(crate) resize_present_probe: std::cell::Cell<Option<std::time::Instant>>,
+    /// v1.11.6 (PLAN_v1116 M2/D-i): true while macOS is live-resizing the
+    /// window. The layer flips `presentsWithTransaction` on state change so
+    /// frames commit atomically with the resized bounds (Warp precedent);
+    /// `encode_and_present` also flushes the Core Animation transaction
+    /// while active. Polled per-frame by the redraw controller.
+    pub(crate) live_resize_active: bool,
     /// v1.10.23 change 2: exact `block_scroll_metrics` memo — the fingerprint
     /// covers every input, so wheel + same-frame scrollbar share one scan.
     pub(crate) scroll_metrics_memo: Cell<BlockScrollMetricsMemo>,
@@ -852,12 +858,7 @@ impl MetalRenderer {
                     // v1.0: label_c (70% fg + 30% bg) — was accent_dim.
                     let fg_v = color_to_normalized(self.theme.foreground);
                     let bg_v = color_to_normalized(self.theme.background);
-                    let thumb_color = [
-                        fg_v[0] * 0.70 + bg_v[0] * 0.30,
-                        fg_v[1] * 0.70 + bg_v[1] * 0.30,
-                        fg_v[2] * 0.70 + bg_v[2] * 0.30,
-                        1.0,
-                    ];
+                    let thumb_color = crate::paint::color_math::mix_fg_over_bg(fg_v, bg_v, 0.30);
                     let (su, sv, suw, svh) = self.space_uv();
                     let bg_uv = [su, sv + svh, su + suw, sv];
                     push_quad(

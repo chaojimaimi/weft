@@ -40,7 +40,7 @@ objc2 = { version = "0.5", features = ["exception"] }
 objc2-metal = "0.2"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry", "NSString", "NSObject"] }
 objc2-app-kit = { version = "0.2", features = ["NSAccessibility", "NSAccessibilityConstants", "NSAccessibilityElement", "NSAccessibilityProtocols", "NSApplication", "NSWindow", "NSView", "NSRunningApplication", "NSMenu", "NSMenuItem", "NSImage", "NSTextInputContext", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSAlert", "NSButton", "NSDockTile"] }
-objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer"] }
+objc2-quartz-core = { version = "0.2", features = ["CAMetalLayer", "CATransaction"] }
 objc2-user-notifications = { version = "=0.2.2", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSound", "UNNotification", "UNNotificationResponse", "UNNotificationTrigger", "block2"] }
 block2 = "=0.5.1"
 winit = "0.30"

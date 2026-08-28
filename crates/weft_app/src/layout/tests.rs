@@ -101,37 +101,6 @@ fn for_pane_aligns_origin_and_clip_to_split_rect() {
     assert_eq!(pane_ctx.clip, Some(pane));
 }
 
-// ── Spacing tokens ──────────────────────────────────────────────────
-
-#[test]
-fn horizontal_spacing_scales_with_cell_w() {
-    let ctx = sample_ctx(); // cell_w = 7.2
-    assert_eq!(Spacing::xs(&ctx), 7.2 * 0.25);
-    assert_eq!(Spacing::sm(&ctx), 7.2 * 0.5);
-    assert_eq!(Spacing::md(&ctx), 7.2);
-    assert_eq!(Spacing::lg(&ctx), 7.2 * 1.5);
-    assert_eq!(Spacing::xl(&ctx), 7.2 * 2.0);
-}
-
-#[test]
-fn vertical_spacing_scales_with_cell_h() {
-    let ctx = sample_ctx(); // cell_h = 16.8
-    assert_eq!(Spacing::row_xs(&ctx), 16.8 * 0.25);
-    assert_eq!(Spacing::row_sm(&ctx), 16.8 * 0.5);
-    assert_eq!(Spacing::row_md(&ctx), 16.8);
-}
-
-#[test]
-fn spacing_scales_when_font_grows() {
-    // Cmd+/- font zoom: cell dimensions change, spacing follows.
-    let small = LayoutCtx::new((1600.0, 1200.0), 7.2, 16.8, 16.0, 16.0);
-    let big = LayoutCtx::new((1600.0, 1200.0), 10.8, 25.2, 16.0, 16.0); // 1.5×
-    assert!(Spacing::md(&big) > Spacing::md(&small));
-    assert!(Spacing::row_md(&big) > Spacing::row_md(&small));
-    // Ratio is preserved (1.5×).
-    assert!((Spacing::md(&big) / Spacing::md(&small) - 1.5).abs() < 1e-5);
-}
-
 #[test]
 fn zero_padding_context() {
     // A borderless context (e.g. fullscreen alt-screen) is valid.
@@ -186,7 +155,7 @@ fn completion_3_items_short_text() {
     // Popup top must stay inside the viewport (no overflow above).
     assert!(layout.popup_rect[1] >= ctx.top());
 
-    // Column anchors: pad = 0.5*cw = 3.6 (Spacing::sm), icon_w = 2*cw = 14.4
+    // Column anchors: pad = 0.5*cw = 3.6, icon_w = 2*cw = 14.4
     // icon_x = popup_x0 + pad = 16 + 3.6 = 19.6
     // label_x = popup_x0 + pad + icon_w = 16 + 3.6 + 14.4 = 34.0
     assert!((layout.icon_x - 19.6).abs() < 1e-3);

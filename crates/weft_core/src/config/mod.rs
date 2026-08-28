@@ -73,10 +73,10 @@ pub use save::ConfigSaveError;
 pub use sections::{
     AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, FontConfig, LogoConfig,
     LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig, PasteConfig,
-    ScrollbackConfig, SyntaxConfig, ThemeConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
+    ScrollbackConfig, SyntaxConfig, ThemeConfig, UiConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
     SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
-pub use theme::{OutputSemanticColors, SyntaxColors, Theme};
+pub use theme::{OutputSemanticColors, SyntaxColors, Theme, ThemeUi};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
 
 use self::save::{
@@ -327,6 +327,32 @@ impl Config {
         } else if theme.contains_key("output") {
             // cfg.theme.output = None：用户清除了整个 output override，删除磁盘表。
             theme.remove("output");
+        }
+        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme] link` — write if set,
+        // remove when cleared (same diff philosophy as the hex keys above).
+        if let Some(link) = &self.theme.link {
+            theme["link"] = toml_edit::value(link.as_str());
+        } else if theme.contains_key("link") {
+            theme.remove("link");
+        }
+        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme.ui]` subsection. 操作现有
+        // 表（若存在）而非每次创建新表，避免清空所有字段时旧表残留。
+        if let Some(ui) = &self.theme.ui {
+            let ui_entry = theme.entry("ui").or_insert_with(toml_edit::table);
+            if ui_entry.is_none() {
+                *ui_entry = toml_edit::table();
+            }
+            let uit = ui_entry.as_table_mut().expect("ui is a table");
+            set_opt_string_clear(uit, "success", &ui.success);
+            set_opt_string_clear(uit, "warning", &ui.warning);
+            set_opt_string_clear(uit, "error", &ui.error);
+            set_opt_string_clear(uit, "find_match", &ui.find_match);
+            if uit.iter().count() == 0 {
+                theme.remove("ui");
+            }
+        } else if theme.contains_key("ui") {
+            // cfg.theme.ui = None：用户清除了整个 ui override，删除磁盘表。
+            theme.remove("ui");
         }
 
         // [window] section.

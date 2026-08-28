@@ -258,7 +258,12 @@ impl UiColors {
             accent_hover,
             accent_pressed,
             success: ensure_contrast(
-                if light_text {
+                // v1.11.6 (M6/D-f): a `theme.ui.success` override replaces
+                // the dual-branch input and STILL runs the 4.5 gate — the
+                // user hex is not necessarily the final painted color.
+                if let Some(user) = theme.ui.success {
+                    user
+                } else if light_text {
                     Color::rgb(135, 204, 92)
                 } else {
                     Color::rgb(50, 120, 35)
@@ -267,7 +272,9 @@ impl UiColors {
                 4.5,
             ),
             warning: ensure_contrast(
-                if light_text {
+                if let Some(user) = theme.ui.warning {
+                    user
+                } else if light_text {
                     Color::rgb(220, 166, 78)
                 } else {
                     Color::rgb(150, 95, 0)
@@ -276,7 +283,9 @@ impl UiColors {
                 4.5,
             ),
             error: ensure_contrast(
-                if light_text {
+                if let Some(user) = theme.ui.error {
+                    user
+                } else if light_text {
                     Color::rgb(217, 92, 92)
                 } else {
                     Color::rgb(180, 45, 45)
@@ -284,7 +293,13 @@ impl UiColors {
                 &[bg, panel],
                 4.5,
             ),
-            find_match: if light_text {
+            find_match: if let Some(user) = theme.ui.find_match {
+                // v1.11.6 (M6/D-f): user override replaces the dual-branch
+                // input. Unlike success/warning/error, this key never had
+                // an ensure_contrast gate ("照旧" per D-f), so the user
+                // value stays raw — the renderer composites it at 50% alpha.
+                user
+            } else if light_text {
                 Color::rgb(242, 199, 51)
             } else {
                 // The renderer composites this token at 50% alpha. A dark
@@ -796,4 +811,48 @@ mod tests {
             }
         }
     }
+}
+
+// ── v1.11.6 (PLAN_v1116 M6/D-f): theme.ui seed overrides ─────────
+
+#[test]
+fn theme_ui_success_override_still_passes_ensure_contrast_gate() {
+    // A user `theme.ui.success` hex replaces the dual-branch INPUT but
+    // still runs ensure_contrast(..., 4.5): the stored hex is NOT the
+    // final painted color — a near-bg value must be lifted to ≥4.5:1
+    // against the theme background.
+    let mut theme = Theme::weft_warm();
+    let raw_bg = theme.background;
+    theme.ui.success = Some(Color::rgb(20, 20, 20)); // ≈ bg → fails 4.5
+    let ui = UiColors::from_theme(&theme);
+    assert_ne!(
+        ui.success,
+        Color::rgb(20, 20, 20),
+        "gate must adjust the user success value"
+    );
+    assert!(
+        contrast_ratio(ui.success, raw_bg) >= 4.5 - 1e-6,
+        "user success override must reach the 4.5 gate, got {}",
+        contrast_ratio(ui.success, raw_bg)
+    );
+    // The other gated keys behave the same way.
+    theme.ui.warning = Some(Color::rgb(20, 20, 20));
+    theme.ui.error = Some(Color::rgb(20, 20, 20));
+    let ui = UiColors::from_theme(&theme);
+    assert!(contrast_ratio(ui.warning, raw_bg) >= 4.5 - 1e-6);
+    assert!(contrast_ratio(ui.error, raw_bg) >= 4.5 - 1e-6);
+}
+
+#[test]
+fn theme_ui_none_falls_back_to_dual_branch() {
+    // All-None (zero-config) keeps the old dual-branch hardcodes —
+    // find_match has no gate in the legacy pipeline, so its None value
+    // is exactly the literal (dark ochre / light yellow).
+    // "light_text" in from_theme means the CANVAS is dark (text is
+    // light) — weft_warm is dark → the yellow branch; weft_light is
+    // light → the dark ochre branch.
+    let dark_ui = UiColors::from_theme(&Theme::weft_warm());
+    assert_eq!(dark_ui.find_match, Color::rgb(242, 199, 51));
+    let light_ui = UiColors::from_theme(&Theme::weft_light());
+    assert_eq!(light_ui.find_match, Color::rgb(65, 25, 0));
 }

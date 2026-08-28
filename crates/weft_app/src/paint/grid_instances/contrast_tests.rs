@@ -15,6 +15,9 @@ use weft_core::selection::SelectionHandler;
 
 const FG_FULL: [f32; 4] = [0.8, 0.6, 0.4, 1.0];
 const BG_DARK: [f32; 4] = [0.1, 0.1, 0.2, 1.0];
+// v1.11.6 (M6): the old HYPERLINK_COLOR const moved into Theme::link;
+// tests pin the default value (identical literal).
+const HYPERLINK_COLOR: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
 
 /// Build a 1-cell grid row with a single cell for SGR attribute tests.
 fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowInstances {
@@ -40,6 +43,7 @@ fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowIn
         0.0,
         0.0,
         false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     )
 }
 
@@ -69,6 +73,7 @@ fn terminal_grid_applies_minimum_contrast_without_touching_background() {
         0.0,
         0.0,
         false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     );
     assert_eq!(result.bg_instances[0].bg, BACKGROUND);
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
@@ -128,6 +133,7 @@ fn grid_explicit_terminal_color_preserves_application_hierarchy() {
         0.0,
         0.0,
         false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     );
     let GlyphInstance::Text { fg, .. } = &instances.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -304,6 +310,7 @@ fn build_high_contrast_cell(cell: &Cell) -> super::GridRowInstances {
         0.0,
         0.0,
         false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     )
 }
 
@@ -442,7 +449,7 @@ fn grid_hyperlink_decoration_suppressed_by_sgr_wavy() {
         result.glyph_instances.iter().all(|g| !matches!(
             g,
             GlyphInstance::Decoration { color, .. }
-                if *color == super::HYPERLINK_COLOR
+                if *color == HYPERLINK_COLOR
         )),
         "hyperlink decoration must be suppressed by the SGR underline"
     );
@@ -458,7 +465,7 @@ fn grid_hyperlink_without_sgr_underline_keeps_hyperlink_color() {
         result.glyph_instances.iter().any(|g| matches!(
             g,
             GlyphInstance::Decoration { color, .. }
-                if *color == super::HYPERLINK_COLOR
+                if *color == HYPERLINK_COLOR
         )),
         "plain hyperlink keeps its decoration"
     );
@@ -536,7 +543,8 @@ fn grid_bold_is_bright_on_maps_ansi_to_bright_variant() {
         20.0,
         0.0,
         0.0,
-        true, // bold_is_bright
+        true,                    // bold_is_bright
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -578,6 +586,7 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
             0.0,
             0.0,
             true,
+            [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
         );
         let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
             panic!("expected text glyph");
@@ -611,6 +620,7 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
         0.0,
         0.0,
         true,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");
@@ -651,6 +661,7 @@ fn grid_bold_is_bright_reverse_dim_order_stable() {
         0.0,
         0.0,
         true,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     );
     let GlyphInstance::Text { fg, .. } = &result.glyph_instances[0] else {
         panic!("expected text glyph");

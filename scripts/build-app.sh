@@ -106,7 +106,18 @@ if [[ -n "${SIGN_IDENTITY}" ]]; then
     # Verify
     codesign --verify --verbose=2 "${APP_DIR}"
 else
-    echo "==> Skipping code signing (pass --sign \"Developer ID: ...\" to enable)"
+    # v1.11.6 (PLAN_v1116 M1/D-h): ad-hoc signing. macOS 26 silently rejects
+    # UNUserNotificationCenter requestAuthorization on unsigned bundles
+    # (granted=false, no dialog — the v1.11.5 notification root cause), so an
+    # unsigned .app can never show the permission prompt. Ad-hoc is the
+    # minimum signature that satisfies the check; it is NOT notarized and
+    # carries no hardened runtime (--options runtime / entitlements are
+    # intentionally absent — no benefit without notarization).
+    # Side effect: every repackaged DMG has a new cdhash, so macOS re-prompts
+    # for notification permission on the first launch of each build.
+    echo "==> Ad-hoc signing bundle (v1.11.6: UNUserNotificationCenter requires a signed bundle)"
+    codesign --force --sign - --identifier "${BUNDLE_ID}" "${APP_DIR}"
+    codesign --verify "${APP_DIR}"
 fi
 
 echo "==> Done: ${APP_DIR}"

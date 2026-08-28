@@ -22,6 +22,10 @@ pub(super) struct BlockOutputTextPaint<'a> {
     pub(super) fallback: [f32; 4],
     pub(super) canvas: [f32; 4],
     pub(super) selection: Option<(usize, usize, [f32; 4])>,
+    /// v1.11.6 (PLAN_v1116 M7/D-e): opaque painted selection color — the
+    /// C1 text-contrast benchmark for selected cells (same source as the
+    /// grid path; zero new computation, computed once per frame).
+    pub(super) selection_painted: [f32; 4],
     pub(super) max_cols: usize,
     pub(super) palette: &'a [Color; 256],
     pub(super) row_pitch: f32,
@@ -77,14 +81,22 @@ fn contrast_background(
     explicit_background: Option<[f32; 4]>,
     canvas: [f32; 4],
     selection: Option<(usize, usize, [f32; 4])>,
+    selection_painted: [f32; 4],
     source_index: usize,
 ) -> [f32; 4] {
+    // v1.11.6 (PLAN_v1116 M7/D-e): C1 flip — the selection wins over an
+    // explicit background. The text-contrast benchmark is the PAINTED
+    // selection color (opaque; same source as the grid path's
+    // `selection_painted`, grid_instances.rs:347-354), NOT the translucent
+    // quad color — selected text must stay readable on the real band.
+    let range = source_index..source_index + 1;
+    if let Some((start, end, _)) = selection {
+        if range.start < end && range.end > start {
+            return selection_painted;
+        }
+    }
     explicit_background.unwrap_or_else(|| {
-        crate::paint::primitives::text_background_for_range(
-            canvas,
-            selection,
-            source_index..source_index + 1,
-        )
+        crate::paint::primitives::text_background_for_range(canvas, selection, range)
     })
 }
 
@@ -227,6 +239,7 @@ impl MetalRenderer {
                 fallback: paint.fallback,
                 canvas: paint.canvas,
                 selection: paint.selection,
+                selection_painted: paint.selection_painted,
                 max_cols: paint.max_cols,
                 palette: paint.palette,
                 row_pitch: paint.row_pitch,
@@ -307,8 +320,13 @@ impl MetalRenderer {
                 (fg, bg)
             };
 
-            let contrast_background =
-                contrast_background(bg_final, paint.canvas, paint.selection, source_index);
+            let contrast_background = contrast_background(
+                bg_final,
+                paint.canvas,
+                paint.selection,
+                paint.selection_painted,
+                source_index,
+            );
             // v1.10.4: terminal graphic glyphs (box drawing / block elements)
             // are decoration — TUIs draw borders/bars with intentionally
             // low-contrast colors (e.g. opencode's ▀ input-box edge on a dark
@@ -327,18 +345,21 @@ impl MetalRenderer {
             // DIM remains an explicit application-owned hierarchy signal and
             // is applied after the optional display contrast correction.
             let fg_final = if flags.contains(CellFlags::DIM) {
-                [
-                    fg_final[0] * 0.5,
-                    fg_final[1] * 0.5,
-                    fg_final[2] * 0.5,
-                    fg_final[3],
-                ]
+                crate::paint::color_math::dim_half(fg_final)
             } else {
                 fg_final
             };
 
             // Draw background quad if non-transparent.
-            if let Some(background) = bg_final {
+            // v1.11.6 (PLAN_v1116 M7/P2-9): a selected cell SKIPS its
+            // per-cell explicit bg quad — the selection band (painted
+            // before the text in block_view.rs) shows through instead of
+            // being covered by the explicit background (C1 flip, no quad
+            // reordering needed).
+            let in_selection = paint
+                .selection
+                .is_some_and(|(start, end, _)| source_index < end && source_index + 1 > start);
+            if let Some(background) = bg_final.filter(|_| !in_selection) {
                 let cell_width = width as f32 * cw;
                 push_quad(
                     vertices,
@@ -451,10 +472,13 @@ impl MetalRenderer {
 mod tests {
     use super::{
         contrast_background, fills_terminal_cell_edges, resolve_block_fg_color, reverse_colors,
-        semantic_fallback_at,
+        semantic_fallback_at, BlockOutputTextPaint, CacheKeyInput,
     };
     use crate::paint::primitives::color_to_normalized;
+    use crate::paint::styled_line_cache::StyledLineCache;
+    use crate::renderer::MetalRenderer;
     use weft_core::config::Theme;
+    use weft_core::grid::Color;
 
     #[test]
     fn block_and_box_glyphs_bridge_block_view_row_leading() {
@@ -519,17 +543,119 @@ mod tests {
     }
 
     #[test]
-    fn selection_background_is_used_unless_reverse_provides_an_explicit_background() {
+    fn selection_background_wins_over_explicit_background() {
+        // v1.11.6 (PLAN_v1116 M7/D-e): C1 flip — a selected char's
+        // contrast benchmark is the PAINTED selection color even when the
+        // cell carries an explicit background (the pre-flip assertion
+        // pinned explicit-wins here; selection now wins, matching grid).
         let canvas = [0.1, 0.2, 0.3, 1.0];
         let selected = [0.4, 0.5, 0.6, 1.0];
         let explicit = [0.7, 0.3, 0.2, 1.0];
+        let painted = [0.33, 0.42, 0.53, 1.0];
         let selection = Some((2, 5, selected));
-        assert_eq!(contrast_background(None, canvas, selection, 3), selected);
         assert_eq!(
-            contrast_background(Some(explicit), canvas, selection, 3),
+            contrast_background(None, canvas, selection, painted, 3),
+            painted
+        );
+        assert_eq!(
+            contrast_background(Some(explicit), canvas, selection, painted, 3),
+            painted,
+            "selection must override the explicit background"
+        );
+        // Outside the [2, 5) range the explicit bg (or canvas) applies.
+        assert_eq!(
+            contrast_background(Some(explicit), canvas, selection, painted, 1),
             explicit
         );
-        assert_eq!(contrast_background(None, canvas, selection, 7), canvas);
+        assert_eq!(
+            contrast_background(Some(explicit), canvas, selection, painted, 5),
+            explicit
+        );
+        assert_eq!(
+            contrast_background(None, canvas, selection, painted, 7),
+            canvas
+        );
+    }
+
+    #[test]
+    fn selection_benchmark_is_painted_not_quad_color() {
+        // The flip's benchmark is the OPAQUE painted color — the same
+        // source as grid_instances.rs:347-354 — NOT the translucent quad
+        // color carried in the selection tuple (using the quad would
+        // under-guard contrast on the real band).
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let quad = [0.4, 0.5, 0.6, 0.60];
+        let painted = [0.82, 0.84, 0.86, 1.0];
+        let selection = Some((0, 8, quad));
+        let benchmark = contrast_background(None, canvas, selection, painted, 4);
+        assert_eq!(benchmark, painted);
+        assert_ne!(benchmark, quad);
+    }
+
+    #[test]
+    fn explicit_background_wins_without_selection() {
+        // Regression anchor: no selection → explicit bg is the benchmark,
+        // and canvas when neither is present (pre-flip behavior intact).
+        let canvas = [0.1, 0.2, 0.3, 1.0];
+        let explicit = [0.7, 0.3, 0.2, 1.0];
+        let painted = [0.33, 0.42, 0.53, 1.0];
+        assert_eq!(
+            contrast_background(Some(explicit), canvas, None, painted, 3),
+            explicit
+        );
+        assert_eq!(contrast_background(None, canvas, None, painted, 3), canvas);
+    }
+
+    #[test]
+    fn cached_output_with_selection_bypasses_styled_line_cache() {
+        // v1.11.6 (PLAN_v1116 M7/P2-9): the C1 flip relies on the bypass
+        // at style.rs:172-175 — `paint.selection.is_some()` skips the
+        // styled-line cache (the selection changes every frame, so cached
+        // color-benchmark vertices would go stale). Pin the invariant:
+        // with a selection the cache counters stay untouched.
+        let Some(_device) = metal::Device::system_default() else {
+            eprintln!("skipping cached-output test: no Metal device");
+            return;
+        };
+        let renderer = MetalRenderer::new_headless_paint(Theme::weft_warm());
+        let paint = BlockOutputTextPaint {
+            x: 0.0,
+            y: 0.0,
+            text: "abc",
+            semantic_text: "abc",
+            style: None,
+            char_offset: 0,
+            fallback: [0.9, 0.9, 0.9, 1.0],
+            canvas: [0.1, 0.1, 0.2, 1.0],
+            selection: Some((1, 2, [0.4, 0.5, 0.6, 0.60])),
+            selection_painted: [0.8, 0.8, 0.85, 1.0],
+            max_cols: 10,
+            palette: &Color::standard_palette(),
+            row_pitch: 16.0,
+        };
+        let key = CacheKeyInput {
+            pane_session_id: 1,
+            block_id: 0,
+            line_idx: 0,
+            chunk_idx: 0,
+            render_generation: 0,
+            palette_fingerprint: 0,
+            source: Some(std::sync::Arc::<str>::from("abc")),
+            styled: None,
+        };
+        let cache = std::cell::RefCell::new(StyledLineCache::new());
+        let mut verts = Vec::new();
+        // A selection-bearing call must bypass the cache entirely — a
+        // non-selected control call with the same key afterwards proves
+        // the key WOULD have been cacheable (the control goes on to hit).
+        renderer.push_block_output_text_cached(&mut verts, paint, key, &cache);
+        let (hits, misses) = cache.borrow_mut().take_hit_miss_counts();
+        assert_eq!(
+            (hits, misses),
+            (0, 0),
+            "selection-bearing calls must never touch the styled-line cache"
+        );
+        assert!(!verts.is_empty());
     }
 
     #[test]

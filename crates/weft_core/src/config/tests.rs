@@ -2657,3 +2657,157 @@ fn clipboard_and_notifications_profile_override_applies() {
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
+
+// ── v1.11.6 (PLAN_v1116 M6): Theme link + [theme.ui] keys ────────────
+
+#[test]
+fn theme_link_default_matches_old_hyperlink_const_bitwise() {
+    // v1.11.6 (PLAN_v1116 M6/D-f): Theme::link default must be bit-equal
+    // to the old HYPERLINK_COLOR const ([0.36, 0.62, 0.94, 1.0]) that
+    // grid_instances.rs carried before the theme-key migration, and
+    // Theme::ui must default to all-None (UiColors dual-branch fallback).
+    let old_const: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
+    let themes = [
+        Theme::weft_warm(),
+        Theme::weft_light(),
+        Theme::warp_dark(),
+        Theme::dracula(),
+        Theme::solarized_dark(),
+        Theme::gruvbox_dark(),
+        Theme::nord(),
+        Theme::tokyo_night(),
+        Theme::catppuccin_mocha(),
+        Theme::one_dark(),
+        Theme::monokai_pro(),
+    ];
+    for theme in themes {
+        for (i, (actual, expected)) in theme.link.iter().zip(old_const).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "link channel {i} of {theme:?} drifted from the old const"
+            );
+        }
+        assert_eq!(
+            theme.ui,
+            ThemeUi::default(),
+            "ui seeds must default to None"
+        );
+    }
+}
+
+#[test]
+fn theme_link_and_ui_parse_from_toml_and_resolve() {
+    let toml_text = r##"
+[theme]
+name = "weft-warm"
+link = "#ffcc00"
+
+[theme.ui]
+success = "#11ff22"
+warning = "#ffaa00"
+error = "#ff2244"
+find_match = "#66ffcc"
+"##;
+    let c: Config = toml::from_str(toml_text).unwrap();
+    assert_eq!(c.theme.link.as_deref(), Some("#ffcc00"));
+    let ui = c.theme.ui.as_ref().expect("[theme.ui] should parse");
+    assert_eq!(ui.success.as_deref(), Some("#11ff22"));
+    assert_eq!(ui.warning.as_deref(), Some("#ffaa00"));
+    assert_eq!(ui.error.as_deref(), Some("#ff2244"));
+    assert_eq!(ui.find_match.as_deref(), Some("#66ffcc"));
+
+    // link: user hex is u8-granular → /255-normalized (P1-4 doc note).
+    let theme = Theme::resolve(&c.theme);
+    for (actual, expected) in theme.link.iter().zip([0xffu8, 0xcc, 0x00]) {
+        assert_eq!(actual.to_bits(), (expected as f32 / 255.0).to_bits());
+    }
+    assert_eq!(theme.link[3].to_bits(), 1.0f32.to_bits());
+    assert_eq!(theme.ui.success, Some(Color::rgb(0x11, 0xff, 0x22)));
+    assert_eq!(theme.ui.warning, Some(Color::rgb(0xff, 0xaa, 0x00)));
+    assert_eq!(theme.ui.error, Some(Color::rgb(0xff, 0x22, 0x44)));
+    assert_eq!(theme.ui.find_match, Some(Color::rgb(0x66, 0xff, 0xcc)));
+}
+
+#[test]
+fn theme_link_invalid_hex_falls_back_to_default() {
+    // Invalid hex must be silently ignored — the base theme's link/ui
+    // stay untouched (same policy as syntax/output overrides).
+    let cfg = ThemeConfig {
+        name: "weft-warm".into(),
+        link: Some("not-a-hex".into()),
+        ui: Some(UiConfig {
+            success: Some("zzzz".into()),
+            warning: Some("#12345".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let theme = Theme::resolve(&cfg);
+    let default_link: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
+    for (actual, expected) in theme.link.iter().zip(default_link) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+    assert_eq!(theme.ui, ThemeUi::default());
+}
+
+#[test]
+fn theme_link_and_ui_round_trip_through_save_load() {
+    // save_to_path must persist [theme] link + [theme.ui], and a reload
+    // must recover them (mirrors syntax_argument_field_round_trips).
+    let dir = unique_tmp_path("theme-link-ui-roundtrip");
+    let path = &dir;
+    std::fs::write(path, "[theme]\nname = \"weft-warm\"\n").unwrap();
+
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    cfg.theme.link = Some("#ffcc00".to_string());
+    cfg.theme.ui = Some(UiConfig {
+        success: Some("#11ff22".to_string()),
+        warning: None,
+        error: Some("#ff2244".to_string()),
+        find_match: None,
+    });
+    cfg.save_to_path(path).unwrap();
+    let after = std::fs::read_to_string(path).unwrap();
+    assert!(
+        after.contains("link = \"#ffcc00\""),
+        "link not on disk:\n{after}"
+    );
+    assert!(
+        after.contains("success = \"#11ff22\""),
+        "[theme.ui] success not on disk:\n{after}"
+    );
+
+    let reloaded: Config = toml::from_str(&after).unwrap();
+    assert_eq!(reloaded.theme.link.as_deref(), Some("#ffcc00"));
+    let ui = reloaded.theme.ui.expect("[theme.ui] should survive reload");
+    assert_eq!(ui.success.as_deref(), Some("#11ff22"));
+    assert_eq!(ui.error.as_deref(), Some("#ff2244"));
+    assert!(ui.warning.is_none() && ui.find_match.is_none());
+}
+
+#[test]
+fn profile_theme_link_and_ui_override_apply() {
+    // A profile's [theme] link/ui must replace the base config wholesale
+    // (apply_overrides semantics: base.theme = profile.theme.clone()).
+    let mut base = Config::default();
+    assert!(base.theme.link.is_none() && base.theme.ui.is_none());
+    let profile = ProfileConfig {
+        theme: Some(ThemeConfig {
+            name: "weft-warm".into(),
+            link: Some("#00aaff".into()),
+            ui: Some(UiConfig {
+                success: Some("#00ff88".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    apply_overrides(&mut base, &profile);
+    assert_eq!(base.theme.link.as_deref(), Some("#00aaff"));
+    assert_eq!(
+        base.theme.ui.as_ref().unwrap().success.as_deref(),
+        Some("#00ff88")
+    );
+}

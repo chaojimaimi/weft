@@ -1,6 +1,6 @@
 //! Block-view scrollbar layout and interaction mapping.
 
-use crate::layout::{LayoutCtx, Rect, Spacing};
+use crate::layout::{LayoutCtx, Rect};
 use crate::paint::primitives::snap_physical_rect;
 
 #[derive(Clone, Copy, Debug)]
@@ -35,7 +35,8 @@ pub(crate) fn scrollbar_layout(
     let idle_width = (ctx.cell_w * 0.5).max(5.0);
     let hover_width = (ctx.cell_w * 0.9).max(8.0);
     let bar_x = ctx.right() - idle_width;
-    let min_thumb = Spacing::row_md(ctx) * 3.0;
+    // v1.11.6: Spacing tokens removed (D-g) — only 2 consumers
+    let min_thumb = ctx.cell_h * 3.0; // was row_md(token) * 3.0
     let ratio = visible as f32 / total as f32;
     let thumb_h = (ctx.height() * ratio).max(min_thumb).min(ctx.height());
     let travel = (ctx.height() - thumb_h).max(0.0);

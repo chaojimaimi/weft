@@ -36,6 +36,7 @@ fn build_row(cells: &[Cell]) -> super::GridRowInstances {
         0.0,
         0.0,
         false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
     )
 }
 

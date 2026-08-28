@@ -7,6 +7,39 @@ use objc2::msg_send;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
+/// v1.11.6 (PLAN_v1116 M2/D-i): query whether the winit window's NSWindow is
+/// currently in a live (user-drag) resize. The renderer flips
+/// `presentsWithTransaction` on the CAMetalLayer while true, so the resized
+/// layer bounds and the new frame commit in one Core Animation transaction
+/// (Warp precedent) instead of CA stretching the previous drawable.
+///
+/// False when the handle cannot be obtained, the platform isn't macOS, the
+/// NSView has no owning NSWindow (detached/teardown), or the ObjC query
+/// panics (belt-and-suspenders — a hot-path failure must degrade, not abort).
+pub(crate) fn window_in_live_resize(window: &Window) -> bool {
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSView;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return false; // Not macOS — nothing to query.
+    };
+    // The raw handle's ns_view is a live NSView for the window's lifetime
+    // (winit owns it); only `window()`/`inLiveResize` are invoked on it.
+    let ns_view: *mut objc2::runtime::AnyObject = appkit.ns_view.as_ptr().cast();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let view: &NSView = &*ns_view.cast();
+        // `[view window]` is unretained; the typed `NSView::window()` returns
+        // a retained Option. A detached view (no window) → false.
+        let retained: Option<Retained<objc2_app_kit::NSWindow>> = view.window();
+        retained.is_some_and(|window| window.inLiveResize())
+    }))
+    .unwrap_or(false)
+}
+
 /// v1.11: NSView `mouseDownCanMoveWindow` override — returns `NO` so macOS
 /// does not auto-start a window drag when the user presses on the tab bar
 /// (which lives in the titlebar region under `FullSizeContentView`).

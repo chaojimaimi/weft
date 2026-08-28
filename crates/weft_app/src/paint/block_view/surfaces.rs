@@ -161,7 +161,19 @@ pub(super) fn push_block_surfaces(
     }
 
     let mut canvases = HashMap::with_capacity(bounds.len());
-    for (block_id, (top, bottom, tone)) in bounds {
+    // v1.11.6 (PLAN_v1116 M3, determinism fix): iterate the per-block bands
+    // in block-id order instead of HashMap iteration order. Each `HashMap`
+    // instance seeds its own RandomState, so iteration order varied run to
+    // run — the quad ORDER inside `vertices` differed between consecutive
+    // identical builds, which the golden tests' double-build self-proof
+    // caught. Bands are disjoint and opaque, so pixel output is unchanged;
+    // the sort only pins the byte order down.
+    let mut ordered: Vec<(BlockId, f32, f32, BlockTone)> = bounds
+        .into_iter()
+        .map(|(id, (top, bottom, tone))| (id, top, bottom, tone))
+        .collect();
+    ordered.sort_by_key(|(id, ..)| id.0);
+    for (block_id, top, bottom, tone) in ordered {
         let color = block_surface_color(colors, block_id, tone);
         canvases.insert(block_id, color);
         let y0 = top.max(paint.clip_top);

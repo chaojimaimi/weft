@@ -214,9 +214,9 @@ impl GridInstanceBatch {
 
 // ── Row instance builder ──────────────────────────────────────────────
 
-/// Soft cyan for OSC 8 hyperlink underlines (matches the existing
-/// single-stream renderer color).
-const HYPERLINK_COLOR: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
+// v1.11.6 (PLAN_v1116 M6/D-f): HYPERLINK_COLOR const removed — the color is
+// now `Theme::link` ([0.36, 0.62, 0.94, 1.0] default), threaded in from the
+// caller as `hyperlink_color` (build_row_instances is a free function).
 
 /// Thickness of hyperlink and cursor-underline decorations, in physical px.
 const UNDERLINE_HEIGHT: f32 = 2.0;
@@ -276,6 +276,9 @@ pub(crate) fn build_row_instances(
     origin_y: f32,
     // v1.11.3 (§3.2): `[compat] bold_is_bright` — bold fg palette 0-7 → bright.
     bold_is_bright: bool,
+    // v1.11.6 (M6/D-f): OSC 8 hyperlink underline color — `Theme::link`
+    // from the caller (this is a free function, no &self.theme here).
+    hyperlink_color: [f32; 4],
 ) -> GridRowInstances {
     let num_cols = grid.num_cols;
     let mut result = GridRowInstances::default();
@@ -381,12 +384,7 @@ pub(crate) fn build_row_instances(
         // the cursor already pins black-on-cursor-color and dimming it
         // would hurt visibility.
         let final_fg = if !is_cursor && cell.flags.contains(CellFlags::DIM) {
-            [
-                final_fg[0] * 0.5,
-                final_fg[1] * 0.5,
-                final_fg[2] * 0.5,
-                final_fg[3],
-            ]
+            crate::paint::color_math::dim_half(final_fg)
         } else {
             final_fg
         };
@@ -478,7 +476,7 @@ pub(crate) fn build_row_instances(
         {
             result.glyph_instances.push(GlyphInstance::Decoration {
                 dst: [x0, y1 - UNDERLINE_HEIGHT, x1, y1],
-                color: HYPERLINK_COLOR,
+                color: hyperlink_color,
             });
         }
 
@@ -557,6 +555,8 @@ mod tests {
     const SELECTION_PAINTED: [f32; 4] = [0.22, 0.34, 0.50, 1.0];
     const CW: f32 = 10.0;
     const CH: f32 = 20.0;
+    // v1.11.6 (M6): theme.link default — the old HYPERLINK_COLOR const.
+    const LINK: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
 
     // v1.10.4: the color-emoji sentinel is fg.a = 2.0; every real fg alpha
     // source (palette u8/255, contrast boost, REVERSE swap, DIM, opacity)
@@ -596,6 +596,7 @@ mod tests {
             0.0,
             0.0,
             false,
+            LINK,
         )
     }
 
@@ -895,7 +896,7 @@ mod tests {
         assert_eq!(result.glyph_instances.len(), 2);
         let has_link = result.glyph_instances.iter().any(|g| {
             matches!(g, GlyphInstance::Decoration { color, dst }
-                if *color == HYPERLINK_COLOR && (dst[3] - dst[1]) == UNDERLINE_HEIGHT)
+                if *color == LINK && (dst[3] - dst[1]) == UNDERLINE_HEIGHT)
         });
         assert!(has_link, "expected a hyperlink underline Decoration");
     }

@@ -285,6 +285,7 @@ impl MetalRenderer {
                 origin_x,
                 origin_y_base + row as f32 * ch,
                 self.bold_is_bright,
+                self.theme.link,
             );
         }
         drop(cache);
@@ -374,6 +375,7 @@ impl MetalRenderer {
                 origin_x,
                 origin_y_base + row as f32 * ch,
                 self.bold_is_bright,
+                self.theme.link,
             );
             batch.push_row(&row_inst, &|ch, cluster, style| {
                 self.resolve_glyph_uv(ch, cluster, style)

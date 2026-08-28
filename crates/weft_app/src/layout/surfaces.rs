@@ -1,6 +1,6 @@
 //! Completion, palette, context-menu, and find geometry.
 
-use super::{LayoutCtx, Rect, Spacing};
+use super::{LayoutCtx, Rect};
 
 // ── Overlay layouts (v0.8 stage 4 — U2) ────────────────────────────────
 //
@@ -99,14 +99,15 @@ pub fn layout_completion(
     let popup_x0 = box_x0;
     let popup_x1 = (popup_x0 + popup_w).min(vp_w - padding_x);
 
-    let pad = Spacing::sm(ctx); // cw * 0.5
+    // v1.11.6: Spacing tokens removed (D-g) — only 2 consumers
+    let pad = ctx.cell_w * 0.5; // former sm token
     let icon_w = 2.0 * cw;
     let label_x = popup_x0 + pad + icon_w;
     let label_cols = popup_cols
         .saturating_sub(1 + 2 + gap_cols + suffix_cols + 1)
         .max(5);
 
-    let top_pad = Spacing::row_sm(ctx); // ch * 0.5
+    let top_pad = ctx.cell_h * 0.5; // former row_sm token
     let popup_h = shown as f32 * ch + top_pad;
     let popup_top = anchor_y - popup_h;
 
