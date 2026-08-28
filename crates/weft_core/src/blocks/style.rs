@@ -327,6 +327,9 @@ impl BlockTracker {
 
     pub fn defer_screen_command_end(&mut self) {
         self.phase = ShellPhase::AtPrompt;
+        // v1.11.7 (P0-2): keep the live block visible through the 200ms
+        // defer→settle window (`in_flight()` gate widened to `|| settling`).
+        self.settling = true;
     }
 
     /// v1.10.7: reverse [`defer_screen_command_end`](Self::defer_screen_command_end).
@@ -337,12 +340,17 @@ impl BlockTracker {
     pub fn resume_screen_command(&mut self) {
         if self.screen_document_start.is_some() {
             self.phase = ShellPhase::CommandExecuting;
+            // v1.11.7 (P0-2): the pending exit was canceled — the settle
+            // window is over, the command continues normally.
+            self.settling = false;
         }
     }
 
     pub fn finish_deferred_screen_command(&mut self, exit_code: Option<i32>) {
         self.finalize(exit_code);
         self.phase = ShellPhase::AtPrompt;
+        // v1.11.7 (P0-2): the settle window is closed — no live block left.
+        self.settling = false;
     }
 }
 

@@ -558,6 +558,14 @@ impl crate::App {
                 .unwrap_or(false);
             let bytes = encode_paste(text, bracketed);
             if let Some(session) = self.sessions.tab_mut(tab) {
+                // v1.11.7 (PLAN_v1117 §三 M2.1, D-c): paste is real user input
+                // — forwarding to the PTY counts as interactive stdin, so the
+                // noninteractive render tier falls back to the classic
+                // takeover for the pasted-into TUI. Only the passthrough
+                // branch marks: editor-insert pastes are never forwarded.
+                if let Some(t) = session.terminal.as_mut() {
+                    t.note_interactive_stdin();
+                }
                 if let Err(e) = session.write_user_input(&bytes) {
                     warn!(error = %e, tab, "failed to paste to PTY");
                 }

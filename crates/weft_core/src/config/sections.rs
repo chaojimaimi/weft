@@ -1,3 +1,4 @@
+use crate::vt::TuiRenderMode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -418,6 +419,29 @@ impl Default for NotificationsConfig {
             enabled: true,
             threshold_secs: 30,
             sound: false,
+        }
+    }
+}
+
+/// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.2, D-d): `[experimental]`
+/// section — experimental switches that are not yet stable enough for
+/// Settings UI rows (config-file keys, like `[blocks]`/`[compat]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ExperimentalConfig {
+    /// Primary-screen TUI render tier (`noninteractive|all|classic`, serde
+    /// default `noninteractive` — the factory default; `Terminal::new` stays
+    /// Classic and the app injects this value at construction, P2-3).
+    /// `noninteractive` fixes the reported uv/ollama progress-bar class while
+    /// keeping interactive TUIs on the classic takeover path; `all` is the
+    /// Warp-terminal dogfood tier; `classic` is the v1.11.6 one-key rollback.
+    pub tui_render_mode: TuiRenderMode,
+}
+
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            tui_render_mode: TuiRenderMode::Noninteractive,
         }
     }
 }

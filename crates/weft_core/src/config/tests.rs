@@ -2811,3 +2811,67 @@ fn profile_theme_link_and_ui_override_apply() {
         Some("#00ff88")
     );
 }
+
+// ── v1.11.7 (PLAN_v1117 §三 M1.2, P2-3): [experimental] tui_render_mode ──
+
+#[test]
+fn experimental_config_defaults_to_noninteractive() {
+    // The factory default is `noninteractive` — the app injects it into every
+    // Terminal at construction (core `Terminal::new` stays Classic).
+    let c = Config::default();
+    assert_eq!(
+        c.experimental.tui_render_mode,
+        crate::vt::TuiRenderMode::Noninteractive
+    );
+    let c: Config = toml::from_str("").unwrap();
+    assert_eq!(
+        c.experimental.tui_render_mode,
+        crate::vt::TuiRenderMode::Noninteractive,
+        "missing [experimental] section deserializes to the factory default"
+    );
+}
+
+#[test]
+fn experimental_tui_render_mode_parses_all_spellings() {
+    let classic: Config =
+        toml::from_str("[experimental]\ntui_render_mode = \"classic\"\n").unwrap();
+    assert_eq!(
+        classic.experimental.tui_render_mode,
+        crate::vt::TuiRenderMode::Classic
+    );
+    let all: Config = toml::from_str("[experimental]\ntui_render_mode = \"all\"\n").unwrap();
+    assert_eq!(
+        all.experimental.tui_render_mode,
+        crate::vt::TuiRenderMode::All
+    );
+    let bogus: Config = toml::from_str("[experimental]\ntui_render_mode = \"bogus\"\n").unwrap();
+    assert_eq!(
+        bogus.experimental.tui_render_mode,
+        crate::vt::TuiRenderMode::Noninteractive,
+        "unknown spelling falls back to the factory default (never fails parse)"
+    );
+}
+
+#[test]
+fn save_writes_tui_render_mode_only_when_non_default() {
+    // Non-default persists; the default (and an explicit reset) removes the
+    // key so a stale file cannot pin a changed default.
+    let mut cfg = Config::default();
+    cfg.experimental.tui_render_mode = crate::vt::TuiRenderMode::All;
+    let path = std::env::temp_dir().join(format!("weft_cfg_v1117_{}.toml", std::process::id()));
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("[experimental]") && text.contains("tui_render_mode = \"all\""),
+        "non-default mode must be written: {text}"
+    );
+    // Back to default → the key disappears on the next save.
+    cfg.experimental.tui_render_mode = crate::vt::TuiRenderMode::Noninteractive;
+    cfg.save_to_path(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("tui_render_mode"),
+        "default mode must be dropped from the file: {text}"
+    );
+    let _ = std::fs::remove_file(&path);
+}

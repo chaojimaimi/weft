@@ -10,6 +10,7 @@ pub(crate) mod kitty_keyboard;
 mod osc;
 mod osc_guard;
 mod perform;
+mod render_mode;
 mod replies;
 mod screen_exit;
 // v1.11.3 (PLAN_v1113 §2.1): colon-form SGR group handlers — extracted so
@@ -19,6 +20,7 @@ mod staging;
 mod ui_events;
 pub use attrs::{Attrs, ShellMarker};
 pub use capability::{ScreenOwner, SettleState};
+pub use render_mode::TuiRenderMode;
 pub use screen_exit::{
     TuiColsKind, PRIMARY_HISTORY_SNAPSHOT_INTERVAL, PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
 };
@@ -131,6 +133,13 @@ pub struct Terminal {
     /// (default true). `false` swallows all four `CSI ...u` ops AND forces
     /// `keyboard_protocol_flags()` to 0 — a one-click rollback.
     kitty_protocol_enabled: bool,
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.2, D-d): primary-screen
+    /// TUI render tier. `Terminal::new` defaults to [`TuiRenderMode::Classic`]
+    /// so the ~40 existing `show_block_view` assertions and the 2750-test
+    /// baseline stay green untouched; the app injects the config's
+    /// `[experimental] tui_render_mode` (serde default `noninteractive`) at
+    /// every construction site (P2-3).
+    tui_render_mode: TuiRenderMode,
 }
 
 impl Terminal {
@@ -178,6 +187,7 @@ impl Terminal {
             osc_guard_enabled: true,
             kitty: kitty_keyboard::KittyKeyboardState::default(),
             kitty_protocol_enabled: true,
+            tui_render_mode: TuiRenderMode::Classic,
         }
     }
 
@@ -303,6 +313,36 @@ impl Terminal {
     /// Active mouse reporting mode (DEC modes 9/1000/1002/1003).
     pub fn mouse_protocol(&self) -> MouseProtocol {
         self.capabilities.mouse_protocol
+    }
+
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.1): record that a real
+    /// user input event was forwarded to the PTY during the current command.
+    ///
+    /// Call sites are strictly event-layer (the app's keyboard outbound path
+    /// and paste forwarder) — automatic replies (XTGETTCAP/DECRQSS/DA/DSR)
+    /// and OSC 52 clipboard write-backs never call this, so negotiation
+    /// traffic cannot flip a TUI's render mode (P1-1).
+    pub fn note_interactive_stdin(&mut self) {
+        self.capabilities.interactive_stdin_seen = true;
+    }
+
+    /// Whether `note_interactive_stdin` fired since the last real command
+    /// boundary (used by `show_block_view`'s noninteractive tier and by the
+    /// app's headless tests).
+    pub fn interactive_stdin_seen(&self) -> bool {
+        self.capabilities.interactive_stdin_seen
+    }
+
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.2): the configured
+    /// primary-screen render tier. Injected by the app from
+    /// `[experimental] tui_render_mode` at every Terminal construction site;
+    /// `Terminal::new` stays Classic (the baseline anchor).
+    pub fn tui_render_mode(&self) -> TuiRenderMode {
+        self.tui_render_mode
+    }
+
+    pub fn set_tui_render_mode(&mut self, mode: TuiRenderMode) {
+        self.tui_render_mode = mode;
     }
 
     /// Whether SGR-1006 mouse-report encoding is selected (DEC mode 1006).

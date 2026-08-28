@@ -482,6 +482,12 @@ impl App {
             &mut tab,
             self.config_state.config.blocks.retained_limit,
         );
+        // v1.11.7 (P2-3): inject the user's TUI render tier — the core default
+        // is Classic; the factory default here is `noninteractive`.
+        crate::config_controller::apply_tui_render_mode(
+            &mut tab,
+            self.config_state.config.experimental.tui_render_mode,
+        );
         // v1.0 V13: On first launch, inject a welcome banner via PTY.
         // The printf is prefixed with a space (HIST_IGNORE_SPACE keeps it
         // out of zsh history). The marker file is created in

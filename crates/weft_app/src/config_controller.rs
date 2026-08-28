@@ -139,6 +139,18 @@ pub(super) fn apply_blocks_retained_limit(tab: &mut Tab, limit: usize) {
     }
 }
 
+/// v1.11.7 (PLAN_v1117 §三 M1.2, P2-3): apply the user's
+/// `[experimental] tui_render_mode` to every pane's terminal of one tab.
+/// Called by each tab/pane creation site that already reads config (same
+/// chokepoints as `apply_blocks_retained_limit`); `Tab::new`'s Terminal
+/// starts in core-default Classic, so every factory-created pane must be
+/// re-injected here.
+pub(super) fn apply_tui_render_mode(tab: &mut Tab, mode: weft_core::vt::TuiRenderMode) {
+    for pane in tab.panes_mut() {
+        pane.set_tui_render_mode(mode);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ConfigApplyDelta {
     rebuild_font: bool,

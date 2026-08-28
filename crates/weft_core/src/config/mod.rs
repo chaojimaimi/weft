@@ -71,10 +71,10 @@ pub use profiles::{
 };
 pub use save::ConfigSaveError;
 pub use sections::{
-    AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, FontConfig, LogoConfig,
-    LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig, PasteConfig,
-    ScrollbackConfig, SyntaxConfig, ThemeConfig, UiConfig, WindowConfig, PASTE_SIZE_TIERS_KIB,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, ExperimentalConfig,
+    FontConfig, LogoConfig, LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig,
+    PasteConfig, ScrollbackConfig, SyntaxConfig, ThemeConfig, UiConfig, WindowConfig,
+    PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme, ThemeUi};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
@@ -109,6 +109,11 @@ pub struct Config {
     /// v1.11.5 (PLAN_v1115 §M8): notification gates
     /// (`[notifications]` enabled/threshold_secs/sound).
     pub notifications: NotificationsConfig,
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.2, D-d):
+    /// `[experimental]` switches — `tui_render_mode` (default
+    /// `noninteractive`) is the primary-screen TUI render tier injected into
+    /// every constructed Terminal (P2-3).
+    pub experimental: ExperimentalConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -561,6 +566,34 @@ impl Config {
                 t.remove("sound");
                 if t.iter().count() == 0 {
                     doc.remove("notifications");
+                }
+            }
+        }
+
+        // [experimental] section — v1.11.7 (PLAN_v1117 §三 M1.2, D-d): only
+        // write `tui_render_mode` when it differs from the factory default
+        // (noninteractive); remove the key/table otherwise so a stale file
+        // can never pin a changed default.
+        {
+            let default_exp = ExperimentalConfig::default();
+            if self.experimental.tui_render_mode != default_exp.tui_render_mode {
+                let exp_entry = doc.entry("experimental").or_insert_with(toml_edit::table);
+                if exp_entry.is_none() {
+                    *exp_entry = toml_edit::table();
+                }
+                match exp_entry.as_table_mut() {
+                    Some(t) => {
+                        t["tui_render_mode"] =
+                            toml_edit::value(self.experimental.tui_render_mode.as_str());
+                    }
+                    None => {
+                        tracing::warn!("[experimental] section is not a table; skipping write");
+                    }
+                }
+            } else if let Some(t) = doc.get_mut("experimental").and_then(|i| i.as_table_mut()) {
+                t.remove("tui_render_mode");
+                if t.iter().count() == 0 {
+                    doc.remove("experimental");
                 }
             }
         }

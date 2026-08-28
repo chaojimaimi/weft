@@ -29,6 +29,8 @@
 
 use super::Terminal;
 use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::input::MouseProtocol;
+use crate::vt::TuiRenderMode;
 use std::time::{Duration, Instant};
 
 mod freeze;
@@ -580,7 +582,43 @@ impl Terminal {
     /// browsing (`primary_history_view`) switches to the BlockView snapshot.
     /// `screen_owned_tui_active()` is stable across transient `cursor_ops`
     /// resets (nested 133 markers), so no render-mode lock is needed.
+    ///
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.3, D-a/D-d): the tiered
+    /// formula. `screen_document_start` still drives the (unchanged) capture
+    /// data plane; this predicate ONLY decides the view policy per tier:
+    /// - `classic`: original formula verbatim (v1.11.6 rollback switch).
+    /// - `all`: `bootstrap_ready && (alt_screen_history_peek || !alt_active)`
+    ///   — the three false items (`screen_owned_tui_active`,
+    ///   `primary_screen_app_active`, `primary_screen_exit_pending`) are
+    ///   dropped together (P0-1: keeping `exit_pending` would void the settle
+    ///   flicker fix; it only appears in screen-owned sessions, so dropping
+    ///   it cannot affect ordinary commands).
+    /// - `noninteractive`: the `all` condition, unless interactive stdin was
+    ///   seen or a mouse protocol is negotiated (P1-3) — then back to the
+    ///   classic formula (which keeps its `exit_pending` item; an exempted
+    ///   interactive command's 200ms settle flash is today's behavior,
+    ///   accepted per D-c).
     pub fn show_block_view(&self) -> bool {
+        match self.tui_render_mode {
+            TuiRenderMode::Classic => self.show_block_view_classic(),
+            TuiRenderMode::All => self.show_block_view_all(),
+            TuiRenderMode::Noninteractive => {
+                if self.capabilities.interactive_stdin_seen
+                    || self.capabilities.mouse_protocol != MouseProtocol::Off
+                {
+                    // Interactive command (or mouse-reporting owner): the
+                    // original heuristics own the viewport again.
+                    self.show_block_view_classic()
+                } else {
+                    self.show_block_view_all()
+                }
+            }
+        }
+    }
+
+    /// v1.11.6 formula, verbatim (the `classic` tier and the interactive
+    /// fallback of the `noninteractive` tier).
+    fn show_block_view_classic(&self) -> bool {
         self.block_tracker.bootstrap_ready()
             && (self.capabilities.alt_screen_history_peek
                 || (!self.capabilities.alt_active
@@ -588,6 +626,14 @@ impl Terminal {
                         || (!self.primary_screen_exit_pending()
                             && !self.screen_owned_tui_active()
                             && !self.primary_screen_app_active()))))
+    }
+
+    /// v1.11.7: screen-owned sessions never leave the BlockView (P0-1 — the
+    /// `primary_screen_exit_pending` item is deliberately absent so the
+    /// 200ms settle window keeps the block visible; D-e).
+    fn show_block_view_all(&self) -> bool {
+        self.block_tracker.bootstrap_ready()
+            && (self.capabilities.alt_screen_history_peek || !self.capabilities.alt_active)
     }
 
     /// v1.10.12-fix: whether a primary-screen TUI currently owns the screen
@@ -1028,6 +1074,22 @@ impl Terminal {
         self.snapshot_primary_screen_output();
         self.block_tracker
             .finish_deferred_screen_command(pending.exit_code);
+        // v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.1, P1-2): a real command
+        // boundary — clear the interactive-stdin exemption so the NEXT command
+        // starts untainted (classic fallback cannot leak across commands).
+        self.capabilities.interactive_stdin_seen = false;
+        // v1.11.7 (P0-2): `composed_cursor_snapshot_line` used to return None
+        // implicitly at settle (its `in_flight()?` died on the AtPrompt
+        // phase), which doubled as the caret-anchor reset. The widened
+        // `in_flight()` gate (settling) keeps the live block alive through
+        // the settle window, so the reset must be explicit now: the anchor
+        // belongs to the finalized session and must not leak into the next
+        // command (b_path regression: block_view_tui_cursor would anchor the
+        // caret past the new live block). Same boundary hygiene for the
+        // keystroke-skip cache (`last_caret_snapshot_cursor`).
+        self.capabilities.primary_screen_cursor_snapshot_line = None;
+        self.capabilities.primary_screen_cursor_segment_len = None;
+        self.capabilities.last_caret_snapshot_cursor = None;
         // v1.10.7: the render-mode lock belongs to the command being
         // finalized — release it here (covers the idle-timer settle AND the
         // 133;B settle; nested-marker paths never settle, so the lock

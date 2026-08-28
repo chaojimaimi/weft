@@ -280,6 +280,19 @@ impl crate::App {
             ?bytes,
             "key → pty"
         );
+        // v1.11.7 (PLAN_v1117 §三 M2.1, D-c/P1-1): this is the keyboard
+        // outbound chokepoint — a non-empty encoding means real user input
+        // was forwarded to the PTY. Mark the terminal so the noninteractive
+        // render tier falls back to the classic takeover for interactive
+        // TUIs. Auto-replies (XTGETTCAP/DECRQSS/DA/DSR) and OSC 52 write-
+        // backs bypass this path entirely, so negotiation can never taint the
+        // flag. Empty encodings (e.g. modifier-only presses) forward nothing
+        // and must not count.
+        if !bytes.is_empty() {
+            if let Some(t) = self.tab_mut().terminal.as_mut() {
+                t.note_interactive_stdin();
+            }
+        }
         let effects = crate::effect::passthrough_key_effects(self.sessions.active_idx(), bytes);
         self.drain_effects(effects);
     }

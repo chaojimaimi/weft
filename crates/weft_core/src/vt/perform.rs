@@ -1007,6 +1007,22 @@ impl vte::Perform for Terminal {
                                 };
                                 self.freeze_primary_screen_document_candidate();
                                 self.block_tracker.on_command_start(command);
+                                // v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三
+                                // M1.1, P1-2): real command boundary — clear
+                                // the interactive-stdin exemption. Deliberately
+                                // NOT at 133;A/D: a nested marker inside a
+                                // still-running screen-owned TUI must not
+                                // clear the flag mid-interaction (the nested
+                                // branch above never reaches this line).
+                                self.capabilities.interactive_stdin_seen = false;
+                                // v1.11.7: same boundary hygiene for the
+                                // caret anchor (see
+                                // `settle_primary_screen_exit`) — a stale
+                                // snapshot line must not anchor the caret
+                                // past the new live block.
+                                self.capabilities.primary_screen_cursor_snapshot_line = None;
+                                self.capabilities.primary_screen_cursor_segment_len = None;
+                                self.capabilities.last_caret_snapshot_cursor = None;
                             }
                         }
                         b"C" => {

@@ -960,3 +960,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tab/snapshot_tests.rs"]
 mod snapshot_tests;
+
+#[cfg(test)]
+#[path = "tab/tui_render_mode_tests.rs"]
+mod tui_render_mode_tests;

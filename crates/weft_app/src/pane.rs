@@ -270,6 +270,17 @@ impl Pane {
         }
     }
 
+    /// v1.11.7 (PLAN_v1117 §三 M1.2, P2-3): inject the user's
+    /// `[experimental] tui_render_mode` into this pane's terminal (the
+    /// factory default is `noninteractive`; `Terminal::new` itself stays
+    /// Classic so weft_core tests keep the v1.11.6 baseline). Mirror of
+    /// `set_blocks_retained_limit` — same chokepoints.
+    pub(crate) fn set_tui_render_mode(&mut self, mode: weft_core::vt::TuiRenderMode) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.set_tui_render_mode(mode);
+        }
+    }
+
     /// Queue a geometry transaction without resizing the Grid ahead of its PTY.
     /// Overwriting an older pending size coalesces resize cascades. The effect
     /// dispatcher applies `TIOCSWINSZ` first and only then commits the Grid,

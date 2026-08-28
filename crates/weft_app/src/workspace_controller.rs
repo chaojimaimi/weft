@@ -322,6 +322,11 @@ impl App {
         // v1.11.2 X4: propagate the block retention cap to the restored tab.
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
             crate::config_controller::apply_blocks_retained_limit(tab, blocks_limit);
+            // v1.11.7 (P2-3): inject the user's TUI render tier.
+            crate::config_controller::apply_tui_render_mode(
+                tab,
+                self.config_state.config.experimental.tui_render_mode,
+            );
         }
 
         // Apply block_id_allocator + palette (mirrors new_tab).
@@ -385,6 +390,9 @@ impl App {
                     let mut new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
                     // v1.11.2 X4: retention cap on workspace-restored splits.
                     new_pane.set_blocks_retained_limit(blocks_limit);
+                    // v1.11.7 (P2-3): TUI render tier on restored splits.
+                    new_pane
+                        .set_tui_render_mode(self.config_state.config.experimental.tui_render_mode);
                     tab.split_pane_with_pane(leaf, dir, ratio, new_pane)
                         .map_err(|e| {
                             warn!(?e, "workspace restore: split failed, skipping subtree");

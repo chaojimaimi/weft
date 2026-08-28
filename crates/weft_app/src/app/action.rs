@@ -192,6 +192,10 @@ impl crate::App {
                             pane.set_blocks_retained_limit(
                                 self.config_state.config.blocks.retained_limit,
                             );
+                            // v1.11.7 (P2-3): TUI render tier on split panes.
+                            pane.set_tui_render_mode(
+                                self.config_state.config.experimental.tui_render_mode,
+                            );
                         }
                         let tab2 = self.sessions.active();
                         tracing::info!(

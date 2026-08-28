@@ -167,6 +167,17 @@ pub(in crate::vt) struct CapabilityFlags {
     /// Brew progress frames (EL + CHA to column 1) never set this, so they don't
     /// count toward TUI detection. Reset at each `?2026h` (window start).
     pub(in crate::vt) synchronized_frame_addressing_seen: bool,
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.1, D-c): whether a REAL
+    /// user input event was forwarded to the PTY during the current command
+    /// (set via `Terminal::note_interactive_stdin`). Only the event layer sets
+    /// it — replies.rs auto-answers (XTGETTCAP/DECRQSS/DA/DSR) and OSC 52
+    /// clipboard write-backs go through `write_sync`, never through this
+    /// accessor, so negotiation traffic can never degrade a TUI back to
+    /// Classic (P1-1). Reset at real command boundaries only
+    /// (`settle_primary_screen_exit` after `finish_deferred_screen_command`
+    /// plus the terminal's `on_command_start`); never at 133;A/B/D — the
+    /// nested-marker path must not clear the flag mid-interaction (P1-2).
+    pub(in crate::vt) interactive_stdin_seen: bool,
 }
 
 impl Default for CapabilityFlags {
@@ -196,6 +207,7 @@ impl Default for CapabilityFlags {
             screen_history: ScreenHistory::default(),
             pending_screen_split_heads: None,
             synchronized_frame_addressing_seen: false,
+            interactive_stdin_seen: false,
         }
     }
 }
@@ -461,5 +473,6 @@ mod tests {
         assert!(f.primary_screen_interrupt_capture.is_none());
         assert!(!f.primary_history_view);
         assert!(!f.synchronized_frame_addressing_seen);
+        assert!(!f.interactive_stdin_seen);
     }
 }

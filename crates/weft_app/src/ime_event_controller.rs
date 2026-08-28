@@ -209,6 +209,18 @@ impl App {
                                 preview = %text.chars().take(40).collect::<String>(),
                                 "IME commit → PTY"
                             );
+                            // v1.11.7 (PLAN_v1117 D-c): an IME commit forwarded
+                            // to the PTY is user input — arm the interactive
+                            // exemption exactly like a forwarded key, so CJK
+                            // input into pi/claude gets the classic takeover
+                            // instead of lingering in the block view.
+                            if let Some(terminal) = self
+                                .sessions
+                                .tab_mut(tab)
+                                .and_then(|session| session.terminal.as_mut())
+                            {
+                                terminal.note_interactive_stdin();
+                            }
                             self.drain_effects(effect::ime_commit_effects(tab, &text));
                         }
                     }

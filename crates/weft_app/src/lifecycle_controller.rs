@@ -65,6 +65,14 @@ impl App {
         // Apply the current theme palette to the new terminal so it matches
         // the window's renderer theme (the atlas is shared per-window, not
         // per-tab — no atlas rebuild needed). v1.11.2 X4 rides this pass.
+        // v1.11.7 (rust-reviewer P0-1): Cmd+T / "+" / VoiceOver tab creation
+        // must inject the tier too, or every user-created tab stays Classic
+        // and the screen-owned block-view fix never applies where tabs are
+        // actually opened. Same chokepoint as set_blocks_retained_limit.
+        crate::config_controller::apply_tui_render_mode(
+            self.sessions.active_mut(),
+            self.config_state.config.experimental.tui_render_mode,
+        );
         if let Some(t) = self.sessions.active_mut().terminal.as_mut() {
             t.set_blocks_retained_limit(self.config_state.config.blocks.retained_limit);
             if let Some(r) = &self.renderer {
@@ -708,6 +716,7 @@ impl App {
                     let saved_cwd = snap.cwd.clone();
                     let cwd_to_apply = crate::pane::restore_spawn_cwd(saved_cwd.as_deref());
                     let blocks_limit = self.config_state.config.blocks.retained_limit;
+                    let render_mode = self.config_state.config.experimental.tui_render_mode;
                     if i == 0 {
                         if cwd_to_apply.is_some() {
                             let mut tab = Tab::new(
@@ -719,6 +728,8 @@ impl App {
                             );
                             if let Some(t) = &mut tab.terminal {
                                 t.set_blocks_retained_limit(blocks_limit);
+                                // v1.11.7 (P2-3): inject the user's TUI tier.
+                                t.set_tui_render_mode(render_mode);
                                 if let Some(r) = &self.renderer {
                                     t.set_palette(r.theme().palette);
                                     t.set_background_color(r.theme().background);
@@ -740,6 +751,8 @@ impl App {
                         tab.restore_from_snapshot(snap);
                         if let Some(t) = &mut tab.terminal {
                             t.set_blocks_retained_limit(blocks_limit);
+                            // v1.11.7 (P2-3): inject the user's TUI tier.
+                            t.set_tui_render_mode(render_mode);
                             if let Some(r) = &self.renderer {
                                 t.set_palette(r.theme().palette);
                                 t.set_background_color(r.theme().background);

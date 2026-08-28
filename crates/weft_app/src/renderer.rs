@@ -769,7 +769,15 @@ impl MetalRenderer {
             // the cache entirely and renders directly from the live grid,
             // eliminating the corruption. Cost: full redraw while in a TUI app
             // (acceptable — TUIs don't stream like shell output).
-            if terminal.is_alt_screen_active() || terminal.primary_screen_app_active() {
+            if (terminal.is_alt_screen_active() || terminal.primary_screen_app_active())
+                && !terminal.show_block_view()
+            {
+                // v1.11.7 (P2-2): `&& !show_block_view()` — while a
+                // screen-owned session renders as a block, the grid is
+                // invisible; the per-frame full rebuild would only burn the
+                // dirty-all path. Skips slightly more than pre-v1.11.7
+                // (classic-tier alt-peek/history views skip too); the
+                // takeover path still forces the rebuild as before.
                 self.force_full_grid_redraw();
             }
 

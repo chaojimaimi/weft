@@ -259,6 +259,17 @@ pub struct BlockTracker {
     /// pin — only explicit user action grows this set, bounding memory at
     /// `retained_limit + user_pinned` by construction.
     user_pinned_ids: HashSet<u64>,
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.4, P0-2): the deferred
+    /// screen-exit settle window. `defer_screen_command_end` flips `phase` to
+    /// AtPrompt immediately (so marker accounting stays coherent), which
+    /// would make `in_flight()` return None and hide the live block for the
+    /// 200ms settle window — worse than today's flash. Set by
+    /// `defer_screen_command_end`, cleared by `finish_deferred_screen_command`
+    /// (and by `resume_screen_command`: a nested 133;B cancels the pending
+    /// exit), so `in_flight()` keeps serving the live block during the
+    /// defer→settle window. `is_capturing()` is unaffected (it still
+    /// requires `screen_document_start.is_some()` — false while settling).
+    settling: bool,
 }
 
 impl Default for BlockTracker {
@@ -294,6 +305,7 @@ impl BlockTracker {
             retained_limit: retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
             evicted_ids: HashSet::new(),
             user_pinned_ids: HashSet::new(),
+            settling: false,
         }
     }
 
@@ -388,8 +400,15 @@ impl BlockTracker {
     /// The currently-running command (between `133;B` and `133;D`), for the
     /// renderer's live block during CommandExecuting (e.g. an interactive
     /// `sudo su`). `None` when nothing is in flight.
+    ///
+    /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.4, P0-2): also `Some`
+    /// during the deferred-exit settle window (`settling`), so the live block
+    /// never vanishes for the 200ms between `defer_screen_command_end` and
+    /// `finish_deferred_screen_command` — the phase already flipped to
+    /// AtPrompt at defer time, and without the widened gate the renderer
+    /// would flash a naked grid exactly when the handle is closing.
     pub fn in_flight(&self) -> Option<InFlightBlock<'_>> {
-        if self.phase != ShellPhase::CommandExecuting {
+        if self.phase != ShellPhase::CommandExecuting && !self.settling {
             return None;
         }
         let command = self

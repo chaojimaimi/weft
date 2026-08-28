@@ -2425,6 +2425,12 @@ fn nested_shell_markers_do_not_split_screen_session_blocks() {
 
     // pi internal command #1: nested zsh precmd (D;0 + A) then preexec (B+C).
     t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    // Timing note (rust-reviewer P2-2): the nested 133;B below must arrive
+    // while `primary_screen_exit` is still pending (< the 200ms settle delay,
+    // measured in REAL wall clock across the two `process` calls) so the
+    // nested-marker cancellation branch runs. A pathologically slow machine
+    // could in principle let the pending exit settle first; the path has no
+    // clock injection today.
     assert_eq!(
         t.block_tracker().phase(),
         ShellPhase::CommandExecuting,
@@ -4538,4 +4544,410 @@ fn ui_events_progress_missing_params_ignored() {
     t.process(b"\x1b]9;4;3\x07"); // state 3 without progress
     t.process(b"\x1b]9;4;9;5\x07"); // unknown state 9
     assert!(t.take_ui_events().is_empty(), "all three must be ignored");
+}
+
+// ── v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1 / M3) ──────────────────
+//
+// Screen-owned sessions keep the BlockView during the whole command
+// (noninteractive/all tiers); interactive stdin / mouse reporting exempt
+// them back to the classic takeover; the settle window keeps the live
+// block visible; and the classic + noninteractive tiers converge on the
+// same snapshot block byte-for-byte.
+
+/// The five F6 app-mode fixtures. Each returns a terminal primed with the
+/// shell markers plus the app's cursor-addressing pattern.
+#[derive(Clone, Copy)]
+enum FixtureKind {
+    /// Claude Code — absolute CUP addressing (`\x1b[H\x1b[2;1H`).
+    Claude,
+    /// openclaw — relative CUU + CUB (`\x1b[999D\x1b[915A\x1b[1A`; the CUB
+    /// is horizontal-only and does not count, the two CUU do).
+    Openclaw,
+    /// pi — CUU + CHA + DEC 2026 synchronized frames.
+    Pi,
+    /// ollama — multi-row in-place repaint, two `\x1b[3A` frames.
+    OllamaMulti,
+    /// brew spinner / synchronized output with zero counting ops.
+    Brew,
+}
+
+fn fixture(kind: FixtureKind) -> Terminal {
+    let mut t = Terminal::new(24, 80);
+    match kind {
+        FixtureKind::Claude => {
+            t.process(b"\x1b]133;A\x07\x1b]133;B\x07claude\x1b]133;C\x07");
+            t.process(b"\x1b[H\x1b[2;1H");
+        }
+        FixtureKind::Openclaw => {
+            t.process(b"\x1b]133;A\x07\x1b]133;B\x07openclaw\x1b]133;C\x07");
+            t.process("\x1b[999D\x1b[915A\x1b[1A".as_bytes());
+        }
+        FixtureKind::Pi => {
+            t.process(b"\x1b]133;A\x07\x1b]133;B\x07pi\x1b]133;C\x07");
+            t.process("\x1b[3A\x1b[1G\x1b[?2026h\x1b[2Ka\x1b[2G\x1b[?2026l".as_bytes());
+        }
+        FixtureKind::OllamaMulti => {
+            t.process(b"\x1b]133;A\x07ollama pull\n\x1b]133;B\x07\x1b]133;C\x07");
+            t.process(b"pulling a: 0%\npulling b: 0%\npulling c: 0%\n");
+            let first =
+                "\x1b[3A\rpulling a: 50%\x1b[K\n\rpulling b: 30%\x1b[K\n\rpulling c: 10%\x1b[K";
+            let second =
+                "\x1b[3A\rpulling a: 80%\x1b[K\n\rpulling b: 60%\x1b[K\n\rpulling c: 40%\x1b[K";
+            t.process(first.as_bytes());
+            t.process(second.as_bytes());
+        }
+        FixtureKind::Brew => {
+            t.process(b"\x1b]133;A\x07brew update\n\x1b]133;B\x07\x1b]133;C\x07");
+            for _ in 0..3 {
+                t.process(b"\x1b[?2026h\x1b[2K\xe2\xa0\x8b\x1b[?2026l");
+            }
+        }
+    }
+    t
+}
+
+/// Assert the three-tier show_block_view result for one fixture.
+#[test]
+fn render_mode_matrix_three_tiers_x_app_fixtures() {
+    // M1.6: 三档 × F6 全部 app 模式. For the four detected TUIs classic
+    // hands the viewport to the live grid; noninteractive (no stdin/mouse)
+    // and all keep the BlockView; brew (zero counting ops) stays a block in
+    // every tier.
+    let detected = [
+        FixtureKind::Claude,
+        FixtureKind::Openclaw,
+        FixtureKind::Pi,
+        FixtureKind::OllamaMulti,
+    ];
+    for kind in detected {
+        let mut t = fixture(kind);
+        assert!(t.primary_screen_app_active(), "fixture must detect a TUI");
+        // classic
+        assert!(
+            !t.show_block_view(),
+            "classic: screen-owned TUI renders in the live grid"
+        );
+        // noninteractive
+        t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+        assert!(
+            t.show_block_view(),
+            "noninteractive: screen-owned session keeps the BlockView"
+        );
+        // all
+        t.set_tui_render_mode(TuiRenderMode::All);
+        assert!(t.show_block_view(), "all: screen-owned always blocks");
+        // classic after the all flip
+        t.set_tui_render_mode(TuiRenderMode::Classic);
+        assert!(!t.show_block_view(), "classic: back to the live grid");
+    }
+    // brew / spinner: zero counting ops — never screen-owned, block in all three.
+    for mode in [
+        TuiRenderMode::Classic,
+        TuiRenderMode::Noninteractive,
+        TuiRenderMode::All,
+    ] {
+        let mut t = fixture(FixtureKind::Brew);
+        t.set_tui_render_mode(mode);
+        assert!(!t.primary_screen_app_active(), "brew must not classify");
+        assert!(t.show_block_view(), "brew stays a block in every tier");
+    }
+}
+
+#[test]
+fn interactive_stdin_flip_overrides_noninteractive_tier() {
+    // M1.6 stdin 翻转: one keystroke exempts the session back to classic.
+    for kind in [
+        FixtureKind::Claude,
+        FixtureKind::Openclaw,
+        FixtureKind::Pi,
+        FixtureKind::OllamaMulti,
+    ] {
+        let mut t = fixture(kind);
+        t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+        assert!(t.show_block_view());
+        t.note_interactive_stdin();
+        assert!(
+            !t.show_block_view(),
+            "stdin seen → classic formula owns the viewport"
+        );
+        assert!(t.interactive_stdin_seen());
+    }
+}
+
+#[test]
+fn nested_markers_do_not_clear_stdin_flag_but_settle_does() {
+    // P1-2: the flag resets at REAL command boundaries only — never at
+    // 133;A/D or nested markers (pi's inner prompts must not flip the view
+    // mid-interaction).
+    let mut t = fixture(FixtureKind::Pi);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t.note_interactive_stdin();
+    assert!(!t.show_block_view(), "exempted to classic");
+
+    // 133;D → deferred exit (screen-owned). A nested 133;B arrives inside
+    // the settle window — this is the TUI's OWN internal command (resume
+    // path), NOT a real boundary: the flag must survive.
+    t.process(b"\x1b]133;D;0\x07\x1b]133;B\x07\x1b]133;C\x07");
+    assert!(
+        t.interactive_stdin_seen(),
+        "nested marker must not clear the stdin flag mid-interaction"
+    );
+    assert!(
+        t.block_tracker().screen_document_start().is_some(),
+        "screen session still owns the document after resume"
+    );
+
+    // A plain prompt marker (133;A) followed by another 133;D also keeps
+    // the flag — only settle / real command start clear it.
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    assert!(
+        t.interactive_stdin_seen(),
+        "133;A alone must not clear the flag (P1-2)"
+    );
+
+    // A real 133;D + settle (or a real 133;B) is the boundary.
+    t.process(b"\x1b]133;D;0\x07");
+    t.settle_primary_screen_exit();
+    assert!(
+        !t.interactive_stdin_seen(),
+        "settle (real command boundary) clears the flag"
+    );
+}
+
+#[test]
+fn settle_clears_stdin_flag_and_next_command_starts_clean() {
+    // M1.6 复位: settle clears; the NEXT command (133;B real path) also
+    // clears, so a stale exemption can never leak.
+    let mut t = fixture(FixtureKind::Claude);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t.note_interactive_stdin();
+    t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07");
+    t.settle_primary_screen_exit();
+    assert!(!t.interactive_stdin_seen());
+    // Next command begins exempt-free (even without an intermediate settle).
+    let mut t2 = fixture(FixtureKind::Claude);
+    t2.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t2.note_interactive_stdin();
+    t2.process(b"next\x1b]133;B\x07\x1b]133;C\x07");
+    assert!(!t2.interactive_stdin_seen(), "real 133;B clears the flag");
+}
+
+#[test]
+fn mouse_protocol_parallel_exemption_without_stdin() {
+    // P1-3: mouse reporting is an interaction capability declaration — the
+    // noninteractive tier exempts the session even with zero stdin bytes.
+    let mut t = fixture(FixtureKind::Claude);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    assert!(t.show_block_view());
+    t.process(b"\x1b[?1002h");
+    assert_eq!(t.mouse_protocol(), MouseProtocol::ButtonEvent);
+    assert!(!t.show_block_view(), "mouse reporting → classic takeover");
+    assert!(!t.interactive_stdin_seen());
+    // The exemption is mode-scoped: a DEC 1002l return restores blocks.
+    t.process(b"\x1b[?1002l");
+    assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+    assert!(t.show_block_view(), "protocol off → blocks again");
+}
+
+#[test]
+fn exit_pending_in_flight_keeps_final_frame_output() {
+    // P0-2 (M1.6): between 133;D (defer) and settle, in_flight() must still
+    // serve the live block with the FINAL snapshot frame — the settling flag
+    // widens the gate so the block never vanishes for the 200ms window.
+    let mut t = fixture(FixtureKind::Claude);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t.process(b"claude> hello\r\n");
+    // A screen-owned capture is active; end the command.
+    t.process(b"\x1b]133;D;0\x07");
+    assert!(
+        t.primary_screen_exit_pending(),
+        "exit deferred until the settle window elapses"
+    );
+    let live = t.block_tracker().in_flight();
+    assert!(
+        live.is_some(),
+        "live block must survive the defer→settle window"
+    );
+    let output = live.unwrap().output.to_string();
+    assert!(
+        !output.is_empty(),
+        "in-flight output must carry the final snapshot frame"
+    );
+    // The block view also stays (P0-1: exit_pending is dropped in the new tiers).
+    assert!(t.show_block_view());
+    // Settling closes the block with that same final frame.
+    t.settle_primary_screen_exit();
+    assert!(t.block_tracker().in_flight().is_none());
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        output,
+        "settle keeps the final frame"
+    );
+}
+
+// ── M3: block fidelity for the reported progress classes ───────────────
+
+#[test]
+fn uv_multi_frame_progress_no_stack_single_terminal_frame() {
+    // uv sync (F14 pattern — multi-frame CUU progress UI). Classic locks the
+    // takeover (regression anchor); noninteractive keeps the BlockView and
+    // the settled output holds ONLY the single terminal frame (no stacked
+    // "Preparing… (1/3)" rows).
+    let mut classic = Terminal::new(24, 80);
+    classic.process(b"\x1b]133;A\x07uv sync\n\x1b]133;B\x07\x1b]133;C\x07");
+    classic.process(b"Resolving packages...\nResolving packages... [1/2]\n");
+    classic.process("\x1b[2A\r\x1b[KPreparing… (1/3)\n\x1b[KPreparing… (2/3)\n".as_bytes());
+    classic.process("\x1b[2A\r\x1b[KPreparing… (2/3)\n\x1b[KPreparing… (3/3)\n".as_bytes());
+    assert!(
+        classic.primary_screen_app_active(),
+        "classic: uv class detected"
+    );
+    assert!(
+        !classic.show_block_view(),
+        "classic lock: multi-frame progress takes over the grid"
+    );
+
+    let mut t = Terminal::new(24, 80);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t.process(b"\x1b]133;A\x07uv sync\n\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"Resolving packages...\nResolving packages... [1/2]\n");
+    t.process("\x1b[2A\r\x1b[KPreparing… (1/3)\n\x1b[KPreparing… (2/3)\n".as_bytes());
+    t.process("\x1b[2A\r\x1b[KPreparing… (2/3)\n\x1b[KPreparing… (3/3)\n".as_bytes());
+    assert!(t.primary_screen_app_active());
+    assert!(
+        t.show_block_view(),
+        "noninteractive: the reported class stays in the BlockView"
+    );
+    // The 50ms rate-limited snapshot publishes on the 133;D path (and the
+    // idle ticker) — after it, the in-flight live block carries the final
+    // frame only, with no stacked superseded rows.
+    t.process(b"\x1b]133;D;0\x07");
+    let live = t.block_tracker().in_flight().unwrap();
+    let live_out = live.output.to_string();
+    assert!(
+        live_out.contains("Preparing… (3/3)"),
+        "live block shows the snapshot content: {live_out:?}"
+    );
+    assert!(
+        !live_out.contains("Resolving packages... [1/2]") && !live_out.contains("Preparing… (1/3)"),
+        "superseded frames must not stack in the live/settled output: {live_out:?}"
+    );
+    t.settle_primary_screen_exit();
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        "Preparing… (2/3)\nPreparing… (3/3)",
+        "settled output is exactly the single terminal frame"
+    );
+}
+
+#[test]
+fn ollama_multi_layer_progress_no_stack() {
+    // ollama pull with a multi-row multi-layer progress bar (tests.rs:1664
+    // extended to a second repaint so cursor_ops crosses the threshold).
+    let mut t = Terminal::new(24, 80);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    t.process(b"\x1b]133;A\x07ollama pull\n\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(b"pulling a: 0%\npulling b: 0%\npulling c: 0%\n");
+    let first = "\x1b[3A\rpulling a: 50%\x1b[K\n\rpulling b: 30%\x1b[K\n\rpulling c: 10%\x1b[K\n";
+    let second = "\x1b[3A\rpulling a: 80%\x1b[K\n\rpulling b: 60%\x1b[K\n\rpulling c: 40%\x1b[K\n";
+    t.process(first.as_bytes());
+    t.process(second.as_bytes());
+    assert!(t.primary_screen_app_active(), "multi-frame ollama detected");
+    assert!(
+        t.show_block_view(),
+        "screen-owned ollama progress keeps the block view"
+    );
+    t.process(b"\n\x1b]133;D;0\x07");
+    t.settle_primary_screen_exit();
+    let block = t.block_tracker().blocks().last().unwrap();
+    assert_eq!(
+        block.output.as_ref(),
+        "pulling a: 80%\npulling b: 60%\npulling c: 40%",
+        "multi-layer repaints must converge to the single final frame"
+    );
+}
+
+#[test]
+fn settle_convergence_classic_and_noninteractive_byte_identical() {
+    // M3.1 汇合差分: classic and noninteractive settle through the SAME
+    // snapshot pipeline — the finished Block.output must be byte-identical
+    // for every detected fixture (direct evidence the data plane is
+    // untouched by the view-policy change).
+    for kind in [
+        FixtureKind::Claude,
+        FixtureKind::Openclaw,
+        FixtureKind::Pi,
+        FixtureKind::OllamaMulti,
+        FixtureKind::Brew,
+    ] {
+        let mut classic = fixture(kind);
+        classic.set_tui_render_mode(TuiRenderMode::Classic);
+        classic.process(b"\x1b]133;D;0\x07");
+        classic.settle_primary_screen_exit();
+        let classic_out = classic
+            .block_tracker()
+            .blocks()
+            .last()
+            .map(|b| b.output.to_string())
+            .unwrap_or_default();
+
+        let mut ni = fixture(kind);
+        ni.set_tui_render_mode(TuiRenderMode::Noninteractive);
+        ni.process(b"\x1b]133;D;0\x07");
+        ni.settle_primary_screen_exit();
+        let ni_out = ni
+            .block_tracker()
+            .blocks()
+            .last()
+            .map(|b| b.output.to_string())
+            .unwrap_or_default();
+
+        assert_eq!(
+            classic_out, ni_out,
+            "classic and noninteractive must converge on the same snapshot block"
+        );
+        assert!(!classic_out.is_empty(), "fixture must produce a block");
+    }
+}
+
+#[test]
+fn claude_caret_tracks_snapshot_line_matching_grid_cursor() {
+    // M3.1 caret: the renderer's BlockView caret is
+    // (snapshot-lines - grid-rows + grid-cursor-row, grid-cursor-col) —
+    // assert the tracked snapshot line matches that mapping so the caret
+    // sits on the exact materialized document row (renderer.rs:
+    // block_view_tui_cursor + block_component::block_view_tui_cursor_line).
+    let mut t = fixture(FixtureKind::Claude);
+    t.set_tui_render_mode(TuiRenderMode::Noninteractive);
+    // Type into the TUI so the document contains content rows.
+    t.process(b"claude> hello\r\nclaude> ");
+    // End the command — the 133;D handler snapshots (tracked line + segment).
+    t.process(b"\x1b]133;D;0\x07");
+    let tracked = t
+        .primary_screen_cursor_snapshot_line()
+        .expect("snapshot must track the cursor line");
+    let live_line_count = t
+        .block_tracker()
+        .in_flight()
+        .unwrap()
+        .output
+        .lines()
+        .count();
+    let mapped = live_line_count
+        .saturating_sub(t.grid().num_rows)
+        .saturating_add(t.grid().cursor.row)
+        .min(live_line_count.saturating_sub(1));
+    assert_eq!(
+        tracked, mapped,
+        "tracked caret line must match the renderer's grid-cursor mapping"
+    );
+    // The caret column is the grid cursor column by construction
+    // (renderer.rs: Some((line, grid.cursor.col))) — nothing to assert
+    // beyond the line mapping above (rust-reviewer P2-1: a col-vs-itself
+    // comparison is a tautology).
+    // Cleanup: settle leaves one block (screen-owned session finalizes).
+    t.settle_primary_screen_exit();
+    assert_eq!(t.block_tracker().blocks().len(), 1);
 }
