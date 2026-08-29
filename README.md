@@ -24,13 +24,15 @@ A modern macOS terminal emulator with block-based command history, Metal GPU ren
 
 ## Performance
 
-Benchmarks (3-run avg, vs Warp reference):
+Interactive throughput (2026-08-17 manual 3-run avg; both columns same methodology, single-session measurement — see `docs/perf/warp-comparison/2026-08-18-baseline.md` for caveats):
 
 | Scenario | Weft | Warp |
 |----------|------|------|
 | `seq 1 10000` | ~17ms | ~10ms |
 | `seq 1 100000` | ~150ms | ~50ms |
 | `ls -la /usr/bin` | ~7.6ms | ~5ms |
+
+Automated baselines (2026-08-29, Apple M2 Max, macOS 26.6.2, release build — full data in `docs/perf/v1.11.9-baseline.md`): VT parse 14.6–20.6 MB/s (100k/1M lines), block visible-window render p95 ≤0.15ms at 100k lines, 10k history filter 15.3ms, offscreen Metal frame p95 ≤0.68ms, GUI idle CPU frame p95 0.48ms. Cold start ~0.39s to first frame (bundled, warm; gate protocol p95 456ms on the bare binary) — exceeded the legacy 0.30s budget set against the v1.10.3-era codebase; waiver and attribution recorded in the baseline doc, optimization queued for v1.12.
 
 Optimizations: CPU VT parser fast-path (ASCII batch), GPU instance rendering with triple-buffered vertex ring, dirty-rect culling, glyph atlas ASCII direct-index.
 

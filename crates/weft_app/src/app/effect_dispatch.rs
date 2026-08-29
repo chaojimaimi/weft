@@ -36,7 +36,6 @@ pub(crate) const PASTE_TOAST_TTL: std::time::Duration = std::time::Duration::fro
 pub(crate) struct PendingPaste {
     pub(crate) tab: usize,
     pub(crate) text: String,
-    #[allow(dead_code)] // carried for logging/diagnostics at decision time
     pub(crate) risk: PasteRisk,
 }
 
@@ -414,6 +413,7 @@ impl crate::App {
                 info!(
                     tab = pending.tab,
                     bytes = pending.text.len(),
+                    ?pending.risk,
                     "large paste cancelled; discarded without writing"
                 );
             }
@@ -424,6 +424,7 @@ impl crate::App {
                 info!(
                     tab = pending.tab,
                     bytes = pending.text.len(),
+                    ?pending.risk,
                     grant_session,
                     "large paste approved"
                 );

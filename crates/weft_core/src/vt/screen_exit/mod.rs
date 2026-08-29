@@ -1285,7 +1285,7 @@ mod tests {
         // zero evidence; the screen-owned TUI still renders in the live grid.
         assert!(
             !t.show_block_view(),
-            "absolute flag cleared → relative-only TUI still uses the live grid"
+            "relative-only command re-arms per-command addressing evidence → still uses the live grid"
         );
     }
 

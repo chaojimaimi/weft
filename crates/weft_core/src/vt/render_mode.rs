@@ -28,6 +28,12 @@ pub enum TuiRenderMode {
     Classic,
     /// Default: screen-owned sessions keep the BlockView unless interactive
     /// stdin or mouse reporting exempts them back to Classic.
+    ///
+    /// v1.11.9 decision record (PLAN_v1119 D-a): default noninteractive per
+    /// 2026-08-29 user decision (no switch requested, conservative item
+    /// stands); `all` = manual experimental tier; `classic` = rollback tier
+    /// until v1.12. Reopen in v1.12 via `all`-tier dogfood (typing echo
+    /// ~100ms, smooth long sessions).
     #[default]
     Noninteractive,
     /// Screen-owned sessions always render in the BlockView (no stdin/mouse
