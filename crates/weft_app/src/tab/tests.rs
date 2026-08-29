@@ -950,3 +950,148 @@ fn single_alt_toggle_converges_to_full_once_resident() {
         "the primary target snaps back to the pre-toggle constant"
     );
 }
+
+/// v1.11.8 (PLAN_v1118 M-E): live-split continuous scenario — a screen-owned
+/// session streams >2MiB in batches; each 1MiB crossing settles finished
+/// head blocks THROUGH THE LIVE PATH (F16: the v1.11.7 block-view-retention
+/// combo that had no coverage). Each manual refresh (bypassing the 50ms
+/// throttle via pub `refresh_primary_history_snapshot_now`) must surface its
+/// head count in `pending_screen_split_heads`; the next `process_messages`
+/// drain must consume it and advance the detached FixedDocumentRow anchor by
+/// heads × chrome rows; after the final settle the stream's head and tail
+/// text must be present in the finished blocks.
+#[test]
+fn live_split_stream_drains_heads_and_compensates_anchor() {
+    let mut tab = tab_with_terminal(40_000);
+    // Screen-owned session: integrated markers + two CUP ops cross the
+    // cursor_ops >= 2 ownership threshold.
+    tab.process_pty_output(b"\x1b]133;A\x07\x1b]133;B\x07stream\x1b]133;C\x07");
+    tab.process_pty_output(b"\x1b[H\x1b[2;1H");
+    assert!(
+        tab.terminal
+            .as_ref()
+            .unwrap()
+            .block_tracker()
+            .screen_document_start()
+            .is_some(),
+        "precondition: the pane owns a primary-screen TUI document"
+    );
+    // Detach the anchor: split-head settlement must advance it by the
+    // inserted chrome rows so the user keeps reading the same visual row.
+    tab.set_block_scroll(100);
+    assert!(matches!(
+        tab.block_scroll_anchor(),
+        BlockScrollAnchor::FixedDocumentRow(100)
+    ));
+
+    // Flood ~1.15MiB in batches below the app's 256KiB message splitter.
+    const FLOOD_BYTES: usize = 192 * 1024;
+    let mut flood = vec![b'a'; FLOOD_BYTES];
+    // Distinct markers pin the head/tail text assertions after settle.
+    flood[..13].copy_from_slice(b"HEAD_MARKER_1");
+    for _ in 0..6 {
+        tab.process_pty_output(&flood);
+    }
+
+    // First 1MiB crossing: the manual refresh splits the composed document;
+    // the heads land in finished blocks synchronously.
+    let heads_before = tab
+        .terminal
+        .as_ref()
+        .unwrap()
+        .block_tracker()
+        .blocks()
+        .len();
+    assert!(
+        tab.terminal
+            .as_mut()
+            .unwrap()
+            .refresh_primary_history_snapshot_now(),
+        "manual refresh must run regardless of the 50ms throttle"
+    );
+    let heads_1 = tab
+        .terminal
+        .as_ref()
+        .unwrap()
+        .block_tracker()
+        .blocks()
+        .len()
+        - heads_before;
+    assert!(heads_1 >= 1, "first flood must settle >= 1 split head");
+
+    // The tab drain consumes the pending head count (the anchor compensation
+    // runs after the terminal borrow ends, tab.rs B-D3).
+    tab.process_messages();
+    assert!(
+        tab.terminal
+            .as_mut()
+            .unwrap()
+            .take_pending_screen_split_heads()
+            .is_none(),
+        "the drain must consume the pending split-head count"
+    );
+
+    // Second crossing: another ~1.15MiB with its own head marker + the
+    // stream-tail marker at the very end.
+    flood[..13].copy_from_slice(b"HEAD_MARKER_2");
+    flood[FLOOD_BYTES - 11..].copy_from_slice(b"TAIL_MARKER");
+    for _ in 0..6 {
+        tab.process_pty_output(&flood);
+    }
+    let heads_before = tab
+        .terminal
+        .as_ref()
+        .unwrap()
+        .block_tracker()
+        .blocks()
+        .len();
+    assert!(
+        tab.terminal
+            .as_mut()
+            .unwrap()
+            .refresh_primary_history_snapshot_now(),
+        "second manual refresh must split the grown document"
+    );
+    let heads_2 = tab
+        .terminal
+        .as_ref()
+        .unwrap()
+        .block_tracker()
+        .blocks()
+        .len()
+        - heads_before;
+    assert!(heads_2 >= 1, "second flood must settle >= 1 split head");
+    tab.process_messages();
+
+    // The detached anchor advanced by (heads_1 + heads_2) chrome rows — the
+    // user's visual row is preserved across both splits.
+    let expected_anchor = 100 + (heads_1 + heads_2) * crate::layout::BLOCK_SPLIT_HEAD_CHROME_ROWS;
+    assert_eq!(
+        tab.block_scroll_anchor(),
+        BlockScrollAnchor::FixedDocumentRow(expected_anchor),
+        "the detached anchor advances by settled-head chrome rows per split"
+    );
+
+    // Settle: the final boundary snapshot may split once more; the finished
+    // head blocks keep the stream's head text and the final block keeps the
+    // stream-tail text — the shared transcript stays complete.
+    tab.process_pty_output(b"\x1b]133;D;0\x07");
+    tab.terminal.as_mut().unwrap().settle_primary_screen_exit();
+    let blocks = tab.terminal.as_ref().unwrap().block_tracker().blocks();
+    assert!(
+        blocks.len() >= 2,
+        "splits + settle leave >= 2 finished blocks"
+    );
+    assert!(
+        blocks[0].output.contains("HEAD_MARKER_1"),
+        "the earliest finished block keeps the first flood's head text"
+    );
+    assert!(
+        blocks.iter().any(|b| b.output.contains("HEAD_MARKER_2")),
+        "the second flood's head text lands in a split head block"
+    );
+    assert!(
+        blocks.last().unwrap().output.contains("TAIL_MARKER"),
+        "the final block keeps the stream-tail text"
+    );
+}

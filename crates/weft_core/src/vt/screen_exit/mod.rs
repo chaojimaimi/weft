@@ -44,21 +44,16 @@ pub(in crate::vt) use ownership::PrimaryScreenOwnership;
 pub const PRIMARY_SCREEN_EXIT_SETTLE_DELAY: Duration = Duration::from_millis(200);
 pub const PRIMARY_HISTORY_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(50);
 
-/// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): minimum *continuous* alternate-
-/// screen residency before `tui_cols_kind()` reports [`TuiColsKind::Full`].
-/// omp 17.3.7 wraps its SIGWINCH repaint in a 1049h → full redraw (~129ms) →
-/// 1049l excursion; a real alt TUI (vim/less) stays resident for seconds.
-/// 250ms ≈ 2x the omp residency and far below any real TUI, so transient
-/// excursions never flip the cols target and the ioctl → SIGWINCH → 1049
-/// feedback loop is broken at the source. See docs/FIX_TRANSIENT_ALT_COLS_FLIP.md.
-pub(crate) const SUSTAINED_ALT_COLS_MS: u64 = 250;
+// v1.11.8 (PLAN_v1118 M-C2): cols policy moved to `cols` (pure functions,
+// zero Terminal coupling). Re-export at the same paths the module root used
+// to provide them — `vt/mod.rs`'s two re-export lines stay untouched.
+mod cols;
 
-/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): burst re-entry detection window.
-/// omp flip-pairs 1049h→repaint→1049l toggle at ~130-330ms intervals.
-/// 400ms covers the burst window while treating isolated alt entries
-/// (less/vim startup, no recent exit) as immediate Full. See
-/// docs/FIX_LESS_ALT_COLS_JUMP.md.
-pub(crate) const ALT_REENTRY_BURST_MS: u64 = 400;
+pub(crate) use cols::sustained_alt_cols_kind;
+pub use cols::TuiColsKind;
+// v1.11.8 (M-C2): consumed only by vt/mod.rs's `#[cfg(test)]` re-export.
+#[cfg(test)]
+pub(crate) use cols::SUSTAINED_ALT_COLS_MS;
 
 pub(in crate::vt) struct PendingPrimaryScreenExit {
     pub(in crate::vt) exit_code: Option<i32>,
@@ -70,76 +65,6 @@ pub(in crate::vt) struct PrimaryScreenInterruptCapture {
     pub(in crate::vt) frozen_styled: StyledOutput,
     pub(in crate::vt) tail: OutputCapture,
     pub(in crate::vt) origin_row: Option<usize>,
-}
-
-/// v1.10.25 Batch 2 (FIX_TUI_INPUT_WIDTH_ALIGNMENT): PTY cols policy for
-/// the active pane. The value drives
-/// `Tab::active_pane_dimensions_for_rect` / `Tab::resize_all_panes_for_rect`
-/// (weft_app), which choose between
-/// [`weft_app::layout::terminal_full_cols`] and
-/// [`weft_app::layout::terminal_content_cols`].
-///
-/// Anti-oscillation history (v1.10.19 → v1.10.25; deduped in v1.10.26 Batch
-/// D — the authoritative anti-cycle design lives in
-/// `weft_app::tab::resize::Tab::burst_locked_cols` / `ALT_RESCALE_DEBOUNCE`):
-/// the mapping here is a pure constant function of the alt flag (a toggle
-/// burst can never ratchet the target into a third value), and the
-/// primary↔alt Content/Full alternation is bounded at the app cols mirror
-/// sites by the burst hysteresis — locked to Content while a two-flip storm
-/// signature is fresh, converging to the live kind once it goes quiet.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TuiColsKind {
-    /// Alt-screen TUI (vim/htop/less): paints edge-to-edge with no
-    /// BlockView gutter. The grid origin is the pane's left edge, so
-    /// every column is renderable.
-    Full,
-    /// Primary-screen TUI (omp/pi/openclaw), including while its exit is
-    /// settling, and plain shell output: the BlockView content width.
-    /// The grid renders inset by the gutter
-    /// (`weft_app::paint::grid::grid_content_origin_x`), so full-width
-    /// cols would overflow the content area by the gutter (~1.5 cols,
-    /// right edge clipped — v1.10.19's full-width scheme). Content width
-    /// makes three independently-computed widths identical: PTY target
-    /// cols == grid render cols == block wrap cols, so the omp input-line
-    /// border `|]` never exceeds the renderable area and never folds to a
-    /// continuation chunk after settle.
-    Content,
-}
-
-/// v1.10.30 (FIX_LESS_ALT_COLS_JUMP): pure decision for the sustained-alt
-/// cols hysteresis feeding [`Terminal::tui_cols_kind`].
-///
-/// Distinguishes isolated vs burst re-entry:
-/// - Isolated entry (no recent exit or >= 400ms since last exit): immediately Full
-/// - Burst re-entry (< 400ms since last exit): requires sustained 250ms residency
-///
-/// This fixes less/vim startup jump (isolated entry gets Full immediately)
-/// while maintaining omp loop suppression (burst re-entries wait 250ms).
-/// A `None` entry time (unknown start) conservatively returns Full.
-/// See docs/FIX_LESS_ALT_COLS_JUMP.md.
-pub(crate) fn sustained_alt_cols_kind(
-    alt_active: bool,
-    alt_active_for: Option<Duration>,
-    since_last_exit: Option<Duration>,
-) -> TuiColsKind {
-    if !alt_active {
-        return TuiColsKind::Content;
-    }
-    // Isolated entry (no recent exit) → immediate Full (fixes less/vim startup)
-    if since_last_exit.map_or(true, |d| d >= Duration::from_millis(ALT_REENTRY_BURST_MS)) {
-        return TuiColsKind::Full;
-    }
-    // Burst re-entry: apply sustained residency threshold
-    match alt_active_for {
-        // Unknown start: conservatively keep the old alt→Full mapping.
-        None => TuiColsKind::Full,
-        // Below the sustained threshold — a transient excursion must not flip.
-        Some(elapsed) if elapsed < Duration::from_millis(SUSTAINED_ALT_COLS_MS) => {
-            TuiColsKind::Content
-        }
-        // Continuous residency at/over the threshold — a real alt TUI.
-        Some(_) => TuiColsKind::Full,
-    }
 }
 
 impl Terminal {
@@ -220,7 +145,7 @@ impl Terminal {
         }
     }
 
-    pub(super) fn note_primary_screen_cursor_addressing(&mut self, absolute: bool) {
+    pub(super) fn note_primary_screen_cursor_addressing(&mut self, relative: bool) {
         // v1.10.4: count cursor addressing on the primary screen regardless
         // of shell phase. Previously gated on CommandExecuting, which missed
         // TUIs that run WITHOUT shell integration (phase stays NotIntegrated —
@@ -245,13 +170,14 @@ impl Terminal {
                 .capabilities
                 .primary_screen_cursor_ops
                 .saturating_add(1);
-            // v1.10.4: absolute addressing (CUP/VPA/CHR) marks a
-            // full-viewport repainter (Claude Code) that needs the live
-            // grid; relative-only TUIs (openclaw) keep the BlockView.
-            self.capabilities.primary_screen_absolute_addressing |= absolute;
             // v1.10.12: relative moves mark a sparse repainter — it paints
             // incrementally, so row-boundary hiding must stay off.
-            self.capabilities.primary_screen_relative_addressing_seen |= !absolute;
+            // v1.11.8 (PLAN_v1118 M-C1): the param used to arrive as
+            // `absolute` and write the (now deleted) zero-read
+            // `primary_screen_absolute_addressing` flag; its only remaining
+            // consumer is `!absolute` below, so the negation moved to the
+            // single call site (perform.rs) and the param is `relative`.
+            self.capabilities.primary_screen_relative_addressing_seen |= relative;
             if self.primary_screen_app_active() {
                 self.begin_primary_screen_output_capture();
             }
@@ -444,6 +370,24 @@ impl Terminal {
         // `screen_document_start` set, so the accumulated frames survive
         // them; only a real boundary (settle → next command) resets it.
         let starting = self.block_tracker.screen_document_start().is_none();
+        // v1.11.8 (PLAN_v1118 M-B): the data-plane takeover flip point.
+        // v1.11.5's forensics lesson (flip points had no logs) closes here —
+        // the first ownership of a command is the interesting boundary.
+        if starting {
+            tracing::info!(
+                cursor_ops = self.capabilities.primary_screen_cursor_ops,
+                phase = ?self.block_tracker.phase(),
+                mode = ?self.tui_render_mode,
+                "beginning primary-screen output capture (data plane takeover)"
+            );
+        } else {
+            tracing::debug!(
+                cursor_ops = self.capabilities.primary_screen_cursor_ops,
+                phase = ?self.block_tracker.phase(),
+                mode = ?self.tui_render_mode,
+                "continuing primary-screen output capture (nested 133 marker)"
+            );
+        }
         if starting {
             self.capabilities.screen_history = crate::vt::capability::ScreenHistory::default();
         }
@@ -639,6 +583,11 @@ impl Terminal {
     /// v1.10.12-fix: whether a primary-screen TUI currently owns the screen
     /// (document capture started and not yet settled). While true, the live
     /// grid renders the TUI's own full-screen output.
+    ///
+    /// classic-tier only (v1.11.8 M-C3): the sole call site is the classic
+    /// `show_block_view` formula (:627) — the all/noninteractive tiers drop
+    /// this item entirely. `screen_owned_tui_active` itself stays: the
+    /// classic tier is retained until v1.12.
     fn screen_owned_tui_active(&self) -> bool {
         self.block_tracker.screen_document_start().is_some()
     }
@@ -931,14 +880,12 @@ impl Terminal {
     /// TUI (openclaw) kept in the BlockView needs the refresh even while
     /// following the live tail (history browsing off).
     ///
-    /// v1.10.7: the v1.10.4 MEDIUM-1 absolute-addressing skip is REMOVED. A
-    /// sparse repainter like pi does occasional CUP full-viewport repaints,
-    /// flipping `primary_screen_absolute_addressing` true while following —
-    /// the skip then froze the session block's snapshot (resumed sessions
-    /// lost their replay body; the final block kept only the last pre-CUP
-    /// frame). The snapshot is the ONLY content source for screen-owned
-    /// blocks, so it must refresh regardless of the transient addressing
-    /// mode. The rate limit still bounds the rescan cost.
+    /// v1.10.7: the v1.10.4 MEDIUM-1 absolute-addressing skip is REMOVED —
+    /// the snapshot is the ONLY content source for screen-owned blocks, so
+    /// it must refresh regardless of the transient addressing mode. The rate
+    /// limit still bounds the rescan cost. (v1.11.8 M-C1: the
+    /// `primary_screen_absolute_addressing` flag itself is gone — zero
+    /// readers since v1.10.12; this doc keeps the skip's rationale record.)
     pub fn refresh_primary_history_snapshot_now(&mut self) -> bool {
         if self.block_tracker.screen_document_start().is_none() {
             return false;
@@ -1031,6 +978,13 @@ impl Terminal {
         tracing::info!(
             ?exit_code,
             settle_delay_ms = PRIMARY_SCREEN_EXIT_SETTLE_DELAY.as_millis(),
+            // v1.11.8 (M-B): the tier + exemption trio that drove
+            // `show_block_view` for this session — captured at the defer
+            // point while the command state is still live.
+            mode = ?self.tui_render_mode,
+            exempt = self.capabilities.interactive_stdin_seen
+                || self.capabilities.mouse_protocol != crate::input::MouseProtocol::Off,
+            mouse = ?self.capabilities.mouse_protocol,
             "deferred primary-screen command finalization"
         );
     }
@@ -1071,6 +1025,14 @@ impl Terminal {
         let Some(pending) = self.capabilities.primary_screen_exit.take() else {
             return false;
         };
+        // v1.11.8 (M-B): capture the tier + exemption trio BEFORE the
+        // boundary hygiene below wipes interactive-stdin/mouse state — the
+        // settle log must describe the session that just ended, not the
+        // post-reset defaults.
+        let ended_mode = self.tui_render_mode;
+        let ended_exempt = self.capabilities.interactive_stdin_seen
+            || self.capabilities.mouse_protocol != crate::input::MouseProtocol::Off;
+        let ended_mouse = self.capabilities.mouse_protocol;
         self.snapshot_primary_screen_output();
         self.block_tracker
             .finish_deferred_screen_command(pending.exit_code);
@@ -1110,6 +1072,9 @@ impl Terminal {
         tracing::info!(
             ?pending.exit_code,
             block_id,
+            mode = ?ended_mode,
+            exempt = ended_exempt,
+            mouse = ?ended_mouse,
             "settled primary-screen command finalization"
         );
         true
@@ -1298,11 +1263,15 @@ mod tests {
     }
 
     #[test]
-    fn osc133_reset_clears_absolute_addressing_flag() {
-        // The absolute-addressing evidence is per-command, like cursor_ops:
-        // the 133;D end marker (and 133;A/B, defensively) must clear it.
-        // (The flag is actually reset at 133;D here; the 133;A reset is
-        // redundant defense for the interrupt path.)
+    fn marker_boundary_rearms_per_command_addressing_evidence() {
+        // v1.11.8 (PLAN_v1118 M-C1): renamed from
+        // `osc133_reset_clears_absolute_addressing_flag` — the zero-read
+        // `primary_screen_absolute_addressing` flag was deleted (F11). The
+        // byte-sequence regression this test pins is unchanged: per-command
+        // addressing evidence is re-armed at the 133;D→133;A boundary, so a
+        // fresh relative-only command re-detects screen ownership from zero
+        // and keeps the same (classic-tier) live-grid view as the CUP-only
+        // command before it.
         let mut t = Terminal::new(5, 20);
         t.process(b"\x1b]133;A\x07\x1b]133;B\x07claude\x1b]133;C\x07");
         t.process("\x1b[H\x1b[2;1H".as_bytes());
@@ -1312,9 +1281,8 @@ mod tests {
         t.settle_primary_screen_exit();
         t.process(b"sh\x1b]133;B\x07\x1b]133;C\x07\x1b[2A\x1b[3B");
         assert!(t.primary_screen_app_active());
-        // v1.10.12: the flag cleared → the relative-only move sequence
-        // does not count as absolute, but the screen-owned TUI still
-        // renders in the live grid.
+        // v1.10.12: the relative-only move sequence re-arms ownership from
+        // zero evidence; the screen-owned TUI still renders in the live grid.
         assert!(
             !t.show_block_view(),
             "absolute flag cleared → relative-only TUI still uses the live grid"

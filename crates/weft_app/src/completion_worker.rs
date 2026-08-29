@@ -251,8 +251,29 @@ mod tests {
         };
         worker.submit(submit("x"));
         let generation = worker.submit(submit("ca"));
-        wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let result = worker.try_recv().unwrap();
+        // v1.11.8 (PLAN_v1118 M-D, candidate 1): the worker may legitimately
+        // win the race and complete gen-1 before the main thread cancels it
+        // (F17) — its result then sits in the queue ahead of gen-2's, so a
+        // single recv+try_recv reads gen-1 and flakes (1 != 2). Poll for the
+        // generation-2 result specifically, within a 2s TOTAL budget
+        // (architect P2-6: worst case = two serial budget periods, aligned
+        // with the old single recv_timeout). gen-1 results are legal
+        // transient states under production race semantics — filtered, not
+        // failed.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let result = 'outer: loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("flaky-test timeout: gen-2 result did not arrive within 2s");
+            wake_rx
+                .recv_timeout(remaining)
+                .expect("worker did not wake");
+            while let Some(r) = worker.try_recv() {
+                if r.generation == generation {
+                    break 'outer r;
+                }
+            }
+        };
         assert_eq!(result.generation, generation);
         assert!(result
             .matches

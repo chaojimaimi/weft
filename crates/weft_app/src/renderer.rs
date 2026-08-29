@@ -570,6 +570,18 @@ impl MetalRenderer {
         // instances_unchanged=true and blit the wrong view's content.
         let view_switched = show_blocks != self.prev_show_blocks.get();
         if view_switched {
+            // v1.11.8 (PLAN_v1118 M-B): edge log for the block/grid view
+            // flip — the renderer-side handoff of the data plane. Fields
+            // mirror the screen-exit defer/settle trio (mode/exempt/mouse)
+            // so flip forensics can reconstruct the `show_block_view()`
+            // decision without re-instrumenting the per-frame query.
+            tracing::info!(
+                mode = ?terminal.tui_render_mode(),
+                exempt = terminal.interactive_stdin_seen()
+                    || terminal.mouse_protocol() != weft_core::input::MouseProtocol::Off,
+                mouse = ?terminal.mouse_protocol(),
+                "renderer view mode switched"
+            );
             self.force_full_grid_redraw();
             // Batch 6 Step 1: reset block-view-only counters so grid-view
             // frames report 0 for visible_block_count / styled_line_lookups

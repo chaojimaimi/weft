@@ -78,16 +78,6 @@ pub(in crate::vt) struct CapabilityFlags {
     /// `CommandExecuting` phase. `>= 2` distinguishes a primary-screen TUI
     /// (Claude Code, OpenCode) from a plain shell command.
     pub(in crate::vt) primary_screen_cursor_ops: u8,
-    /// Whether the current primary-screen TUI has used absolute cursor
-    /// addressing (CUP `H`/`f`, VPA `d` — v1.10.5: CHR `G` is horizontal-
-    /// only and no longer counts) — the full-viewport repaint pattern of
-    /// Claude Code / OpenCode, which need the live grid. Relative-only
-    /// TUIs (openclaw: CUU/CUD/CUB + EL/ED partial redraws) render
-    /// correctly in the BlockView and must stay there, so this flag
-    /// keeps `show_block_view()` true for them even after `cursor_ops`
-    /// crosses the TUI-detection threshold. Reset with each OSC 133 prompt
-    /// marker like `primary_screen_cursor_ops`.
-    pub(in crate::vt) primary_screen_absolute_addressing: bool,
     /// v1.10.12: the TUI ever used relative cursor addressing (A/B/D/…).
     /// A sparse repainter (omp/pi) repaints incrementally — shell rows above
     /// its document boundary must NOT be hidden (it didn't repaint them).
@@ -100,10 +90,7 @@ pub(in crate::vt) struct CapabilityFlags {
     /// occasionally issues a full-viewport CUP), the BlockView stays locked
     /// for the whole command — a later CUP repaint must not flip the renderer
     /// to the live grid mid-session (that flips layout every task and loses
-    /// the user's Warp-style history blocks). Set at first screen ownership
-    /// (`!absolute_addressing` at that moment), reset at each real prompt
-    /// boundary. Full-viewport CUP TUIs (Claude Code) detect as absolute →
-    /// lock=false → live grid, unchanged.
+    /// the user's Warp-style history blocks).
     /// v1.10.6: the cursor's line index in the most recent primary-screen
     /// snapshot. Tracked during snapshot construction so the BlockView paint
     /// can place the caret/preedit on the exact materialized document row.
@@ -190,7 +177,6 @@ impl Default for CapabilityFlags {
             sgr_mouse: false,
             app_cursor_keys: false,
             tagged_shell_markers_seen: false,
-            primary_screen_absolute_addressing: false,
             primary_screen_relative_addressing_seen: false,
             primary_screen_cursor_ops: 0,
             primary_screen_cursor_snapshot_line: None,

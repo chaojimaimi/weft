@@ -115,7 +115,7 @@ else
     # intentionally absent — no benefit without notarization).
     # Side effect: every repackaged DMG has a new cdhash, so macOS re-prompts
     # for notification permission on the first launch of each build.
-    echo "==> Ad-hoc signing bundle (v1.11.6: UNUserNotificationCenter requires a signed bundle)"
+    echo "==> Ad-hoc signing bundle (UNUserNotificationCenter requires a signed bundle)"
     codesign --force --sign - --identifier "${BUNDLE_ID}" "${APP_DIR}"
     codesign --verify "${APP_DIR}"
 fi

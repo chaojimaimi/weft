@@ -392,11 +392,17 @@ impl vte::Perform for Terminal {
         // capture_cursor::is_primary_screen_addressing for the byte-level
         // rationale. Also traces cursor-moving CSIs for cursor-desync forensics.
         if super::capture_cursor::is_primary_screen_addressing(action, param(params, 0, 1)) {
-            let absolute = super::capture_cursor::is_absolute_primary_screen_addressing(
-                action,
-                param(params, 0, 1),
+            // v1.11.8 (PLAN_v1118 M-C1): the negation of
+            // `is_absolute_primary_screen_addressing` moved here — the
+            // deleted `primary_screen_absolute_addressing` flag was the
+            // param's only dedicated consumer; `relative_addressing_seen`
+            // still needs the inverted bit.
+            self.note_primary_screen_cursor_addressing(
+                !super::capture_cursor::is_absolute_primary_screen_addressing(
+                    action,
+                    param(params, 0, 1),
+                ),
             );
-            self.note_primary_screen_cursor_addressing(absolute);
         }
         if matches!(
             action,
@@ -881,7 +887,6 @@ impl vte::Perform for Terminal {
                                     && self.block_tracker.phase() == ShellPhase::CommandExecuting
                                     && self.capabilities.primary_screen_exit.is_none();
                             self.capabilities.primary_screen_cursor_ops = 0;
-                            self.capabilities.primary_screen_absolute_addressing = false;
                             self.capabilities.primary_screen_relative_addressing_seen = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();
@@ -981,7 +986,6 @@ impl vte::Perform for Terminal {
                                 self.block_tracker.resume_screen_command();
                                 self.capabilities.primary_history_view = false;
                                 self.capabilities.primary_screen_cursor_ops = 0;
-                                self.capabilities.primary_screen_absolute_addressing = false;
                                 self.capabilities.primary_screen_relative_addressing_seen = false;
                                 self.reset_primary_screen_synchronized_frame();
                                 self.shell_markers.push(ShellMarker::CommandStart);
@@ -989,7 +993,6 @@ impl vte::Perform for Terminal {
                                 self.settle_primary_screen_exit();
                                 self.capabilities.primary_history_view = false;
                                 self.capabilities.primary_screen_cursor_ops = 0;
-                                self.capabilities.primary_screen_absolute_addressing = false;
                                 // v1.10.7: real command start — a new
                                 // command re-detects its render mode at
                                 // first screen ownership.
@@ -1047,7 +1050,6 @@ impl vte::Perform for Terminal {
                                     && self.capabilities.primary_screen_exit.is_none();
                             self.snapshot_primary_screen_output();
                             self.capabilities.primary_screen_cursor_ops = 0;
-                            self.capabilities.primary_screen_absolute_addressing = false;
                             self.capabilities.primary_screen_relative_addressing_seen = false;
                             self.reset_primary_screen_synchronized_frame();
                             self.attrs = Default::default();

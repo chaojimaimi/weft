@@ -323,7 +323,14 @@ impl Terminal {
     /// and OSC 52 clipboard write-backs never call this, so negotiation
     /// traffic cannot flip a TUI's render mode (P1-1).
     pub fn note_interactive_stdin(&mut self) {
-        self.capabilities.interactive_stdin_seen = true;
+        // v1.11.8 (M-B): the exemption decision point for the noninteractive
+        // tier — log only the false→true transition (the call site is the
+        // per-keystroke event layer; the flag itself is per-command until
+        // settle clears it).
+        if !self.capabilities.interactive_stdin_seen {
+            self.capabilities.interactive_stdin_seen = true;
+            tracing::debug!("interactive stdin seen — command exempted to the classic tier");
+        }
     }
 
     /// Whether `note_interactive_stdin` fired since the last real command
@@ -343,6 +350,9 @@ impl Terminal {
 
     pub fn set_tui_render_mode(&mut self, mode: TuiRenderMode) {
         self.tui_render_mode = mode;
+        // v1.11.8 (M-B): the tier decides every `show_block_view()` answer —
+        // log the injection point (per Terminal construction, not a hot path).
+        tracing::debug!(?mode, "tui render mode set");
     }
 
     /// Whether SGR-1006 mouse-report encoding is selected (DEC mode 1006).
@@ -1049,32 +1059,36 @@ impl Terminal {
                 tracing::debug!(set, "DEC synchronized output toggled");
             }
             9 => {
-                self.capabilities.mouse_protocol = if set {
+                let new = if set {
                     MouseProtocol::X10
                 } else {
                     MouseProtocol::Off
-                }
+                };
+                self.set_mouse_protocol(new, 9);
             }
             1000 => {
-                self.capabilities.mouse_protocol = if set {
+                let new = if set {
                     MouseProtocol::Normal
                 } else {
                     MouseProtocol::Off
-                }
+                };
+                self.set_mouse_protocol(new, 1000);
             }
             1002 => {
-                self.capabilities.mouse_protocol = if set {
+                let new = if set {
                     MouseProtocol::ButtonEvent
                 } else {
                     MouseProtocol::Off
-                }
+                };
+                self.set_mouse_protocol(new, 1002);
             }
             1003 => {
-                self.capabilities.mouse_protocol = if set {
+                let new = if set {
                     MouseProtocol::AnyEvent
                 } else {
                     MouseProtocol::Off
-                }
+                };
+                self.set_mouse_protocol(new, 1003);
             }
             // v1.0 fix: SGR-1006 mouse ENCODING (selects the format of mouse
             // reports, independent of whether reporting is on). vim/tmux/htop
@@ -1086,6 +1100,17 @@ impl Terminal {
             // apps that request them fall back to our default (SGR-1006 when
             // sgr_mouse, legacy otherwise).
             _ => tracing::trace!(mode, set, "unhandled DEC private mode"),
+        }
+    }
+
+    /// v1.11.8 (PLAN_v1118 M-B): single write point for the mouse-protocol
+    /// DEC modes (9/1000/1002/1003) with a change guard — TUIs re-assert
+    /// their DECSET modes on every repaint, so an unconditional log would
+    /// spam per prompt/frame. Logs only on an actual protocol transition.
+    fn set_mouse_protocol(&mut self, new: MouseProtocol, decset_mode: u16) {
+        if new != self.capabilities.mouse_protocol {
+            self.capabilities.mouse_protocol = new;
+            tracing::info!(?new, decset_mode, "DECSET mouse protocol negotiated");
         }
     }
 }
