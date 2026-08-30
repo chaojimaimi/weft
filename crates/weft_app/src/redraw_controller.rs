@@ -3,7 +3,20 @@
 use super::*;
 
 impl App {
+    /// v1.11.10 (PLAN_v11110 M-B/D-e): the RedrawRequested entry — honors
+    /// both early returns (synchronized-output suppression, route-consume).
     pub(super) fn handle_redraw_requested(&mut self) {
+        self.run_redraw(false);
+    }
+
+    /// v1.11.10 (PLAN_v11110 M-B/D-d/D-e): the Resized-branch entry during a
+    /// live drag — same-tick synchronous draw that bypasses the two early
+    /// returns below (see the WHY comments on each gate).
+    pub(super) fn handle_redraw_requested_forced(&mut self) {
+        self.run_redraw(true);
+    }
+
+    fn run_redraw(&mut self, forced: bool) {
         self.pump_pty();
         // Drag-selection autoscroll: the 40ms timer wakes this path while a
         // drag is held past the block content edge, so the viewport keeps
@@ -17,18 +30,37 @@ impl App {
         if self.sessions.active_mut().take_pending_alt_rescale() {
             self.recompute_layout();
         }
-        if self
-            .sessions
-            .active()
-            .terminal
-            .as_ref()
-            .is_some_and(Terminal::synchronized_output)
-        {
+        if crate::redraw_gates::redraw_suppressed(
+            forced,
+            self.sessions
+                .active()
+                .terminal
+                .as_ref()
+                .is_some_and(Terminal::synchronized_output),
+            crate::input_router::route_session_input(!self.sessions.is_empty()),
+        ) {
+            // WHY (v1.11.10 M-B/D-j): synchronized output deliberately
+            // suppresses presents so a TUI can move a big cursor region
+            // without showing every intermediate state. During a live drag
+            // the frozen/stretched frame is the worse artifact (D-j), so the
+            // forced path draws the current state anyway — TUI repaints and
+            // heals once its sync block ends. Non-forced keeps the
+            // suppression.
             return;
         }
-        if crate::input_router::route_session_input(!self.sessions.is_empty())
-            == crate::input_router::SessionInputRoute::Consume
-        {
+        if crate::redraw_gates::redraw_suppressed(
+            forced,
+            false,
+            crate::input_router::route_session_input(!self.sessions.is_empty()),
+        ) {
+            // WHY (v1.11.10 M-B/D-d): route-consume means a modal captured
+            // the pointer and owns the frame — skip the draw so the modal's
+            // repaint is not fought. The forced path ignores the route: a
+            // live-resize frame must commit regardless, and the modal renders
+            // on top in the same tick's draw. Structural note: gate 1 already
+            // returns on !forced && consume, so this gate is unreachable in
+            // the current flow — kept as an independent future divergence
+            // point (rust-reviewer 2026-08-30).
             return;
         }
         self.update_cursor_blink();
@@ -746,12 +778,29 @@ impl App {
             crate::performance_probe::report_first_frame_once();
             // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) DEBUG
             // probe (stage 4/4): first present after a Resized — closes the
-            // resize-blank-interval chain (stretch → dimension-only → repaint).
+            // resize-blank-interval chain (stretch → dimension-only →
+            // repaint).
+            // v1.11.10 (PLAN_v11110 M-B/D-f): fields extended with the
+            // live-resize/forced context; delta > 2ms is a warning (the
+            // same-tick draw target) instead of the default debug level —
+            // machine self-evidence for the drag-stretch fix.
             if let Some(since) = renderer.take_resize_present_probe() {
-                tracing::debug!(
-                    since_resize_ms = since.elapsed().as_millis(),
-                    "RESIZE_PROBE first_present",
-                );
+                let since_ms = since.elapsed().as_millis();
+                if since_ms > 2 {
+                    tracing::warn!(
+                        since_resize_ms = since_ms,
+                        live_resize = renderer.live_resize_active,
+                        forced,
+                        "RESIZE_PROBE first_present",
+                    );
+                } else {
+                    tracing::debug!(
+                        since_resize_ms = since_ms,
+                        live_resize = renderer.live_resize_active,
+                        forced,
+                        "RESIZE_PROBE first_present",
+                    );
+                }
             }
             // R3 task 6: finish the per-frame trace — drains any GPU-completion
             // messages that landed since last frame and emits the frame line.

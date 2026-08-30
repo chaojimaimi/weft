@@ -115,6 +115,26 @@ impl App {
                         self.scroll_active_tab_into_view();
                     }
                 }
+                // v1.11.10 (PLAN_v11110 M-B/D-d): synchronous same-tick draw
+                // while live resizing. The bounds change stretches the
+                // previous drawable the instant AppKit commits it; a queued
+                // RedrawRequested lands a beat later, so
+                // presentsWithTransaction never saw the intermediate sizes.
+                // Polling here (before the draw) plus the forced path
+                // (bypassing the sync-output / route-consume early returns)
+                // gives every resize tick an atomic frame — the missing two
+                // of Warp's three-piece guarantee. Unconditional
+                // set_live_resize: the false reset must not depend on a
+                // later RedrawRequested arriving (the last drag event can be
+                // a Resized).
+                if let (Some(renderer), window) = (&mut self.renderer, self.window.as_ref()) {
+                    let live_resize =
+                        window.is_some_and(crate::macos_window::window_in_live_resize);
+                    renderer.set_live_resize(live_resize);
+                    if live_resize {
+                        self.handle_redraw_requested_forced();
+                    }
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // Moving between Retina and non-Retina displays changes every

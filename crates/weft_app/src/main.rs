@@ -72,6 +72,7 @@ mod performance_probe;
 mod profiles_controller;
 mod recovery_controller;
 mod redraw_controller;
+mod redraw_gates;
 mod renderer;
 mod runbook_controller;
 mod scene;

@@ -1,6 +1,20 @@
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
+/// Wrap `text` into contiguous byte ranges whose terminal display width fits
+/// `cols`, keeping graphemes atomic (CJK counts 2 columns).
+///
+/// v1.11.10 (PLAN_v11110 M-A/D-a): word-aware breaks. A trailing word (a
+/// run of non-whitespace after the last whitespace in the chunk) that fits
+/// alone on the next line moves there whole instead of being split mid-word
+/// (`skills` → `s|kills` was the character-count artifact). Lines without
+/// whitespace (CJK) and words wider than `cols` (git hashes, URLs) keep the
+/// historical character cut via the `byte > start` guard.
+///
+/// P2-1: a chunk's DISPLAYED width may exceed `cols` — trailing overflow
+/// whitespace absorbs into the chunk before the break (continuation lines
+/// never start with blank space). Consumers must handle the clip at render
+/// time and must NOT assume chunk width ≤ cols.
 fn wrap_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
     if cols == 0 {
         return std::iter::once(0..text.len()).collect();
@@ -8,19 +22,65 @@ fn wrap_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = 0usize;
     let mut col = 0usize;
+    // v1.11.10 (M-A): trailing-word state — byte offset where the current
+    // word started, and the chunk-relative column it started at.
+    let mut word_start: Option<usize> = None;
+    let mut col_at_word_start: Option<usize> = None;
     for (byte, grapheme) in text.grapheme_indices(true) {
         let width = weft_core::grid::terminal_text_width(grapheme);
         if width == 0 {
             continue;
         }
-        if col + width > cols && grapheme.chars().all(char::is_whitespace) {
+        if grapheme.chars().all(char::is_whitespace) {
+            // Overflowing or not, whitespace always terminates the trailing
+            // word (P1-2): a word ending exactly at the column boundary
+            // followed by absorbed overflow spaces must not keep its word
+            // state, or the next short word would be cut at the wrong
+            // point (`zz aaaaaaa␣␣XY` @ cols=10 → break must land at "XY").
             col += width;
+            word_start = None;
+            col_at_word_start = None;
             continue;
         }
-        if col + width > cols && byte > start {
-            ranges.push(start..byte);
-            start = byte;
-            col = 0;
+        if word_start.is_none() {
+            word_start = Some(byte);
+            col_at_word_start = Some(col);
+        }
+        if col + width > cols {
+            // Overflow. Word-aware fallback decision:
+            if let (Some(ws), Some(c0)) = (word_start, col_at_word_start) {
+                // The whole word moved to the next line must fit there alone.
+                let word_fits_alone = (col - c0) + width <= cols;
+                if ws > start && word_fits_alone {
+                    // chunk1 keeps everything through the trailing padding
+                    // whitespace; the word (including the part already past
+                    // `cols` and the current grapheme) opens the next chunk.
+                    ranges.push(start..ws);
+                    start = ws;
+                    // New chunk's current column = the width the word has
+                    // already consumed. The word is now the chunk head, so
+                    // col_at_word_start becomes 0 — a stale pre-fallback
+                    // column must not leak into later overflow decisions.
+                    col -= c0;
+                    col_at_word_start = Some(0);
+                    // No continue: this grapheme counts into the new chunk
+                    // via `col += width` below.
+                } else {
+                    // Character hard cut — the `byte > start` guard stays
+                    // (P1-1): a single grapheme wider than cols (CJK w=2 @
+                    // cols=1) must not push an empty range; advance col only,
+                    // the next grapheme breaks.
+                    if byte > start {
+                        ranges.push(start..byte);
+                        start = byte;
+                        col = 0;
+                    }
+                }
+            } else if byte > start {
+                ranges.push(start..byte);
+                start = byte;
+                col = 0;
+            }
         }
         col += width;
     }
@@ -632,5 +692,96 @@ mod tests {
             screen_origin_line_chunks(line, 0).collect::<Vec<_>>(),
             vec![line.to_string()]
         );
+    }
+
+    // ── v1.11.10 (PLAN_v11110 M-A/D-a): word-aware breaks ──────────────
+    // Every test below corresponds to one state-machine cell of the plan
+    // pseudocode (word_start / col_at_word_start tracking + fallback rules).
+
+    #[test]
+    fn word_aware_ls_columns_keep_words_whole() {
+        // cols=10: the pure character cut splits "skills" (`s|kills`) and
+        // "USER.md"; the word-aware rule moves each word whole into the
+        // next chunk and keeps the padding whitespace in the chunk before.
+        let chunks = wrap_line_chunks("A  B  C  skills  USER.md", 10).collect::<Vec<_>>();
+        assert_eq!(chunks, ["A  B  C  ", "skills  ", "USER.md"]);
+        assert_eq!(chunks.concat(), "A  B  C  skills  USER.md");
+    }
+
+    #[test]
+    fn long_no_whitespace_run_keeps_character_cuts_and_preserves_concat() {
+        // An 80-char hash has no whitespace: word_start == chunk start, so
+        // `ws > start` never holds → the historical character cut applies
+        // and concat still reconstructs the original.
+        let hash = "0123456789abcdef".repeat(5);
+        let chunks = wrap_line_chunks(&hash, 10).collect::<Vec<_>>();
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), hash);
+        assert!(chunks.iter().all(|c| c.len() <= 10));
+    }
+
+    #[test]
+    fn cjk_no_whitespace_lines_keep_chunk_boundaries_byte_identical() {
+        // CJK lines (no whitespace anywhere) must keep the per-grapheme
+        // character cut — chunk boundaries byte-identical to the pre-change
+        // implementation (a 4-col line fits exactly two 2-col graphemes).
+        let chunks = wrap_line_chunks("中文命令测试数据", 4).collect::<Vec<_>>();
+        assert_eq!(chunks, ["中文", "命令", "测试", "数据"]);
+        assert_eq!(chunks.concat(), "中文命令测试数据");
+    }
+
+    #[test]
+    fn word_exactly_cols_wide_moves_whole_and_does_not_break_again() {
+        // The trailing word is exactly `cols` wide: `word_fits_alone` is
+        // inclusive, so it fits on the next line and no further break
+        // happens inside it.
+        let chunks = wrap_line_chunks("ab cdefgh", 6).collect::<Vec<_>>();
+        assert_eq!(chunks, ["ab ", "cdefgh"]);
+    }
+
+    #[test]
+    fn trailing_overflow_whitespace_absorption_is_unchanged() {
+        // Line-end overflow whitespace still absorbs into the previous chunk
+        // (continuation lines never start with blank space).
+        let chunks = wrap_line_chunks("abcdefghi   ", 5).collect::<Vec<_>>();
+        assert_eq!(chunks, ["abcde", "fghi   "]);
+        assert_eq!(chunks.concat(), "abcdefghi   ");
+    }
+
+    #[test]
+    fn single_grapheme_wider_than_cols_pushes_no_empty_range() {
+        // P1-1: a CJK grapheme (w=2) at cols=1 cannot fit; without the
+        // `byte > start` guard the first chunk would be an empty range.
+        // Chunk count must match the pre-change implementation.
+        let chunks = wrap_line_chunks("中文", 1).collect::<Vec<_>>();
+        assert_eq!(chunks, ["中", "文"]);
+        assert!(chunks.iter().all(|c| !c.is_empty()));
+    }
+
+    #[test]
+    fn absorbed_overflow_whitespace_ends_the_trailing_word() {
+        // P1-2 anchor: "zz aaaaaaa␣␣XY" @ cols=10 — the word "aaaaaaa" ends
+        // exactly at the column boundary, then two overflow spaces absorb.
+        // They must TERMINATE the trailing word: "XY" then breaks at its own
+        // start. A stale word start would misplace the breakpoint into
+        // ["zz ", "aaaaaaa␣␣XY"].
+        let chunks = wrap_line_chunks("zz aaaaaaa  XY", 10).collect::<Vec<_>>();
+        assert_eq!(chunks, ["zz aaaaaaa  ", "XY"]);
+        assert_eq!(chunks.concat(), "zz aaaaaaa  XY");
+    }
+
+    #[test]
+    fn three_breaks_in_one_line_restart_word_state_between() {
+        // P1-3: one line, breaks in sequence — word fallback, then character
+        // hard cut, then word fallback again; ws/c0 must restart each time.
+        let chunks = wrap_line_chunks("aa bbbbbbbbbb cccccc dd ee ff", 8).collect::<Vec<_>>();
+        // 1) the "bbbbbbbbbb" word overflows: it fits alone → fallback to its
+        //    start ("aa " keeps the padding whitespace).
+        // 2) the same word overflows again with ws == start → hard cut
+        //    (chunk2 chars the word, chunk3 continues mid-word "bb ").
+        // 3) whitespace reset, word "cccccc" overflows → word fallback again
+        //    (chunk4 starts with the whole word).
+        assert_eq!(chunks, ["aa ", "bbbbbbbb", "bb ", "cccccc ", "dd ee ff"]);
+        assert_eq!(chunks.concat(), "aa bbbbbbbbbb cccccc dd ee ff");
     }
 }

@@ -439,19 +439,50 @@ fn golden_all_row_types() {
 #[test]
 fn golden_wrapped_output() {
     require_metal_or_skip();
+    // P2-5 (PLAN_v11110): the mixed-word tail line is the word-boundary
+    // anchor for the M-A change. Word+space widths (8 and 6 cols) do NOT
+    // divide the 88-col headless layout evenly, so under pure character
+    // wrapping the second "b.txt" would split mid-word ("…b.|txt…"); the
+    // word-aware rule keeps every word whole. The anchor assertion below
+    // locks that shape so a future regression to character wrapping fails
+    // even after a blind golden re-capture.
+    let words = format!("{}{}", "USER.md ".repeat(10), "b.txt ".repeat(5));
     let blocks = vec![block_literal(
         5,
         "grep -r weft src",
         Some("/tmp/weft"),
         &format!(
-            "src/weft/main.rs:1: use weft_core::grid;\n{}\nlast line\n",
-            "x".repeat(260)
+            "src/weft/main.rs:1: use weft_core::grid;\n{}\nlast line\n{}\n",
+            "x".repeat(260),
+            words,
         ),
         Some(0),
     )];
     let palette = palette_literal();
     let renderer = renderer_headless();
     let empty = HashMap::new();
+    // P2-5 word-boundary anchor: recompute the same chunking the golden path
+    // uses (layout cols from the headless layout ctx, S2 has the fixed-CWD
+    // header active). Every break must land at a word start and the chunk
+    // before each break must end in whitespace.
+    let ctx = renderer.layout_ctx.expect("headless layout ctx");
+    let layout = crate::layout::layout_block_view(&ctx, 600.0, true);
+    let ranges = crate::paint::grid_cache::block_line_chunk_ranges(&words, layout.cols);
+    let chunks: Vec<&str> = ranges.iter().map(|r| &words[r.clone()]).collect();
+    eprintln!("S2 word-anchor: cols={} chunks={chunks:?}", layout.cols);
+    assert!(
+        chunks.len() > 1,
+        "the mixed-word line must wrap at cols {}",
+        layout.cols
+    );
+    assert!(
+        chunks[0].ends_with("b.txt "),
+        "the chunk before the first break keeps the trailing padding whitespace"
+    );
+    assert!(
+        chunks.iter().skip(1).all(|c| c.starts_with("b.txt ")),
+        "every continuation chunk must start at a word boundary (got {chunks:?})"
+    );
     let model_a = s2_model(&blocks, &palette, &empty);
     let model_b = s2_model(&blocks, &palette, &empty);
     run_golden(
