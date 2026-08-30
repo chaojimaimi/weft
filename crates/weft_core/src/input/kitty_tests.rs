@@ -592,10 +592,15 @@ fn home_end_pgup_pgdn_ins_del_plain() {
             "0b{flags:b}"
         );
         assert_eq!(enc_h(flags, KeyCode::End, Modifiers::empty()), b"\x1b[4~");
-        assert_eq!(enc_h(flags, KeyCode::PageUp, Modifiers::empty()), b"\x1b[H");
+        // v1.11.13 (PLAN_v11113 §M3): the handler fallback chain now emits
+        // the standard xterm tilde form (PageUp quirk fix — was `CSI H`/`I`).
+        assert_eq!(
+            enc_h(flags, KeyCode::PageUp, Modifiers::empty()),
+            b"\x1b[5~"
+        );
         assert_eq!(
             enc_h(flags, KeyCode::PageDown, Modifiers::empty()),
-            b"\x1b[I"
+            b"\x1b[6~"
         );
         assert_eq!(
             enc_h(flags, KeyCode::Insert, Modifiers::empty()),

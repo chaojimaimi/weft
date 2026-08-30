@@ -585,6 +585,11 @@ impl ApplicationHandler<AppEvent> for App {
                 // replacement discarded the loaded history, and additional
                 // restored tabs never received it at all.
                 self.hydrate_tabs_from_history_store();
+                // v1.11.13 (PLAN_v11113 §M2): Normal-arm restore complete —
+                // flip the activation gate + replay queued cold-start clicks
+                // (NOT at the resumed() tail: the Pending arm must keep the
+                // gate closed until apply_recovery_choice restores).
+                self.finish_restore_notifications();
             }
             recovery_controller::StartupRecoveryOutcome::Pending => {
                 // v1.10.23: the recovery prompt is on screen (deferred off

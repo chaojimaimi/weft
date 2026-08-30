@@ -29,6 +29,9 @@ mod completion_worker;
 mod config_controller;
 mod config_state;
 mod context_menu_component;
+// v1.11.13 (PLAN_v11113 §M1): graphic Dock progress bar (OSC 9;4) —
+// DockVisual pipeline + bar synthesis drawing.
+mod dock_progress;
 mod editor_controller;
 mod effect;
 mod event_replay;
@@ -144,6 +147,9 @@ pub(crate) use app::helpers::{
     chord_label, first_run_welcome, is_command_position, resolve_text_char, seed_workflows,
     shell_integration_env, strip_prompt_prefix, weft_cache_dir, word_at,
 };
+// v1.11.13 (PLAN_v11113 §M5): the labels moved to the menu scene component;
+// the re-export keeps every `crate::CONTEXT_MENU_ITEMS` consumer unchanged.
+pub(crate) use context_menu_component::CONTEXT_MENU_ITEMS;
 
 // ── Messages between threads ─────────────────────────────────────────
 
@@ -322,41 +328,6 @@ struct App {
     /// `AiResultEvent::ModelsRefreshed` with the Settings "Test Connection"
     /// button. `None` when no refresh is pending.
     ai_models_request_id: Option<u64>,
-}
-
-/// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
-/// Keep in sync with `CONTEXT_MENU_ITEM_COUNT` in `layout/surfaces.rs`.
-const CONTEXT_MENU_ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
-    ("Copy Command", "copy_command"),
-    ("Copy Output", "copy_output"),
-    // v1.10.34: combined copy — cwd + command + output in one paste-ready
-    // snippet (see weft_core::blocks::format_block_for_copy). Solves the
-    // "analyze a command result" flow that previously needed 2-3 separate
-    // copies, since drag selection cannot cross block structural rows.
-    ("Copy Block", "copy_block"),
-    ("Toggle Fold", "toggle_fold"),
-    // v0.9 W4: send the block's command to the input box for re-editing
-    // (Warp-style "rerun" — user can tweak parameters before pressing Enter).
-    ("Send to Input", "send_to_input"),
-    // v1.7.3-C: Block reuse actions — bookmark, note, export.
-    ("Toggle Bookmark", "toggle_bookmark"),
-    ("Add Note", "add_note"),
-    ("Export Block", "export_block"),
-    // v1.8.2: AI diagnose for failed blocks (no-op on success/when AI off).
-    ("Diagnose with AI", "diagnose"),
-];
-
-/// Action triggered by clicking a button in the find popup. Produced by
-/// `App::find_button_at` from the renderer's stored hit-test rects.
-enum FindButtonAction {
-    /// Click the ".*" toggle — flip regex mode (visual only).
-    ToggleRegex,
-    /// Click the "Aa" toggle — flip case-sensitive search.
-    ToggleCase,
-    /// Click the "↓" button — jump to next match.
-    Next,
-    /// Click the "↑" button — jump to previous match.
-    Prev,
 }
 
 impl App {
@@ -638,6 +609,11 @@ fn main() {
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    // v1.11.13 (PLAN_v11113 §M2): install the UN notification delegate
+    // BEFORE winit's didFinishLaunching (runs inside run_app) so a
+    // cold-start notification click reaches the app (bundle-identity gate
+    // + exception::catch inside; no-op for dev binaries).
+    crate::macos_notifications::install_early_delegate(&proxy);
     let mut app = App::new(proxy);
     event_loop.run_app(&mut app).unwrap();
 }

@@ -2,10 +2,12 @@
 //!
 //! `block_complete_should_notify` decides whether a completed command block
 //! earns a system notification; `notification_text` shapes the payload;
-//! `badge_text` maps the OSC 9;4 Dock state to a badge string; `RateLimiter`
-//! and `DenyCooldown` throttle notify events / OSC 52 read-denies. All are
-//! pure — injectable clocks, no I/O, no App/AppState dependency — so every
-//! branch is unit-testable (test-first requirement).
+//! `dock_visual` (v1.11.13) maps the OSC 9;4 Dock state to the graphic
+//! `DockVisual` (the v1.11.5 `badge_text` string mapping lives on only as
+//! `dock_progress::fallback_badge_text`); `RateLimiter` and `DenyCooldown`
+//! throttle notify events / OSC 52 read-denies. All are pure — injectable
+//! clocks, no I/O, no App/AppState dependency — so every branch is
+//! unit-testable (test-first requirement).
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -139,14 +141,18 @@ pub fn notification_text(command: &str, elapsed: Duration, failed: bool) -> (Str
     (title, body)
 }
 
-/// Map an OSC 9;4 Dock state to the badge text (v1.11.5 D-e): `42%` /
-/// `…` (indeterminate) / `!` (failed) / `None` (clear).
-pub fn badge_text(progress: DockProgress) -> Option<String> {
+/// v1.11.13 (PLAN_v11113 §M1): map an OSC 9;4 Dock state to the graphic
+/// [`DockVisual`] the M1 pipeline carries (dispatch → debounce → dock_
+/// progress drawing). The v1.11.5 string folding (`badge_text`) is gone —
+/// its mapping survives ONLY as `dock_progress::fallback_badge_text`, the
+/// drawing module's failure fallback.
+pub fn dock_visual(progress: DockProgress) -> crate::dock_progress::DockVisual {
+    use crate::dock_progress::DockVisual;
     match progress {
-        DockProgress::Clear => None,
-        DockProgress::Indeterminate => Some("…".to_string()),
-        DockProgress::Failed => Some("!".to_string()),
-        DockProgress::Percent(p) => Some(format!("{p}%")),
+        DockProgress::Clear => DockVisual::Clear,
+        DockProgress::Indeterminate => DockVisual::Bar(None),
+        DockProgress::Failed => DockVisual::Badge,
+        DockProgress::Percent(p) => DockVisual::Bar(Some(p)),
     }
 }
 
@@ -328,24 +334,31 @@ mod tests {
         assert!(body.len() <= 256);
     }
 
-    // ── badge_text (iTerm2 semantics, v1.11.5 D-e) ─────────────────────
+    // ── dock_visual (v1.11.13 PLAN_v11113 §M1) ──────────────────────────
+    // The v1.11.5 badge_text mapping test moved to dock_progress.rs
+    // (fallback_badge_text is its single surviving source).
 
     #[test]
-    fn badge_text_maps_all_four_progress_states() {
-        assert_eq!(badge_text(DockProgress::Clear), None);
+    fn dock_visual_maps_all_four_progress_states() {
+        use crate::dock_progress::DockVisual;
+        assert_eq!(dock_visual(DockProgress::Clear), DockVisual::Clear);
         assert_eq!(
-            badge_text(DockProgress::Indeterminate).as_deref(),
-            Some("…")
+            dock_visual(DockProgress::Indeterminate),
+            DockVisual::Bar(None),
+            "indeterminate → static centered segment (animation = v1.12)"
         );
-        assert_eq!(badge_text(DockProgress::Failed).as_deref(), Some("!"));
+        assert_eq!(dock_visual(DockProgress::Failed), DockVisual::Badge);
         assert_eq!(
-            badge_text(DockProgress::Percent(47)).as_deref(),
-            Some("47%")
+            dock_visual(DockProgress::Percent(47)),
+            DockVisual::Bar(Some(47))
         );
-        assert_eq!(badge_text(DockProgress::Percent(0)).as_deref(), Some("0%"));
         assert_eq!(
-            badge_text(DockProgress::Percent(100)).as_deref(),
-            Some("100%")
+            dock_visual(DockProgress::Percent(0)),
+            DockVisual::Bar(Some(0))
+        );
+        assert_eq!(
+            dock_visual(DockProgress::Percent(100)),
+            DockVisual::Bar(Some(100))
         );
     }
 

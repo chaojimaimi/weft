@@ -80,8 +80,13 @@ impl InputHandler {
             KeyCode::Left => self.encode_arrow('D', mods),
             KeyCode::Home => self.encode_home(mods),
             KeyCode::End => self.encode_end(mods),
-            KeyCode::PageUp => self.encode_page('H', mods),
-            KeyCode::PageDown => self.encode_page('I', mods),
+            // v1.11.13 (PLAN_v11113 §M3): PageUp/PageDown were the last
+            // encoders ignoring mods and emitted the ConEmu-legacy bare
+            // `CSI H` / `CSI I` — xterm terminfo khome=\E[H made vim/less
+            // read PageUp as Home. Standard xterm family sends `CSI 5~` /
+            // `CSI 6~`; mods ride the shared helper (`CSI 5;2~`).
+            KeyCode::PageUp => self.encode_csi_tilde_or_mod(5, mods),
+            KeyCode::PageDown => self.encode_csi_tilde_or_mod(6, mods),
             KeyCode::Delete => self.encode_delete(mods),
             KeyCode::Insert => self.encode_insert(mods),
             KeyCode::F(n) => self.encode_function_key(n, mods),
@@ -390,10 +395,6 @@ impl InputHandler {
 
     fn encode_delete(&self, mods: Modifiers) -> Vec<u8> {
         self.encode_csi_tilde_or_mod(3, mods)
-    }
-
-    fn encode_page(&self, suffix: char, _mods: Modifiers) -> Vec<u8> {
-        vec![0x1b, b'[', suffix as u8]
     }
 
     fn encode_function_key(&self, n: u8, mods: Modifiers) -> Vec<u8> {

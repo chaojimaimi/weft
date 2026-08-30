@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Action triggered by clicking a button in the find popup. Produced by
+/// `App::find_button_at` (this controller — the hit-test lives here) from
+/// the find scene's hit-test rects.
+///
+/// v1.11.13 (PLAN_v11113 §M5): moved here from main.rs — the enum belongs
+/// to the controller that produces and consumes it.
+pub(crate) enum FindButtonAction {
+    /// Click the ".*" toggle — flip regex mode (visual only).
+    ToggleRegex,
+    /// Click the "Aa" toggle — flip case-sensitive search.
+    ToggleCase,
+    /// Click the "↓" button — jump to next match.
+    Next,
+    /// Click the "↑" button — jump to previous match.
+    Prev,
+}
+
 impl App {
     pub(super) fn active_scrollbar_layout(
         &self,

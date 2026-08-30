@@ -58,8 +58,11 @@ fn legacy_twin_flags_zero_byte_identical() {
         (KeyCode::Home, Modifiers::empty(), None, b"\x1b[1~"),
         (KeyCode::End, Modifiers::empty(), None, b"\x1b[4~"),
         (KeyCode::Home, Modifiers::SHIFT, None, b"\x1b[1;2~"),
-        (KeyCode::PageUp, Modifiers::empty(), None, b"\x1b[H"),
-        (KeyCode::PageDown, Modifiers::empty(), None, b"\x1b[I"),
+        // v1.11.13 (PLAN_v11113 §M3): PageUp/PageDown quirk fix — the
+        // legacy twin regenerates with the standard xterm `CSI 5~`/`CSI 6~`
+        // (intentional behavior change, logged in docs/PROGRESS.md).
+        (KeyCode::PageUp, Modifiers::empty(), None, b"\x1b[5~"),
+        (KeyCode::PageDown, Modifiers::empty(), None, b"\x1b[6~"),
         (KeyCode::Delete, Modifiers::empty(), None, b"\x1b[3~"),
         (KeyCode::Insert, Modifiers::empty(), None, b"\x1b[2~"),
         (KeyCode::F(1), Modifiers::empty(), None, b"\x1bOP"),
@@ -262,5 +265,63 @@ fn mask_cuts_report_all_keys_bit() {
         s.flags(false),
         0b1_0011,
         "0b1000 must be masked out of the negotiated set"
+    );
+}
+
+// ── v1.11.13 (PLAN_v11113 §M3): Release-without-0b10 encoder defense ──
+// (moved here from kitty_tests.rs — module-size gate; this file owns the
+// release-routing tests.)
+
+#[test]
+fn release_without_event_types_flag_returns_none() {
+    // The entry guard returns None for ANY release when 0b10 is absent —
+    // including modified rows the decision logic would otherwise claim
+    // (Ctrl+Enter used to emit `CSI 13;5u` on release at L1).
+    for flags in [0b1_u8, 0b1_0000, 0b1_0001] {
+        debug_assert!(flags & FLAG_REPORT_EVENT_TYPES == 0);
+        assert_eq!(
+            encode_kitty_key(
+                flags,
+                KittyEventKind::Release,
+                KeyCode::Enter,
+                Modifiers::CONTROL,
+                None
+            ),
+            None,
+            "modified release must not be claimed without 0b10"
+        );
+        assert_eq!(
+            encode_kitty_key(
+                flags,
+                KittyEventKind::Release,
+                KeyCode::PageUp,
+                Modifiers::SHIFT,
+                None
+            ),
+            None,
+            "family-key release must not be claimed without 0b10"
+        );
+        assert_eq!(
+            encode_kitty_key(
+                flags,
+                KittyEventKind::Release,
+                KeyCode::Char('a'),
+                Modifiers::empty(),
+                Some("a")
+            ),
+            None,
+            "raw-text release must not be claimed without 0b10"
+        );
+    }
+    // Orthogonality: a legitimate 0b10 release still escape-codes.
+    assert_eq!(
+        encode_kitty_key(
+            0b11,
+            KittyEventKind::Release,
+            KeyCode::Enter,
+            Modifiers::CONTROL,
+            None
+        ),
+        Some(b"\x1b[13;5:3u".to_vec())
     );
 }

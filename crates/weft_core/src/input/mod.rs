@@ -251,12 +251,16 @@ mod tests {
     }
 
     // ── Page Up / Page Down ───────────────────────────────────────
+    // v1.11.13 (PLAN_v11113 §M3): behavior change — PageUp/PageDown now
+    // emit the standard xterm `CSI 5~` / `CSI 6~` (the old bare `CSI H` /
+    // `CSI I` collided with terminfo khome=\E[H, so vim/less read PageUp
+    // as Home).
 
     #[test]
     fn page_up() {
         assert_eq!(
             handler().encode_key(KeyCode::PageUp, Modifiers::empty()),
-            b"\x1b[H"
+            b"\x1b[5~"
         );
     }
 
@@ -264,7 +268,19 @@ mod tests {
     fn page_down() {
         assert_eq!(
             handler().encode_key(KeyCode::PageDown, Modifiers::empty()),
-            b"\x1b[I"
+            b"\x1b[6~"
+        );
+    }
+
+    #[test]
+    fn page_up_down_with_mods() {
+        assert_eq!(
+            handler().encode_key(KeyCode::PageUp, Modifiers::SHIFT),
+            b"\x1b[5;2~"
+        );
+        assert_eq!(
+            handler().encode_key(KeyCode::PageDown, Modifiers::CONTROL),
+            b"\x1b[6;5~"
         );
     }
 

@@ -19,8 +19,9 @@
 //!    [`objc2::exception::catch`] so a surprise exception downgrades to a
 //!    logged drop instead of an abort.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use block2::{Block, RcBlock};
 use objc2::exception::catch;
@@ -83,6 +84,76 @@ static DELEGATE: OnceLock<Retained<WeftNotifDelegate>> = OnceLock::new();
 /// Monotonic notification-request identifier source (UNNotificationRequest
 /// ids must be unique or the request replaces itself).
 static NEXT_NOTIFICATION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+// ── v1.11.13 (PLAN_v11113 §M2): cold-start activation gate ──────────
+
+/// Activation readiness + cold-start backlog. ONE Mutex (P1-2): splitting
+/// ready/pending into an AtomicBool + Mutex would let check-then-push and
+/// flip-then-take interleave and permanently strand an id.
+#[derive(Debug, Default)]
+pub(crate) struct ActivationGate {
+    ready: bool,
+    pending: VecDeque<i64>,
+}
+
+/// What the delegate must do with an activation id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationRoute {
+    /// App restore finished → forward through the proxy now.
+    Deliver,
+    /// Restore still pending → queue for the
+    /// `finish_restore_notifications` replay.
+    Queue,
+}
+
+/// Pure gate routing (caller holds the lock) — unit-test matrix in the
+/// tests module and at the ui_events replay seam.
+fn gate_route(gate: &mut ActivationGate, block_id: i64) -> ActivationRoute {
+    if gate.ready {
+        ActivationRoute::Deliver
+    } else {
+        gate.pending.push_back(block_id);
+        ActivationRoute::Queue
+    }
+}
+
+/// Pure ready-flip + FIFO drain (caller holds the lock). Under the same
+/// lock as `gate_route`, so a click arriving "during" the flip either
+/// delivers (saw ready) or queues-then-drains (saw !ready) — never lost.
+fn gate_open_and_drain(gate: &mut ActivationGate) -> Vec<i64> {
+    gate.ready = true;
+    gate.pending.drain(..).collect()
+}
+
+/// The process-wide gate. Static because the UN delegate callback and the
+/// restore completion points live in different call trees.
+static ACTIVATION_GATE: Mutex<ActivationGate> = Mutex::new(ActivationGate {
+    ready: false,
+    pending: VecDeque::new(),
+});
+
+/// Delegate-facing routing step: lock + route. `true` = forward the
+/// activation to the app (proxy path); `false` = queued (replayed by
+/// `App::finish_restore_notifications`). A poisoned lock is recovered —
+/// a dropped notification click must not become a panic.
+pub(crate) fn route_notification_activation(block_id: i64) -> bool {
+    match ACTIVATION_GATE.lock() {
+        Ok(mut gate) => gate_route(&mut gate, block_id) == ActivationRoute::Deliver,
+        Err(poisoned) => {
+            gate_route(&mut poisoned.into_inner(), block_id) == ActivationRoute::Deliver
+        }
+    }
+}
+
+/// Ready-flip + FIFO drain of the queued cold-start clicks. Called by
+/// `App::finish_restore_notifications` at the two restore completion
+/// points (resumed Normal arm / apply_recovery_choice).
+pub(crate) fn open_activation_gate() -> Vec<i64> {
+    match ACTIVATION_GATE.lock() {
+        Ok(mut gate) => gate_open_and_drain(&mut gate),
+        Err(poisoned) => gate_open_and_drain(&mut poisoned.into_inner()),
+    }
+}
 
 /// Real sink. `center` is `None` when construction already threw a foreign
 /// unwind (P0 fix: NEVER re-call `currentNotificationCenter` after a throw —
@@ -240,6 +311,64 @@ impl NotificationSink for UnSink {
     }
 }
 
+/// Bundle-identity probe shared by [`build_sink`] and
+/// [`install_early_delegate`]. `Some(id)` = proper .app identity. The
+/// NSBundle query does not depend on NSApplication, so it is safe at
+/// main() time — before the event loop starts (architect-verified,
+/// PLAN_v11113 §M2).
+fn probe_bundle_identity() -> Option<String> {
+    unsafe {
+        catch(|| {
+            NSBundle::mainBundle()
+                .bundleIdentifier()
+                .map(|id| id.to_string())
+        })
+    }
+    .ok()
+    .flatten()
+    .filter(|id| !id.is_empty())
+}
+
+/// v1.11.13 (PLAN_v11113 §M2): install the UN delegate at main() time —
+/// BEFORE winit's `didFinishLaunching` (which runs inside `run_app`) — so
+/// a COLD-START notification click (app relaunched by clicking a
+/// notification, still restoring) is delivered to `WeftNotifDelegate`
+/// instead of dropped (Apple contract: set the delegate before launch
+/// completes). Same bundle-identity hard gate as [`build_sink`]; the
+/// delegate only routes responses, so a config-disabled notification
+/// system gains zero side effects (the post side keeps its config gate).
+///
+/// Idempotent with [`UnSink::new`]: the DELEGATE static is get-or-init
+/// (P2-1) and the NOTIFICATION_PROXY set is a OnceLock — whichever
+/// installer runs second reuses the same delegate instance.
+pub fn install_early_delegate(proxy: &winit::event_loop::EventLoopProxy<AppEvent>) {
+    if probe_bundle_identity().is_none() {
+        tracing::debug!("early notification delegate skipped: no bundle identity (dev binary)");
+        return;
+    }
+    let _ = NOTIFICATION_PROXY.set(proxy.clone());
+    let Some(mtm) = MainThreadMarker::new() else {
+        tracing::warn!("early notification delegate skipped: not on main thread");
+        return;
+    };
+    let _ = unsafe {
+        catch(std::panic::AssertUnwindSafe(|| {
+            let center = UNUserNotificationCenter::currentNotificationCenter();
+            // P2-1 get-or-init: shared static with UnSink::new — its later
+            // `DELEGATE.set` is a natural no-op once we are installed.
+            let delegate = DELEGATE.get_or_init(|| WeftNotifDelegate::new(mtm));
+            center.setDelegate(Some(ProtocolObject::from_ref(&**delegate)));
+        }))
+    }
+    .map_err(|exception| {
+        tracing::warn!(
+            ?exception,
+            "early delegate install threw a foreign unwind (caught); \
+             the resumed() install path remains"
+        );
+    });
+}
+
 /// Build the process's notification sink. Call once from `resumed` (main
 /// thread).
 ///
@@ -250,17 +379,7 @@ pub fn build_sink(
     mtm: MainThreadMarker,
     proxy: winit::event_loop::EventLoopProxy<AppEvent>,
 ) -> Box<dyn NotificationSink> {
-    let bundle_id = unsafe {
-        catch(|| {
-            NSBundle::mainBundle()
-                .bundleIdentifier()
-                .map(|id| id.to_string())
-        })
-    }
-    .ok()
-    .flatten()
-    .filter(|id| !id.is_empty());
-    match bundle_id {
+    match probe_bundle_identity() {
         Some(id) => {
             tracing::debug!(
                 bundle_id = %id,
@@ -379,20 +498,33 @@ fn handle_notification_response(
     };
 
     // 5) forward to the main thread.
+    //    v1.11.13 (PLAN_v11113 §M2): gate FIRST, inside the lock — a
+    //    cold-start click arriving before the restore finished queues for
+    //    the finish_restore_notifications replay instead of hitting the
+    //    "该命令块已被清理" toast (the block exists in the history store;
+    //    the app just isn't hydrated yet).
     if let Some(block_id) = block_id {
-        if let Some(proxy) = NOTIFICATION_PROXY.get() {
-            dispatch2::DispatchQueue::main().exec_async(move || {
-                // v1.11.12 (PLAN_v11112 M-C): a failure here silently drops
-                // the notification click (no jump to the command block).
-                // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
-                if let Err(e) = proxy.send_event(AppEvent::NotificationActivated(block_id)) {
-                    tracing::warn!(
-                        error = %e,
-                        block_id,
-                        "send_event failed: notification click lost"
-                    );
-                }
-            });
+        if route_notification_activation(block_id) {
+            if let Some(proxy) = NOTIFICATION_PROXY.get() {
+                dispatch2::DispatchQueue::main().exec_async(move || {
+                    // v1.11.12 (PLAN_v11112 M-C): a failure here silently drops
+                    // the notification click (no jump to the command block).
+                    // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+                    if let Err(e) = proxy.send_event(AppEvent::NotificationActivated(block_id)) {
+                        tracing::warn!(
+                            error = %e,
+                            block_id,
+                            "send_event failed: notification click lost"
+                        );
+                    }
+                });
+            } else {
+                // rust-reviewer M2: unreachable under the current install
+                // order (install_early_delegate injects the proxy before the
+                // delegate exists) — but if that invariant ever breaks, make
+                // the loss audible instead of silently dropping the click.
+                tracing::warn!(block_id, "activation delivered with no proxy: dropped");
+            }
         }
     }
 }
@@ -458,3 +590,59 @@ declare_class!(
         }
     }
 );
+
+// ── v1.11.13 (PLAN_v11113 §M2): gate pure-logic tests (LOCAL gates — the
+// process-global ACTIVATION_GATE lifecycle is covered once, at the
+// ui_events replay seam, to keep cross-test global state deterministic).
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn gate_queues_while_not_ready_and_replays_fifo() {
+        let mut gate = ActivationGate::default();
+        assert_eq!(gate_route(&mut gate, 7), ActivationRoute::Queue);
+        assert_eq!(gate_route(&mut gate, 3), ActivationRoute::Queue);
+        // Flip + drain: FIFO order preserved, backlog emptied.
+        assert_eq!(gate_open_and_drain(&mut gate), vec![7, 3]);
+    }
+
+    #[test]
+    fn gate_delivers_directly_once_ready() {
+        let mut gate = ActivationGate::default();
+        assert_eq!(
+            gate_open_and_drain(&mut gate),
+            Vec::<i64>::new(),
+            "open on an empty gate drains nothing"
+        );
+        assert_eq!(gate_route(&mut gate, 9), ActivationRoute::Deliver);
+        // A ready-gate click never lands in the backlog.
+        assert!(gate.pending.is_empty());
+    }
+
+    #[test]
+    fn gate_drain_twice_yields_empty() {
+        let mut gate = ActivationGate::default();
+        let _ = gate_route(&mut gate, 1);
+        assert_eq!(gate_open_and_drain(&mut gate), vec![1]);
+        assert_eq!(
+            gate_open_and_drain(&mut gate),
+            Vec::<i64>::new(),
+            "repeat take is empty (no double replay)"
+        );
+    }
+
+    #[test]
+    fn gate_flip_and_click_ordering_never_strands() {
+        // P1-2 invariant at the pure-fn level: whichever order the two
+        // lock holders run in, the id is delivered or replayed — never
+        // lost (the reason the gate is ONE Mutex, not AtomicBool+Mutex).
+        let mut click_first = ActivationGate::default();
+        let _ = gate_route(&mut click_first, 5);
+        assert_eq!(gate_open_and_drain(&mut click_first), vec![5]);
+        let mut flip_first = ActivationGate::default();
+        let _ = gate_open_and_drain(&mut flip_first);
+        assert_eq!(gate_route(&mut flip_first, 6), ActivationRoute::Deliver);
+    }
+}

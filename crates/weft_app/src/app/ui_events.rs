@@ -97,33 +97,42 @@ pub(crate) fn try_occupy_osc52_read_slot(
 /// bypasses the window and applies immediately; everything else is staged
 /// and applied at most once per `PROGRESS_DEBOUNCE`, keeping the newest
 /// value (a faster stream overwrites the pending slot — latest wins).
+///
+/// v1.11.13 (PLAN_v11113 §M1): the carried value is the `DockVisual` enum,
+/// not folded badge text — the drawing layer needs the shape, not a string.
 pub(crate) const PROGRESS_DEBOUNCE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
 pub(crate) struct DockBadgeDebounce {
-    pending: Option<String>,
+    pending: Option<crate::dock_progress::DockVisual>,
     last_applied: Option<Instant>,
 }
 
 /// What the debounce wants the caller to do right now.
 #[derive(Debug)]
 pub(crate) enum DebounceAction {
-    /// Apply this badge text now (or clear when `None`).
-    Apply(Option<String>),
+    /// Apply this dock visual now.
+    Apply(crate::dock_progress::DockVisual),
     /// Stage it; nothing to do this tick.
     Deferred,
 }
 
 impl DockBadgeDebounce {
-    /// Feed one OSC 9;4-derived badge value (already mapped by
-    /// `badge_text`; `None` = clear). Clear applies immediately (plan D-e
-    /// exception); other values apply if the last application was ≥ 200 ms
-    /// ago, else they replace the pending slot (latest wins).
-    pub(crate) fn accept(&mut self, now: Instant, value: Option<String>) -> DebounceAction {
-        if value.is_none() {
+    /// Feed one OSC 9;4-derived dock visual (mapped by `dock_visual`).
+    /// Clear applies immediately (plan D-e exception); other values apply
+    /// if the last application was ≥ 200 ms ago, else they replace the
+    /// pending slot (latest wins).
+    pub(crate) fn accept(
+        &mut self,
+        now: Instant,
+        value: crate::dock_progress::DockVisual,
+    ) -> DebounceAction {
+        // P2-4: the "clear now" test matches the variant (the carried type
+        // is an enum — the old `is_none()` string test has no analogue).
+        if matches!(value, crate::dock_progress::DockVisual::Clear) {
             self.pending = None;
             self.last_applied = Some(now);
-            return DebounceAction::Apply(None);
+            return DebounceAction::Apply(crate::dock_progress::DockVisual::Clear);
         }
         match self.last_applied {
             None => {
@@ -136,7 +145,7 @@ impl DockBadgeDebounce {
                 DebounceAction::Apply(value)
             }
             Some(_) => {
-                self.pending = value;
+                self.pending = Some(value);
                 DebounceAction::Deferred
             }
         }
@@ -144,15 +153,18 @@ impl DockBadgeDebounce {
 
     /// Flush the staged value once its 200 ms window has elapsed. Called
     /// from the frame drain and the 1 Hz autosave tick so a stalled
-    /// progress stream still lands its final badge (~1 s worst case).
-    pub(crate) fn flush_if_due(&mut self, now: Instant) -> Option<Option<String>> {
+    /// progress stream still lands its final visual (~1 s worst case).
+    pub(crate) fn flush_if_due(
+        &mut self,
+        now: Instant,
+    ) -> Option<crate::dock_progress::DockVisual> {
         let pending = self.pending.take()?;
         let due = self
             .last_applied
             .map_or(true, |last| now.duration_since(last) >= PROGRESS_DEBOUNCE);
         if due {
             self.last_applied = Some(now);
-            Some(Some(pending))
+            Some(pending)
         } else {
             self.pending = Some(pending);
             None
@@ -170,8 +182,10 @@ impl App {
                     self.on_clipboard_write(data, truncated);
                 }
                 UiEvent::ClipboardReadRequest => self.on_clipboard_read_request(),
+                // v1.11.13 (PLAN_v11113 §M1): the enum rides through — the
+                // graphic layer needs the shape, no badge_text folding.
                 UiEvent::DockProgress(progress) => {
-                    self.on_dock_progress(crate::notify_policy::badge_text(progress));
+                    self.on_dock_progress(progress);
                 }
             }
         }
@@ -270,30 +284,61 @@ impl App {
         }
     }
 
-    /// OSC 9;4 — Dock badge text through the 200 ms latest-wins debounce
-    /// (M7: real setter; the text mapping is M5 badge_text).
-    fn on_dock_progress(&mut self, badge: Option<String>) {
+    /// OSC 9;4 — Dock visual through the 200 ms latest-wins debounce.
+    /// v1.11.13 (PLAN_v11113 §M1): the graphic setter (progress bar
+    /// synthesis) replaces the v1.11.5 badge-text setter; same-value
+    /// replays short-circuit inside `set_dock_visual` (P2-5).
+    fn on_dock_progress(&mut self, progress: weft_core::vt::DockProgress) {
+        let visual = crate::notify_policy::dock_visual(progress);
         match self
             .dock_badge_debounce
-            .accept(std::time::Instant::now(), badge)
+            .accept(std::time::Instant::now(), visual)
         {
-            DebounceAction::Apply(value) => {
+            DebounceAction::Apply(visual) => {
                 // SAFETY: dispatch drain runs on the main event-loop thread.
-                unsafe { crate::macos_notifications::set_dock_badge(value.as_deref()) }
+                unsafe {
+                    crate::dock_progress::set_dock_visual(
+                        visual,
+                        self.window_runtime.current_logo_variant,
+                    )
+                }
             }
             DebounceAction::Deferred => {}
         }
     }
 
-    /// Flush a staged dock badge once its debounce window elapsed. Hooked
+    /// Flush a staged dock visual once its debounce window elapsed. Hooked
     /// into the frame drain and the 1 Hz autosave tick.
     pub(crate) fn flush_dock_badge(&mut self) {
-        if let Some(value) = self
+        if let Some(visual) = self
             .dock_badge_debounce
             .flush_if_due(std::time::Instant::now())
         {
             // SAFETY: frame drain / autosave tick run on the main thread.
-            unsafe { crate::macos_notifications::set_dock_badge(value.as_deref()) }
+            unsafe {
+                crate::dock_progress::set_dock_visual(
+                    visual,
+                    self.window_runtime.current_logo_variant,
+                )
+            }
+        }
+    }
+
+    /// v1.11.13 (PLAN_v11113 §M2): flip the notification-activation gate
+    /// ready and replay queued cold-start clicks FIFO. Called at BOTH
+    /// restore completion points — `resumed`'s Normal arm tail and the end
+    /// of `apply_recovery_choice` — and NEVER earlier: the Pending arm
+    /// deliberately leaves the gate closed so an early click queues until
+    /// the user's recovery choice has restored the tabs (otherwise it
+    /// would hit the "该命令块已被清理" toast against a half-built
+    /// session).
+    pub(crate) fn finish_restore_notifications(&mut self) {
+        for block_id in crate::macos_notifications::open_activation_gate() {
+            tracing::info!(
+                block_id,
+                "notification activation: replaying queued cold-start click"
+            );
+            self.handle_notification_activated(block_id);
         }
     }
 
@@ -546,56 +591,67 @@ impl App {
 mod tests {
     use super::*;
 
+    // v1.11.13 (PLAN_v11113 §M1): the three debounce tests migrated to the
+    // DockVisual enum carrier — semantics unchanged (200 ms latest-wins,
+    // Clear immediate).
+
     #[test]
     fn debounce_clear_applies_immediately() {
         let mut d = DockBadgeDebounce::default();
         let t0 = Instant::now();
-        match d.accept(t0, Some("42%".into())) {
-            DebounceAction::Apply(Some(v)) => assert_eq!(v, "42%"),
+        match d.accept(t0, crate::dock_progress::DockVisual::Bar(Some(42))) {
+            DebounceAction::Apply(v) => {
+                assert_eq!(v, crate::dock_progress::DockVisual::Bar(Some(42)))
+            }
             other => panic!("first percent must apply, got {other:?}"),
         }
         // Clear bypasses the window even 1 ms later
-        match d.accept(t0 + Duration::from_millis(1), None) {
-            DebounceAction::Apply(None) => {}
+        match d.accept(
+            t0 + Duration::from_millis(1),
+            crate::dock_progress::DockVisual::Clear,
+        ) {
+            DebounceAction::Apply(crate::dock_progress::DockVisual::Clear) => {}
             other => panic!("clear must apply immediately, got {other:?}"),
         }
     }
 
     #[test]
     fn debounce_latest_wins_within_window() {
+        use crate::dock_progress::DockVisual;
         let mut d = DockBadgeDebounce::default();
         let t0 = Instant::now();
-        let _ = d.accept(t0, Some("10%".into()));
+        let _ = d.accept(t0, DockVisual::Bar(Some(10)));
         // 100 ms later: staged, not applied
-        match d.accept(t0 + Duration::from_millis(100), Some("20%".into())) {
+        match d.accept(t0 + Duration::from_millis(100), DockVisual::Bar(Some(20))) {
             DebounceAction::Deferred => {}
             other => panic!("expected deferred, got {other:?}"),
         }
         // newest value replaces the pending slot (latest wins)
-        match d.accept(t0 + Duration::from_millis(150), Some("30%".into())) {
+        match d.accept(t0 + Duration::from_millis(150), DockVisual::Bar(Some(30))) {
             DebounceAction::Deferred => {}
             other => panic!("expected deferred, got {other:?}"),
         }
         // window elapsed → the NEWEST staged value applies
-        match d.accept(t0 + Duration::from_millis(201), Some("40%".into())) {
-            DebounceAction::Apply(Some(v)) => assert_eq!(v, "40%"),
+        match d.accept(t0 + Duration::from_millis(201), DockVisual::Bar(Some(40))) {
+            DebounceAction::Apply(v) => assert_eq!(v, DockVisual::Bar(Some(40))),
             other => panic!("expected apply of newest, got {other:?}"),
         }
     }
 
     #[test]
     fn debounce_flush_lands_staged_value() {
+        use crate::dock_progress::DockVisual;
         let mut d = DockBadgeDebounce::default();
         let t0 = Instant::now();
-        let _ = d.accept(t0, Some("10%".into()));
-        let _ = d.accept(t0 + Duration::from_millis(50), Some("70%".into()));
+        let _ = d.accept(t0, DockVisual::Bar(Some(10)));
+        let _ = d.accept(t0 + Duration::from_millis(50), DockVisual::Bar(Some(70)));
         // not due yet
         assert!(d.flush_if_due(t0 + Duration::from_millis(100)).is_none());
         // due → lands the latest value; second flush is empty
         let flushed = d
             .flush_if_due(t0 + Duration::from_millis(250))
             .expect("due");
-        assert_eq!(flushed.as_deref(), Some("70%"));
+        assert_eq!(flushed, DockVisual::Bar(Some(70)));
         assert!(d.flush_if_due(t0 + Duration::from_millis(300)).is_none());
     }
 
@@ -684,6 +740,34 @@ mod tests {
                 pane_id: PaneId(3)
             })
         );
+    }
+
+    #[test]
+    fn cold_start_activation_queues_then_replays_fifo() {
+        // v1.11.13 (PLAN_v11113 §M2): the AppEvent-layer lifecycle, driven
+        // through the exact functions the UN delegate (the
+        // NotificationActivated producer) and finish_restore_notifications
+        // share. Single global-state test — see the module-local gate
+        // tests in macos_notifications.rs for the matrix on local gates.
+        // 1) Two clicks arrive BEFORE the restore finished → queued, no
+        //    AppEvent emitted (route says "not deliverable").
+        assert!(!crate::macos_notifications::route_notification_activation(
+            7
+        ));
+        assert!(!crate::macos_notifications::route_notification_activation(
+            3
+        ));
+        // 2) finish_restore_notifications: ready-flip + FIFO drain — the
+        //    replay sequence handle_notification_activated receives.
+        assert_eq!(
+            crate::macos_notifications::open_activation_gate(),
+            vec![7, 3],
+            "replay follows click order (FIFO)"
+        );
+        // 3) After the flip, further clicks deliver immediately and
+        //    nothing stays stranded in the backlog.
+        assert!(crate::macos_notifications::route_notification_activation(9));
+        assert!(crate::macos_notifications::open_activation_gate().is_empty());
     }
 
     #[test]

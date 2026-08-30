@@ -184,6 +184,14 @@ pub fn encode_kitty_key(
     mods: Modifiers,
     text: Option<&str>,
 ) -> Option<Vec<u8>> {
+    // v1.11.13 (PLAN_v11113 §M3): defense in depth — a Release is only
+    // reportable when 0b10 (ReportEventTypes) was negotiated. Orthogonal to
+    // the escape-coding branch below (which owns the 0b10 release shape):
+    // without 0b10 a Release must fall through (None ⇒ legacy never emits
+    // it; the app-side gate drops the event, this guards the encoder seam).
+    if kind == KittyEventKind::Release && flags & FLAG_REPORT_EVENT_TYPES == 0 {
+        return None;
+    }
     let level = if flags & FLAG_REPORT_ALL_KEYS != 0 {
         // 0b1000 gates the all-keys tier: plain printables flip to escape
         // codes ONLY under this flag (spec: ReportAssociatedText attaches

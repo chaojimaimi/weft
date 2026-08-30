@@ -531,6 +531,10 @@ impl App {
         // synchronously in `resumed()` — the tab topology is final only
         // after the chosen restore path has run.
         self.hydrate_tabs_from_history_store();
+        // v1.11.13 (PLAN_v11113 §M2): recovery-path restore complete —
+        // flip the activation gate + replay queued cold-start clicks
+        // against the now-hydrated block ids.
+        self.finish_restore_notifications();
     }
 }
 

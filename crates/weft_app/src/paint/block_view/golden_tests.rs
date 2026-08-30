@@ -684,3 +684,9 @@ fn block_view_golden_env_flags_exactly_one() {
         assert!(!flag_is_enabled(value));
     }
 }
+
+// v1.11.13 (PLAN_v11113 §M4): the styled_underlines scene lives in its own
+// #[path] file (module-size gate — the kitty_tests → kitty_golden_tests
+// precedent); it sees every fixture/helper above through `use super::*`.
+#[path = "golden_underlines.rs"]
+mod underlines;

@@ -1,6 +1,10 @@
 //! Mouse press routing controller.
 
 use super::*;
+// v1.11.13 (PLAN_v11113 §M5): the enum moved out of main.rs to the
+// controller that produces it (`App::find_button_at` lives in
+// geometry_controller.rs).
+use crate::geometry_controller::FindButtonAction;
 
 impl App {
     pub(super) fn take_context_menu(&mut self, reason: &'static str) -> Option<ContextMenu> {

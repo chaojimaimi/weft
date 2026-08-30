@@ -15,6 +15,33 @@ pub(crate) enum ContextMenuKeyAction {
     Consume,
 }
 
+/// Context menu item labels. v1.7.3-C added bookmark/note/export actions.
+/// Keep in sync with `CONTEXT_MENU_ITEM_COUNT` in `layout/surfaces.rs`.
+///
+/// v1.11.13 (PLAN_v11113 §M5): moved here from main.rs (which keeps a
+/// `pub(crate) use` re-export, so every `crate::CONTEXT_MENU_ITEMS` path
+/// is unchanged) — the labels belong to the menu scene component that
+/// renders them, not to the startup orchestrator.
+pub(crate) const CONTEXT_MENU_ITEMS: &[(&str, &str); crate::layout::CONTEXT_MENU_ITEM_COUNT] = &[
+    ("Copy Command", "copy_command"),
+    ("Copy Output", "copy_output"),
+    // v1.10.34: combined copy — cwd + command + output in one paste-ready
+    // snippet (see weft_core::blocks::format_block_for_copy). Solves the
+    // "analyze a command result" flow that previously needed 2-3 separate
+    // copies, since drag selection cannot cross block structural rows.
+    ("Copy Block", "copy_block"),
+    ("Toggle Fold", "toggle_fold"),
+    // v0.9 W4: send the block's command to the input box for re-editing
+    // (Warp-style "rerun" — user can tweak parameters before pressing Enter).
+    ("Send to Input", "send_to_input"),
+    // v1.7.3-C: Block reuse actions — bookmark, note, export.
+    ("Toggle Bookmark", "toggle_bookmark"),
+    ("Add Note", "add_note"),
+    ("Export Block", "export_block"),
+    // v1.8.2: AI diagnose for failed blocks (no-op on success/when AI off).
+    ("Diagnose with AI", "diagnose"),
+];
+
 pub(crate) fn clamped_context_menu_selection(selection: usize, item_count: usize) -> Option<usize> {
     (item_count > 0).then(|| selection.min(item_count - 1))
 }
