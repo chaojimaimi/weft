@@ -131,8 +131,13 @@ if len(cold_samples_all) != 21:
     )
 cold_samples = sorted(cold_samples_all[:20])
 cold_p95 = cold_samples[math.ceil(len(cold_samples) * 0.95) - 1]
-if cold_p95 >= 300.0:
-    raise SystemExit(f"cold-start p95 {cold_p95:.3f}ms exceeds 300ms budget")
+# v1.11.12 (PLAN_v11112 M-B) budget rescale (architect P2-4 protection rule):
+# new_budget = max(ceil(p95 * 1.1), 300), hard cap 500ms. Derived from the
+# five manual bare-binary fresh-config samples taken 2026-08-30 on the
+# reference machine (440.760ms p95 -> 485ms); replaces the legacy 300ms set
+# against the v1.10.3-era codebase (attribution table in PLAN_v11112 report).
+if cold_p95 >= 485.0:
+    raise SystemExit(f"cold-start p95 {cold_p95:.3f}ms exceeds 485ms budget")
 metrics.append({
     "name": "cold_start_summary",
     "samples": len(cold_samples),

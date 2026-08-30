@@ -49,6 +49,107 @@ pub(crate) fn report_first_frame_once() {
     }
 }
 
+/// v1.11.12 (PLAN_v11112 M-B): compile-time-closed set of cold-start phases.
+/// A fixed enum (not free-form names) keeps stray/mistyped phase names out of
+/// baseline.json. Nine phases (the architect's P1-3 `path_scan` and P1-4
+/// `stores_open` widen the original 8-value list): every V110_METRIC
+/// `cold_start` line except `first_frame` is one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartupPhase {
+    /// Login-shell PATH scan (`scan_path_bins`) — spawns the login shell,
+    /// 1500ms deadline; the top "+63ms" suspect.
+    PathScan,
+    /// Config load + `ConfigState` build (excludes the PATH scan).
+    Config,
+    /// UNUserNotificationCenter sink build (`build_sink`).
+    Notifications,
+    /// `MTLCreateSystemDefaultDevice`.
+    MetalDevice,
+    /// Glyph atlas construction (font load + rasterization warm-up).
+    Atlas,
+    /// `MetalRenderer::new` — shader compile + pipelines + layer.
+    RendererInit,
+    /// Window creation + pane/PTY spawn + sidebar/Dock icon application.
+    WindowPane,
+    /// blocks.db / annotation store / search index open (+ index rebuild)
+    /// and palette search worker spawn.
+    StoresOpen,
+    /// Startup recovery detection + tab snapshot restore + history hydration.
+    SessionRestore,
+}
+
+impl StartupPhase {
+    pub(crate) const ALL: [StartupPhase; 9] = [
+        StartupPhase::PathScan,
+        StartupPhase::Config,
+        StartupPhase::Notifications,
+        StartupPhase::MetalDevice,
+        StartupPhase::Atlas,
+        StartupPhase::RendererInit,
+        StartupPhase::WindowPane,
+        StartupPhase::StoresOpen,
+        StartupPhase::SessionRestore,
+    ];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            StartupPhase::PathScan => "path_scan",
+            StartupPhase::Config => "config",
+            StartupPhase::Notifications => "notifications",
+            StartupPhase::MetalDevice => "metal_device",
+            StartupPhase::Atlas => "atlas",
+            StartupPhase::RendererInit => "renderer_init",
+            StartupPhase::WindowPane => "window_pane",
+            StartupPhase::StoresOpen => "stores_open",
+            StartupPhase::SessionRestore => "session_restore",
+        }
+    }
+}
+
+/// Per-phase de-duplication — each phase reports at most once per process
+/// (architect P1-2: phases must NOT share `FIRST_FRAME_REPORTED`, whose swap
+/// would let the first caller silence every later phase).
+static PHASE_REPORTED: [AtomicBool; StartupPhase::ALL.len()] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+/// Report one cold-start phase boundary. The metric is a cumulative instant
+/// (ms since `STARTUP_BEGIN`); the per-phase attribution table is derived by
+/// differencing consecutive lines. Zero cost when the probe is off (the
+/// `STARTUP_BEGIN` OnceLock is never set).
+pub(crate) fn report_phase(phase: StartupPhase) {
+    let Some(started) = STARTUP_BEGIN.get() else {
+        return;
+    };
+    if !claim_phase_index(phase as usize) {
+        return;
+    }
+    println!("{}", phase_metric_line(phase, started.elapsed()));
+}
+
+/// Claim a phase's single report slot. Separated from `report_phase` so the
+/// de-dup semantics are testable without the probe env var.
+fn claim_phase_index(index: usize) -> bool {
+    !PHASE_REPORTED[index].swap(true, Ordering::Relaxed)
+}
+
+/// The exact V110_METRIC line a phase emits (separated for the format test).
+fn phase_metric_line(phase: StartupPhase, elapsed: Duration) -> String {
+    format!(
+        "V110_METRIC name=cold_start_phase phase={} ms={:.3}",
+        phase.as_str(),
+        elapsed.as_secs_f64() * 1000.0
+    )
+}
+
 /// Resolve the warm-up duration from `WARMUP_ENV` or fall back to `WARMUP`.
 /// Used by `app_runtime.rs` to schedule `PerformanceProbeStart`. Unparseable
 /// values fall back to the default rather than panicking — the probe is a
@@ -424,5 +525,43 @@ mod tests {
         std::env::remove_var(SAMPLE_ENV);
         assert_eq!(warmup_duration(), WARMUP);
         assert_eq!(sample_duration(), SAMPLE);
+    }
+
+    // ── v1.11.12 (PLAN_v11112 M-B): cold-start phase probe ──────────────
+
+    /// Phase names are unique, non-empty, machine-safe (the python gate
+    /// parser regex is `[a-zA-Z0-9_]+`), and every slot has one.
+    #[test]
+    fn phase_names_are_unique_and_machine_safe() {
+        let mut names: Vec<&str> = StartupPhase::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names.len(), 9);
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 9, "phase names must be unique");
+        assert!(names.iter().all(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }));
+    }
+
+    /// The metric line format the gate's parser consumes.
+    #[test]
+    fn phase_metric_line_format() {
+        let line = phase_metric_line(StartupPhase::PathScan, Duration::from_secs_f64(0.063256));
+        assert_eq!(
+            line,
+            "V110_METRIC name=cold_start_phase phase=path_scan ms=63.256"
+        );
+    }
+
+    /// Each phase slot claims exactly once — first claim wins, later claims
+    /// (and therefore later prints) are suppressed. Exercises every index so
+    /// the `PHASE_REPORTED` array length is pinned to the enum.
+    #[test]
+    fn phase_claim_is_exactly_once_per_index() {
+        for (index, phase) in StartupPhase::ALL.iter().enumerate() {
+            assert_eq!(*phase as usize, index, "enum ordinals must match ALL");
+            assert!(claim_phase_index(index), "first claim must win");
+            assert!(!claim_phase_index(index), "second claim must be suppressed");
+        }
     }
 }

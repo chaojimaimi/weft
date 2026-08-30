@@ -38,6 +38,10 @@ impl MetalRenderer {
         // dependencies remain here — scale_factor, inner_size and the layer
         // attachment itself (architect-verified list).
         let device = Device::system_default().expect("No Metal device found");
+        // v1.11.12 (PLAN_v11112 M-B): metal-device phase boundary. Inert in
+        // headless golden tests — the probe's STARTUP_BEGIN OnceLock is only
+        // set when WEFT_GUI_PERF_PROBE=1.
+        crate::performance_probe::report_phase(crate::performance_probe::StartupPhase::MetalDevice);
         let scale = window.scale_factor();
         let size = window.inner_size();
         let renderer = Self::build_paint_core(
@@ -94,6 +98,8 @@ impl MetalRenderer {
 
         // Build glyph atlas with CJK support
         let atlas = GlyphAtlas::new(&device, &font_config, scale);
+        // v1.11.12 (PLAN_v11112 M-B): atlas phase boundary.
+        crate::performance_probe::report_phase(crate::performance_probe::StartupPhase::Atlas);
 
         info!(
             "Window: {}x{} physical ({}x scale), viewport: {}x{} physical, atlas cells: {}x{}",

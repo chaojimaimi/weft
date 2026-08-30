@@ -43,6 +43,15 @@ pub(crate) struct OutputCapture {
     screen_prefix: String,
     /// Parallel styled lines for the prefix (line indices local to the prefix).
     screen_prefix_styled: Option<StyledOutput>,
+    /// v1.11.12 (PLAN_v11112 M-A): line-count ledger for `screen_prefix`,
+    /// maintained at every mutation point (`append_screen_prefix`,
+    /// `drain_screen_prefix`, `clear`). Semantics identical to the old O(n)
+    /// recompute: `screen_prefix.matches('\n').count() +
+    /// usize::from(!screen_prefix.is_empty())`. The recompute was paid on
+    /// every prefix append and every snapshot refresh (`screen_head_lines`).
+    /// Invariant tests pin counter == recompute
+    /// (`vt/screen_exit/tests.rs`).
+    line_count: usize,
 }
 
 impl OutputCapture {
@@ -60,6 +69,9 @@ impl OutputCapture {
         self.style_overflow = false;
         self.screen_prefix.clear();
         self.screen_prefix_styled = None;
+        // v1.11.12 (PLAN_v11112 M-A): the second reset mechanism (alongside
+        // `ScreenHistory::default`) — the ledger must be zeroed with the text.
+        self.line_count = 0;
     }
 
     pub(crate) fn replace(&mut self, text: &str, max_bytes: usize) {
@@ -368,10 +380,16 @@ impl OutputCapture {
             return;
         }
         let line_offset = self.screen_prefix_line_count();
+        // v1.11.12 (PLAN_v11112 M-A): line-ledger delta — one line per '\n'
+        // in the segment plus exactly ONE more (the separator '\n' when the
+        // prefix was non-empty, else the segment's own final unterminated
+        // line — the same +1 either way).
+        let appended_lines = text.matches('\n').count() + 1;
         if !self.screen_prefix.is_empty() {
             self.screen_prefix.push('\n');
         }
         self.screen_prefix.push_str(text);
+        self.line_count += appended_lines;
         if let Some(styled) = styled.filter(|s| s.has_colors()) {
             let mut styled = styled;
             for line in &mut styled.lines {
@@ -394,6 +412,7 @@ impl OutputCapture {
         if consumed >= self.screen_prefix.len() {
             self.screen_prefix.clear();
             self.screen_prefix_styled = None;
+            self.line_count = 0;
             return;
         }
         // `consumed < len` here (the `consumed >= len` case cleared above):
@@ -401,6 +420,10 @@ impl OutputCapture {
         // overlong-line mid-cut) — complete lines fully owned by the head
         // are exactly the newlines in the consumed bytes.
         let consumed_lines = self.screen_prefix[..consumed].matches('\n').count();
+        // v1.11.12 (PLAN_v11112 M-A): mirror the ledger decrement — for a
+        // partial drain the removed lines are exactly the newlines in the
+        // consumed region (the remaining tail keeps its own final line).
+        self.line_count = self.line_count.saturating_sub(consumed_lines);
         self.screen_prefix.drain(..consumed);
         if let Some(styled) = &mut self.screen_prefix_styled {
             styled
@@ -430,9 +453,11 @@ impl OutputCapture {
     /// Number of text lines in the screen prefix — the styled-line offset
     /// applied to the viewport segment when the three-part composed block
     /// text is built.
+    ///
+    /// v1.11.12 (PLAN_v11112 M-A): O(1) read of the mutation-maintained
+    /// ledger instead of an O(n) full-string recompute.
     pub(crate) fn screen_prefix_line_count(&self) -> usize {
-        let text = &self.screen_prefix;
-        text.matches('\n').count() + usize::from(!text.is_empty())
+        self.line_count
     }
 
     // ── Style RLE maintenance ────────────────────────────────────────────

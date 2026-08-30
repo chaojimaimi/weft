@@ -442,7 +442,12 @@ impl App {
                     false
                 }
             };
-            let _ = proxy.send_event(crate::AppEvent::Osc52ReadDecided { allowed, seq });
+            // v1.11.12 (PLAN_v11112 M-C): decision-loop send — a failure here
+            // parks the OSC 52 read request forever.
+            // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+            if let Err(e) = proxy.send_event(crate::AppEvent::Osc52ReadDecided { allowed, seq }) {
+                warn!(error = %e, "send_event failed: OSC 52 read decision lost; parked request never resolves");
+            }
         });
     }
 

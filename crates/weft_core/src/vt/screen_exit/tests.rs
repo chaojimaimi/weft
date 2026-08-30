@@ -560,3 +560,376 @@ fn composed_history_prefix_and_snapshot_join_without_seams() {
         "the empty bottom row is omitted from the snapshot"
     );
 }
+
+// ── v1.11.12 (PLAN_v11112 M-A): line-ledger invariants ──────────────────
+// Every mutation point of the two head ledgers — `ScreenHistory::line_count`
+// (preserved-frame history) and `OutputCapture`'s prefix ledger — must leave
+// the counter exactly equal to the O(n) recompute it replaced:
+// `text.matches('\n').count() + usize::from(!text.is_empty())`. Exhaustive
+// mutation list (PLAN_v11112 F3): history append / trim (three branches) /
+// `ScreenHistory::default` reset; prefix append / drain (three branches) /
+// clear / rebase seed. A drift turns `screen_history_lines`,
+// `screen_prefix_line_count` and `screen_head_lines` into wrong caret and
+// drag-selection offsets.
+
+use crate::blocks::StyledOutput;
+
+/// The O(n) ground truth both ledgers must always equal.
+fn ledger_recount(text: &str) -> usize {
+    text.matches('\n').count() + usize::from(!text.is_empty())
+}
+
+/// History append maintains the ledger across all shape branches: empty
+/// history + single line (空串边界), empty history + multi-line, non-empty
+/// history (separator branch), and the empty-text early return (no change).
+#[test]
+fn history_append_ledger_matches_recompute() {
+    let mut t = Terminal::new(6, 40);
+
+    // Empty history + single-line frame: the frame's own final line is +1.
+    t.append_screen_history_frame("frame one", StyledOutput::default());
+    let text = t.capabilities.screen_history.text.clone();
+    assert_eq!(t.screen_history_lines(), ledger_recount(&text));
+    assert_eq!(t.screen_history_lines(), 1);
+
+    // Non-empty history + multi-line frame: separator + embedded newlines.
+    t.append_screen_history_frame("a\nb\nc", StyledOutput::default());
+    let text = t.capabilities.screen_history.text.clone();
+    assert_eq!(t.screen_history_lines(), ledger_recount(&text));
+    assert_eq!(t.screen_history_lines(), 4);
+
+    // Empty-text early return: neither text nor ledger move.
+    let before = t.screen_history_lines();
+    t.append_screen_history_frame("", StyledOutput::default());
+    assert_eq!(t.screen_history_lines(), before);
+    assert_eq!(t.capabilities.screen_history.text, text);
+}
+
+/// The 1MiB-cap early return drops the frame without touching the ledger.
+#[test]
+fn history_append_at_cap_leaves_ledger_untouched() {
+    let mut t = Terminal::new(6, 40);
+    let filler = "x".repeat(crate::blocks::MAX_OUTPUT_BYTES);
+    t.append_screen_history_frame(&filler, StyledOutput::default());
+    let before = t.screen_history_lines();
+    let bytes_before = t.capabilities.screen_history.text.len();
+    t.append_screen_history_frame("dropped", StyledOutput::default());
+    assert_eq!(t.screen_history_lines(), before);
+    assert_eq!(t.capabilities.screen_history.text.len(), bytes_before);
+}
+
+/// Trim decrements by the exact `consumed_lines` expression for all three
+/// consumption branches: zero, partial line boundary, whole history.
+#[test]
+fn history_trim_ledger_matches_recompute() {
+    let mut t = Terminal::new(6, 40);
+    t.append_screen_history_frame("l1\nl2\nl3\nl4", StyledOutput::default());
+    assert_eq!(t.screen_history_lines(), 4);
+    let full = t.capabilities.screen_history.text.clone();
+
+    // Zero-consumption early return.
+    t.trim_screen_history(0);
+    assert_eq!(t.screen_history_lines(), ledger_recount(&full));
+
+    // Partial: cut at the first line boundary ("l1\n" = 3 bytes) → 1 line.
+    t.trim_screen_history(3);
+    let rest = t.capabilities.screen_history.text.clone();
+    assert_eq!(rest, "l2\nl3\nl4");
+    assert_eq!(t.screen_history_lines(), ledger_recount(&rest));
+    assert_eq!(t.screen_history_lines(), 3);
+
+    // Whole-history branch: consumed == len counts the final line too → 0.
+    let len = t.capabilities.screen_history.text.len();
+    t.trim_screen_history(len);
+    assert!(t.capabilities.screen_history.text.is_empty());
+    assert_eq!(t.screen_history_lines(), 0);
+    assert_eq!(t.screen_history_lines(), ledger_recount(""));
+}
+
+/// Overlong-line mid-cut trim: the boundary is not at a '\n', yet the
+/// ledger must still equal the recompute of the remaining text.
+#[test]
+fn history_trim_mid_cut_keeps_ledger_aligned() {
+    let mut t = Terminal::new(6, 40);
+    t.append_screen_history_frame("aaaa\nbbbb", StyledOutput::default());
+    assert_eq!(t.screen_history_lines(), 2);
+    // Cut 6 bytes = "aaaa\nb" (mid-cut inside "bbbb") → removes line 1 only.
+    t.trim_screen_history(6);
+    let rest = t.capabilities.screen_history.text.clone();
+    assert_eq!(rest, "bbb");
+    assert_eq!(t.screen_history_lines(), ledger_recount(&rest));
+    assert_eq!(t.screen_history_lines(), 1);
+}
+
+/// Reset mechanism 1: `ScreenHistory::default()` (capture restart) zeroes
+/// the ledger together with the text.
+#[test]
+fn history_default_reset_zeroes_ledger() {
+    let mut t = Terminal::new(6, 40);
+    t.append_screen_history_frame("a\nb\nc", StyledOutput::default());
+    assert_eq!(t.screen_history_lines(), 3);
+    // The exact expression `begin_primary_screen_output_capture` runs.
+    t.capabilities.screen_history = crate::vt::capability::ScreenHistory::default();
+    assert!(t.capabilities.screen_history.text.is_empty());
+    assert_eq!(t.capabilities.screen_history.line_count, 0);
+    assert_eq!(t.screen_history_lines(), 0);
+}
+
+/// The head composition: `screen_head_lines` is the sum of both O(1) ledger
+/// reads and matches a recompute over the two texts.
+#[test]
+fn head_lines_equal_history_plus_prefix_ledgers() {
+    let mut t = Terminal::new(6, 40);
+    t.append_screen_history_frame("h1\nh2", StyledOutput::default());
+    // The tracker gates prefix appends on screen ownership, which requires
+    // the CommandExecuting phase (same setup as the screen_capture tests).
+    t.block_tracker_mut().on_command_start("tui".to_string());
+    t.block_tracker_mut().begin_screen_owned_output(0);
+    t.block_tracker_mut()
+        .append_screen_prefix("p1\np2\np3", None);
+    let head = t.screen_head_lines();
+    assert_eq!(head, t.screen_history_lines() + t.screen_prefix_lines());
+    assert_eq!(head, 2 + 3);
+}
+
+/// Prefix append mirrors the history ledger: empty prefix + single line,
+/// multi-line segments, the empty-segment early return, and that `replace`
+/// (the screen-snapshot path) never touches the prefix or its ledger.
+#[test]
+fn prefix_append_ledger_matches_recompute() {
+    use crate::blocks::OutputCapture;
+    let mut capture = OutputCapture::default();
+
+    capture.append_screen_prefix("row one", None);
+    assert_eq!(
+        capture.screen_prefix_line_count(),
+        ledger_recount(capture.screen_prefix_text())
+    );
+    assert_eq!(capture.screen_prefix_line_count(), 1);
+
+    capture.append_screen_prefix("a\nb\nc", None);
+    assert_eq!(
+        capture.screen_prefix_line_count(),
+        ledger_recount(capture.screen_prefix_text())
+    );
+    assert_eq!(capture.screen_prefix_line_count(), 4);
+
+    // Empty segment: early return, ledger unchanged.
+    capture.append_screen_prefix("", None);
+    assert_eq!(capture.screen_prefix_line_count(), 4);
+
+    // `replace` swaps the live segment only — prefix (and ledger) survive.
+    capture.replace("viewport", crate::blocks::MAX_OUTPUT_BYTES);
+    assert_eq!(capture.screen_prefix_line_count(), 4);
+}
+
+/// Prefix drain branches: zero early return, partial drain, and the
+/// consume-everything clear.
+#[test]
+fn prefix_drain_ledger_matches_recompute() {
+    use crate::blocks::OutputCapture;
+    let mut capture = OutputCapture::default();
+    capture.append_screen_prefix("l1\nl2\nl3\nl4", None);
+    assert_eq!(capture.screen_prefix_line_count(), 4);
+
+    // Zero drain: early return.
+    capture.drain_screen_prefix(0);
+    assert_eq!(capture.screen_prefix_line_count(), 4);
+
+    // Partial: "l1\n" = 3 bytes → 1 line gone.
+    capture.drain_screen_prefix(3);
+    assert_eq!(capture.screen_prefix_text(), "l2\nl3\nl4");
+    assert_eq!(
+        capture.screen_prefix_line_count(),
+        ledger_recount(capture.screen_prefix_text())
+    );
+    assert_eq!(capture.screen_prefix_line_count(), 3);
+
+    // Everything (consumed >= len) → full clear, ledger 0.
+    capture.drain_screen_prefix(usize::MAX);
+    assert!(capture.screen_prefix_text().is_empty());
+    assert_eq!(capture.screen_prefix_line_count(), 0);
+}
+
+/// Reset mechanism 2: `OutputCapture::clear` zeroes the prefix ledger
+/// alongside the text (the second of the two distinct reset mechanisms).
+#[test]
+fn prefix_clear_zeroes_ledger() {
+    use crate::blocks::OutputCapture;
+    let mut capture = OutputCapture::default();
+    capture.append_screen_prefix("a\nb\nc", None);
+    assert_eq!(capture.screen_prefix_line_count(), 3);
+    capture.clear();
+    assert!(capture.screen_prefix_text().is_empty());
+    assert_eq!(capture.screen_prefix_line_count(), 0);
+}
+
+/// The capture-start rebase seeds the prefix through the same append entry,
+/// so its ledger is maintained too (Terminal-level, real VT stream).
+#[test]
+fn rebase_seed_keeps_prefix_ledger_aligned() {
+    let mut terminal = Terminal::new(5, 40);
+    terminal.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    // Pre-capture (below the 2-cursor-op threshold): LF overflow pushes
+    // OWNED rows into the scrollback — exactly the retained rows the
+    // capture-start rebase folds into the prefix.
+    for i in 0..8 {
+        terminal.process(format!("pre-{i}\r\n").as_bytes());
+    }
+    // Second cursor op → capture starts → rebase seeds the prefix.
+    terminal.process("\x1b[2;1H".as_bytes());
+    terminal.process("\x1b[3;1H".as_bytes());
+    assert!(terminal.primary_screen_app_active());
+
+    let prefix = terminal.block_tracker().screen_prefix_text().to_string();
+    assert!(
+        prefix.contains("pre-"),
+        "rebase must seed the prefix, got {prefix:?}"
+    );
+    assert_eq!(
+        terminal.block_tracker().screen_prefix_line_count(),
+        ledger_recount(&prefix)
+    );
+}
+
+/// Mixed sequence over both ledgers (append → append → trim → drain →
+/// append) with a recompute assertion after every step — the drift catcher.
+#[test]
+fn mixed_mutation_sequence_keeps_both_ledgers_aligned() {
+    let mut t = Terminal::new(6, 40);
+
+    t.append_screen_history_frame("f1\nf2", StyledOutput::default());
+    t.append_screen_history_frame("f3", StyledOutput::default());
+    let history = t.capabilities.screen_history.text.clone();
+    assert_eq!(t.screen_history_lines(), ledger_recount(&history));
+
+    t.block_tracker_mut().append_screen_prefix("p1", None);
+    t.block_tracker_mut().append_screen_prefix("p2\np3", None);
+    let prefix = t.block_tracker().screen_prefix_text().to_string();
+    assert_eq!(
+        t.block_tracker().screen_prefix_line_count(),
+        ledger_recount(&prefix)
+    );
+    assert_eq!(
+        t.screen_head_lines(),
+        ledger_recount(&history) + ledger_recount(&prefix)
+    );
+
+    // Trim half the history at a line boundary. The prefix drain has no
+    // tracker-level wrapper (it runs inside `split_screen_history`), so its
+    // half of the mixed sequence runs on the capture directly.
+    let cut = history.find('\n').unwrap() + 1;
+    t.trim_screen_history(cut);
+    let history = t.capabilities.screen_history.text.clone();
+    assert_eq!(t.screen_history_lines(), ledger_recount(&history));
+
+    use crate::blocks::OutputCapture;
+    let mut capture = OutputCapture::default();
+    capture.append_screen_prefix("q1", None);
+    capture.append_screen_prefix("q2\nq3", None);
+    let drained = capture.screen_prefix_text().find('\n').unwrap() + 1;
+    capture.drain_screen_prefix(drained);
+    assert_eq!(capture.screen_prefix_text(), "q2\nq3");
+    assert_eq!(capture.screen_prefix_line_count(), 2);
+
+    // Grow both again.
+    t.append_screen_history_frame("f9", StyledOutput::default());
+    t.block_tracker_mut().append_screen_prefix("p9", None);
+    let history = t.capabilities.screen_history.text.clone();
+    let prefix = t.block_tracker().screen_prefix_text().to_string();
+    assert_eq!(
+        t.screen_head_lines(),
+        ledger_recount(&history) + ledger_recount(&prefix)
+    );
+}
+
+// ── v1.11.12 (PLAN_v11112 M-A): refresh-cost scaling benchmarks ─────────
+// #[ignore] benchmarks feeding the .13 representation-layer decision (frozen
+// head/tail split). Data goes into the version's PROGRESS/baseline notes:
+// per-refresh cost as a function of the composed HEAD size (the O(head)
+// tails: line-ledger reads ×2, styled shift, text re-copy) and the pure
+// iteration cost of an all-false owned-mask scrollback span (walk starts at
+// document_start, upper-bounded by the ring capacity). Run with:
+//   cargo test -p weft_core --lib perf_ -- --ignored --nocapture
+
+/// Screen-owned session with a TUI-engaged viewport (real VT stream).
+fn screen_owned_terminal(rows: usize, cols: usize, ring: usize) -> Terminal {
+    let mut t = Terminal::with_scrollback(rows, cols, ring);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07tui\x1b]133;C\x07");
+    // Two absolute-addressing ops cross the TUI capture threshold.
+    t.process("\x1b[2;1H".as_bytes());
+    t.process("\x1b[3;1H".as_bytes());
+    t.process(b"prompt> ");
+    t
+}
+
+/// Per-refresh cost vs composed head size (10k / 50k / 100k lines). The head
+/// is seeded through the REAL append path so the ledger stays consistent;
+/// 7-byte lines keep 100k lines under the 1MiB split budget.
+#[test]
+#[ignore]
+fn perf_snapshot_refresh_cost_scaling() {
+    for head_lines in [10_000usize, 50_000, 100_000] {
+        let mut t = screen_owned_terminal(30, 100, 2_000);
+        let frame: Vec<String> = (0..1_000).map(|i| format!("{i:06}")).collect();
+        let frames = head_lines / 1_000;
+        for _ in 0..frames {
+            let text = frame.join("\n");
+            t.append_screen_history_frame(&text, StyledOutput::default());
+        }
+        assert_eq!(t.screen_history_lines(), head_lines);
+
+        // Warm caches, then average over N refreshes.
+        for _ in 0..3 {
+            t.refresh_primary_history_snapshot_now();
+        }
+        let iterations = 20u32;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            t.refresh_primary_history_snapshot_now();
+        }
+        let per_refresh_ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+        println!(
+            "V110_METRIC name=snapshot_refresh_scaling head_lines={head_lines} per_refresh_ms={per_refresh_ms:.3}"
+        );
+    }
+}
+
+/// P1-1: owned-path walk cost when the scrollback mask is ALL FALSE — the
+/// walk iterates from document_start (ring start here) up to the ring
+/// capacity while every scrollback row is skipped. Measured as the delta
+/// between a full-span walk (9k all-false rows) and the same terminal
+/// geometry with an empty ring (viewport-only walk).
+#[test]
+#[ignore]
+fn perf_owned_walk_allfalse_mask_iteration_cost() {
+    // Full span: ring starts empty at capture start, so document_start == 0
+    // and 9k scrolled-out (mask-false) rows sit between it and the viewport.
+    let mut full = screen_owned_terminal(10, 100, 10_000);
+    for _ in 0..9_000 {
+        full.process(b"\n");
+    }
+    let document_start = full
+        .block_tracker()
+        .screen_document_start()
+        .expect("screen-owned");
+    assert_eq!(document_start, 0, "ring was empty at capture start");
+
+    // Control: identical geometry and viewport, nothing ever scrolled.
+    let control = screen_owned_terminal(10, 100, 10_000);
+
+    let walk = |t: &Terminal| {
+        let start = std::time::Instant::now();
+        let (_text, _, _) = t.primary_screen_document_snapshot(document_start.min(1));
+        start.elapsed().as_secs_f64() * 1000.0
+    };
+    // Walk each twice, report the second (warmed) run.
+    let _ = walk(&full);
+    let full_ms = walk(&full);
+    let _ = walk(&control);
+    let control_ms = walk(&control);
+    println!(
+        "V110_METRIC name=snapshot_walk_allfalse_mask scrollback_rows=9000 full_ms={full_ms:.3} viewport_only_ms={control_ms:.3} iteration_delta_ms={:.3}",
+        full_ms - control_ms
+    );
+}

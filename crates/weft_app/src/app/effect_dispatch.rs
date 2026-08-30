@@ -463,7 +463,12 @@ impl crate::App {
                     crate::macos_alert::PastePromptResponse::Cancel
                 }
             };
-            let _ = proxy.send_event(crate::AppEvent::PasteDecided { response, seq });
+            // v1.11.12 (PLAN_v11112 M-C): decision-loop send — a failure here
+            // parks the paste forever (the dialog decided, nobody hears it).
+            // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+            if let Err(e) = proxy.send_event(crate::AppEvent::PasteDecided { response, seq }) {
+                tracing::warn!(error = %e, "send_event failed: paste decision lost; parked paste never resolves");
+            }
         });
     }
 

@@ -142,6 +142,12 @@ fn schedule_primary_history_refresh_wakes(
     tabs: &mut [Tab],
     proxy: &winit::event_loop::EventLoopProxy<AppEvent>,
 ) {
+    // v1.11.12 (PLAN_v11112 M-C): shared note for ALL wakeup-class send_event
+    // sites (12×: app_runtime 154/234/260/681, mouse:943, config:445,
+    // palette_search_worker:276, main.rs 463/466/472, app_state:673, pane:141)
+    // plus the 5 timer sites below and the probe thread:
+    // EventLoopClosed = loop exited, by design silent — no wake can ever be
+    // delivered after exit, so a warn would be pure teardown noise.
     for delay in tabs
         .iter_mut()
         .filter_map(Tab::take_primary_history_refresh_wake_delay)
@@ -357,6 +363,8 @@ impl ApplicationHandler<AppEvent> for App {
         } else {
             tracing::warn!("notification sink: not on main thread at resumed; keeping NoopSink");
         }
+        // v1.11.12 (PLAN_v11112 M-B): notifications phase boundary.
+        performance_probe::report_phase(performance_probe::StartupPhase::Notifications);
 
         let win = &self.config_state.config.window;
         // v0.9 U-D1: resolve the startup theme honoring `follow_system` so
@@ -430,6 +438,9 @@ impl ApplicationHandler<AppEvent> for App {
             (win.padding_x, win.padding_y),
             win.opacity,
         );
+        // v1.11.12 (PLAN_v11112 M-B): renderer-init phase boundary (shader
+        // compile + pipelines happen inside `MetalRenderer::new`).
+        performance_probe::report_phase(performance_probe::StartupPhase::RendererInit);
 
         // Enable IME so CJK input methods compose/commit into the PTY. Without
         // this winit delivers raw keystrokes (e.g. pinyin letters) instead of
@@ -448,6 +459,8 @@ impl ApplicationHandler<AppEvent> for App {
         self.spawn_pty(init_rows, init_cols);
         self.window = Some(window);
         self.renderer = Some(renderer);
+        // v1.11.12 (PLAN_v11112 M-B): window/pane phase boundary.
+        performance_probe::report_phase(performance_probe::StartupPhase::WindowPane);
 
         // F3-3: apply the persisted sidebar width override (if any) so the
         // first frame opens with the user's last-dragged width instead of the
@@ -530,6 +543,10 @@ impl ApplicationHandler<AppEvent> for App {
                 self.proxy.clone(),
             );
         }
+        // v1.11.12 (PLAN_v11112 M-B): stores-open phase boundary — covers the
+        // blocks.db + annotation + search-index open/rebuild above (architect
+        // P1-4: the missing "+63ms" segment boundary).
+        performance_probe::report_phase(performance_probe::StartupPhase::StoresOpen);
 
         // v1.6.3: Crash recovery detection. Check for an unclean shutdown
         // and offer to restore from a recovery snapshot if one exists.
@@ -577,6 +594,10 @@ impl ApplicationHandler<AppEvent> for App {
                 info!("recovery prompt pending; tab restore deferred to RecoveryChosen event");
             }
         }
+        // v1.11.12 (PLAN_v11112 M-B): session-restore phase boundary —
+        // recovery detection + tab snapshot restore + history hydration all
+        // happened inside the match above.
+        performance_probe::report_phase(performance_probe::StartupPhase::SessionRestore);
 
         // Open the workflow DB (best-effort) and seed built-in templates on
         // first launch.

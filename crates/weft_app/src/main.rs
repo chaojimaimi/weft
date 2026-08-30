@@ -45,6 +45,9 @@ mod layout;
 mod lifecycle_controller;
 mod macos_alert;
 mod macos_file_dialog;
+// v1.11.12 (PLAN_v11112 M-D): pointer-parameterized pure decision core for
+// the system-appearance query (macos_system.rs sits at the 800-line ceiling).
+mod macos_appearance;
 // v1.11.5 (PLAN_v1115 §M4): native notification sink (UNUserNotificationCenter
 // + bundle-identity hard gate).
 mod macos_notifications;
@@ -374,6 +377,11 @@ impl App {
         // we fall back to defaults — matching the legacy `Config::load()`
         // startup behavior so a broken config never blocks app launch.
         let path_bins = scan_path_bins();
+        // v1.11.12 (PLAN_v11112 M-B): PATH-scan phase boundary — the scan
+        // spawns the login shell (1500ms deadline) and is the top "+63ms"
+        // cold-start suspect (architect P1-3); without this boundary its
+        // cost blurs into the config phase.
+        performance_probe::report_phase(performance_probe::StartupPhase::PathScan);
         let config_state = match weft_core::config::load_resolved() {
             Ok(loaded) => {
                 info!(
@@ -398,6 +406,9 @@ impl App {
                 ConfigState::new(Config::default(), path_bins)
             }
         };
+        // v1.11.12 (PLAN_v11112 M-B): config phase boundary — `ConfigState`
+        // is fully built here (the PATH scan above is NOT part of it).
+        performance_probe::report_phase(performance_probe::StartupPhase::Config);
         let probe = performance_probe::PerformanceProbe::from_env();
         let frame_trace_enabled = probe.enabled();
         let completion_proxy = proxy.clone();

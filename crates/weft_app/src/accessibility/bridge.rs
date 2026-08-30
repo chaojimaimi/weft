@@ -72,12 +72,19 @@ declare_class!(
             EVENT_PROXY
                 .get()
                 .is_some_and(|proxy| {
-                    proxy
-                        .send_event(AppEvent::AccessibilityPress {
-                            generation: self.ivars().generation.get(),
-                            node_id: self.ivars().node_id,
-                        })
-                        .is_ok()
+                    // v1.11.12 (PLAN_v11112 M-C): the result already surfaces
+                    // to AX (a failed send reports press-not-performed), so
+                    // this is trace-only — no warn, unlike the decision loops.
+                    match proxy.send_event(AppEvent::AccessibilityPress {
+                        generation: self.ivars().generation.get(),
+                        node_id: self.ivars().node_id,
+                    }) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::debug!(%error, "send_event failed: accessibility press not delivered (loop exited)");
+                            false
+                        }
+                    }
                 })
                 .into()
         }

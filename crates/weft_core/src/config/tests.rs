@@ -2875,3 +2875,67 @@ fn save_writes_tui_render_mode_only_when_non_default() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ── v1.11.12 (PLAN_v11112 M-E): save skip-ledger tests ──────────────────
+// A hand-written scalar where a table belongs must still save successfully —
+// the writer skips that segment, leaves it untouched on disk, and records the
+// top-level segment name in the `skipped` ledger that `save_to_path` warns
+// about. The external save signature is unchanged (F9).
+
+#[test]
+fn save_ledger_records_scalar_ai_section() {
+    use crate::config::save::write_ai_section;
+    let mut doc: toml_edit::DocumentMut = r#"
+ai = "x"
+"#
+    .parse()
+    .expect("parse");
+    let ai = AiConfig {
+        provider: Some("ollama".into()),
+        ..Default::default()
+    };
+    let mut skipped: Vec<&'static str> = Vec::new();
+    write_ai_section(&mut doc, &ai, &mut skipped);
+    // The save succeeds (no panic) and the ledger names the segment.
+    assert_eq!(skipped, vec!["ai"], "scalar [ai] must be recorded");
+    // The malformed disk content is preserved untouched.
+    assert_eq!(doc["ai"].as_str(), Some("x"));
+}
+
+#[test]
+fn save_ledger_records_scalar_profile_section() {
+    use crate::config::save::write_profiles;
+    // `[profiles.work]` with `font = "y"` (a scalar where FontConfig belongs).
+    // Note: save_to_path's parse_existing rejects this shape outright (serde
+    // fails), so — like the v1.11.0 M6 tests — this exercises the WRITER
+    // defense directly; the skip ledger is that defense's observability.
+    let mut doc: toml_edit::DocumentMut = r#"
+[profiles]
+[profiles.work]
+font = "y"
+"#
+    .parse()
+    .expect("parse");
+    let cfg = Config {
+        profiles: std::collections::BTreeMap::from([(
+            "work".into(),
+            ProfileConfig {
+                font: Some(crate::config::FontConfig {
+                    family: "JetBrains Mono".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    };
+    let mut skipped: Vec<&'static str> = Vec::new();
+    write_profiles(&mut doc, &cfg, &mut skipped);
+    // The save succeeds and the ledger records the profiles segment.
+    assert!(
+        skipped.contains(&"profiles"),
+        "scalar profile section must be recorded, got {skipped:?}"
+    );
+    // The malformed `font = "y"` survives untouched.
+    assert_eq!(doc["profiles"]["work"]["font"].as_str(), Some("y"));
+}

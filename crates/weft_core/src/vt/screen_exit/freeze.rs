@@ -86,7 +86,9 @@ impl Terminal {
     /// prepends to every screen snapshot. Bounded at `MAX_OUTPUT_BYTES` —
     /// frames beyond the cap are dropped (head-keeping, matching the snapshot
     /// truncation semantics).
-    fn append_screen_history_frame(&mut self, text: &str, styled: StyledOutput) {
+    // v1.11.12 (PLAN_v11112 M-A): `pub(super)` so the ledger invariant
+    // tests can drive the append path directly.
+    pub(super) fn append_screen_history_frame(&mut self, text: &str, styled: StyledOutput) {
         let offset = self.screen_history_lines();
         let history = &mut self.capabilities.screen_history;
         if text.is_empty() {
@@ -102,10 +104,17 @@ impl Terminal {
             );
             return;
         }
+        // v1.11.12 (PLAN_v11112 M-A): line-ledger delta. The composed text
+        // gains one line per '\n' in the appended frame plus exactly ONE more:
+        // when the history was non-empty the separator '\n' opens it, when it
+        // was empty the appended frame's own final (unterminated) line is it —
+        // both are the same +1, so the delta is unconditional.
+        let appended_lines = text.matches('\n').count() + 1;
         if !history.text.is_empty() {
             history.text.push('\n');
         }
         history.text.push_str(text);
+        history.line_count += appended_lines;
         if styled.has_colors() {
             let mut styled = styled;
             for line in &mut styled.lines {
@@ -121,9 +130,13 @@ impl Terminal {
     /// Number of text lines in the preserved-frame history — the offset
     /// prepended to every screen snapshot (caret anchor and drag-selection
     /// migration must shift by it to stay on the rendered block rows).
+    ///
+    /// v1.11.12 (PLAN_v11112 M-A): O(1) read of the mutation-maintained
+    /// ledger (`ScreenHistory::line_count`) instead of an O(n) full-string
+    /// recompute — this was paid on every append, every compose and twice per
+    /// snapshot refresh (via `screen_head_lines`).
     pub(super) fn screen_history_lines(&self) -> usize {
-        let text = &self.capabilities.screen_history.text;
-        text.matches('\n').count() + usize::from(!text.is_empty())
+        self.capabilities.screen_history.line_count
     }
 
     /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): number of text lines in the
@@ -459,7 +472,9 @@ impl Terminal {
     /// part folded into a finished block by the 1MiB split). The boundary is
     /// a line boundary of the history, so the remaining text is intact; kept
     /// styled lines are re-indexed.
-    fn trim_screen_history(&mut self, consumed: usize) {
+    // v1.11.12 (PLAN_v11112 M-A): `pub(super)` (like the sibling append) so
+    // the ledger invariant tests can drive the trim branches directly.
+    pub(super) fn trim_screen_history(&mut self, consumed: usize) {
         if consumed == 0 {
             return;
         }
@@ -476,6 +491,11 @@ impl Terminal {
         // them. `consumed == len`: the whole history was folded into the
         // head, whose boundary sits past the history end — the last line is
         // completed by the head's separator '\n' and must be counted too.
+        // v1.11.12 (PLAN_v11112 M-A): the SAME expression is the ledger
+        // decrement (P2-2 — reusing it verbatim instead of an independent
+        // `.lines().count()`: a trailing '\n' would count differently and
+        // drift the counter).
+        history.line_count = history.line_count.saturating_sub(consumed_lines);
         history.text.drain(..consumed);
         if let Some(styled) = &mut history.styled {
             styled

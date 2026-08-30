@@ -24,38 +24,38 @@ fn guarded_unwind<T>(action: &str, default: T, f: impl FnOnce() -> T) -> T {
 /// We poll rather than register a distributed-notification observer because
 /// winit owns the `NSApplication` and its delegate, making selector-based
 /// callbacks awkward; a 1Hz poll is cheap and matches the existing
-/// config-mtime poller pattern. v1.11.0 (M5): panic-safe default is dark;
-/// the body runs inside `guarded_unwind` (catch_unwind, AUDIT_v1.10.39).
+/// config-mtime poller pattern.
+///
+/// v1.11.0 (M5): panic-safe default is dark (`guarded_unwind`, AUDIT_v1.10.39).
+/// v1.11.12 (PLAN_v11112 D-d): decision logic lives in the pointer-
+/// parameterized pure function [`crate::macos_appearance::appearance_from_parts`]
+/// (null-pointer unit tests there); ANY broken-query path (null class, nil
+/// defaults/key, nil `UTF8String`) now ALSO defaults to DARK, aligned with
+/// the panic fallback (previously `false`/light). Legal nil `stringForKey:`
+/// stays Light. The wrapper resolves pointers with null-guards (a nil
+/// receiver is never messaged) and hands them to the pure function.
 pub(super) unsafe fn system_appearance_is_dark() -> bool {
     guarded_unwind("system_appearance_is_dark", true, || unsafe {
+        use crate::macos_appearance::appearance_from_parts;
         let defaults_cls = objc2::ffi::objc_getClass(c"NSUserDefaults".as_ptr());
         let str_cls = objc2::ffi::objc_getClass(c"NSString".as_ptr());
-        if defaults_cls.is_null() || str_cls.is_null() {
-            return false;
-        }
-        let defaults: *mut AnyObject =
-            msg_send![defaults_cls as *const AnyObject, standardUserDefaults];
-        if defaults.is_null() {
-            return false;
-        }
+        let defaults: *mut AnyObject = if defaults_cls.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![defaults_cls as *const AnyObject, standardUserDefaults]
+        };
         let c_key = std::ffi::CString::new("AppleInterfaceStyle").unwrap_or_default();
-        let key_ns: *mut AnyObject =
-            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_key.as_ptr()];
-        if key_ns.is_null() {
-            return false;
-        }
-        // stringForKey: returns nil for absent keys (Light mode default).
-        let value_ns: *mut AnyObject = msg_send![defaults, stringForKey: key_ns];
-        if value_ns.is_null() {
-            return false;
-        }
-        let c_str: *const i8 = msg_send![value_ns, UTF8String];
-        if c_str.is_null() {
-            return false;
-        }
-        let raw = std::ffi::CStr::from_ptr(c_str);
-        let s = raw.to_str().unwrap_or("").trim().to_ascii_lowercase();
-        s == "dark"
+        let key_ns: *mut AnyObject = if str_cls.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![str_cls as *const AnyObject, stringWithUTF8String: c_key.as_ptr()]
+        };
+        let value_ns: *mut AnyObject = if defaults.is_null() || key_ns.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg_send![defaults, stringForKey: key_ns]
+        };
+        appearance_from_parts(defaults_cls, str_cls, defaults, key_ns, value_ns)
     })
 }
 

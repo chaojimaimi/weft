@@ -204,8 +204,18 @@ impl Terminal {
         let Some(document_start) = self.block_tracker.screen_document_start() else {
             return;
         };
+        // v1.11.12 (PLAN_v11112 M-A): per-refresh phase timings (document walk
+        // / space-tail / compose / publish). The four Instant reads are
+        // negligible; the SNAPSHOT_PHASES line itself (including the O(n)
+        // line count) is only materialized when DEBUG is enabled, so
+        // production logs stay silent and `--nocapture`/RUST_LOG=debug can
+        // still attribute refresh cost. The aggregate feeds the .13
+        // representation-layer decision (frozen head/tail split).
+        let walk_start = Instant::now();
         let (text, styled, cursor_line) = self.primary_screen_document_snapshot(document_start);
+        let after_walk = Instant::now();
         let (text, styled) = space_primary_screen_exit_tail(text, styled);
+        let after_tail = Instant::now();
         // v1.10.23 (FIX_OMP_CONTENT_LOSS): prepend the preserved superseded
         // frames so the block transcript stays complete across full-frame
         // repaints; the cursor line shifts by the prepended history.
@@ -213,7 +223,22 @@ impl Terminal {
         // between the frames and the snapshot.
         let segment_len = text.len();
         let (text, styled) = self.compose_screen_history(text, styled);
+        let after_compose = Instant::now();
+        let composed_lines = tracing::enabled!(tracing::Level::DEBUG).then(|| text.lines().count());
         self.publish_screen_snapshot(text, styled, segment_len);
+        let after_publish = Instant::now();
+        if let Some(lines) = composed_lines {
+            let us = |from: Instant, to: Instant| (to - from).as_micros() as u64;
+            tracing::debug!(
+                "SNAPSHOT_PHASES walk={} tail={} compose={} publish={} total={} lines={}",
+                us(walk_start, after_walk),
+                us(after_walk, after_tail),
+                us(after_tail, after_compose),
+                us(after_compose, after_publish),
+                us(walk_start, after_publish),
+                lines,
+            );
+        }
         // v1.10.6/25/26 (FIX_IME_PREEDIT): store the caret snapshot line
         // AFTER publish from the composed text actually written
         // (`freeze::composed_cursor_snapshot_line`) — pre-split offsets or

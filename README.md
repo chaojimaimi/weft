@@ -34,6 +34,8 @@ Interactive throughput (2026-08-17 manual 3-run avg; both columns same methodolo
 
 Automated baselines (2026-08-29, Apple M2 Max, macOS 26.6.2, release build — full data in `docs/perf/v1.11.9-baseline.md`): VT parse 14.6–20.6 MB/s (100k/1M lines), block visible-window render p95 ≤0.15ms at 100k lines, 10k history filter 15.3ms, offscreen Metal frame p95 ≤0.68ms, GUI idle CPU frame p95 0.48ms. Cold start ~0.39s to first frame (bundled, warm; gate protocol p95 456ms on the bare binary) — exceeded the legacy 0.30s budget set against the v1.10.3-era codebase; waiver and attribution recorded in the baseline doc, optimization queued for v1.12.
 
+Cold-start budget: 485ms p95 (bare release binary, fresh config; bundled warm typically lower). Protocol: `scripts/performance_gate.sh` samples 20 sequential launches of the bare `target/release/weft` binary, each with an isolated fresh `XDG_CACHE_HOME`/`XDG_CONFIG_HOME`, and takes the nearest-rank p95 of `first_frame_ms`. The 485ms figure was rescaled in v1.11.12 from measured data (max(ceil(p95×1.1), 300), cap 500 — see `scripts/performance_gate.sh`); per-phase attribution lives in the plan report (`docs/PLAN_v11112_SNAPSHOT_COST_COLDSTART.md` M-B).
+
 Optimizations: CPU VT parser fast-path (ASCII batch), GPU instance rendering with triple-buffered vertex ring, dirty-rect culling, glyph atlas ASCII direct-index.
 
 ## Build

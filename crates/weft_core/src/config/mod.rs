@@ -466,17 +466,23 @@ impl Config {
             }
         }
 
+        // v1.11.12 (PLAN_v11112 M-E): skip ledger — nested defensive skips
+        // (a hand-written scalar where a table belongs) are collected by the
+        // save:: writers and surfaced once below; the external save signature
+        // is unchanged (F9).
+        let mut skipped: Vec<&'static str> = Vec::new();
+
         // [ai] section — v1.6 AI integration. Implementation lives in
         // `save::write_ai_section` to keep this file within its
         // architecture-gate line budget.
-        save::write_ai_section(&mut doc, &self.ai);
+        save::write_ai_section(&mut doc, &self.ai, &mut skipped);
 
         // [paste] section — v1.11.1 large-paste protection
         // (PLAN_v1111 §4.2). Same line-budget rationale as [ai].
-        save::write_paste_section(&mut doc, &self.paste);
+        save::write_paste_section(&mut doc, &self.paste, &mut skipped);
 
         // [blocks] section — v1.11.2 X4 retention cap (PLAN_v1112 §1.2).
-        save::write_blocks_section(&mut doc, &self.blocks);
+        save::write_blocks_section(&mut doc, &self.blocks, &mut skipped);
 
         // [compat] section — v1.11.3 (PLAN_v1113 §3.3); v1.11.4 adds
         // `kitty_keyboard` (PLAN_v1114 §3). Inline like the [logo] block
@@ -611,7 +617,15 @@ impl Config {
         // v1.5.0: active_profile + profiles. Lives in `save::write_*` to
         // keep this file within its architecture-gate budget.
         save::write_active_profile(&mut doc, &self.active_profile);
-        save::write_profiles(&mut doc, self);
+        save::write_profiles(&mut doc, self, &mut skipped);
+
+        // v1.11.12 (PLAN_v11112 M-E): surface any skipped segments. Only
+        // reachable with a hand-broken TOML file (parse_existing already
+        // rejects scalar TOP-LEVEL sections), so this is diagnostics, not a
+        // normal path — the skipped content survives on disk untouched.
+        if !skipped.is_empty() {
+            tracing::warn!("config save skipped sections: {:?}", skipped);
+        }
 
         // Atomic write: <path>.tmp → rename → <path>.
         let parent = path.parent().ok_or(ConfigSaveError::NoParentDir)?;

@@ -449,7 +449,14 @@ impl App {
                             crate::macos_alert::RecoveryChoice::Ignore
                         }
                     };
-                    let _ = proxy.send_event(AppEvent::RecoveryChosen(choice));
+                    // v1.11.12 (PLAN_v11112 M-C): decision-loop send — a
+                    // failure here leaves the recovery prompt choice undelivered
+                    // and startup recovery pending forever, so it must leave a
+                    // trace (unlike the by-design-silent wakeups).
+                    // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+                    if let Err(e) = proxy.send_event(AppEvent::RecoveryChosen(choice)) {
+                        warn!(error = %e, "send_event failed: recovery choice lost; startup recovery stays pending");
+                    }
                 });
                 info!(
                     age_secs = age_secs,

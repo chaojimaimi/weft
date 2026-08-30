@@ -39,6 +39,14 @@ use super::screen_exit::{
 pub(in crate::vt) struct ScreenHistory {
     pub(in crate::vt) text: String,
     pub(in crate::vt) styled: Option<StyledOutput>,
+    /// v1.11.12 (PLAN_v11112 M-A): line-count ledger for `text`, maintained at
+    /// every mutation point (append in `freeze::append_screen_history_frame`,
+    /// trim in `freeze::trim_screen_history`, reset via `ScreenHistory::default`
+    /// in `capture::begin_primary_screen_output_capture`). Semantics identical
+    /// to the old O(n) recompute: `text.matches('\n').count() +
+    /// usize::from(!text.is_empty())`. Invariant tests pin counter == recompute
+    /// at every mutation point (`vt/screen_exit/tests.rs`).
+    pub(in crate::vt) line_count: usize,
 }
 
 /// Aggregated capability + primary-screen lifecycle state.

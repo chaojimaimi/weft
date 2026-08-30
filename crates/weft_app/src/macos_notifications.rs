@@ -382,7 +382,16 @@ fn handle_notification_response(
     if let Some(block_id) = block_id {
         if let Some(proxy) = NOTIFICATION_PROXY.get() {
             dispatch2::DispatchQueue::main().exec_async(move || {
-                let _ = proxy.send_event(AppEvent::NotificationActivated(block_id));
+                // v1.11.12 (PLAN_v11112 M-C): a failure here silently drops
+                // the notification click (no jump to the command block).
+                // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+                if let Err(e) = proxy.send_event(AppEvent::NotificationActivated(block_id)) {
+                    tracing::warn!(
+                        error = %e,
+                        block_id,
+                        "send_event failed: notification click lost"
+                    );
+                }
             });
         }
     }

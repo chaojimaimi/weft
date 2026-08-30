@@ -108,7 +108,14 @@ declare_class!(
                 let tag: isize = unsafe { msg_send![sender, tag] };
                 if let Some(action) = action_from_isize(tag) {
                     if let Some(proxy) = MENU_PROXY.get() {
-                        let _ = proxy.send_event(AppEvent::MenuAction(action));
+                        // v1.11.12 (PLAN_v11112 M-C): decision-loop send — a
+                        // failure silently drops the menu action. The warn
+                        // runs before the catch_unwind boundary, so it still
+                        // lands if a later panic is captured.
+                        // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+                        if let Err(e) = proxy.send_event(AppEvent::MenuAction(action)) {
+                            tracing::warn!(error = %e, "send_event failed: menu action lost");
+                        }
                     }
                 }
             }));
@@ -122,7 +129,12 @@ declare_class!(
         #[method(weftQuit:)]
         fn weft_quit(&self, _sender: &AnyObject) {
             if let Some(proxy) = MENU_PROXY.get() {
-                let _ = proxy.send_event(AppEvent::QuitRequested);
+                // v1.11.12 (PLAN_v11112 M-C): decision-loop send — a failure
+                // silently drops the quit request.
+                // (if-let instead of inspect_err: MSRV 1.75 < 1.76)
+                if let Err(e) = proxy.send_event(AppEvent::QuitRequested) {
+                    tracing::warn!(error = %e, "send_event failed: quit request lost");
+                }
             }
         }
     }
