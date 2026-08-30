@@ -15,7 +15,7 @@
 
 use crate::effect::Effect;
 use crate::{clipboard_copy, clipboard_paste, warn};
-use tracing::info;
+use tracing::{debug, info};
 use weft_core::input::{
     classify_paste, contains_dangerous_control_chars, encode_paste, format_byte_count,
     paste_preview, PasteRisk,
@@ -31,13 +31,22 @@ const PASTE_PROMPT_PREVIEW_CHARS: usize = 80;
 pub(crate) const PASTE_TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// v1.11.1: a paste parked while its confirmation dialog is on screen.
-/// Consumed exactly once via `take` in [`App::apply_paste_decision`]; the
-/// tab index uses the same identity as `Effect::Paste { tab }`.
+/// Consumed exactly once via the seq-matched take in
+/// [`App::apply_paste_decision`]; `session_id` uses the same identity as
+/// `Effect::Paste { session_id }` and `seq` pairs each park with its own
+/// dialog reply (v1.11.11 M-B — a stale reply can never consume a newer
+/// park, and a closed tab drops the parked paste instead of re-targeting).
 pub(crate) struct PendingPaste {
-    pub(crate) tab: usize,
+    pub(crate) session_id: u64,
+    pub(crate) seq: u64,
     pub(crate) text: String,
     pub(crate) risk: PasteRisk,
 }
+
+/// v1.11.11 (M-B): paste-request sequence allocator. Each park consumes one
+/// seq; the deferred dialog carries it back in `AppEvent::PasteDecided` so
+/// the decision pairs with the exact park that spawned it.
+static NEXT_PASTE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// v1.11.1: what to do with a parked paste after the user decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,11 +76,20 @@ pub(crate) fn resolve_pending_paste(
     }
 }
 
-/// v1.11.1: exactly-once consumption of the parked paste (mirrors
-/// `recovery_controller::take_pending_recovery`; a duplicated decision event
-/// finds `None` and becomes a logged no-op).
-fn take_pending_paste(pending: &mut Option<PendingPaste>) -> Option<PendingPaste> {
-    pending.take()
+/// v1.11.1: exactly-once consumption of the parked paste, paired by seq
+/// (v1.11.11 M-B, mirroring the OSC52 `take_pending_if_seq_matches` pattern
+/// in app/ui_events.rs — a stale decision is ignored AND the slot stays
+/// occupied; do NOT copy the pre-M-B unconditional take). A duplicated
+/// decision event finds no matching seq and becomes a logged no-op.
+fn take_pending_paste_if_seq_matches(
+    pending: &mut Option<PendingPaste>,
+    seq: u64,
+) -> Option<PendingPaste> {
+    match pending {
+        Some(parked) if parked.seq == seq => pending.take(),
+        Some(_) => None, // stale — leave the newer park in place
+        None => None,
+    }
 }
 
 /// v1.11.1: toast eligibility — only pastes that actually executed AND meet
@@ -104,80 +122,118 @@ impl crate::App {
     pub(crate) fn drain_effects(&mut self, effects: impl IntoIterator<Item = Effect>) {
         for effect in effects {
             match effect {
-                Effect::WritePty { tab, bytes } => {
-                    if let Some(session) = self.sessions.tab_mut(tab) {
-                        let session_id = session.session_id;
-                        let input_seq = session.input_seq();
-                        let (screen_owner, settle_state, history_snapshot_due) = session
-                            .terminal
-                            .as_ref()
-                            .map(|t| (t.screen_owner(), t.settle_state(), t.history_snapshot_due()))
-                            .unwrap_or((
-                                weft_core::vt::ScreenOwner::Shell,
-                                weft_core::vt::SettleState::Idle,
-                                false,
-                            ));
-                        tracing::debug!(
-                            session_id,
-                            input_seq,
-                            tab,
-                            bytes_len = bytes.len(),
-                            %screen_owner,
-                            %settle_state,
-                            history_snapshot_due,
-                            delivery = "pty-write",
-                            "effect dispatched",
-                        );
-                        if let Err(error) = session.write_user_input(&bytes) {
-                            warn!(%error, tab, "failed to apply PTY write effect");
+                Effect::WritePty { session_id, bytes } => {
+                    // v1.11.11 (M-B): effects carry the stable session id; the
+                    // drain reverse-looks-up the current tab index. A closed
+                    // tab means the effect is stale — dropping it fixes the
+                    // previous silent mis-delivery (index shifts re-targeted
+                    // old effects into unrelated sessions).
+                    if let Some(tab) = self.sessions.tab_index_by_session_id(session_id) {
+                        if let Some(session) = self.sessions.tab_mut(tab) {
+                            let input_seq = session.input_seq();
+                            let (screen_owner, settle_state, history_snapshot_due) = session
+                                .terminal
+                                .as_ref()
+                                .map(|t| {
+                                    (t.screen_owner(), t.settle_state(), t.history_snapshot_due())
+                                })
+                                .unwrap_or((
+                                    weft_core::vt::ScreenOwner::Shell,
+                                    weft_core::vt::SettleState::Idle,
+                                    false,
+                                ));
+                            tracing::debug!(
+                                session_id,
+                                input_seq,
+                                tab,
+                                bytes_len = bytes.len(),
+                                %screen_owner,
+                                %settle_state,
+                                history_snapshot_due,
+                                delivery = "pty-write",
+                                "effect dispatched",
+                            );
+                            if let Err(error) = session.write_user_input(&bytes) {
+                                warn!(%error, tab, "failed to apply PTY write effect");
+                            }
                         }
+                    } else {
+                        warn!(
+                            session_id,
+                            bytes_len = bytes.len(),
+                            "dropping stale WritePty effect: no tab owns the session"
+                        );
                     }
                 }
-                Effect::InterruptPty { tab } => {
-                    if let Some(session) = self.sessions.tab_mut(tab) {
-                        let session_id = session.session_id;
-                        let input_seq = session.input_seq();
-                        let (screen_owner, settle_state, history_snapshot_due) = session
-                            .terminal
-                            .as_ref()
-                            .map(|t| (t.screen_owner(), t.settle_state(), t.history_snapshot_due()))
-                            .unwrap_or((
-                                weft_core::vt::ScreenOwner::Shell,
-                                weft_core::vt::SettleState::Idle,
-                                false,
-                            ));
-                        tracing::debug!(
-                            session_id,
-                            input_seq,
-                            tab,
-                            %screen_owner,
-                            %settle_state,
-                            history_snapshot_due,
-                            delivery = "pty-etx",
-                            "interrupt effect dispatched",
-                        );
-                        let delivered = session.interrupt_pty();
-                        if !delivered {
-                            warn!(
+                Effect::InterruptPty { session_id } => {
+                    if let Some(tab) = self.sessions.tab_index_by_session_id(session_id) {
+                        if let Some(session) = self.sessions.tab_mut(tab) {
+                            let input_seq = session.input_seq();
+                            let (screen_owner, settle_state, history_snapshot_due) = session
+                                .terminal
+                                .as_ref()
+                                .map(|t| {
+                                    (t.screen_owner(), t.settle_state(), t.history_snapshot_due())
+                                })
+                                .unwrap_or((
+                                    weft_core::vt::ScreenOwner::Shell,
+                                    weft_core::vt::SettleState::Idle,
+                                    false,
+                                ));
+                            tracing::debug!(
+                                session_id,
+                                input_seq,
                                 tab,
-                                "interrupt delivery failed; preserving PTY output and phase"
+                                %screen_owner,
+                                %settle_state,
+                                history_snapshot_due,
+                                delivery = "pty-etx",
+                                "interrupt effect dispatched",
                             );
+                            let delivered = session.interrupt_pty();
+                            if !delivered {
+                                warn!(
+                                    tab,
+                                    "interrupt delivery failed; preserving PTY output and phase"
+                                );
+                            }
                         }
+                    } else {
+                        warn!(
+                            session_id,
+                            "dropping stale InterruptPty effect: no tab owns the session"
+                        );
                     }
                 }
                 Effect::ResizePty {
-                    tab,
+                    session_id,
                     pane_id,
                     rows,
                     cols,
                 } => {
-                    self.apply_pty_resize_effect(tab, pane_id, rows, cols);
+                    if let Some(tab) = self.sessions.tab_index_by_session_id(session_id) {
+                        self.apply_pty_resize_effect(tab, pane_id, rows, cols);
+                    } else {
+                        warn!(
+                            session_id,
+                            "dropping stale ResizePty effect: no tab owns the session"
+                        );
+                    }
                 }
                 Effect::CopyClipboard { text } => clipboard_copy(&text),
                 Effect::PersistTabs => self.save_all_tabs(),
                 Effect::PersistBlocks { blocks } => self.persist_blocks(&blocks),
                 Effect::LoadOlderBlocks => self.apply_load_older_blocks(),
-                Effect::Paste { tab } => self.apply_paste(tab),
+                Effect::Paste { session_id } => {
+                    if let Some(tab) = self.sessions.tab_index_by_session_id(session_id) {
+                        self.apply_paste(tab);
+                    } else {
+                        warn!(
+                            session_id,
+                            "dropping stale Paste effect: no tab owns the session"
+                        );
+                    }
+                }
                 Effect::Exit => self.should_exit = true,
                 Effect::TabClosed {
                     removed_idx,
@@ -347,10 +403,20 @@ impl crate::App {
     /// is `dispatch2` + `Queue::main().exec_async` + proxy round-trip
     /// (recovery_controller.rs template).
     fn park_and_prompt_paste(&mut self, tab: usize, text: String, risk: PasteRisk) {
+        // v1.11.11 (M-B): the parked paste carries the tab's stable session
+        // id — a tab closed while the dialog is up drops the decision instead
+        // of re-targeting a shifted index. The drain already verified the tab
+        // exists (index came from the session-id reverse lookup), so this
+        // read is defensive-only.
+        let Some(session_id) = self.sessions.tab(tab).map(|t| t.session_id) else {
+            warn!(tab, "paste tab vanished before parking; dropping the paste");
+            return;
+        };
         // Park BEFORE deferring; consumed exactly once by
         // `apply_paste_decision`. A second Cmd+V while a dialog is up parks
         // over it — decisions pair with whatever is parked at that moment,
-        // same contract as the recovery prompt state machine.
+        // same contract as the recovery prompt state machine (each park gets
+        // a fresh seq, so the older dialog's reply is dropped as stale).
         if self.pending_paste_confirm.is_some() {
             warn!("large paste confirmed while another confirmation was in flight; superseding the parked paste");
         }
@@ -361,9 +427,16 @@ impl crate::App {
         );
         let preview = paste_preview(&text, PASTE_PROMPT_PREVIEW_CHARS);
         let bytes = text.len();
-        self.pending_paste_confirm = Some(PendingPaste { tab, text, risk });
+        let seq = NEXT_PASTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pending_paste_confirm = Some(PendingPaste {
+            session_id,
+            seq,
+            text,
+            risk,
+        });
         info!(
-            tab,
+            session_id,
+            seq,
             risk = %risk.label(),
             bytes,
             "large paste parked; prompting off the winit handler"
@@ -390,28 +463,43 @@ impl crate::App {
                     crate::macos_alert::PastePromptResponse::Cancel
                 }
             };
-            let _ = proxy.send_event(crate::AppEvent::PasteDecided(response));
+            let _ = proxy.send_event(crate::AppEvent::PasteDecided { response, seq });
         });
     }
 
     /// v1.11.1: handle the user's paste decision delivered from the deferred
-    /// dialog block. Consumes `pending_paste_confirm` exactly once; a stray
-    /// or duplicated event without a parked paste is a logged no-op.
+    /// dialog block. Consumes the seq-matched parked paste exactly once; a
+    /// stray, duplicated or stale (seq-mismatched) event without a matching
+    /// park is a logged no-op.
     pub(crate) fn apply_paste_decision(
         &mut self,
         response: crate::macos_alert::PastePromptResponse,
+        seq: u64,
     ) {
-        let Some(pending) = take_pending_paste(&mut self.pending_paste_confirm) else {
-            warn!(
+        let Some(pending) = take_pending_paste_if_seq_matches(&mut self.pending_paste_confirm, seq)
+        else {
+            debug!(
                 ?response,
-                "paste decision arrived without a parked paste; ignoring"
+                seq, "paste decision did not match the parked paste's seq; dropped"
+            );
+            return;
+        };
+        // v1.11.11 (M-B): the target tab may have closed while the dialog was
+        // up — drop the decision instead of writing into a shifted index.
+        let Some(tab) = self.sessions.tab_index_by_session_id(pending.session_id) else {
+            warn!(
+                session_id = pending.session_id,
+                seq,
+                ?response,
+                "paste target tab closed while the confirmation was pending; discarding"
             );
             return;
         };
         match resolve_pending_paste(response) {
             PasteOutcome::Discard => {
                 info!(
-                    tab = pending.tab,
+                    session_id = pending.session_id,
+                    seq,
                     bytes = pending.text.len(),
                     ?pending.risk,
                     "large paste cancelled; discarded without writing"
@@ -422,13 +510,14 @@ impl crate::App {
                     self.paste_allow_for_session = true;
                 }
                 info!(
-                    tab = pending.tab,
+                    session_id = pending.session_id,
+                    seq,
                     bytes = pending.text.len(),
                     ?pending.risk,
                     grant_session,
                     "large paste approved"
                 );
-                self.apply_paste_text_with_toast(pending.tab, &pending.text);
+                self.apply_paste_text_with_toast(tab, &pending.text);
             }
         }
     }
@@ -613,14 +702,15 @@ impl crate::App {
 #[cfg(test)]
 mod paste_guard_tests {
     use super::{
-        paste_toast_eligible, paste_toast_expired, resolve_pending_paste, take_pending_paste,
-        PasteOutcome, PendingPaste, PASTE_TOAST_TTL,
+        paste_toast_eligible, paste_toast_expired, resolve_pending_paste,
+        take_pending_paste_if_seq_matches, PasteOutcome, PendingPaste, PASTE_TOAST_TTL,
     };
     use crate::macos_alert::PastePromptResponse;
 
-    fn pending(tab: usize) -> Option<PendingPaste> {
+    fn pending(session_id: u64, seq: u64) -> Option<PendingPaste> {
         Some(PendingPaste {
-            tab,
+            session_id,
+            seq,
             text: "payload".to_string(),
             risk: weft_core::input::PasteRisk::Large,
         })
@@ -648,37 +738,74 @@ mod paste_guard_tests {
         );
     }
 
-    // ── park/take exactly-once state machine ───────────────────────────
+    // ── park/take exactly-once state machine (v1.11.11: seq-paired) ────
 
     #[test]
     fn parked_paste_is_consumed_exactly_once_and_stray_decisions_are_noops() {
-        // None → Some: park while the deferred prompt is on screen.
-        let mut slot = pending(3);
+        // None → Some: park while the deferred prompt is on screen (seq 1).
+        let mut slot = pending(3, 1);
         assert!(slot.is_some());
 
-        // Some → None: the first decision consumes it.
-        let consumed = take_pending_paste(&mut slot);
-        assert_eq!(consumed.as_ref().map(|p| p.tab), Some(3));
+        // Some → None: the first decision with the matching seq consumes it.
+        let consumed = take_pending_paste_if_seq_matches(&mut slot, 1);
+        assert_eq!(consumed.as_ref().map(|p| p.session_id), Some(3));
         assert!(slot.is_none(), "take must empty the slot");
 
         // A duplicated/stray decision event finds nothing — no double apply.
-        assert!(take_pending_paste(&mut slot).is_none());
-        assert!(take_pending_paste(&mut slot).is_none());
+        assert!(take_pending_paste_if_seq_matches(&mut slot, 1).is_none());
+        assert!(take_pending_paste_if_seq_matches(&mut slot, 1).is_none());
     }
 
     #[test]
     fn superseding_a_parked_paste_replaces_the_text_in_place() {
-        let mut slot = pending(0);
-        assert_eq!(slot.as_ref().map(|p| p.tab), Some(0), "first paste parked");
-        // A second Cmd+V while the dialog is up parks over the first.
+        let mut slot = pending(0, 1);
+        assert_eq!(
+            slot.as_ref().map(|p| p.session_id),
+            Some(0),
+            "first paste parked"
+        );
+        // A second Cmd+V while the dialog is up parks over the first with a
+        // fresh seq (2).
         slot = Some(PendingPaste {
-            tab: 2,
+            session_id: 2,
+            seq: 2,
             text: "newer paste".to_string(),
             risk: weft_core::input::PasteRisk::ControlChars,
         });
-        let consumed = take_pending_paste(&mut slot).unwrap();
-        assert_eq!(consumed.tab, 2);
+        // v1.11.11 (M-B): the FIRST dialog's decision (seq 1) is stale — it
+        // must NOT consume the newer park.
+        assert!(
+            take_pending_paste_if_seq_matches(&mut slot, 1).is_none(),
+            "stale decision must leave the newer park in place"
+        );
+        assert!(slot.is_some(), "newer park survives the stale decision");
+        let consumed = take_pending_paste_if_seq_matches(&mut slot, 2).unwrap();
+        assert_eq!(consumed.session_id, 2);
         assert_eq!(consumed.text, "newer paste");
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn stale_seq_drop_never_consumes_a_newer_park() {
+        // One park, one stale decision: taken is None, the park stays for its
+        // own matching decision.
+        let mut slot = Some(PendingPaste {
+            session_id: 7,
+            seq: 4,
+            text: "keep".to_string(),
+            risk: weft_core::input::PasteRisk::Large,
+        });
+        for stale_seq in [1, 2, 3, 5, 99] {
+            assert!(
+                take_pending_paste_if_seq_matches(&mut slot, stale_seq).is_none(),
+                "seq {stale_seq} must be dropped as stale"
+            );
+            assert!(slot.is_some(), "park must survive stale seq {stale_seq}");
+        }
+        // The matching decision applies — carries the parked identity.
+        let applied = take_pending_paste_if_seq_matches(&mut slot, 4).expect("matching seq");
+        assert_eq!(applied.session_id, 7);
+        assert_eq!(applied.text, "keep");
         assert!(slot.is_none());
     }
 

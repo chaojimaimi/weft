@@ -235,6 +235,17 @@ pub struct AttributeSpan {
     /// 2=Double, 3=Wavy, 4=Dotted, 5=Dashed; 0 = absent/legacy and reads as
     /// Single. u8 keeps the persisted JSON shape stable across releases;
     /// `#[serde(default)]` keeps old snapshots (no field → 0) loadable.
+    ///
+    /// v1.11.11 (PLAN_v11111 M-D m5) rollback-direction contract:
+    /// - forward (old reader, new data): serde IGNORES unknown fields, so a
+    ///   snapshot written by a newer build loads in an older binary with the
+    ///   field dropped — the older reader then applies `compat_underline_style`
+    ///   (0/absent → Single), falling back to the behavior it knew.
+    /// - both directions: the u8 encoding is stable (SGR numbering), and
+    ///   `compat_underline_style` maps 0 => Single on every read path, so a
+    ///   value written as Single by a new build reads as Single in the old
+    ///   build and vice versa. The field may never be renumbered or removed
+    ///   without bumping the snapshot schema version.
     #[serde(default)]
     pub underline_style: u8,
 }

@@ -221,7 +221,15 @@ impl App {
                             {
                                 terminal.note_interactive_stdin();
                             }
-                            self.drain_effects(effect::ime_commit_effects(tab, &text));
+                            // v1.11.11 (M-B): Effects carry the stable session
+                            // id; the commit target's index still routes the
+                            // interactive-stdin note above.
+                            if let Some(session) = self.sessions.tab(tab) {
+                                self.drain_effects(effect::ime_commit_effects(
+                                    session.session_id,
+                                    &text,
+                                ));
+                            }
                         }
                     }
                 }

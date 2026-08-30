@@ -293,7 +293,11 @@ impl crate::App {
                 t.note_interactive_stdin();
             }
         }
-        let effects = crate::effect::passthrough_key_effects(self.sessions.active_idx(), bytes);
+        // v1.11.11 (M-B): the Effect family targets the stable session id. The
+        // active tab exists for the whole handler, so forwarding semantics
+        // are unchanged; the drain reverse-looks-up the id at delivery.
+        let effects =
+            crate::effect::passthrough_key_effects(self.sessions.active().session_id, bytes);
         self.drain_effects(effects);
     }
 

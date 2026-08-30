@@ -700,7 +700,7 @@ impl App {
             winit::event::MouseButton::Middle => {
                 // Middle click: paste
                 self.drain_effects(vec![crate::effect::Effect::Paste {
-                    tab: self.sessions.active_idx(),
+                    session_id: self.sessions.active().session_id,
                 }]);
                 let pos = self.pixel_to_grid(x, y);
                 self.send_mouse_event(MouseButton::Middle, MouseAction::Press, pos);

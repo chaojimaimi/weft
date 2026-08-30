@@ -60,10 +60,22 @@ pub(crate) fn underline_rects(
             let p = (cw * 0.5).max(3.0);
             let quads = if width >= 2.0 * p { 8 } else { 4 };
             let seg = width / quads as f32;
+            // v1.11.11 (PLAN_v11111 M-D wavy, architect formula): the level
+            // phase derives from the GLOBAL x0 square wave, not the per-cell
+            // quad index. The old `(i / 2) % 2` pinned a degraded (4-quad)
+            // segment's levels to its own origin, so a narrow cell next to a
+            // standard cell stepped its phase back at the seam. At a cell
+            // start (x0 == column start) the formula reduces to the old
+            // sequence — standard cells and the x0=0 degraded cell keep
+            // their exact levels. `_column` stays reserved for
+            // documentation; it does not participate in the math.
+            let half = p * 0.5;
             for (i, rect) in rects.iter_mut().enumerate().take(quads) {
-                // Square-wave steps: first half of each period rides above
-                // the baseline (−1px), second half below (+1px).
-                let level = if (i / 2) % 2 == 0 { -1.0 } else { 1.0 };
+                let level = if (((x0 + i as f32 * seg) / half).floor() as i64).rem_euclid(2) == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
                 let qx0 = x0 + i as f32 * seg;
                 *rect = [qx0, y0 + level, qx0 + seg, y1 + level];
             }
@@ -197,10 +209,22 @@ mod underline_rects_tests {
         let (r, n) = rects(UnderlineStyle::Wavy, 0.0, CW, CW);
         assert_eq!(n, 8, "2 complete periods = 8 quads");
         let seg = CW / 8.0;
+        // v1.11.11 (M-D wavy): at a cell start (x0 = 0) the global formula
+        // reduces to the original per-quad sequence — levels stay
+        // -1,-1,+1,+1,-1,-1,+1,+1, computed here from the global wave so the
+        // test follows the behavior instead of re-pinning it.
+        let quad_level = |i: usize| -> f32 {
+            let half = (CW * 0.5) * 0.5;
+            if (((i as f32 * seg) / half).floor() as i64).rem_euclid(2) == 0 {
+                -1.0
+            } else {
+                1.0
+            }
+        };
         for (i, q) in r.iter().take(8).enumerate() {
             assert!((q[0] - i as f32 * seg).abs() < 1e-4, "quad {i} x0");
             assert!((q[2] - (i as f32 + 1.0) * seg).abs() < 1e-4, "quad {i} x1");
-            let level = if (i / 2) % 2 == 0 { -1.0 } else { 1.0 };
+            let level = quad_level(i);
             assert!((q[1] - (20.0 + level)).abs() < 1e-4, "quad {i} y0");
             assert!((q[3] - (22.0 + level)).abs() < 1e-4, "quad {i} y1");
         }
@@ -212,11 +236,42 @@ mod underline_rects_tests {
         let (r, n) = rects(UnderlineStyle::Wavy, 0.0, 4.0, 4.0);
         assert_eq!(n, 4, "narrow cell degrades to one period");
         let seg = 4.0 / 4.0;
+        // v1.11.11 (M-D wavy): the degraded segment follows the global
+        // phase. At x0 = 0 the first three quads keep the old levels; the
+        // fourth now continues the global wave (−1 instead of the old +1),
+        // so a neighboring cell's first quad lands on the same level.
+        let expected = [-1.0, -1.0, 1.0, -1.0];
         for (i, q) in r.iter().take(4).enumerate() {
             assert!((q[0] - i as f32 * seg).abs() < 1e-4);
-            let level = if (i / 2) % 2 == 0 { -1.0 } else { 1.0 };
-            assert!((q[1] - (20.0 + level)).abs() < 1e-4);
+            assert!((q[1] - (20.0 + expected[i])).abs() < 1e-4, "quad {i} y0");
+            assert!((q[3] - (22.0 + expected[i])).abs() < 1e-4, "quad {i} y1");
         }
+    }
+
+    #[test]
+    fn wavy_adjacent_narrow_cells_continue_the_global_phase() {
+        // v1.11.11 (M-D wavy): two adjacent degraded cells (cw = 4 → 4
+        // quads each) must keep the global wavelength p = 3 continuous at the
+        // seam — the second cell's levels derive from its absolute x0 (4),
+        // not a restarted phase. The old per-cell index reset the wave at
+        // every grid boundary, painting a visible step between the cells.
+        let (a, na) = rects(UnderlineStyle::Wavy, 0.0, 4.0, 4.0);
+        let (b, nb) = rects(UnderlineStyle::Wavy, 4.0, 4.0, 4.0);
+        assert_eq!(na, 4);
+        assert_eq!(nb, 4);
+        let a_levels: Vec<f32> = a.iter().take(4).map(|q| q[1] - 20.0).collect();
+        let b_levels: Vec<f32> = b.iter().take(4).map(|q| q[1] - 20.0).collect();
+        assert_eq!(a_levels, [-1.0, -1.0, 1.0, -1.0]);
+        // Full-wave readback for cell B: x = 4..8 at half-period 1.5 →
+        // -1,+1,-1,-1 — the levels continue the global square wave.
+        assert_eq!(b_levels, [-1.0, 1.0, -1.0, -1.0]);
+        // Seam continuity: the last quad of cell A and the first quad of
+        // cell B share the seam x = 4 and must ride the same level.
+        assert_eq!(a[3][1], b[0][1], "seam at x=4 must not step the wave");
+        assert!(
+            (a[3][2] - b[0][0]).abs() < 1e-4,
+            "cell B starts where A ends"
+        );
     }
 
     #[test]

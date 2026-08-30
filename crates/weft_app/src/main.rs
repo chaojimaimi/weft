@@ -180,10 +180,14 @@ pub(crate) enum AppEvent {
     /// to a main-queue block, same FIX_RECOVERY_MODAL_SPIN discipline)
     /// closed. Carries the full three-way choice — Cancel / Once /
     /// AlwaysSession — because a bare bool cannot express "paste once"
-    /// versus "discard" (both would be `false`). Handled in
-    /// `App::apply_paste_decision`, which consumes
+    /// versus "discard" (both would be `false`). v1.11.11 (M-B): `seq` pairs
+    /// the reply with the exact parked paste that spawned it. Handled in
+    /// `App::apply_paste_decision`, which consumes the seq-matched
     /// `App.pending_paste_confirm` exactly once.
-    PasteDecided(crate::macos_alert::PastePromptResponse),
+    PasteDecided {
+        response: crate::macos_alert::PastePromptResponse,
+        seq: u64,
+    },
     /// v1.11.5 (PLAN_v1115 §M3): the deferred OSC 52 read prompt closed. The
     /// user's answer pairs with the parked request ONLY when `seq` matches
     /// (peek-compare-take — a stale decision never consumes a newer slot).
@@ -450,7 +454,12 @@ impl App {
             paste_allow_for_session: false,
             search_index: None,
             note_editor: NoteEditorState::default(),
-            completion_worker: completion_worker::CompletionWorker::new(move || {
+            completion_worker: completion_worker::CompletionWorker::new(move |generation| {
+                // v1.11.11 (M-C): the waker now carries the completed
+                // request's generation — kept in the debug log only;
+                // AppEvent::Wake stays payload-less (runbook/AI workers keep
+                // the Fn() form, asymmetry documented in PROGRESS).
+                tracing::debug!(generation, "completion worker wake");
                 let _ = completion_proxy.send_event(AppEvent::Wake);
             }),
             runbook_worker: runbook_controller::RunbookWorker::new(move || {

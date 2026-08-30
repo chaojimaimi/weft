@@ -307,10 +307,13 @@ impl ApplicationHandler<AppEvent> for App {
                 // actually is.
                 self.apply_recovery_choice(choice);
             }
-            AppEvent::PasteDecided(response) => {
+            AppEvent::PasteDecided { response, seq } => {
                 // v1.11.1: deferred paste prompt closed (same
                 // FIX_RECOVERY_MODAL_SPIN discipline as RecoveryChosen).
-                self.apply_paste_decision(response);
+                // v1.11.11 (M-B): the reply pairs with the parked paste via
+                // its seq — a stale dialog response never consumes a newer
+                // park (OSC52 pattern).
+                self.apply_paste_decision(response, seq);
             }
             AppEvent::Osc52ReadDecided { allowed, seq } => {
                 // v1.11.5 (PLAN_v1115 §M3): deferred OSC 52 read permission

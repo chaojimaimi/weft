@@ -64,7 +64,10 @@ pub(crate) struct CompletionWorker {
 }
 
 impl CompletionWorker {
-    pub(crate) fn new(waker: impl Fn() + Send + Sync + 'static) -> Self {
+    // v1.11.11 (M-C): the waker carries the completed request's generation so
+    // the app can correlate wake-ups with generation-filtered results
+    // (flaky-test determinism; AppEvent::Wake itself stays payload-less).
+    pub(crate) fn new(waker: impl Fn(u64) + Send + Sync + 'static) -> Self {
         let (request_tx, request_rx) = bounded::<WorkerRequest>(1);
         let (result_tx, result_rx) = bounded::<CompletionResult>(4);
         let generation = Arc::new(AtomicU64::new(0));
@@ -124,7 +127,7 @@ fn run_worker(
     request_rx: Receiver<WorkerRequest>,
     result_tx: Sender<CompletionResult>,
     stale_result_rx: Receiver<CompletionResult>,
-    waker: Arc<dyn Fn() + Send + Sync>,
+    waker: Arc<dyn Fn(u64) + Send + Sync>,
 ) {
     let filesystem_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
     while let Ok(request) = request_rx.recv() {
@@ -204,7 +207,7 @@ fn run_worker(
             word_end: request.word_end,
             matches,
         });
-        waker();
+        waker(request.generation);
     }
 }
 
@@ -232,8 +235,12 @@ mod tests {
     #[test]
     fn newer_request_cancels_and_replaces_pending_request() {
         let (wake_tx, wake_rx) = std::sync::mpsc::channel();
-        let mut worker = CompletionWorker::new(move || {
-            let _ = wake_tx.send(());
+        // v1.11.11 (M-C): the waker carries the completed request's
+        // generation — the test records the wake sequence and pins the final
+        // wake to the replaced request (gen >= 2), making the cancel/
+        // replace path deterministic.
+        let mut worker = CompletionWorker::new(move |generation| {
+            let _ = wake_tx.send(generation);
         });
         let submit = |prefix: &str| CompletionSubmit {
             pane_session_id: 1,
@@ -261,19 +268,35 @@ mod tests {
         // transient states under production race semantics — filtered, not
         // failed.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut wakes_seen: Vec<u64> = Vec::new();
         let result = 'outer: loop {
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .expect("flaky-test timeout: gen-2 result did not arrive within 2s");
-            wake_rx
-                .recv_timeout(remaining)
-                .expect("worker did not wake");
+            wakes_seen.push(
+                wake_rx
+                    .recv_timeout(remaining)
+                    .expect("worker did not wake"),
+            );
             while let Some(r) = worker.try_recv() {
                 if r.generation == generation {
                     break 'outer r;
                 }
             }
         };
+        // v1.11.11 (M-C): the replaced request's wake (generation >= 2) is
+        // guaranteed to be in the channel once its result was consumed — the
+        // worker sends the wake AFTER the result, and the channel is
+        // unbounded. Drain any wake still in flight: the assertion pins that
+        // the waker carries the generation (gen-1 may legitimately be the
+        // last RECEIVED wake when both results were already queued).
+        while let Ok(gen) = wake_rx.try_recv() {
+            wakes_seen.push(gen);
+        }
+        assert!(
+            wakes_seen.iter().any(|&gen| gen >= 2),
+            "a wake must carry the replaced request's generation (>= 2); saw {wakes_seen:?}"
+        );
         assert_eq!(result.generation, generation);
         assert!(result
             .matches

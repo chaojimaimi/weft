@@ -107,11 +107,25 @@ pub fn xtgettcap_negative_replies(payload: &[u8]) -> Vec<Vec<u8>> {
 
 /// v1.11.3 DECRQSS (PLAN_v1113 §2.2): refused answer for an unanswerable
 /// query — `DCS 0 $ r <pt> ST`, echoing the query string per DECRQSS.
+///
+/// v1.11.11 (PLAN_v11111 M-D m2): C0 bytes (0x00-0x1F) and DEL are stripped
+/// from the echoed payload before it is written back to the PTY — an
+/// unfiltered echo of collected control bytes would re-inject them into the
+/// client. 0x1b cannot actually appear in a fully collected DCS payload
+/// (vte terminates the sequence at the ESC of ST), so its exclusion is
+/// defense in depth, not a format change: printable bytes and >= 0x80 bytes
+/// pass through untouched, keeping every legal DECRQSS answer byte-identical.
 #[must_use]
 pub fn decrqss_refused_reply(payload: &[u8]) -> Vec<u8> {
     let mut reply = Vec::with_capacity(payload.len() + 6);
     reply.extend_from_slice(b"\x1bP0$r");
-    reply.extend_from_slice(payload);
+    reply.extend_from_slice(
+        &payload
+            .iter()
+            .copied()
+            .filter(|b| *b >= 0x20 && *b != 0x7f)
+            .collect::<Vec<u8>>(),
+    );
     reply.extend_from_slice(b"\x1b\\");
     reply
 }
@@ -461,6 +475,35 @@ mod tests {
         let (kind, payload) = c.finish().expect("DECRQSS request must answer");
         assert_eq!(kind, DcsQueryKind::Decrqss);
         assert_eq!(payload, b"m");
+    }
+
+    // ── v1.11.11 (PLAN_v11111 M-D m2): refused-reply C0 stripping ────────
+
+    #[test]
+    fn decrqss_refused_reply_strips_c0_and_del_from_payload() {
+        // Bell and SOH bytes collected around query text must NOT be echoed
+        // back into the PTY as literal controls.
+        let reply = decrqss_refused_reply(b"\x07abc\x01");
+        assert_eq!(reply, b"\x1bP0$rabc\x1b\\");
+        // The DCS/ST framing intentionally contains ESC — check only the
+        // echoed body between the introducer and the terminator.
+        let body = &reply[5..reply.len() - 2];
+        assert!(
+            !body.iter().any(|b| *b < 0x20 || *b == 0x7f),
+            "echoed body must contain no C0/DEL bytes"
+        );
+    }
+
+    #[test]
+    fn decrqss_refused_reply_keeps_printables_and_high_bytes_untouched() {
+        // Printable bytes (>= 0x20, != 0x7f) and >= 0x80 bytes pass through
+        // verbatim — the legal-answer format is unchanged.
+        let payload: &[u8] = &[b'4', b':', 0x7f, b'3', 0x80, 0xff, b'm'];
+        let reply = decrqss_refused_reply(payload);
+        assert_eq!(reply, b"\x1bP0$r4:3\x80\xffm\x1b\\");
+        // The `m` probe — the ONLY legal DECRQSS payload — is byte-identical
+        // to the pre-m2 answer (payload == b"m" never contains C0).
+        assert_eq!(decrqss_refused_reply(b"m"), b"\x1bP0$rm\x1b\\");
     }
 
     #[test]

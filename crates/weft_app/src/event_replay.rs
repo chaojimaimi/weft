@@ -218,11 +218,29 @@ mod tests {
     }
 
     impl ReplayState {
+        /// v1.11.11 (M-B, architect P1-2): the fake tabs get DETERMINISTIC
+        /// session ids. `Tab::empty()` allocates from the process-global
+        /// `NEXT_SESSION_ID`, which is nondeterministic across parallel test
+        /// runs — the harness overrides each tab's id and tests read ids back
+        /// through [`Self::session_id`] instead of asserting literals.
         fn with_tabs(count: usize) -> Self {
+            let mut tabs: Vec<Tab> = (0..count).map(|_| Tab::empty()).collect();
+            for (index, tab) in tabs.iter_mut().enumerate() {
+                tab.session_id = Self::session_id(index);
+            }
             Self {
-                tabs: (0..count).map(|_| Tab::empty()).collect(),
+                tabs,
                 ..Self::default()
             }
+        }
+
+        /// Deterministic read-back of the harness session id for a tab index.
+        /// Out-of-range indices yield an id no fake tab owns, so
+        /// reverse-lookup consumers (the rewritten `tab_exists` filter)
+        /// naturally resolve to `None` — the same shape a closed tab takes.
+        fn session_id(tab: usize) -> u64 {
+            const HARNESS_SESSION_ID_BASE: u64 = 70_000;
+            HARNESS_SESSION_ID_BASE + tab as u64
         }
 
         fn dispatch(&mut self, input: ImeInput, owner: Option<OverlayInputOwner>, mode: InputMode) {
@@ -266,13 +284,21 @@ mod tests {
                             }
                         }
                         ImeCommitTarget::Pty { tab } => {
-                            let tab_exists = self.tabs.get(tab).is_some();
-                            self.effects
-                                .extend(ime_commit_effects(tab, &text).into_iter().filter(
+                            // v1.11.11 (M-B): the effect carries the session
+                            // id; the existence filter mirrors the drain's
+                            // reverse lookup (a session id no fake tab owns
+                            // — a closed tab — drops the WritePty).
+                            let session_id = Self::session_id(tab);
+                            let session_tab =
+                                self.tabs.iter().position(|t| t.session_id == session_id);
+                            self.effects.extend(
+                                ime_commit_effects(session_id, &text).into_iter().filter(
                                     |effect| {
-                                        tab_exists || !matches!(effect, Effect::WritePty { .. })
+                                        session_tab.is_some()
+                                            || !matches!(effect, Effect::WritePty { .. })
                                     },
-                                ));
+                                ),
+                            );
                         }
                     },
                 }
@@ -317,7 +343,7 @@ mod tests {
                 return;
             };
             let bytes = tab.input_handler.encode_key(key, mods);
-            let effects = passthrough_key_effects(self.active_tab, bytes);
+            let effects = passthrough_key_effects(tab.session_id, bytes);
             self.effects.extend(effects);
         }
     }
@@ -346,7 +372,7 @@ mod tests {
             replay.effects,
             [
                 Effect::WritePty {
-                    tab: 1,
+                    session_id: ReplayState::session_id(1),
                     bytes: "新输入".as_bytes().to_vec(),
                 },
                 Effect::RequestRedraw,
@@ -443,6 +469,29 @@ mod tests {
         assert_eq!(replay.effects, [Effect::RequestRedraw]);
     }
 
+    // v1.11.11 (M-B): a Pty commit whose session id no fake tab owns (the
+    // session was "closed") drops the WritePty while the redraw survives —
+    // mirrors the drain's reverse-lookup drop for stale effects.
+    #[test]
+    fn commit_targeting_a_closed_session_drops_write_pty_but_keeps_redraw() {
+        let mut replay = ReplayState::with_tabs(2);
+        // active_tab 5 is past the live tabs — the commit target's session id
+        // (70_005) is owned by no tab, exactly like a tab closed while the
+        // effect was in flight.
+        replay.active_tab = 5;
+        replay.dispatch(
+            ImeInput::Commit("孤儿".into()),
+            None,
+            InputMode::Passthrough,
+        );
+        assert_eq!(
+            replay.effects,
+            [Effect::RequestRedraw],
+            "WritePty for a closed session must be dropped, redraw kept"
+        );
+        assert!(replay.editor_commits.is_empty());
+    }
+
     #[test]
     fn empty_commit_only_clears_preedit_and_editor_commit_keeps_tab_identity() {
         let mut replay = ReplayState::with_tabs(2);
@@ -532,7 +581,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 1,
+                session_id: ReplayState::session_id(1),
                 bytes: b"a".to_vec(),
             }]
         );
@@ -544,7 +593,12 @@ mod tests {
         replay.dispatch_keyboard(KeyCode::Char('c'), Modifiers::CONTROL);
         assert_eq!(
             replay.effects,
-            [Effect::InterruptPty { tab: 0 }, Effect::RequestRedraw]
+            [
+                Effect::InterruptPty {
+                    session_id: ReplayState::session_id(0)
+                },
+                Effect::RequestRedraw,
+            ]
         );
     }
 
@@ -562,7 +616,7 @@ mod tests {
             assert_eq!(
                 replay.effects,
                 [Effect::WritePty {
-                    tab: 0,
+                    session_id: ReplayState::session_id(0),
                     bytes: vec![0x1b, b'[', suffix],
                 }],
                 "key={key:?}"
@@ -577,7 +631,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: vec![0x1b, b'O', b'P'],
             }]
         );
@@ -590,7 +644,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: b"\x1b[15~".to_vec(),
             }]
         );
@@ -603,7 +657,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: vec![0x1b, b'a'],
             }]
         );
@@ -616,7 +670,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: b"\x1b[Z".to_vec(),
             }]
         );
@@ -629,7 +683,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: b"\r".to_vec(),
             }]
         );
@@ -645,11 +699,11 @@ mod tests {
             replay.effects,
             [
                 Effect::WritePty {
-                    tab: 0,
+                    session_id: ReplayState::session_id(0),
                     bytes: b"x".to_vec(),
                 },
                 Effect::WritePty {
-                    tab: 2,
+                    session_id: ReplayState::session_id(2),
                     bytes: b"y".to_vec(),
                 },
             ]
@@ -673,11 +727,11 @@ mod tests {
             replay.effects,
             [
                 Effect::WritePty {
-                    tab: 0,
+                    session_id: ReplayState::session_id(0),
                     bytes: vec![0x01],
                 },
                 Effect::WritePty {
-                    tab: 0,
+                    session_id: ReplayState::session_id(0),
                     bytes: vec![0x1a],
                 },
             ]
@@ -691,7 +745,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: vec![0x1b],
             }]
         );
@@ -704,7 +758,7 @@ mod tests {
         assert_eq!(
             replay.effects,
             [Effect::WritePty {
-                tab: 0,
+                session_id: ReplayState::session_id(0),
                 bytes: vec![0x7f],
             }]
         );

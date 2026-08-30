@@ -30,7 +30,7 @@ impl crate::App {
             }
             Action::Paste => {
                 self.drain_effects(vec![Effect::Paste {
-                    tab: self.sessions.active_idx(),
+                    session_id: self.sessions.active().session_id,
                 }]);
                 true
             }

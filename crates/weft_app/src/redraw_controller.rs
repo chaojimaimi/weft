@@ -148,10 +148,13 @@ impl App {
             .sessions
             .tabs()
             .iter()
-            .map(|tab| tab.pending_pane_resizes())
+            .map(|tab| (tab.session_id, tab.pending_pane_resizes()))
             .collect();
-        let resize_effects =
-            effect::pending_resize_effects(&pending, self.sessions.active_idx(), cascade_settled);
+        let resize_effects = effect::pending_resize_effects(
+            &pending,
+            self.sessions.active().session_id,
+            cascade_settled,
+        );
         self.drain_effects(resize_effects);
 
         // v0.9 H1: borrow the active Tab once and access its fields
