@@ -350,19 +350,47 @@ pub(crate) fn block_content_metrics_with_cache(
     (total, terminal.grid().num_rows.max(1))
 }
 
-/// v1.10.5: 把 grid 光标行映射进 live 块快照(`document_start .. grid end`):
-/// `line_count - grid_rows + cursor_row`,BlockView paint(caret/IME preedit)
-/// 与原生 IME anchor 共用同一 document 行。
-/// v1.10.6: 快照短于视口时,钳制到最后一行 live 文本,避免 caret/preedit 消失。
-pub(crate) fn block_view_tui_cursor_line(
+/// v1.11.14 (password caret): the BlockView caret anchor plus whether the
+/// grid cursor row maps to a MATERIALIZED live text line. When the second
+/// element is false, the cursor sits on a trailing empty row the live
+/// document does not carry — password readers (privilege helpers, ssh,
+/// su) disable echo and emit their own newline, parking the cursor on an
+/// empty row below the last output line. The caller must then anchor the
+/// caret at the END of that last line (`block_view_line_end_col`) instead
+/// of the raw grid column, which is 0 after CRLF and historically jumped
+/// the caret to the FRONT of the prompt text.
+/// v1.10.5 lineage: `line_count - grid_rows + cursor_row` maps the grid
+/// cursor row into the live block snapshot (`document_start .. grid
+/// end`); BlockView paint (caret/IME preedit) and the native IME anchor
+/// share this document line. v1.10.6: a snapshot shorter than the
+/// viewport clamps to the last live text line so the caret/preedit never
+/// disappears.
+pub(crate) fn block_view_tui_cursor_anchor(
     live_line_count: usize,
     grid_rows: usize,
     cursor_row: usize,
-) -> usize {
-    let mapped = live_line_count
+) -> (usize, bool) {
+    let unclamped = live_line_count
         .saturating_sub(grid_rows)
         .saturating_add(cursor_row);
-    mapped.min(live_line_count.saturating_sub(1))
+    let line = unclamped.min(live_line_count.saturating_sub(1));
+    (line, unclamped < live_line_count)
+}
+
+/// v1.11.14: display column (cells) one past the last glyph of live text
+/// line `line` — the caret anchor when the grid cursor row is not
+/// materialized. Per-char widths follow the `block_match_visual_ranges`
+/// convention so the column aligns with the painted glyphs (CJK = 2).
+pub(crate) fn block_view_line_end_col(output: &str, line: usize) -> usize {
+    output
+        .lines()
+        .nth(line)
+        .map(|l| {
+            l.chars()
+                .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// v1.10.5: 仅 LIVE 行(block_id=None)可挂 TUI caret/IME preedit;已完成块用
@@ -437,36 +465,63 @@ mod tests {
     use weft_core::blocks::{Block, BlockId};
 
     #[test]
-    fn tui_cursor_line_maps_viewport_row_into_snapshot() {
+    fn tui_cursor_anchor_maps_viewport_row_into_snapshot() {
         // v1.10.5: 快照跨 document_start..grid end,光标快照行 = line_count - grid_rows + cursor_row。
         assert_eq!(
-            block_view_tui_cursor_line(34, 34, 33),
-            33,
+            block_view_tui_cursor_anchor(34, 34, 33),
+            (33, true),
             "bottom row maps to the last snapshot line"
         );
         assert_eq!(
-            block_view_tui_cursor_line(34, 34, 0),
-            0,
+            block_view_tui_cursor_anchor(34, 34, 0),
+            (0, true),
             "top row maps to the first viewport line"
         );
         assert_eq!(
-            block_view_tui_cursor_line(40, 34, 33),
-            39,
+            block_view_tui_cursor_anchor(40, 34, 33),
+            (39, true),
             "scrollback above the viewport shifts the mapping"
         );
         // Degenerate inputs saturate instead of underflowing.
-        assert_eq!(block_view_tui_cursor_line(2, 34, 0), 0);
+        assert_eq!(block_view_tui_cursor_anchor(2, 34, 0), (0, true));
         // v1.10.6: 快照 < grid 时 cursor_row 可能超出 live_line_count,钳制到末行。
+        // v1.11.14: 钳制发生即未落实(cursor 行在 live 文本之外)——调用方须改用行尾锚定。
         assert_eq!(
-            block_view_tui_cursor_line(10, 33, 13),
-            9,
-            "cursor_row beyond snapshot clamps to the last live line"
+            block_view_tui_cursor_anchor(10, 33, 13),
+            (9, false),
+            "cursor_row beyond snapshot clamps to the last live line, unmaterialized"
         );
         assert_eq!(
-            block_view_tui_cursor_line(10, 33, 9),
-            9,
+            block_view_tui_cursor_anchor(10, 33, 9),
+            (9, true),
             "cursor_row at snapshot boundary maps to the last line"
         );
+    }
+
+    #[test]
+    fn tui_cursor_anchor_reports_unmaterialized_trailing_row() {
+        // v1.11.14: password reader scenario — live text "cmd\nPassword: \n"
+        // (2 lines), cursor parked on the empty row below (row 2): the line
+        // clamps back to the prompt line but must be flagged unmaterialized.
+        assert_eq!(block_view_tui_cursor_anchor(2, 10, 2), (1, false));
+        // Typing phase — cursor ON the prompt row: materialized.
+        assert_eq!(block_view_tui_cursor_anchor(2, 10, 1), (1, true));
+        // Full-viewport document (scrollback present): mapping exact.
+        assert_eq!(block_view_tui_cursor_anchor(40, 34, 33), (39, true));
+        assert_eq!(block_view_tui_cursor_anchor(40, 34, 0), (6, true));
+        // Empty live text: nothing materializes.
+        assert_eq!(block_view_tui_cursor_anchor(0, 10, 3), (0, false));
+    }
+
+    #[test]
+    fn line_end_col_measures_display_cells_one_past_last_glyph() {
+        let output = "cmd\nPassword: \n";
+        assert_eq!(block_view_line_end_col(output, 0), 3);
+        assert_eq!(block_view_line_end_col(output, 1), 10);
+        // CJK glyphs occupy two cells — matches the painted-glyph convention.
+        assert_eq!(block_view_line_end_col("密码\n", 0), 4);
+        // Out-of-range line saturates to column 0.
+        assert_eq!(block_view_line_end_col(output, 7), 0);
     }
 
     #[test]

@@ -319,14 +319,29 @@ impl MetalRenderer {
             return None;
         }
         let tracked = terminal.primary_screen_cursor_snapshot_line();
-        let line = tracked.unwrap_or_else(|| {
-            crate::block_component::block_view_tui_cursor_line(
-                live.output.lines().count(),
-                terminal.grid().num_rows,
-                grid.cursor.row,
-            )
-        });
-        Some((line, grid.cursor.col))
+        let (line, col) = match tracked {
+            // v1.10.6: the precisely tracked snapshot line beats the formula.
+            Some(line) => (line, grid.cursor.col),
+            None => {
+                // v1.11.14: formula fallback. When the grid cursor row has
+                // no materialized live text line (password readers park it
+                // on a trailing empty row), anchor the caret at the END of
+                // the last live line — the raw grid column is 0 there and
+                // used to jump the caret to the front of the prompt text.
+                let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
+                    live.output.lines().count(),
+                    terminal.grid().num_rows,
+                    grid.cursor.row,
+                );
+                let col = if materialized {
+                    grid.cursor.col
+                } else {
+                    crate::block_component::block_view_line_end_col(live.output, line)
+                };
+                (line, col)
+            }
+        };
+        Some((line, col))
     }
 
     /// Draw the terminal Grid (and optional overlays) to screen.

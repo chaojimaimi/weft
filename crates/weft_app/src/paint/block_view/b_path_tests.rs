@@ -118,7 +118,7 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
 fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
     let output = (0..12).map(|i| format!("stream-{i}\n")).collect::<String>();
     // Formula path (no composed snapshot yet): cursor line =
-    // line_count - grid_rows + cursor_row (block_view_tui_cursor_line).
+    // line_count - grid_rows + cursor_row (block_view_tui_cursor_anchor).
     let grid_rows = 8;
     let cursor_row = 5;
     let cursor_line = output
@@ -363,13 +363,19 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
          would anchor the caret past the new live block"
     );
 
-    // Formula fallback (renderer.rs block_view_tui_cursor_line): map the grid
-    // cursor row into the new live block.
+    // Formula fallback (renderer.rs block_view_tui_cursor_anchor): map the grid
+    // cursor row into the new live block. The fixture streams whole lines, so
+    // the cursor parks one row past the live text — unmaterialized, and the
+    // anchor clamps to the last live line (col would be the end-of-line one).
     let live = terminal.block_tracker().in_flight().unwrap();
-    let cursor_line = crate::block_component::block_view_tui_cursor_line(
+    let (cursor_line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
         live.output.lines().count(),
         terminal.grid().num_rows,
         terminal.grid().cursor.row,
+    );
+    assert!(
+        !materialized,
+        "whole-line streaming leaves the cursor on the trailing empty row"
     );
     assert!(
         cursor_line < live.output.lines().count(),
@@ -473,4 +479,93 @@ fn a_path_grid_preedit_conditions_hold_after_settle() {
         "A path: preedit at grid cursor ({row},{col}) must lay out rows; \
          should_show_tui_preedit(Passthrough, non-empty, owns-ime=true) == true"
     );
+}
+
+/// v1.11.14: a password reader that disables echo and emits its own
+/// newline parks the grid cursor on the empty row below the last live
+/// text line. The caret must anchor AFTER the prompt glyphs on that last
+/// line (its end column), never at column 0 — the historical symptom was
+/// the caret jumping to the very front of the prompt text.
+#[test]
+fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
+    use weft_core::vt::Terminal;
+    let mut terminal = Terminal::new(10, 80);
+    terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
+    terminal.process(b"Password: ");
+    terminal.snapshot_primary_screen_output_for_caret();
+    // Typing phase: cursor on the materialized prompt row.
+    let _tracked = terminal.primary_screen_cursor_snapshot_line();
+    let live = terminal.block_tracker().in_flight().unwrap();
+    let live_lines = live.output.lines().count();
+    let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
+    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
+        live_lines,
+        terminal.grid().num_rows,
+        row,
+    );
+    assert!(
+        materialized,
+        "typing phase: cursor on the prompt row is materialized"
+    );
+    let col = if materialized {
+        col
+    } else {
+        crate::block_component::block_view_line_end_col(live.output, line)
+    };
+    assert_eq!(
+        (line, col),
+        (1, 10),
+        "typing phase: caret right after the prompt"
+    );
+
+    // The reader's own newline (ONLCR of its compensation "\n") arrives.
+    terminal.process(b"\r\n");
+    terminal.snapshot_primary_screen_output_for_caret();
+    let tracked = terminal.primary_screen_cursor_snapshot_line();
+    let live = terminal.block_tracker().in_flight().unwrap();
+    let live_lines = live.output.lines().count();
+    let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
+    assert_eq!(
+        (row, col),
+        (2, 0),
+        "grid cursor on the empty row below the prompt"
+    );
+    assert!(
+        tracked.is_none(),
+        "non-TUI block never establishes the tracked anchor"
+    );
+    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
+        live_lines,
+        terminal.grid().num_rows,
+        row,
+    );
+    assert!(!materialized, "cursor row has no live text line");
+    let col = crate::block_component::block_view_line_end_col(live.output, line);
+    assert_eq!(
+        (line, col),
+        (1, 10),
+        "caret stays after the prompt glyphs — no jump to column 0"
+    );
+}
+
+/// v1.11.14: a failed attempt re-prompts — the new prompt row is
+/// materialized again and the caret follows the grid column exactly.
+#[test]
+fn pw_prompt_caret_rematerializes_on_retry_prompt() {
+    use weft_core::vt::Terminal;
+    let mut terminal = Terminal::new(10, 80);
+    terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
+    terminal.process(b"Password: \r\nSorry, try again\r\nPassword: ");
+    terminal.snapshot_primary_screen_output_for_caret();
+    let live = terminal.block_tracker().in_flight().unwrap();
+    let live_lines = live.output.lines().count();
+    let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
+    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
+        live_lines,
+        terminal.grid().num_rows,
+        row,
+    );
+    assert!(materialized, "retry prompt row carries text");
+    assert_eq!(col, 10);
+    assert_eq!(line, 3, "caret on the re-issued prompt line");
 }
