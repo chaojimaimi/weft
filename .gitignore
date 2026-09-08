@@ -33,3 +33,5 @@ assets/icon.iconset/
 # 2026-08-21: untracked via `git rm -r --cached docs/` — see analysis before force-purge
 /docs/
 /build/
+
+releases/
