@@ -16,7 +16,7 @@
 use std::sync::atomic::Ordering;
 
 use crossbeam_channel::{Receiver, Sender};
-use weft_core::input::InputHandler;
+use weft_core::input::{new_flag, InputHandler, MouseSuppressFlag};
 use weft_core::persistence::TabSnapshot;
 use weft_core::pty::{Pty, PtyError, PtyEvent};
 use weft_core::selection::SelectionHandler;
@@ -52,6 +52,13 @@ pub struct Pane {
     pub input_seq: u64,
     pub terminal: Option<Terminal>,
     pub pty: Option<Pty>,
+    /// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1.2): reader-side
+    /// mouse-suppression flag — shared with this pane's PTY read loop and
+    /// Terminal parser. While it is set, weft must not write hover/wheel
+    /// bytes into a session whose TUI already emitted its disable sequences
+    /// (or whose PTY hit EOF). Per-pane by design: only THIS session's own
+    /// mouse sends are suppressed, never a sibling pane's.
+    pub mouse_suppress: MouseSuppressFlag,
     pub msg_rx: Receiver<AppMsg>,
     pub msg_tx: Sender<AppMsg>,
     pub input_handler: InputHandler,
@@ -131,12 +138,16 @@ impl Pane {
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
         let wake_proxy = proxy.clone();
+        // v1.11.15 (FIX A): one flag per pane — the PTY reader thread and the
+        // Terminal parser share it (see the field doc).
+        let mouse_suppress = new_flag();
         let pty = match Pty::spawn_with_args(
             &shell,
             &[],
             (rows as u16, cols as u16),
             &env_refs,
             cwd,
+            mouse_suppress.clone(),
             move || {
                 let _ = wake_proxy.send_event(AppEvent::Wake);
             },
@@ -155,7 +166,8 @@ impl Pane {
             weft_core::config::SCROLLBACK_MIN_LINES,
             weft_core::config::SCROLLBACK_MAX_LINES,
         );
-        let terminal = Terminal::with_scrollback(rows, cols, scrollback_lines);
+        let mut terminal = Terminal::with_scrollback(rows, cols, scrollback_lines);
+        terminal.set_mouse_suppress_flag(mouse_suppress.clone());
         tracing::info!(rows, cols, "initial terminal size");
 
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
@@ -164,6 +176,7 @@ impl Pane {
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: Some(terminal),
             pty: Some(pty),
+            mouse_suppress,
             msg_rx,
             msg_tx,
             input_handler: InputHandler::new(),
@@ -194,6 +207,7 @@ impl Pane {
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: None,
             pty: None,
+            mouse_suppress: new_flag(),
             msg_rx,
             msg_tx,
             input_handler: InputHandler::new(),
@@ -227,6 +241,7 @@ impl Pane {
             input_seq: NEXT_INPUT_SEQ.fetch_add(1, Ordering::Relaxed),
             terminal: Some(Terminal::with_scrollback(24, 80, scrollback_lines)),
             pty: None,
+            mouse_suppress: new_flag(),
             msg_rx,
             msg_tx,
             input_handler: InputHandler::new(),

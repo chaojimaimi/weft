@@ -629,6 +629,32 @@ impl Tab {
         self.active_mut().pump_pty()
     }
 
+    /// v1.11.15 (FIX A, PLAN_v11115 §1.2): whether the active pane's PTY
+    /// reader observed this session's mouse-disable sequence (or its exit).
+    /// While true, no hover/wheel bytes may be written to this pane — the
+    /// shell behind the in-flight disable may already be in cooked mode.
+    /// Per-pane by design: only THIS session's sends are suppressed.
+    pub fn mouse_suppressed(&self) -> bool {
+        weft_core::input::is_suppressed(&self.mouse_suppress)
+    }
+
+    /// v1.11.15 (FIX D, PLAN_v11115 §4): copy the active pane's negotiated
+    /// input modes into `input_handler` before mouse-event encoding. One
+    /// method closes three sync gaps (Release path, TerminalOwner move
+    /// shortcut, non-active owner tabs) — it reads the TARGET tab.
+    /// Borrow-split precedent: mouse_controller.rs's sync.
+    pub fn sync_mouse_modes(&mut self) {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return;
+        };
+        let mouse_protocol = terminal.mouse_protocol();
+        let sgr_mouse = terminal.sgr_mouse();
+        let app_cursor_keys = terminal.app_cursor_keys();
+        self.input_handler.app_cursor_keys = app_cursor_keys;
+        self.input_handler.mouse_protocol = mouse_protocol;
+        self.input_handler.sgr_mouse = sgr_mouse;
+    }
+
     /// Deliver one PTY-native interrupt without discarding command output.
     ///
     /// Ctrl+C is always one ETX byte, regardless of whether the foreground app
@@ -648,9 +674,14 @@ impl Tab {
     /// must not be reused by a future interrupt. Keeping this cancellation at
     /// the PTY boundary covers keyboard, paste, mouse, wheel, workflow, and
     /// delayed TUI-scroll input uniformly.
-    pub fn write_user_input(&mut self, data: &[u8]) -> weft_core::pty::Result<()> {
+    ///
+    /// v1.11.15 (FIX E): returns the bytes the PTY actually accepted
+    /// (`Pty::write_sync_reported`) so a partial write is observable;
+    /// existing `is_ok()` / `let _ =` callers compile unchanged, and the
+    /// paste path consumes the count for a truncation toast.
+    pub fn write_user_input(&mut self, data: &[u8]) -> weft_core::pty::Result<usize> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         // Genuine PTY input is the semantic boundary for returning to the
         // live view — EXCEPT while a command is executing. During
@@ -716,7 +747,7 @@ impl Tab {
                 "tab has no PTY",
             ))
         })?;
-        pty.write_sync(data)
+        pty.write_sync_reported(data)
     }
 
     /// Process queued messages into the terminal and drain finished blocks.

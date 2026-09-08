@@ -879,6 +879,12 @@ impl App {
 
         // Check if mouse protocol is active — forward scroll to PTY
         if mouse_protocol_active {
+            // v1.11.15 (FIX A): the reader already saw this session's
+            // mouse-disable — the wheel must not land in a shell that is
+            // back in cooked mode (the teardown leak window).
+            if self.sessions.active().mouse_suppressed() {
+                return;
+            }
             if !self.terminal_content_contains(x, y) {
                 return;
             }
@@ -915,6 +921,13 @@ impl App {
         // back to ordinary local viewport scrolling (so normal commands do not
         // lose their first gesture during the two-second launch window).
         if tui_starting && !alt_screen_active {
+            // v1.11.15 (FIX A): same suppression gate as the reporting branch
+            // — do not even queue a gesture that would be replayed into a
+            // suppressed session (the parked resolution checks the flag too,
+            // but not queueing keeps the wake timer off entirely).
+            if self.sessions.active().mouse_suppressed() {
+                return;
+            }
             if !self.terminal_content_contains(x, y) {
                 return;
             }

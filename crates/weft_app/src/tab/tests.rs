@@ -1095,3 +1095,81 @@ fn live_split_stream_drains_heads_and_compensates_anchor() {
         "the final block keeps the stream-tail text"
     );
 }
+
+// ── v1.11.15 (FIX A/D): mouse suppression + per-gesture mode sync ──────
+
+#[test]
+fn sync_mouse_modes_copies_terminal_mouse_trio_into_input_handler() {
+    use weft_core::input::MouseProtocol;
+    let mut t = tab_with_terminal(100);
+    // Negotiate AnyEvent + SGR + DECCKM on the terminal; the input handler
+    // stays at its fresh defaults until the sync.
+    t.terminal
+        .as_mut()
+        .unwrap()
+        .process(b"\x1b[?1003h\x1b[?1006h\x1b[?1h");
+    assert_eq!(t.input_handler.mouse_protocol, MouseProtocol::Off);
+    t.sync_mouse_modes();
+    assert_eq!(
+        t.input_handler.mouse_protocol,
+        MouseProtocol::AnyEvent,
+        "mouse protocol must sync from the target tab's terminal"
+    );
+    assert!(t.input_handler.sgr_mouse, "SGR flag must sync");
+    assert!(
+        t.input_handler.app_cursor_keys,
+        "DECCKM must sync (stale mode would emit CSI arrows instead of SS3)"
+    );
+}
+
+#[test]
+fn sync_mouse_modes_without_terminal_is_a_noop() {
+    let mut t = Tab::empty();
+    // Must not panic on terminal == None and must not touch input_handler.
+    t.sync_mouse_modes();
+    assert_eq!(
+        t.input_handler.mouse_protocol,
+        weft_core::input::MouseProtocol::Off
+    );
+    assert!(!t.input_handler.sgr_mouse);
+    assert!(!t.input_handler.app_cursor_keys);
+    assert_eq!(t.input_handler.kitty_flags, 0);
+}
+
+#[test]
+fn mouse_suppressed_reads_the_active_pane_flag() {
+    use weft_core::input::set_suppressed;
+    let mut t = tab_with_terminal(100);
+    assert!(!t.mouse_suppressed(), "fresh pane starts unsuppressed");
+    set_suppressed(&t.mouse_suppress);
+    assert!(t.mouse_suppressed());
+}
+
+#[test]
+fn suppressed_pending_tui_scroll_is_consumed_without_pty_bytes() {
+    use weft_core::input::set_suppressed;
+    let mut t = tab_with_terminal(100);
+    t.arm_tui_scroll_window();
+    assert!(t.queue_tui_scroll(-2, 5, 10, weft_core::input::Modifiers::empty()));
+    // The TUI's full startup handshake arrives while the gesture is parked;
+    // without suppression this resolution would be SGR wheel bytes.
+    t.terminal
+        .as_mut()
+        .unwrap()
+        .process(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h");
+    // …but the session's disable arrives first (the leak scenario): the
+    // reader flips the flag before the 50ms grace period elapses.
+    set_suppressed(&t.mouse_suppress);
+    expire_pending_scroll(&mut t);
+
+    // The resolution must be Some (never None — that would strand the
+    // deadline with no wake left to consume it) and must not write the PTY.
+    let Some(TuiScrollResolution::LocalRows(0)) = t.resolve_pending_tui_scroll() else {
+        panic!("expected the suppressed zero-row resolution");
+    };
+    assert!(t.pending_tui_scroll.is_none(), "pending must be consumed");
+    assert!(
+        !t.tui_scroll_window_active(),
+        "the launch window must be explicitly consumed"
+    );
+}

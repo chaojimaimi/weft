@@ -64,15 +64,34 @@ impl App {
         action: MouseAction,
         pos: GridPos,
     ) -> bool {
+        {
+            let Some(session) = self.sessions.tab(tab) else {
+                return false;
+            };
+            let Some(terminal) = session.terminal.as_ref() else {
+                return false;
+            };
+            // v1.11.15 (FIX A): the PTY reader saw this session's
+            // mouse-disable sequence (or its exit) — stop feeding hover/report
+            // bytes into a shell that may already be back in cooked mode.
+            if session.mouse_suppressed() {
+                return false;
+            }
+            if !terminal.accepts_mouse_reporting_input() {
+                return false;
+            }
+        }
+        // v1.11.15 (FIX D): per-gesture mode sync against the TARGET tab.
+        // One call here closes the three existing gaps (release-only
+        // gestures, the TerminalOwner move shortcut, non-active owner tabs)
+        // because it reads this tab's terminal instead of relying on the
+        // active-tab sync points elsewhere.
+        if let Some(session) = self.sessions.tab_mut(tab) {
+            session.sync_mouse_modes();
+        }
         let Some(session) = self.sessions.tab(tab) else {
             return false;
         };
-        let Some(terminal) = session.terminal.as_ref() else {
-            return false;
-        };
-        if !terminal.accepts_mouse_reporting_input() {
-            return false;
-        }
         let mut m = Modifiers::empty();
         if self.interaction.mods.state().shift_key() {
             m |= Modifiers::SHIFT;

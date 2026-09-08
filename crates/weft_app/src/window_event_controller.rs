@@ -398,6 +398,15 @@ impl App {
                 // gate — long commands notify only while the window is out
                 // of focus. Initial state is `true` (see `App::new`).
                 self.window_focused = focused;
+                // v1.11.15 (FIX C, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §3):
+                // winit only delivers ModifiersChanged while this window is
+                // the event target — switching apps mid-press can leave
+                // stale mods behind (the incident's Cb=48 Move+CONTROL
+                // hover report). Reset to the same default InteractionState
+                // constructs with (app_state.rs) on BOTH the gain- and
+                // lose-focus branches; the failure direction is dropping
+                // modifier bits, which is safe.
+                self.interaction.mods = winit::event::Modifiers::default();
                 // Reset blink timer on focus change
                 if focused {
                     self.window_runtime.cursor_blink_on = true;

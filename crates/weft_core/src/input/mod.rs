@@ -8,6 +8,9 @@ pub mod keys;
 pub mod kitty;
 pub mod mode;
 pub mod mouse;
+// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1): reader-thread
+// mouse-disable pre-scan — flag + persistent FSM scanner.
+pub mod mouse_suppress;
 pub mod paste;
 
 pub use handler::InputHandler;
@@ -15,6 +18,10 @@ pub use keys::{KeyCode, Modifiers};
 pub use kitty::{encode_kitty_key, KittyEventKind};
 pub use mode::{effective_mode, InputMode};
 pub use mouse::{MouseAction, MouseButton, MouseProtocol};
+// v1.11.15 (FIX A): reader-side mouse suppression plumbing.
+pub use mouse_suppress::{
+    is_suppressed, new_flag, set_suppressed, MouseDisableScanner, MouseSuppressFlag,
+};
 pub use paste::{
     bracketed_paste_end, bracketed_paste_start, build_submit_bytes, classify_paste,
     contains_dangerous_control_chars, encode_paste, format_byte_count, paste_preview,

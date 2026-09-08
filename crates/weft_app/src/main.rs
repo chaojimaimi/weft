@@ -563,7 +563,20 @@ impl App {
                 had_pty_output = true;
             }
         }
-        if deferred_local_scroll != 0 {
+        // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2): when the
+        // dead tab was the LAST one, `remove_dead` has already emptied
+        // `tabs` by this point — the UiEvents collected above came from a
+        // session that no longer exists, and the dispatch arms deref the
+        // active tab. Drop them at the source (#4 panic entry).
+        // Review P3: this guard also precedes `scroll_local_view` (active
+        // tab deref) as pure defense against future drain restructuring.
+        if self.sessions.tabs().is_empty() {
+            tracing::debug!(
+                dropped = drained_ui_events.len(),
+                "dropping stale ui events — last session exited"
+            );
+            drained_ui_events.clear();
+        } else if deferred_local_scroll != 0 {
             self.scroll_local_view(deferred_local_scroll);
         }
         // v1.11.5 (PLAN_v1115 §M2): app-facing ui events (OSC 52 clipboard,

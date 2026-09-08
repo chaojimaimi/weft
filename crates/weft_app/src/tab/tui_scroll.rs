@@ -79,6 +79,13 @@ impl Tab {
     /// Resolve an early gesture after the 50ms protocol grace period. If the
     /// command entered alt screen, encode against its final mouse modes;
     /// otherwise return rows for normal local block/grid scrolling.
+    ///
+    /// v1.11.15 (FIX A): when the reader-side suppression flag flipped while
+    /// the gesture was parked (the session's disable sequence reached the
+    /// parser pipeline), the gesture is dropped WITHOUT any PTY write — it
+    /// returns a zero-row local resolution instead of `None` (returning
+    /// `None` would leave the deadline armed with no later wake to consume
+    /// it).
     pub fn resolve_pending_tui_scroll(&mut self) -> Option<TuiScrollResolution> {
         let pending = self.pending_tui_scroll.as_ref()?;
         if std::time::Instant::now() < pending.resolve_at {
@@ -86,6 +93,12 @@ impl Tab {
         }
         let pending = self.pending_tui_scroll.take()?;
         self.tui_scroll_wake_scheduled = false;
+        if self.mouse_suppressed() {
+            // Consume the launch window explicitly — a suppressed resolution
+            // must leave nothing armed behind it.
+            self.tui_scroll_deadline = None;
+            return Some(TuiScrollResolution::LocalRows(0));
+        }
         // v1.3: snapshot every value we need from `terminal` inside a single
         // `if let` block so the immutable terminal borrow releases before we
         // mutate `input_handler` / `tui_scroll_deadline` (which both deref

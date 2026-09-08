@@ -3014,6 +3014,70 @@ fn vim_mouse_a_sequence_enables_sgr_button_event_reporting() {
     assert!(!t.sgr_mouse());
 }
 
+// ── v1.11.15 (FIX A): reader-side mouse-suppression flag undo ────────
+
+#[test]
+fn mouse_suppress_flag_clears_on_both_decset_and_decrst_of_mouse_modes() {
+    use crate::input::{is_suppressed, new_flag, set_suppressed};
+    let mut t = term();
+    let flag = new_flag();
+    t.set_mouse_suppress_flag(flag.clone());
+
+    // The parser must clear on the SET arm (h) — a re-asserted DECSET is
+    // just as much proof the TUI is alive as a reset.
+    set_suppressed(&flag);
+    t.process(b"\x1b[?1003h");
+    assert!(!is_suppressed(&flag), "DECSET 1003 (h) must clear the flag");
+
+    // …and on the RESET arm (l) — the TUI's teardown disable.
+    set_suppressed(&flag);
+    t.process(b"\x1b[?1003l");
+    assert!(!is_suppressed(&flag), "DECRST 1003 (l) must clear the flag");
+
+    // Encoding mode 1006 and X10 mode 9 ride the same pre-clear.
+    set_suppressed(&flag);
+    t.process(b"\x1b[?1006l");
+    assert!(!is_suppressed(&flag), "DECRST 1006 must clear the flag");
+    set_suppressed(&flag);
+    t.process(b"\x1b[?9h");
+    assert!(!is_suppressed(&flag), "DECSET 9 must clear the flag");
+
+    // The change-guarded set_mouse_protocol body (a TUI re-asserting its
+    // current mode) must not skip the clear: 1003 is already AnyEvent here,
+    // the guard logs/writes nothing, and the flag still clears.
+    set_suppressed(&flag);
+    t.process(b"\x1b[?1003h");
+    assert!(
+        !is_suppressed(&flag),
+        "an h-arm no-op through the change guard must still clear the flag"
+    );
+}
+
+#[test]
+fn mouse_suppress_flag_survives_non_mouse_dec_modes() {
+    use crate::input::{is_suppressed, new_flag, set_suppressed};
+    let mut t = term();
+    let flag = new_flag();
+    t.set_mouse_suppress_flag(flag.clone());
+    set_suppressed(&flag);
+    t.process(b"\x1b[?1049l\x1b[?2004h\x1b[?2026l\x1b[?25h");
+    assert!(
+        is_suppressed(&flag),
+        "only the mouse mode family clears the flag; ?1049/?2004/?2026/?25 must not"
+    );
+}
+
+#[test]
+fn mouse_suppress_flag_none_is_noop_for_the_parser() {
+    // No flag injected (headless default): every mouse-mode parse is a
+    // plain no-op clear — zero disturbance to the 2800-test baseline.
+    let mut t = term();
+    t.process(b"\x1b[?1003h");
+    assert_eq!(t.mouse_protocol(), MouseProtocol::AnyEvent);
+    t.process(b"\x1b[?1003l");
+    assert_eq!(t.mouse_protocol(), MouseProtocol::Off);
+}
+
 // ── Full reset ───────────────────────────────────────────────
 
 #[test]

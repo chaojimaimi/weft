@@ -260,6 +260,14 @@ impl App {
     /// (single slot — an occupied slot DROPS the new request with a warn,
     /// H-i) and prompt off the winit handler.
     fn on_clipboard_read_request(&mut self) {
+        // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2): a stale OSC
+        // 52 read request can outlive the last tab; both the Allow and
+        // Prompt branches deref sessions.active() below. Drop the request
+        // with a debug trail instead of indexing past the end.
+        if self.sessions.tabs().is_empty() {
+            tracing::debug!("dropping stale OSC 52 read request — no tabs left");
+            return;
+        }
         let mode = self.config_state.config.clipboard.osc52;
         let now = std::time::Instant::now();
         let gate = osc52_read_gate(mode, self.osc52_deny_cooldown, now);

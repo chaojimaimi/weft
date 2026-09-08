@@ -76,8 +76,16 @@ impl IntegratedSession {
         env.push(("HOME", fake_home_str));
         let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-        let pty = Pty::spawn_with_args("/bin/zsh", &[], (ROWS, COLS), &env_refs, None, || {})
-            .expect("failed to spawn zsh");
+        let pty = Pty::spawn_with_args(
+            "/bin/zsh",
+            &[],
+            (ROWS, COLS),
+            &env_refs,
+            None,
+            weft_core::input::new_flag(),
+            || {},
+        )
+        .expect("failed to spawn zsh");
         Some(Self {
             pty,
             term: Terminal::new(ROWS as usize, COLS as usize),

@@ -661,8 +661,24 @@ impl crate::App {
                 if let Some(t) = session.terminal.as_mut() {
                     t.note_interactive_stdin();
                 }
-                if let Err(e) = session.write_user_input(&bytes) {
-                    warn!(error = %e, tab, "failed to paste to PTY");
+                // v1.11.15 (FIX E): a partial write surfaces a truncation
+                // toast — defensive only on production macOS (n_tty silently
+                // discards input overflow; the master always reports full
+                // success — pty.rs's saturated-child anchor). The branch
+                // exists for ssh/remote ptys and future platform behavior.
+                match session.write_user_input(&bytes) {
+                    Ok(n) if n < bytes.len() => {
+                        warn!(written = n, total = bytes.len(), tab, "paste truncated");
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.set_paste_toast(Some((
+                                "粘贴已截断".to_string(),
+                                std::time::Instant::now(),
+                            )));
+                        }
+                        self.request_redraw();
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, tab, "failed to paste to PTY"),
                 }
             }
         }

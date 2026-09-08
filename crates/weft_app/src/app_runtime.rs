@@ -223,49 +223,58 @@ impl ApplicationHandler<AppEvent> for App {
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();
-                self.poll_completion_results();
-                self.poll_runbook_results();
-                self.poll_ai_results();
-                schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
-                if self.sessions.tabs().iter().any(|tab| {
-                    tab.terminal
+                // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2):
+                // process_messages → remove_dead can empty `tabs` when the
+                // LAST shell exits (panic.log ×6). Everything below derefs
+                // tabs[active] in one way or another, so when no tabs remain
+                // the arm falls straight through to the shared should_exit
+                // tail at the bottom of user_event (Effect::Exit was already
+                // drained inside process_messages — semantics unchanged).
+                if !self.sessions.tabs().is_empty() {
+                    self.poll_completion_results();
+                    self.poll_runbook_results();
+                    self.poll_ai_results();
+                    schedule_primary_history_refresh_wakes(self.sessions.tabs_mut(), &self.proxy);
+                    if self.sessions.tabs().iter().any(|tab| {
+                        tab.terminal
+                            .as_ref()
+                            .is_some_and(Terminal::primary_screen_exit_pending)
+                    }) {
+                        let proxy = self.proxy.clone();
+                        schedule_synchronized_output_watchdog(
+                            self.screen_exit_watchdog_pending.clone(),
+                            weft_core::vt::PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
+                            move || {
+                                let _ = proxy.send_event(AppEvent::Wake);
+                            },
+                        );
+                    }
+                    let active_synchronized = self
+                        .sessions
+                        .active()
+                        .terminal
                         .as_ref()
-                        .is_some_and(Terminal::primary_screen_exit_pending)
-                }) {
-                    let proxy = self.proxy.clone();
-                    schedule_synchronized_output_watchdog(
-                        self.screen_exit_watchdog_pending.clone(),
-                        weft_core::vt::PRIMARY_SCREEN_EXIT_SETTLE_DELAY,
-                        move || {
-                            let _ = proxy.send_event(AppEvent::Wake);
-                        },
-                    );
-                }
-                let active_synchronized = self
-                    .sessions
-                    .active()
-                    .terminal
-                    .as_ref()
-                    .is_some_and(Terminal::synchronized_output);
-                let any_synchronized = self
-                    .sessions
-                    .tabs()
-                    .iter()
-                    .any(crate::tab::Tab::any_synchronized_output);
-                if !active_synchronized {
-                    self.request_redraw();
-                }
-                if any_synchronized {
-                    let proxy = self.proxy.clone();
-                    schedule_synchronized_output_watchdog(
-                        self.window_runtime
-                            .synchronized_output_watchdog_pending
-                            .clone(),
-                        weft_core::vt::SYNCHRONIZED_OUTPUT_TIMEOUT,
-                        move || {
-                            let _ = proxy.send_event(AppEvent::Wake);
-                        },
-                    );
+                        .is_some_and(Terminal::synchronized_output);
+                    let any_synchronized = self
+                        .sessions
+                        .tabs()
+                        .iter()
+                        .any(crate::tab::Tab::any_synchronized_output);
+                    if !active_synchronized {
+                        self.request_redraw();
+                    }
+                    if any_synchronized {
+                        let proxy = self.proxy.clone();
+                        schedule_synchronized_output_watchdog(
+                            self.window_runtime
+                                .synchronized_output_watchdog_pending
+                                .clone(),
+                            weft_core::vt::SYNCHRONIZED_OUTPUT_TIMEOUT,
+                            move || {
+                                let _ = proxy.send_event(AppEvent::Wake);
+                            },
+                        );
+                    }
                 }
             }
             AppEvent::ConfigReload => {

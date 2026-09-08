@@ -42,7 +42,9 @@ use crate::blocks::{BlockTracker, CapturedStyle, OutputCapture, ShellPhase};
 use crate::editor::Editor;
 use crate::grid::{CellFlags, CellWidth, Color, Cursor, CursorStyle, Grid};
 use crate::hyperlink::HyperlinkRegistry;
-use crate::input::{build_submit_bytes, effective_mode, InputMode, MouseProtocol};
+use crate::input::{
+    build_submit_bytes, effective_mode, InputMode, MouseProtocol, MouseSuppressFlag,
+};
 pub const SYNCHRONIZED_OUTPUT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 /// The terminal: owns a Grid, vte::Parser, and current attributes.
 /// Implements `vte::Perform` to translate escape sequences into Grid mutations.
@@ -140,6 +142,11 @@ pub struct Terminal {
     /// `[experimental] tui_render_mode` (serde default `noninteractive`) at
     /// every construction site (P2-3).
     tui_render_mode: TuiRenderMode,
+    /// v1.11.15 (FIX A, PLAN_v11115 §1.2): the pane's reader-side mouse
+    /// suppression flag. The reader sets it on the first mouse-disable byte;
+    /// THIS parser is the authoritative undo (h and l alike). `None` until
+    /// the app injects it — clears are then no-ops.
+    mouse_suppress: Option<MouseSuppressFlag>,
 }
 
 impl Terminal {
@@ -188,6 +195,7 @@ impl Terminal {
             kitty: kitty_keyboard::KittyKeyboardState::default(),
             kitty_protocol_enabled: true,
             tui_render_mode: TuiRenderMode::Classic,
+            mouse_suppress: None,
         }
     }
 
@@ -313,6 +321,12 @@ impl Terminal {
     /// Active mouse reporting mode (DEC modes 9/1000/1002/1003).
     pub fn mouse_protocol(&self) -> MouseProtocol {
         self.capabilities.mouse_protocol
+    }
+
+    /// v1.11.15 (FIX A): inject this pane's reader-side mouse-suppression
+    /// flag (app calls it once; the reader thread holds the other Arc).
+    pub fn set_mouse_suppress_flag(&mut self, flag: MouseSuppressFlag) {
+        self.mouse_suppress = Some(flag);
     }
 
     /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.1): record that a real
@@ -1025,7 +1039,16 @@ impl Terminal {
     }
 
     /// Handle DEC private mode set/reset (CSI ? <n> h/l).
+    ///
+    /// v1.11.15 (FIX A): this parse is the AUTHORITATIVE undo of the
+    /// reader scanner's set — the pre-clear runs UNCONDITIONALLY (h and l
+    /// both clear; the set_mouse_protocol change guard must not gate it).
     fn handle_dec_private_mode(&mut self, mode: u16, set: bool) {
+        if crate::input::mouse_suppress::MOUSE_SUPPRESS_CLEAR_MODES.contains(&mode) {
+            if let Some(flag) = &self.mouse_suppress {
+                flag.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
         match mode {
             1 => self.capabilities.app_cursor_keys = set, // DECCKM
             6 => {

@@ -98,6 +98,7 @@ impl TuiSession {
             (rows, cols),
             &env,
             Some(cwd_text.as_ref()),
+            weft_core::input::new_flag(),
             || {},
         )
         .unwrap_or_else(|error| panic!("failed to spawn {program}: {error}"));

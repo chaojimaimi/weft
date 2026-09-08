@@ -54,8 +54,16 @@ fn spawn_sandboxed_zsh() -> (Pty, std::path::PathBuf) {
     env.push(("HOME", fake_home_str));
     let env_refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    let pty = Pty::spawn_with_args("/bin/zsh", &[], (24, 80), &env_refs, None, || {})
-        .expect("failed to spawn zsh");
+    let pty = Pty::spawn_with_args(
+        "/bin/zsh",
+        &[],
+        (24, 80),
+        &env_refs,
+        None,
+        weft_core::input::new_flag(),
+        || {},
+    )
+    .expect("failed to spawn zsh");
     (pty, sandbox)
 }
 

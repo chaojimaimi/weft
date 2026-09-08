@@ -385,6 +385,13 @@ impl App {
     }
 
     pub(super) fn poll_completion_results(&mut self) {
+        // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2): stale worker
+        // results can arrive after the last tab exited; the loop body derefs
+        // sessions.active() unconditionally. (The Wake arm now skips the call
+        // on empty tabs — this entry guard is the second, independent layer.)
+        if self.sessions.tabs().is_empty() {
+            return;
+        }
         while let Some(result) = self.completion_worker.try_recv() {
             if result.generation != self.completion_worker.current_generation()
                 || self.sessions.active().pane_session_id != result.pane_session_id

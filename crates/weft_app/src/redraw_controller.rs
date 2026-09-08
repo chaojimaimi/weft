@@ -18,11 +18,27 @@ impl App {
 
     fn run_redraw(&mut self, forced: bool) {
         self.pump_pty();
+        // v1.11.15 review P2: tabs may ALREADY be empty here — emptied by a
+        // previous event's process_messages while a drag gesture stayed
+        // armed. pump_selection_autoscroll derefs the active tab through
+        // block_view_active() when `selection_drag_pos` is set, so the
+        // early return must precede it (the just-emptied window below is a
+        // separate guard).
+        if self.sessions.tabs().is_empty() {
+            return;
+        }
         // Drag-selection autoscroll: the 40ms timer wakes this path while a
         // drag is held past the block content edge, so the viewport keeps
         // scrolling (and the selection extending) even with a still pointer.
         self.pump_selection_autoscroll();
         let had_output = self.process_messages();
+        // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2): the last
+        // shell can exit inside process_messages (remove_dead empties
+        // `tabs`); every line below derefs the active tab. run_redraw
+        // returns (), so a plain return is the whole guard.
+        if self.sessions.tabs().is_empty() {
+            return;
+        }
         // v1.10.4: if the active pane entered/exited alt-screen (DEC 1049),
         // recompute geometry so PTY cols switch between full-width (TUI)
         // and gutter-subtracted (BlockView). Must happen before the render

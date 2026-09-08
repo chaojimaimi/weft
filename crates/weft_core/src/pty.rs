@@ -15,6 +15,8 @@ use nix::unistd::{self, Pid};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
+use crate::input::{new_flag, MouseDisableScanner, MouseSuppressFlag};
+
 /// PTY-specific errors.
 #[derive(Debug, Error)]
 pub enum PtyError {
@@ -74,7 +76,7 @@ impl Pty {
     ///
     /// `args` are passed as additional arguments to the program.
     pub fn spawn<W: Fn() + Send + 'static>(shell: &str, size: (u16, u16), wake: W) -> Result<Self> {
-        Self::spawn_with_args(shell, &[], size, &[], None, wake)
+        Self::spawn_with_args(shell, &[], size, &[], None, new_flag(), wake)
     }
 
     /// Spawn a process inside a PTY with additional arguments and env overrides.
@@ -88,12 +90,21 @@ impl Pty {
     /// shell starts in that directory without needing to send a `cd` command
     /// (which would pollute shell history and the block tracker). `PWD` env var
     /// is also set so shell integration OSC 7 reports the correct cwd.
+    ///
+    /// `mouse_suppress` — v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK
+    /// §1): the per-pane reader-side mouse-suppression flag. The read loop
+    /// flips it when the byte stream carries a mouse-disable DECRST and on
+    /// every exit path, so the UI stops sending hover/wheel bytes into a PTY
+    /// whose TUI is (or may be) gone before the main thread parses those
+    /// bytes. The flag's authoritative undo is the main-thread vte parser
+    /// (`Terminal::handle_dec_private_mode`).
     pub fn spawn_with_args<W: Fn() + Send + 'static>(
         program: &str,
         args: &[&str],
         size: (u16, u16),
         extra_env: &[(&str, &str)],
         cwd: Option<&str>,
+        mouse_suppress: MouseSuppressFlag,
         wake: W,
     ) -> Result<Self> {
         let winsize = Winsize {
@@ -181,7 +192,7 @@ impl Pty {
                 let read_child_pid = child;
 
                 tokio::spawn(async move {
-                    read_loop(duped, read_child_pid, tx, wake).await;
+                    read_loop(duped, read_child_pid, tx, mouse_suppress, wake).await;
                 });
 
                 Ok(Self {
@@ -209,6 +220,12 @@ impl Pty {
     }
 
     /// Write bytes to the PTY (keyboard input → shell).
+    ///
+    /// v1.11.15 (FIX E): the loop advances by the number of bytes actually
+    /// accepted instead of treating ANY successful write as completion — a
+    /// partial write (kernel input queue full, reader slow) used to drop the
+    /// tail silently while reporting success. A zero-progress write fails
+    /// fast (std `write_all` contract) instead of spinning.
     pub async fn write(&self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -225,10 +242,26 @@ impl Pty {
         let writer =
             tokio::io::unix::AsyncFd::new(duped).expect("failed to create async fd for write");
         // Use the AsyncFd to perform a non-blocking write.
+        let mut written = 0usize;
         loop {
             let mut guard = writer.writable().await.map_err(PtyError::Write)?;
-            match guard.try_io(|fd| nix::unistd::write(fd, data).map_err(io::Error::from)) {
-                Ok(Ok(_)) => return Ok(()),
+            match guard
+                .try_io(|fd| nix::unistd::write(fd, &data[written..]).map_err(io::Error::from))
+            {
+                Ok(Ok(n)) => {
+                    written += n;
+                    if written >= data.len() {
+                        return Ok(());
+                    }
+                    if n == 0 {
+                        // Zero bytes with data remaining can never make
+                        // progress — mirror write_all_nonblocking's contract.
+                        return Err(PtyError::Write(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "pty write returned 0 with data remaining",
+                        )));
+                    }
+                }
                 Ok(Err(e)) => return Err(PtyError::Write(e)),
                 Err(_would_block) => continue,
             }
@@ -249,24 +282,32 @@ impl Pty {
     /// remaining bytes are dropped, but loudly — warn! reports the dropped
     /// count. The caller keeps deciding on fallbacks (e.g. `send_interrupt`
     /// for Ctrl+C).
+    ///
+    /// v1.11.15 (FIX E): now a thin wrapper over [`Self::write_sync_reported`]
+    /// — the drop warn lives there, and this signature stays `Ok(())` so
+    /// every existing caller is undisturbed.
     pub fn write_sync(&self, data: &[u8]) -> Result<()> {
+        self.write_sync_reported(data).map(|_| ())
+    }
+
+    /// v1.11.15 (FIX E, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §5): honest
+    /// synchronous write — returns the number of bytes that actually left
+    /// when the retry budget expires (`Ok(written)`) instead of masking a
+    /// partial write as `Ok(())`. On production macOS the `TimedOut` arm is
+    /// unreachable (the n_tty line discipline silently discards input
+    /// overflow, so the master always writes the full count — see the
+    /// saturated-child anchor test below); the honest mapping exists for
+    /// ssh/remote ptys and future platforms. The warn is kept here so both
+    /// wrappers surface the drop exactly once.
+    pub fn write_sync_reported(&self, data: &[u8]) -> Result<usize> {
         if data.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let fd = self.master.as_raw_fd();
         let mut write_one =
             |buf: &[u8]| nix::unistd::write(&self.master, buf).map_err(io::Error::from);
-        match write_all_nonblocking(&mut write_one, fd, data, WRITE_RETRY_BUDGET) {
-            WriteOutcome::WrittenAll => Ok(()),
-            WriteOutcome::TimedOut { written } => {
-                tracing::warn!(
-                    dropped = data.len() - written,
-                    "pty write_sync budget exhausted — dropped remaining bytes"
-                );
-                Ok(())
-            }
-            WriteOutcome::Error(e) => Err(PtyError::Write(e)),
-        }
+        let outcome = write_all_nonblocking(&mut write_one, fd, data, WRITE_RETRY_BUDGET);
+        map_write_outcome(outcome, data.len())
     }
 
     /// Deliver one Ctrl+C interrupt to the foreground process.
@@ -451,6 +492,26 @@ where
     }
 }
 
+/// v1.11.15 (FIX E): the pure `WriteOutcome → honest report` mapping shared
+/// by `write_sync_reported`. Extracted so the TimedOut-reports-written
+/// contract is unit-testable without a real PTY (the partial-write arm is
+/// unreachable against a real macOS master — see the module's saturated
+/// child anchor). A budget timeout warns with the dropped count and reports
+/// the bytes that made it out; a full write reports the total.
+fn map_write_outcome(outcome: WriteOutcome, total: usize) -> Result<usize> {
+    match outcome {
+        WriteOutcome::WrittenAll => Ok(total),
+        WriteOutcome::TimedOut { written } => {
+            tracing::warn!(
+                dropped = total - written,
+                "pty write budget exhausted — dropping remaining bytes"
+            );
+            Ok(written)
+        }
+        WriteOutcome::Error(e) => Err(PtyError::Write(e)),
+    }
+}
+
 fn resize_ioctl_result(result: nix::libc::c_int) -> Result<()> {
     if result == -1 {
         Err(PtyError::Resize(nix::errno::Errno::last()))
@@ -557,16 +618,28 @@ fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u
 /// task on `send().await`, which backpressures into the kernel PTY buffer and
 /// ultimately blocks the child's writes — bytes are never dropped. UI wakes
 /// are throttled to ~60 Hz during floods (`WakeThrottle`); Exit always wakes.
+///
+/// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1): every chunk is fed
+/// through a persistent [`MouseDisableScanner`] BEFORE it is queued; the
+/// first mouse-disable DECRST flips `suppress` right here on the reader
+/// thread, closing the parse-latency window in which the UI used to keep
+/// writing hover bytes into a shell that had already left the TUI. The exit
+/// paths (EOF / EIO / EBADF / read error) force-set the flag too, covering a
+/// TUI killed before it could emit its disable sequences.
 async fn read_loop<W: Fn() + Send + 'static>(
     fd: OwnedFd,
     child_pid: Pid,
     tx: mpsc::Sender<PtyEvent>,
+    suppress: MouseSuppressFlag,
     wake: W,
 ) {
     // Buffer size: 256KB as per architecture doc.
     const BUF_SIZE: usize = 256 * 1024;
 
     let mut throttle = WakeThrottle::default();
+    // Persistent across chunks: a sequence split across reads stays inside
+    // the FSM (no carry buffer needed).
+    let mut mouse_scanner = MouseDisableScanner::new();
 
     let async_fd = match tokio::io::unix::AsyncFd::new(fd) {
         Ok(fd) => fd,
@@ -602,6 +675,12 @@ async fn read_loop<W: Fn() + Send + 'static>(
             }
             Ok(Ok(n)) => {
                 let data = buf[..n].to_vec();
+                // v1.11.15 (FIX A): scan before queueing so the flag flips as
+                // early as the bytes exist. A hit here is always followed by
+                // the main-thread parser clearing it (h and l arms alike).
+                if mouse_scanner.feed(&data) {
+                    crate::input::set_suppressed(&suppress);
+                }
                 // R1-4: env-gated capture tee for recording real PTY byte
                 // streams. Disabled by default (one env::var lookup per read);
                 // set WEFT_PTY_CAPTURE=/path/to/capture.bin to record. Fixtures
@@ -661,6 +740,13 @@ async fn read_loop<W: Fn() + Send + 'static>(
         }
     }
 
+    // v1.11.15 (FIX A): every exit path lands here (EOF, EIO/EBADF, read
+    // error, unreadable fd). Force-set the flag so a TUI killed before it
+    // could emit its mouse-disable sequences cannot leave the UI writing
+    // hover bytes into a dead or legacy-mode PTY. The pending tab teardown (or
+    // the parser's next mouse-mode DECSET, for a surviving shell) is the
+    // authoritative follow-up.
+    crate::input::set_suppressed(&suppress);
     // Wait for child and report exit status.
     let exit_status = match waitpid_safe(child_pid) {
         Ok(status) => {
@@ -731,510 +817,8 @@ impl From<nix::sys::wait::WaitStatus> for ChildStatus {
     }
 }
 
+// Tests extracted to `pty/tests.rs` (repo convention) to keep the
+// production file within the architecture gate.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resize_ioctl_failure_is_propagated() {
-        assert!(matches!(resize_ioctl_result(-1), Err(PtyError::Resize(_))));
-        assert!(resize_ioctl_result(0).is_ok());
-    }
-
-    #[test]
-    fn child_env_drops_inherited_no_color_policy() {
-        let mut env = std::collections::HashMap::from([
-            ("NO_COLOR".into(), "1".into()),
-            ("TERM".into(), "dumb".into()),
-        ]);
-        strip_launcher_presentation_env(&mut env);
-        assert!(!env.contains_key(std::ffi::OsStr::new("NO_COLOR")));
-        assert_eq!(env.get(std::ffi::OsStr::new("TERM")), Some(&"dumb".into()));
-    }
-
-    /// Test that spawning a PTY with /bin/cat works and we can read/write.
-    #[tokio::test]
-    async fn spawn_and_echo() {
-        let mut pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
-
-        // Give the child a moment to start.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Write something.
-        pty.write(b"hello\n").await.expect("write failed");
-
-        // Read it back (cat echoes input).
-        let output = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv())
-            .await
-            .expect("timeout waiting for output")
-            .expect("channel closed");
-
-        match output {
-            PtyEvent::Output(data) => {
-                let s = String::from_utf8_lossy(&data);
-                assert!(
-                    s.contains("hello"),
-                    "expected output to contain 'hello', got: {s:?}"
-                );
-            }
-            PtyEvent::Exit(code) => {
-                panic!("child exited unexpectedly: {code:?}");
-            }
-        }
-
-        // Verify child is alive.
-        assert!(pty.is_alive());
-    }
-
-    /// Test that resize doesn't error.
-    #[tokio::test]
-    async fn resize_works() {
-        let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        pty.resize(50, 120).expect("resize failed");
-    }
-
-    /// Test that child exit is detected.
-    /// Uses `sleep 0` (exits immediately with code 0).
-    #[tokio::test]
-    async fn detects_child_exit() {
-        let mut pty = Pty::spawn_with_args("/bin/sleep", &["0"], (24, 80), &[], None, || {})
-            .expect("failed to spawn PTY");
-
-        // Collect events until we get an Exit.
-        let mut got_exit = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
-
-            match event {
-                Ok(Some(PtyEvent::Exit(result))) => {
-                    // /bin/true exits with code 0.
-                    assert!(result.is_ok(), "expected clean exit, got: {result:?}");
-                    assert_eq!(result.unwrap(), 0, "sleep 0 should exit 0");
-                    got_exit = true;
-                    break;
-                }
-                Ok(Some(PtyEvent::Output(_))) => continue,
-                Ok(None) => break, // channel closed
-                Err(_) => break,   // timeout
-            }
-        }
-        assert!(got_exit, "never received Exit event from /bin/true");
-    }
-
-    /// Test sync write.
-    #[tokio::test]
-    async fn sync_write_works() {
-        let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        pty.write_sync(b"test\n").expect("sync write failed");
-        assert!(pty.is_alive());
-    }
-
-    /// Ctrl+C must remain a PTY byte for raw-mode consumers such as SSH and
-    /// terminal REPLs. With ISIG disabled the child can observe the literal
-    /// ETX value; a direct SIGINT implementation would never produce BYTE:3.
-    #[tokio::test]
-    async fn interrupt_delivers_exactly_one_etx_to_raw_mode() {
-        let script = concat!(
-            "stty -isig -icanon -echo; ",
-            "printf 'READY\\r\\n'; ",
-            "byte=$(/bin/dd bs=1 count=1 2>/dev/null | /usr/bin/od -An -tu1); ",
-            "printf 'BYTE:%s\\r\\n' \"$byte\""
-        );
-        let mut pty = Pty::spawn_with_args("/bin/sh", &["-c", script], (24, 80), &[], None, || {})
-            .expect("failed to spawn raw-mode PTY fixture");
-
-        let mut output = String::new();
-        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !output.contains("READY") && tokio::time::Instant::now() < ready_deadline {
-            if let Ok(Some(PtyEvent::Output(bytes))) =
-                tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await
-            {
-                output.push_str(&String::from_utf8_lossy(&bytes));
-            }
-        }
-        assert!(
-            output.contains("READY"),
-            "raw fixture did not become ready: {output:?}"
-        );
-        assert!(pty.send_interrupt(), "ETX write should succeed");
-
-        let exit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while tokio::time::Instant::now() < exit_deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
-                Ok(Some(PtyEvent::Output(bytes))) => {
-                    output.push_str(&String::from_utf8_lossy(&bytes));
-                }
-                Ok(Some(PtyEvent::Exit(result))) => {
-                    assert_eq!(result, Ok(0));
-                    break;
-                }
-                Ok(None) => break,
-                Err(_) => continue,
-            }
-        }
-        let byte = output
-            .split("BYTE:")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next());
-        assert_eq!(
-            byte,
-            Some("3"),
-            "raw child must receive one literal ETX byte: {output:?}"
-        );
-        assert_eq!(
-            output.matches("BYTE:").count(),
-            1,
-            "one key must deliver once"
-        );
-    }
-
-    /// Test that `extra_env` overrides reach the child via the `execve` path.
-    /// `/usr/bin/env` prints its environment and exits; our override must appear.
-    #[tokio::test]
-    async fn extra_env_reaches_child() {
-        let mut pty = Pty::spawn_with_args(
-            "/usr/bin/env",
-            &[],
-            (24, 80),
-            &[("WEFT_TEST_OVERRIDE", "sentinel-12345")],
-            None,
-            || {},
-        )
-        .expect("failed to spawn PTY");
-
-        let mut buf = Vec::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline {
-            match tokio::time::timeout(std::time::Duration::from_millis(200), pty.recv()).await {
-                Ok(Some(PtyEvent::Output(data))) => buf.extend_from_slice(&data),
-                Ok(Some(PtyEvent::Exit(_))) => break,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        let s = String::from_utf8_lossy(&buf);
-        assert!(
-            s.contains("WEFT_TEST_OVERRIDE=sentinel-12345"),
-            "override missing from child env; got:\n{s}"
-        );
-    }
-
-    /// Test error type display.
-    #[test]
-    fn error_display() {
-        let err = PtyError::ChildExited(1);
-        assert!(err.to_string().contains("exited with code 1"));
-
-        let err = PtyError::ChildSignaled("SIGHUP".into());
-        assert!(err.to_string().contains("killed by signal"));
-    }
-
-    // ── T4: additional PTY coverage ────────────────────────────────────
-
-    /// Spawning a non-existent program: forkpty succeeds (the fork itself
-    /// works), the child's exec fails, and the child exits with code 127
-    /// (the POSIX convention for "command not found"). The parent sees an
-    /// `Exit` event rather than a spawn-time error.
-    ///
-    /// Marked `#[ignore]` because it spawns a real subprocess (needs a PTY
-    /// and a working fork). Run with `cargo test -- --ignored`.
-    #[tokio::test]
-    #[ignore]
-    async fn spawn_unknown_command_child_exits() {
-        let mut pty = Pty::spawn("/no/such/binary/xyzzy", (24, 80), || {})
-            .expect("forkpty itself should succeed even if the program doesn't exist");
-
-        // The child's exec will fail → it exits with code 127. Collect
-        // events until we see the Exit.
-        let mut got_exit = false;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while tokio::time::Instant::now() < deadline {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), pty.recv()).await;
-            match event {
-                Ok(Some(PtyEvent::Exit(result))) => {
-                    // exec failure → child exits with 127.
-                    assert!(
-                        result.is_ok(),
-                        "expected exit code 127, got error: {result:?}"
-                    );
-                    assert_eq!(result.unwrap(), 127, "exec failure should exit 127");
-                    got_exit = true;
-                    break;
-                }
-                Ok(Some(PtyEvent::Output(_))) => continue,
-                Ok(None) => break,
-                Err(_) => break,
-            }
-        }
-        assert!(
-            got_exit,
-            "should receive an Exit event for an unknown command"
-        );
-    }
-
-    // ── v1.11.2 X2 (PLAN_v1112 §2): wake-throttle decision table ──────
-
-    #[test]
-    fn pty_wake_due_throttles_floods_to_sixty_hz() {
-        // Inside the 16 ms window with a non-empty queue: no wake.
-        assert!(!pty_wake_due(false, false, 1_000, 1_008));
-        // At/after the window boundary: wake.
-        assert!(pty_wake_due(false, false, 1_000, 1_016));
-        assert!(pty_wake_due(false, false, 1_000, 2_000));
-    }
-
-    #[test]
-    fn pty_wake_due_wakes_a_caught_up_consumer_immediately() {
-        // An empty queue means the consumer is idle — fresh output must be
-        // pumped without waiting out the 16 ms window.
-        assert!(pty_wake_due(false, true, 1_000, 1_001));
-    }
-
-    #[test]
-    fn pty_wake_due_exit_bypasses_the_throttle() {
-        assert!(pty_wake_due(true, false, 1_000, 1_001));
-    }
-
-    // Restored verbatim from HEAD (rust-reviewer v1.11.2 Major-1): the
-    // interrupted worker had dropped these write-budget behavior anchors
-    // while restructuring the tests module; the production functions they
-    // pin (write_all_nonblocking / WriteOutcome / write_sync) are unchanged
-    // by v1.11.2, so the anchors must survive too.
-
-    // ── FIX_TERMINAL_CAPABILITY_HARDENING: bounded-EAGAIN write loop ──
-
-    /// EWOULDBLOCK twice, then success → the loop must poll-wait and retry,
-    /// ending in WrittenAll with all three calls observed.
-    #[test]
-    fn write_all_nonblocking_retries_wouldblock_then_succeeds() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let mut calls = 0;
-        let outcome = write_all_nonblocking(
-            &mut |buf: &[u8]| {
-                calls += 1;
-                if calls <= 2 {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                } else {
-                    Ok(buf.len())
-                }
-            },
-            devnull.as_raw_fd(),
-            b"hello",
-            Duration::from_millis(50),
-        );
-        assert!(
-            matches!(outcome, WriteOutcome::WrittenAll),
-            "expected WrittenAll, got {outcome:?}"
-        );
-        assert_eq!(calls, 3, "must retry after each EWOULDBLOCK");
-    }
-
-    /// A writer that stays blocked must burn through the whole budget and
-    /// then give up with an observable TimedOut result (the caller warns
-    /// about the dropped bytes).
-    #[test]
-    fn write_all_nonblocking_gives_up_after_budget() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let started = std::time::Instant::now();
-        let outcome = write_all_nonblocking(
-            &mut |_buf: &[u8]| Err(io::Error::from(io::ErrorKind::WouldBlock)),
-            devnull.as_raw_fd(),
-            b"data",
-            Duration::from_millis(40),
-        );
-        assert!(
-            matches!(outcome, WriteOutcome::TimedOut { written: 0 }),
-            "continuously-blocked writer must time out, got {outcome:?}"
-        );
-        assert!(
-            started.elapsed() >= Duration::from_millis(30),
-            "must spend the budget waiting before giving up"
-        );
-    }
-
-    /// Partial writes must advance and re-issue with the unsent remainder.
-    #[test]
-    fn write_all_nonblocking_chains_partial_writes() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let mut seen: Vec<Vec<u8>> = Vec::new();
-        let outcome = write_all_nonblocking(
-            &mut |buf: &[u8]| {
-                seen.push(buf.to_vec());
-                Ok(buf.len().min(3)) // claim 3 bytes written per call
-            },
-            devnull.as_raw_fd(),
-            b"hello",
-            Duration::from_millis(50),
-        );
-        assert!(
-            matches!(outcome, WriteOutcome::WrittenAll),
-            "partial writes must converge, got {outcome:?}"
-        );
-        assert_eq!(
-            seen,
-            vec![b"hello".to_vec(), b"lo".to_vec()],
-            "remainder must be re-issued"
-        );
-    }
-
-    /// A writer claiming `Ok(0)` with data remaining must fail fast with a
-    /// WriteZero error (std `write_all` contract) instead of spinning out
-    /// the whole budget.
-    #[test]
-    fn write_all_nonblocking_fails_fast_on_zero_write() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let started = std::time::Instant::now();
-        let outcome = write_all_nonblocking(
-            &mut |_buf: &[u8]| Ok(0),
-            devnull.as_raw_fd(),
-            b"data",
-            Duration::from_millis(50),
-        );
-        assert!(
-            matches!(outcome, WriteOutcome::Error(ref e) if e.kind() == io::ErrorKind::WriteZero),
-            "zero-write must fail fast with WriteZero, got {outcome:?}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(30),
-            "zero-write must not spin to the budget deadline"
-        );
-    }
-
-    /// A writer that makes partial progress and THEN blocks forever must
-    /// report `TimedOut` with the bytes that actually made it out — the
-    /// caller (`write_sync`) warns with the dropped remainder, so partial
-    /// drops must stay observable via `written`, never masked as success.
-    #[test]
-    fn write_all_nonblocking_times_out_with_partial_writes() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let mut writes = 0;
-        let outcome = write_all_nonblocking(
-            &mut |buf: &[u8]| {
-                writes += 1;
-                if writes == 1 {
-                    Ok(buf.len().min(4)) // claim the first 4 bytes
-                } else {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                }
-            },
-            devnull.as_raw_fd(),
-            b"abcdef",
-            Duration::from_millis(30),
-        );
-        match outcome {
-            WriteOutcome::TimedOut { written } => {
-                assert_eq!(written, 4, "partial progress must survive the timeout");
-            }
-            other => panic!("expected TimedOut with partial write, got {other:?}"),
-        }
-    }
-
-    /// A REAL kernel-backed EAGAIN, no fake closures: a Unix pipe whose
-    /// buffer is full and whose reader never drains. `write_all_nonblocking`
-    /// must burn its budget waiting for POLLOUT (which cannot fire) and
-    /// report `TimedOut { written: 0 }`.
-    #[test]
-    fn write_all_nonblocking_times_out_against_real_full_pipe() {
-        let (reader, writer) = nix::unistd::pipe().expect("pipe");
-        let _reader = reader; // held open so the pipe stays full for the whole test
-        nix::fcntl::fcntl(
-            writer.as_raw_fd(),
-            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .expect("set pipe write end non-blocking");
-
-        // Saturate: write 4 KiB chunks until the kernel refuse (EAGAIN).
-        let mut accepted = 0usize;
-        loop {
-            match nix::unistd::write(&writer, &[0u8; 4096]) {
-                Ok(n) => accepted += n,
-                Err(nix::errno::Errno::EAGAIN) => break,
-                Err(error) => panic!("unexpected pipe fill error: {error}"),
-            }
-            if accepted > 4 * 1024 * 1024 {
-                panic!("pipe never filled; unexpected kernel behavior");
-            }
-        }
-        assert!(accepted > 0, "pipe must accept then refuse writes");
-
-        let mut kernel_writes = 0usize;
-        let outcome = write_all_nonblocking(
-            &mut |buf: &[u8]| match nix::unistd::write(&writer, buf) {
-                Ok(n) => {
-                    kernel_writes += n;
-                    Ok(n)
-                }
-                Err(nix::errno::Errno::EAGAIN) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-                Err(error) => Err(io::Error::from(error)),
-            },
-            writer.as_raw_fd(),
-            b"overflow payload that can never fit",
-            Duration::from_millis(40),
-        );
-        match outcome {
-            WriteOutcome::TimedOut { written } => {
-                assert_eq!(written, 0, "full pipe must accept nothing");
-            }
-            other => panic!("expected TimedOut against a real full pipe, got {other:?}"),
-        }
-        assert_eq!(kernel_writes, 0, "no byte may sneak into a full pipe");
-    }
-
-    /// AUDIT_v1.10.39 (write-budget behavior anchor): `write_sync` maps a
-    /// budget-exhausted write to `Ok(())` — dropping the overflow with
-    /// only a warn! (see the doc comment on `write_sync`). The plan was
-    /// to trigger that arm with a real PTY, but on macOS it is
-    /// unreachable: the n_tty line discipline silently DISCARDS input
-    /// overflow instead of holding the queue full (probed empirically:
-    /// 512 MiB into a never-reading child returned full-count writes,
-    /// never EAGAIN), so the real kernel never surfaces a persistent
-    /// full buffer to the master fd. The `TimedOut → Ok(())` mapping is
-    /// therefore pinned by the injected-writer unit tests above, and this
-    /// test pins what IS reachable on real hardware — the audit's
-    /// "silent drop": a huge write into a saturated child returns Ok(())
-    /// with the overflow invisible to the caller. Both pieces document,
-    /// not endorse, the status quo.
-    #[tokio::test]
-    async fn write_sync_large_write_into_saturated_child_reports_ok() {
-        // `/bin/sleep` never reads stdin, so the child's input queue is
-        // permanently saturated; the kernel discards the overflow.
-        let pty = Pty::spawn("/bin/sleep", (24, 80), || {}).expect("failed to spawn PTY");
-        let payload = vec![0x55u8; 1024 * 1024];
-        let result = pty.write_sync(&payload);
-        assert!(
-            result.is_ok(),
-            "write_sync must stay Ok() into a saturated child, got {result:?}"
-        );
-    }
-
-    /// EINTR is retried like EWOULDBLOCK (asymmetric with the poll loop's
-    /// EINTR handling, which already continues).
-    #[test]
-    fn write_all_nonblocking_retries_interrupted_like_wouldblock() {
-        let devnull = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let mut calls = 0;
-        let outcome = write_all_nonblocking(
-            &mut |buf: &[u8]| {
-                calls += 1;
-                if calls <= 2 {
-                    Err(io::Error::from(io::ErrorKind::Interrupted))
-                } else {
-                    Ok(buf.len())
-                }
-            },
-            devnull.as_raw_fd(),
-            b"hi",
-            Duration::from_millis(50),
-        );
-        assert!(
-            matches!(outcome, WriteOutcome::WrittenAll),
-            "Interrupted must be retried, got {outcome:?}"
-        );
-        assert_eq!(calls, 3, "must retry after each Interrupted");
-    }
-}
+#[path = "pty/tests.rs"]
+mod tests;
