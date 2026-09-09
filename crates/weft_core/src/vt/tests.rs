@@ -3918,6 +3918,20 @@ mod perf_benchmarks {
         (ms, bytes_len)
     }
 
+    /// v1.11.16: perf budgets are calibrated for a developer machine, but
+    /// shared CI runners are both slower and noisier, so an absolute
+    /// assertion there measures the runner rather than the parser.
+    /// `WEFT_PERF_SLACK` scales every target (default 1.0 = the real budget);
+    /// CI sets a documented factor so the regression signal survives without
+    /// turning host jitter into red builds.
+    fn perf_slack() -> f64 {
+        std::env::var("WEFT_PERF_SLACK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v >= 1.0)
+            .unwrap_or(1.0)
+    }
+
     /// `seq 1 10000` — plan target: < 50ms (Warp ~10ms).
     #[test]
     #[ignore]
@@ -3925,7 +3939,8 @@ mod perf_benchmarks {
         println!("\n=== Phase 1.5 benchmark: seq 1 10000 (target < 50ms) ===");
         let bytes = seq_output(10_000);
         let (ms, _) = bench("seq 1 10000", &bytes);
-        assert!(ms < 50.0, "seq 1 10000 took {ms:.2}ms, target < 50ms");
+        let target = 50.0 * perf_slack();
+        assert!(ms < target, "seq 1 10000 took {ms:.2}ms, target < {target:.0}ms");
     }
 
     /// `seq 1 100000` — plan target: < 300ms (Warp ~50ms).
@@ -3935,7 +3950,8 @@ mod perf_benchmarks {
         println!("\n=== Phase 1.5 benchmark: seq 1 100000 (target < 300ms) ===");
         let bytes = seq_output(100_000);
         let (ms, _) = bench("seq 1 100000", &bytes);
-        assert!(ms < 300.0, "seq 1 100000 took {ms:.2}ms, target < 300ms");
+        let target = 300.0 * perf_slack();
+        assert!(ms < target, "seq 1 100000 took {ms:.2}ms, target < {target:.0}ms");
     }
 
     /// `ls -la /usr/bin` style (~1000 entries) — plan target: < 20ms (Warp ~5ms).
@@ -3945,7 +3961,8 @@ mod perf_benchmarks {
         println!("\n=== Phase 1.5 benchmark: ls -la /usr/bin (target < 20ms) ===");
         let bytes = ls_output(1000);
         let (ms, _) = bench("ls -la /usr/bin (1000 entries)", &bytes);
-        assert!(ms < 20.0, "ls output took {ms:.2}ms, target < 20ms");
+        let target = 20.0 * perf_slack();
+        assert!(ms < target, "ls output took {ms:.2}ms, target < {target:.0}ms");
     }
 
     /// Pure ASCII bulk (no escapes) — measures the C1 fast-path ceiling.

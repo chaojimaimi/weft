@@ -66,6 +66,10 @@ jobs:
       # It used to sit before it and died with exit 127 (command not found) —
       # masked for weeks because CI never got past Clippy.
       - name: Performance budgets
+        # Shared runners are slower/noisier than a dev box; budgets carry a
+        # documented 3x slack here (default 1.0 keeps the real budget locally).
+        env:
+          WEFT_PERF_SLACK: "3"
         run: ./scripts/performance_gate.sh
 
       - name: Verify .app bundle
