@@ -13,8 +13,11 @@ use std::time::Duration;
 use support::{require_command, require_path_command, sandbox, TuiSession};
 use weft_core::input::{InputHandler, Modifiers, MouseProtocol};
 
-const START_TIMEOUT: Duration = Duration::from_secs(4);
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(3);
+// v1.11.16: raised from 4s/3s. These drive real /usr/bin binaries on a shared
+// CI runner, where process start and first paint are markedly slower than on a
+// dev box; the lower values turned host latency into flaky failures.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[tokio::test(flavor = "current_thread")]
 async fn less_search_prompt_match_and_exit_roundtrip() {
@@ -106,11 +109,17 @@ async fn vim_mouse_search_cjk_grid_and_exit_roundtrip() {
     let args = ["--clean", "-n", "-i", "NONE", &fixture_text];
 
     let mut session = TuiSession::spawn(VIM, &args, 24, 80, &dir);
+    // v1.11.16: wait for the fixture content as well as the alt screen. The
+    // old form only waited for alt-screen activation and then asserted the
+    // text immediately — a race that passed on a fast dev box and failed on a
+    // slow runner, where Vim had not painted the first line yet.
     assert!(
         session
-            .wait_until(START_TIMEOUT, |s| s.terminal.is_alt_screen_active())
+            .wait_until(START_TIMEOUT, |s| {
+                s.terminal.is_alt_screen_active() && s.visible_text().contains("0001")
+            })
             .await,
-        "Vim did not enter alt screen; output={:?}",
+        "Vim did not enter alt screen with fixture content; output={:?}",
         String::from_utf8_lossy(&session.raw_output)
     );
     assert!(session.visible_text().contains("0001"));
