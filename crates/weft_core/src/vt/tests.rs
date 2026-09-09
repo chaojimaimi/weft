@@ -3940,7 +3940,10 @@ mod perf_benchmarks {
         let bytes = seq_output(10_000);
         let (ms, _) = bench("seq 1 10000", &bytes);
         let target = 50.0 * perf_slack();
-        assert!(ms < target, "seq 1 10000 took {ms:.2}ms, target < {target:.0}ms");
+        assert!(
+            ms < target,
+            "seq 1 10000 took {ms:.2}ms, target < {target:.0}ms"
+        );
     }
 
     /// `seq 1 100000` — plan target: < 300ms (Warp ~50ms).
@@ -3951,7 +3954,10 @@ mod perf_benchmarks {
         let bytes = seq_output(100_000);
         let (ms, _) = bench("seq 1 100000", &bytes);
         let target = 300.0 * perf_slack();
-        assert!(ms < target, "seq 1 100000 took {ms:.2}ms, target < {target:.0}ms");
+        assert!(
+            ms < target,
+            "seq 1 100000 took {ms:.2}ms, target < {target:.0}ms"
+        );
     }
 
     /// `ls -la /usr/bin` style (~1000 entries) — plan target: < 20ms (Warp ~5ms).
@@ -3962,7 +3968,10 @@ mod perf_benchmarks {
         let bytes = ls_output(1000);
         let (ms, _) = bench("ls -la /usr/bin (1000 entries)", &bytes);
         let target = 20.0 * perf_slack();
-        assert!(ms < target, "ls output took {ms:.2}ms, target < {target:.0}ms");
+        assert!(
+            ms < target,
+            "ls output took {ms:.2}ms, target < {target:.0}ms"
+        );
     }
 
     /// Pure ASCII bulk (no escapes) — measures the C1 fast-path ceiling.
