@@ -1139,7 +1139,7 @@ fn sync_mouse_modes_without_terminal_is_a_noop() {
 #[test]
 fn mouse_suppressed_reads_the_active_pane_flag() {
     use weft_core::input::set_suppressed;
-    let mut t = tab_with_terminal(100);
+    let t = tab_with_terminal(100);
     assert!(!t.mouse_suppressed(), "fresh pane starts unsuppressed");
     set_suppressed(&t.mouse_suppress);
     assert!(t.mouse_suppressed());

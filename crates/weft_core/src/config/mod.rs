@@ -308,11 +308,14 @@ impl Config {
                 Some(false) => {
                     ot["enabled"] = toml_edit::value(false);
                 }
-                Some(true) => {
-                    if ot.contains_key("enabled") {
-                        ot.remove("enabled");
-                    }
+                // v1.11.16: the inner `if` is folded into a match guard
+                // (clippy::collapsible_match is a hard error under CI's
+                // `-D warnings`). Semantics unchanged: delete the on-disk
+                // `enabled` key only when it actually exists.
+                Some(true) if ot.contains_key("enabled") => {
+                    ot.remove("enabled");
                 }
+                Some(true) => {}
                 None => {}
             }
             set_opt_string_clear(ot, "output_default", &out.output_default);

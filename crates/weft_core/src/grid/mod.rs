@@ -943,9 +943,9 @@ impl Grid {
 
     /// Clear all tab stops (CSI 3g).
     pub fn clear_all_tabstops(&mut self) {
-        for stop in &mut self.tabstops {
-            *stop = false;
-        }
+        // v1.11.16: `fill` supersedes the manual loop (clippy::manual_slice_fill
+        // is a hard error under CI's `-D warnings`).
+        self.tabstops.fill(false);
     }
 
     /// Advance cursor to next tab stop (CSI I / HT).

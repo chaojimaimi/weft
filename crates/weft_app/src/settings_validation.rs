@@ -310,7 +310,7 @@ fn push_float_range(errors: &mut Vec<FieldError>, label: &str, value: f32, min: 
 
 fn validate_keybindings(config: &Config, errors: &mut Vec<FieldError>) {
     let mut bindings: Vec<_> = config.keybindings.iter().collect();
-    bindings.sort_by(|(left, _), (right, _)| left.cmp(right));
+    bindings.sort_by_key(|(left, _)| *left);
     let mut canonical: HashMap<(KeyCode, Modifiers), (&str, Action)> = HashMap::new();
     for (binding, action) in bindings {
         let Some(chord) = weft_core::config::parse_binding(binding) else {

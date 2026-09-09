@@ -72,6 +72,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          # v1.11.16: pinned to match rust-toolchain.toml (see ci.yml note).
+          toolchain: "1.98.1"
           targets: aarch64-apple-darwin
           components: rustfmt, clippy
 

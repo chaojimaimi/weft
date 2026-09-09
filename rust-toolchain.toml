@@ -1,0 +1,21 @@
+# Weft toolchain pin (v1.11.16)
+#
+# Why pin: CI previously resolved `dtolnay/rust-toolchain@stable` to whatever
+# the newest stable happened to be. Stable Rust ships new clippy lints
+# (`byte_char_slices`, `manual_slice_fill`, `collapsible_match`,
+# `unnecessary_sort_by`, `unnecessary_min_or_max` …) and the workflow runs
+# `cargo clippy --all-targets -- -D warnings`, so every toolchain bump silently
+# converted fresh warnings into hard build failures — CI had been red since
+# 2026-08-14 with no code defect behind it.
+#
+# Pinning the channel makes local, CI and release builds use one toolchain, so
+# new lints only land when we deliberately bump `channel` below.
+#
+# Bump procedure: set `channel` to the new version, run
+# `cargo clippy --all-targets -- -D warnings` and fix what it reports, then
+# commit the toolchain bump together with the fixes.
+
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

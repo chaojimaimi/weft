@@ -250,7 +250,10 @@ impl App {
             return;
         };
         let visible = renderer.block_visible_rows(prompt_lines, cwd_header_active);
-        let target = rows_from_bottom.saturating_sub(visible / 3).max(0);
+        // v1.11.16: `saturating_sub` already floors at 0 — the trailing
+        // `.max(0)` was dead (clippy::unnecessary_min_or_max under CI's
+        // `-D warnings`).
+        let target = rows_from_bottom.saturating_sub(visible / 3);
         self.sessions.active_mut().set_block_scroll(target);
 
         // Arm the highlight: accent border around the block for 1.5s.

@@ -323,7 +323,7 @@ impl vte::Perform for Terminal {
     ) {
         self.suppress_joined_scalar = false;
         // DECRQM private-mode query; report DEC 2026 synchronized output.
-        if action == 'p' && intermediates == [b'?', b'$'] {
+        if action == 'p' && intermediates == b"?$" {
             for sub in params.iter() {
                 if let &[mode] = sub {
                     let status = match mode {
@@ -343,7 +343,7 @@ impl vte::Perform for Terminal {
         // handle_dec_private_mode(1, false) and silently toggled DECCKM off.
         // Non-h/l actions fall through to the match below, where the per-arm
         // intermediates guards swallow them (see the 'u' arm).
-        if intermediates == [b'?'] && matches!(action, 'h' | 'l') {
+        if intermediates == b"?" && matches!(action, 'h' | 'l') {
             let set = action == 'h';
             for sub in params.iter() {
                 if let &[mode] = sub {
@@ -535,7 +535,7 @@ impl vte::Perform for Terminal {
                 self.respond(b"\x1b[?62;1;2;4;6;9;15;22c");
             }
             // DA2 / secondary device attributes (CSI > c).
-            'c' if intermediates == [b'>'] => {
+            'c' if intermediates == b">" => {
                 // "weft", version 0, ROM 0.
                 self.respond(b"\x1b[>0;276;0c");
             }
@@ -640,12 +640,12 @@ impl vte::Perform for Terminal {
             // sends it at startup. Reply `DCS > | weft <ver> ST`. Split by
             // exact intermediates so it cannot collide with DECSCUSR below
             // (empty or SP intermediates) nor DA2 (`CSI > c`).
-            'q' if intermediates == [b'>'] => {
+            'q' if intermediates == b">" => {
                 self.respond(&replies::xtversion_reply());
             }
             // Cursor style (DECSCUSR — CSI <n> q)
             'q' => {
-                if intermediates.is_empty() || intermediates == [b' '] {
+                if intermediates.is_empty() || intermediates == b" " {
                     // ECMA/DEC standard form is `CSI Ps SP q`; retain the
                     // no-intermediate form for compatibility with older TUIs.
                     let style = param(params, 0, 0);
@@ -1085,7 +1085,7 @@ impl vte::Perform for Terminal {
         // DCS queries we answer: XTGETTCAP (`+q`, opencode `Ms` probe) and
         // v1.11.3 DECRQSS (`$q`, nvim `ESC P $ q m ST` probe, §2.2); the
         // rest stays ignored.
-        if action == 'q' && (intermediates == [b'+'] || intermediates == [b'$']) {
+        if action == 'q' && (intermediates == b"+" || intermediates == b"$") {
             self.dcs_query.begin(action, intermediates);
             return;
         }

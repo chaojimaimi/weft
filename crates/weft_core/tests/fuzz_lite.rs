@@ -115,7 +115,7 @@ fn emit_esc_atom(rng: &mut XorShift64, out: &mut Vec<u8>) {
         1..=4 => {
             out.extend_from_slice(b"\x1b[");
             push_number(out, rng.param_u16());
-            out.push([b'A', b'B', b'C', b'D'][(rng.below(4)) as usize]);
+            out.push(b"ABCD"[(rng.below(4)) as usize]);
         }
         // ED / EL — erase display / line.
         5 | 6 => {
@@ -128,7 +128,7 @@ fn emit_esc_atom(rng: &mut XorShift64, out: &mut Vec<u8>) {
         7..=12 => {
             out.extend_from_slice(b"\x1b[");
             push_number(out, rng.param_u16());
-            out.push([b'@', b'P', b'L', b'M', b'S', b'T'][(rng.below(6)) as usize]);
+            out.push(b"@PLMST"[(rng.below(6)) as usize]);
         }
         // SGR — five shapes: reset, indexed, truecolor, underline-color,
         // and a >32-parameter flood.

@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn slash_and_question_mark_each_emit_exactly_one_raw_pty_write() {
-        for byte in [b'/', b'?'] {
+        for byte in *b"/?" {
             assert_eq!(
                 passthrough_key_effects(2, vec![byte]),
                 [Effect::WritePty {
