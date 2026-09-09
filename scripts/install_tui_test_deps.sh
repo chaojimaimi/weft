@@ -6,6 +6,25 @@ TMUX_SHA256="87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96"
 TMUX_URL="https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz"
 TMUX_PREFIX="${WEFT_TMUX_PREFIX:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/weft-tmux-${TMUX_VERSION}}"
 
+# v1.11.16: glyph tests assert Fira Code's "no true italic face" behavior
+# (`fira_code_without_italic_variant_is_rejected` — Core Text would otherwise
+# approximate Italic with Regular). GitHub runners don't ship the font, and the
+# test now skips when it is absent, so install it here to keep the assertion
+# live in CI. Runs before the tmux early-exit below.
+install_fira_code() {
+    if system_profiler SPFontsDataType 2>/dev/null | grep -qi "Fira Code"; then
+        echo "Fira Code already installed"
+        return 0
+    fi
+    echo "Installing Fira Code (glyph variant tests)"
+    # Best-effort: the test skips if the font ends up missing, so a brew/cask
+    # hiccup must not fail the whole dependency step.
+    brew install --cask font-fira-code || \
+        echo "warning: Fira Code install failed — glyph variant tests will skip"
+}
+
+install_fira_code
+
 add_to_github_path() {
     if [[ -n "${GITHUB_PATH:-}" ]]; then
         echo "$1" >> "${GITHUB_PATH}"

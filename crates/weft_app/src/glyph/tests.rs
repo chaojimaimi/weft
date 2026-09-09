@@ -93,6 +93,15 @@ fn menlo_variants_resolve_via_properties_match() {
 #[test]
 fn fira_code_without_italic_variant_is_rejected() {
     use font_kit::properties::{Style as FontStyle, Weight};
+    // v1.11.16: environment guard. This test asserts Fira Code's own behavior
+    // (no Italic face), so it can only run where the family is installed.
+    // CI installs it via scripts/install_tui_test_deps.sh; anywhere else the
+    // test skips instead of failing on a missing font (same shape as
+    // tui_integration's require_command guard).
+    if super::font::resolve_font("Fira Code", &[]).is_none() {
+        eprintln!("skipping fira_code_without_italic_variant_is_rejected: Fira Code not installed");
+        return;
+    }
     let bold = super::font::resolve_font_variant(
         "Fira Code",
         &["/System/Library/Fonts/Menlo.ttc"],
