@@ -2322,6 +2322,64 @@ fn print_wrap_at_bottom_row_stays_in_bounds() {
         t.grid().cursor.row,
         t.grid().num_rows
     );
+    // Fix B2 (v1.11.16): at the last physical row outside the scroll region
+    // the cursor stays put, and NO row may be marked `wrapped` (the old code
+    // mismarked row-1 as a continuation of unrelated content).
+    assert!(
+        (0..t.grid().num_rows).all(|r| !t.grid().viewport[r].wrapped),
+        "no row may be marked wrapped when the cursor cannot advance"
+    );
+}
+
+/// Fix B2 (v1.11.16): a normal deferred wrap on a non-last row must mark the
+/// row the cursor just left as `wrapped` so reflow can merge the continuation.
+#[test]
+fn wrap_marks_previous_row_on_normal_newline() {
+    let mut t = Terminal::new(24, 80);
+    let row_before = 5;
+    t.grid_mut().cursor.row = row_before;
+    t.grid_mut().cursor.col = 79; // last column
+    t.grid_mut().cursor.wrap_pending = true;
+    t.process(b"x"); // triggers the deferred-wrap path, advances to row 6
+    assert_eq!(t.grid().cursor.row, row_before + 1, "cursor should advance");
+    // 'x' is half-width: after the wrap to col 0 the print advances col to 1.
+    assert_eq!(t.grid().cursor.col, 1, "cursor sits after the printed 'x'");
+    assert!(
+        t.grid().viewport[row_before].wrapped,
+        "row {} (the row the cursor left) must be marked wrapped",
+        row_before
+    );
+}
+
+/// Fix B2 (v1.11.16): a deferred wrap at the scroll-region bottom must scroll
+/// and mark the row above the bottom as `wrapped`.
+#[test]
+fn wrap_marks_previous_row_on_scroll_region_bottom() {
+    let mut t = Terminal::new(24, 80);
+    t.grid_mut().set_scroll_region(1, 10); // 1-based → top 0, bottom 9
+    let bottom = t.grid().scroll_region().1;
+    assert_eq!(bottom, 9);
+    t.grid_mut().cursor.row = bottom;
+    t.grid_mut().cursor.col = 79; // last column
+    t.grid_mut().cursor.wrap_pending = true;
+    let sb_before = t.grid().scrollback.len();
+    t.process(b"x"); // triggers scroll at the region bottom
+                     // The cursor stays on the bottom row after a scroll; the row above it is
+                     // the overflowed row and must be marked wrapped.
+    assert_eq!(
+        t.grid().cursor.row,
+        bottom,
+        "cursor stays on bottom after scroll"
+    );
+    assert!(
+        t.grid().viewport[bottom - 1].wrapped,
+        "row {} (above the scroll-region bottom) must be marked wrapped",
+        bottom - 1
+    );
+    assert!(
+        t.grid().scrollback.len() > sb_before,
+        "a scroll must have occurred at the scroll-region bottom"
+    );
 }
 
 // ── Scroll ───────────────────────────────────────────────────

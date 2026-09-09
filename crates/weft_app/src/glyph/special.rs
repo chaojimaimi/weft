@@ -91,6 +91,23 @@ pub(super) fn rasterize(ch: char, width: u32, height: u32) -> Option<Vec<u8>> {
         '┬' => Some(draw_box(width, height, LEFT | RIGHT | DOWN, false)),
         '┴' => Some(draw_box(width, height, LEFT | RIGHT | UP, false)),
         '┼' => Some(draw_box(width, height, LEFT | RIGHT | UP | DOWN, false)),
+        // Geometric Shapes: procedural edge-to-edge rendering with 4x4
+        // supersampled antialiasing (see supersample / draw_* below). Shapes
+        // are centered and sized by min(width, height) so a wide (double-cell)
+        // slot keeps circles round instead of stretching them.
+        '●' => Some(draw_circle_fill(width, height, 0.85)),
+        '⬤' => Some(draw_circle_fill(width, height, 0.95)),
+        '○' => Some(draw_circle_ring(width, height, 0.85, 0.24 * 0.85 / 2.0)),
+        '•' => Some(draw_circle_fill(width, height, 0.45)),
+        '◦' => Some(draw_circle_ring(width, height, 0.45, 0.30 * 0.45 / 2.0)),
+        '■' => Some(draw_square_fill(width, height, 0.85)),
+        '□' => Some(draw_square_frame(width, height, 0.85, 0.12 * 0.85)),
+        '▲' => Some(draw_triangle(width, height, TriDir::Up, 0.85)),
+        '▼' => Some(draw_triangle(width, height, TriDir::Down, 0.85)),
+        '▶' => Some(draw_triangle(width, height, TriDir::Right, 0.85)),
+        '◀' => Some(draw_triangle(width, height, TriDir::Left, 0.85)),
+        '◆' => Some(draw_diamond(width, height, 0.85, true)),
+        '◇' => Some(draw_diamond(width, height, 0.85, false)),
         _ => None,
     }
 }
@@ -174,6 +191,123 @@ fn paint(pixels: &mut [u8], width: u32, x0: u32, y0: u32, x1: u32, y1: u32) {
         for x in x0..x1 {
             pixels[(y * width + x) as usize] = u8::MAX;
         }
+    }
+}
+
+/// Antialiasing supersample factor. Each output pixel is the coverage ratio
+/// (0–255) of 16 subpixel inclusion tests.
+const AA: u32 = 4;
+
+/// Generic 4×4 supersampled rasterizer.
+///
+/// `f` receives normalized coordinates centered on the cell so that
+/// `min(width, height)` is one unit: `(0, 0)` is the cell center, the x/y
+/// axes run along the cell edges, and +y points downward (toward higher pixel
+/// rows). `f` returns `true` when the sample point lies inside the shape.
+fn supersample(width: u32, height: u32, f: impl Fn(f32, f32) -> bool) -> Vec<u8> {
+    let mut pixels = vec![0u8; width as usize * height as usize];
+    let cx = width as f32 / 2.0;
+    let cy = height as f32 / 2.0;
+    let unit = (width.min(height)) as f32;
+    let inv = 1.0 / AA as f32;
+    for py in 0..height {
+        for px in 0..width {
+            let mut hits = 0u32;
+            for j in 0..AA {
+                let sy = (py as f32) + (j as f32 + 0.5) * inv;
+                let ny = (sy - cy) / unit;
+                for i in 0..AA {
+                    let sx = (px as f32) + (i as f32 + 0.5) * inv;
+                    let nx = (sx - cx) / unit;
+                    if f(nx, ny) {
+                        hits += 1;
+                    }
+                }
+            }
+            pixels[(py * width + px) as usize] = ((hits * 255 + (AA * AA) / 2) / (AA * AA)) as u8;
+        }
+    }
+    pixels
+}
+
+/// Filled circle. `ratio` is the diameter relative to `min(width, height)`.
+fn draw_circle_fill(width: u32, height: u32, ratio: f32) -> Vec<u8> {
+    let r = ratio / 2.0;
+    let r2 = r * r;
+    supersample(width, height, move |x, y| x * x + y * y <= r2)
+}
+
+/// Ring (hollow circle). `ratio` is the diameter; `stroke` is the line width
+/// expressed as a fraction of the circle radius.
+fn draw_circle_ring(width: u32, height: u32, ratio: f32, stroke: f32) -> Vec<u8> {
+    let r = ratio / 2.0;
+    let outer = r + stroke / 2.0;
+    let inner = (r - stroke / 2.0).max(0.0);
+    let o2 = outer * outer;
+    let i2 = inner * inner;
+    supersample(width, height, move |x, y| {
+        let d2 = x * x + y * y;
+        d2 <= o2 && d2 >= i2
+    })
+}
+
+/// Filled axis-aligned square. `ratio` is the edge length relative to
+/// `min(width, height)`.
+fn draw_square_fill(width: u32, height: u32, ratio: f32) -> Vec<u8> {
+    let h = ratio / 2.0;
+    supersample(width, height, move |x, y| x.abs() <= h && y.abs() <= h)
+}
+
+/// Hollow square frame. `ratio` is the edge length; `stroke` is the line width
+/// as a fraction of the edge.
+fn draw_square_frame(width: u32, height: u32, ratio: f32, stroke: f32) -> Vec<u8> {
+    let h = ratio / 2.0;
+    let t = stroke / 2.0;
+    supersample(width, height, move |x, y| {
+        let ax = x.abs();
+        let ay = y.abs();
+        ax <= h && ay <= h && (ax >= h - t || ay >= h - t)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum TriDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Filled triangle. `ratio` is the bounding-box edge relative to
+/// `min(width, height)`; `dir` points the apex toward that edge.
+///
+/// The raw bitmap is stored bottom-up (row 0 = visual bottom, row h-1 = visual
+/// top) and V-flipped at paint time, so `Up` (▲, point at the visual top) must
+/// place the apex at the BACK of the buffer (large y, higher row index).
+/// `Down` mirrors this. Left/Right are unaffected by the vertical flip.
+fn draw_triangle(width: u32, height: u32, dir: TriDir, ratio: f32) -> Vec<u8> {
+    let h = ratio / 2.0;
+    supersample(width, height, move |x, y| match dir {
+        TriDir::Up => y >= -h && y <= h && x >= (y - h) / 2.0 && x <= (h - y) / 2.0,
+        TriDir::Down => y >= -h && y <= h && x >= -(y + h) / 2.0 && x <= (y + h) / 2.0,
+        TriDir::Left => x >= -h && x <= h && y >= -(x + h) / 2.0 && y <= (x + h) / 2.0,
+        TriDir::Right => x >= -h && x <= h && y >= (x - h) / 2.0 && y <= (h - x) / 2.0,
+    })
+}
+
+/// Diamond (square rotated 45°). `ratio` is the diagonal relative to
+/// `min(width, height)`. When `filled` is false a hollow frame is drawn whose
+/// line width is ~10% of the diagonal.
+fn draw_diamond(width: u32, height: u32, ratio: f32, filled: bool) -> Vec<u8> {
+    let h = ratio / 2.0;
+    if filled {
+        supersample(width, height, move |x, y| x.abs() + y.abs() <= h)
+    } else {
+        let band = ratio * 0.10 / 2.0; // half of the ~10%-of-diagonal stroke
+        supersample(width, height, move |x, y| {
+            let d = x.abs() + y.abs();
+            d <= h && d >= h - band
+        })
     }
 }
 
@@ -262,6 +396,131 @@ mod tests {
                 assert!(
                     rasterize(ch, 8, 16).is_some(),
                     "missing rasterizer for {ch}"
+                );
+            }
+        }
+    }
+
+    // ---- Geometric Shapes (Fix A) ----
+
+    /// Mean ink coverage across a mask, 0.0–1.0.
+    fn coverage(pixels: &[u8]) -> f32 {
+        let sum: u32 = pixels.iter().map(|&p| p as u32).sum();
+        sum as f32 / (pixels.len() as f32 * 255.0)
+    }
+
+    #[test]
+    fn geometric_circle_ink_coverage() {
+        let pixels = rasterize('●', 24, 24).unwrap();
+        let cov = coverage(&pixels);
+        assert!(
+            (0.50..=0.65).contains(&cov),
+            "circle coverage {cov} outside [0.50, 0.65] (expected ~0.567)"
+        );
+    }
+
+    #[test]
+    fn bullet_smaller_than_circle() {
+        let big = coverage(&rasterize('●', 24, 24).unwrap());
+        let small = coverage(&rasterize('•', 24, 24).unwrap());
+        assert!(
+            small < big * 0.4,
+            "bullet coverage {small} not < circle {big} * 0.4"
+        );
+    }
+
+    #[test]
+    fn ring_has_hollow_center() {
+        let w = 24;
+        let h = 24;
+        let pixels = rasterize('○', w, h).unwrap();
+        let cx = w as f32 / 2.0;
+        let cy = h as f32 / 2.0;
+
+        // Central third of the cell should be transparent.
+        let mut center_sum = 0u32;
+        let mut center_n = 0u32;
+        // Annular band at 0.38–0.45 of unit should carry ink.
+        let mut band_sum = 0u32;
+        let mut band_n = 0u32;
+        for y in 0..h {
+            for x in 0..w {
+                let dx = (x as f32 + 0.5 - cx) / w as f32;
+                let dy = (y as f32 + 0.5 - cy) / h as f32;
+                let r = (dx * dx + dy * dy).sqrt();
+                let v = pixels[(y * w + x) as usize] as u32;
+                if r < 1.0 / 3.0 {
+                    center_sum += v;
+                    center_n += 1;
+                }
+                if (0.38..=0.45).contains(&r) {
+                    band_sum += v;
+                    band_n += 1;
+                }
+            }
+        }
+        let center_mean = center_sum as f32 / center_n as f32;
+        let band_mean = band_sum as f32 / band_n as f32;
+        assert!(center_mean < 30.0, "ring center not hollow: {center_mean}");
+        assert!(band_mean > 100.0, "ring band lacks ink: {band_mean}");
+    }
+
+    #[test]
+    fn aa_edges_have_midtones() {
+        let pixels = rasterize('●', 24, 24).unwrap();
+        let has_midtone = pixels.iter().any(|&v| v > 30 && v < 225);
+        assert!(has_midtone, "no antialiased midtone pixels found");
+    }
+
+    #[test]
+    fn triangle_orientation_respects_bottom_up_atlas() {
+        let w = 24;
+        let h = 24;
+        let quarter = h / 4;
+
+        // The raw bitmap is bottom-up: vec rows 0..quarter are the VISUAL BOTTOM
+        // and rows 3*quarter.. are the VISUAL TOP (flipped at paint time).
+        let up = rasterize('▲', w, h).unwrap();
+        let up_front: u32 = up[..quarter as usize * w as usize]
+            .iter()
+            .map(|&p| p as u32)
+            .sum();
+        let up_back: u32 = up[(3 * quarter as usize) * w as usize..]
+            .iter()
+            .map(|&p| p as u32)
+            .sum();
+        assert!(
+            up_back < up_front,
+            "▲ visual-top rows {up_back} should have less ink than visual-bottom rows {up_front}"
+        );
+
+        let down = rasterize('▼', w, h).unwrap();
+        let down_front: u32 = down[..quarter as usize * w as usize]
+            .iter()
+            .map(|&p| p as u32)
+            .sum();
+        let down_back: u32 = down[(3 * quarter as usize) * w as usize..]
+            .iter()
+            .map(|&p| p as u32)
+            .sum();
+        assert!(
+            down_back > down_front,
+            "▼ visual-top rows {down_back} should have more ink than visual-bottom rows {down_front}"
+        );
+    }
+
+    #[test]
+    fn circle_not_stretched_in_wide_slot() {
+        let small = rasterize('●', 24, 24).unwrap();
+        let wide = rasterize('●', 48, 24).unwrap();
+        let off = (48 - 24) / 2;
+        for y in 0..24 {
+            for k in 0..24 {
+                let w_idx = y * 48 + (off + k) as usize;
+                let s_idx = y * 24 + k as usize;
+                assert_eq!(
+                    wide[w_idx], small[s_idx],
+                    "mismatch at y={y} k={k} (wide slot stretched the circle)"
                 );
             }
         }

@@ -1333,6 +1333,59 @@ fn resize_unwraps_line_written_by_vt_parser() {
     );
 }
 
+/// Fix B2 (v1.11.16): `write_char_with_attrs` deferred wrap on a non-last row
+/// must mark the row the cursor left as `wrapped`.
+#[test]
+fn write_char_wrap_marks_previous_row_on_normal_newline() {
+    use super::CellFlags;
+    let mut grid = Grid::with_scrollback(5, 20, 100);
+    let row_before = 1;
+    grid.cursor.row = row_before;
+    grid.cursor.col = 19; // last column
+    grid.cursor.wrap_pending = true;
+    grid.write_char_with_attrs(
+        'x',
+        CellColor::Default,
+        CellColor::Default,
+        CellFlags::empty(),
+    );
+    assert_eq!(grid.cursor.row, row_before + 1, "cursor should advance");
+    // 'x' is half-width: after the wrap to col 0 the write advances col to 1.
+    assert_eq!(grid.cursor.col, 1, "cursor sits after the written 'x'");
+    assert!(
+        grid.viewport[row_before].wrapped,
+        "row {} (the row the cursor left) must be marked wrapped",
+        row_before
+    );
+}
+
+/// Fix B2 (v1.11.16): `write_char_with_attrs` deferred wrap at the last
+/// physical row outside the scroll region must NOT mark any row `wrapped`
+/// (the old code mismarked the unrelated row above).
+#[test]
+fn write_char_wrap_no_mark_outside_scroll_region() {
+    use super::CellFlags;
+    let mut grid = Grid::with_scrollback(5, 20, 100);
+    // Scroll region bottom = row index 1; full region would be 4.
+    grid.set_scroll_region(1, 2); // 1-based → top 0, bottom 1
+    let bottom = grid.scroll_region().1;
+    assert_eq!(bottom, 1);
+    grid.cursor.row = 4; // last row, outside the scroll region
+    grid.cursor.col = 19; // last column
+    grid.cursor.wrap_pending = true;
+    grid.write_char_with_attrs(
+        'x',
+        CellColor::Default,
+        CellColor::Default,
+        CellFlags::empty(),
+    );
+    assert_eq!(grid.cursor.row, 4, "cursor must stay put at the last row");
+    assert!(
+        (0..grid.num_rows).all(|r| !grid.viewport[r].wrapped),
+        "no row may be marked wrapped when the cursor cannot advance"
+    );
+}
+
 // ── v1.0 P0-b: dirty tracking tests ────────────────────────────────
 
 #[test]

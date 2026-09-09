@@ -242,6 +242,25 @@ impl Grid {
         out
     }
 
+    /// v1.11.16 (Fix B2): Grid-local counterpart of
+    /// `Terminal::deferred_wrap_newline` (no screen-transform side effects —
+    /// plain `scroll_up` only).
+    fn advance_row_for_wrap(&mut self) {
+        self.cursor.wrap_pending = false;
+        self.cursor.col = 0;
+        let mut advanced = false;
+        if self.cursor.row == self.scroll_bottom {
+            self.scroll_up(1);
+            advanced = true;
+        } else if self.cursor.row < self.num_rows - 1 {
+            self.cursor.row += 1;
+            advanced = true;
+        }
+        if advanced && self.cursor.row > 0 {
+            self.viewport[self.cursor.row - 1].wrapped = true;
+        }
+    }
+
     /// Write a character at the cursor position with given attributes.
     /// Used by VT performer to print with current SGR attributes.
     pub fn write_char_with_attrs(
@@ -258,17 +277,7 @@ impl Grid {
 
         // Handle deferred wrap before writing
         if self.cursor.wrap_pending {
-            self.cursor.wrap_pending = false;
-            self.cursor.col = 0;
-            if self.cursor.row == self.scroll_bottom {
-                self.scroll_up(1);
-            } else if self.cursor.row < self.num_rows - 1 {
-                self.cursor.row += 1;
-            }
-            // Mark the row as wrapped
-            if self.cursor.row > 0 {
-                self.viewport[self.cursor.row - 1].wrapped = true;
-            }
+            self.advance_row_for_wrap();
         }
 
         let width = if terminal_char_width(ch) > 1 {
@@ -283,16 +292,7 @@ impl Grid {
         // If wide char would straddle line boundary, wrap first
         if width == CellWidth::Full && col + 1 >= self.num_cols {
             // Move to next line
-            self.cursor.col = 0;
-            if self.cursor.row == self.scroll_bottom {
-                self.scroll_up(1);
-            } else if self.cursor.row < self.num_rows - 1 {
-                self.cursor.row += 1;
-            }
-            // Mark the row as wrapped
-            if self.cursor.row > 0 {
-                self.viewport[self.cursor.row - 1].wrapped = true;
-            }
+            self.advance_row_for_wrap();
             // AUDIT_v1.10.39: when the cursor already sits on the bottom
             // row of a 1-column grid, the wrap above changes nothing (col
             // stays 0, no row can advance), so recursing would re-enter

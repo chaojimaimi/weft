@@ -31,6 +31,7 @@ fn backend_at(base_url: &str) -> OllamaBackend {
     let http = Arc::new(
         reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
+            .no_proxy()
             .build()
             .unwrap(),
     );
@@ -48,6 +49,7 @@ fn backend_at(base_url: &str) -> OllamaBackend {
 fn tags_http_client(base_url: &str) -> (reqwest::Client, String) {
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
+        .no_proxy()
         .build()
         .unwrap();
     (http, base_url.to_string())

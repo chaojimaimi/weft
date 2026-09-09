@@ -590,9 +590,10 @@ async fn pty_write_large_payload_is_fully_delivered() {
     let mut output = Vec::new();
     let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !contains_subslice(&output, b"READY") && tokio::time::Instant::now() < ready_deadline {
-        match tokio::time::timeout(Duration::from_millis(200), pty.recv()).await {
-            Ok(Some(PtyEvent::Output(data))) => output.extend_from_slice(&data),
-            _ => {}
+        if let Ok(Some(PtyEvent::Output(data))) =
+            tokio::time::timeout(Duration::from_millis(200), pty.recv()).await
+        {
+            output.extend_from_slice(&data);
         }
     }
     assert!(contains_subslice(&output, b"READY"), "fixture not ready");
@@ -633,7 +634,7 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 async fn read_loop_sets_suppress_flag_on_mouse_disable_bytes() {
     let flag = new_flag();
     assert!(!crate::input::is_suppressed(&flag));
-    let pty = Pty::spawn_with_args(
+    let _pty = Pty::spawn_with_args(
         "/bin/sh",
         &[
             "-c",
@@ -689,4 +690,88 @@ async fn read_loop_sets_suppress_flag_on_child_exit() {
         crate::input::is_suppressed(&flag),
         "EOF/EIO exit path must force-set the suppression flag"
     );
+}
+
+// ── v1.11.16 (Fix B1): exit-race zombie leak on receiver drop ──────
+
+/// Dropping the `Pty` (which drops the only event receiver) must NOT
+/// leave the child as a zombie. The read loop's `tx.send()` failure arm
+/// used to `return` early, skipping `waitpid_safe` and leaking the child
+/// until weft exited. After the fix it sends a defensive SIGHUP and
+/// `break`s into the shared exit tail, which reaps the child.
+#[tokio::test]
+async fn receiver_drop_during_flood_reaps_child() {
+    // A child that floods output so the read loop is busy in the
+    // send arm when we drop the Pty. `yes` is spawned directly (not via
+    // `sh -c`) so SIGHUP kills the child itself rather than leaving a
+    // grandchild holding the PTY open.
+    let mut pty = Pty::spawn_with_args("/usr/bin/yes", &[], (24, 80), &[], None, new_flag(), || {})
+        .expect("failed to spawn flooding PTY");
+
+    // Pump a few events so the read loop is running and the channel
+    // is live, then capture the pid and drop the whole Pty — this
+    // drops the receiver, which makes the next `tx.send()` fail.
+    for _ in 0..5 {
+        let _ = tokio::time::timeout(Duration::from_millis(500), pty.recv()).await;
+    }
+    let pid = pty.child_pid();
+    drop(pty);
+
+    // Poll until the child has been fully reaped. If the read loop did
+    // its job, `waitpid(WNOHANG)` returns ECHILD (no zombie left). The
+    // loop converges to ECHILD either because the read loop reaped it or
+    // because our own WNOHANG reaped a transient zombie — both prove no
+    // permanent zombie.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut reaped = false;
+    while tokio::time::Instant::now() < deadline {
+        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Err(nix::errno::Errno::ECHILD) => {
+                reaped = true;
+                break;
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    assert!(
+        reaped,
+        "child must be reaped (waitpid => ECHILD), not left as a zombie on receiver drop"
+    );
+}
+
+/// The same receiver-drop path must force-set the shared mouse
+/// suppression flag — consistent with the EOF/EIO exit path.
+#[tokio::test]
+async fn receiver_drop_sets_mouse_suppressed() {
+    let flag = new_flag();
+    assert!(!crate::input::is_suppressed(&flag));
+
+    let mut pty = Pty::spawn_with_args(
+        "/usr/bin/yes",
+        &[],
+        (24, 80),
+        &[],
+        None,
+        flag.clone(),
+        || {},
+    )
+    .expect("failed to spawn flooding PTY");
+
+    for _ in 0..5 {
+        let _ = tokio::time::timeout(Duration::from_millis(500), pty.recv()).await;
+    }
+    drop(pty);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if crate::input::is_suppressed(&flag) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("receiver-drop path must force-set the suppression flag");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }

@@ -205,7 +205,14 @@ impl SessionManager {
 
     /// Remove a dead tab (shell exited) at `idx`. Same as `close_background`
     /// but semantically distinct for future cleanup hooks.
+    ///
+    /// v1.11.16 (Fix B3): removing the ACTIVE tab must match `close_active`
+    /// semantics (focus falls to the previous tab) instead of
+    /// `close_background`'s keep-index behavior (focus lands on the next).
     pub fn remove_dead(&mut self, idx: usize) -> bool {
+        if idx == self.active_tab {
+            return self.close_active();
+        }
         self.close_background(idx)
     }
 
@@ -1081,5 +1088,69 @@ mod tests {
         assert_eq!(adjust_index_after_move(2, 3, 1), 3); // C shifts right
         assert_eq!(adjust_index_after_move(3, 3, 1), 1); // D moved
         assert_eq!(adjust_index_after_move(4, 3, 1), 4); // E stays
+    }
+
+    #[test]
+    fn remove_dead_active_tab_focuses_previous() {
+        // v1.11.16 (Fix B3): removing the active tab must focus the
+        // previous tab, matching close_active semantics.
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(1); // [A,B,C] active = B
+        assert!(!sm.remove_dead(1)); // remove active B
+        assert_eq!(sm.len(), 2);
+        assert_eq!(sm.active_idx(), 0); // focus falls to A (index 0)
+    }
+
+    #[test]
+    fn remove_dead_active_last_tab_focuses_new_last() {
+        // v1.11.16 (Fix B3): removing the last active tab focuses the
+        // new last tab (index len-1), matching close_active semantics.
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(2); // [A,B,C] active = C
+        assert!(!sm.remove_dead(2)); // remove active C
+        assert_eq!(sm.len(), 2);
+        assert_eq!(sm.active_idx(), 1); // focus falls to B (the new last)
+    }
+
+    #[test]
+    fn remove_dead_background_tab_keeps_index_behavior() {
+        // v1.11.16 (Fix B3): removing a BACKGROUND (non-active) tab must
+        // keep close_background's reindex behavior, not close_active's.
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(1); // [A,B,C] active = B
+                          // Remove tab 0 (before active): active shifts down to 0.
+        assert!(!sm.remove_dead(0));
+        assert_eq!(sm.len(), 2);
+        assert_eq!(sm.active_idx(), 0);
+
+        // Reset and remove the background tab AFTER active.
+        let mut sm = SessionManager::new();
+        for _ in 0..3 {
+            sm.push_tab(Tab::empty());
+        }
+        sm.set_active(1); // [A,B,C] active = B
+                          // Remove tab 2 (after active): active index stays at 1.
+        assert!(!sm.remove_dead(2));
+        assert_eq!(sm.len(), 2);
+        assert_eq!(sm.active_idx(), 1);
+    }
+
+    #[test]
+    fn remove_dead_last_remaining_tab_reports_is_last() {
+        // v1.11.16 (Fix B3): removing the only remaining tab reports
+        // is_last = true (session should exit).
+        let mut sm = SessionManager::new();
+        sm.push_tab(Tab::empty());
+        assert!(sm.remove_dead(0));
+        assert!(sm.is_empty());
     }
 }

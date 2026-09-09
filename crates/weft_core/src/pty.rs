@@ -704,9 +704,12 @@ async fn read_loop<W: Fn() + Send + 'static>(
                 // is exactly "queue is empty" for this single-producer task.)
                 let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
                 if tx.send(PtyEvent::Output(data)).await.is_err() {
-                    // Receiver dropped — shutdown.
-                    tracing::debug!("PTY event receiver dropped, stopping read loop");
-                    return;
+                    // v1.11.16 (Fix B1): receiver dropped ⟹ Pty dropped (no take/move
+                    // path for event_rx — verified). Drop::drop runs before field drops,
+                    // so SIGHUP is already sent; re-kill is a harmless ESRCH no-op.
+                    // Break into the shared exit tail (set_suppressed + waitpid_safe).
+                    let _ = signal::kill(child_pid, Signal::SIGHUP);
+                    break;
                 }
                 // Nudge the UI event loop so fresh output is pumped promptly,
                 // instead of idling until the next keyboard/mouse event — but

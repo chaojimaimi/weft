@@ -95,19 +95,7 @@ impl vte::Perform for Terminal {
 
         // Handle deferred wrap
         if self.grid.cursor.wrap_pending {
-            self.grid.cursor.wrap_pending = false;
-            self.grid.cursor.col = 0;
-            let (_, bottom) = self.grid.scroll_region();
-            if self.grid.cursor.row == bottom {
-                self.scroll_grid_up(1);
-            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
-                self.grid.cursor.row += 1;
-            }
-            // Mark the previous row as wrapped so reflow can merge it
-            // back when the terminal widens.
-            if self.grid.cursor.row > 0 {
-                self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
-            }
+            self.deferred_wrap_newline();
         }
 
         // v1.0 perf: ASCII fast path — all ASCII chars are width 1.
@@ -126,18 +114,7 @@ impl vte::Perform for Terminal {
 
         // Wide char straddling line boundary → wrap first
         if width == CellWidth::Full && col + 1 >= num_cols {
-            self.grid.cursor.wrap_pending = false;
-            self.grid.cursor.col = 0;
-            let (_, bottom) = self.grid.scroll_region();
-            if self.grid.cursor.row == bottom {
-                self.scroll_grid_up(1);
-            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
-                self.grid.cursor.row += 1;
-            }
-            // Mark the previous row as wrapped for reflow
-            if self.grid.cursor.row > 0 {
-                self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
-            }
+            self.deferred_wrap_newline();
             let new_row = self.grid.cursor.row;
             let new_col = self.grid.cursor.col;
             self.prepare_primary_screen_exit_row_overwrite();
@@ -210,19 +187,9 @@ impl vte::Perform for Terminal {
         let mut row = row;
         let mut col = col;
         if col >= num_cols {
-            self.grid.cursor.wrap_pending = false;
-            self.grid.cursor.col = 0;
-            let (_, bottom) = self.grid.scroll_region();
-            if self.grid.cursor.row == bottom {
-                self.scroll_grid_up(1);
-            } else if self.grid.cursor.row < self.grid.num_rows - 1 {
-                self.grid.cursor.row += 1;
-            }
+            self.deferred_wrap_newline();
             row = self.grid.cursor.row;
             col = 0;
-            if row > 0 {
-                self.grid.viewport[row - 1].wrapped = true;
-            }
         }
         self.prepare_primary_screen_exit_row_overwrite();
         self.include_primary_screen_viewport_row(row);

@@ -232,6 +232,30 @@ impl Terminal {
         &mut self.grid
     }
 
+    /// v1.11.16 (Fix B2): shared deferred-wrap newline. Clears `wrap_pending`,
+    /// moves to the next row (scrolling at the region bottom), and marks the
+    /// previous row `wrapped` ONLY when the cursor actually advanced or a
+    /// scroll occurred. At the last physical row outside the scroll region
+    /// (DECSTBM status-line layout) neither arm fires — the cursor stays put
+    /// and NO row may be marked (the old code mismarked `row-1` as a
+    /// continuation of unrelated content).
+    fn deferred_wrap_newline(&mut self) {
+        self.grid.cursor.wrap_pending = false;
+        self.grid.cursor.col = 0;
+        let (_, bottom) = self.grid.scroll_region();
+        let mut advanced = false;
+        if self.grid.cursor.row == bottom {
+            self.scroll_grid_up(1);
+            advanced = true; // content moved up; cursor.row-1 is the overflowed row
+        } else if self.grid.cursor.row < self.grid.num_rows - 1 {
+            self.grid.cursor.row += 1;
+            advanced = true;
+        }
+        if advanced && self.grid.cursor.row > 0 {
+            self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
+        }
+    }
+
     /// The 256-color palette. Seeded from the theme, mutable by OSC 4/104.
     /// The renderer resolves `CellColor::Palette(i)` against this each frame,
     /// so theme switches and OSC edits recolor the screen on the next draw.
@@ -636,7 +660,6 @@ impl Terminal {
             self.grid.scroll_offset = 0;
         }
         let num_cols = self.grid.num_cols;
-        let num_rows = self.grid.num_rows;
         let fg = self.attrs.fg;
         let bg = self.attrs.bg;
         let base_flags = self.attrs.flags | CellFlags::DIRTY;
@@ -653,17 +676,7 @@ impl Terminal {
         while offset < bytes.len() {
             // Handle deferred wrap (same as print()) — once per row boundary.
             if self.grid.cursor.wrap_pending {
-                self.grid.cursor.wrap_pending = false;
-                self.grid.cursor.col = 0;
-                let (_, bottom) = self.grid.scroll_region();
-                if self.grid.cursor.row == bottom {
-                    self.scroll_grid_up(1);
-                } else if self.grid.cursor.row < num_rows - 1 {
-                    self.grid.cursor.row += 1;
-                }
-                if self.grid.cursor.row > 0 {
-                    self.grid.viewport[self.grid.cursor.row - 1].wrapped = true;
-                }
+                self.deferred_wrap_newline();
             }
 
             let col = self.grid.cursor.col;
@@ -672,19 +685,8 @@ impl Terminal {
             // a narrowing resize. Reset to col 0 and advance row (same as the
             // old per-char bounds check, but done once per row boundary).
             let col = if col >= num_cols {
-                self.grid.cursor.wrap_pending = false;
-                self.grid.cursor.col = 0;
-                let (_, bottom) = self.grid.scroll_region();
-                if self.grid.cursor.row == bottom {
-                    self.scroll_grid_up(1);
-                } else if self.grid.cursor.row < num_rows - 1 {
-                    self.grid.cursor.row += 1;
-                }
-                let new_row = self.grid.cursor.row;
-                if new_row > 0 {
-                    self.grid.viewport[new_row - 1].wrapped = true;
-                }
-                0
+                self.deferred_wrap_newline();
+                self.grid.cursor.col
             } else {
                 col
             };

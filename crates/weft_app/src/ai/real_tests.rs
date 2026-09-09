@@ -28,6 +28,7 @@ async fn real_ollama_lists_models_and_completes() {
     let http = Arc::new(
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .no_proxy()
             .build()
             .expect("build local Ollama client"),
     );
