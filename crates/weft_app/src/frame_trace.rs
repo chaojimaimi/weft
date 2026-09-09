@@ -494,9 +494,19 @@ mod tests {
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));
         r.encode_end();
+        // v1.11.16: the upper bound guards against a gross unit/accumulation bug,
+        // not against scheduling jitter. The three segments each `sleep(50µs)`,
+        // so a correct recorder yields a few dozen µs; a unit error (e.g.
+        // recording seconds, or summing across frames) lands in the millions and
+        // is still caught. On a loaded shared CI runner the thread can be
+        // descheduled for tens of ms inside the 50µs window (observed 7513µs),
+        // so a tight 5ms cap was a flaky false failure. 100ms keeps the real
+        // regression signal while tolerating host jitter. (A ms-vs-µs bug yields
+        // `as_millis()` ≈ 0, which the `>= 40` lower bound already rejects.)
+        assert!(r.layout_us >= 40, "layout_us too small: {}", r.layout_us);
         assert!(
-            r.layout_us >= 40 && r.layout_us < 5_000,
-            "layout_us={}",
+            r.layout_us < 100_000,
+            "layout_us={} (expected < 100ms; check unit/accumulation)",
             r.layout_us
         );
         assert!(r.build_us >= 40, "build_us={}", r.build_us);
