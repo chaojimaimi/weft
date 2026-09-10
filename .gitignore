@@ -31,7 +31,16 @@ assets/icon.iconset/
 
 # Internal engineering docs (kept local, not for the public repo)
 # 2026-08-21: untracked via `git rm -r --cached docs/` — see analysis before force-purge
-/docs/
+# Keep the whole /docs/ tree ignored, then re-include only the three release
+# acceptance matrices that scripts/acceptance_preflight.sh (CI) requires.
+# (A plain `!/docs/X.md` cannot override `/docs/` because git won't descend
+# into an ignored dir, so we un-ignore the dir, ignore its contents, and
+# re-include the three contract files.)
+!/docs/
+/docs/*
+!/docs/V17_MANUAL_ACCEPTANCE.md
+!/docs/V18_MANUAL_ACCEPTANCE.md
+!/docs/V19_RELEASE_ACCEPTANCE.md
 /build/
 
 releases/
