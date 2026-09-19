@@ -1,0 +1,11 @@
+name = "Rosé Pine Dawn"
+variant = "light"
+author = "Emilia Dunfelt <edun@dunfelt.se>"
+source = "tinted-theming/schemes/base16/rose-pine-dawn.yaml"
+license = "MIT"
+
+background = "#faf4ed"
+foreground = "#575279"
+cursor = "#575279"
+selection = "#f2e9de"
+palette = ["#fffaf3", "#b4637a", "#286983", "#d7827e", "#907aa9", "#ea9d34", "#56949f", "#575279", "#9893a5", "#b4637a", "#286983", "#d7827e", "#907aa9", "#ea9d34", "#56949f", "#cecacd"]

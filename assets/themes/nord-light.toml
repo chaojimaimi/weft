@@ -1,0 +1,11 @@
+name = "Nord Light"
+variant = "light"
+author = "threddast, based on fuxialexander's doom-nord-light-theme (Doom Emacs)"
+source = "tinted-theming/schemes/base16/nord-light.yaml"
+license = "MIT"
+
+background = "#e5e9f0"
+foreground = "#2e3440"
+cursor = "#2e3440"
+selection = "#b8c5db"
+palette = ["#c2d0e7", "#99324b", "#4f894c", "#9a7500", "#3b6ea8", "#97365b", "#398eac", "#2e3440", "#aebacf", "#99324b", "#4f894c", "#9a7500", "#3b6ea8", "#97365b", "#398eac", "#29838d"]

@@ -214,8 +214,8 @@ impl From<std::io::Error> for WorkspaceError {
     }
 }
 
-impl From<serde_yaml::Error> for WorkspaceError {
-    fn from(e: serde_yaml::Error) -> Self {
+impl From<serde_yaml_ng::Error> for WorkspaceError {
+    fn from(e: serde_yaml_ng::Error) -> Self {
         Self::Yaml(e.to_string())
     }
 }
@@ -299,12 +299,12 @@ impl WorkspaceDocument {
 
     /// Serialize to YAML string.
     pub fn to_yaml(&self) -> Result<String, WorkspaceError> {
-        serde_yaml::to_string(self).map_err(WorkspaceError::from)
+        serde_yaml_ng::to_string(self).map_err(WorkspaceError::from)
     }
 
     /// Deserialize from YAML string, then validate.
     pub fn from_yaml(yaml: &str) -> Result<Self, WorkspaceError> {
-        let doc: Self = serde_yaml::from_str(yaml).map_err(WorkspaceError::from)?;
+        let doc: Self = serde_yaml_ng::from_str(yaml).map_err(WorkspaceError::from)?;
         doc.validate()?;
         Ok(doc)
     }

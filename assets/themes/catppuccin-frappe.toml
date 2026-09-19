@@ -1,0 +1,11 @@
+name = "Catppuccin Frappe"
+variant = "dark"
+author = "https://github.com/catppuccin/catppuccin"
+source = "tinted-theming/schemes/base16/catppuccin-frappe.yaml"
+license = "MIT"
+
+background = "#303446"
+foreground = "#c6d0f5"
+cursor = "#c6d0f5"
+selection = "#414559"
+palette = ["#292c3c", "#e78284", "#a6d189", "#e5c890", "#8caaee", "#ca9ee6", "#81c8be", "#c6d0f5", "#51576d", "#e78284", "#a6d189", "#e5c890", "#8caaee", "#ca9ee6", "#81c8be", "#babbf1"]

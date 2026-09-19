@@ -58,7 +58,7 @@ pub enum RecoveryError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("yaml serialization error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
     #[error("workspace error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceError),
     #[error("unsupported recovery version: found {found}, max {max}")]
@@ -104,12 +104,12 @@ impl RecoverySnapshot {
 
     /// Serialize to YAML.
     pub fn to_yaml(&self) -> Result<String, RecoveryError> {
-        Ok(serde_yaml::to_string(self)?)
+        Ok(serde_yaml_ng::to_string(self)?)
     }
 
     /// Deserialize from YAML.
     pub fn from_yaml(yaml: &str) -> Result<Self, RecoveryError> {
-        let snap: Self = serde_yaml::from_str(yaml)?;
+        let snap: Self = serde_yaml_ng::from_str(yaml)?;
         if snap.version > RECOVERY_VERSION {
             return Err(RecoveryError::UnsupportedVersion {
                 found: snap.version,

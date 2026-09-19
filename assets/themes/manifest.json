@@ -1,0 +1,114 @@
+[
+  {
+    "name": "Catppuccin Frappe",
+    "file": "catppuccin-frappe.toml",
+    "variant": "dark",
+    "author": "https://github.com/catppuccin/catppuccin",
+    "source": "tinted-theming/schemes/base16/catppuccin-frappe.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Catppuccin Latte",
+    "file": "catppuccin-latte.toml",
+    "variant": "light",
+    "author": "https://github.com/catppuccin/catppuccin",
+    "source": "tinted-theming/schemes/base16/catppuccin-latte.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Catppuccin Macchiato",
+    "file": "catppuccin-macchiato.toml",
+    "variant": "dark",
+    "author": "https://github.com/catppuccin/catppuccin",
+    "source": "tinted-theming/schemes/base16/catppuccin-macchiato.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Catppuccin Mocha",
+    "file": "catppuccin-mocha.toml",
+    "variant": "dark",
+    "author": "https://github.com/catppuccin/catppuccin",
+    "source": "tinted-theming/schemes/base16/catppuccin-mocha.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Dracula",
+    "file": "dracula.toml",
+    "variant": "dark",
+    "author": null,
+    "source": "iTerm2-Color-Schemes/wezterm/Dracula.toml",
+    "license": "MIT"
+  },
+  {
+    "name": "Everforest Dark Medium",
+    "file": "everforest-dark-medium.toml",
+    "variant": "dark",
+    "author": "Sainnhe Park (https://github.com/sainnhe)",
+    "source": "tinted-theming/schemes/base16/everforest-dark-medium.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Everforest Light (Medium)",
+    "file": "everforest-light-medium.toml",
+    "variant": "light",
+    "author": "Márcio Sobel (https://github.com/marciosobel)",
+    "source": "tinted-theming/schemes/base16/everforest-light-medium.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Flexoki Dark",
+    "file": "flexoki-dark.toml",
+    "variant": "dark",
+    "author": "Steph Ango (https://github.com/kepano/flexoki)",
+    "source": "tinted-theming/schemes/base16/flexoki-dark.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Flexoki Light",
+    "file": "flexoki-light.toml",
+    "variant": "light",
+    "author": "Steph Ango (https://github.com/kepano/flexoki)",
+    "source": "tinted-theming/schemes/base16/flexoki-light.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Github Dark",
+    "file": "github-dark.toml",
+    "variant": "dark",
+    "author": "Tinted Theming (https://github.com/tinted-theming)",
+    "source": "tinted-theming/schemes/base16/github-dark.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Nord Light",
+    "file": "nord-light.toml",
+    "variant": "light",
+    "author": "threddast, based on fuxialexander's doom-nord-light-theme (Doom Emacs)",
+    "source": "tinted-theming/schemes/base16/nord-light.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Nord",
+    "file": "nord.toml",
+    "variant": "dark",
+    "author": "arcticicestudio",
+    "source": "tinted-theming/schemes/base16/nord.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Rosé Pine Dawn",
+    "file": "rose-pine-dawn.toml",
+    "variant": "light",
+    "author": "Emilia Dunfelt <edun@dunfelt.se>",
+    "source": "tinted-theming/schemes/base16/rose-pine-dawn.yaml",
+    "license": "MIT"
+  },
+  {
+    "name": "Rosé Pine",
+    "file": "rose-pine.toml",
+    "variant": "dark",
+    "author": "Emilia Dunfelt <edun@dunfelt.se>",
+    "source": "tinted-theming/schemes/base16/rose-pine.yaml",
+    "license": "MIT"
+  }
+]

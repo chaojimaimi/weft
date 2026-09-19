@@ -77,7 +77,7 @@ unicode-width = "0.2"
 unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml_ng = "0.10"
 toml = "0.8"
 toml_edit = "0.22"
 core-graphics-types = "0.1"

@@ -1,0 +1,11 @@
+name = "Flexoki Dark"
+variant = "dark"
+author = "Steph Ango (https://github.com/kepano/flexoki)"
+source = "tinted-theming/schemes/base16/flexoki-dark.yaml"
+license = "MIT"
+
+background = "#100f0f"
+foreground = "#cecdc3"
+cursor = "#cecdc3"
+selection = "#282726"
+palette = ["#1c1b1a", "#d14d41", "#879a39", "#d0a215", "#4385be", "#8b7ec8", "#3aa99f", "#cecdc3", "#575653", "#d14d41", "#879a39", "#d0a215", "#4385be", "#8b7ec8", "#3aa99f", "#fffcf0"]

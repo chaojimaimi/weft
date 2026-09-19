@@ -75,6 +75,15 @@ pub struct ThemeConfig {
     /// v1.11.6 (PLAN_v1116 M6/D-f): `[theme.ui]` seed-color overrides.
     /// `None` keys keep the `UiColors` light/dark dual-branch defaults.
     pub ui: Option<UiConfig>,
+    /// v1.12: 主题变体（`"dark"` / `"light"`）。导入外部主题时由转档脚本写入；
+    /// 缺省时运行时按背景相对亮度推导（`Theme::is_dark`）。
+    pub variant: Option<String>,
+    /// v1.12: 主题作者（署名用，来自上游 `CREDITS.md` / base16 `author`）。
+    pub author: Option<String>,
+    /// v1.12: 上游来源（仓库或文件路径），便于追溯与更新。
+    pub source: Option<String>,
+    /// v1.12: 单个主题的许可标识（上游集合许可不等于单主题许可）。
+    pub license: Option<String>,
 }
 
 /// v1.0 S5: TOML-facing syntax color overrides. All fields optional; absent
@@ -156,6 +165,10 @@ impl Default for ThemeConfig {
             output: None,
             link: None,
             ui: None,
+            variant: None,
+            author: None,
+            source: None,
+            license: None,
         }
     }
 }

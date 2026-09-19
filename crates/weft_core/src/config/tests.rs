@@ -491,6 +491,67 @@ fn load_theme_from_yaml_file() {
 }
 
 #[test]
+fn theme_file_name_filter_matches_only_probed_extensions() {
+    // audit FIX-4: the picker filter and load_from_dir share one literal
+    // set (Theme::THEME_FILE_EXTENSIONS) — anything the filter rejects
+    // would not have loaded anyway.
+    assert!(Theme::is_theme_file_name("dracula.toml"));
+    assert!(Theme::is_theme_file_name("nord.yaml"));
+    assert!(Theme::is_theme_file_name("nord.yml"));
+    // Case-sensitive anchor: load_from_dir probes lowercase literals only,
+    // so `Theme.TOML` must be filtered even though it "has an extension".
+    assert!(!Theme::is_theme_file_name("dracula.TOML"));
+    assert!(!Theme::is_theme_file_name("README.md"));
+    assert!(!Theme::is_theme_file_name(".DS_Store"));
+    assert!(!Theme::is_theme_file_name("noext"));
+    assert!(!Theme::is_theme_file_name(""));
+}
+
+#[test]
+fn load_from_dir_rejects_unsafe_name_without_panicking() {
+    // `dir.join("../evil.toml")` used to be able to escape the themes dir;
+    // the name guard must reject before any path is built.
+    let dir = temp_path("theme-unsafe-name");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(Theme::load_from_dir(&dir, "../evil").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_from_dir_refuses_oversized_theme_file() {
+    // 1.1 MiB payload — above the 1 MiB read cap (guard fires before the
+    // read, so the oversized body is never parsed).
+    let dir = temp_path("theme-oversize");
+    let body = format!(
+        "foreground = \"#abcdef\"\n#{}",
+        "#".repeat(1024 * 1024 + 1024)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("big.toml"), &body).unwrap();
+    assert!(Theme::load_from_dir(&dir, "big").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_from_dir_loads_file_at_the_cap_boundary() {
+    // Exactly 1 MiB is NOT over the cap — the guard is strictly
+    // `len > cap`, so a max-size theme still loads.
+    let dir = temp_path("theme-cap-boundary");
+    let head = "foreground = \"#abcdef\"\n";
+    let pad = 1024 * 1024 - head.len() - 1; // -1 for the leading '#'
+    let body = format!("{head}#{}", "#".repeat(pad));
+    assert_eq!(body.len(), 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("exact.toml"), &body).unwrap();
+    let theme = Theme::load_from_dir(&dir, "exact").expect("1MiB-exact theme should load");
+    assert_eq!(theme.foreground, Color::rgb(0xab, 0xcd, 0xef));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_theme_missing_file_returns_none() {
     // v0.9 W2+: when no file matches, returns None (falls back to default).
     let dir = temp_path("theme-nonexistent");
@@ -2938,4 +2999,233 @@ font = "y"
     );
     // The malformed `font = "y"` survives untouched.
     assert_eq!(doc["profiles"]["work"]["font"].as_str(), Some("y"));
+}
+
+// ── v1.12: 主题元数据（variant / author / source / license）────────────
+
+#[test]
+fn theme_metadata_parses_from_toml() {
+    // 转档脚本会写入这四个键；缺键时必须是 None（不破坏旧配置）。
+    let text = r#"
+name = "nord"
+variant = "dark"
+author = "Arctic Ice Studio"
+source = "iTerm2-Color-Schemes/wezterm/Nord.toml"
+license = "MIT"
+"#;
+    let cfg: ThemeConfig = toml::from_str(text).expect("theme metadata should parse");
+    assert_eq!(cfg.name, "nord");
+    assert_eq!(cfg.variant.as_deref(), Some("dark"));
+    assert_eq!(cfg.author.as_deref(), Some("Arctic Ice Studio"));
+    assert_eq!(
+        cfg.source.as_deref(),
+        Some("iTerm2-Color-Schemes/wezterm/Nord.toml")
+    );
+    assert_eq!(cfg.license.as_deref(), Some("MIT"));
+}
+
+#[test]
+fn theme_metadata_defaults_to_none() {
+    let cfg: ThemeConfig = toml::from_str("name = \"weft-warm\"").expect("minimal theme");
+    assert!(cfg.variant.is_none());
+    assert!(cfg.author.is_none());
+    assert!(cfg.source.is_none());
+    assert!(cfg.license.is_none());
+}
+
+// ── v1.12: 外部主题格式嗅探（wezterm / alacritty / generic / base16）──────
+
+/// 上游实测格式：mbadolato/iTerm2-Color-Schemes 的 wezterm/Dracula.toml。
+const SNIFF_WEZTERM_DRACULA: &str = r##"
+[colors]
+foreground = "#f8f8f2"
+background = "#282a36"
+cursor_bg = "#f8f8f2"
+cursor_fg = "#282a36"
+selection_bg = "#44475a"
+selection_fg = "#ffffff"
+ansi = ["#21222c","#ff5555","#50fa7b","#f1fa8c","#bd93f9","#ff79c6","#8be9fd","#f8f8f2"]
+brights = ["#6272a4","#ff6e6e","#69ff94","#ffffa5","#d6acff","#ff92df","#a4ffff","#ffffff"]
+"##;
+
+const SNIFF_BASE16_NORD: &str = r##"
+system: "base16"
+name: "Nord"
+author: "arcticicestudio"
+variant: "dark"
+palette:
+  base00: "#2e3440"
+  base01: "#3b4252"
+  base02: "#434c5e"
+  base03: "#4c566a"
+  base04: "#d8dee9"
+  base05: "#e5e9f0"
+  base06: "#eceff4"
+  base07: "#8fbcbb"
+  base08: "#bf616a"
+  base09: "#d08770"
+  base0A: "#ebcb8b"
+  base0B: "#a3be8c"
+  base0C: "#88c0d0"
+  base0D: "#81a1c1"
+  base0E: "#b48ead"
+  base0F: "#5e81ac"
+"##;
+
+fn write_theme_file(dir: &std::path::Path, name: &str, body: &str) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(name), body).unwrap();
+}
+
+#[test]
+fn load_from_dir_sniffs_wezterm_toml() {
+    let dir = temp_path("theme-sniff-wezterm");
+    write_theme_file(&dir, "dracula.toml", SNIFF_WEZTERM_DRACULA);
+
+    let theme = Theme::load_from_dir(&dir, "dracula").expect("wezterm theme should import");
+    // 兼容层原样落位。
+    assert_eq!(theme.foreground, Color::rgb(0xf8, 0xf8, 0xf2));
+    assert_eq!(theme.background, Color::rgb(0x28, 0x2a, 0x36));
+    assert_eq!(theme.palette[1], Color::rgb(0xff, 0x55, 0x55));
+    assert_eq!(theme.palette[8], Color::rgb(0x62, 0x72, 0xa4));
+    assert_eq!(theme.cursor, Color::rgb(0xf8, 0xf8, 0xf2));
+    // 语义层已推导：syntax 走 ANSI 槽位约定，且层级校验通过。
+    assert_eq!(theme.syntax.command, Color::rgb(0x50, 0xfa, 0x7b));
+    assert_eq!(theme.output.success, theme.syntax.command);
+    assert!(theme.is_dark());
+    assert!(
+        theme.semantic_hierarchy_violations().is_empty(),
+        "derived theme violates the hierarchy contract: {:?}",
+        theme.semantic_hierarchy_violations()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_from_dir_sniffs_base16_yaml() {
+    let dir = temp_path("theme-sniff-base16");
+    write_theme_file(&dir, "nord.yaml", SNIFF_BASE16_NORD);
+
+    let theme = Theme::load_from_dir(&dir, "nord").expect("base16 scheme should import");
+    assert_eq!(theme.background, Color::rgb(0x2e, 0x34, 0x40));
+    assert_eq!(theme.foreground, Color::rgb(0xe5, 0xe9, 0xf0));
+    // base16 官方终端模板映射：ANSI 1 = base08（red），ANSI 4 = base0D（blue）。
+    assert_eq!(theme.palette[1], Color::rgb(0xbf, 0x61, 0x6a));
+    assert_eq!(theme.palette[4], Color::rgb(0x81, 0xa1, 0xc1));
+    assert!(theme.is_dark());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_from_dir_keeps_weft_native_schema_working() {
+    // 自有 schema 的扁平文件不能被嗅探逻辑吃掉（回归保护）；且**只给兼容层**
+    // 时语义层必须由该文件自身推导，不得继承 weft_warm 的琥珀色。
+    let dir = temp_path("theme-sniff-native");
+    write_theme_file(
+        &dir,
+        "mine.toml",
+        "foreground = \"#abcdef\"\nbackground = \"#112233\"\n",
+    );
+    let theme = Theme::load_from_dir(&dir, "mine").expect("native theme should load");
+    assert_eq!(theme.foreground, Color::rgb(0xab, 0xcd, 0xef));
+    assert_eq!(theme.background, Color::rgb(0x11, 0x22, 0x33));
+    assert_ne!(
+        theme.accent,
+        Theme::weft_warm().accent,
+        "accent must be derived"
+    );
+    assert!(
+        theme.semantic_hierarchy_violations().is_empty(),
+        "derived theme violates the hierarchy contract: {:?}",
+        theme.semantic_hierarchy_violations()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_from_dir_respects_explicit_semantic_layer() {
+    // 文件显式写了 accent → 尊重作者声明，不再由兼容层推导。
+    let dir = temp_path("theme-sniff-explicit-accent");
+    write_theme_file(
+        &dir,
+        "mine.toml",
+        "foreground = \"#abcdef\"\nbackground = \"#112233\"\naccent = \"#ff00ff\"\n",
+    );
+    let theme = Theme::load_from_dir(&dir, "mine").expect("native theme should load");
+    assert_eq!(theme.accent, Color::rgb(0xff, 0x00, 0xff));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn import_metadata_fields_are_carried_through_theme_file() {
+    // author/source/license/variant 是转档脚本写入的元数据；解析不得报错，
+    // 且不参与颜色解析（颜色仍由外部格式嗅探决定）。
+    let dir = temp_path("theme-sniff-metadata");
+    write_theme_file(
+        &dir,
+        "meta.toml",
+        &format!(
+            "name = \"Dracula\"\nvariant = \"dark\"\nauthor = \"Zeno Rocha\"\n\
+             source = \"iTerm2-Color-Schemes/wezterm/Dracula.toml\"\nlicense = \"MIT\"\n\
+             {SNIFF_WEZTERM_DRACULA}"
+        ),
+    );
+    let theme = Theme::load_from_dir(&dir, "meta").expect("metadata + wezterm body should load");
+    assert_eq!(theme.background, Color::rgb(0x28, 0x2a, 0x36));
+    assert_eq!(theme.palette[10], Color::rgb(0x69, 0xff, 0x94));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bundled_theme_assets_load_and_pass_hierarchy_contract() {
+    // v1.12: `assets/themes/*.toml` 是转档脚本的产物（P0-2）。这里做资产
+    // 守卫：每一个随包主题都必须能被 load_from_dir 加载，且推导出的语义层
+    // 满足 V17 §2.4 视觉层级契约——避免"转档产物悄悄坏掉"。
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/themes");
+    if !dir.is_dir() {
+        // 资产目录是可选内容（未执行转档脚本时跳过）。
+        return;
+    }
+    let mut checked = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("read assets/themes")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("theme stem")
+            .to_string();
+        let theme = Theme::load_from_dir(&dir, &name)
+            .unwrap_or_else(|| panic!("bundled theme `{name}` failed to load"));
+        assert!(
+            theme.semantic_hierarchy_violations().is_empty(),
+            "bundled theme `{name}` violates the hierarchy contract: {:?}",
+            theme.semantic_hierarchy_violations()
+        );
+        names.push(name);
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "assets/themes exists but contains no .toml themes"
+    );
+    // 亮暗配对是新资产的核心价值：至少要有一套亮色主题。
+    assert!(
+        names
+            .iter()
+            .any(|n| { Theme::load_from_dir(&dir, n).is_some_and(|t| !t.is_dark()) }),
+        "bundled themes contain no light variant: {names:?}"
+    );
 }

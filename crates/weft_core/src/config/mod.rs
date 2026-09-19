@@ -46,6 +46,7 @@ mod profiles;
 mod save;
 mod sections;
 mod theme;
+mod theme_import;
 mod transfer;
 
 use std::collections::{BTreeMap, HashMap};
@@ -77,6 +78,10 @@ pub use sections::{
     PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme, ThemeUi};
+pub use theme_import::{
+    contrast_ratio, ensure_minimum_contrast, mix_colors, relative_luminance, ThemeImport,
+    CHROME_CONTRAST, TEXT_CONTRAST,
+};
 pub use transfer::{export_config_document, import_config_document, ConfigTransferError};
 
 use self::save::{
@@ -262,6 +267,20 @@ impl Config {
         }
         if let Some(dn) = &self.theme.dark_name {
             theme["dark_name"] = toml_edit::value(dn.as_str());
+        }
+        // v1.12: 主题元数据（变体/作者/来源/许可）。有则写、无则删，保证
+        // 差量写回不留陈旧署名。
+        for (key, value) in [
+            ("variant", &self.theme.variant),
+            ("author", &self.theme.author),
+            ("source", &self.theme.source),
+            ("license", &self.theme.license),
+        ] {
+            if let Some(v) = value {
+                theme[key] = toml_edit::value(v.as_str());
+            } else if theme.contains_key(key) {
+                theme.remove(key);
+            }
         }
         // [theme.syntax] subsection.
         // 操作现有表（若存在）而非每次创建新表，避免清空所有字段时旧表残留。
@@ -631,11 +650,38 @@ impl Config {
         }
 
         // Atomic write: <path>.tmp → rename → <path>.
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let parent = path.parent().ok_or(ConfigSaveError::NoParentDir)?;
         std::fs::create_dir_all(parent).map_err(ConfigSaveError::Io)?;
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, doc.to_string()).map_err(ConfigSaveError::Io)?;
-        std::fs::rename(&tmp, path).map_err(ConfigSaveError::Io)?;
+        // VULN-008: create the tmp at 0600, eliminating the 0644 window for
+        // newly created files. `mode` only applies at creation time — a
+        // stale 0644 `.tmp` from an older version is still caught by the
+        // chmod below.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(doc.to_string().as_bytes()));
+        written.map_err(ConfigSaveError::Io)?;
+        // VULN-008: chmod BEFORE the rename — rename(2) keeps the tmp
+        // inode's permissions, so a 0600 tmp means config.toml never lands
+        // world-readable (a chmod after the rename would reopen a 0644
+        // window on every save).
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ConfigSaveError::Io(e));
+        }
+        // Cleanup aligns with the export/import failure branches; the
+        // post-chmod tmp is already 0600, so this is consistency, not
+        // exposure control.
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ConfigSaveError::Io(e));
+        }
         Ok(())
     }
 

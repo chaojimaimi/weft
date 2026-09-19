@@ -1,0 +1,11 @@
+name = "Catppuccin Latte"
+variant = "light"
+author = "https://github.com/catppuccin/catppuccin"
+source = "tinted-theming/schemes/base16/catppuccin-latte.yaml"
+license = "MIT"
+
+background = "#eff1f5"
+foreground = "#4c4f69"
+cursor = "#4c4f69"
+selection = "#ccd0da"
+palette = ["#e6e9ef", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#8839ef", "#179299", "#4c4f69", "#bcc0cc", "#d20f39", "#40a02b", "#df8e1d", "#1e66f5", "#8839ef", "#179299", "#7287fd"]

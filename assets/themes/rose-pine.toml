@@ -1,0 +1,11 @@
+name = "Rosé Pine"
+variant = "dark"
+author = "Emilia Dunfelt <edun@dunfelt.se>"
+source = "tinted-theming/schemes/base16/rose-pine.yaml"
+license = "MIT"
+
+background = "#191724"
+foreground = "#e0def4"
+cursor = "#e0def4"
+selection = "#26233a"
+palette = ["#1f1d2e", "#eb6f92", "#31748f", "#ebbcba", "#c4a7e7", "#f6c177", "#9ccfd8", "#e0def4", "#6e6a86", "#eb6f92", "#31748f", "#ebbcba", "#c4a7e7", "#f6c177", "#9ccfd8", "#524f67"]

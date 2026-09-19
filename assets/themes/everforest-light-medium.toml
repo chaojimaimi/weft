@@ -1,0 +1,11 @@
+name = "Everforest Light (Medium)"
+variant = "light"
+author = "Márcio Sobel (https://github.com/marciosobel)"
+source = "tinted-theming/schemes/base16/everforest-light-medium.yaml"
+license = "MIT"
+
+background = "#fdf6e3"
+foreground = "#5c6a72"
+cursor = "#5c6a72"
+selection = "#e6e2cc"
+palette = ["#f4f0d9", "#f85552", "#8da101", "#dfa000", "#3a94c5", "#df69ba", "#35a77c", "#5c6a72", "#939f91", "#f85552", "#8da101", "#dfa000", "#3a94c5", "#df69ba", "#35a77c", "#2d353b"]

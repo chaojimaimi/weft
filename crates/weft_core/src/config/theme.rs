@@ -7,8 +7,22 @@ use std::path::PathBuf;
 
 use crate::grid::Color;
 
-use super::parsers::parse_hex;
-use super::sections::ThemeConfig;
+use super::{
+    sections::ThemeConfig,
+    theme_import::{apply_overrides, resolve_theme_file},
+};
+
+/// Guard for user-config-supplied theme names: reject empty names and any
+/// path-separator or NUL so `dir.join(name.ext)` can never leave the
+/// themes directory. Defense in depth — the only caller passes a name from
+/// the user's own config.toml.
+fn is_safe_theme_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/') && !name.contains('\\') && !name.contains('\0')
+}
+
+/// Read cap for a single theme file (defensive: config files are trusted,
+/// but a multi-GiB "theme" would stall config load).
+const THEME_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Syntax-highlight color palette. Theme-driven so every theme
 /// can define its own command/flag/path/string colors; replaces the hardcoded
@@ -853,122 +867,19 @@ impl Theme {
             "monokai-pro" | "monokai_pro" | "monokai" => Self::monokai_pro(),
             other => match Self::load_from_file(other) {
                 Some(t) => t,
-                None => Self::weft_warm(),
+                None => {
+                    // v1.12: 此前静默回落到 weft-warm，用户拼错主题名时毫无
+                    // 反馈（看起来像"换主题没生效"）。这里明确告警。
+                    tracing::warn!(
+                        theme = other,
+                        themes_dir = ?Self::themes_dir(),
+                        "unknown theme name — falling back to weft-warm",
+                    );
+                    Self::weft_warm()
+                }
             },
         };
-        let mut theme = base;
-        if let Some(c) = cfg.foreground.as_deref().and_then(parse_hex) {
-            theme.foreground = c;
-        }
-        if let Some(c) = cfg.background.as_deref().and_then(parse_hex) {
-            theme.background = c;
-        }
-        if let Some(c) = cfg.cursor.as_deref().and_then(parse_hex) {
-            theme.cursor = c;
-        }
-        if let Some(c) = cfg.selection.as_deref().and_then(parse_hex) {
-            theme.selection = c;
-        }
-        if let Some(c) = cfg.accent.as_deref().and_then(parse_hex) {
-            theme.accent = c;
-        }
-        if let Some(c) = cfg.accent_dim.as_deref().and_then(parse_hex) {
-            theme.accent_dim = c;
-        }
-        if let Some(c) = cfg.separator.as_deref().and_then(parse_hex) {
-            theme.separator = c;
-        }
-        for (i, hex) in cfg.palette.iter().enumerate() {
-            if i >= 256 {
-                break;
-            }
-            if let Some(c) = parse_hex(hex) {
-                theme.palette[i] = c;
-            }
-        }
-        // v1.0 S5: apply per-syntax-token color overrides on top of the base
-        // theme's SyntaxColors. Each field is an optional hex string; absent
-        // fields retain the base theme's value.
-        if let Some(syn) = cfg.syntax.as_ref() {
-            if let Some(c) = syn.command.as_deref().and_then(parse_hex) {
-                theme.syntax.command = c;
-            }
-            if let Some(c) = syn.flag.as_deref().and_then(parse_hex) {
-                theme.syntax.flag = c;
-            }
-            if let Some(c) = syn.path.as_deref().and_then(parse_hex) {
-                theme.syntax.path = c;
-            }
-            if let Some(c) = syn.string.as_deref().and_then(parse_hex) {
-                theme.syntax.string = c;
-            }
-            if let Some(c) = syn.number.as_deref().and_then(parse_hex) {
-                theme.syntax.number = c;
-            }
-            if let Some(c) = syn.variable.as_deref().and_then(parse_hex) {
-                theme.syntax.variable = c;
-            }
-            if let Some(c) = syn.operator.as_deref().and_then(parse_hex) {
-                theme.syntax.operator = c;
-            }
-            if let Some(c) = syn.comment.as_deref().and_then(parse_hex) {
-                theme.syntax.comment = c;
-            }
-            if let Some(c) = syn.argument.as_deref().and_then(parse_hex) {
-                theme.syntax.argument = c;
-            }
-            if let Some(c) = syn.default.as_deref().and_then(parse_hex) {
-                theme.syntax.default = c;
-            }
-        }
-        // v1.7.0-B: apply output semantic color overrides.
-        // v1.11.0: the `cwd` override was removed — that key was dead
-        // config (the painter derives CWD gray from fg×0.65); see
-        // AUDIT_v1.10.39 / PLAN_v111.
-        if let Some(out) = cfg.output.as_ref() {
-            if let Some(c) = out.output_default.as_deref().and_then(parse_hex) {
-                theme.output.output_default = c;
-            }
-            if let Some(c) = out.metadata.as_deref().and_then(parse_hex) {
-                theme.output.metadata = c;
-            }
-            if let Some(c) = out.success.as_deref().and_then(parse_hex) {
-                theme.output.success = c;
-            }
-            if let Some(c) = out.failure.as_deref().and_then(parse_hex) {
-                theme.output.failure = c;
-            }
-        }
-        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme] link` — OSC 8 hyperlink
-        // underline color. Hex is u8-granular: parsed to Color then
-        // /255-normalized into the f32 domain, so a user value can never
-        // reproduce the exact 0.36/0.62/0.94 default (documented; P1-4).
-        if let Some(c) = cfg.link.as_deref().and_then(parse_hex) {
-            theme.link = [
-                c.r as f32 / 255.0,
-                c.g as f32 / 255.0,
-                c.b as f32 / 255.0,
-                1.0,
-            ];
-        }
-        // v1.11.6 (PLAN_v1116 M6/D-f): `[theme.ui]` seed colors — a present
-        // key replaces the UiColors dual-branch input downstream (the
-        // 4.5-contrast gate still applies there); invalid hex falls back.
-        if let Some(ui) = cfg.ui.as_ref() {
-            if let Some(c) = ui.success.as_deref().and_then(parse_hex) {
-                theme.ui.success = Some(c);
-            }
-            if let Some(c) = ui.warning.as_deref().and_then(parse_hex) {
-                theme.ui.warning = Some(c);
-            }
-            if let Some(c) = ui.error.as_deref().and_then(parse_hex) {
-                theme.ui.error = Some(c);
-            }
-            if let Some(c) = ui.find_match.as_deref().and_then(parse_hex) {
-                theme.ui.find_match = Some(c);
-            }
-        }
-        theme
+        apply_overrides(base, cfg)
     }
 
     /// v0.9 W2+: Load a custom theme from a file.
@@ -1009,16 +920,59 @@ impl Theme {
         Self::load_from_dir(&dir, name)
     }
 
+    /// Extensions `load_from_dir` probes, in order. `available_theme_names`
+    /// (weft_app) filters directory listings with the same set so the picker
+    /// can never offer a stem that would fail to load.
+    pub const THEME_FILE_EXTENSIONS: [&str; 3] = ["toml", "yaml", "yml"];
+
+    /// True when `file_name` has a non-empty stem and one of
+    /// [`Self::THEME_FILE_EXTENSIONS`]. Exact-match on the lowercase
+    /// extension — `load_from_dir` probes the same literals, so anything
+    /// this rejects would not have loaded anyway. The non-empty-stem
+    /// requirement keeps `".toml"` (a hidden file) out, matching
+    /// `Path::extension()`, so the picker and the loader share ONE
+    /// predicate.
+    pub fn is_theme_file_name(file_name: &str) -> bool {
+        file_name.rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty() && Self::THEME_FILE_EXTENSIONS.contains(&ext)
+        })
+    }
+
     /// v0.9 W2+: Internal loader that reads from an explicit `dir`. Used by
     /// [`load_from_file`] (which resolves the dir from env) and by unit
     /// tests (which pass a tempdir). See [`load_from_file`] for the file
     /// format and resolution semantics.
     pub(super) fn load_from_dir(dir: &std::path::Path, name: &str) -> Option<Self> {
+        // Path-traversal guard: `name` comes from the user's config, and a
+        // crafted `/`/`..` name must not be able to steer dir.join() outside
+        // the themes directory.
+        if !is_safe_theme_name(name) {
+            tracing::warn!(
+                name = %name,
+                "unsafe theme name rejected (empty or contains a path separator)"
+            );
+            return None;
+        }
         // Try each supported extension in order: toml, yaml, yml.
-        for ext in ["toml", "yaml", "yml"] {
+        for ext in Self::THEME_FILE_EXTENSIONS {
             let path = dir.join(format!("{name}.{ext}"));
             if !path.exists() {
                 continue;
+            }
+            // A metadata probe failure is the same race as a failed exists()
+            // above: fall through to the next extension. Only a confirmed
+            // over-cap file is a hard stop, matching the read-failure path.
+            let len = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                Err(_) => continue,
+            };
+            if len > THEME_FILE_MAX_BYTES {
+                tracing::warn!(
+                    path = %path.display(),
+                    len,
+                    "theme file exceeds the read cap; refusing to load",
+                );
+                return None;
             }
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
@@ -1031,41 +985,25 @@ impl Theme {
                     return None;
                 }
             };
-            // Parse according to extension. TOML reuses ThemeConfig serde
-            // (which derives Deserialize). YAML uses serde_yaml.
-            let file_cfg: ThemeConfig = match ext {
-                "toml" => match toml::from_str(&text) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "failed to parse theme file as TOML",
-                        );
-                        return None;
-                    }
-                },
-                "yaml" | "yml" => match serde_yaml::from_str(&text) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "failed to parse theme file as YAML",
-                        );
-                        return None;
-                    }
-                },
-                _ => unreachable!(),
+            // v1.12: 先嗅探外部格式（wezterm TOML / alacritty TOML /
+            // iTerm2 generic YAML / base16-24 YAML），再退回 weft 自有
+            // schema；顺序与冲突原因见 `resolve_theme_file` 的文档。
+            let (base, overrides) = match resolve_theme_file(name, &text, ext) {
+                Some(resolved) => resolved,
+                None => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "failed to parse theme file (neither a known external \
+                         format nor a weft theme schema)",
+                    );
+                    return None;
+                }
             };
             tracing::info!(
                 path = %path.display(),
                 "loaded custom theme from file",
             );
-            // The file's own inline overrides are applied by reusing the
-            // resolve pipeline with the file's ThemeConfig. Base on weft_warm
-            // so unspecified fields get sensible defaults.
-            return Some(Self::resolve_named("weft-warm", &file_cfg));
+            return Some(apply_overrides(base, &overrides));
         }
         // No file matched — silently fall back (user may have just typed a
         // built-in name we don't recognize yet, so don't warn here).
@@ -1080,5 +1018,49 @@ impl Theme {
         }
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join(".config").join("weft").join("themes"))
+    }
+}
+
+// Inline (not config/tests.rs) because `is_safe_theme_name` is
+// module-private by design — the sibling test module cannot see it.
+#[cfg(test)]
+mod theme_guard_tests {
+    use super::{is_safe_theme_name, THEME_FILE_MAX_BYTES};
+
+    #[test]
+    fn safe_theme_name_accepts_ordinary_names() {
+        assert!(is_safe_theme_name("dracula"));
+        assert!(is_safe_theme_name("my-theme_2"));
+    }
+
+    #[test]
+    fn safe_theme_name_rejects_empty_traversal_and_separators() {
+        // Escaping dir.join() requires a separator — a bare ".." name only
+        // produces the in-dir file "...toml", so it stays accepted.
+        assert!(!is_safe_theme_name(""));
+        assert!(!is_safe_theme_name("../x"));
+        assert!(!is_safe_theme_name("a/b"));
+        assert!(!is_safe_theme_name("a\\b"));
+        assert!(!is_safe_theme_name("a\0b"));
+    }
+
+    #[test]
+    fn theme_file_read_cap_is_one_mib() {
+        // Large enough for any real theme, small enough that a multi-GiB
+        // "theme" can never stall config load.
+        assert_eq!(THEME_FILE_MAX_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn is_theme_file_name_requires_non_empty_stem() {
+        use super::Theme;
+        // PLAN_audit_fix_batch2 B5 boundary: the stem requirement makes this
+        // predicate agree with Path::extension() on bare dot files, so the
+        // picker and loader can share one implementation.
+        assert!(!Theme::is_theme_file_name(".toml"));
+        assert!(Theme::is_theme_file_name("a.b.toml"), "dotted stem is fine");
+        // Stem stays required alongside the existing extension rules.
+        assert!(Theme::is_theme_file_name("dracula.toml"));
+        assert!(!Theme::is_theme_file_name("foo."));
     }
 }

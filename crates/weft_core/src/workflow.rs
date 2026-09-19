@@ -208,7 +208,7 @@ pub enum WorkflowStoreError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("yaml error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_yaml_ng::Error),
 }
 
 /// SQLite-backed store of workflow definitions. Mirrors `BlockStore` in
@@ -354,7 +354,7 @@ impl WorkflowStore {
     /// Import a workflow from YAML text. Creates a new workflow or updates
     /// an existing one if the name matches. Returns the workflow id.
     pub fn import_yaml(&self, yaml: &str) -> Result<i64, WorkflowStoreError> {
-        let wf: Workflow = serde_yaml::from_str(yaml)?;
+        let wf: Workflow = serde_yaml_ng::from_str(yaml)?;
         // Check if a workflow with this name already exists.
         if let Some(existing) = self.find_by_name(&wf.name)? {
             let mut updated = wf.clone();
@@ -373,7 +373,7 @@ impl WorkflowStore {
              FROM workflows WHERE id=?1",
         )?;
         let wf = stmt.query_row(params![id], row_to_workflow)?;
-        Ok(serde_yaml::to_string(&wf)?)
+        Ok(serde_yaml_ng::to_string(&wf)?)
     }
 }
 

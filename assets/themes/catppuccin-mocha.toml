@@ -1,0 +1,11 @@
+name = "Catppuccin Mocha"
+variant = "dark"
+author = "https://github.com/catppuccin/catppuccin"
+source = "tinted-theming/schemes/base16/catppuccin-mocha.yaml"
+license = "MIT"
+
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+cursor = "#cdd6f4"
+selection = "#313244"
+palette = ["#181825", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#cba6f7", "#94e2d5", "#cdd6f4", "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#cba6f7", "#94e2d5", "#b4befe"]
