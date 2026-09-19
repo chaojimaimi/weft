@@ -8,6 +8,29 @@ use super::ui_events::{
     DockProgress, NOTIFY_BODY_MAX, NOTIFY_TITLE_MAX, OSC52_MAX_BYTES, OSC52_READ_REPLY_MAX,
 };
 
+/// Hard cap for OSC 0/2 window titles and OSC 7 cwd payloads. The osc_guard
+/// 1MiB cap bounds the raw sequence; this bounds what we retain — a title
+/// longer than any legible window label is noise (and an NSWindow-title
+/// rendering hazard). Truncation is char-boundary safe (CJK/emoji titles).
+pub const OSC_TITLE_MAX_BYTES: usize = 4096;
+
+/// Lossy-decode an OSC payload and cap it at [`OSC_TITLE_MAX_BYTES`] bytes
+/// without splitting a UTF-8 char (follows `parse_osc_notify`'s char-level
+/// truncation precedent).
+pub fn cap_osc_payload(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    if s.len() <= OSC_TITLE_MAX_BYTES {
+        return s.into_owned();
+    }
+    // Walk back to the nearest char boundary at or before the cap
+    // (`is_char_boundary(0)` is always true, so this terminates).
+    let mut end = OSC_TITLE_MAX_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// Parse an OSC 7 payload `file://[host]/abs/path` → `/abs/path`.
 pub fn parse_osc7_cwd(payload: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(payload).ok()?;
@@ -497,5 +520,55 @@ mod tests {
             osc52_read_reply(&at_cap).is_some(),
             "exactly at cap still answers"
         );
+    }
+
+    // ── VULN-009: title/cwd payload cap ──────────────────────────────────
+
+    #[test]
+    fn cap_osc_payload_ascii_boundaries() {
+        assert_eq!(cap_osc_payload(b"short"), "short");
+        let b4095 = vec![b'x'; 4095];
+        assert_eq!(
+            cap_osc_payload(&b4095),
+            String::from_utf8(b4095.clone()).unwrap()
+        );
+        let b4096 = vec![b'x'; 4096];
+        assert_eq!(
+            cap_osc_payload(&b4096),
+            String::from_utf8(b4096.clone()).unwrap()
+        );
+        let b4097 = vec![b'x'; 4097];
+        assert_eq!(cap_osc_payload(&b4097).len(), 4096);
+        assert_eq!(cap_osc_payload(b""), "");
+    }
+
+    #[test]
+    fn cap_osc_payload_truncates_on_char_boundary() {
+        // 2000 CJK chars = 6000 bytes, all valid — the cut at byte 4096
+        // would land mid-char (4095 is the boundary), so the result is the
+        // first 1365 chars.
+        let title = "表".repeat(2000);
+        let capped = cap_osc_payload(title.as_bytes());
+        assert_eq!(capped.chars().count(), 1365);
+        assert_eq!(capped.len(), 1365 * 3);
+        assert!(capped.len() <= OSC_TITLE_MAX_BYTES);
+        assert!(
+            !capped.contains('\u{FFFD}'),
+            "valid UTF-8 must not be lossy-mangled"
+        );
+        assert_eq!(capped, "表".repeat(1365));
+    }
+
+    #[test]
+    fn cap_osc_payload_dangling_continuation_byte_is_lossy_replaced() {
+        // 4095 ASCII bytes + one dangling continuation byte: the lossy pass
+        // turns it into U+FFFD (3 bytes ⇒ 4098), then the cap walks back to
+        // the boundary at 4095 — no split char in the output.
+        let mut bytes = vec![b'a'; 4095];
+        bytes.push(0x80);
+        let capped = cap_osc_payload(&bytes);
+        assert_eq!(capped.len(), 4095);
+        assert_eq!(capped.chars().count(), 4095);
+        assert!(capped.chars().all(|c| c == 'a'));
     }
 }

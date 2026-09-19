@@ -33,14 +33,33 @@ pub fn bracketed_paste_end() -> Vec<u8> {
     b"\x1b[201~".to_vec()
 }
 
+/// C0 controls (except \t \n \r) and DEL stripped from bracketed paste
+/// payloads. ESC is the injection vector: a pasted `\x1b[201~` forges the
+/// terminator and everything after it executes as fresh keystrokes. Same
+/// strip class as `build_submit_bytes`'s non-bracketed branch, minus \r
+/// (paste preserves line structure; kitty strips the same class).
+fn strip_bracketed_paste_controls(text: &str) -> String {
+    text.chars()
+        .filter(|&c| {
+            // Inverse of `contains_dangerous_control_chars`'s predicate in
+            // the same term order: the \t\n\r exemptions of the two functions
+            // must stay identical (pinned by the consistency test below).
+            !(c == '\x7f'
+                || (c.is_ascii() && (c as u8) < 0x20 && c != '\t' && c != '\n' && c != '\r'))
+        })
+        .collect()
+}
+
 /// Wrap text for bracketed paste mode.
 pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
         let mut bytes = bracketed_paste_start();
-        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(strip_bracketed_paste_controls(text).as_bytes());
         bytes.extend(bracketed_paste_end());
         bytes
     } else {
+        // Explicit-risk path released by the confirmation gate (PLAN_v1111
+        // §7 rollback contract): byte-verbatim passthrough, no stripping.
         text.as_bytes().to_vec()
     }
 }
@@ -164,8 +183,9 @@ pub fn format_byte_count(bytes: usize) -> String {
 #[cfg(test)]
 mod paste_guard_tests {
     use super::{
-        classify_paste, contains_dangerous_control_chars, format_byte_count, paste_preview,
-        PasteGuardCfg, PasteRisk, DEFAULT_PASTE_SIZE_THRESHOLD_KIB,
+        bracketed_paste_end, bracketed_paste_start, classify_paste,
+        contains_dangerous_control_chars, encode_paste, format_byte_count, paste_preview,
+        strip_bracketed_paste_controls, PasteGuardCfg, PasteRisk, DEFAULT_PASTE_SIZE_THRESHOLD_KIB,
     };
 
     fn cfg(size_threshold_kib: u32) -> PasteGuardCfg {
@@ -350,5 +370,103 @@ mod paste_guard_tests {
         assert_eq!(format_byte_count(1258291), "1.2 MiB");
         assert_eq!(format_byte_count(2 * 1024 * 1024), "2 MiB");
         assert_eq!(format_byte_count(3 * 1024 * 1024 * 1024), "3 GiB");
+    }
+
+    // ── encode_paste: bracketed-paste injection stripping (audit VULN-002)
+
+    /// Payload between the bracketed wrapper markers.
+    fn bracketed_payload(out: &[u8]) -> String {
+        let start = bracketed_paste_start().len();
+        let end = out.len() - bracketed_paste_end().len();
+        String::from_utf8_lossy(&out[start..end]).into_owned()
+    }
+
+    #[test]
+    fn bracketed_paste_strips_forged_terminator_esc() {
+        // The only ESC bytes in the output belong to the 200~/201~ wrapper;
+        // the payload's forged `\x1b[201~` loses its ESC, so the leftover
+        // "[201~" text stays inert inside bracketed mode.
+        let out = encode_paste("\x1b[201~echo pwned", true);
+        let mut expected = bracketed_paste_start();
+        expected.extend_from_slice(b"[201~echo pwned");
+        expected.extend(bracketed_paste_end());
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bracketed_paste_preserves_tab_newline_cr_and_multibyte() {
+        let text = "a\tb\nc\rd 中文🎉";
+        let out = encode_paste(text, true);
+        assert_eq!(
+            bracketed_payload(&out),
+            text,
+            "\\t\\n\\r and CJK/emoji are exempt"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_strips_del_and_other_c0() {
+        let out = encode_paste("x\u{7f}y\u{7}z", true);
+        assert_eq!(
+            bracketed_payload(&out),
+            "xyz",
+            "DEL (0x7f) and bell must go"
+        );
+    }
+
+    #[test]
+    fn all_control_payload_reduces_to_bare_wrapper() {
+        let text: String = (0u8..0x20)
+            .filter(|&b| b != b'\t' && b != b'\n' && b != b'\r')
+            .chain(std::iter::once(0x7f))
+            .map(|b| b as char)
+            .collect();
+        let out = encode_paste(&text, true);
+        let mut expected = bracketed_paste_start();
+        expected.extend(bracketed_paste_end());
+        assert_eq!(out, expected, "empty payload → only 200~/201~ wrapper");
+    }
+
+    #[test]
+    fn bracketed_empty_payload_is_bare_wrapper() {
+        let mut expected = bracketed_paste_start();
+        expected.extend(bracketed_paste_end());
+        assert_eq!(encode_paste("", true), expected);
+    }
+
+    #[test]
+    fn strip_result_never_still_classifies_dangerous() {
+        // Consistency contract: the strip fn is the "peeled" twin of
+        // contains_dangerous_control_chars — their \t\n\r exemption sets
+        // must be identical, so a stripped payload can never reclassify.
+        let samples = [
+            "\x1b[201~echo pwned",
+            "a\tb\nc\rd",
+            "\u{7}\u{0}\u{7f}",
+            "中文🎉\x1b",
+        ];
+        for t in samples {
+            let stripped = strip_bracketed_paste_controls(t);
+            assert!(
+                !contains_dangerous_control_chars(&stripped),
+                "stripped {t:?} still contains dangerous controls: {stripped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_is_identity_on_plain_text_with_exempt_controls() {
+        assert_eq!(
+            strip_bracketed_paste_controls("hello 中文\tworld\nline2\r"),
+            "hello 中文\tworld\nline2\r"
+        );
+    }
+
+    #[test]
+    fn non_bracketed_paste_is_byte_verbatim() {
+        // Rollback anchor (PLAN_v1111 §7): the explicit-risk non-bracketed
+        // path stays untouched — bytes in, bytes out.
+        let text = "\x1b[201~echo pwned\r\x7f中文";
+        assert_eq!(encode_paste(text, false), text.as_bytes().to_vec());
     }
 }

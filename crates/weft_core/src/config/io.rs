@@ -194,14 +194,19 @@ pub fn load_resolved_from_path(path: &Path) -> Result<LoadedConfig, ConfigLoadEr
 
 // ── Atomic write helper ─────────────────────────────────────────────────
 
-/// Atomically write `bytes` to `path`: write to `<path>.tmp` then rename.
-/// The temp file lives in the same directory so the rename is atomic on the
-/// same filesystem. Returns the path that was written (== `path`).
+/// Atomically write `bytes` to `path`: create `<path>.tmp` at 0600, write,
+/// then rename. The temp file lives in the same directory so the
+/// rename is atomic on the same filesystem. Returns the path that was
+/// written (== `path`).
 ///
-/// Used by save and import flows. On error the destination is guaranteed
-/// unchanged, and the `.tmp` file is removed (best-effort) so a failed
-/// write does not leak a partial temp file.
+/// Currently test-only — `Config::save_to_path` and the import flow each
+/// own their own tmp+rename sequence — but kept as the shared helper for
+/// future config writers, so the 0600 hardening (VULN-008) lives here too.
+/// On error the destination is guaranteed unchanged, and the `.tmp` file is
+/// removed (best-effort) so a failed write does not leak a partial temp file.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<PathBuf, std::io::Error> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -210,14 +215,37 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<PathBuf, std::io::Error
     })?;
     std::fs::create_dir_all(parent)?;
     let tmp = path.with_extension("toml.tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    // VULN-008: create the tmp at 0600, eliminating the 0644 window for
+    // newly created files. `mode` only applies at creation time — a stale
+    // 0644 `.tmp` left by an older version is still caught by the chmod
+    // below.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(bytes));
+    if let Err(e) = written {
         // Best-effort cleanup so a failed write doesn't leave a partial
         // `.tmp` behind. Ignore the remove error — the original write
         // failure is the one we want to surface.
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
+    // VULN-008: chmod BEFORE the rename — rename(2) keeps the tmp inode's
+    // permissions, so a 0600 tmp makes the 0644 window zero-length. Kept as
+    // the fallback for stale tmp files created by older versions.
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Cleanup mirrors the failure branches above; the post-chmod tmp is
+    // already 0600, so this is consistency, not exposure control.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(path.to_path_buf())
 }
 
@@ -474,6 +502,30 @@ lines = 500_000_000
         let path = PathBuf::from("/nonexistent/dir/weft-test/file.toml");
         let result = atomic_write(&path, b"x");
         assert!(result.is_err(), "writing to a missing parent dir must fail");
+    }
+
+    // ── VULN-008: every config write path lands at 0600 ─────────────────
+
+    #[test]
+    fn atomic_write_lands_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("atomic-0600");
+        let _ = std::fs::remove_file(&path);
+        atomic_write(&path, b"secret").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "atomic_write output must be 0600");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_to_path_lands_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("save-0600");
+        let _ = std::fs::remove_file(&path);
+        Config::default().save_to_path(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "save_to_path output must be 0600");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

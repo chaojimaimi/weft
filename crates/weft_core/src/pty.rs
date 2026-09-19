@@ -24,6 +24,8 @@ pub enum PtyError {
     Fork(#[source] nix::errno::Errno),
     #[error("child process exec failed")]
     ExecFailed,
+    #[error("program or argument contains NUL byte: {0}")]
+    InvalidProgram(String),
     #[error("pty read error: {0}")]
     Read(#[source] io::Error),
     #[error("pty write error: {0}")]
@@ -129,6 +131,21 @@ impl Pty {
             env_with_cwd.iter().map(|(k, v)| (*k, v.as_str())).collect();
         let env_cstrings = build_child_env(&env_refs_cwd);
 
+        // SAFETY sibling of the env snapshot above: argv CStrings are built
+        // in the parent too — a CString allocation or panic inside the
+        // post-fork child can take the malloc lock another runtime thread
+        // holds across fork. A pre-fork failure returns Err normally, so no
+        // fork happens and no orphan process can be left behind.
+        let prog_cstr = std::ffi::CString::new(program)
+            .map_err(|_| PtyError::InvalidProgram(program.to_string()))?;
+        let mut argv_cstrs: Vec<std::ffi::CString> = vec![prog_cstr];
+        for arg in args {
+            argv_cstrs.push(
+                std::ffi::CString::new(*arg)
+                    .map_err(|_| PtyError::InvalidProgram((*arg).to_string()))?,
+            );
+        }
+
         // SAFETY: forkpty is safe to call — it creates a PTY pair and forks.
         // The child immediately execs, so there are no shared resources to corrupt.
         let result = unsafe { forkpty(Some(&winsize), None).map_err(PtyError::Fork)? };
@@ -140,25 +157,20 @@ impl Pty {
                 if let Some(c) = cwd {
                     let _ = unistd::chdir(c);
                 }
-                // Child process: exec the program with arguments.
-                let prog_cstr = std::ffi::CString::new(program)
-                    .expect("program path must not contain null bytes");
-                let mut argv_cstrs: Vec<std::ffi::CString> = vec![prog_cstr.clone()];
-                for arg in args {
-                    argv_cstrs.push(
-                        std::ffi::CString::new(*arg).expect("arg must not contain null bytes"),
-                    );
-                }
                 let argv: Vec<&std::ffi::CStr> = argv_cstrs.iter().map(|c| c.as_c_str()).collect();
+                // argv_cstrs[0] is both the exec program argument and
+                // argv[0]; sharing its &CStr keeps the two immutable borrows
+                // on the same Vec (no CString clone needed).
+                let prog: &std::ffi::CStr = argv_cstrs[0].as_c_str();
                 if env_cstrings.is_empty() {
                     // No overrides: inherit env, search PATH (preserves prior behavior).
-                    let _ = unistd::execvp(&prog_cstr, &argv);
+                    let _ = unistd::execvp(prog, &argv);
                 } else {
                     // Explicit env. execve does not search PATH, so `program`
                     // must be absolute — true for shells from $SHELL.
                     let envp: Vec<&std::ffi::CStr> =
                         env_cstrings.iter().map(|c| c.as_c_str()).collect();
-                    let _ = unistd::execve(&prog_cstr, &argv, &envp);
+                    let _ = unistd::execve(prog, &argv, &envp);
                 }
                 // exec only returns on error — exit child immediately.
                 std::process::exit(127);
@@ -220,6 +232,10 @@ impl Pty {
     }
 
     /// Write bytes to the PTY (keyboard input → shell).
+    ///
+    /// NOTE: the production input path does not go through here — it uses
+    /// the synchronous [`Self::write_sync_reported`] (tab.rs). This async
+    /// variant survives as the test-injection seam.
     ///
     /// v1.11.15 (FIX E): the loop advances by the number of bytes actually
     /// accepted instead of treating ANY successful write as completion — a
@@ -342,6 +358,10 @@ impl Pty {
 
     /// v1.0 fix: Flush the PTY's kernel-side read buffer and drain queued
     /// output events from the internal channel.
+    ///
+    /// Draining the channel also discards any queued [`PtyEvent::Exit`], so
+    /// this must only be used on the flood-recovery path — never during
+    /// normal teardown, where losing the exit status matters.
     ///
     /// Reserved for explicit flood-recovery actions. Ctrl+C itself must never
     /// call this after writing ETX: `tcflush(TCIFLUSH)` can discard the ETX

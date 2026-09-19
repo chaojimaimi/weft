@@ -236,6 +236,17 @@ impl App {
         // would confuse user-facing toasts — strip here, before reuse.
         let clean = text.replace('\0', "");
         crate::macos_system::clipboard_copy(&clean);
+        // audit batch1: default-mode writes were silent — a remote program
+        // could replace the clipboard without a trace. unrestricted is an
+        // explicit opt-out; truncated writes keep their more specific toast
+        // below.
+        if mode == weft_core::config::Osc52Mode::Default && !truncated {
+            let message = format!("OSC 52：程序写入了系统剪贴板（{} 字节）", clean.len());
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_paste_toast(Some((message, std::time::Instant::now())));
+                self.request_redraw();
+            }
+        }
         if truncated {
             let message = format!(
                 "OSC 52 内容超大：已截断为前 {} 字节写入剪贴板",

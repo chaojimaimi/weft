@@ -45,7 +45,15 @@ pub(crate) unsafe fn appearance_from_parts(
     if value_ns.is_null() {
         return false;
     }
-    let c_str: *const i8 = objc2::msg_send![value_ns, UTF8String];
+    // VULN-005: UTF8String on a corrupted/non-string object can raise an
+    // ObjC assertion — degrade to the same "broken query → default dark"
+    // semantics as the null checks above.
+    let c_str: *const i8 = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        objc2::msg_send![value_ns, UTF8String]
+    })) {
+        Ok(c_str) => c_str,
+        Err(_) => return true,
+    };
     if c_str.is_null() {
         // UTF8String failing is a broken query too → default dark.
         return true;

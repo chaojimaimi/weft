@@ -20,9 +20,12 @@
 //! renderer, or PTY. The App layer wires them to NSOpenPanel/NSSavePanel
 //! and applies the resulting `LoadedConfig` to the runtime.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::profiles::ProfileError;
@@ -155,7 +158,29 @@ pub fn export_config_document(
                 })?;
                 let cfg: Config = toml::from_str(text)?;
                 let (_effective, _diags) = cfg.resolve_active_profile()?;
-                raw
+                // VULN-008 (second half): the legacy `api_key` is ignored by
+                // the app (Ollama-only, no key needed) but still deserialized
+                // for compat — it must never ride along in a shareable
+                // export. Redaction is targeted (any `ai` table) via
+                // toml_edit, so a no-key config stays byte-identical.
+                let mut doc = toml_edit::DocumentMut::from_str(text).map_err(|e| {
+                    // `Parse` carries toml::de::Error; wrap the toml_edit
+                    // error. Fail CLOSED: a document we cannot redact is
+                    // never exported as raw bytes.
+                    ConfigTransferError::Parse(<toml::de::Error as serde::de::Error>::custom(
+                        e.to_string(),
+                    ))
+                })?;
+                let redacted = redact_api_keys(&mut doc);
+                if redacted > 0 {
+                    tracing::warn!(
+                        count = redacted,
+                        "exported config redacted api_key value(s)"
+                    );
+                    doc.to_string().into_bytes()
+                } else {
+                    raw
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Source file absent — serialize `source` to canonical TOML.
@@ -175,9 +200,29 @@ pub fn export_config_document(
     })?;
     std::fs::create_dir_all(parent).map_err(ConfigTransferError::Write)?;
     let tmp = destination.with_extension("toml.tmp");
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    // VULN-008: create the tmp at 0600, eliminating the 0644 window for
+    // newly created files. `mode` only applies at creation time — a stale
+    // 0644 `.tmp` from an older version is still caught by the chmod below.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(&bytes));
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigTransferError::Write(e));
+    }
+    // VULN-008: land the export at 0600, BEFORE the rename (rename(2) keeps
+    // the tmp inode's permissions). Failure is downgraded to a warning: a
+    // user-chosen destination (e.g. exFAT) may not support POSIX modes, and
+    // a successful export beats permission hardening here.
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            error = %e,
+            "could not chmod exported config to 0600; exporting anyway"
+        );
     }
     if let Err(e) = std::fs::rename(&tmp, destination) {
         let _ = std::fs::remove_file(&tmp);
@@ -260,12 +305,37 @@ pub fn import_config_document(
         // nothing to back up — the import is a fresh write.
         if config_path.exists() {
             std::fs::copy(config_path, &backup).map_err(ConfigTransferError::Backup)?;
+            // Backups are never cleaned up and can carry a legacy api_key —
+            // keep them 0600 like the live config (`fs::copy` follows the
+            // source's mode, which may be looser). VULN-008.
+            if let Err(e) =
+                std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&backup);
+                return Err(ConfigTransferError::Backup(e));
+            }
         }
     }
 
     // Step 4: atomic write of the import bytes to config_path.
     let tmp = config_path.with_extension("toml.tmp");
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
+    // VULN-008: create the tmp at 0600, eliminating the 0644 window for
+    // newly created files. `mode` only applies at creation time — a stale
+    // 0644 `.tmp` from an older version is still caught by the chmod below.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(&bytes));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigTransferError::Write(e));
+    }
+    // VULN-008: chmod BEFORE the rename — rename(2) keeps the tmp inode's
+    // permissions, so the imported config never lands world-readable.
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(ConfigTransferError::Write(e));
     }
@@ -295,6 +365,88 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+// ── Export redaction (VULN-008) ───────────────────────────────────────
+
+/// Remove every `api_key` key found under a table named `ai` from `doc`,
+/// returning the number of keys removed. Pure: touches only `doc`.
+///
+/// Recurses through nested tables so `[profiles.<name>.ai]` is covered, and
+/// handles both inline (`ai = { api_key = "x" }`) and dotted (`ai.api_key =
+/// "x"`) forms. Empty/whitespace keys are removed too (harmless and tidier).
+/// Nested recursion is REQUIRED: `save_to_path` preserves an existing
+/// `[profiles.*.ai] api_key` on disk, so real config files carry it.
+fn redact_api_keys(doc: &mut toml_edit::DocumentMut) -> usize {
+    redact_ai_keys_in_table(doc.as_table_mut())
+}
+
+/// Walk one table, redacting under `ai`-named children and recursing
+/// everywhere else.
+fn redact_ai_keys_in_table(table: &mut toml_edit::Table) -> usize {
+    let mut removed = 0;
+    for (key, item) in table.iter_mut() {
+        if key == "ai" {
+            removed += redact_ai_item(item);
+        } else {
+            removed += redact_descendant(item);
+        }
+    }
+    removed
+}
+
+/// `item` is the value of an `ai` key: strip its `api_key`, then keep
+/// recursing (an `ai` table can nest further `ai` tables).
+fn redact_ai_item(item: &mut toml_edit::Item) -> usize {
+    let mut removed = 0;
+    if let Some(t) = item.as_table_mut() {
+        // Covers `[ai]`, `[profiles.*.ai]`, and the dotted form — toml_edit
+        // models `ai.api_key = "x"` as a dotted table.
+        if t.remove("api_key").is_some() {
+            removed += 1;
+        }
+        removed += redact_ai_keys_in_table(t);
+    } else if let Some(inline) = item.as_value_mut().and_then(|v| v.as_inline_table_mut()) {
+        if inline.remove("api_key").is_some() {
+            removed += 1;
+        }
+        removed += redact_ai_keys_in_inline(inline);
+    }
+    removed
+}
+
+/// Walk one non-`ai` item, recursing into any nested tables.
+///
+/// Premise: TOML array-of-tables entries (`[[x]]`, an `ArrayOfTables`) are
+/// NOT recursed into — they are neither a table nor an inline value here,
+/// so an `ai` table nested under one would be missed. The current `Config`
+/// schema has no array-of-tables field that can carry an `ai` table (and
+/// the document is deserialized into `Config` before redaction anyway); if
+/// such a field is ever added, this function needs an array-of-tables
+/// branch.
+fn redact_descendant(item: &mut toml_edit::Item) -> usize {
+    let mut removed = 0;
+    if let Some(t) = item.as_table_mut() {
+        removed += redact_ai_keys_in_table(t);
+    } else if let Some(inline) = item.as_value_mut().and_then(|v| v.as_inline_table_mut()) {
+        removed += redact_ai_keys_in_inline(inline);
+    }
+    removed
+}
+
+/// Inline-table twin of [`redact_ai_keys_in_table`].
+fn redact_ai_keys_in_inline(inline: &mut toml_edit::InlineTable) -> usize {
+    let mut removed = 0;
+    for (key, value) in inline.iter_mut() {
+        let is_ai = key == "ai";
+        if let Some(nested) = value.as_inline_table_mut() {
+            if is_ai && nested.remove("api_key").is_some() {
+                removed += 1;
+            }
+            removed += redact_ai_keys_in_inline(nested);
+        }
+    }
+    removed
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -402,6 +554,93 @@ key = "value"
         // Destination must not be created.
         assert!(!dest.exists());
         let _ = std::fs::remove_file(&src);
+    }
+
+    // ── VULN-008: api_key must never ride along in an export ─────────────
+
+    #[test]
+    fn export_redacts_top_level_api_key_and_keeps_comments() {
+        let src = tmp("export-redact-src");
+        let dest = tmp("export-redact-dest");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        let content =
+            "# user comment\n[font]\nfamily = \"Menlo\"\n\n[ai]\napi_key = \"sk-secret\"\n";
+        write(&src, content);
+
+        export_config_document(Some(&src), &Config::default(), &dest).unwrap();
+
+        let exported = std::fs::read_to_string(&dest).unwrap();
+        assert!(!exported.contains("api_key"), "key must be stripped");
+        assert!(!exported.contains("sk-secret"));
+        assert!(exported.contains("# user comment"), "comments survive");
+        assert!(
+            exported.contains("family = \"Menlo\""),
+            "unrelated lines survive verbatim"
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn export_redacts_inline_ai_table_api_key() {
+        // `ai = { api_key = "x" }` — the inline-table form of the same leak.
+        let src = tmp("export-inline-src");
+        let dest = tmp("export-inline-dest");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        write(
+            &src,
+            "[font]\nfamily = \"Menlo\"\n\nai = { provider = \"ollama\", api_key = \"x\" }\n",
+        );
+
+        export_config_document(Some(&src), &Config::default(), &dest).unwrap();
+
+        let exported = std::fs::read_to_string(&dest).unwrap();
+        assert!(!exported.contains("api_key"));
+        assert!(!exported.contains("\"x\""));
+        assert!(
+            exported.contains("provider = \"ollama\""),
+            "sibling inline keys stay"
+        );
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn export_without_api_key_is_byte_identical() {
+        // No api_key anywhere ⇒ zero diff: comments and formatting must be
+        // preserved byte-for-byte (the redaction path is not taken at all).
+        let src = tmp("export-nodiff-src");
+        let dest = tmp("export-nodiff-dest");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        let content =
+            "# top comment\n[font]\nfamily = \"Menlo\"\n\n[unknown_section]\nkey = \"v\"\n";
+        write(&src, content);
+
+        export_config_document(Some(&src), &Config::default(), &dest).unwrap();
+
+        let exported = std::fs::read(&dest).unwrap();
+        assert_eq!(exported, content.as_bytes(), "no api_key ⇒ zero diff");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn export_canonical_output_has_no_api_key() {
+        // Canonical branch (no source file): `save_to_path` never writes
+        // api_key (save.rs only persists non-default values and the field
+        // is skip_serializing), so the canonical export is clean by
+        // construction — pinned here so a save-side regression is caught.
+        let dest = tmp("export-canonical-redact");
+        let _ = std::fs::remove_file(&dest);
+
+        export_config_document(None, &Config::default(), &dest).unwrap();
+
+        let exported = std::fs::read_to_string(&dest).unwrap();
+        assert!(!exported.contains("api_key"));
+        let _ = std::fs::remove_file(&dest);
     }
 
     // ── Import ───────────────────────────────────────────────────────
@@ -767,6 +1006,104 @@ family = "Profile"
         assert!(backup_content.contains("Original"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── VULN-008: transfer write paths land at 0600 ──────────────────────
+
+    #[test]
+    fn export_lands_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tmp("perm-export-src");
+        let dest = tmp("perm-export-dest");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        write(&src, "[font]\nfamily = \"Menlo\"\n");
+
+        export_config_document(Some(&src), &Config::default(), &dest).unwrap();
+
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "export output must be 0600");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    fn import_lands_0600_and_backup_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let import = tmp("perm-import-src");
+        let config = tmp("perm-import-dest");
+        let _ = std::fs::remove_file(&import);
+        let _ = std::fs::remove_file(&config);
+        write(&config, "[font]\nfamily = \"Old\"\n");
+        write(&import, "[font]\nfamily = \"New\"\n");
+
+        import_config_document(&import, &config).unwrap();
+
+        let mode = std::fs::metadata(&config).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "imported config must be 0600");
+        // The backup carries the old (possibly key-bearing) content and is
+        // never cleaned up — it must be 0600 too, not the source's mode.
+        let config_name = config.file_name().unwrap().to_string_lossy().into_owned();
+        let parent = config.parent().unwrap();
+        let backups: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                name.starts_with(&config_name) && name.contains(".bak.")
+            })
+            .collect();
+        assert!(!backups.is_empty(), "backup file must exist");
+        let backup_mode = backups[0].metadata().unwrap().permissions().mode();
+        assert_eq!(backup_mode & 0o777, 0o600, "backup must be 0600");
+        let _ = std::fs::remove_file(&import);
+        let _ = std::fs::remove_file(&config);
+        for b in backups {
+            let _ = std::fs::remove_file(b.path());
+        }
+    }
+
+    // ── redact_api_keys (pure) ───────────────────────────────────────────
+
+    #[test]
+    fn redact_api_keys_covers_top_level_nested_inline_and_dotted() {
+        let redact = |text: &str| {
+            let mut doc = toml_edit::DocumentMut::from_str(text).unwrap();
+            redact_api_keys(&mut doc)
+        };
+        // Top-level table + nested profile table in one document.
+        // NOTE: `[profiles.work.ai]` cannot appear in a REAL config (the
+        // schema rejects `ai` inside a profile via deny_unknown_fields) —
+        // exercised here directly because export's validation would
+        // fail-closed on it before redaction ever runs.
+        assert_eq!(
+            redact("[ai]\napi_key = \"a\"\n\n[profiles.work.ai]\napi_key = \"b\"\n"),
+            2,
+            "top-level and nested ai tables both redacted"
+        );
+        assert_eq!(
+            redact("ai = { api_key = \"x\", provider = \"ollama\" }\n[font]\nfamily = \"M\"\n"),
+            1,
+            "inline-table form"
+        );
+        assert_eq!(redact("ai.api_key = \"d\"\n"), 1, "dotted-key form");
+        assert_eq!(
+            redact("[font]\nfamily = \"M\"\napi_key = \"untouched\"\n"),
+            0,
+            "api_key outside an `ai` table is not ours to touch"
+        );
+    }
+
+    #[test]
+    fn redact_api_keys_removes_empty_and_whitespace_keys() {
+        let mut doc = toml_edit::DocumentMut::from_str("[ai]\napi_key = \"\"\n").unwrap();
+        assert_eq!(redact_api_keys(&mut doc), 1, "empty key is removed");
+        let mut doc = toml_edit::DocumentMut::from_str("[ai]\napi_key = \"   \"\n").unwrap();
+        assert_eq!(redact_api_keys(&mut doc), 1, "whitespace key is removed");
+        assert!(
+            doc.to_string().contains("[ai]"),
+            "the section header itself stays"
+        );
     }
 
     /// Helper: set a path to read-only (mode 0555 for dirs, 0444 for files).

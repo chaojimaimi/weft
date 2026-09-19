@@ -68,15 +68,26 @@ pub(crate) unsafe fn attach_layer_to_nsview(layer: &MetalLayer, window: &Window,
     let layer_ptr: *mut objc2::runtime::AnyObject =
         (&**layer) as *const _ as *mut objc2::runtime::AnyObject;
 
-    let _: () = msg_send![ns_view, setWantsLayer: true];
-    let _: () = msg_send![ns_view, setLayer: layer_ptr];
-    // Retina: the backing store (drawable) is physical pixels; tell the layer its
-    // contents are at the window scale so it isn't displayed at the wrong density.
-    let _: () = msg_send![layer_ptr, setContentsScale: scale];
-    // Metal renders with a top-left origin (framebuffer row 0 = top). The vertex
-    // shader already maps logical-top → clip-top, so the drawable is upright; do NOT
-    // set geometryFlipped (it would composite the framebuffer upside-down).
-    let _: () = msg_send![layer_ptr, setGeometryFlipped: false];
+    // VULN-005: an ObjC runtime assertion inside these raw messages must
+    // degrade (window renders without a Metal layer), not abort the process.
+    // The `expect`/`panic!` above are programming errors and stay outside
+    // the guard so they still propagate normally.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let _: () = msg_send![ns_view, setWantsLayer: true];
+        let _: () = msg_send![ns_view, setLayer: layer_ptr];
+        // Retina: the backing store (drawable) is physical pixels; tell the layer its
+        // contents are at the window scale so it isn't displayed at the wrong density.
+        let _: () = msg_send![layer_ptr, setContentsScale: scale];
+        // Metal renders with a top-left origin (framebuffer row 0 = top). The vertex
+        // shader already maps logical-top → clip-top, so the drawable is upright; do NOT
+        // set geometryFlipped (it would composite the framebuffer upside-down).
+        let _: () = msg_send![layer_ptr, setGeometryFlipped: false];
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!(
+            "attach_layer_to_nsview: ObjC panic while attaching the Metal layer; continuing without a layer"
+        );
+    });
 }
 
 /// v1.1: Configure a Warp-style transparent titlebar on the native NSWindow.
@@ -172,7 +183,20 @@ pub(crate) unsafe fn ns_window_of(
     use objc2::msg_send;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    let ptr: *mut AnyObject = msg_send![view, window];
+    // VULN-005: guard the raw message HERE so every call site is covered
+    // (configure_titlebar / set_window_opaque already catch_unwind around
+    // their own bodies, but ui_events.rs calls this helper bare). Nested
+    // catch is redundant but harmless; a panic degrades to "no window".
+    let ptr: *mut AnyObject =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            msg_send![view, window]
+        })) {
+            Ok(ptr) => ptr,
+            Err(_) => {
+                tracing::warn!("ns_window_of: ObjC panic in [view window]; treating as no window");
+                return None;
+            }
+        };
     if ptr.is_null() {
         None
     } else {
@@ -191,7 +215,14 @@ pub(crate) unsafe fn ns_window_of(
 pub(crate) unsafe fn set_layer_opaque(layer: &MetalLayer, opaque: bool) {
     let layer_ptr: *mut objc2::runtime::AnyObject =
         (&**layer) as *const _ as *mut objc2::runtime::AnyObject;
-    let _: () = msg_send![layer_ptr, setOpaque: opaque];
+    // VULN-005: an ObjC assertion in setOpaque: must not abort the app —
+    // worst case the layer keeps its previous opacity.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        let _: () = msg_send![layer_ptr, setOpaque: opaque];
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("set_layer_opaque: ObjC panic in setOpaque:; keeping the previous opacity");
+    });
 }
 
 /// v1.2.11 fix: toggle NSWindow-level transparency at runtime.

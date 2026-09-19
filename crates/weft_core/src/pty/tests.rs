@@ -66,6 +66,42 @@ async fn resize_works() {
     pty.resize(50, 120).expect("resize failed");
 }
 
+// ── argv NUL rejection is a pre-fork failure (audit VULN-006) ──────────
+// Both tests are sync on purpose: a regression that re-forks before the
+// CString build would leave a live child/hung test instead of an Err.
+
+#[test]
+fn spawn_rejects_nul_in_program_with_invalid_program() {
+    // Match instead of formatting the whole Result: Pty is not Debug, and
+    // the Err arm only needs the (Debug) error for the failure message.
+    match Pty::spawn_with_args("/bin/za\0sh", &[], (24, 80), &[], None, new_flag(), || {}) {
+        Err(err @ PtyError::InvalidProgram(_)) => {
+            assert!(err.to_string().contains("NUL"), "{err}");
+        }
+        Err(err) => panic!("expected Err(InvalidProgram), got {err:?}"),
+        Ok(_) => panic!("spawn with a NUL program must fail pre-fork"),
+    }
+}
+
+#[test]
+fn spawn_rejects_nul_in_arg_with_invalid_program() {
+    match Pty::spawn_with_args(
+        "/bin/echo",
+        &["a\0b"],
+        (24, 80),
+        &[],
+        None,
+        new_flag(),
+        || {},
+    ) {
+        Err(err @ PtyError::InvalidProgram(_)) => {
+            assert!(err.to_string().contains("NUL"), "{err}");
+        }
+        Err(err) => panic!("expected Err(InvalidProgram), got {err:?}"),
+        Ok(_) => panic!("spawn with a NUL arg must fail pre-fork"),
+    }
+}
+
 /// Test that child exit is detected.
 /// Uses `sleep 0` (exits immediately with code 0).
 #[tokio::test]

@@ -170,13 +170,9 @@ impl AccessibilityBridge {
             }
 
             for node in &nodes {
-                let element = self.elements.get(&stable_id(&node.id)).expect("AX element");
-                element.setAccessibilityElement(true);
-                element.setAccessibilityEnabled(true);
-                element.setAccessibilityRole(Some(native_role(&node.role)));
-                let label = NSString::from_str(&node.label);
-                element.setAccessibilityLabel(Some(&label));
-                element.setAccessibilityIdentifier(Some(&NSString::from_str(&node.id)));
+                // Parent resolved before the entry() insert below: the read
+                // borrow must end before the entry's &mut borrow starts, and
+                // a node is never its own parent, so ordering is value-neutral.
                 let parent = node
                     .parent
                     .as_ref()
@@ -185,6 +181,20 @@ impl AccessibilityBridge {
                         &*(element.as_ref() as *const WeftAccessibilityElement).cast::<AnyObject>()
                     })
                     .unwrap_or(view_object);
+                let element = self.elements.entry(stable_id(&node.id)).or_insert_with(|| {
+                    // Invariant hole (structure_changed missed a node):
+                    // synthesize in-frame like the rebuild branch instead of
+                    // panicking inside the per-redraw path (panic.log ×6
+                    // lesson domain).
+                    tracing::warn!(id = %node.id, "AX element missing for stable node; synthesizing");
+                    WeftAccessibilityElement::new(node, self.generation)
+                });
+                element.setAccessibilityElement(true);
+                element.setAccessibilityEnabled(true);
+                element.setAccessibilityRole(Some(native_role(&node.role)));
+                let label = NSString::from_str(&node.label);
+                element.setAccessibilityLabel(Some(&label));
+                element.setAccessibilityIdentifier(Some(&NSString::from_str(&node.id)));
                 element.setAccessibilityParent(Some(parent));
                 // WinitView is flipped (top-left origin). Let AppKit convert
                 // that exact view-space rect to the screen-space AXFrame;

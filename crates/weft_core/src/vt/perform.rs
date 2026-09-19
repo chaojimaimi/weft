@@ -1,6 +1,7 @@
 use super::attrs::ShellMarker;
 use super::osc::{
-    parse_osc52, parse_osc7_cwd, parse_osc_notify, parse_osc_progress, parse_x11_color, Osc52Result,
+    cap_osc_payload, parse_osc52, parse_osc7_cwd, parse_osc_notify, parse_osc_progress,
+    parse_x11_color, Osc52Result,
 };
 use super::param;
 use super::replies;
@@ -712,7 +713,10 @@ impl vte::Perform for Terminal {
         match code {
             "0" | "2" => {
                 if params.len() > 1 {
-                    self.title = String::from_utf8_lossy(params[1]).into_owned();
+                    // VULN-009: cap before retaining — the osc_guard 1MiB raw
+                    // cap is the only other bound, and a near-1MiB title would
+                    // otherwise reach the NSWindow title verbatim.
+                    self.title = cap_osc_payload(params[1]);
                 }
             }
             "4" => {
@@ -747,7 +751,10 @@ impl vte::Perform for Terminal {
             }
             "7" => {
                 if params.len() > 1 {
-                    if let Some(path) = parse_osc7_cwd(params[1]) {
+                    // VULN-009: same payload cap as the title. A truncated
+                    // file:// URL yields a bounded wrong path — acceptable,
+                    // cwd is display/git-probe only.
+                    if let Some(path) = parse_osc7_cwd(cap_osc_payload(params[1]).as_bytes()) {
                         self.cwd = Some(path.clone());
                         // Mirror into the block tracker so each block is stamped
                         // with the dir it ran in (for the block-view header).

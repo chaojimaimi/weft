@@ -199,12 +199,19 @@ impl MetalRenderer {
 
         // CAMetalLayer contentsScale is not exposed by metal-rs. Keep the raw
         // Objective-C message contained and unwind-protected per project rule.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             use objc2::msg_send;
             let layer_ptr: *mut objc2::runtime::AnyObject =
                 (&*self.layer) as *const _ as *mut objc2::runtime::AnyObject;
             let _: () = msg_send![layer_ptr, setContentsScale: scale];
-        }));
+        }))
+        .unwrap_or_else(|_| {
+            // VULN-005: never silent — an ObjC assertion here means the
+            // layer scale may be stale until the next display move.
+            tracing::error!(
+                "update_scale: ObjC panic in setContentsScale:; continuing with the previous layer scale"
+            );
+        });
 
         self.force_full_grid_redraw();
         // v1.4.1: atlas rebuild invalidates glyph UVs baked into cached

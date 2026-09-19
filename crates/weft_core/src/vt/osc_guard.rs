@@ -26,8 +26,10 @@
 //!   `< 0x80` terminator value, so blind per-byte counting is safe.
 //!
 //! Over-CAP truncation is a visible but bounded behavior change: dispatch
-//! sees a truncated payload. Downstream consumers already cap (title in
-//! perform.rs, OSC 8 URLs in hyperlink.rs); OSC 133 markers are tiny.
+//! sees a truncated payload. The guard's 1MiB only bounds the RAW payload —
+//! what downstream code RETAINS is capped separately (OSC 0/2 title and
+//! OSC 7 cwd by perform.rs's 4KiB `cap_osc_payload`, OSC 8 URLs in
+//! hyperlink.rs); OSC 133 markers are tiny.
 
 /// Maximum OSC payload bytes forwarded to vte per OSC sequence before the
 /// guard switches to Swallowing (1 MiB).

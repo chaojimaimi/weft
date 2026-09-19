@@ -2404,6 +2404,28 @@ fn osc_set_title() {
     assert_eq!(t.title(), "mytitle");
 }
 
+// VULN-009 integration anchor: a 50KiB OSC 2 title (well under the
+// osc_guard 1MiB raw cap, so the guard forwards it) must reach `self.title`
+// capped at OSC_TITLE_MAX_BYTES, not verbatim.
+#[test]
+fn osc2_title_is_capped_at_4kib() {
+    let mut t = term();
+    let seq = format!("\x1b]2;{}\x07", "x".repeat(50_000));
+    t.process(seq.as_bytes());
+    assert_eq!(t.title().len(), super::osc::OSC_TITLE_MAX_BYTES);
+}
+
+// Same cap on the OSC 7 cwd path: a hostile near-cap file:// URL must not
+// retain an unbounded string.
+#[test]
+fn osc7_cwd_payload_is_capped() {
+    let mut t = term();
+    let seq = format!("\x1b]7;file://host/{}\x07", "d/".repeat(30_000));
+    t.process(seq.as_bytes());
+    let cwd = t.cwd.clone().unwrap_or_default();
+    assert!(cwd.len() <= super::osc::OSC_TITLE_MAX_BYTES);
+}
+
 // v1.10.12: OSC 11 background-color query. TUIs (omp/pi/opencode) probe it
 // at startup to pick their theme; the response carries the app theme's
 // background in xterm `rgb:RR/GG/BB` form.
