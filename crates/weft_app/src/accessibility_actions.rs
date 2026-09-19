@@ -7,9 +7,10 @@ fn palette_theme_action(
     open: bool,
     palette: &crate::palette_state::PaletteState,
     name: &str,
+    theme_cfg: &weft_core::config::ThemeConfig,
 ) -> Option<bool> {
     (open && palette.theme_picker_contains(name))
-        .then(|| crate::palette_state::theme_name_is_dark(name))
+        .then(|| crate::palette_state::theme_is_dark(name, theme_cfg))
 }
 
 impl App {
@@ -68,8 +69,12 @@ impl App {
                 }
             }
             AccessibilityAction::PaletteTheme(name) => {
-                let Some(dark) = palette_theme_action(self.palette.open, &self.palette, &name)
-                else {
+                let Some(dark) = palette_theme_action(
+                    self.palette.open,
+                    &self.palette,
+                    &name,
+                    &self.config_state.config.theme,
+                ) else {
                     return;
                 };
                 self.apply_theme_by_name(&name, dark);
@@ -87,6 +92,7 @@ mod tests {
 
     #[test]
     fn palette_theme_action_requires_open_current_filtered_theme() {
+        let cfg = weft_core::config::ThemeConfig::default();
         let mut palette = PaletteState::new();
         palette.open = true;
         palette.submode = PaletteSubMode::SelectTheme {
@@ -94,13 +100,22 @@ mod tests {
             themes: vec!["weft-light".into(), "weft-warm".into()],
         };
         assert_eq!(
-            palette_theme_action(true, &palette, "weft-light"),
+            palette_theme_action(true, &palette, "weft-light", &cfg),
             Some(false)
         );
-        assert_eq!(palette_theme_action(true, &palette, "weft-warm"), None);
-        assert_eq!(palette_theme_action(false, &palette, "weft-light"), None);
+        assert_eq!(
+            palette_theme_action(true, &palette, "weft-warm", &cfg),
+            None
+        );
+        assert_eq!(
+            palette_theme_action(false, &palette, "weft-light", &cfg),
+            None
+        );
 
         palette.submode = PaletteSubMode::Search;
-        assert_eq!(palette_theme_action(true, &palette, "weft-light"), None);
+        assert_eq!(
+            palette_theme_action(true, &palette, "weft-light", &cfg),
+            None
+        );
     }
 }

@@ -132,6 +132,32 @@ pub struct Tab {
     resize_output_probe: Option<std::time::Instant>,
 }
 
+/// v1.11 audit P1-1 (PLAN_audit_fix_batch3 C2): immutable draw inputs for one
+/// non-active pane, derived under the [`Tab::active_pane_views`] invariants.
+/// The rect is NOT carried here — layout is the caller's concern; pair
+/// `pane_id` against `split_tree().layout(content_rect)` at the call site.
+pub(crate) struct BackgroundPaneView<'a> {
+    /// Pane the view came from — the pairing key for the caller's rects.
+    pub pane_id: PaneId,
+    /// Shared terminal reference. Background panes' terminals are only read
+    /// during draw (invariant 4 of `active_pane_views`).
+    pub terminal: &'a Terminal,
+    /// Block-scroll snapshot (`offset_value + fraction`) taken at derivation
+    /// time, so the draw path needs no second borrow of the pane.
+    pub block_scroll: f32,
+    /// v1.4.1: pane-scoped namespace for the styled-line vertex cache.
+    pub pane_session_id: u64,
+}
+
+/// v1.11 audit P1-1 (PLAN_audit_fix_batch3 C2): the split-borrow view of a
+/// tab's panes for one draw frame — mutable access to the active pane plus
+/// shared reads of every background pane, replacing the raw `*const
+/// Terminal` pointer bridge in redraw_controller.
+pub(crate) struct PaneViewSet<'a> {
+    pub active: &'a mut Pane,
+    pub backgrounds: Vec<BackgroundPaneView<'a>>,
+}
+
 impl std::ops::Deref for Tab {
     type Target = Pane;
     fn deref(&self) -> &Self::Target {
@@ -158,6 +184,51 @@ impl Tab {
     /// Mutably borrow the active pane.
     pub(crate) fn active_mut(&mut self) -> &mut Pane {
         self
+    }
+
+    /// v1.11 audit P1-1 (PLAN_audit_fix_batch3 C2): split-borrow the pane map
+    /// for one draw frame — `&mut` on the active pane plus shared reads of
+    /// every background pane, so callers never need a raw-pointer bridge.
+    ///
+    /// CALLER ORDER CONTRACT: `split_tree().layout(content_rect)` (and any
+    /// other read of the tab) must complete BEFORE this call — the returned
+    /// views hold `&mut Tab` for their whole lifetime, so the read-only
+    /// layout walk has to finish first. See redraw_controller::run_redraw.
+    ///
+    /// WHY SAFE CODE, not the plan-reviewed raw-pointer sketch: the locked
+    /// form (`map_ptr → get_mut(active)` then `(*map_ptr).iter()`) is UB
+    /// under Stacked Borrows in BOTH orders — the second reborrow through
+    /// the raw pointer pops the first one's tag, and Miri (A9, nightly
+    /// 2026-09-18) rejects it: "trying to retag ... Unique permission ...
+    /// tag does not exist in the borrow stack" at the return of this fn.
+    /// `iter_mut` derives the same shape soundly: std guarantees the yielded
+    /// `&mut Pane`s are pairwise disjoint, so keeping the active entry's
+    /// `&mut` and shrinking every other element to a shared `&Terminal`
+    /// needs no unsafe — the borrow checker now enforces what the five
+    /// invariants could only document.
+    pub(crate) fn active_pane_views(&mut self) -> PaneViewSet<'_> {
+        let active_id = self.active_pane_id();
+        let mut active: Option<&mut Pane> = None;
+        let mut backgrounds: Vec<BackgroundPaneView<'_>> = Vec::new();
+        for (id, pane) in self.panes.iter_mut() {
+            if *id == active_id {
+                active = Some(pane);
+            } else if let Some(terminal) = pane.terminal.as_ref() {
+                // Same snapshot the raw-pointer bridge took: offset + the
+                // transient trackpad fraction, read once per frame.
+                backgrounds.push(BackgroundPaneView {
+                    pane_id: *id,
+                    terminal,
+                    block_scroll: pane.block_scroll_anchor.offset_value() as f32
+                        + pane.block_scroll_fraction,
+                    pane_session_id: pane.pane_session_id,
+                });
+            }
+        }
+        PaneViewSet {
+            active: active.expect("active_pane always points at a present pane"),
+            backgrounds,
+        }
     }
 
     /// Borrow a specific pane by id. Returns `None` if the pane is not in

@@ -1,7 +1,7 @@
-// arch-gate: allow-over-800
 // Overlay stack builder: z-order + warm-up + hit-testing for all overlay
-// layers. Grew with F3 panel scroll_offset param and block hover actions;
-// remaining size is the per-overlay build_overlay_stack dispatch.
+// layers. v1.11 audit 3C (PLAN_audit_fix_batch3 C1): the parameter-group
+// structs moved to overlay/view_params.rs, bringing the file back under the
+// default 800-line budget (allowlist entry removed).
 //! Unified overlay stack — manages z-order, rendering, warm-up, and hit-testing
 //! for all overlay UI layers (history panel, prompt input box, completion
 //! dropdown, and future Command Palette / context menu).
@@ -19,6 +19,16 @@ use weft_core::vt::Terminal;
 use crate::paint::panel::PanelDrawParams;
 use crate::paint::preedit::TuiPreeditDrawParams;
 use crate::paint::prompt::PromptDrawParams;
+
+// v1.11 audit (PLAN_audit_fix_batch3 C1): the five view-parameter groups
+// replacing build_overlay_stack's flat 60-param signature live in their own
+// module (overlay.rs is at its line budget; the new file has zero pressure).
+mod view_params;
+
+pub use view_params::{
+    ImeViewParams, PaletteViewParams, PanelViewParams, PromptViewParams, SettingsOwnedSnapshot,
+    SettingsViewParams,
+};
 
 // ── Z-order ───────────────────────────────────────────────────────────
 
@@ -138,13 +148,13 @@ impl SettingsTab {
     }
 }
 
-/// v1.0 S1: A single theme entry in the Appearance tab's theme list.
-#[derive(Debug, Clone, Copy)]
+/// v1.0 S1 / v1.12: 主题条目。`name`/`label` 用 `String`（自定义主题名是运行时值）。
+#[derive(Debug, Clone)]
 pub struct SettingsThemeView {
     /// Theme name as it appears in config (`weft-warm`, `warp`, etc.).
-    pub name: &'static str,
+    pub name: String,
     /// Human-readable display label.
-    pub label: &'static str,
+    pub label: String,
 }
 
 /// v1.0 S1: A keybinding row in the Keybindings tab.
@@ -542,83 +552,35 @@ pub enum HitTarget {
 ///
 /// Call this inside the `if let (Some(renderer), Some(terminal)) = ...`
 /// split-borrow block in `RedrawRequested`.
-#[allow(clippy::too_many_arguments)]
+///
+/// v1.11 audit (PLAN_audit_fix_batch3 C1): the flat 60-parameter signature
+/// is clustered into five view-parameter groups (see `view_params.rs`); the
+/// unused `_viewport_width` was dropped and the settings group is `Option`-
+/// gated at the call site.
 pub fn build_overlay_stack<'a>(
     terminal: &'a Terminal,
-    _viewport_width: f32,
-    panel_width: f32,
-    panel_open: bool,
-    panel_query: &'a str,
-    panel_selection: usize,
-    panel_expanded: Option<BlockId>,
-    panel_search_focused: bool,
-    panel_scroll_offset: usize,
-    ime_preedit: &'a str,
-    ime_preedit_cursor: Option<(usize, usize)>,
-    terminal_owns_ime: bool,
-    palette_open: bool,
-    palette_query: &'a str,
-    palette_selection: usize,
-    palette_entries: &'a [(String, String, &'a str)],
-    palette_banner: &'a str,
-    palette_submode_input: &'a str,
-    palette_ime_preedit: &'a str,
-    palette_ime_preedit_cursor: Option<(usize, usize)>,
-    palette_form: Option<&'a PaletteFormView<'a>>,
-    prompt_selection: Option<((usize, usize), (usize, usize))>,
-    submit_on_ctrl_enter: bool,
-    settings_open: bool,
-    settings_tab: SettingsTab,
-    settings_selection: usize,
-    settings_scroll_offset: usize,
-    settings_theme_name: &'a str,
-    settings_themes: &'a [SettingsThemeView],
-    settings_font_family: &'a str,
-    settings_font_size: f32,
-    settings_line_height: f32,
-    settings_window_opacity: f32,
-    settings_window_padding_x: u32,
-    settings_window_padding_y: u32,
-    settings_scrollback_lines: usize,
-    settings_minimum_contrast: f32,
-    settings_window_width: u32,
-    settings_window_height: u32,
-    settings_sidebar_width: Option<f32>,
-    settings_submit_on_ctrl_enter: bool,
-    settings_smart_select: bool,
-    settings_paste_rows: crate::settings_validation::PasteRowsView,
-    settings_keybindings: &'a [SettingsKeybindingView],
-    settings_logo_variant: weft_core::config::LogoVariant,
-    settings_error: Option<&'a str>,
-    settings_is_narrow: bool,
-    settings_drill_down: bool,
-    settings_keybinding_conflict_count: usize,
-    settings_field_errors: &'a [(String, String)],
-    settings_profiles: &'a [SettingsProfileView<'a>],
-    settings_semantic_output_enabled: bool,
-    settings_ai: AiSettingsView<'a>,
-    // v1.11.5 (PLAN_v1115 §M8): Advanced rows 4-7 draw values.
-    settings_notify_enabled: bool,
-    settings_notify_threshold_secs: u64,
-    settings_notify_sound: bool,
-    settings_osc52_mode: weft_core::config::Osc52Mode,
+    panel: PanelViewParams<'a>,
+    ime: ImeViewParams<'a>,
+    palette: PaletteViewParams<'a>,
+    prompt: PromptViewParams,
+    settings: Option<&'a SettingsViewParams<'a>>,
 ) -> OverlayStack<'a> {
     let mut layers = Vec::new();
 
     // History panel (Cmd+Shift+B).
-    if panel_open {
+    if panel.panel_open {
         layers.push(OverlayLayer {
             kind: OverlayKind::HistoryPanel,
             z: OverlayZ::Panel,
             input_policy: OverlayInputPolicy::Focused,
             content: OverlayContent::HistoryPanel(PanelDrawParams {
                 blocks: terminal.block_tracker().blocks(),
-                width_px: panel_width,
-                query: panel_query,
-                selection: panel_selection,
-                expanded_id: panel_expanded,
-                search_focused: panel_search_focused,
-                scroll_offset: panel_scroll_offset,
+                width_px: panel.panel_width,
+                query: panel.panel_query,
+                selection: panel.panel_selection,
+                expanded_id: panel.panel_expanded,
+                search_focused: panel.panel_search_focused,
+                scroll_offset: panel.panel_scroll_offset,
             }),
         });
     }
@@ -628,31 +590,31 @@ pub fn build_overlay_stack<'a>(
     // the TUI cursor so applications such as OpenCode, vim and less get the
     // same inline composition feedback as the native editor.
     let tui_preedit_mode = terminal.effective_input_mode();
-    if !ime_preedit.is_empty()
-        && !should_show_tui_preedit(tui_preedit_mode, ime_preedit, terminal_owns_ime)
+    if !ime.ime_preedit.is_empty()
+        && !should_show_tui_preedit(tui_preedit_mode, ime.ime_preedit, ime.terminal_owns_ime)
     {
         // v1.10.26 probe: composing text exists but the TUI preedit overlay
         // gate rejected it — the only silent failure left between the
         // router and the renderer. Info: fires only while composing.
         tracing::info!(
             ?tui_preedit_mode,
-            terminal_owns_ime,
-            len = ime_preedit.chars().count(),
+            terminal_owns_ime = ime.terminal_owns_ime,
+            len = ime.ime_preedit.chars().count(),
             "IME_PREEDIT_GATE_REJECT"
         );
     }
     if should_show_tui_preedit(
         terminal.effective_input_mode(),
-        ime_preedit,
-        terminal_owns_ime,
+        ime.ime_preedit,
+        ime.terminal_owns_ime,
     ) {
         layers.push(OverlayLayer {
             kind: OverlayKind::TuiPreedit,
             z: OverlayZ::Prompt,
             input_policy: OverlayInputPolicy::Passive,
             content: OverlayContent::TuiPreedit(TuiPreeditDrawParams {
-                text: ime_preedit,
-                cursor: ime_preedit_cursor,
+                text: ime.ime_preedit,
+                cursor: ime.ime_preedit_cursor,
             }),
         });
     }
@@ -670,20 +632,20 @@ pub fn build_overlay_stack<'a>(
                 cwd: terminal.cwd(),
                 lines: &terminal.editor().buffer.lines,
                 cursor: terminal.editor().buffer.cursor,
-                preedit: if ime_preedit.is_empty() {
+                preedit: if ime.ime_preedit.is_empty() {
                     None
                 } else {
-                    Some(ime_preedit)
+                    Some(ime.ime_preedit)
                 },
-                preedit_cursor: if ime_preedit.is_empty() {
+                preedit_cursor: if ime.ime_preedit.is_empty() {
                     None
                 } else {
-                    ime_preedit_cursor
+                    ime.ime_preedit_cursor
                 },
                 search,
-                selection: prompt_selection,
+                selection: prompt.prompt_selection,
                 scroll_offset: terminal.editor().buffer.scroll_offset,
-                submit_on_ctrl_enter,
+                submit_on_ctrl_enter: prompt.submit_on_ctrl_enter,
             }),
         });
 
@@ -708,8 +670,9 @@ pub fn build_overlay_stack<'a>(
     }
 
     // Command Palette (v0.7).
-    if palette_open {
-        let entry_views: Vec<PaletteEntryView<'a>> = palette_entries
+    if palette.palette_open {
+        let entry_views: Vec<PaletteEntryView<'a>> = palette
+            .palette_entries
             .iter()
             .map(|(label, desc, kind)| PaletteEntryView {
                 label: label.as_str(),
@@ -744,58 +707,60 @@ pub fn build_overlay_stack<'a>(
             z: OverlayZ::Palette,
             input_policy: OverlayInputPolicy::Modal,
             content: OverlayContent::CommandPalette(PaletteDrawParams {
-                query: palette_query,
+                query: palette.palette_query,
                 entries: entry_views_box,
-                selection: palette_selection,
-                form: palette_form,
-                banner: palette_banner,
-                submode_input: palette_submode_input,
-                ime_preedit: palette_ime_preedit,
-                ime_preedit_cursor: palette_ime_preedit_cursor,
+                selection: palette.palette_selection,
+                form: palette.palette_form,
+                banner: palette.palette_banner,
+                submode_input: palette.palette_submode_input,
+                ime_preedit: palette.palette_ime_preedit,
+                ime_preedit_cursor: palette.palette_ime_preedit_cursor,
             }),
         });
     }
 
     // Settings panel (Cmd+,) — v1.0 S1. Highest z so it overlays everything.
-    if settings_open {
+    // C1 gating: the caller passes None while the panel is closed, so the
+    // whole settings construction chain is skipped on its side too.
+    if let Some(settings) = settings {
         layers.push(OverlayLayer {
             kind: OverlayKind::Settings,
             z: OverlayZ::Settings,
             input_policy: OverlayInputPolicy::Modal,
             content: OverlayContent::Settings(SettingsDrawParams {
-                active_tab: settings_tab,
-                selection: settings_selection,
-                scroll_offset: settings_scroll_offset,
-                theme_name: settings_theme_name,
-                themes: settings_themes,
-                font_family: settings_font_family,
-                font_size: settings_font_size,
-                line_height: settings_line_height,
-                window_opacity: settings_window_opacity,
-                window_padding_x: settings_window_padding_x,
-                window_padding_y: settings_window_padding_y,
-                scrollback_lines: settings_scrollback_lines,
-                minimum_contrast: settings_minimum_contrast,
-                window_width: settings_window_width,
-                window_height: settings_window_height,
-                sidebar_width: settings_sidebar_width,
-                submit_on_ctrl_enter: settings_submit_on_ctrl_enter,
-                smart_select: settings_smart_select,
-                paste_rows: settings_paste_rows,
-                keybindings: settings_keybindings,
-                logo_variant: settings_logo_variant,
-                error: settings_error,
-                is_narrow: settings_is_narrow,
-                drill_down: settings_drill_down,
-                keybinding_conflict_count: settings_keybinding_conflict_count,
-                field_errors: settings_field_errors,
-                profiles: settings_profiles,
-                semantic_output_enabled: settings_semantic_output_enabled,
-                ai: settings_ai,
-                notify_enabled: settings_notify_enabled,
-                notify_threshold_secs: settings_notify_threshold_secs,
-                notify_sound: settings_notify_sound,
-                osc52_mode: settings_osc52_mode,
+                active_tab: settings.settings_tab,
+                selection: settings.settings_selection,
+                scroll_offset: settings.settings_scroll_offset,
+                theme_name: settings.settings_theme_name,
+                themes: settings.settings_themes,
+                font_family: settings.settings_font_family,
+                font_size: settings.settings_font_size,
+                line_height: settings.settings_line_height,
+                window_opacity: settings.settings_window_opacity,
+                window_padding_x: settings.settings_window_padding_x,
+                window_padding_y: settings.settings_window_padding_y,
+                scrollback_lines: settings.settings_scrollback_lines,
+                minimum_contrast: settings.settings_minimum_contrast,
+                window_width: settings.settings_window_width,
+                window_height: settings.settings_window_height,
+                sidebar_width: settings.settings_sidebar_width,
+                submit_on_ctrl_enter: settings.settings_submit_on_ctrl_enter,
+                smart_select: settings.settings_smart_select,
+                paste_rows: settings.settings_paste_rows,
+                keybindings: settings.settings_keybindings,
+                logo_variant: settings.settings_logo_variant,
+                error: settings.settings_error,
+                is_narrow: settings.settings_is_narrow,
+                drill_down: settings.settings_drill_down,
+                keybinding_conflict_count: settings.settings_keybinding_conflict_count,
+                field_errors: settings.settings_field_errors,
+                profiles: &settings.settings_profiles,
+                semantic_output_enabled: settings.settings_semantic_output_enabled,
+                ai: settings.settings_ai,
+                notify_enabled: settings.settings_notify_enabled,
+                notify_threshold_secs: settings.settings_notify_threshold_secs,
+                notify_sound: settings.settings_notify_sound,
+                osc52_mode: settings.settings_osc52_mode,
             }),
         });
     }

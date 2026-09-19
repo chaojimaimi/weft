@@ -52,6 +52,24 @@ impl Scrollback {
         }
     }
 
+    /// Move all retained rows out of the buffer in logical order (oldest
+    /// first), leaving it empty.
+    ///
+    /// PLAN_audit_fix_batch3 3B: `Grid::resize` takes the whole ring before
+    /// a reflow instead of cloning every row (~10k clones per resize step
+    /// on a 10k buffer); the caller rebuilds the ring afterwards.
+    pub(super) fn into_rows(mut self) -> Vec<Row> {
+        if self.len == self.max_lines && self.head > 0 {
+            // Wrapped ring → logical order, rotated in place (no clones).
+            self.buffer.rotate_left(self.head);
+        }
+        let mut rows = std::mem::take(&mut self.buffer);
+        rows.truncate(self.len);
+        self.head = 0;
+        self.len = 0;
+        rows
+    }
+
     /// Number of lines in scrollback.
     pub fn len(&self) -> usize {
         self.len

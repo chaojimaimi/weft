@@ -818,13 +818,20 @@ impl App {
                     if let Some(view) = self
                         .settings_theme_views()
                         .get(self.settings.selection)
-                        .copied()
+                        .cloned()
                     {
                         if self.settings.draft.theme.name != view.name {
-                            self.settings.draft.theme.name = view.name.to_string();
+                            self.settings.draft.theme.name = view.name.clone();
                             self.settings.draft.theme.follow_system = false;
-                            if !view.name.contains("light") {
-                                self.config_state.preferred_dark_theme = view.name.to_string();
+                            // v1.12: 按解析后的背景相对亮度判定（此前按名字里
+                            // 有没有 "light"，导入主题必然误判）。
+                            if weft_core::config::Theme::resolve_named(
+                                &view.name,
+                                &self.settings.draft.theme,
+                            )
+                            .is_dark()
+                            {
+                                self.config_state.preferred_dark_theme = view.name;
                             }
                             self.settings
                                 .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
@@ -902,54 +909,41 @@ impl App {
     /// v1.0 S1: The list of built-in themes for the Appearance category. The
     /// order matches `Theme::resolve_named`'s match arms so the list
     /// stays in sync with the resolver.
+    /// v1.12: 内置主题在前（ curated 顺序），其后追加 `~/.config/weft/themes/`
+    /// 下发现的自定义主题——此前设置界面只有内置项，自定义主题只能从命令
+    /// 面板进入，两处行为不一致。
     pub(super) fn settings_theme_views(&self) -> Vec<crate::overlay::SettingsThemeView> {
         use crate::overlay::SettingsThemeView;
-        vec![
-            SettingsThemeView {
-                name: "weft-warm",
-                label: "Weft Warm (default)",
-            },
-            SettingsThemeView {
-                name: "weft-light",
-                label: "Weft Light",
-            },
-            SettingsThemeView {
-                name: "warp",
-                label: "Warp Dark",
-            },
-            SettingsThemeView {
-                name: "dracula",
-                label: "Dracula",
-            },
-            SettingsThemeView {
-                name: "solarized-dark",
-                label: "Solarized Dark",
-            },
-            SettingsThemeView {
-                name: "gruvbox-dark",
-                label: "Gruvbox Dark",
-            },
-            SettingsThemeView {
-                name: "nord",
-                label: "Nord",
-            },
-            SettingsThemeView {
-                name: "tokyo-night",
-                label: "Tokyo Night",
-            },
-            SettingsThemeView {
-                name: "catppuccin",
-                label: "Catppuccin Mocha",
-            },
-            SettingsThemeView {
-                name: "one-dark",
-                label: "One Dark",
-            },
-            SettingsThemeView {
-                name: "monokai-pro",
-                label: "Monokai Pro",
-            },
-        ]
+        const BUILTINS: [(&str, &str); 11] = [
+            ("weft-warm", "Weft Warm (default)"),
+            ("weft-light", "Weft Light"),
+            ("warp", "Warp Dark"),
+            ("dracula", "Dracula"),
+            ("solarized-dark", "Solarized Dark"),
+            ("gruvbox-dark", "Gruvbox Dark"),
+            ("nord", "Nord"),
+            ("tokyo-night", "Tokyo Night"),
+            ("catppuccin", "Catppuccin Mocha"),
+            ("one-dark", "One Dark"),
+            ("monokai-pro", "Monokai Pro"),
+        ];
+        let mut views: Vec<SettingsThemeView> = BUILTINS
+            .iter()
+            .map(|(name, label)| SettingsThemeView {
+                name: (*name).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect();
+        for name in self.available_theme_names() {
+            if views.iter().any(|v| v.name == name) {
+                continue;
+            }
+            views.push(SettingsThemeView {
+                label: name.clone(),
+                name,
+            });
+        }
+        views
     }
 
     /// F5: The list of keybinding rows for the Keybindings category. Each

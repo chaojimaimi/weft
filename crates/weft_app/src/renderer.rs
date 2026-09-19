@@ -88,9 +88,9 @@ pub struct MetalRenderer {
     pub block_selected: Option<BlockId>,
     pub block_action_hovered: Option<crate::block_component::BlockHeaderAction>,
     /// v1.7.3-C: Set of bookmarked block IDs (set per-frame by the app from
-    /// `AnnotationStore`). The block view draws a ★ glyph before the header
-    /// text of each bookmarked block.
-    pub bookmarked_blocks: std::collections::HashSet<BlockId>,
+    /// `AnnotationStore`); block view draws a ★ before bookmarked headers.
+    /// v1.11 audit C3 (PLAN_audit_fix_batch3): Arc — refcount-bump handoff.
+    pub bookmarked_blocks: std::sync::Arc<std::collections::HashSet<BlockId>>,
     /// v1.8.2: Per-block AI diagnose state (set per-frame by the app).
     /// The block view renders an inline panel below the output of blocks
     /// that have a diagnose result or a pending request.

@@ -273,8 +273,13 @@ impl PaletteState {
     }
 }
 
-pub(crate) fn theme_name_is_dark(name: &str) -> bool {
-    !matches!(name, "weft-light" | "solarized-light" | "gruvbox-light")
+/// v1.12: 亮暗按**解析后背景的相对亮度**判定（WCAG L<0.5 为暗）。
+///
+/// 旧实现按名字里有没有 "light" 猜，对导入的社区主题必然误判（例如
+/// "Catppuccin Latte" 不含 light 字样却是最亮的浅色主题）。解析成本只在
+/// 主题切换时付一次，不在每帧路径上。
+pub(crate) fn theme_is_dark(name: &str, cfg: &weft_core::config::ThemeConfig) -> bool {
+    weft_core::config::Theme::resolve_named(name, cfg).is_dark()
 }
 
 /// v1.8.1: Simple FNV-1a hash for AI suggestion accessibility keys.
@@ -391,12 +396,15 @@ mod tests {
     }
 
     #[test]
-    fn theme_dark_classification_matches_picker_apply_contract() {
-        assert!(!super::theme_name_is_dark("weft-light"));
-        assert!(!super::theme_name_is_dark("solarized-light"));
-        assert!(!super::theme_name_is_dark("gruvbox-light"));
-        assert!(super::theme_name_is_dark("weft-warm"));
-        assert!(super::theme_name_is_dark("nord"));
+    fn theme_dark_classification_uses_background_luminance() {
+        // 亮暗由解析后的背景相对亮度决定，而不是名字里有没有 "light"。
+        let cfg = weft_core::config::ThemeConfig::default();
+        assert!(!super::theme_is_dark("weft-light", &cfg));
+        assert!(super::theme_is_dark("weft-warm", &cfg));
+        assert!(super::theme_is_dark("nord", &cfg));
+        assert!(super::theme_is_dark("dracula", &cfg));
+        // 未知名主题回落到 weft-warm（暗），与 resolve_named 行为一致。
+        assert!(super::theme_is_dark("no-such-theme", &cfg));
     }
 
     // ── v1.5.1: PaletteEntry::Profile tests ──────────────────────────

@@ -820,7 +820,7 @@ impl MetalRenderer {
                 verts,
                 content_x0 + cw * 2.0,
                 row_y,
-                theme.label,
+                &theme.label,
                 label_color,
                 content_cols,
             );

@@ -70,6 +70,17 @@ pub struct Pane {
     /// position the caret at.
     pub ime_preedit_cursor: Option<(usize, usize)>,
     pub pending_pty_resize: Option<(usize, usize)>,
+    /// FIX-α (docs/FIX_DRAG_RESIZE_STUTTER.md): instant of the last
+    /// SUCCESSFUL resize commit. Stamped only by the apply point after
+    /// `commit_pty_resize_result` succeeds — an ioctl failure keeps
+    /// `pending_pty_resize` for retry and must never stamp (the retry would
+    /// be interval-suppressed). `pending_resize_effects` gates re-emission
+    /// on `now - stamp >= RESIZE_COMMIT_MIN_INTERVAL` so a live drag pays at
+    /// most one grid reflow per pane per interval instead of one per frame.
+    /// `None` until the first commit; a stamp left by an old resize is stale
+    /// by the time a new cascade starts (monotonic clock), so non-drag
+    /// resizes commit immediately.
+    pub(crate) last_resize_commit: Option<std::time::Instant>,
     /// v1.10.19: winsize `(rows, cols)` last actually sent to the PTY via
     /// TIOCSWINSZ. `apply_winsize_ioctl` dedups against it: re-requesting a
     /// size the PTY already has must not re-issue the ioctl (each redundant
@@ -184,6 +195,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_resize_commit: None,
             last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
@@ -215,6 +227,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_resize_commit: None,
             last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,
@@ -249,6 +262,7 @@ impl Pane {
             ime_preedit: String::new(),
             ime_preedit_cursor: None,
             pending_pty_resize: None,
+            last_resize_commit: None,
             last_sent_winsize: None,
             pending_pty_output: None,
             block_scroll_anchor: BlockScrollAnchor::FollowBottom,

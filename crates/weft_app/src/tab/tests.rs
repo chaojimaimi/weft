@@ -254,6 +254,64 @@ fn split_active_pane_adds_pane_and_switches_focus() {
     assert_eq!(t.split_tree().panes(), vec![original, new_id]);
 }
 
+// ── v1.11 audit P1-1 (PLAN_audit_fix_batch3 C2): active_pane_views ──
+
+#[test]
+fn active_pane_views_single_pane_has_no_backgrounds() {
+    let mut t = tab_with_terminal(100);
+    let views = t.active_pane_views();
+    assert!(views.backgrounds.is_empty());
+    // The active pane is still handed out mutably.
+    let _active: &mut Pane = views.active;
+}
+
+#[test]
+fn active_pane_views_backgrounds_exclude_active_terminal() {
+    let mut t = tab_with_terminal(100);
+    let original = t.active_pane_id();
+    let new_id = t
+        .split_active_pane_test(SplitDirection::Vertical, 0.5, 100)
+        .expect("split succeeds");
+    // The new pane is active (split contract); snapshot expected ids and
+    // the original terminal's address while `t` is only shared-borrowed.
+    let original_pane = t.pane(original).expect("original pane present");
+    let original_session = original_pane.pane_session_id;
+    let original_scroll = original_pane.block_scroll_anchor.offset_value() as f32
+        + original_pane.block_scroll_fraction;
+    let original_terminal: *const weft_core::vt::Terminal =
+        original_pane.terminal.as_ref().expect("original terminal");
+    let active_session = t.pane(new_id).expect("active pane present").pane_session_id;
+
+    let views = t.active_pane_views();
+    assert_eq!(views.backgrounds.len(), 1);
+    let bg = &views.backgrounds[0];
+    assert_eq!(bg.pane_id, original);
+    assert_eq!(bg.pane_session_id, original_session);
+    assert!(bg.pane_session_id != active_session);
+    assert_eq!(bg.block_scroll, original_scroll);
+    // Address comparison: the background reference points at the ORIGINAL
+    // pane's terminal, never at the active pane's.
+    let active_terminal: *const weft_core::vt::Terminal =
+        views.active.terminal.as_ref().expect("active terminal") as *const _;
+    let bg_terminal: *const weft_core::vt::Terminal = bg.terminal;
+    assert!(!std::ptr::eq(bg_terminal, active_terminal));
+    assert!(std::ptr::eq(bg_terminal, original_terminal));
+}
+
+#[test]
+fn active_pane_views_active_is_same_pane_as_active_mut() {
+    let mut t = tab_with_terminal(100);
+    let expected_session = t.pane(t.active_pane_id()).unwrap().pane_session_id;
+    {
+        let views = t.active_pane_views();
+        assert_eq!(views.active.pane_session_id, expected_session);
+        // Mutations through the view must land on the same pane that
+        // `active_mut()` hands out afterwards.
+        views.active.ime_preedit = "あ".to_string();
+    }
+    assert_eq!(t.active_mut().ime_preedit, "あ");
+}
+
 #[test]
 fn split_with_invalid_ratio_is_rejected() {
     let mut t = tab_with_terminal(100);

@@ -3,6 +3,7 @@
 mod cell;
 mod cursor;
 mod display;
+mod reflow;
 mod row;
 mod row_extras;
 mod scrollback;
@@ -201,14 +202,13 @@ impl Grid {
 
     /// Extract a single **live viewport** row's text — skipping wide-char
     /// spacers and trimming trailing blank/default cells. `row` is a viewport
-    /// index (like `cursor.row`). Used to snapshot the command line at OSC
-    /// 133;B (the prompt row, before any output scrolls it into history).
+    /// index (like `cursor.row`). LIVE-VIEWPORT semantics: the scroll-aware
+    /// twin is [`displayed_row_text`](Self::displayed_row_text). Used to
+    /// snapshot the command line at OSC 133;B (the prompt row).
     ///
     /// v1.6.0: cells tagged with `CellFlags::EXTRA` contribute their full
-    /// multi-scalar grapheme cluster (from `RowExtras`) instead of just the
-    /// lead `char`. This keeps the snapshot faithful to what the user sees —
-    /// a prompt row containing `"e\u{0301}"` snapshots as `"é"` (decomposed)
-    /// rather than `'e'` alone.
+    /// multi-scalar grapheme cluster so the snapshot matches what the user
+    /// sees — `"e\u{0301}"` snapshots as `"é"` (decomposed), not `'e'` alone.
     pub fn row_text(&self, row: usize) -> String {
         if row >= self.num_rows {
             return String::new();
@@ -262,7 +262,9 @@ impl Grid {
     }
 
     /// Write a character at the cursor position with given attributes.
-    /// Used by VT performer to print with current SGR attributes.
+    ///
+    /// NOTE: the VT print path has its own inline write logic — this
+    /// function is currently only exercised by tests.
     pub fn write_char_with_attrs(
         &mut self,
         ch: char,
@@ -322,6 +324,9 @@ impl Grid {
             // rust-reviewer v1.11.3 Minor-4: overwrite must reset ALL content
             // fields — leaving underline_style/color stale would make a
             // future caller inherit the previous cell's decoration.
+            // WARNING: `UnderlineStyle::Single` here is unconditional — this
+            // differs from perform.rs, where the style is copied per attrs.
+            // The two call sites' semantics are not interchangeable.
             cell.underline_style = UnderlineStyle::Single;
             cell.underline_color = None;
 
@@ -1131,12 +1136,12 @@ impl Grid {
         }
 
         // ── Phase 1: Collect all rows ────────────────────────────────
-        let mut all_rows: Vec<Row> = Vec::new();
-        for i in 0..self.scrollback.len() {
-            if let Some(row) = self.scrollback.get(i) {
-                all_rows.push(row.clone());
-            }
-        }
+        // 3B: rows MOVE out of the ring (was per-row clone); Phase 4 rebuilds it.
+        let scrollback_max = self.scrollback.max_lines;
+        let mut all_rows: Vec<Row> = Scrollback::into_rows(std::mem::replace(
+            &mut self.scrollback,
+            Scrollback::new(scrollback_max),
+        ));
         let scrollback_len = all_rows.len();
         for row in self.viewport.drain(..) {
             all_rows.push(row);
@@ -1194,24 +1199,29 @@ impl Grid {
         // prev_wrapped to detect if the current row is a continuation.
         let mut prev_wrapped = false;
 
+        // FIX-β (docs/FIX_DRAG_RESIZE_STUTTER.md) β-2: read-only pre-scan —
+        // exact per-row content extents (the loop below never re-scans) and
+        // exact per-line cell totals (each `merge_buf` is armed with its
+        // final capacity, so `extend` fills it and never doubles). The
+        // capacities are advisory: a prescan/grouping divergence would only
+        // lose precision (natural doubling), never correctness.
+        let scan = reflow::prescan(&all_rows);
+        let content_ends = scan.content_ends;
+        let mut next_line_cap = scan.line_caps.into_iter();
+        // FIX-β β-1: old rows recycle through this pool — Phase 2 moves each
+        // row in after merging its cells, Phase 3 draws wrapped rows from it
+        // (`reflow::recycled_row`). Buffer identity cycles: Phase 4's rows
+        // come back here on the NEXT resize, so oscillating resizes converge
+        // to near-zero reallocation (surplus drops with the pool).
+        let mut row_pool: Vec<Row> = Vec::new();
+
         for (all_idx, row) in all_rows.into_iter().enumerate() {
             let is_cursor_row = all_idx == old_cursor_all_idx;
 
-            // Content extent: trim trailing BLANK cells (never-written defaults).
-            // This matters for wrapped rows too: when a full-width char would
-            // straddle the right margin the print path wraps *before* placing
-            // it, leaving the last cell as a never-written default. Treating
-            // that cell as content (the old `row.cells.len()` for wrapped rows)
-            // baked a phantom space into the logical line on every reflow,
-            // compounding into growing gaps between CJK characters. A written
-            // space is preserved because writes always set the DIRTY flag, so
-            // `!flags.is_empty()` keeps it.
-            let content_end = row
-                .cells
-                .iter()
-                .rposition(|c| c.character != ' ' || !c.flags.is_empty())
-                .map(|i| i + 1)
-                .unwrap_or(0);
+            // Content extent (β-2): precomputed by the prescan — the
+            // trailing-blank trim rationale lives on `reflow`'s
+            // `row_content_end`.
+            let content_end = content_ends[all_idx];
 
             let is_continuation = prev_wrapped && !merge_buf.is_empty();
             prev_wrapped = row.wrapped;
@@ -1227,6 +1237,11 @@ impl Grid {
                         &mut lines,
                     );
                 }
+                // FIX-β β-2: arm the buffer this boundary OPENS with its
+                // exact prescanned length. Every row crosses this branch
+                // (the first row too: prev_wrapped starts false), so no
+                // separate pre-loop arm is needed.
+                merge_buf = Vec::with_capacity(next_line_cap.next().unwrap_or(0));
                 merge_has_cursor = false;
                 merge_cursor_offset = 0;
             }
@@ -1248,6 +1263,8 @@ impl Grid {
             merge_extras.merge_shifted(&row.extras, offset, usize::MAX);
 
             merge_buf.extend(row.cells.iter().take(content_end).cloned());
+            // FIX-β β-1: the row's cells are merged — recycle the buffer.
+            row_pool.push(row);
         }
         // Flush last line
         if !merge_buf.is_empty() {
@@ -1275,7 +1292,7 @@ impl Grid {
                 cursor_wrap_start = line_start;
             }
 
-            let mut current = Row::new(new_cols);
+            let mut current = reflow::recycled_row(&mut row_pool, new_cols);
             current.wrapped = false;
             let mut col: usize = 0;
             // v1.6.1: track this line's extras, splitting off entries for
@@ -1299,7 +1316,7 @@ impl Grid {
                     let tail = line_extras.split_off(new_cols, usize::MAX);
                     current.extras = line_extras;
                     wrapped_rows.push(current);
-                    current = Row::new(new_cols);
+                    current = reflow::recycled_row(&mut row_pool, new_cols);
                     line_extras = tail;
                     col = 0;
                     if line.has_cursor && buf_idx == line.cursor_buf_offset {
@@ -1319,7 +1336,7 @@ impl Grid {
                     let tail = line_extras.split_off(new_cols, usize::MAX);
                     current.extras = line_extras;
                     wrapped_rows.push(current);
-                    current = Row::new(new_cols);
+                    current = reflow::recycled_row(&mut row_pool, new_cols);
                     line_extras = tail;
                     col = 0;
                     if line.has_cursor && buf_idx == line.cursor_buf_offset {
@@ -1348,7 +1365,7 @@ impl Grid {
                     let tail = line_extras.split_off(new_cols, usize::MAX);
                     current.extras = line_extras;
                     wrapped_rows.push(current);
-                    current = Row::new(new_cols);
+                    current = reflow::recycled_row(&mut row_pool, new_cols);
                     line_extras = tail;
                     col = 0;
                 }
@@ -1372,18 +1389,18 @@ impl Grid {
             (vp_start, cursor_row)
         };
 
+        // 3B: split_off/extend MOVE rows into place (was clone + to_vec);
+        // surplus rows past the viewport window drop as the old slice did.
         if total <= new_rows {
             let mut vp = Vec::with_capacity(new_rows);
             vp.extend(wrapped_rows);
             vp.resize(new_rows, Row::new(new_cols));
             self.viewport = vp;
-            self.scrollback = Scrollback::new(self.scrollback.max_lines);
         } else {
-            self.scrollback = Scrollback::new(self.scrollback.max_lines);
-            for row in wrapped_rows[..vp_start].iter() {
-                self.scrollback.push(row.clone());
-            }
-            self.viewport = wrapped_rows[vp_start..vp_start + new_rows].to_vec();
+            let mut vp = wrapped_rows.split_off(vp_start);
+            vp.truncate(new_rows);
+            self.scrollback.extend(wrapped_rows);
+            self.viewport = vp;
         }
 
         self.num_rows = new_rows;

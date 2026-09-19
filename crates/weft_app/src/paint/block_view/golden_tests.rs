@@ -421,8 +421,10 @@ fn golden_all_row_types() {
     let palette = palette_literal();
 
     // Bookmarked star on block 1's header.
+    // v1.11 audit (PLAN_audit_fix_batch3 C3): set is Arc-shared; make_mut
+    // unwraps the freshly-constructed (unique) Arc in place.
     let mut renderer = renderer_headless();
-    renderer.bookmarked_blocks.insert(BlockId(1));
+    std::sync::Arc::make_mut(&mut renderer.bookmarked_blocks).insert(BlockId(1));
 
     let model_a = s1_model(&blocks, &diagnose, &palette);
     let model_b = s1_model(&blocks, &diagnose, &palette);

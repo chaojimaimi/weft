@@ -23,10 +23,13 @@ impl App {
                 };
                 match store.toggle_bookmark(block_id) {
                     Ok(bookmarked) => {
+                        // v1.11 audit (PLAN_audit_fix_batch3 C3): the set is
+                        // Arc-shared with the renderer; make_mut clones only
+                        // on the rare (refcount > 1) toggle path.
                         if bookmarked {
-                            self.bookmarked_blocks.insert(block_id);
+                            std::sync::Arc::make_mut(&mut self.bookmarked_blocks).insert(block_id);
                         } else {
-                            self.bookmarked_blocks.remove(&block_id);
+                            std::sync::Arc::make_mut(&mut self.bookmarked_blocks).remove(&block_id);
                         }
                         info!(?block_id, bookmarked, "bookmark toggled");
                         self.sync_bookmark_to_search_index(block_id);

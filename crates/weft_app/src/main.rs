@@ -307,7 +307,9 @@ struct App {
     note_editor: NoteEditorState,
     completion_worker: completion_worker::CompletionWorker,
     runbook_worker: runbook_controller::RunbookWorker,
-    bookmarked_blocks: std::collections::HashSet<BlockId>,
+    /// v1.7.3-C / v1.11 audit (PLAN_audit_fix_batch3 C3): Arc-shared with the
+    /// renderer so the per-frame handoff is a refcount bump, not a set clone.
+    bookmarked_blocks: std::sync::Arc<std::collections::HashSet<BlockId>>,
     /// v1.8: Local AI state (Ollama-only). Holds the config snapshot,
     /// optional backend, and result channel. Background tokio tasks
     /// communicate via crossbeam-channel; drained in `poll_ai_results`.
@@ -447,7 +449,7 @@ impl App {
             runbook_worker: runbook_controller::RunbookWorker::new(move || {
                 let _ = runbook_proxy.send_event(AppEvent::Wake);
             }),
-            bookmarked_blocks: std::collections::HashSet::new(),
+            bookmarked_blocks: std::sync::Arc::new(std::collections::HashSet::new()),
             ai_state: ai::AiState::new_with_waker(
                 ai_config_snapshot,
                 Some(std::sync::Arc::new(move || {

@@ -679,7 +679,7 @@ impl App {
                 })
                 .zip(themes.iter())
             {
-                node.label = theme.label.into();
+                node.label = theme.label.clone();
                 node.state = selected_state(theme.name == self.settings.draft.theme.name);
             }
         }

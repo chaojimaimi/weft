@@ -214,6 +214,12 @@ impl Tab {
     }
 
     /// Read every pane's pending PTY resize and synchronized-frame state.
+    ///
+    /// FIX-α (docs/FIX_DRAG_RESIZE_STUTTER.md): the same read also carries
+    /// the pane's alt-screen state (`resize_dims` path → exempt from the
+    /// commit interval) and its last successful commit instant (the throttle
+    /// anchor) — same source as `synchronized`, so all three gates can never
+    /// diverge.
     pub(crate) fn pending_pane_resizes(&self) -> Vec<PendingPaneResize> {
         let mut out = Vec::new();
         for (id, pane) in &self.panes {
@@ -222,7 +228,17 @@ impl Tab {
                     .terminal
                     .as_ref()
                     .is_some_and(Terminal::synchronized_output);
-                out.push(PendingPaneResize::new(*id, dim, synchronized));
+                let alt_active = pane
+                    .terminal
+                    .as_ref()
+                    .is_some_and(Terminal::is_alt_screen_active);
+                out.push(PendingPaneResize::new(
+                    *id,
+                    dim,
+                    synchronized,
+                    alt_active,
+                    pane.last_resize_commit,
+                ));
             }
         }
         out

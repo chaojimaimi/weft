@@ -339,13 +339,14 @@ impl App {
             info!("follow_system disabled by manual toggle");
         }
         let themes = self.settings_theme_views();
-        let current = &self.config_state.config.theme.name;
+        let current = self.config_state.config.theme.name.clone();
         // Find current theme index; default to 0 if not found.
         let idx = themes.iter().position(|t| t.name == current).unwrap_or(0);
         let next = &themes[(idx + 1) % themes.len()];
         let name = next.name.to_string();
-        // Determine if the new theme is dark (for theme_is_dark tracking).
-        let is_light = name.contains("light");
+        // v1.12: 亮暗按解析后背景的相对亮度判定（导入主题名字里没有 "light"）。
+        let cfg_ref = &self.config_state.config.theme;
+        let is_light = !weft_core::config::Theme::resolve_named(&name, cfg_ref).is_dark();
         self.config_state.theme_is_dark = !is_light;
         if !is_light {
             self.config_state.preferred_dark_theme = name.clone();
@@ -424,10 +425,20 @@ impl App {
         .map(|s| s.to_string())
         .collect();
         // Append custom theme file stems from the themes dir (if any).
+        // Same predicate load_from_dir uses (non-empty stem + probed
+        // extension) so the picker never offers a stem that would fail to
+        // load — .DS_Store/README.md stems used to become phantom entries.
         if let Some(dir) = weft_core::config::Theme::themes_dir() {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 let mut customs: Vec<String> = Vec::new();
                 for entry in entries.flatten() {
+                    let is_theme = entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(weft_core::config::Theme::is_theme_file_name);
+                    if !is_theme {
+                        continue;
+                    }
                     if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
                         // Skip names that collide with built-ins.
                         if !names.iter().any(|n| n == stem) {
@@ -551,9 +562,9 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(name) = selected_name(self.palette.selection, &buffer) {
-                    // Heuristic: classify as dark unless the name clearly
-                    // indicates a light theme. Affects follow_system parity.
-                    let dark = crate::palette_state::theme_name_is_dark(&name);
+                    // v1.12: 按解析后背景的相对亮度判定，不再猜名字。
+                    let dark =
+                        crate::palette_state::theme_is_dark(&name, &self.config_state.config.theme);
                     self.apply_theme_by_name(&name, dark);
                     self.palette.submode = PaletteSubMode::Search;
                     self.palette.query.clear();

@@ -526,10 +526,12 @@ impl ApplicationHandler<AppEvent> for App {
             }
         });
         self.sessions.set_annotation_store(annotation_store);
+        // v1.11 audit (PLAN_audit_fix_batch3 C3): Arc-shared with the renderer.
         self.bookmarked_blocks = self
             .sessions
             .annotation_store()
             .and_then(|store| store.bookmarked_ids().ok())
+            .map(std::sync::Arc::new)
             .unwrap_or_default();
 
         // v1.7.1: Open the search index (sidecar to blocks.db) for main-thread
@@ -834,6 +836,10 @@ impl App {
                     (rows, cols),
                     resize_succeeded,
                 );
+            }
+            // FIX-α: stamp on success only — a failed ioctl stays retryable.
+            if committed {
+                pane.last_resize_commit = Some(std::time::Instant::now());
             }
             (ioctl_sent, committed)
         };

@@ -214,6 +214,15 @@ impl MetalRenderer {
             let buffer = &ring[ring_idx];
             {
                 let ptr = buffer.contents() as *mut u8;
+                // SAFETY: two invariants hold.
+                // (1) The ring slot being written is not in flight on the
+                // GPU: the ring index advances once per upload, so this slot
+                // was last handed to the GPU ring.len() uploads ago (frames
+                // in flight ≤ ring length), and `did_modify_range` below —
+                // not this write — is what publishes the new contents.
+                // (2) `resize_ring_for_usage` above guarantees the buffer is
+                // at least `vertex_data_size` bytes, so the copy stays in
+                // bounds of the storage `contents()` points into.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         vertices.as_ptr() as *const u8,

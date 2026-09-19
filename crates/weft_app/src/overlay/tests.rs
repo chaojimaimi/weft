@@ -238,12 +238,12 @@ fn settings_z_is_above_palette() {
 fn overlay_warmup_settings_collects_label_and_theme_chars() {
     let themes = vec![
         SettingsThemeView {
-            name: "weft-warm",
-            label: "Weft Warm",
+            name: "weft-warm".into(),
+            label: "Weft Warm".into(),
         },
         SettingsThemeView {
-            name: "warp",
-            label: "Warp Dark",
+            name: "warp".into(),
+            label: "Warp Dark".into(),
         },
     ];
     let kbs = vec![SettingsKeybindingView {
@@ -359,4 +359,128 @@ fn settings_overlay_is_modal_and_highest_z() {
     let top = stack.topmost_modal().expect("should have a modal");
     assert_eq!(top.z, OverlayZ::Settings);
     assert_eq!(top.kind, OverlayKind::Settings);
+}
+
+// ── v1.11 audit (PLAN_audit_fix_batch3 C1): view-param groups ──────
+
+/// Grouped build_overlay_stack must carry every group field into the
+/// resulting draw params unchanged (等价断言), and the `Option`-gated
+/// settings group must appear only when `Some`.
+#[test]
+fn build_overlay_stack_groups_carry_params_and_gate_settings() {
+    let terminal = weft_core::vt::Terminal::new(24, 80);
+
+    let panel = PanelViewParams {
+        panel_width: 123.0,
+        panel_open: true,
+        panel_query: "query",
+        panel_selection: 3,
+        panel_expanded: None,
+        panel_search_focused: true,
+        panel_scroll_offset: 7,
+    };
+    let ime = ImeViewParams {
+        ime_preedit: "",
+        ime_preedit_cursor: None,
+        terminal_owns_ime: true,
+    };
+    let palette = PaletteViewParams {
+        palette_open: false,
+        palette_query: "",
+        palette_selection: 0,
+        palette_entries: &[],
+        palette_banner: "",
+        palette_submode_input: "",
+        palette_ime_preedit: "",
+        palette_ime_preedit_cursor: None,
+        palette_form: None,
+    };
+    let prompt = PromptViewParams {
+        prompt_selection: None,
+        submit_on_ctrl_enter: true,
+    };
+
+    // Settings gated OFF (None): no Settings layer may appear.
+    let closed = build_overlay_stack(&terminal, panel, ime, palette, prompt, None);
+    assert!(!closed
+        .layers
+        .iter()
+        .any(|l| l.kind == OverlayKind::Settings));
+
+    // Settings gated ON: the group's fields must reach the draw params
+    // unchanged (the old flat parameters flowed into the same fields).
+    let palette = PaletteViewParams {
+        palette_open: false,
+        palette_query: "",
+        palette_selection: 0,
+        palette_entries: &[],
+        palette_banner: "",
+        palette_submode_input: "",
+        palette_ime_preedit: "",
+        palette_ime_preedit_cursor: None,
+        palette_form: None,
+    };
+    let owned = SettingsOwnedSnapshot {
+        themes: vec![SettingsThemeView {
+            name: "weft-warm".into(),
+            label: "Weft Warm".into(),
+        }],
+        keybindings: vec![SettingsKeybindingView {
+            action: "Copy".to_string(),
+            binding: "cmd+c".to_string(),
+            conflict: false,
+        }],
+        keybinding_conflict_count: 0,
+        active_profile: None,
+        profile_names: vec!["work".to_string()],
+    };
+    let settings_state = crate::app_state::SettingsState::new();
+    let settings_params = settings_state.view_params(&owned, test_ai_view(), false);
+    let open = build_overlay_stack(
+        &terminal,
+        panel,
+        ime,
+        palette,
+        prompt,
+        Some(&settings_params),
+    );
+
+    // Panel layer: group fields projected verbatim into PanelDrawParams.
+    let panel_layer = open
+        .layers
+        .iter()
+        .find(|l| l.kind == OverlayKind::HistoryPanel)
+        .expect("panel_open=true pushes the panel layer");
+    match &panel_layer.content {
+        OverlayContent::HistoryPanel(p) => {
+            assert_eq!(p.width_px, 123.0);
+            assert_eq!(p.query, "query");
+            assert_eq!(p.selection, 3);
+            assert!(p.search_focused);
+            assert_eq!(p.scroll_offset, 7);
+        }
+        _ => panic!("panel layer must carry PanelDrawParams"),
+    }
+
+    // Settings layer: present, modal, topmost, fed by view_params.
+    let top = open.topmost_modal().expect("settings layer present");
+    assert_eq!(top.kind, OverlayKind::Settings);
+    assert_eq!(top.z, OverlayZ::Settings);
+    match &top.content {
+        OverlayContent::Settings(s) => {
+            assert_eq!(s.active_tab, SettingsTab::Appearance);
+            assert_eq!(s.theme_name, settings_state.draft.theme.name);
+            assert_eq!(s.themes.len(), 1);
+            assert_eq!(s.keybindings.len(), 1);
+            // view_params rebuilds the profile toolbar from the snapshot:
+            // "Base" first (active = no active profile), then each name.
+            assert_eq!(s.profiles.len(), 2);
+            assert_eq!(s.profiles[0].name, "Base");
+            assert!(s.profiles[0].is_active);
+            assert_eq!(s.profiles[1].name, "work");
+            assert!(!s.profiles[1].is_active);
+            assert_eq!(s.field_errors.len(), 0);
+        }
+        _ => panic!("settings layer must carry SettingsDrawParams"),
+    }
 }

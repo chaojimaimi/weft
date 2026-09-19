@@ -1652,3 +1652,411 @@ fn delete_lines_marks_dirty() {
         "row outside scroll region must NOT be dirty"
     );
 }
+
+// ── PLAN_audit_fix_batch3 3B: reflow clone-cost measurement (Phase A/C) ──
+
+/// Counting global allocator for the weft_core unit-test binary (cfg(test)
+/// only — the production binary keeps the system allocator from main.rs).
+/// Cumulative counters, no dealloc subtraction: a measurement snapshots the
+/// counters before/after the target call and reports the DELTA, so frees and
+/// allocator reuse inside the measured window cannot distort the numbers.
+mod measure_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub static ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+    pub static ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct CountingAllocator;
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+                ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = System.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+                ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout)
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = System.realloc(ptr, layout, new_size);
+            if !new_ptr.is_null() {
+                ALLOC_BYTES.fetch_add(new_size, Ordering::Relaxed);
+                ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAllocator = CountingAllocator;
+
+    /// (cumulative allocated bytes, cumulative allocation calls).
+    pub fn snapshot() -> (usize, usize) {
+        (
+            ALLOC_BYTES.load(Ordering::Relaxed),
+            ALLOC_CALLS.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Serialize the measurement tests so sibling `#[ignore]` tests running on
+/// another harness thread cannot pollute the allocator deltas.
+fn measure_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 3B fixture (PLAN scenario): 60×200 grid driven to 10k scrollback lines
+/// through the real VT print path. ASCII lines interleave with CJK lines
+/// and every 4th line is long enough to soft-wrap, so merge/continuation
+/// grouping and wide-pair rewrap carry real weight in the measurement.
+fn fill_mixed_scrollback_60x200() -> Grid {
+    let mut grid = Grid::with_scrollback(60, 200, 10_000);
+    let cjk = "汉字终端重排测量";
+    for i in 0..10_000usize {
+        let line = match i % 4 {
+            0 => format!("long wrapped line {i:05} {}", "x".repeat(240)),
+            2 => format!("CJK wrapped 行{i:05} {}", cjk.repeat(24)),
+            3 => format!("CJK 行{i:05} {cjk}"),
+            _ => format!("line {i:05} ascii resize payload"),
+        };
+        for ch in line.chars() {
+            // write_char_with_attrs is the wrapping writer (write_char is
+            // the test-injection variant that clips at num_cols); soft-wrap
+            // weight is part of the PLAN scenario.
+            grid.write_char_with_attrs(
+                ch,
+                CellColor::Default,
+                CellColor::Default,
+                CellFlags::empty(),
+            );
+        }
+        if i + 1 < 10_000 {
+            grid.newline();
+        }
+    }
+    grid
+}
+
+/// 3B Phase A gate — single-step cost. Decision protocol (locked): run in
+/// RELEASE via
+/// `cargo test -p weft_core --lib --release -- --ignored --test-threads=1 --nocapture measure`
+/// (debug numbers are recorded for reference only). Byte reference points:
+/// one Cell is exactly 24 bytes (pinned above), so ~4M merged cells ≈ ~96MB
+/// if the rewrap path cloned every cell.
+#[test]
+#[ignore]
+fn measure_reflow_single_step_61x200() {
+    let _guard = measure_lock();
+    let mut grid = fill_mixed_scrollback_60x200();
+    let (bytes_before, calls_before) = measure_alloc::snapshot();
+    let started = std::time::Instant::now();
+    grid.resize(61, 200);
+    let elapsed = started.elapsed();
+    let (bytes, calls) = measure_alloc::snapshot();
+    println!(
+        "MEASURE single resize(61,200) [10k scrollback]: time={elapsed:?} alloc_bytes={} alloc_calls={}",
+        bytes - bytes_before,
+        calls - calls_before
+    );
+    assert_eq!(grid.num_rows, 61);
+    assert_eq!(grid.num_cols, 200);
+}
+
+/// 3B Phase A gate — 60-step ±1 column resize storm (drag simulation),
+/// same fixture and release protocol as the single-step measurement.
+#[test]
+#[ignore]
+fn measure_reflow_storm_60_steps() {
+    let _guard = measure_lock();
+    let mut grid = fill_mixed_scrollback_60x200();
+    let (bytes_before, calls_before) = measure_alloc::snapshot();
+    let started = std::time::Instant::now();
+    for step in 0..60 {
+        let cols = if step % 2 == 0 { 199 } else { 200 };
+        grid.resize(60, cols);
+    }
+    let elapsed = started.elapsed();
+    let (bytes, calls) = measure_alloc::snapshot();
+    println!(
+        "MEASURE storm 60x ±1 col [10k scrollback]: time={elapsed:?} alloc_bytes={} alloc_calls={}",
+        bytes - bytes_before,
+        calls - calls_before
+    );
+    assert_eq!(grid.num_cols, 200);
+}
+
+/// 3B protocol, FIX_DRAG_RESIZE_STUTTER β acceptance: steady-state tier of
+/// the oscillating drag. The storm test reports the 60-step total; this one
+/// isolates the FIRST step (realloc-heavy by design: rows built at the old
+/// width grow into the new capacity) and the mean of the LAST 10 steps of a
+/// 20-step ±1-col oscillation (buffer identity has fully cycled through the
+/// pool — the tier the ~52MB/step target measures). Also records a deep
+/// narrow step (200→80: heavy wrapping exhausts the pool, forcing fresh-row
+/// fallbacks) as its own tier. Same release protocol:
+/// `cargo test -p weft_core --lib --release -- --ignored --test-threads=1
+/// --nocapture measure_oscillation`.
+#[test]
+#[ignore]
+fn measure_reflow_oscillation_steady_state() {
+    let _guard = measure_lock();
+    let mut grid = fill_mixed_scrollback_60x200();
+    let mut step_bytes: Vec<usize> = Vec::new();
+    for step in 0..20 {
+        let cols = if step % 2 == 0 { 199 } else { 200 };
+        let (before_b, _) = measure_alloc::snapshot();
+        grid.resize(60, cols);
+        let (after_b, _) = measure_alloc::snapshot();
+        step_bytes.push(after_b - before_b);
+    }
+    let first = step_bytes[0];
+    let tail = &step_bytes[10..];
+    let steady = tail.iter().sum::<usize>() / tail.len();
+    println!(
+        "MEASURE oscillation steady-state [10k scrollback, 20 steps ±1 col]: \
+         first_step_bytes={first} steady_mean_bytes_per_step_last10={steady} all_steps={step_bytes:?}"
+    );
+    // Deep-narrow tier (200→80): wrapped rows far exceed the old row count,
+    // so the pool runs dry and `Row::new` fallbacks dominate.
+    let (before_b, _) = measure_alloc::snapshot();
+    grid.resize(60, 80);
+    let (after_b, _) = measure_alloc::snapshot();
+    println!(
+        "MEASURE deep narrow 200->80 [10k scrollback]: alloc_bytes={}",
+        after_b - before_b
+    );
+    assert_eq!(grid.num_cols, 80);
+}
+
+// ── PLAN_audit_fix_batch3 3B: move-reflow content equivalence (red line) ──
+
+/// Plain text of one physical row: WIDE_SPACER halves skipped, trailing
+/// blank cells (space + empty flags — the same predicate reflow's
+/// `content_end` uses) trimmed. Works for scrollback rows regardless of
+/// their only-grow width.
+fn row_plain_text(row: &Row) -> String {
+    let last = row
+        .cells
+        .iter()
+        .rposition(|c| c.character != ' ' || !c.flags.is_empty())
+        .map_or(0, |i| i + 1);
+    row.cells[..last]
+        .iter()
+        .filter(|c| !c.flags.contains(CellFlags::WIDE_SPACER))
+        .map(|c| c.character)
+        .collect()
+}
+
+/// Full document (scrollback ++ viewport) as logical lines: consecutive
+/// rows joined while the previous row carries `wrapped`, all-blank lines
+/// dropped (reflow's flush_line drops the same set).
+fn logical_lines(grid: &Grid) -> Vec<String> {
+    let mut rows: Vec<&Row> = Vec::with_capacity(grid.scrollback.len() + grid.num_rows);
+    for i in 0..grid.scrollback.len() {
+        rows.push(grid.scrollback.get(i).unwrap());
+    }
+    rows.extend(grid.viewport.iter());
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for row in rows {
+        let text = row_plain_text(row);
+        current.push_str(&text);
+        if !row.wrapped && !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// 3B red line: the move-semantics reflow must preserve logical lines
+/// byte-for-byte across narrowing, widening, and a full round trip.
+///
+/// The fixture leaves the cursor on the LAST (short) line without a trailing
+/// newline — the real resize scenario (shell sitting at the prompt). Grid
+/// resize anchors the viewport window at the cursor and discards physical
+/// rows below it by design, so a dangling cursor on a blank row below the
+/// content would measure the discard path instead of reflow preservation.
+#[test]
+fn resize_move_reflow_preserves_logical_lines() {
+    let mut grid = Grid::with_scrollback(6, 12, 64);
+    let lines = [
+        "short ascii",
+        "a long ascii line that must soft wrap at twelve columns",
+        "汉字宽字符",
+        "中文内容需要换行的长行包含宽字符测量",
+        "abcdefghijkl",
+        "tail 8",
+    ];
+    for (i, line) in lines.iter().enumerate() {
+        for ch in line.chars() {
+            grid.write_char_with_attrs(
+                ch,
+                CellColor::Default,
+                CellColor::Default,
+                CellFlags::empty(),
+            );
+        }
+        if i + 1 < lines.len() {
+            grid.newline();
+        }
+    }
+    let expected: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        logical_lines(&grid),
+        expected,
+        "fixture itself must read back as the written lines"
+    );
+
+    grid.resize(4, 10);
+    assert_eq!(
+        logical_lines(&grid),
+        expected,
+        "narrowing reflow must preserve logical lines"
+    );
+    grid.resize(6, 20);
+    assert_eq!(
+        logical_lines(&grid),
+        expected,
+        "widening reflow must preserve logical lines"
+    );
+    grid.resize(6, 12);
+    assert_eq!(
+        logical_lines(&grid),
+        expected,
+        "round-trip reflow must preserve logical lines"
+    );
+}
+
+/// 3B red line: scrollback rows must survive the Phase-1 wholesale take and
+/// re-emerge intact in the Phase-4 redistribution (a regression here would
+/// silently empty history instead of merely cloning it). The cursor stays on
+/// the last content line (no trailing newline) — the bottom-anchored resize
+/// scenario — so the Phase-4 window covers the document tail.
+#[test]
+fn resize_move_keeps_scrollback_distribution_intact() {
+    let mut grid = Grid::with_scrollback(3, 8, 32);
+    for i in 1..=8usize {
+        for ch in format!("line-{i:02}").chars() {
+            grid.write_char_with_attrs(
+                ch,
+                CellColor::Default,
+                CellColor::Default,
+                CellFlags::empty(),
+            );
+        }
+        if i < 8 {
+            grid.newline();
+        }
+    }
+    let expected: Vec<String> = (1..=8).map(|i| format!("line-{i:02}")).collect();
+    assert_eq!(logical_lines(&grid), expected);
+
+    grid.resize(4, 20);
+    assert!(
+        !grid.scrollback.is_empty(),
+        "history must survive the resize"
+    );
+    let mut actual: Vec<String> = Vec::new();
+    for i in 0..grid.scrollback.len() {
+        actual.push(row_plain_text(grid.scrollback.get(i).unwrap()));
+    }
+    for row in &grid.viewport {
+        let text = row_plain_text(row);
+        if !text.is_empty() {
+            actual.push(text);
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "history + viewport must rebuild the document in order"
+    );
+}
+
+/// 3B red line, Phase-4 grow branch (FIX_DRAG_RESIZE_STUTTER β, review
+/// P3-3): when the rewrapped document fits the new height
+/// (`total <= new_rows`), the viewport is padded with fresh rows. The
+/// padding must be indistinguishable from `Row::new(new_cols)` — a recycled
+/// stale row leaking into the padding would render ghost content below the
+/// document.
+#[test]
+fn resize_row_growth_pads_viewport_with_fresh_blank_rows() {
+    let mut grid = Grid::with_scrollback(2, 10, 16);
+    for ch in "hi".chars() {
+        grid.write_char_with_attrs(
+            ch,
+            CellColor::Default,
+            CellColor::Default,
+            CellFlags::empty(),
+        );
+    }
+    grid.resize(5, 10);
+    assert_eq!(grid.num_rows, 5);
+    assert_eq!(logical_lines(&grid), vec!["hi"]);
+    let fresh = Row::new(10);
+    for (i, row) in grid.viewport.iter().enumerate().skip(1) {
+        assert!(!row.wrapped, "padding row {i} must be unwrapped");
+        assert!(
+            row.extras.is_empty(),
+            "padding row {i} must carry no extras"
+        );
+        for (col, (a, b)) in row.cells.iter().zip(fresh.cells.iter()).enumerate() {
+            assert_eq!(a.character, b.character, "padding row {i} col {col}");
+            assert_eq!(a.flags, b.flags, "padding row {i} col {col}");
+            assert_eq!(a.width, b.width, "padding row {i} col {col}");
+        }
+    }
+}
+
+// ── PLAN_audit_fix_batch3 3B: Scrollback::into_rows unit tests ───────────
+
+fn row_with_label(label: char) -> Row {
+    let mut row = Row::new(2);
+    row.cells[0].character = label;
+    row
+}
+
+#[test]
+fn scrollback_into_rows_moves_rotated_ring_in_logical_order() {
+    let mut sb = Scrollback::new(4);
+    for label in ['a', 'b', 'c', 'd', 'e', 'f'] {
+        sb.push(row_with_label(label));
+    }
+    // The ring retains the newest 4 rows (c..f); into_rows consumes the
+    // buffer and must unwrap them to logical order.
+    let rows = sb.into_rows();
+    let text: String = rows.iter().map(|r| r.cells[0].character).collect();
+    assert_eq!(text, "cdef", "rotated ring must unwrap to logical order");
+    assert!(
+        Scrollback::new(4).into_rows().is_empty(),
+        "empty ring yields no rows"
+    );
+}
+
+#[test]
+fn scrollback_into_rows_moves_unwrapped_buffer_in_order() {
+    let mut sb = Scrollback::new(8);
+    for label in ['a', 'b', 'c'] {
+        sb.push(row_with_label(label));
+    }
+    let rows = sb.into_rows();
+    let text: String = rows.iter().map(|r| r.cells[0].character).collect();
+    assert_eq!(text, "abc");
+}

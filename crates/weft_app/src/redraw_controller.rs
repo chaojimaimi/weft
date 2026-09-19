@@ -2,6 +2,41 @@
 
 use super::*;
 
+// ── v1.11 audit (PLAN_audit_fix_batch3 C4): owned pre-draw snapshots ──
+//
+// run_redraw's overlay/settings inputs used to be stack locals in one
+// giant function body; the borrow checker only accepted that because every
+// borrowed projection stayed inline. Hoisted into per-domain helpers, they
+// must return OWNED data — any reference tied to `&self` would conflict
+// with the `&mut sessions` borrow (`active_mut`) held for the rest of the
+// frame. 借用冲突时按 PLAN 退化为更多 owned，禁止 unsafe 绕。
+
+/// Owned data for the Settings LocalAi tab; `AiSettingsView` is built at
+/// its use point from this snapshot (复审 P2-1: never stored in a returned
+/// struct).
+struct AiSettingsSnapshot {
+    model_names: Vec<String>,
+    connection_label: String,
+    base_url: String,
+    observability: String,
+}
+
+/// Owned palette-form data + the pre-computed palette IME cursor area.
+/// `palette_entries` and the banner/submode inputs are deliberately NOT
+/// here: they are built inside the pane-borrowed section (C4 快照边界外，
+/// 复审 P2-2).
+struct PaletteSnapshot {
+    form: Option<PaletteFormSnapshot>,
+    ime_area: Option<crate::ime::ImeCursorArea>,
+}
+
+/// Owned snapshot of one active workflow form.
+struct PaletteFormSnapshot {
+    workflow_name: String,
+    fields: Vec<(String, String, bool)>,
+    current_field: usize,
+}
+
 impl App {
     /// v1.11.10 (PLAN_v11110 M-B/D-e): the RedrawRequested entry — honors
     /// both early returns (synchronized-output suppression, route-consume).
@@ -170,6 +205,7 @@ impl App {
             &pending,
             self.sessions.active().session_id,
             cascade_settled,
+            std::time::Instant::now(),
         );
         self.drain_effects(resize_effects);
 
@@ -185,119 +221,30 @@ impl App {
         // conflict with `active_mut()`. The returned `TabBarDrawState`
         // is owned and lives for the whole draw call.
         let tab_bar = self.tab_bar_state();
-        // v1.0 S1: compute Settings panel view data before the
-        // mutable `tab` borrow below — settings_theme_views() and
-        // settings_keybinding_views() borrow self immutably, which
-        // would conflict with `active_mut()`.
-        let settings_themes = self.settings_theme_views();
-        let settings_keybindings = self.settings_keybinding_views();
-        // F5: compute settings split-layout state before the mutable `tab`
-        // borrow below. These feed build_overlay_stack's new params.
+        // v1.11 audit (PLAN_audit_fix_batch3 C4): the pre-draw state the
+        // overlay/settings builders need is captured as OWNED per-domain
+        // snapshots while `self` is only shared-borrowed. The old inline
+        // locals compiled only because every borrowed projection stayed in
+        // this function body; hoisted into helpers, any `&self`-tied view
+        // struct would conflict with the `&mut sessions` borrow below.
+        // AiSettingsView / PaletteFormView are therefore constructed AT
+        // their use point from these snapshots, never stored in a struct
+        // that crosses the `active_mut()` boundary.
         let settings_is_narrow = self.settings_is_narrow();
-        let settings_drill_down = self.settings.drill_down;
-        let settings_keybinding_conflict_count =
-            settings_keybindings.iter().filter(|v| v.conflict).count();
         let terminal_owns_ime = self.overlay_input_owner().is_none();
-        let settings_field_errors: &[(String, String)] = &self.settings.field_errors;
-        // v1.5.1: Build profile views for the Settings toolbar. Index 0 is
-        // always "Base" (is_active = no active profile); 1..N are sorted
-        // profile names. Built before the mutable `tab` borrow below to
-        // avoid borrow conflicts.
-        let active_profile = self.active_profile_name();
-        let profile_names = self.profile_names_sorted();
-        let mut settings_profiles: Vec<crate::overlay::SettingsProfileView<'_>> =
-            Vec::with_capacity(profile_names.len() + 1);
-        settings_profiles.push(crate::overlay::SettingsProfileView {
-            name: "Base",
-            is_active: active_profile.is_none(),
-        });
-        for name in &profile_names {
-            settings_profiles.push(crate::overlay::SettingsProfileView {
-                name: name.as_str(),
-                is_active: active_profile == Some(name.as_str()),
-            });
-        }
-        // v1.8.3: Build the LocalAi tab view from the draft AI config +
-        // cached model list + connection status. Borrowed lifetimes tie back
-        // to `self` so this must be built before the mutable `tab` borrow.
-        let settings_ai_model_names: Vec<String> =
-            self.ai_models.iter().map(|m| m.name.clone()).collect();
-        let settings_ai_connection_label = self.ai_connection_status.label();
-        let settings_ai_base_url = crate::ai::client::effective_base_url(&self.settings.draft.ai);
-        // v1.8.3: Observability summary — pre-formatted so the renderer only
-        // pushes one text run. Empty when no requests have been made (so the
-        // row is hidden on a fresh launch). Only aggregate counts + p95
-        // latency; no prompt/response text.
-        let metrics_snap = self.ai_state.metrics_snapshot();
-        let settings_ai_observability = if metrics_snap.requests_total == 0 {
-            String::new()
-        } else {
-            // v1.8.3: Surface truncations when non-zero — they indicate the
-            // prompt budget was hit (history/output clipped before sending).
-            if metrics_snap.truncations_total > 0 {
-                format!(
-                    "{} req · {} ok · {} err · {} canc · {} trunc · p95 {}ms",
-                    metrics_snap.requests_total,
-                    metrics_snap.successes_total,
-                    metrics_snap.errors_total,
-                    metrics_snap.cancellations_total,
-                    metrics_snap.truncations_total,
-                    metrics_snap.p95_latency_ms,
-                )
-            } else {
-                format!(
-                    "{} req · {} ok · {} err · {} canc · p95 {}ms",
-                    metrics_snap.requests_total,
-                    metrics_snap.successes_total,
-                    metrics_snap.errors_total,
-                    metrics_snap.cancellations_total,
-                    metrics_snap.p95_latency_ms,
-                )
-            }
-        };
-        let settings_ai = crate::overlay::AiSettingsView {
-            enabled: self.settings.draft.ai.is_configured(),
-            model: self.settings.draft.ai.model.as_deref().unwrap_or(""),
-            base_url: &settings_ai_base_url,
-            max_tokens: self.settings.draft.ai.effective_max_tokens(),
-            timeout_secs: self.settings.draft.ai.effective_timeout_secs() as u32,
-            enable_command_generation: self.settings.draft.ai.enable_command_generation,
-            enable_error_diagnosis: self.settings.draft.ai.enable_error_diagnosis,
-            models: &settings_ai_model_names,
-            connection_status: &settings_ai_connection_label,
-            testing: self.ai_connection_status.is_testing(),
-            observability: &settings_ai_observability,
-        };
-        let palette_form_fields = self
-            .palette
-            .form
-            .as_ref()
-            .map(WorkflowForm::draw_fields)
-            .unwrap_or_default();
-        let palette_form_view =
-            self.palette
-                .form
-                .as_ref()
-                .map(|form| crate::overlay::PaletteFormView {
-                    workflow_name: &form.workflow_name,
-                    fields: &palette_form_fields,
-                    current_field: form.current_field,
-                });
+        // C1 gating: with the settings panel closed the whole settings
+        // construction chain is skipped (String collection included) — the
+        // panel was the only consumer of this data (评审已核实).
+        let settings_open = self.settings.open;
+        let settings_ai_snap = settings_open.then(|| self.ai_settings_snapshot());
+        let settings_owned_snap = settings_open.then(|| self.settings_owned_snapshot());
+        let palette_snap = self.palette_snapshot();
         let prev_drawn = self.sessions.prev_drawn_tab();
         // v1.7.3-C: snapshot the bookmarked-block set before the mutable
         // `tab` borrow below. `annotation_store()` borrows `self.sessions`
         // immutably, which would conflict with `active_mut()`.
-        let bookmarked_blocks = self.bookmarked_blocks.clone();
-        // v1.8.5: compute the palette IME cursor area before the mutable
-        // `tab` borrow below. `palette_ime_cursor_area` reads from
-        // `self.palette` and `self.interaction`, which would conflict
-        // with `self.sessions.active_mut()`.
-        let palette_ime_area = self
-            .renderer
-            .as_ref()
-            .and_then(|r| r.layout_ctx)
-            .filter(|_| self.palette.open)
-            .and_then(|ctx| self.palette_ime_cursor_area(ctx));
+        // v1.11 audit (PLAN_audit_fix_batch3 C3): refcount bump, not a clone.
+        let bookmarked_blocks = std::sync::Arc::clone(&self.bookmarked_blocks);
         let tab = self.sessions.active_mut();
         // v1.0 P0-b: when the active tab changed since the last frame,
         // the renderer's per-row grid cache is stale — force a full
@@ -327,100 +274,73 @@ impl App {
                     .ensure_cursor_visible(prompt_max_rows);
             }
         }
-        // v1.3 Batch 5.5: compute pane layouts BEFORE the mutable `pane`
-        // borrow below. The split tree is read-only structure; background
-        // panes' Terminals are read-only during draw (only the active
-        // pane's selection_handler mutates). We collect background terminal
-        // pointers as raw `*const Terminal` because `PaneRenderInfo<'a>`
-        // holds `&'a Terminal` — a borrow that can't cross the
-        // `tab.active_mut()` call (std HashMap doesn't support disjoint
-        // &mut / & on different keys). Soundness: `tab` outlives the draw
-        // call; background panes' terminals are only read (never mutated)
-        // during draw; the only mutation is the active pane's
-        // selection_handler.
-        let (active_pane_rect, bg_terminal_ptrs, pane_layouts_snapshot, active_pane_id) =
-            match self.renderer.as_ref() {
-                Some(renderer_ref) => {
-                    let chrome_top = renderer_ref
-                        .tab_bar_height()
-                        .max(renderer_ref.titlebar_height());
-                    let panel_open = self.panel.open;
-                    let sidebar_placement = crate::ui_tokens::sidebar_placement(
-                        panel_open,
-                        renderer_ref.sidebar_width(),
-                        renderer_ref.sidebar_push_width(),
-                    );
-                    let chrome_left = sidebar_placement.terminal_push_width;
-                    let content_rect: crate::layout::Rect = [
-                        renderer_ref.padding_x + chrome_left,
-                        renderer_ref.padding_y + chrome_top,
-                        renderer_ref.viewport.0 - renderer_ref.padding_x,
-                        renderer_ref.viewport.1 - renderer_ref.padding_y,
-                    ];
-                    let pane_layouts = tab.split_tree().layout(content_rect);
-                    let active_id = tab.active_pane_id();
-                    let active_rect = pane_layouts
-                        .iter()
-                        .find(|(id, _)| *id == active_id)
-                        .map(|(_, rect)| *rect)
-                        .unwrap_or(content_rect);
-                    let ptrs: Vec<(crate::layout::Rect, *const Terminal, f32, u64)> = pane_layouts
-                        .iter()
-                        .filter(|(id, _)| *id != active_id)
-                        .filter_map(|(id, rect)| {
-                            let pane = tab.pane(*id)?;
-                            let terminal = pane.terminal.as_ref()?;
-                            Some((
-                                *rect,
-                                terminal as *const Terminal,
-                                pane.block_scroll_anchor.offset_value() as f32
-                                    + pane.block_scroll_fraction,
-                                pane.pane_session_id,
-                            ))
-                        })
-                        .collect();
-                    tracing::debug!(
-                        content_rect = ?content_rect,
-                        active_id = ?active_id,
-                        active_rect = ?active_rect,
-                        pane_layouts = ?pane_layouts,
-                        bg_count = ptrs.len(),
-                        "draw pane layouts"
-                    );
-                    (active_rect, ptrs, pane_layouts, active_id)
-                }
-                None => (
-                    [0.0, 0.0, 0.0, 0.0],
-                    Vec::<(crate::layout::Rect, *const Terminal, f32, u64)>::new(),
-                    Vec::new(),
-                    weft_core::pane_layout::PaneId(0),
-                ),
-            };
-        // Build PaneRenderInfo from raw pointers. The references are valid
-        // for the entire draw scope (tab outlives draw; background terminals
-        // are immutable during draw).
-        let background_panes: Vec<crate::renderer::PaneRenderInfo> = bg_terminal_ptrs
+        // v1.3 Batch 5.5 / v1.11 audit P1-1 (PLAN_audit_fix_batch3 C2):
+        // compute pane layouts BEFORE the mutable `pane` borrow below. The
+        // split tree is read-only structure; background panes' Terminals are
+        // read-only during draw (only the active pane's selection_handler
+        // mutates).
+        //
+        // ORDER CONTRACT (Tab::active_pane_views): the read-only
+        // `split_tree().layout` walk below MUST complete before
+        // `active_pane_views()` is called — the returned views hold `&mut
+        // Tab` for the rest of the draw scope, so nothing else may touch
+        // the tab in that window.
+        let content_rect: crate::layout::Rect = match self.renderer.as_ref() {
+            Some(renderer_ref) => {
+                let chrome_top = renderer_ref
+                    .tab_bar_height()
+                    .max(renderer_ref.titlebar_height());
+                let sidebar_placement = crate::ui_tokens::sidebar_placement(
+                    self.panel.open,
+                    renderer_ref.sidebar_width(),
+                    renderer_ref.sidebar_push_width(),
+                );
+                [
+                    renderer_ref.padding_x + sidebar_placement.terminal_push_width,
+                    renderer_ref.padding_y + chrome_top,
+                    renderer_ref.viewport.0 - renderer_ref.padding_x,
+                    renderer_ref.viewport.1 - renderer_ref.padding_y,
+                ]
+            }
+            None => [0.0, 0.0, 0.0, 0.0],
+        };
+        let pane_layouts_snapshot: Vec<(weft_core::pane_layout::PaneId, crate::layout::Rect)> =
+            tab.split_tree().layout(content_rect);
+        let active_pane_id = tab.active_pane_id();
+        let active_pane_rect = pane_layouts_snapshot
             .iter()
-            .map(
-                |(rect, ptr, block_scroll, pane_session_id)| crate::renderer::PaneRenderInfo {
+            .find(|(id, _)| *id == active_pane_id)
+            .map(|(_, rect)| *rect)
+            .unwrap_or(content_rect);
+        let crate::tab::PaneViewSet {
+            active: pane,
+            backgrounds,
+        } = tab.active_pane_views();
+        // Pair each background view with its layout rect — the same fusion the raw-pointer
+        // bridge used to do inline. Empty for single-pane tabs; renderer-None's degenerate
+        // [0,0,0,0] rects are never consumed (draw is gated on `Some(renderer)` below).
+        let background_panes: Vec<crate::renderer::PaneRenderInfo> = pane_layouts_snapshot
+            .iter()
+            .filter(|(id, _)| *id != active_pane_id)
+            .filter_map(|(id, rect)| {
+                let view = backgrounds.iter().find(|b| b.pane_id == *id)?;
+                Some(crate::renderer::PaneRenderInfo {
                     rect: *rect,
-                    // SAFETY: `ptr` was obtained from `tab.pane(id).terminal`
-                    // above. `tab` outlives this scope; background panes'
-                    // terminals are not mutated during draw (only the active
-                    // pane's selection_handler is mutated, a disjoint Pane).
-                    terminal: unsafe { &**ptr },
-                    block_scroll: *block_scroll,
+                    terminal: view.terminal,
+                    block_scroll: view.block_scroll,
                     submit_on_ctrl_enter: self.config_state.config.editor.submit_on_ctrl_enter,
-                    pane_session_id: *pane_session_id,
-                },
-            )
+                    pane_session_id: view.pane_session_id,
+                })
+            })
             .collect();
-        // v1.3: take a single `&mut Pane` borrow so `terminal` (immutable)
-        // and `selection_handler` (mutable, passed to `renderer.draw` below)
-        // can be disjoint-field-borrowed from the same pane. Going through
-        // `&tab.terminal` / `&mut tab.selection_handler` separately would
-        // both deref through `Tab` and conflict.
-        let pane = tab.active_mut();
+        tracing::debug!(
+            content_rect = ?content_rect,
+            active_id = ?active_pane_id,
+            active_rect = ?active_pane_rect,
+            pane_layouts = ?pane_layouts_snapshot,
+            bg_count = background_panes.len(),
+            "draw pane layouts"
+        );
         let terminal_opt = pane.terminal.as_ref();
         if let (Some(renderer), Some(terminal)) = (&mut self.renderer, terminal_opt) {
             if tab_changed {
@@ -535,74 +455,73 @@ impl App {
                 }
             };
 
-            // v1.0 S1: build Settings panel overlay stack. The
-            // settings_themes and settings_keybindings Vecs were
-            // computed before the mutable `tab` borrow above.
+            // v1.11 audit (PLAN_audit_fix_batch3 C1/C4): rebuild the
+            // borrowed views at their use point from the owned snapshots —
+            // `view_params`' receiver is `&SettingsState`, so its borrows
+            // project onto `self.settings` only and stay disjoint from the
+            // `&mut sessions` borrow held via `tab`. `palette_entries` and
+            // `palette_banner`/`palette_submode_input` above stay built in
+            // the pane-borrowed section by design (C4 快照边界).
+            let palette_form_view =
+                palette_snap
+                    .form
+                    .as_ref()
+                    .map(|form| crate::overlay::PaletteFormView {
+                        workflow_name: &form.workflow_name,
+                        fields: &form.fields,
+                        current_field: form.current_field,
+                    });
+            let settings_params = settings_ai_snap.as_ref().and_then(|ai_snap| {
+                settings_owned_snap.as_ref().map(|owned| {
+                    let settings_ai = crate::overlay::AiSettingsView {
+                        enabled: self.settings.draft.ai.is_configured(),
+                        model: self.settings.draft.ai.model.as_deref().unwrap_or(""),
+                        base_url: &ai_snap.base_url,
+                        max_tokens: self.settings.draft.ai.effective_max_tokens(),
+                        timeout_secs: self.settings.draft.ai.effective_timeout_secs() as u32,
+                        enable_command_generation: self.settings.draft.ai.enable_command_generation,
+                        enable_error_diagnosis: self.settings.draft.ai.enable_error_diagnosis,
+                        models: &ai_snap.model_names,
+                        connection_status: &ai_snap.connection_label,
+                        testing: self.ai_connection_status.is_testing(),
+                        observability: &ai_snap.observability,
+                    };
+                    self.settings
+                        .view_params(owned, settings_ai, settings_is_narrow)
+                })
+            });
             let overlays = crate::overlay::build_overlay_stack(
                 terminal,
-                renderer.viewport_width(),
-                renderer.sidebar_width(),
-                self.panel.open,
-                &self.panel.query,
-                self.panel.selection,
-                self.panel.expanded,
-                self.panel.search_focused,
-                self.panel.scroll_offset,
-                &pane.ime_preedit,
-                pane.ime_preedit_cursor,
-                terminal_owns_ime,
-                self.palette.open,
-                &self.palette.query,
-                self.palette.selection,
-                &palette_entries,
-                &palette_banner,
-                &palette_submode_input,
-                &self.palette.ime_preedit,
-                self.palette.ime_preedit_cursor,
-                palette_form_view.as_ref(),
-                terminal.editor().buffer.selection_range(),
-                self.config_state.config.editor.submit_on_ctrl_enter,
-                self.settings.open,
-                self.settings.tab,
-                self.settings.selection,
-                self.settings.scroll_offset,
-                &self.settings.draft.theme.name,
-                &settings_themes,
-                &self.settings.draft.font.family,
-                self.settings.draft.font.size,
-                self.settings.draft.font.line_height,
-                self.settings.draft.window.opacity,
-                self.settings.draft.window.padding_x,
-                self.settings.draft.window.padding_y,
-                self.settings.draft.scrollback.lines,
-                self.settings.draft.theme.minimum_contrast,
-                self.settings.draft.window.width,
-                self.settings.draft.window.height,
-                self.settings.draft.window.sidebar_width,
-                self.settings.draft.editor.submit_on_ctrl_enter,
-                self.settings.draft.editor.smart_select,
-                // v1.11.1 (PLAN_v1111 §4.6): paste protection rows.
-                crate::settings_validation::PasteRowsView {
-                    confirm_large: self.settings.draft.paste.confirm_large,
-                    confirm_control_chars: self.settings.draft.paste.confirm_control_chars,
-                    size_threshold_kib: self.settings.draft.paste.size_threshold_kib,
+                crate::overlay::PanelViewParams {
+                    panel_width: renderer.sidebar_width(),
+                    panel_open: self.panel.open,
+                    panel_query: &self.panel.query,
+                    panel_selection: self.panel.selection,
+                    panel_expanded: self.panel.expanded,
+                    panel_search_focused: self.panel.search_focused,
+                    panel_scroll_offset: self.panel.scroll_offset,
                 },
-                &settings_keybindings,
-                self.settings.draft.logo.variant,
-                self.settings.error.as_deref(),
-                settings_is_narrow,
-                settings_drill_down,
-                settings_keybinding_conflict_count,
-                settings_field_errors,
-                &settings_profiles,
-                self.settings.draft.theme.semantic_output_enabled(),
-                settings_ai,
-                // v1.11.5 (PLAN_v1115 §M8): Advanced notification/clipboard
-                // rows (order matches build_overlay_stack's tail params).
-                self.settings.draft.notifications.enabled,
-                self.settings.draft.notifications.threshold_secs,
-                self.settings.draft.notifications.sound,
-                self.settings.draft.clipboard.osc52,
+                crate::overlay::ImeViewParams {
+                    ime_preedit: &pane.ime_preedit,
+                    ime_preedit_cursor: pane.ime_preedit_cursor,
+                    terminal_owns_ime,
+                },
+                crate::overlay::PaletteViewParams {
+                    palette_open: self.palette.open,
+                    palette_query: &self.palette.query,
+                    palette_selection: self.palette.selection,
+                    palette_entries: &palette_entries,
+                    palette_banner: &palette_banner,
+                    palette_submode_input: &palette_submode_input,
+                    palette_ime_preedit: &self.palette.ime_preedit,
+                    palette_ime_preedit_cursor: self.palette.ime_preedit_cursor,
+                    palette_form: palette_form_view.as_ref(),
+                },
+                crate::overlay::PromptViewParams {
+                    prompt_selection: terminal.editor().buffer.selection_range(),
+                    submit_on_ctrl_enter: self.config_state.config.editor.submit_on_ctrl_enter,
+                },
+                settings_params.as_ref(),
             );
             // v0.8 U6: compute block-content metrics for the dynamic
             // scrollbar thumb (total/visible/max_scroll). None in grid
@@ -839,7 +758,7 @@ impl App {
                     window,
                     ctx,
                     terminal,
-                    palette_ime_area,
+                    palette_snap.ime_area,
                     renderer.block_view_tui_caret_area.get(),
                 );
             }
@@ -930,5 +849,83 @@ impl App {
             width: ctx.cell_w,
             height: ctx.cell_h,
         })
+    }
+
+    // ── v1.11 audit (PLAN_audit_fix_batch3 C4): snapshot helpers ─────
+    //
+    // 逐段移动自 run_redraw 前置段（~:182-300 旧边界），只搬不改。
+
+    /// Owned data for the Settings LocalAi tab (former :220-257 block).
+    fn ai_settings_snapshot(&self) -> AiSettingsSnapshot {
+        let metrics_snap = self.ai_state.metrics_snapshot();
+        AiSettingsSnapshot {
+            model_names: self.ai_models.iter().map(|m| m.name.clone()).collect(),
+            connection_label: self.ai_connection_status.label(),
+            base_url: crate::ai::client::effective_base_url(&self.settings.draft.ai),
+            // v1.8.3: Observability summary — pre-formatted so the renderer
+            // only pushes one text run. Empty when no requests have been
+            // made (so the row is hidden on a fresh launch). Only aggregate
+            // counts + p95 latency; no prompt/response text.
+            observability: if metrics_snap.requests_total == 0 {
+                String::new()
+            } else {
+                // v1.8.3: Surface truncations when non-zero — they indicate
+                // the prompt budget was hit (history/output clipped before
+                // sending).
+                if metrics_snap.truncations_total > 0 {
+                    format!(
+                        "{} req · {} ok · {} err · {} canc · {} trunc · p95 {}ms",
+                        metrics_snap.requests_total,
+                        metrics_snap.successes_total,
+                        metrics_snap.errors_total,
+                        metrics_snap.cancellations_total,
+                        metrics_snap.truncations_total,
+                        metrics_snap.p95_latency_ms,
+                    )
+                } else {
+                    format!(
+                        "{} req · {} ok · {} err · {} canc · p95 {}ms",
+                        metrics_snap.requests_total,
+                        metrics_snap.successes_total,
+                        metrics_snap.errors_total,
+                        metrics_snap.cancellations_total,
+                        metrics_snap.p95_latency_ms,
+                    )
+                }
+            },
+        }
+    }
+
+    /// Owned computed values of the settings domain (former :192-207
+    /// blocks; profile_names 归属 settings 域，复审 P2-2). Borrowed values
+    /// (draft fields / error / field_errors) are projected by
+    /// `SettingsState::view_params` directly off `self.settings`.
+    fn settings_owned_snapshot(&self) -> crate::overlay::SettingsOwnedSnapshot {
+        let settings_keybindings = self.settings_keybinding_views();
+        crate::overlay::SettingsOwnedSnapshot {
+            themes: self.settings_theme_views(),
+            keybinding_conflict_count: settings_keybindings.iter().filter(|v| v.conflict).count(),
+            keybindings: settings_keybindings,
+            active_profile: self.active_profile_name().map(str::to_owned),
+            profile_names: self.profile_names_sorted(),
+        }
+    }
+
+    /// Owned palette-form snapshot + palette IME cursor area (former
+    /// :271-285 and :295-300 blocks).
+    fn palette_snapshot(&self) -> PaletteSnapshot {
+        PaletteSnapshot {
+            form: self.palette.form.as_ref().map(|form| PaletteFormSnapshot {
+                workflow_name: form.workflow_name.clone(),
+                fields: WorkflowForm::draw_fields(form),
+                current_field: form.current_field,
+            }),
+            ime_area: self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.layout_ctx)
+                .filter(|_| self.palette.open)
+                .and_then(|ctx| self.palette_ime_cursor_area(ctx)),
+        }
     }
 }
