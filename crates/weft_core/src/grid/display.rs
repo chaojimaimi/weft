@@ -31,6 +31,8 @@ impl Grid {
     /// scrollback offset. Accessibility and other viewport consumers must use
     /// this instead of [`row_text`](Self::row_text), which intentionally reads
     /// only the live buffer for shell-marker snapshots.
+    /// PLAN_B Phase 0: retained as the scroll-aware twin of `row_text` (the
+    /// live-viewport semantics live on that method's doc).
     ///
     /// v1.6.0: cells tagged with `CellFlags::EXTRA` contribute their full
     /// multi-scalar grapheme cluster via [`Grid::grapheme_at`], so accessibility

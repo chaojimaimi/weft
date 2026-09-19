@@ -135,10 +135,12 @@ impl Grid {
     /// Snapshot the rows produced since `scrollback_start`, followed by the
     /// live viewport. Primary-screen TUIs use this as their detached command
     /// transcript because their coordinate repaint stream is not linear text.
+    #[doc(hidden)]
     pub fn document_text_from(&self, scrollback_start: u64) -> String {
         self.document_snapshot_from(scrollback_start).0
     }
 
+    #[doc(hidden)]
     pub fn document_snapshot_from(&self, scrollback_start: u64) -> (String, StyledOutput) {
         self.document_snapshot_from_indices(
             self.scrollback.index_since(scrollback_start),
@@ -148,6 +150,7 @@ impl Grid {
         )
     }
 
+    #[doc(hidden)]
     pub fn document_snapshot_from_position(&self, document_start: u64) -> (String, StyledOutput) {
         let viewport_origin = self.scrollback.position();
         let (scrollback_start, viewport_start) = if document_start <= viewport_origin {

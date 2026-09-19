@@ -43,7 +43,17 @@ impl Terminal {
         }
     }
 
-    pub(super) fn primary_screen_document_snapshot(
+    /// PLAN_B Phase 0 (docs/PLAN_B_phase0.md P0-1): the single snapshot façade
+    /// every primary-screen path must route through — from Phase 1 (flat
+    /// storage migration) onward this is the ONLY call site allowed to invoke
+    /// the Grid snapshot fns, so the storage-source flip touches exactly one
+    /// producer.
+    ///
+    /// Documented exception: `freeze.rs`'s scrollback-only frame-preservation
+    /// path still calls the Grid directly because it needs the empty-viewport
+    /// ownership-mask form this signature cannot express; that whole path
+    /// migrates to the Phase 1 index mapping.
+    pub fn primary_screen_document_snapshot(
         &self,
         document_start: u64,
     ) -> (String, StyledOutput, Option<usize>) {

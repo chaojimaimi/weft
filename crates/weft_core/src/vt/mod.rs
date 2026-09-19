@@ -5,6 +5,10 @@
 mod attrs;
 mod capability;
 mod capture_cursor;
+// PLAN_B Phase 0 (docs/PLAN_B_phase0.md P0-2): crate-internal differential
+// equivalence channel — declared test-only so production builds never see it.
+#[cfg(test)]
+mod capture_diff;
 mod grapheme;
 pub(crate) mod kitty_keyboard;
 mod osc;

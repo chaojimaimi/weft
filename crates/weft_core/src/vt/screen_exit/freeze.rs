@@ -63,6 +63,10 @@ impl Terminal {
         } else {
             // Ownership masks still apply: only rows the TUI actually owned
             // belong to the document transcript.
+            // PLAN_B Phase 0: documented direct-Grid exception — frame
+            // preservation needs the EMPTY viewport mask (the fresh frame must
+            // stay out), a form `primary_screen_document_snapshot` cannot
+            // express; Phase 1 migrates this path to the index mapping.
             let (text, styled, _) = self
                 .grid
                 .document_snapshot_from_position_with_ownership_masks_and_resolver(
