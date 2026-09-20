@@ -44,3 +44,4 @@ assets/icon.iconset/
 /build/
 
 releases/
+.workbuddy/

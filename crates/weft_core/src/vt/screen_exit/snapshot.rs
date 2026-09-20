@@ -5,7 +5,33 @@ use super::tail::{merge_primary_screen_interrupt_tail, space_primary_screen_exit
 use super::Terminal;
 use super::PRIMARY_HISTORY_SNAPSHOT_INTERVAL;
 use crate::blocks::{StyledOutput, MAX_OUTPUT_BYTES};
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// C1 (PLAN_S2_render Stream C): env switch shared with the app-side
+/// performance probe (`weft_app::performance_probe::ENV_NAME`). weft_core
+/// self-reads the same string — the crates are peers, so the single
+/// `WEFT_GUI_PERF_PROBE=1` switch drives both without a dependency edge.
+const PERF_PROBE_ENV: &str = "WEFT_GUI_PERF_PROBE";
+
+/// C1: cached probe flag. Snapshot composition runs on every full-frame
+/// repaint; `std::env::var_os` per call would put a syscall on that path.
+/// Process-lifetime caching is correct — the probe is a launch-time switch.
+static PERF_PROBE_CACHE: OnceLock<bool> = OnceLock::new();
+
+/// C1: probe gate for the snapshot phase log (cached; see
+/// [`PERF_PROBE_CACHE`]).
+fn perf_probe_enabled() -> bool {
+    *PERF_PROBE_CACHE.get_or_init(|| env_flag_enabled(std::env::var_os(PERF_PROBE_ENV).as_deref()))
+}
+
+/// C1: pure decision over one env value — mirrors the app-side
+/// `performance_probe::flag_enabled` exactly: only the literal `"1"`
+/// enables; `true`/`yes`/unset do not. Unit-tested below (the process-level
+/// [`OnceLock`] cache itself is not runtime-injectable).
+fn env_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
 
 impl Terminal {
     /// v1.10.20: snapshot line index of a live viewport row, computed with
@@ -224,20 +250,43 @@ impl Terminal {
         let segment_len = text.len();
         let (text, styled) = self.compose_screen_history(text, styled);
         let after_compose = Instant::now();
-        let composed_lines = tracing::enabled!(tracing::Level::DEBUG).then(|| text.lines().count());
+        // C1 (PLAN_S2_render Stream C): the WARN-escalated probe line must
+        // fire even under the app's default `info` file filter, so the gate
+        // is `probe || debug-enabled` (pre-existing DEBUG-only behavior is
+        // unchanged when the probe is off).
+        let composed_lines = (perf_probe_enabled() || tracing::enabled!(tracing::Level::DEBUG))
+            .then(|| text.lines().count());
         self.publish_screen_snapshot(text, styled, segment_len);
         let after_publish = Instant::now();
         if let Some(lines) = composed_lines {
             let us = |from: Instant, to: Instant| (to - from).as_micros() as u64;
-            tracing::debug!(
-                "SNAPSHOT_PHASES walk={} tail={} compose={} publish={} total={} lines={}",
-                us(walk_start, after_walk),
-                us(after_walk, after_tail),
-                us(after_tail, after_compose),
-                us(after_compose, after_publish),
-                us(walk_start, after_publish),
-                lines,
-            );
+            let ms = |from: Instant, to: Instant| (to - from).as_millis() as u64;
+            if perf_probe_enabled() {
+                // C1: probe on — WARN with a grep-stable SNAPSHOT_PHASES
+                // prefix (same collection channel as RESIZE_PROBE) and
+                // millisecond phase fields; lands in weft.log under the
+                // default `info` filter that the DEBUG line never reached.
+                tracing::warn!(
+                    "SNAPSHOT_PHASES walk_ms={} tail_ms={} compose_ms={} publish_ms={} total_ms={} lines={}",
+                    ms(walk_start, after_walk),
+                    ms(after_walk, after_tail),
+                    ms(after_tail, after_compose),
+                    ms(after_compose, after_publish),
+                    ms(walk_start, after_publish),
+                    lines,
+                );
+            } else {
+                // C1: probe off — the pre-existing DEBUG line, unchanged.
+                tracing::debug!(
+                    "SNAPSHOT_PHASES walk={} tail={} compose={} publish={} total={} lines={}",
+                    us(walk_start, after_walk),
+                    us(after_walk, after_tail),
+                    us(after_tail, after_compose),
+                    us(after_compose, after_publish),
+                    us(walk_start, after_publish),
+                    lines,
+                );
+            }
         }
         // v1.10.6/25/26 (FIX_IME_PREEDIT): store the caret snapshot line
         // AFTER publish from the composed text actually written
@@ -259,5 +308,44 @@ impl Terminal {
         } else {
             self.block_tracker.replace_screen_snapshot(&text, styled);
         }
+    }
+}
+
+#[cfg(test)]
+mod perf_probe_tests {
+    use super::{env_flag_enabled, perf_probe_enabled, PERF_PROBE_ENV};
+    use std::ffi::OsStr;
+
+    /// C1: the weft_core-side probe flag shares the app-side
+    /// (`performance_probe::flag_enabled`) exact-"1" semantics: `true`/`yes`
+    /// deliberately do NOT enable, matching that channel's existing contract
+    /// and test suite.
+    #[test]
+    fn env_flag_mirrors_app_side_one_only_semantics() {
+        assert!(env_flag_enabled(Some(OsStr::new("1"))));
+        assert!(!env_flag_enabled(Some(OsStr::new("0"))));
+        assert!(!env_flag_enabled(Some(OsStr::new("true"))));
+        assert!(!env_flag_enabled(Some(OsStr::new("yes"))));
+        assert!(!env_flag_enabled(Some(OsStr::new(""))));
+        assert!(!env_flag_enabled(None));
+    }
+
+    /// The cached flag must agree with a fresh read of the same env var —
+    /// pins the [`OnceLock`] wiring against drifting from the env contract.
+    /// (The cache itself is process-level by design: the probe is a
+    /// launch-time switch, so runtime injection is neither possible nor
+    /// wanted; the acceptance's on/off behavior is verified end-to-end by
+    /// `docs/MEASURE_drag_instrumentation.md`'s grep steps.)
+    #[test]
+    fn cached_probe_flag_matches_fresh_env_read() {
+        let fresh = env_flag_enabled(std::env::var_os(PERF_PROBE_ENV).as_deref());
+        assert_eq!(perf_probe_enabled(), fresh);
+    }
+
+    /// The env name must stay byte-identical to the app-side probe so the
+    /// single `WEFT_GUI_PERF_PROBE=1` switch drives both crates.
+    #[test]
+    fn env_name_matches_app_side_probe() {
+        assert_eq!(PERF_PROBE_ENV, "WEFT_GUI_PERF_PROBE");
     }
 }
