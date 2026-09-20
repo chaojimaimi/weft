@@ -1,4 +1,35 @@
+use super::row::Row;
 use super::{CellFlags, Grid};
+
+/// Text of one physical row, shared by [`Grid::row_text`] (live viewport,
+/// shell-marker snapshots) and [`Grid::displayed_row_text`] (scroll-aware
+/// a11y): skip `WIDE_SPACER`; `EXTRA` cells contribute their full
+/// multi-scalar cluster; `\0` renders as a space; trailing blanks trimmed.
+pub(crate) fn row_display_text(row: &Row, cols: usize) -> String {
+    let width = cols.min(row.cells.len());
+    let last = row.cells[..width]
+        .iter()
+        .rposition(|cell| cell.character != ' ' && cell.character != '\0')
+        .map_or(0, |index| index + 1);
+    let mut out = String::with_capacity(last);
+    for (col, cell) in row.cells[..last].iter().enumerate() {
+        if cell.flags.contains(CellFlags::WIDE_SPACER) {
+            continue;
+        }
+        if cell.flags.contains(CellFlags::EXTRA) {
+            if let Some(cluster) = row.extras.grapheme_at(col) {
+                out.push_str(cluster);
+                continue;
+            }
+        }
+        out.push(if cell.character == '\0' {
+            ' '
+        } else {
+            cell.character
+        });
+    }
+    out
+}
 
 impl Grid {
     /// Whether the displayed row continues onto the following physical row.
@@ -42,31 +73,26 @@ impl Grid {
         if row >= self.num_rows {
             return String::new();
         }
-        let last = (0..self.num_cols)
-            .rposition(|col| {
-                let cell = self.cell(row, col);
-                cell.character != ' ' && cell.character != '\0'
-            })
-            .map(|col| col + 1)
-            .unwrap_or(0);
-        let mut out = String::with_capacity(last);
-        for col in 0..last {
-            let cell = self.cell(row, col);
-            if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                continue;
-            }
-            if cell.flags.contains(CellFlags::EXTRA) {
-                if let Some(cluster) = self.grapheme_at(row, col) {
-                    out.push_str(cluster);
-                    continue;
+        // Resolve the source row with exactly [`Grid::cell`]'s scroll math,
+        // then build the text from it in one pass (T3 D5-3 — the per-column
+        // cell()/grapheme_at() replay is gone).
+        let sb_len = self.scrollback.len();
+        let offset = self.scroll_offset.min(sb_len);
+        if offset > 0 {
+            if row < offset {
+                if let Some(history_row) = self.history_window_row(row) {
+                    return row_display_text(history_row, self.num_cols);
                 }
+                return String::new();
             }
-            out.push(if cell.character == '\0' {
-                ' '
-            } else {
-                cell.character
-            });
+            if let Some(visible) = self.viewport.get(row - offset) {
+                return row_display_text(visible, self.num_cols);
+            }
+            return String::new();
         }
-        out
+        if let Some(visible) = self.viewport.get(row) {
+            return row_display_text(visible, self.num_cols);
+        }
+        String::new()
     }
 }

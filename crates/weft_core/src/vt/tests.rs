@@ -5141,3 +5141,127 @@ fn resize_widening_keeps_written_trailing_space_in_history() {
         "written trailing space must survive the flat roundtrip, got {merged:?}"
     );
 }
+
+#[test]
+fn osc8_wide_char_spacer_hover_shape_matches_history() {
+    // T3 (P3-2 ruling): the print path gives the WIDE_SPACER half the lead's
+    // hyperlink so viewport rows hover like materialized history rows — both
+    // halves of the glyph are clickable in either storage.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/wide\x1b\\");
+    t.process("中".as_bytes());
+    t.process(b"\x1b]8;;\x1b\\");
+    // Viewport shape: lead linked, spacer linked.
+    let id = t.grid().hyperlink_id_at(0, 0).expect("lead cell linked");
+    assert_eq!(
+        t.grid().hyperlink_id_at(0, 1),
+        Some(id),
+        "viewport spacer must carry the lead's hyperlink"
+    );
+    assert_eq!(t.hyperlinks().url(id), Some("https://weft.dev/wide"));
+
+    // Push the row into flat history and view it: the materialized shape
+    // must match the viewport shape.
+    t.process(b"\x1b[3;1H\n");
+    t.grid_mut().set_scroll_offset(1);
+    assert_eq!(
+        t.grid().hyperlink_id_at(0, 0),
+        Some(id),
+        "history lead linked"
+    );
+    assert_eq!(
+        t.grid().hyperlink_id_at(0, 1),
+        Some(id),
+        "history spacer linked"
+    );
+    // Overwriting the pair without a link clears both halves. Note the
+    // two-char write: 'a' hits the lead, 'b' lands ON the spacer slot and
+    // cleans its extras via the write's own unlink path — the single-char
+    // regression below is what catches the stale-extras case.
+    t.process(b"\x1b[1;1Hab");
+    assert_eq!(t.grid().hyperlink_id_at(0, 0), None);
+    assert_eq!(t.grid().hyperlink_id_at(0, 1), None);
+}
+
+#[test]
+fn osc8_narrow_overwrite_of_wide_lead_kills_spacer_link_into_history() {
+    // T3 review P1: overwriting ONLY the lead of a linked wide pair leaves
+    // the spacer's cell flag clean (reset) but used to leave its extras
+    // hyperlink behind. Viewport hover looked fine (flag-guarded read), but
+    // flat encoding reads extras → "default cell + stale extras" encoded a
+    // linked blank → materialized history showed a phantom clickable link.
+    let mut t = Terminal::new(3, 80);
+    t.process(b"\x1b]8;;https://weft.dev/wide\x1b\\");
+    t.process("中".as_bytes()); // lead col 0 + spacer col 1, both linked
+    t.process(b"\x1b]8;;\x1b\\");
+    let id = t.grid().hyperlink_id_at(0, 0).expect("lead linked");
+    assert_eq!(t.grid().hyperlink_id_at(0, 1), Some(id), "precondition");
+
+    // ONE narrow char over the lead — nothing lands on the spacer slot.
+    t.process(b"\x1b[1;1Ha");
+    assert_eq!(t.grid().hyperlink_id_at(0, 0), None);
+    assert_eq!(t.grid().hyperlink_id_at(0, 1), None, "viewport flag clean");
+    assert_eq!(
+        t.grid().viewport[0].extras.hyperlink_id_at(1),
+        None,
+        "spacer extras entry must be cleared with the pair"
+    );
+
+    // The phantom resurrected exactly here: encode reads extras, so scroll
+    // the row into flat history and inspect the materialized shape.
+    t.process(b"\x1b[3;1H\n");
+    t.grid_mut().set_scroll_offset(1);
+    let row = t.grid().scrollback.get(0).expect("row in flat history");
+    assert_eq!(
+        row.extras.hyperlink_id_at(1),
+        None,
+        "spacer extras must not survive into flat history"
+    );
+    assert!(!row.cells[1]
+        .flags
+        .contains(crate::grid::CellFlags::HYPERLINK));
+    assert_eq!(
+        t.grid().hyperlink_id_at(0, 1),
+        None,
+        "no phantom clickable link on the materialized blank"
+    );
+    // The overwriting char itself is intact.
+    assert_eq!(t.grid().cell(0, 0).character, 'a');
+}
+
+#[test]
+fn extras_entries_are_multi_scalar_and_match_the_extra_flag() {
+    // T1 reviewer P3-3: flat materialization drops single-scalar clusters,
+    // which is only lossless because the print path can never create one.
+    // Pin the invariant: extras entry ⟺ EXTRA flag, and every stored
+    // cluster has ≥ 2 scalars.
+    let mut t = Terminal::new(2, 80);
+    t.process("e\u{0301}".as_bytes()); // combining acute
+    t.process("x".as_bytes());
+    t.process("👩\u{200d}🔬".as_bytes()); // ZWJ sequence
+    t.process("中".as_bytes()); // plain wide, no cluster
+    t.process("*\u{fe0f}".as_bytes()); // VS16 promotion
+    for (row_index, row) in t.grid().viewport.iter().enumerate() {
+        for (col, cell) in row.cells.iter().enumerate() {
+            let entry = row.extras.get(col);
+            assert_eq!(
+                cell.flags.contains(crate::grid::CellFlags::EXTRA),
+                entry.is_some(),
+                "extras ⟺ EXTRA violated at ({row_index},{col})"
+            );
+            if let Some(extra) = entry {
+                let cluster = extra
+                    .grapheme
+                    .as_ref()
+                    .expect("print path only stores clusters");
+                assert!(
+                    cluster.chars().count() >= 2,
+                    "single-scalar cluster at ({row_index},{col}): {cluster:?}"
+                );
+            }
+        }
+    }
+    // row_text renders clusters whole: the combining mark shows up after
+    // the 'e' (decomposed form, matching what the user's terminal shows).
+    assert_eq!(t.grid().row_text(0), "e\u{0301}x👩\u{200d}🔬中*\u{fe0f}");
+}

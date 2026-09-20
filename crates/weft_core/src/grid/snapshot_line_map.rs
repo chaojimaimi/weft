@@ -73,16 +73,19 @@ impl Grid {
         }
         let mut state = SnapshotWalkState::default();
         // Scrollback rows precede the viewport in document order.
+        // T3 (D5-2): rows contribute their snapshot text length straight from
+        // the flat runs — the per-row `Row` materialization dominated this
+        // replay (it walks every retained row per drag-anchor query).
         for index in scrollback_start..self.scrollback.len() {
             if !scrollback_owned.map_or(true, |owned| owned.get(index).copied().unwrap_or(false)) {
                 continue;
             }
-            let Some(row) = self.scrollback.get(index) else {
+            let Some(row_len) = self.scrollback.row_snapshot_text_len(index) else {
                 break;
             };
             // A non-empty row that overflows the text budget aborts the
             // snapshot; nothing after it exists in the document.
-            if walk_snapshot_row(&mut state, &row, self.num_cols).is_some()
+            if walk_snapshot_len(&mut state, row_len).is_some()
                 && state.text_len > SNAPSHOT_TEXT_BUDGET
             {
                 return None;
@@ -122,10 +125,11 @@ struct SnapshotWalkState {
     text_len: usize,
 }
 
-/// Advance the walk over one document row. Returns the row's snapshot line
-/// index when it is non-empty, `None` when it is skipped as empty.
-fn walk_snapshot_row(state: &mut SnapshotWalkState, row: &Row, num_cols: usize) -> Option<usize> {
-    let row_len = snapshot_row_text_len(row, num_cols);
+/// Advance the walk over one document row's text length. Returns the row's
+/// snapshot line index when it is non-empty, `None` when it is skipped as
+/// empty. Split from [`walk_snapshot_row`] so the flat scrollback replay can
+/// feed run-derived lengths without a materialized [`Row`] (T3 D5-2).
+fn walk_snapshot_len(state: &mut SnapshotWalkState, row_len: usize) -> Option<usize> {
     if row_len == 0 {
         if state.started {
             state.pending_empty += 1;
@@ -144,6 +148,11 @@ fn walk_snapshot_row(state: &mut SnapshotWalkState, row: &Row, num_cols: usize) 
     state.pending_empty = 0;
     state.text_len = state.text_len.saturating_add(row_len);
     Some(state.line_index)
+}
+
+/// Row-shaped convenience wrapper over [`walk_snapshot_len`].
+fn walk_snapshot_row(state: &mut SnapshotWalkState, row: &Row, num_cols: usize) -> Option<usize> {
+    walk_snapshot_len(state, snapshot_row_text_len(row, num_cols))
 }
 
 /// Byte length of the row's snapshot text, mirroring `styled_row`'s push

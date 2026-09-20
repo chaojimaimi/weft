@@ -75,6 +75,13 @@ impl Row {
             // v1.6.0: the lead cell at `col` is being cleared by the caller;
             // drop its cluster too so it doesn't leak into a new char.
             self.extras.clear_cell(col);
+            // T3 review P1: the spacer half carries the lead's hyperlink
+            // (OSC 8 two-half hover shape), so its extras entry — hyperlink
+            // only, a spacer never holds a grapheme — must die with the
+            // pair. Left behind, flat encoding sees "default cell + stale
+            // extras" and re-materializes a phantom clickable link on a
+            // blank history cell.
+            self.extras.clear_cell(col + 1);
         }
     }
 

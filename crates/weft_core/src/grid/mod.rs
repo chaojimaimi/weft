@@ -216,33 +216,9 @@ impl Grid {
         if row >= self.num_rows {
             return String::new();
         }
-        let cells = &self.viewport[row].cells;
-        // Extent: index after the last non-blank cell (blank = never-written
-        // space / NUL).
-        let last = cells
-            .iter()
-            .take(self.num_cols)
-            .rposition(|c| c.character != ' ' && c.character != '\0')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let mut out = String::with_capacity(last);
-        for (col, cell) in cells.iter().take(last).enumerate() {
-            if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                continue;
-            }
-            if cell.flags.contains(CellFlags::EXTRA) {
-                if let Some(cluster) = self.viewport[row].extras.grapheme_at(col) {
-                    out.push_str(cluster);
-                    continue;
-                }
-            }
-            out.push(if cell.character == '\0' {
-                ' '
-            } else {
-                cell.character
-            });
-        }
-        out
+        // T3 (D5-3): shares the builder with `displayed_row_text` — the two
+        // walks were character-for-character identical rules.
+        display::row_display_text(&self.viewport[row], self.num_cols)
     }
 
     /// v1.11.16 (Fix B2): Grid-local counterpart of

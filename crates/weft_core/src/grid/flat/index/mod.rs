@@ -66,8 +66,10 @@ pub(crate) enum GraphemeSizing {
 /// A run of consecutive graphemes with identical sizing.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub(crate) struct GraphemeRun {
-    count: NonZeroU16,
-    info: GraphemeInfo,
+    /// T3: pub(crate) — the find byte-snapshot and the D5-2 selection
+    /// replay consume run data without going through the index type.
+    pub(crate) count: NonZeroU16,
+    pub(crate) info: GraphemeInfo,
 }
 
 impl GraphemeRun {
@@ -307,7 +309,9 @@ impl Index {
     }
 
     /// Grapheme runs for one row (None when the row is out of bounds).
-    fn grapheme_runs_for_row(&self, row_idx: usize) -> Option<&[GraphemeRun]> {
+    /// pub(crate) for T3: the find byte-snapshot and the selection replay's
+    /// text-length walk both read runs without materializing [`Row`]s.
+    pub(crate) fn grapheme_runs_for_row(&self, row_idx: usize) -> Option<&[GraphemeRun]> {
         let entry = self.get_entry(row_idx)?;
 
         let runs = match &entry.grapheme_sizing {

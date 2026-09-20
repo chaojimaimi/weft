@@ -120,6 +120,14 @@ impl vte::Perform for Terminal {
             let new_col = self.grid.cursor.col;
             self.prepare_primary_screen_exit_row_overwrite();
             self.include_primary_screen_viewport_row(new_row);
+            // T3 review P1: bisected far-half registry accounting (see the
+            // standard site) — the fresh pair below re-tags new_col and
+            // new_col+1; only a slot beyond them can keep a stale entry.
+            let next_bisected = new_col + 2 < num_cols
+                && self.grid.viewport[new_row].cells[new_col + 1].width == CellWidth::Full
+                && self.grid.viewport[new_row].cells[new_col + 2]
+                    .flags
+                    .contains(CellFlags::WIDE_SPACER);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col);
             self.grid.viewport[new_row].clear_wide_pair_at(new_col + 1);
             // v1.6.0 review C1: clear orphaned grapheme extras for wide-char overwrite.
@@ -165,6 +173,28 @@ impl vte::Perform for Terminal {
                     .extras
                     .set_hyperlink(new_col, None);
             }
+            // T3 (P3-2 ruling): the spacer half carries the lead's hyperlink
+            // so viewport rows hover like materialized history rows (both
+            // halves of the glyph are clickable). Plain assignment above
+            // already dropped any stale HYPERLINK flag; registry/extras are
+            // cleaned symmetrically with the lead.
+            if new_col + 1 < num_cols {
+                if let Some(id) = self.active_hyperlink_id {
+                    self.hyperlinks.link_cell(new_row, new_col + 1, id);
+                    self.grid.viewport[new_row]
+                        .extras
+                        .set_hyperlink(new_col + 1, Some(id));
+                    self.grid.viewport[new_row].cells[new_col + 1].flags |= CellFlags::HYPERLINK;
+                } else {
+                    self.hyperlinks.unlink_cell(new_row, new_col + 1);
+                    self.grid.viewport[new_row]
+                        .extras
+                        .set_hyperlink(new_col + 1, None);
+                }
+            }
+            if next_bisected {
+                self.hyperlinks.unlink_cell(new_row, new_col + 2);
+            }
             self.grid.viewport[new_row].mark_dirty(new_col);
             if new_col + 1 < num_cols {
                 self.grid.viewport[new_row].mark_dirty(new_col + 1);
@@ -194,6 +224,22 @@ impl vte::Perform for Terminal {
         }
         self.prepare_primary_screen_exit_row_overwrite();
         self.include_primary_screen_viewport_row(row);
+
+        // T3 review P1: a narrow write that bisects a wide pair clears the
+        // far half's cell + extras (inside clear_wide_pair_at) — its
+        // registry entry must follow. Detected before the clears mutate the
+        // row.
+        let lead_bisected = col > 0
+            && self.grid.viewport[row].cells[col]
+                .flags
+                .contains(CellFlags::WIDE_SPACER)
+            && self.grid.viewport[row].cells[col - 1].width == CellWidth::Full;
+        let spacer_bisected = width == CellWidth::Half
+            && col + 1 < num_cols
+            && self.grid.viewport[row].cells[col].width == CellWidth::Full
+            && self.grid.viewport[row].cells[col + 1]
+                .flags
+                .contains(CellFlags::WIDE_SPACER);
 
         {
             self.grid.viewport[row].clear_wide_pair_at(col);
@@ -254,6 +300,30 @@ impl vte::Perform for Terminal {
             } else {
                 self.hyperlinks.unlink_cell(row, col);
                 self.grid.viewport[row].extras.set_hyperlink(col, None);
+            }
+            // T3 (P3-2 ruling): spacer carries the lead's hyperlink — see the
+            // wrap-first site above. `spacer.flags = WIDE_SPACER` in the write
+            // above already cleared a stale HYPERLINK flag; the id/registry
+            // follow the lead symmetrically.
+            if width == CellWidth::Full && col + 1 < num_cols {
+                if let Some(id) = self.active_hyperlink_id {
+                    self.hyperlinks.link_cell(row, col + 1, id);
+                    self.grid.viewport[row]
+                        .extras
+                        .set_hyperlink(col + 1, Some(id));
+                    self.grid.viewport[row].cells[col + 1].flags |= CellFlags::HYPERLINK;
+                } else {
+                    self.hyperlinks.unlink_cell(row, col + 1);
+                    self.grid.viewport[row].extras.set_hyperlink(col + 1, None);
+                }
+            }
+            // T3 review P1: registry entries of bisected wide-pair halves die
+            // with the pair (extras already handled by clear_wide_pair_at).
+            if lead_bisected {
+                self.hyperlinks.unlink_cell(row, col - 1);
+            }
+            if spacer_bisected {
+                self.hyperlinks.unlink_cell(row, col + 1);
             }
             self.grid.viewport[row].mark_dirty(col);
             if width == CellWidth::Full && col + 1 < num_cols {

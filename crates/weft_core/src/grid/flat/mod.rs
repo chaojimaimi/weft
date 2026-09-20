@@ -243,6 +243,109 @@ impl FlatStorage {
         self.columns = columns;
     }
 
+    /// T3 (D5-1): one-shot byte snapshot of the retained rows for the
+    /// off-thread text search — the whole point is that the worker gets
+    /// plain bytes plus RLE run tables instead of ~32B/cell clones. Run
+    /// walk = the row-local half of `content_offset_to_point`, so hit →
+    /// column mapping needs no `Index` on the worker side.
+    pub(crate) fn search_rows_snapshot(&self) -> (Vec<u8>, Vec<crate::find::FindSnapshotRow>) {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut rows = Vec::with_capacity(self.len());
+        for index in 0..self.len() {
+            let Some(range) = self.index.content_range_for_row(index) else {
+                break;
+            };
+            let Some(entry) = self.index.get_entry(index) else {
+                break;
+            };
+            let range_len = (range.end - range.start).as_usize();
+            // Drop the row terminator — the search walks cells only.
+            let cell_bytes = if entry.has_trailing_newline {
+                range_len - 1
+            } else {
+                range_len
+            };
+            let start = bytes.len();
+            let cell_end = range.start + cell_bytes;
+            bytes.extend_from_slice(self.content[range.start..cell_end].as_bytes());
+            let runs: Vec<(u16, u8, u16)> = self
+                .index
+                .grapheme_runs_for_row(index)
+                .unwrap_or(&[])
+                .iter()
+                .map(|run| {
+                    (
+                        run.count.get(),
+                        run.info.cell_width,
+                        run.info.utf8_bytes.get(),
+                    )
+                })
+                .collect();
+            // T3 review P3-2: pin the flat invariant — the runs must
+            // account for exactly the row's cell bytes.
+            debug_assert_eq!(
+                runs.iter()
+                    .map(|(count, _, utf8_len)| *count as usize * *utf8_len as usize)
+                    .sum::<usize>(),
+                cell_bytes,
+                "run byte sum must equal cell_bytes at row {index}"
+            );
+            rows.push(crate::find::FindSnapshotRow {
+                start,
+                cell_bytes,
+                runs,
+            });
+        }
+        (bytes, rows)
+    }
+
+    /// T3 (D5-2): byte length of a row's snapshot text, computed from the
+    /// flat runs WITHOUT materializing the [`Row`] — the drag-selection
+    /// replay walks every retained row per query, and per-row `Row`
+    /// allocation dominated that cost.
+    ///
+    /// Mirrors `snapshot_line_map::snapshot_row_text_len` exactly: trailing
+    /// blank graphemes are trimmed (a grapheme is blank iff its lead scalar
+    /// is `' '`; `\0` never reaches flat content), and every kept grapheme
+    /// contributes its full UTF-8 byte length (a multi-scalar cluster's run
+    /// bytes ARE the cluster string the snapshot text uses).
+    ///
+    /// The rule stays cross-checked by snapshot_line_map's replay-vs-builder
+    /// regression tests, which run this path against the real builder.
+    pub(crate) fn row_snapshot_text_len(&self, index: usize) -> Option<usize> {
+        let range = self.index.content_range_for_row(index)?;
+        let runs = self.index.grapheme_runs_for_row(index)?;
+        let base = range.start;
+        let mut last_contentful: Option<usize> = None;
+        let mut ordinal = 0usize;
+        let mut off = 0usize;
+        for run in runs {
+            for _ in 0..run.count.get() {
+                let end = base + off + run.info.utf8_bytes.get() as usize;
+                let text = std::str::from_utf8(self.content[base + off..end].as_bytes()).ok();
+                let lead = text.and_then(|s| s.chars().next());
+                if lead.is_some_and(|c| c != ' ') {
+                    last_contentful = Some(ordinal);
+                }
+                off += run.info.utf8_bytes.get() as usize;
+                ordinal += 1;
+            }
+        }
+        // Sum the bytes of the first `last_contentful + 1` graphemes.
+        let keep = last_contentful.map_or(0, |o| o + 1);
+        let mut total = 0usize;
+        let mut seen = 0usize;
+        for run in runs {
+            if seen >= keep {
+                break;
+            }
+            let take = (run.count.get() as usize).min(keep - seen);
+            total += take * run.info.utf8_bytes.get() as usize;
+            seen += take;
+        }
+        Some(total)
+    }
+
     /// Re-wraps the index at a new column count. Content bytes, attribute
     /// maps, and offsets are untouched — that is the entire reflow story.
     #[allow(dead_code)] // T5: resize protocol (D4 step 4) is the caller.

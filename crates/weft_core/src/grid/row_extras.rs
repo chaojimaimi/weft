@@ -88,7 +88,10 @@ impl CellExtra {
 ///
 /// - Entries are keyed by the column of the **lead cell** of a grapheme
 ///   cluster. For wide clusters (e.g. emoji), the `WIDE_SPACER` cell at
-///   `col + 1` never has its own entry.
+///   `col + 1` never has a *grapheme* entry — but since the T3 spacer-hover
+///   ruling it can carry a **hyperlink-only** entry (mirroring the lead's
+///   OSC 8 id so both halves hover); `clear_wide_pair_at` removes it with
+///   the pair.
 /// - Every column with an entry must have `CellFlags::EXTRA` set on the
 ///   corresponding `Cell` so consumers know to consult `RowExtras`.
 /// - When a cell is overwritten, cleared, or shifted, its entry must be

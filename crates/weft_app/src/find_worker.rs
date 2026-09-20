@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use weft_core::find::{find_in_snapshot, FindMatch, FindSnapshot};
+use weft_core::find::{find_in_snapshot_range, FindMatch, FindSnapshot};
 
 /// A query + snapshot to be scanned by the worker.
 struct FindQuery {
@@ -126,7 +126,7 @@ impl FindWorker {
                 current = newer;
             }
 
-            let total = current.snapshot.rows.len();
+            let total = current.snapshot.total_rows();
             let case = current.case_sensitive;
             let is_regex = current.is_regex;
             let query = current.query.clone();
@@ -320,27 +320,11 @@ fn scan_chunk(
     case_sensitive: bool,
     is_regex: bool,
 ) -> Vec<FindMatch> {
-    // Build a sub-snapshot view that shares the row data via Arc cloning
-    // (Vec<(char,u8)> clone is the cost here, but chunks are small).
-    let mut sub_rows = Vec::with_capacity(end - start);
-    for i in start..end {
-        sub_rows.push(snapshot.rows[i].clone());
-    }
-    let sub = FindSnapshot {
-        rows: sub_rows,
-        num_cols: snapshot.num_cols,
-    };
-    let mut matches = match find_in_snapshot(&sub, query, case_sensitive, is_regex) {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    // Rebase row indices: find_in_snapshot returns 0-based indices within
-    // the sub-snapshot; we need to add `start` to get back to the original
-    // unified row index.
-    for m in &mut matches {
-        m.row += start;
-    }
-    matches
+    // T3 (D5-1): the range entry scans rows [start, end) directly — the old
+    // sub-snapshot clone (rows + their cells) is gone, and row indices come
+    // back absolute already.
+    find_in_snapshot_range(snapshot, start, end, query, case_sensitive, is_regex)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -350,21 +334,37 @@ mod tests {
     use weft_core::find::{FindSnapshot, FindSnapshotCell};
 
     fn snap(rows: &[&str]) -> Arc<FindSnapshot> {
-        // v1.6.0: FindSnapshot rows use FindSnapshotCell with named fields.
-        // Tests use single-scalar rows, so cluster is always None here.
-        let rows: Vec<Vec<FindSnapshotCell>> = rows
-            .iter()
-            .map(|r| {
-                r.chars()
-                    .map(|c| FindSnapshotCell {
-                        ch: c,
-                        width: 1u8,
-                        cluster: None,
-                    })
-                    .collect()
-            })
-            .collect();
-        Arc::new(FindSnapshot { rows, num_cols: 80 })
+        // T3 shape: test rows go into the flat byte region — that also
+        // exercises the bytes+runs token walk the production snapshot uses.
+        // (The trailing region up to num_cols is blank-padded by the walk.)
+        let mut content = Vec::new();
+        let mut snapshot_rows = Vec::with_capacity(rows.len());
+        for r in rows {
+            let start = content.len();
+            content.extend_from_slice(r.as_bytes());
+            // Single-scalar ASCII test rows: one uniform run of
+            // (count, width 1, 1 byte per grapheme).
+            let width = r.chars().count() as u16;
+            let run = if width > 0 {
+                vec![(width, 1u8, 1u16)]
+            } else {
+                Vec::new()
+            };
+            snapshot_rows.push(weft_core::find::FindSnapshotRow {
+                start,
+                cell_bytes: r.len(),
+                runs: run,
+            });
+        }
+        let viewport_rows: Vec<Vec<FindSnapshotCell>> = Vec::new();
+        Arc::new(FindSnapshot {
+            scrollback: weft_core::find::FindSnapshotScrollback {
+                content,
+                rows: snapshot_rows,
+            },
+            viewport_rows,
+            num_cols: 80,
+        })
     }
 
     #[test]
