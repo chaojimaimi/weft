@@ -13,7 +13,7 @@
         },
         {
           "pair": "increased_border",
-          "ratio": 5.648
+          "ratio": 7.788
         },
         {
           "pair": "panel_selection",
@@ -24,35 +24,35 @@
       "text": [
         {
           "pair": "primary_canvas",
-          "ratio": 11.532
+          "ratio": 16.836
         },
         {
           "pair": "primary_chrome",
-          "ratio": 12.057
+          "ratio": 17.603
         },
         {
           "pair": "primary_raised",
-          "ratio": 9.16
+          "ratio": 13.374
         },
         {
           "pair": "primary_panel",
-          "ratio": 13.055
+          "ratio": 19.059
         },
         {
           "pair": "secondary_canvas",
-          "ratio": 6.308
+          "ratio": 8.804
         },
         {
           "pair": "secondary_chrome",
-          "ratio": 6.596
+          "ratio": 9.204
         },
         {
           "pair": "secondary_raised",
-          "ratio": 5.011
+          "ratio": 6.993
         },
         {
           "pair": "secondary_panel",
-          "ratio": 7.141
+          "ratio": 9.966
         },
         {
           "pair": "focus",

@@ -112,7 +112,8 @@ pub struct SyntaxConfig {
 /// v1.7.0-D: `enabled` controls the semantic fallback classifier. When
 /// `false`, the classifier is skipped and unstyled output uses
 /// `output_default` only. ANSI-styled output is NEVER affected by this
-/// toggle. Defaults to `true` (enabled).
+/// toggle. v1.12.2 (PLAN_S2_render A1): defaults to `false` (disabled) —
+/// unstyled output renders in a single bright `output_default`.
 ///
 /// v1.11.0: the `cwd` field was removed — dead config (painter derives
 /// CWD gray from fg×0.65). A leftover `cwd = "..."` in user TOML is
@@ -175,12 +176,17 @@ impl Default for ThemeConfig {
 
 impl ThemeConfig {
     /// v1.7.0-D: Returns whether the semantic output fallback classifier is
-    /// enabled. Defaults to `true` when the `[theme.output]` section or
-    /// `enabled` field is absent. When `false`, the classifier is skipped
-    /// and unstyled output uses `output_default` only; ANSI styling is
-    /// NEVER affected by this toggle.
+    /// enabled. v1.12.2 (PLAN_S2_render A1): defaults to `false` when the
+    /// `[theme.output]` section or `enabled` field is absent. Migration
+    /// semantics (serde `unwrap_or`): users who never configured `enabled`
+    /// follow the new default; an explicit `enabled = true` in config.toml
+    /// is preserved. When `false`, the classifier is skipped and unstyled
+    /// output uses `output_default` only; ANSI styling is NEVER affected.
     pub fn semantic_output_enabled(&self) -> bool {
-        self.output.as_ref().and_then(|o| o.enabled).unwrap_or(true)
+        self.output
+            .as_ref()
+            .and_then(|o| o.enabled)
+            .unwrap_or(false)
     }
 }
 

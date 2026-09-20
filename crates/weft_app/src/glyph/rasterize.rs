@@ -143,6 +143,15 @@ impl GlyphAtlas {
 
     /// Rasterize a single glyph into a pixel buffer.
     /// Returns the pixel data ready for upload to the atlas texture.
+    ///
+    /// A2 negative result (PLAN_S2_render, 2026-09-20): re-routing this to
+    /// `Format::Rgb24` (RGB CoreText context via font-kit's temp-Rgba32
+    /// canvas + blit, `set_should_smooth_fonts(true)`) was measured with a
+    /// differential probe and produced **byte-identical masks to A8**
+    /// (Menlo 'W' @28pt, both masks 255 ink px, 0/578 differing; R==G==B).
+    /// CoreText font smoothing no longer alters mask coverage on this OS,
+    /// so the re-route was pure cost — rolled back per the plan's go/no-go
+    /// gate. A8 stays.
     #[allow(clippy::too_many_arguments)] // font + slot geometry + style flags
     pub(super) fn rasterize_glyph(
         font: &Font,

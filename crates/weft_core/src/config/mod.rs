@@ -319,22 +319,22 @@ impl Config {
                 *output_entry = toml_edit::table();
             }
             let ot = output_entry.as_table_mut().expect("output is a table");
-            // enabled: 三态处理。
-            //   Some(false) → 写入 `enabled = false`（关闭语义着色）。
-            //   Some(true)  → 显式删除磁盘上的 enabled 键（默认 true，避免残留 false）。
+            // enabled: 三态处理（v1.12.2 PLAN_S2_render A1：默认值翻转为 false）。
+            //   Some(true)  → 写入 `enabled = true`（显式开启语义着色，现为新默认下的非默认值）。
+            //   Some(false) → 显式删除磁盘上的 enabled 键（默认 false，避免残留 true）。
             //   None        → 不动（保持磁盘原值）。
             match out.enabled {
-                Some(false) => {
-                    ot["enabled"] = toml_edit::value(false);
+                Some(true) => {
+                    ot["enabled"] = toml_edit::value(true);
                 }
                 // v1.11.16: the inner `if` is folded into a match guard
                 // (clippy::collapsible_match is a hard error under CI's
                 // `-D warnings`). Semantics unchanged: delete the on-disk
                 // `enabled` key only when it actually exists.
-                Some(true) if ot.contains_key("enabled") => {
+                Some(false) if ot.contains_key("enabled") => {
                     ot.remove("enabled");
                 }
-                Some(true) => {}
+                Some(false) => {}
                 None => {}
             }
             set_opt_string_clear(ot, "output_default", &out.output_default);

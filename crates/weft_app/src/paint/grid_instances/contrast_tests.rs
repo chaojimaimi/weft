@@ -674,3 +674,64 @@ fn grid_bold_is_bright_reverse_dim_order_stable() {
         assert!((actual - exp).abs() < 1e-6, "fg={fg:?} exp={expected:?}");
     }
 }
+
+// ── v1.12.2 (PLAN_S2_render A3): text Y physical-pixel snapping ───────
+
+/// Text glyph quads must snap their Y edges to integer physical pixels
+/// (fractional pane/chrome origins would sample the glyph atlas with a
+/// subpixel offset → blurry Retina text). Bg runs and decorations keep the
+/// raw fractional Y on purpose — snapping color blocks would open vertical
+/// seams between adjacent runs. Mirrors the pane_dividers naming paradigm.
+#[test]
+fn build_row_instances_snaps_text_y_to_integer_pixels_keeps_bg_fractional() {
+    let mut grid = Grid::new(1, 1);
+    grid.viewport[0].cells[0] = Cell::with_char('A');
+    let origin_y = 10.4f32; // fractional row origin (e.g. 3-way pane split)
+    let origin_x = 3.7f32;
+    let result = build_row_instances(
+        &grid,
+        &Color::standard_palette(),
+        0,
+        FG_FULL,
+        BG_DARK,
+        [1.0; 4],
+        [0.3, 0.5, 0.7, 0.6],
+        [0.22, 0.34, 0.50, 1.0],
+        &Cursor::default(),
+        CursorStyle::Underline,
+        true, // show cursor → underline decoration stays on the raw Y
+        &SelectionHandler::new(),
+        1.0,
+        1.0,  // minimum_contrast = 1.0 → never adjusts
+        10.0, // cw
+        20.0, // ch
+        origin_x,
+        origin_y,
+        false,
+        [0.36, 0.62, 0.94, 1.0], // link (theme default, M6)
+    );
+
+    // Text glyph: both Y edges are integers; X untouched (fractional ok).
+    let GlyphInstance::Text { dst, .. } = &result.glyph_instances[0] else {
+        panic!("expected text glyph");
+    };
+    assert_eq!(dst[1], 10.0, "text y0 must snap to the integer pixel below");
+    assert_eq!(dst[3], 30.0, "text y1 must snap (10.4 + 20.0 → floor 30)");
+    assert!((dst[0] - origin_x).abs() < 1e-6, "x must stay unsnapped");
+
+    // Background run: Y edges stay fractional (no snapping, no seams).
+    assert_eq!(result.bg_instances.len(), 1);
+    assert_eq!(result.bg_instances[0].y0, 10.4, "bg y0 must stay raw");
+    assert_eq!(result.bg_instances[0].h, 20.0);
+
+    // Cursor underline decoration: also raw (exempt class, like the cursor).
+    let deco = result
+        .glyph_instances
+        .iter()
+        .find(|g| matches!(g, GlyphInstance::Decoration { .. }))
+        .expect("underline cursor must emit a decoration");
+    let GlyphInstance::Decoration { dst, .. } = deco else {
+        unreachable!()
+    };
+    assert_eq!(dst[3], origin_y + 20.0, "decoration y1 must stay raw");
+}

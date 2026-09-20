@@ -941,9 +941,16 @@ fn output_semantic_override_all_fields() {
 // ── v1.7.0-D: semantic_output_enabled toggle tests ────────────────
 
 #[test]
-fn semantic_output_enabled_defaults_to_true() {
+fn semantic_output_enabled_defaults_to_false() {
+    // v1.12.2 (PLAN_S2_render A1): the semantic fallback classifier now
+    // defaults OFF — unstyled output renders in `output_default` only.
+    // serde `unwrap_or` migration: users who never wrote `enabled` follow
+    // the new default; an explicit `enabled = true` keeps working (pinned
+    // by semantic_output_enabled_true_persists_to_disk below).
     let cfg = ThemeConfig::default();
-    assert!(cfg.semantic_output_enabled(), "default should be true");
+    assert!(!cfg.semantic_output_enabled(), "default should be false");
+    let parsed: ThemeConfig = toml::from_str("[theme]").unwrap();
+    assert!(!parsed.semantic_output_enabled());
 }
 
 #[test]
@@ -971,7 +978,10 @@ fn semantic_output_enabled_explicit_true() {
 }
 
 #[test]
-fn semantic_output_enabled_persists_through_save_load() {
+fn semantic_output_enabled_false_omitted_from_disk_as_new_default() {
+    // v1.12.2 (PLAN_S2_render A1): `false` is the new default, so an
+    // explicit `enabled = false` is no longer written to disk (minimal-write
+    // contract, matching `follow_system`). Reload must still report false.
     let dir = unique_tmp_path("semantic-toggle");
     let path = dir.join("config.toml");
     let cfg = Config {
@@ -988,22 +998,24 @@ fn semantic_output_enabled_persists_through_save_load() {
     cfg.save_to_path(&path).expect("save");
     let text = std::fs::read_to_string(&path).expect("read");
     assert!(
-        text.contains("enabled = false"),
-        "expected 'enabled = false' in saved config:\n{}",
+        !text.contains("enabled"),
+        "expected 'enabled' to be absent from saved config (default false is implicit):\n{}",
         text
     );
     // Reload and verify.
     let loaded: Config = toml::from_str(&text).expect("parse");
     assert!(
         !loaded.theme.semantic_output_enabled(),
-        "reload should preserve enabled = false"
+        "reload should report false (new default)"
     );
 }
 
 #[test]
-fn semantic_output_enabled_true_not_written_to_disk() {
-    // v1.7.0-D review fix: `enabled = true` is the default, so it should NOT
-    // be written to disk (minimal-write contract, matching `follow_system`).
+fn semantic_output_enabled_true_persists_to_disk() {
+    // v1.12.2 (PLAN_S2_render A1): an explicit `enabled = true` is now the
+    // NON-default value and must be written — otherwise a settings re-save
+    // would silently drop the user's opt-in and the next load would flip
+    // them back to the (new) default false.
     let dir = unique_tmp_path("semantic-toggle-true");
     let path = dir.join("config.toml");
     let cfg = Config {
@@ -1020,59 +1032,61 @@ fn semantic_output_enabled_true_not_written_to_disk() {
     cfg.save_to_path(&path).expect("save");
     let text = std::fs::read_to_string(&path).expect("read");
     assert!(
-        !text.contains("enabled"),
-        "expected 'enabled' to be absent from saved config (default true is implicit):\n{}",
+        text.contains("enabled = true"),
+        "expected 'enabled = true' in saved config:\n{}",
         text
     );
-    // Reload still reports true (default).
+    // Reload keeps the explicit opt-in (migration guarantee).
     let loaded: Config = toml::from_str(&text).expect("parse");
-    assert!(loaded.theme.semantic_output_enabled());
+    assert!(
+        loaded.theme.semantic_output_enabled(),
+        "reload should preserve enabled = true"
+    );
 }
 
 #[test]
-fn semantic_output_toggle_off_then_on_clears_false_from_disk() {
-    // v1.7.5 regression: 用户通过 Settings 把 Semantic 从 on 切到 off 再切回 on，
-    // 磁盘上仍残留 `enabled = false`，导致 reload 后仍为 false。
-    // 根因：save_to_path 只在 `enabled == Some(false)` 时写入该键，切回 on 时
-    // 既不写 `enabled = true` 也不删除已有的 `enabled = false`，toml_edit 增量
-    // 编辑保留了旧键。
+fn semantic_output_toggle_on_then_off_clears_true_from_disk() {
+    // v1.12.2 mirror of the v1.7.5 regression (default flipped): the user
+    // toggles semantic ON (writes `enabled = true`) then back OFF; the
+    // toml_edit incremental edit must not leave a stale `enabled = true`
+    // on disk, or reload would resurrect the ON state.
     let dir = unique_tmp_path("semantic-toggle-roundtrip");
     // unique_tmp_path 返回的是 config.toml 路径，其父目录已创建
     let path = &dir;
-    // 初始文件：无 enabled 键（默认 true）
+    // 初始文件：无 enabled 键（默认 false）
     std::fs::write(path, "[theme]\nname = \"weft-warm\"\n").unwrap();
 
-    // off: load → set enabled = Some(false) → save
-    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    cfg.theme.output = Some(OutputSemanticConfig {
-        enabled: Some(false),
-        ..Default::default()
-    });
-    cfg.save_to_path(path).unwrap();
-    let after_off = std::fs::read_to_string(path).unwrap();
-    assert!(after_off.contains("enabled = false"));
-
     // on: load → set enabled = Some(true) → save
-    let mut cfg: Config = toml::from_str(&after_off).unwrap();
+    let mut cfg: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     cfg.theme.output = Some(OutputSemanticConfig {
         enabled: Some(true),
         ..Default::default()
     });
     cfg.save_to_path(path).unwrap();
     let after_on = std::fs::read_to_string(path).unwrap();
+    assert!(after_on.contains("enabled = true"));
 
-    // 关键断言：磁盘上不应残留 enabled = false
+    // off: load → set enabled = Some(false) → save
+    let mut cfg: Config = toml::from_str(&after_on).unwrap();
+    cfg.theme.output = Some(OutputSemanticConfig {
+        enabled: Some(false),
+        ..Default::default()
+    });
+    cfg.save_to_path(path).unwrap();
+    let after_off = std::fs::read_to_string(path).unwrap();
+
+    // 关键断言：磁盘上不应残留 enabled = true
     assert!(
-        !after_on.contains("enabled = false"),
-        "BUG: 'enabled = false' still on disk after toggle to ON:\n{}",
-        after_on
+        !after_off.contains("enabled = true"),
+        "BUG: 'enabled = true' still on disk after toggle to OFF:\n{}",
+        after_off
     );
-    // reload 后应为 true
-    let reloaded: Config = toml::from_str(&after_on).unwrap();
+    // reload 后应为 false（新默认）
+    let reloaded: Config = toml::from_str(&after_off).unwrap();
     assert!(
-        reloaded.theme.semantic_output_enabled(),
-        "after toggle ON, reload should report true; disk:\n{}",
-        after_on
+        !reloaded.theme.semantic_output_enabled(),
+        "after toggle OFF, reload should report false; disk:\n{}",
+        after_off
     );
 }
 
@@ -2084,13 +2098,18 @@ fn semantic_profile(enabled: bool) -> Config {
 
 #[test]
 fn active_profile_semantic_off_survives_save_and_reload() {
+    // v1.12.2 (PLAN_S2_render A1): `enabled = false` is now the default and
+    // is omitted from disk; the profile override still resolves to false.
     let path = unique_tmp_path("profile-semantic-off").join("config.toml");
     semantic_profile(false).save_to_path(&path).unwrap();
     let loaded = load_resolved_from_path(&path).unwrap();
     assert!(!loaded.effective.theme.semantic_output_enabled());
-    assert!(std::fs::read_to_string(&path)
-        .unwrap()
-        .contains("enabled = false"));
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("enabled = true"),
+        "explicit false must not be re-spelled as true on disk"
+    );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
 

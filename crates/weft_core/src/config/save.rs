@@ -503,8 +503,14 @@ fn write_profile_sections(
                 }
                 write_profile_section(t, "output", th.output.is_some(), skipped, |ot, _| {
                     if let Some(output) = &th.output {
-                        if output.enabled == Some(false) {
-                            ot["enabled"] = toml_edit::value(false);
+                        // v1.12.2 (PLAN_S2_render A1): the classifier default
+                        // flipped to `false`, so the non-default value to
+                        // persist is now `true`. Writing only the non-default
+                        // keeps the minimal-write contract and lets the
+                        // remove() branch clear a stale key on toggle (the
+                        // v1.7.5 residue bug, mirrored for the new default).
+                        if output.enabled == Some(true) {
+                            ot["enabled"] = toml_edit::value(true);
                         } else {
                             ot.remove("enabled");
                         }

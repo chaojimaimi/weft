@@ -178,7 +178,7 @@ impl Theme {
             (0xc4, 0xa0, 0xc8), // 4 blue    (dusty purple-blue for warmth)
             (0xd4, 0x88, 0x70), // 5 magenta (warm coral)
             (0xd4, 0xa5, 0x74), // 6 cyan    (amber — matches accent)
-            (0xe0, 0xd4, 0xc4), // 7 white   (warm cream)
+            (0xf1, 0xf1, 0xf1), // 7 white (neutral near-white — dimmer than default fg)
             (0x4a, 0x3f, 0x35), // 8 bright black (warm dark brown)
             (0xe0, 0x88, 0x78), // 9 bright red
             (0xd0, 0xe0, 0x90), // 10 bright green
@@ -186,13 +186,16 @@ impl Theme {
             (0xd8, 0xc0, 0xe0), // 12 bright blue
             (0xe8, 0xa8, 0x90), // 13 bright magenta
             (0xe8, 0xc8, 0x9c), // 14 bright cyan
-            (0xf0, 0xe8, 0xdc), // 15 bright white
+            (0xff, 0xff, 0xff), // 15 bright white (pure — must not dim below SGR 37)
         ];
         for (i, (r, g, b)) in ansi.iter().enumerate() {
             palette[i] = Color::rgb(*r, *g, *b);
         }
         Self {
-            foreground: Color::rgb(0xe0, 0xd4, 0xc4), // warm cream
+            // v1.12.2 (PLAN_S2_render A1): default fg is now the brightest
+            // neutral — plain text must lead the brightness hierarchy
+            // (Warp convention: default fg ≥ ANSI white ≥ everything else).
+            foreground: Color::rgb(0xff, 0xff, 0xff), // pure white
             background: Color::rgb(0x22, 0x1c, 0x18), // deep warm brown
             cursor: Color::rgb(0xf0, 0xd4, 0xa8),     // amber-tinted white (glow anchor)
             // Selection: warm amber tint at higher saturation than the
@@ -214,10 +217,10 @@ impl Theme {
                 operator: Color::rgb(0xc8, 0x68, 0x58), // brick red
                 comment: Color::rgb(0x7a, 0x6a, 0x58),  // warm gray (== accent_dim)
                 argument: Color::rgb(0xc8, 0xa8, 0x88), // warm sand — distinct from olive command
-                default: Color::rgb(0xe0, 0xd4, 0xc4),  // == foreground
+                default: Color::rgb(0xff, 0xff, 0xff),  // == foreground
             },
             output: OutputSemanticColors {
-                output_default: Color::rgb(0xe0, 0xd4, 0xc4), // == syntax.default
+                output_default: Color::rgb(0xff, 0xff, 0xff), // == syntax.default
                 metadata: Color::rgb(0xa8, 0x90, 0x70),       // muted amber
                 success: Color::rgb(0xb8, 0xc8, 0x78),        // ANSI 2 green (olive)
                 failure: Color::rgb(0xc8, 0x68, 0x58),        // ANSI 1 red (brick)

@@ -441,8 +441,12 @@ pub(crate) fn build_row_instances(
             } else {
                 None
             };
+            // v1.12.2 (PLAN_S2_render A3): text glyphs snap Y edges to
+            // integer physical pixels (fractional pane/chrome origins would
+            // sample the atlas with a subpixel offset). Bg runs and
+            // decorations keep the raw fractional Y (plan scope: text only).
             result.glyph_instances.push(GlyphInstance::Text {
-                dst: [x0, y0, x1, y1],
+                dst: [x0, y0.floor(), x1, y1.floor()],
                 ch: cell.character,
                 fg: final_fg,
                 cluster,

@@ -80,6 +80,15 @@ impl MetalRenderer {
     ) {
         let cw = self.cell_width() as f32;
         let [x, y] = origin;
+        // v1.12.2 (PLAN_S2_render A3): snap text quad Y edges to integer
+        // physical pixels (the whole coordinate chain is already physical —
+        // viewport, padding, atlas rasterization). Fractional row origins
+        // (pane splits, chrome offsets) otherwise sample the glyph atlas
+        // with a subpixel offset → blurry text on Retina. X is deliberately
+        // NOT snapped (plan scope: Y only); background/color-block quads
+        // are snapped nowhere to avoid vertical seams.
+        let y0 = y.floor();
+        let y1 = (y + glyph_height).floor();
         let mut col = 0usize;
         let mut px = x;
         for grapheme in text.graphemes(true) {
@@ -114,7 +123,7 @@ impl MetalRenderer {
             let fg = if g.is_color { [0.0, 0.0, 0.0, 2.0] } else { fg };
             push_quad(
                 vertices,
-                [px, y, px + cell_w, y + glyph_height],
+                [px, y0, px + cell_w, y1],
                 [u, v + vh, u + uw, v],
                 fg,
                 [0.0; 4],
@@ -146,6 +155,12 @@ impl MetalRenderer {
     ) {
         let cw = self.cell_width() as f32;
         let [x, y] = origin;
+        // v1.12.2 (PLAN_S2_render A3): same Y snap as `push_text_with_height`
+        // — this span path directly emits text quads (prompt/input canvas),
+        // so it is a third text-quad outlet beside the two named choke
+        // points; leaving it fractional would keep prompt text blurry.
+        let y0 = y.floor();
+        let y1 = (y + self.cell_height() as f32).floor();
         let mut col = 0usize;
         let mut px = x;
         let mut char_index; // relative to this visual row; set per segment below
@@ -202,7 +217,7 @@ impl MetalRenderer {
                     };
                     push_quad(
                         vertices,
-                        [px, y, px + cell_w, y + self.cell_height() as f32],
+                        [px, y0, px + cell_w, y1],
                         [u, v + vh, u + uw, v],
                         color,
                         [0.0; 4],
@@ -213,5 +228,89 @@ impl MetalRenderer {
                 char_index = grapheme_end;
             }
         }
+    }
+}
+
+// ── v1.12.2 (PLAN_S2_render A3): text Y physical-pixel snapping ───────
+
+#[cfg(test)]
+mod snap_tests {
+    use crate::renderer::MetalRenderer;
+    use weft_core::config::Theme;
+
+    /// Mirror the golden/offscreen skip precedent: no Metal device → skip.
+    fn renderer_headless_or_skip() -> Option<MetalRenderer> {
+        metal::Device::system_default()?;
+        Some(MetalRenderer::new_headless_paint(Theme::weft_warm()))
+    }
+
+    /// Text quad vertices must land on integer physical pixels in Y. The
+    /// full coordinate chain (viewport, padding, atlas) is already physical;
+    /// a fractional row origin (pane split / chrome offset) used to sample
+    /// the glyph atlas with a subpixel offset → blurry text on Retina.
+    /// Naming paradigm follows pane_dividers.rs ("snaps fractional coords
+    /// to integer pixels"). X is intentionally unsnapped (plan scope: Y).
+    #[test]
+    fn push_text_with_height_snaps_fractional_y_to_integer_pixels() {
+        let Some(renderer) = renderer_headless_or_skip() else {
+            eprintln!("skipping push_text_with_height snap test: no Metal device");
+            return;
+        };
+        let mut verts = Vec::new();
+        renderer.push_text_with_height(
+            &mut verts,
+            [0.0, 10.4],
+            "A",
+            [1.0; 4],
+            8,
+            renderer.cell_height() as f32,
+            crate::glyph::GlyphStyle::REGULAR,
+        );
+        assert!(
+            !verts.is_empty(),
+            "'A' must be prewarmed into the headless atlas (no glyph → no quads)"
+        );
+        // Each push_quad vertex is 12 floats: x, y, u, v, fg(4), bg(4);
+        // 6 vertices per quad. Vertex N's y lives at 12*N + 1.
+        for n in 0..(verts.len() / 12) {
+            let y = verts[n * 12 + 1];
+            assert_eq!(y.fract(), 0.0, "vertex {n} y not integer: {y}");
+        }
+        // And the snapped value is the floor of the fractional origin.
+        assert_eq!(verts[1], 10.0, "y0 must floor 10.4 → 10.0");
+    }
+
+    /// Outlet #3 (rust-reviewer M1 P2): `push_line_spans_on_canvas` is the
+    /// third text-quad outlet (prompt/input canvas). With `selection: None`
+    /// it emits glyph quads only, so every vertex Y must be integer.
+    #[test]
+    fn push_line_spans_on_canvas_snaps_fractional_y_to_integer_pixels() {
+        let Some(renderer) = renderer_headless_or_skip() else {
+            eprintln!("skipping push_line_spans_on_canvas snap test: no Metal device");
+            return;
+        };
+        let mut verts = Vec::new();
+        let line = "abc";
+        let spans = weft_core::syntax::tokenize_spans(line, true);
+        renderer.push_line_spans_on_canvas(
+            &mut verts,
+            [0.0, 10.4],
+            line,
+            0,
+            3,
+            &spans,
+            8,
+            [0.0, 0.0, 80.0, 24.0],
+            None,
+        );
+        assert!(
+            !verts.is_empty(),
+            "prewarmed ascii must produce quads (no glyph → no quads)"
+        );
+        for n in 0..(verts.len() / 12) {
+            let y = verts[n * 12 + 1];
+            assert_eq!(y.fract(), 0.0, "vertex {n} y not integer: {y}");
+        }
+        assert_eq!(verts[1], 10.0, "y0 must floor 10.4 → 10.0");
     }
 }
