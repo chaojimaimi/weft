@@ -334,11 +334,10 @@ mod offset_point_conversion {
 
         let original_point = Point { row: 2, col: 0 };
 
-        let offset = storage
-            .index
-            .content_offset_at_point(original_point)
-            .expect("should be able to convert point to offset");
-        assert_eq!(offset, ByteOffset::from_usize(13));
+        // T5: content_offset_at_point died with the marker dance — the
+        // cursor anchors walk runs row-locally. Feed the hand-computed
+        // offset and check the to_point mapping instead.
+        let offset = ByteOffset::from_usize(13);
 
         let point = storage
             .index
@@ -356,11 +355,10 @@ mod offset_point_conversion {
 
         let original_point = Point { row: 0, col: 2 };
 
-        let offset = storage
-            .index
-            .content_offset_at_point(original_point)
-            .expect("should be able to convert point to offset");
-        assert_eq!(offset, ByteOffset::from_usize(4));
+        // T5: content_offset_at_point died with the marker dance — the
+        // cursor anchors walk runs row-locally. Feed the hand-computed
+        // offset and check the to_point mapping instead.
+        let offset = ByteOffset::from_usize(4);
 
         let point = storage
             .index
@@ -378,11 +376,10 @@ mod offset_point_conversion {
 
         let original_point = Point { row: 2, col: 1 };
 
-        let offset = storage
-            .index
-            .content_offset_at_point(original_point)
-            .expect("should be able to convert point to offset");
-        assert_eq!(offset, ByteOffset::from_usize(14));
+        // T5: content_offset_at_point died with the marker dance — the
+        // cursor anchors walk runs row-locally. Feed the hand-computed
+        // offset and check the to_point mapping instead.
+        let offset = ByteOffset::from_usize(14);
 
         let point = storage
             .index

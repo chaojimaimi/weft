@@ -1,8 +1,16 @@
-use crate::grid::{CellColor, Color, Grid, Row};
+//! Primary-screen row ownership mask (v1.10.19+) and its resize migration.
+//!
+//! T5 (D4/PLAN_B): the mask migrates through a resize via the protocol's
+//! old→new row map — O(rows) index arithmetic — instead of the deleted
+//! shadow-grid full clone (a whole `Grid` of marker-painted rows reflowed
+//! per resize). A post-resize row is owned iff any pre-resize row whose
+//! content it carries was owned; that matches the shadow's `row_is_owned`
+//! any-marker reduction, because wrapped fragments carry their source rows'
+//! bytes and empty rows carry no bytes at all.
 
 use super::Terminal;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::vt) struct PrimaryScreenOwnership {
     pub(in crate::vt) scrollback: Vec<bool>,
     pub(in crate::vt) viewport: Option<Vec<bool>>,
@@ -23,85 +31,42 @@ impl PrimaryScreenOwnership {
         }
     }
 
-    /// Reflow a row ownership mask through the exact same Grid algorithm as
-    /// the primary document. A shadow grid carries an opaque marker in every
-    /// retained cell, so wrapping and logical-line merges transform ownership
-    /// together with content instead of merely resizing the viewport suffix.
-    fn reflowed(&self, grid: &Grid, rows: usize, cols: usize) -> Self {
-        let retained_rows = grid.scrollback.len().saturating_add(grid.num_rows);
-        let max_reflow_rows = retained_rows
-            .saturating_mul(grid.num_cols.max(1))
-            .saturating_div(cols.max(1))
-            .saturating_add(retained_rows)
-            .max(rows);
-        let mut shadow = Grid::with_scrollback(grid.num_rows, grid.num_cols, max_reflow_rows);
-        for index in 0..grid.scrollback.len() {
-            if let Some(row) = grid.scrollback.get(index) {
-                shadow.scrollback.push(marked_row(
-                    &row,
-                    self.scrollback.get(index).copied().unwrap_or(false),
-                ));
+    /// Reduces the mask through [`crate::grid::GridRowMap`]: every old
+    /// document row (scrollback rows first, then viewport rows) paints its
+    /// ownership onto the post-rebuild rows its content occupies.
+    ///
+    /// `viewport_had_mask = false` means "no ownership evidence yet" — the
+    /// capture path must stay unfiltered for viewport rows, so the absence
+    /// carries through (the shadow mapped `Option::as_ref` the same way).
+    pub(in crate::vt) fn from_row_map(
+        map: &crate::grid::GridRowMap,
+        pre_flags: &[bool],
+        viewport_had_mask: bool,
+    ) -> Self {
+        let total = map.old_row_new_range.last().map_or(0, |(_, last)| last + 1);
+        let mut owned = vec![false; total];
+        for ((first, last), &flag) in map.old_row_new_range.iter().zip(pre_flags) {
+            if flag {
+                for owned_flag in &mut owned[*first..=*last] {
+                    *owned_flag = true;
+                }
             }
         }
-        shadow.viewport = grid
-            .viewport
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                marked_row(
-                    row,
-                    self.viewport
-                        .as_deref()
-                        .and_then(|owned| owned.get(index))
-                        .copied()
-                        .unwrap_or(false),
-                )
-            })
-            .collect();
-        shadow.cursor = grid.cursor.clone();
-        shadow.resize(rows, cols);
-
+        let flat = map.flat_rows.min(owned.len());
+        let viewport = viewport_had_mask.then(|| {
+            let mut mask = owned
+                .get(flat..flat + map.popped)
+                .map(<[bool]>::to_vec)
+                .unwrap_or_default();
+            // Blank padding rows the pop could not fill are unowned.
+            mask.resize(map.viewport_rows, false);
+            mask
+        });
         Self {
-            scrollback: (0..shadow.scrollback.len())
-                .map(|index| {
-                    shadow
-                        .scrollback
-                        .get(index)
-                        .is_some_and(|row| row_is_owned(&row))
-                })
-                .collect(),
-            viewport: self
-                .viewport
-                .as_ref()
-                .map(|_| shadow.viewport.iter().map(row_is_owned).collect::<Vec<_>>()),
+            scrollback: owned[..flat].to_vec(),
+            viewport,
         }
     }
-}
-
-const OWNED_MARKER: CellColor = CellColor::Rgb(Color {
-    r: 11,
-    g: 37,
-    b: 73,
-    a: 0,
-});
-const UNOWNED_MARKER: CellColor = CellColor::Rgb(Color {
-    r: 73,
-    g: 37,
-    b: 11,
-    a: 0,
-});
-
-fn marked_row(row: &Row, owned: bool) -> Row {
-    let mut marked = row.clone();
-    let marker = if owned { OWNED_MARKER } else { UNOWNED_MARKER };
-    for cell in &mut marked.cells {
-        cell.bg = marker;
-    }
-    marked
-}
-
-fn row_is_owned(row: &Row) -> bool {
-    row.cells.iter().any(|cell| cell.bg == OWNED_MARKER)
 }
 
 impl Terminal {
@@ -116,20 +81,38 @@ impl Terminal {
         } else {
             &mut self.grid
         };
-        let mut ownership = self
+        // Capture the pre-resize flags in unified document order (scrollback
+        // rows, then viewport rows) — the same order the row map keys on.
+        let viewport_had_mask = self
             .capabilities
             .primary_screen_ownership
-            .reflowed(grid, rows, cols);
-        self.capabilities.primary_screen_document_candidate = grid
-            .resize_preserving_document_position(
-                self.capabilities.primary_screen_document_candidate,
-                rows,
-                cols,
-            );
-        // The shadow grid deliberately has enough capacity to observe the
-        // complete reflow, while the real grid keeps its configured
-        // scrollback cap. Align both documents after the real resize drops
-        // an overflowing oldest prefix.
+            .viewport
+            .is_some();
+        let mut pre_flags = self
+            .capabilities
+            .primary_screen_ownership
+            .scrollback
+            .clone();
+        match &self.capabilities.primary_screen_ownership.viewport {
+            Some(viewport_owned) => pre_flags.extend_from_slice(viewport_owned),
+            None => pre_flags.resize(grid.scrollback.len() + grid.num_rows, false),
+        }
+        let (new_candidate, row_map) = grid.resize_preserving_document_position(
+            self.capabilities.primary_screen_document_candidate,
+            rows,
+            cols,
+        );
+        self.capabilities.primary_screen_document_candidate = new_candidate;
+        // T5 review P2: an identity map (dimensions unchanged) carries no
+        // rows to reduce — returning an empty mask here would wipe every
+        // scrap of ownership evidence on a PTY resize that ended up a no-op.
+        let mut ownership = if row_map.old_row_new_range.is_empty() {
+            self.capabilities.primary_screen_ownership.clone()
+        } else {
+            PrimaryScreenOwnership::from_row_map(&row_map, &pre_flags, viewport_had_mask)
+        };
+        // The protocol's `apply_max_rows` may have evicted an oldest prefix;
+        // align the mask with the surviving document.
         ownership.retain_scrollback_suffix(grid.scrollback.len());
         self.capabilities.primary_screen_ownership = ownership;
     }

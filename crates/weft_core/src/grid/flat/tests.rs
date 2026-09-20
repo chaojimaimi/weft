@@ -581,71 +581,34 @@ fn content_offsets_survive_front_eviction_and_clear() {
 }
 
 #[test]
-fn materialize_all_drains_and_preserves_position_for_reencode() {
-    // T2 resize bridge contract: rows come out owned, the storage drains,
-    // and position/counters stay monotonic so anchors survive the reflow.
+fn pop_rows_pulls_the_tail_and_trims_storage() {
+    // T5 D4-5: the resize protocol pops the new viewport off the bottom of
+    // storage; the popped rows materialize in document order and the tail
+    // (blank rows past the cursor) is removed. Position never rewinds.
     let mut storage = FlatStorage::new(5, usize::MAX);
-    storage.push_rows_from_string("aaaaa\nbbbbb\n");
+    storage.push_rows_from_string("aaaaa\nbbbbb\nccccc\n");
     let position_before = storage.position();
 
-    let rows = storage.materialize_all();
+    let rows = storage.pop_rows(2);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].cells[0].character, 'a');
-    assert_eq!(rows[1].cells[0].character, 'b');
-    assert!(
-        rows[0].cells[1].flags.contains(CellFlags::DIRTY),
-        "written cells keep the write-marker"
-    );
+    assert_eq!(rows[0].cells[0].character, 'b');
+    assert_eq!(rows[1].cells[0].character, 'c');
+    assert!(rows[0].cells[1].flags.contains(CellFlags::DIRTY));
 
-    assert_eq!(storage.len(), 0);
+    assert_eq!(storage.len(), 1);
+    assert_eq!(storage.get(0).expect("row").cells[0].character, 'a');
     assert_eq!(
         storage.position(),
         position_before,
-        "drain must not rewind the anchor"
+        "pop must not rewind the anchor"
     );
 
-    // The drained rows re-encode cleanly (what resize Phase 4 does).
-    storage.extend(rows);
-    assert_eq!(storage.len(), 2);
-    assert_eq!(
-        storage.get(1).expect("row").cells[0].character,
-        'b',
-        "re-encoded history reads back identically"
-    );
-}
-
-#[test]
-fn replace_row_reencodes_in_place_and_keeps_neighbors() {
-    // T2 transitional get_mut adapter: an in-place edit must preserve every
-    // other row exactly and keep offsets monotonic (never re-zeroed).
-    let mut storage = FlatStorage::new(5, usize::MAX);
-    storage.push_rows_from_string("11111\n22222\n33333\n");
-    let end_before = storage.content.end_offset();
-
-    let mut edited = storage.get(1).expect("row 1");
-    edited.cells[0].character = 'X';
-    edited.cells[0].flags |= CellFlags::BOLD;
-    storage.replace_row(1, edited);
-
-    assert_eq!(storage.len(), 3);
-    let r0 = storage.get(0).expect("row 0");
-    let r1 = storage.get(1).expect("row 1");
-    let r2 = storage.get(2).expect("row 2");
-    assert_eq!(r0.cells[0].character, '1', "predecessor untouched");
-    assert_eq!(r1.cells[0].character, 'X');
-    assert!(r1.cells[0].flags.contains(CellFlags::BOLD), "edit lands");
-    assert_eq!(r2.cells[0].character, '3', "successor untouched");
-
-    assert!(
-        storage.content.end_offset() >= end_before,
-        "offsets never rewind"
-    );
-
-    // The whole storage still round-trips through the attribute maps.
-    let all: Vec<Row> = (0..storage.len())
-        .map(|i| storage.get(i).expect("in bounds"))
-        .collect();
-    assert_eq!(all[2].cells[1].character, '3');
+    // Popping more rows than exist yields everything (the caller pads the
+    // viewport with fresh blank rows).
+    let all = storage.pop_rows(10);
+    assert_eq!(all.len(), 1);
+    assert_eq!(storage.len(), 0);
+    assert_eq!(storage.position(), position_before);
 }
 
 #[test]

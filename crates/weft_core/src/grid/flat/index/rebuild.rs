@@ -161,12 +161,13 @@ impl EntryBuilder {
 
         let mut remaining = count.get() as usize;
         while remaining > 0 {
-            if self.num_cells == index.columns {
-                // Row exactly full: flush and continue in a fresh row (the
-                // slow path cuts lazily at the same point).
+            if self.num_cells >= index.columns {
+                // Row full (or over-full from a degenerate prior wide
+                // grapheme): flush and continue in a fresh row — the slow
+                // path cuts lazily at the same point.
                 mem::take(self).append_to_index(index);
             }
-            let take = remaining.min(index.columns - self.num_cells);
+            let take = remaining.min(index.columns.saturating_sub(self.num_cells));
             self.num_cells += take;
             self.incr_content_offset += take;
             match self.grapheme_runs.last_mut() {

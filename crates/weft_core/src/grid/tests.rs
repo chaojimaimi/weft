@@ -2031,38 +2031,174 @@ fn resize_row_growth_pads_viewport_with_fresh_blank_rows() {
     }
 }
 
-// ── PLAN_audit_fix_batch3 3B: Scrollback::into_rows unit tests ───────────
+// ── T5: D4 protocol — G5 regression + cursor migration spec ────────────
 
-fn row_with_label(label: char) -> Row {
-    let mut row = Row::new(2);
-    row.cells[0].character = label;
-    row
-}
-
+/// G5 (PLAN_S3 成功判据): cursor parked on an EMPTY bottom row + three
+/// resizes — content must survive and the position anchor must stay
+/// monotonic. The pre-S3 reflow lost scrollback here (blank-row inflation
+/// shifted the window); the D4 protocol makes loss structurally impossible:
+/// content rows are never dropped, only blank rows after the cursor are.
 #[test]
-fn scrollback_into_rows_moves_rotated_ring_in_logical_order() {
-    let mut sb = Scrollback::new(4);
-    for label in ['a', 'b', 'c', 'd', 'e', 'f'] {
-        sb.push(row_with_label(label));
+fn cursor_on_empty_row_survives_three_resizes_without_content_loss() {
+    let mut grid = Grid::with_scrollback(5, 20, 200);
+    // Ten content lines, then the cursor rests on a fresh empty row.
+    for i in 0..10 {
+        let label = format!("line-{i:02}");
+        for (c, ch) in label.chars().enumerate() {
+            grid.viewport[4].cells[c].character = ch;
+        }
+        grid.cursor.row = 4;
+        grid.newline();
     }
-    // The ring retains the newest 4 rows (c..f); into_rows consumes the
-    // buffer and must unwrap them to logical order.
-    let rows = sb.into_rows();
-    let text: String = rows.iter().map(|r| r.cells[0].character).collect();
-    assert_eq!(text, "cdef", "rotated ring must unwrap to logical order");
+    grid.set_scroll_offset(0);
+    let position_before = grid.scrollback.position();
+
+    // Three resize cycles (shrink, grow, settle).
+    grid.resize(3, 12);
+    grid.resize(7, 30);
+    grid.resize(5, 20);
+
     assert!(
-        Scrollback::new(4).into_rows().is_empty(),
-        "empty ring yields no rows"
+        grid.scrollback.position() >= position_before,
+        "position anchor must be monotonic across resizes"
     );
+    // Every content line still exists in the document (scrollback + viewport).
+    let mut all_text = String::new();
+    for i in 0..grid.scrollback_len() {
+        let row = grid.scrollback.get(i).expect("history row");
+        all_text.push_str(&row.cells.iter().map(|c| c.character).collect::<String>());
+        all_text.push('\n');
+    }
+    for row in &grid.viewport {
+        all_text.push_str(&row.cells.iter().map(|c| c.character).collect::<String>());
+        all_text.push('\n');
+    }
+    for i in 0..10 {
+        assert!(
+            all_text.contains(&format!("line-{i:02}")),
+            "content line {i} lost across three resizes"
+        );
+    }
 }
 
+/// Cursor migration spec (Warp resize.rs behaviour table): a mid-content
+/// cursor tracks its character through the re-wrap.
 #[test]
-fn scrollback_into_rows_moves_unwrapped_buffer_in_order() {
-    let mut sb = Scrollback::new(8);
-    for label in ['a', 'b', 'c'] {
-        sb.push(row_with_label(label));
+fn resize_maps_cursor_to_its_character_in_the_new_wrap() {
+    let mut grid = Grid::with_scrollback(4, 10, 50);
+    // One content line; the cursor sits mid-word (after the 'u' of "quick").
+    let line = "The quick";
+    for (c, ch) in line.chars().enumerate() {
+        grid.viewport[0].cells[c].character = ch;
     }
-    let rows = sb.into_rows();
-    let text: String = rows.iter().map(|r| r.cells[0].character).collect();
-    assert_eq!(text, "abc");
+    grid.cursor.row = 0;
+    grid.cursor.col = 6;
+    grid.resize(4, 8);
+
+    // "The quick" at 8 cols wraps after "The quic"; the cursor (between
+    // 'u' and 'i') follows its character into the continuation row.
+    let ch = grid.cell(grid.cursor.row, grid.cursor.col).character;
+    assert_eq!(ch, 'i', "cursor must track its character through re-wrap");
+    assert!(grid.cursor.row < grid.num_rows);
+}
+
+/// The D4 structural fix for the pre-S3 loss: with the cursor parked past
+/// the content end on a fresh row, a shrinking resize must NOT push content
+/// rows into scrollback (the legacy window top-anchors at the cursor's
+/// line, so content above the cursor stays in the viewport).
+#[test]
+fn resize_keeps_content_above_cursor_in_viewport() {
+    let mut grid = Grid::with_scrollback(5, 10, 100);
+    let row_labels = ['A', 'I', 'Q'];
+    for (r, label) in row_labels.iter().enumerate() {
+        for c in 0..8 {
+            grid.viewport[r].cells[c].character = (*label as u8 + c as u8) as char;
+        }
+    }
+    grid.cursor.row = 2;
+    grid.cursor.col = 8;
+    let sb_before = grid.scrollback_len();
+    grid.resize(4, 12);
+    assert_eq!(
+        grid.scrollback_len(),
+        sb_before,
+        "shrink with cursor at the content boundary must not create history"
+    );
+    // The content rows are still the viewport's first rows.
+    assert_eq!(grid.cell(0, 0).character, 'A');
+    assert_eq!(grid.cell(1, 0).character, 'I');
+    assert_eq!(grid.cell(2, 0).character, 'Q');
+}
+
+/// T5 review P0 probe 1: `[blank]["abc"][cursor-blank]` shrink. The
+/// collapsed blank row above the cursor used to shift the pushed-sequence
+/// index fed to the row map, dropping the cursor onto row 0 ('a') instead
+/// of its own position at the start of the collapsed document's second
+/// content row.
+#[test]
+fn resize_blank_above_cursor_anchors_at_mapped_line() {
+    let mut grid = Grid::with_scrollback(3, 10, 50);
+    grid.viewport[1].cells[0].character = 'a';
+    grid.viewport[1].cells[1].character = 'b';
+    grid.viewport[1].cells[2].character = 'c';
+    grid.cursor.row = 2; // parked on an empty row below "abc"
+    grid.cursor.col = 0;
+
+    grid.resize(3, 8);
+
+    assert_eq!(
+        (grid.cursor.row, grid.cursor.col),
+        (1, 0),
+        "cursor must anchor at its logical line, not the collapsed index"
+    );
+    // The buggy indexing dropped the cursor onto row 0 ('a'); "abc" itself
+    // stays in viewport row 0 and the cursor rests on its own blank row.
+    assert_eq!(grid.cell(0, 0).character, 'a', "'a' must not be stomped");
+    // Content intact: "abc" and the cursor's blank row both survive.
+    let mut seen = String::new();
+    for i in 0..grid.scrollback_len() {
+        let text = grid
+            .scrollback
+            .get(i)
+            .expect("row")
+            .cells
+            .iter()
+            .map(|c| c.character)
+            .collect::<String>();
+        seen.push_str(text.trim_end());
+        seen.push('\n');
+    }
+    for row in &grid.viewport {
+        let text = row.cells.iter().map(|c| c.character).collect::<String>();
+        seen.push_str(text.trim_end());
+        seen.push('\n');
+    }
+    assert!(seen.contains("abc\n"), "content lost: {seen:?}");
+}
+
+/// T5 review P0 probe 2: blank row BETWEEN two content rows and below the
+/// cursor's neighbours — `[abcd][blank][wxyz][cursor-blank]`. Same index-
+/// space mix-up: the cursor landed on row 1 ('w' of wxyz) instead of row 2.
+#[test]
+fn resize_blank_between_content_rows_anchors_at_mapped_line() {
+    let mut grid = Grid::with_scrollback(4, 10, 50);
+    for (c, ch) in "abcd".chars().enumerate() {
+        grid.viewport[0].cells[c].character = ch;
+    }
+    for (c, ch) in "wxyz".chars().enumerate() {
+        grid.viewport[2].cells[c].character = ch;
+    }
+    grid.cursor.row = 3; // parked on an empty row below "wxyz"
+    grid.cursor.col = 0;
+
+    grid.resize(4, 8);
+
+    assert_eq!(
+        (grid.cursor.row, grid.cursor.col),
+        (2, 0),
+        "cursor must anchor at its logical line, not the collapsed index"
+    );
+    // "wxyz" sits in viewport row 1 (the collapsed blank row 1 has no
+    // bytes); the buggy indexing dropped the cursor onto it ('w').
+    assert_eq!(grid.cell(1, 0).character, 'w', "'w' must not be stomped");
 }

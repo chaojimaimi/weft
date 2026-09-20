@@ -7,7 +7,6 @@ pub mod flat;
 mod reflow;
 mod row;
 mod row_extras;
-mod scrollback;
 mod snapshot;
 mod snapshot_line_map;
 pub use cell::{
@@ -17,7 +16,6 @@ pub use cell::{
 pub use cursor::{Cursor, CursorStyle};
 pub use row::Row;
 pub use row_extras::{CellExtra, RowExtras};
-pub use scrollback::Scrollback;
 
 use flat::FlatStorage;
 use std::sync::Arc;
@@ -1109,296 +1107,137 @@ impl Grid {
     }
 
     pub fn resize(&mut self, new_rows: usize, new_cols: usize) {
+        self.resize_impl(new_rows, new_cols);
+    }
+
+    /// D4 resize protocol (PLAN_S3 §二 D4, ported from Warp
+    /// `grid/resize.rs::resize_storage`): push the whole viewport into flat
+    /// storage without truncation, convert the cursor to a content offset,
+    /// rebuild the row index at the new width (zero content copies), map the
+    /// offset back to a position, pop the new viewport off the bottom of
+    /// storage (dropping only the blank rows past the cursor), then apply
+    /// the retention limit.
+    ///
+    /// This replaces the T2 bridge (materialize everything → legacy rewrap →
+    /// re-encode, three full passes) with one `Index::rebuild`.
+    fn resize_impl(&mut self, new_rows: usize, new_cols: usize) -> GridRowMap {
         if new_rows == self.num_rows && new_cols == self.num_cols {
-            return;
+            return GridRowMap::identity();
         }
+        let old_num_rows = self.num_rows;
+        let sb_pre = self.scrollback.len();
 
-        // ── Phase 1: Collect all rows ────────────────────────────────
-        // 3B: rows MOVE out of the ring (was per-row clone); Phase 4 rebuilds
-        // it. T2 bridge: materialize the flat history (cold path) and drain
-        // the storage; Phase 4 re-encodes it. position / counters stay
-        // monotonic (D3 评审 P2-1: anchors survive the reflow instead of
-        // collapsing with the old ring swap).
-        let mut all_rows: Vec<Row> = self.scrollback.materialize_all();
-        let scrollback_len = all_rows.len();
-        for row in self.viewport.drain(..) {
-            all_rows.push(row);
-        }
-        let old_cursor_all_idx = scrollback_len + self.cursor.row;
-
-        // ── Phase 2: Group into logical lines ────────────────────────
-        // A logical line is a sequence of rows where 2nd+ rows have
-        // wrapped=true. Merging wrapped rows into one cell buffer allows
-        // proper reflow: narrowing wraps, widening unwraps.
-        //
-        // v1.6.1: RowExtras (grapheme clusters + hyperlink ids) are merged
-        // alongside cells so they survive resize/reflow. The merge offset
-        // is the current `merge_buf.len()` (the column position where the
-        // row's content begins in the logical line).
-        struct LogicalLine {
-            cells: Vec<Cell>,
-            has_cursor: bool,
-            cursor_buf_offset: usize,
-            /// v1.6.1: merged extras for this logical line. Entries are keyed
-            /// by column index in the merged cell buffer. During rewrap
-            /// (Phase 3), they're split back into per-row extras.
-            extras: RowExtras,
-        }
-
-        let mut lines: Vec<LogicalLine> = Vec::new();
-        let mut merge_buf: Vec<Cell> = Vec::new();
-        let mut merge_extras: RowExtras = RowExtras::new();
-        let mut merge_has_cursor = false;
-        let mut merge_cursor_offset: usize = 0;
-
-        // v1.6.1: flush_line now also accepts the merged extras. The closure
-        // takes ownership of both `buf` and `extras` and stores them in the
-        // LogicalLine. An empty line (all blanks, no cursor) is dropped, but
-        // its extras are also dropped since they can't correspond to real
-        // content.
-        let flush_line = |buf: Vec<Cell>,
-                          has_cur: bool,
-                          cur_off: usize,
-                          extras: RowExtras,
-                          lines: &mut Vec<LogicalLine>| {
-            let empty = !has_cur && buf.iter().all(|c| c.character == ' ' && c.flags.is_empty());
-            if !empty {
-                lines.push(LogicalLine {
-                    cells: buf,
-                    has_cursor: has_cur,
-                    cursor_buf_offset: cur_off,
-                    extras,
-                });
-            }
+        // ── D4-1/2: cursor state + push the whole viewport (no truncation).
+        let cursor_row = self.cursor.row.min(old_num_rows.saturating_sub(1));
+        let logical_col = if self.cursor.wrap_pending {
+            self.num_cols
+        } else {
+            self.cursor.col.min(self.num_cols.saturating_sub(1))
         };
-
-        // Track the PREVIOUS row's wrapped flag. wrapped=true means
-        // "this row's content continues on the next row", so we check
-        // prev_wrapped to detect if the current row is a continuation.
-        let mut prev_wrapped = false;
-
-        // FIX-β (docs/FIX_DRAG_RESIZE_STUTTER.md) β-2: read-only pre-scan —
-        // exact per-row content extents (the loop below never re-scans) and
-        // exact per-line cell totals (each `merge_buf` is armed with its
-        // final capacity, so `extend` fills it and never doubles). The
-        // capacities are advisory: a prescan/grouping divergence would only
-        // lose precision (natural doubling), never correctness.
-        let scan = reflow::prescan(&all_rows);
-        let content_ends = scan.content_ends;
-        let mut next_line_cap = scan.line_caps.into_iter();
-        // FIX-β β-1: old rows recycle through this pool — Phase 2 moves each
-        // row in after merging its cells, Phase 3 draws wrapped rows from it
-        // (`reflow::recycled_row`). Buffer identity cycles: Phase 4's rows
-        // come back here on the NEXT resize, so oscillating resizes converge
-        // to near-zero reallocation (surplus drops with the pool).
-        let mut row_pool: Vec<Row> = Vec::new();
-
-        for (all_idx, row) in all_rows.into_iter().enumerate() {
-            let is_cursor_row = all_idx == old_cursor_all_idx;
-
-            // Content extent (β-2): precomputed by the prescan — the
-            // trailing-blank trim rationale lives on `reflow`'s
-            // `row_content_end`.
-            let content_end = content_ends[all_idx];
-
-            let is_continuation = prev_wrapped && !merge_buf.is_empty();
-            prev_wrapped = row.wrapped;
-
-            if !is_continuation {
-                // Flush previous logical line
-                if !merge_buf.is_empty() {
-                    flush_line(
-                        std::mem::take(&mut merge_buf),
-                        merge_has_cursor,
-                        merge_cursor_offset,
-                        std::mem::take(&mut merge_extras),
-                        &mut lines,
-                    );
-                }
-                // FIX-β β-2: arm the buffer this boundary OPENS with its
-                // exact prescanned length. Every row crosses this branch
-                // (the first row too: prev_wrapped starts false), so no
-                // separate pre-loop arm is needed.
-                merge_buf = Vec::with_capacity(next_line_cap.next().unwrap_or(0));
-                merge_has_cursor = false;
-                merge_cursor_offset = 0;
-            }
-
-            // Track cursor offset in the merged buffer.
-            // Use cursor.col directly — the cursor can legitimately be beyond
-            // content (e.g. after a CSI cursor-move on an empty line at col 5).
-            if is_cursor_row {
-                merge_cursor_offset = merge_buf.len() + self.cursor.col;
-                merge_has_cursor = true;
-            }
-
-            // v1.6.1: merge this row's extras into the logical line's extras
-            // at the current buffer offset. Only entries for columns < content_end
-            // are relevant (beyond that is trimmed blanks). `merge_shifted`
-            // with cols=usize::MAX keeps all entries since the logical line
-            // has no width limit.
-            let offset = merge_buf.len();
-            merge_extras.merge_shifted(&row.extras, offset, usize::MAX);
-
-            merge_buf.extend(row.cells.iter().take(content_end).cloned());
-            // FIX-β β-1: the row's cells are merged — recycle the buffer.
-            row_pool.push(row);
+        let viewport_rows = std::mem::take(&mut self.viewport);
+        let cursor_flat_target = sb_pre + cursor_row;
+        let mut cursor_flat = sb_pre;
+        let mut old_ends: Vec<usize> = Vec::with_capacity(sb_pre + old_num_rows);
+        let mut old_wrapped: Vec<bool> = Vec::with_capacity(sb_pre + old_num_rows);
+        for i in 0..sb_pre {
+            old_ends.push(self.scrollback.content_range_end(i).unwrap_or(0));
+            old_wrapped.push(self.scrollback.row_wraps(i));
         }
-        // Flush last line
-        if !merge_buf.is_empty() {
-            flush_line(
-                merge_buf,
-                merge_has_cursor,
-                merge_cursor_offset,
-                merge_extras,
-                &mut lines,
+        // All-blank viewport rows collapse here, exactly as the legacy
+        // reflow's `flush_line` dropped empty lines (unless the cursor sat
+        // on them): otherwise blank-row debris accumulates in scrollback
+        // across resize cycles. Collapsed rows record a zero-width entry in
+        // the row map so mask/anchor indices stay aligned with their callers.
+        for (idx, row) in viewport_rows.into_iter().enumerate() {
+            let is_cursor_row = sb_pre + idx == cursor_flat_target;
+            if !is_cursor_row && row_is_all_blank(&row) {
+                // Collapsed rows still occupy a map entry (zero-width) —
+                // old_ends/old_wrapped stay in FULL-DOCUMENT index space so
+                // the ownership mask and anchor lookups key on the same
+                // indices the callers hold.
+                old_ends.push(old_ends.last().copied().unwrap_or(0));
+                old_wrapped.push(row.wrapped);
+                continue;
+            }
+            self.scrollback.push_without_truncation(row);
+            self.history_window_valid = false;
+            old_ends.push(
+                self.scrollback
+                    .content_range_end(self.scrollback.len() - 1)
+                    .unwrap_or(0),
             );
+            old_wrapped.push(self.scrollback.row_wraps(self.scrollback.len() - 1));
+            if sb_pre + idx < cursor_flat_target {
+                cursor_flat += 1;
+            }
         }
 
-        // ── Phase 3: Rewrap each logical line ────────────────────────
-        // v1.6.1: extras are split at wrap boundaries so each wrapped row
-        // gets the extras for its portion of the line. `split_off` removes
-        // entries at [wrap_col, cols) from the logical line's extras and
-        // returns them as a new RowExtras for the next wrapped row.
-        let mut wrapped_rows: Vec<Row> = Vec::new();
-        let mut cursor_wrap_start = 0;
-        let mut new_cursor_col = 0;
+        // ── D4-3: cursor → content offset (anchored to the cell left of the
+        // cursor so the position tracks its content through the re-wrap).
+        let anchor = self.scrollback.cursor_anchor(cursor_flat, logical_col);
 
-        for line in &lines {
-            let line_start = wrapped_rows.len();
-            if line.has_cursor {
-                cursor_wrap_start = line_start;
-            }
+        // ── D4-4: re-wrap at the new width (content bytes untouched).
+        self.scrollback.set_columns(new_cols);
 
-            let mut current = reflow::recycled_row(&mut row_pool, new_cols);
-            current.wrapped = false;
-            let mut col: usize = 0;
-            // v1.6.1: track this line's extras, splitting off entries for
-            // each wrapped row as we go. We consume `line.extras` by cloning
-            // (can't take &mut of a borrowed line) — the clone is cheap
-            // because extras are sparse (most rows have 0-2 entries).
-            let mut line_extras = line.extras.clone();
+        // ── Row map: old document rows (scrollback then viewport) → the
+        // post-rebuild flat rows their content occupies. Content offsets are
+        // stable, so a two-pointer walk over the per-row ranges is exact.
+        let new_total = self.scrollback.len();
+        let new_ends: Vec<usize> = (0..new_total)
+            .map(|i| self.scrollback.content_range_end(i).unwrap_or(usize::MAX))
+            .collect();
+        let map = build_row_map(&old_ends, &new_ends);
 
-            for (buf_idx, cell) in line.cells.iter().enumerate() {
-                // Record cursor position when we reach its offset
-                if line.has_cursor && buf_idx == line.cursor_buf_offset {
-                    new_cursor_col = col;
-                }
+        // ── D4-5: content offset → (row, col, wrap_pending).
+        let (_, cursor_col_new, wrap_pending) =
+            self.scrollback.cursor_point_from_anchor(anchor, new_cols);
 
-                // Wrap to next sub-row if current is full
-                if col >= new_cols {
-                    current.wrapped = true;
-                    // v1.6.1: split extras at the wrap boundary. Entries in
-                    // [0, new_cols) stay with the current row; entries in
-                    // [new_cols, ∞) move to the next row (shifted to start at 0).
-                    let tail = line_extras.split_off(new_cols, usize::MAX);
-                    current.extras = line_extras;
-                    wrapped_rows.push(current);
-                    current = reflow::recycled_row(&mut row_pool, new_cols);
-                    line_extras = tail;
-                    col = 0;
-                    if line.has_cursor && buf_idx == line.cursor_buf_offset {
-                        new_cursor_col = 0;
-                    }
-                }
-
-                // Skip wide spacers from old layout
-                if cell.flags.contains(CellFlags::WIDE_SPACER) {
-                    continue;
-                }
-
-                // Wide char at last column doesn't fit — wrap first.
-                if cell.width == CellWidth::Full && col + 1 >= new_cols && col > 0 {
-                    current.wrapped = true;
-                    // v1.6.1: split extras before wrapping (same as above).
-                    let tail = line_extras.split_off(new_cols, usize::MAX);
-                    current.extras = line_extras;
-                    wrapped_rows.push(current);
-                    current = reflow::recycled_row(&mut row_pool, new_cols);
-                    line_extras = tail;
-                    col = 0;
-                    if line.has_cursor && buf_idx == line.cursor_buf_offset {
-                        new_cursor_col = 0;
-                    }
-                }
-
-                if col < new_cols {
-                    // Cell is Copy (PLAN_S3 D1 评审 P1-1): a plain field copy.
-                    current.cells[col] = *cell;
-                    current.mark_dirty(col);
-
-                    if cell.width == CellWidth::Full && col + 1 < new_cols {
-                        current.cells[col + 1].character = ' ';
-                        current.cells[col + 1].flags = CellFlags::WIDE_SPACER;
-                        current.cells[col + 1].width = CellWidth::Half;
-                        current.mark_dirty(col + 1);
-                    }
-
-                    col += cell.width as usize;
-                }
-            }
-            // Handle cursor at end of content (beyond all cells)
-            if line.has_cursor && line.cursor_buf_offset >= line.cells.len() {
-                if col >= new_cols {
-                    current.wrapped = true;
-                    let tail = line_extras.split_off(new_cols, usize::MAX);
-                    current.extras = line_extras;
-                    wrapped_rows.push(current);
-                    current = reflow::recycled_row(&mut row_pool, new_cols);
-                    line_extras = tail;
-                    col = 0;
-                }
-                new_cursor_col = col;
-            }
-            // v1.6.1: assign remaining extras to the last wrapped row.
-            current.extras = line_extras;
-            wrapped_rows.push(current);
+        // Document-space walk-back: the map (and every downstream consumer —
+        // ownership mask, frozen boundary) is keyed by document row, not by
+        // the post-collapse pushed sequence.
+        let mut line_first = sb_pre + cursor_row;
+        while line_first > 0 && old_wrapped[line_first - 1] {
+            line_first -= 1;
         }
-
-        // ── Phase 4: Split into scrollback + viewport ────────────────
-        let total = wrapped_rows.len();
-        let (vp_start, new_cursor_row) = if total <= new_rows {
-            let cursor_row = cursor_wrap_start.min(total.saturating_sub(1));
-            (0, cursor_row)
-        } else {
-            let ideal_start = cursor_wrap_start.saturating_sub(new_rows.saturating_sub(1));
-            let max_start = total.saturating_sub(new_rows);
-            let vp_start = ideal_start.min(max_start);
-            let cursor_row = cursor_wrap_start.saturating_sub(vp_start);
-            (vp_start, cursor_row)
-        };
-
-        // 3B: split_off/extend MOVE rows into place (was clone + to_vec);
-        // surplus rows past the viewport window drop as the old slice did.
-        if total <= new_rows {
-            let mut vp = Vec::with_capacity(new_rows);
-            vp.extend(wrapped_rows);
-            vp.resize(new_rows, Row::new(new_cols));
-            self.viewport = vp;
-        } else {
-            let mut vp = wrapped_rows.split_off(vp_start);
-            vp.truncate(new_rows);
-            self.scrollback.extend(wrapped_rows);
-            self.viewport = vp;
+        let line_new_start = map.get(line_first).copied().map_or(0, |(first, _)| first);
+        let vp_start = line_new_start
+            .saturating_sub(new_rows.saturating_sub(1))
+            .min(new_total.saturating_sub(new_rows));
+        let mut popped = self.scrollback.pop_rows(new_total.saturating_sub(vp_start));
+        let popped_real = new_rows.min(popped.len());
+        let mut viewport_rows: Vec<Row> = popped.drain(..popped_real).collect();
+        if viewport_rows.len() < new_rows {
+            viewport_rows.resize(new_rows, Row::new(new_cols));
         }
-        // T2 bridge: rows were re-encoded at `new_cols` — track the width
-        // without a second Index::rebuild.
-        self.scrollback.set_columns_no_rebuild(new_cols);
+        self.viewport = viewport_rows;
 
+        // ── Dimensions, cursor, and the retention limit.
         self.num_rows = new_rows;
         self.num_cols = new_cols;
         self.scroll_bottom = new_rows.saturating_sub(1);
         self.scroll_top = 0;
         self.tabstops = Self::init_tabstops(new_cols);
-        self.set_scroll_offset(0);
 
-        self.cursor.row = new_cursor_row.min(new_rows.saturating_sub(1));
-        self.cursor.col = new_cursor_col.min(new_cols.saturating_sub(1));
-        self.cursor.wrap_pending = false;
+        self.cursor.row = line_new_start
+            .saturating_sub(vp_start)
+            .min(new_rows.saturating_sub(1));
+        self.cursor.col = cursor_col_new.min(new_cols.saturating_sub(1));
+        self.cursor.wrap_pending = wrap_pending;
+        self.set_scroll_offset(0);
         // v1.0 P0-b: all rows are new/rearranged after a reflow.
         self.mark_all_dirty();
-    }
+        self.scrollback.apply_max_rows();
 
+        GridRowMap {
+            old_row_new_range: map,
+            flat_rows: vp_start,
+            popped: popped_real,
+            viewport_rows: new_rows,
+        }
+    }
+}
+
+impl Grid {
     /// Clear the entire screen and reset cursor.
     pub fn clear(&mut self) {
         for row in &mut self.viewport {
@@ -1420,5 +1259,67 @@ impl Grid {
     /// Get scroll region boundaries (read-only).
     pub fn scroll_region(&self) -> (usize, usize) {
         (self.scroll_top, self.scroll_bottom)
+    }
+}
+
+/// The legacy reflow's blank-line predicate (`flush_line`): every cell
+/// is a never-written default. Written blanks (DIRTY) keep their row.
+fn row_is_all_blank(row: &Row) -> bool {
+    row.cells
+        .iter()
+        .all(|cell| cell.character == ' ' && cell.flags.is_empty())
+}
+
+/// Old row `i` (of `old_ends.len()`) maps to the post-rebuild rows
+/// `[first, last]` — the rows containing its first and last byte. Both
+/// range lists partition the same content stream in order. Collapsed
+/// zero-byte rows anchor at the row containing their position. Stateless
+/// per-row partition (no carry-over state to go stale across rows).
+fn build_row_map(old_ends: &[usize], new_ends: &[usize]) -> Vec<(usize, usize)> {
+    if old_ends.is_empty() || new_ends.is_empty() {
+        return Vec::new();
+    }
+    // First new row whose end lies past `byte` — the row containing it.
+    let row_containing = |byte: usize| -> usize {
+        let candidate = new_ends.partition_point(|&end| end <= byte);
+        candidate.min(new_ends.len() - 1)
+    };
+    let mut map = Vec::with_capacity(old_ends.len());
+    let mut prev_end = 0usize;
+    for &end in old_ends {
+        if end == prev_end {
+            let at = row_containing(prev_end);
+            map.push((at, at));
+        } else {
+            let first = row_containing(prev_end);
+            let last = row_containing(end - 1);
+            map.push((first, last));
+        }
+        prev_end = end;
+    }
+    map
+}
+
+/// Old→new row mapping computed by the D4 resize protocol: for each
+/// pre-resize document row (scrollback rows first, then viewport rows), the
+/// inclusive post-rebuild flat-row range its content occupies.
+pub(crate) struct GridRowMap {
+    pub old_row_new_range: Vec<(usize, usize)>,
+    /// Flat rows remaining after the viewport pop-back.
+    pub flat_rows: usize,
+    /// Rows popped back into the viewport (before blank padding).
+    pub popped: usize,
+    /// The new viewport height — mask consumers pad up to it.
+    pub viewport_rows: usize,
+}
+
+impl GridRowMap {
+    pub(crate) fn identity() -> Self {
+        Self {
+            old_row_new_range: Vec::new(),
+            flat_rows: 0,
+            popped: 0,
+            viewport_rows: 0,
+        }
     }
 }

@@ -2,7 +2,7 @@
 mod snapshot_row; // v1.11.3: gate budget
 
 use self::snapshot_row::{mark_snapshot_truncated, push_snapshot_text, styled_row};
-use super::{CellColor, CellFlags, Color, Grid, Row};
+use super::{Grid, Row};
 use crate::blocks::{StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
 use std::sync::Arc;
 
@@ -23,141 +23,49 @@ pub(crate) fn url_to_string(url: Arc<str>) -> String {
 
 // T2: flat history materializes owned rows (no `&Row` to lend), so retained
 // rows are handed out by value. All uses are read-only cold paths.
-fn retained_row(grid: &Grid, index: usize) -> Option<Row> {
-    if index < grid.scrollback.len() {
-        grid.scrollback.get(index)
-    } else {
-        grid.viewport
-            .get(index.saturating_sub(grid.scrollback.len()))
-            .cloned()
-    }
-}
-
-fn row_content_end(row: &Row) -> usize {
-    row.cells
-        .iter()
-        .rposition(|cell| cell.character != ' ' || !cell.flags.is_empty())
-        .map(|index| index + 1)
-        .unwrap_or(0)
-}
-
 impl Grid {
     /// Reflow once while mapping an absolute row boundary to the rebuilt
-    /// document. A temporary cell marker preserves a boundary that points at
-    /// a blank row or into a wrapped logical line.
+    /// document.
+    ///
+    /// T5 (D4): the boundary maps through the resize's row map — the anchor
+    /// row's content occupies a contiguous post-rebuild row range, and the
+    /// boundary lands on its first row. This replaces the marker-cell trick
+    /// (write marker bg -> resize -> hunt marker -> restore): no cell
+    /// mutation, no `replace_row` re-encode, and the anchor can no longer
+    /// drift when the marked column wraps differently.
     pub(crate) fn resize_preserving_document_position(
         &mut self,
         document_start: u64,
         new_rows: usize,
         new_cols: usize,
-    ) -> u64 {
+    ) -> (u64, crate::grid::GridRowMap) {
         if new_rows == self.num_rows && new_cols == self.num_cols {
-            return document_start;
+            return (document_start, crate::grid::GridRowMap::identity());
         }
         let retained_start = self
             .scrollback
             .position()
             .saturating_sub(self.scrollback.len() as u64);
-        let retained_index = document_start.saturating_sub(retained_start) as usize;
-        let scrollback_len = self.scrollback.len();
-        let retained_len = scrollback_len.saturating_add(self.num_rows);
-        let direct_column = retained_row(self, retained_index).and_then(|row| {
-            let end = row_content_end(&row);
-            row.cells[..end]
-                .iter()
-                .position(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
-        });
-        let (marker_row, marker_column, after_line) = if let Some(column) = direct_column {
-            (retained_index, column, false)
-        } else {
-            let previous = (0..retained_index.min(retained_len))
-                .rev()
-                .find_map(|index| {
-                    let row = retained_row(self, index)?;
-                    let end = row_content_end(&row);
-                    row.cells[..end]
-                        .iter()
-                        .rposition(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
-                        .map(|column| (index, column))
-                });
-            let Some((row, column)) = previous else {
-                self.resize(new_rows, new_cols);
-                return 0;
-            };
-            (row, column, true)
-        };
-        const MARKER: CellColor = CellColor::Rgb(Color {
-            r: 17,
-            g: 29,
-            b: 43,
-            a: 0,
-        });
-        // T2 transitional adapter: flat rows materialize owned, so the marker
-        // is written back through a targeted re-encode (`replace_row`). T5
-        // deletes this whole marker-cell technique for a content-offset anchor.
-        let original_bg = if marker_row < scrollback_len {
-            let Some(mut row) = self.scrollback.get(marker_row) else {
-                self.resize(new_rows, new_cols);
-                return document_start;
-            };
-            let Some(cell) = row.cells.get_mut(marker_column) else {
-                self.resize(new_rows, new_cols);
-                return document_start;
-            };
-            let original_bg = cell.bg;
-            cell.bg = MARKER;
-            self.scrollback.replace_row(marker_row, row);
-            original_bg
-        } else {
-            let Some(row) = self
-                .viewport
-                .get_mut(marker_row.saturating_sub(scrollback_len))
-            else {
-                self.resize(new_rows, new_cols);
-                return document_start;
-            };
-            let Some(cell) = row.cells.get_mut(marker_column) else {
-                self.resize(new_rows, new_cols);
-                return document_start;
-            };
-            let original_bg = cell.bg;
-            cell.bg = MARKER;
-            original_bg
-        };
-        self.resize(new_rows, new_cols);
+        // The anchor names a document row: its index within the unified
+        // (scrollback + viewport) row sequence, clamped into range.
+        let old_row_index = document_start.saturating_sub(retained_start) as usize;
 
-        let marker = (0..self.scrollback.len().saturating_add(self.num_rows)).find_map(|index| {
-            retained_row(self, index)
-                .and_then(|row| row.cells.iter().position(|cell| cell.bg == MARKER))
-                .map(|column| (index, column))
-        });
-        let Some((marker_row, marker_column)) = marker else {
-            return document_start;
-        };
-        if marker_row < self.scrollback.len() {
-            let mut row = self
-                .scrollback
-                .get(marker_row)
-                .expect("marker row must exist in flat history");
-            row.cells[marker_column].bg = original_bg;
-            self.scrollback.replace_row(marker_row, row);
-        } else {
-            self.viewport[marker_row - self.scrollback.len()].cells[marker_column].bg = original_bg;
-        }
-        let mut boundary_row = marker_row;
-        if after_line {
-            loop {
-                let wrapped = retained_row(self, boundary_row).is_some_and(|row| row.wrapped);
-                boundary_row = boundary_row.saturating_add(1);
-                if !wrapped {
-                    break;
-                }
-            }
-        }
-        self.scrollback
+        let map = self.resize_impl(new_rows, new_cols);
+
+        let (first_new_row, _) = map
+            .old_row_new_range
+            .get(old_row_index)
+            .copied()
+            .unwrap_or((0, 0));
+        let retained_start_post = self
+            .scrollback
             .position()
-            .saturating_sub(self.scrollback.len() as u64)
-            .saturating_add(boundary_row as u64)
+            .saturating_sub(self.scrollback.len() as u64);
+        let mapped = retained_start_post + first_new_row as u64;
+        // The map covers rows post-rebuild; `apply_max_rows` may have
+        // evicted an oldest prefix — the boundary clamps into the surviving
+        // document instead of pointing past its start.
+        (mapped.max(retained_start_post), map)
     }
 
     /// Snapshot the rows produced since `scrollback_start`, followed by the
@@ -497,6 +405,7 @@ impl Grid {
 
 #[cfg(test)]
 mod tests {
+    use super::super::CellFlags;
     use super::*;
 
     fn row(text: &str, cols: usize) -> Row {
@@ -701,7 +610,7 @@ mod tests {
         grid.cursor.row = 4;
         let document_start = grid.scrollback.position() + 3;
 
-        let mapped = grid.resize_preserving_document_position(document_start, 6, 6);
+        let (mapped, _map) = grid.resize_preserving_document_position(document_start, 6, 6);
         let snapshot = grid.document_snapshot_from_position(mapped).0;
 
         assert!(!snapshot.contains("old shell"));

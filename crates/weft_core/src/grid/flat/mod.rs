@@ -18,9 +18,10 @@
 //! - Width authority: `Cell.width` (评审 P2); nothing recomputes widths from
 //!   the text.
 //!
-//! T2: wired as `Grid.scrollback`. `materialize_all` / `replace_row` are the
-//! two transitional bridges for the old reflow and the marker-cell trick —
-//! both cold paths, both scheduled to die in T5/T6.
+//! T5: the storage is the sole history surface. `Grid::resize` runs the D4
+//! protocol through it (`push_without_truncation` → `set_columns` →
+//! `pop_rows`), the old Cell-ring `Scrollback` is deleted, and the frozen
+//! 133 boundary + ownership mask migrate via the resize row map.
 
 mod attribute_map;
 mod content;
@@ -124,6 +125,46 @@ impl FlatStorage {
         }
     }
 
+    /// Encodes one row WITHOUT applying the retention limit (D4 step 2:
+    /// the resize protocol pushes the whole viewport into storage before
+    /// pulling rows back out; the limit applies once at the end).
+    pub(crate) fn push_without_truncation(&mut self, row: Row) {
+        self.position = self.position.saturating_add(1);
+        self.encode_row(&row);
+    }
+
+    /// Pops the last `count` rows off the tail of storage (D4 step 5: the
+    /// resize protocol pulls the new viewport back out, dropping the blank
+    /// bottom rows past the cursor). Returns the materialized rows in
+    /// document order; the tail (and its content bytes) is removed.
+    /// Position / `num_truncated_rows` are untouched — a resize pop is not
+    /// scrollback eviction.
+    pub(crate) fn pop_rows(&mut self, count: usize) -> Vec<Row> {
+        let start = self.len().saturating_sub(count);
+        let rows: Vec<Row> = (start..self.len())
+            .map(|i| self.get(i).expect("pop index must be in bounds"))
+            .collect();
+        let new_content_len = self.index.truncate(start);
+        self.truncate_content_tail(new_content_len);
+        rows
+    }
+
+    /// End offset (exclusive) of the row's content range — the D4 row-map
+    /// walk reads one end per row instead of materializing ranges.
+    pub(crate) fn content_range_end(&self, row: usize) -> Option<usize> {
+        self.index
+            .content_range_for_row(row)
+            .map(|range| range.end.as_usize())
+    }
+
+    /// Whether the row soft-wraps into the next one (D4 cursor mapping:
+    /// `input_needs_wrap` needs to know if the row hard-terminates).
+    pub(crate) fn row_wraps(&self, row: usize) -> bool {
+        self.index
+            .get_entry(row)
+            .is_some_and(|entry| !entry.has_trailing_newline)
+    }
+
     /// Evicts the oldest rows until the `max_lines` limit holds.
     pub(crate) fn apply_max_rows(&mut self) {
         let excess_rows = self.index.len().saturating_sub(self.max_lines);
@@ -202,45 +243,6 @@ impl FlatStorage {
         self.fg_color_map.truncate(new_content_len);
         self.bg_and_style_map.truncate(new_content_len);
         self.hyperlink_id_map.truncate(new_content_len);
-    }
-
-    /// T2 resize bridge (cold path): materializes every retained row as an
-    /// owned [`Row`] and drains the storage, ready for the reflowed rows to
-    /// be re-encoded via [`Self::extend`]. Position / counters stay
-    /// monotonic (D3 评审 P2-1: anchors now survive a full reflow instead of
-    /// collapsing with the old ring swap).
-    pub(crate) fn materialize_all(&mut self) -> Vec<Row> {
-        let rows: Vec<Row> = (0..self.len())
-            .map(|i| self.get(i).expect("materialize index must be in bounds"))
-            .collect();
-        let new_content_len = self.index.truncate(0);
-        self.truncate_content_tail(new_content_len);
-        rows
-    }
-
-    /// T2 transitional adapter for the two `Scrollback::get_mut` consumers
-    /// (the snapshot marker dance; T5 deletes the technique). Flat storage
-    /// is append-only, so an in-place edit re-encodes the edited row and
-    /// everything after it — O(rows), accepted because screen-exit runs it
-    /// at most once per command.
-    pub(crate) fn replace_row(&mut self, index: usize, row: Row) {
-        debug_assert!(index < self.len(), "replace_row index out of bounds");
-        let tail: Vec<Row> = ((index + 1)..self.len())
-            .map(|i| self.get(i).expect("tail index must be in bounds"))
-            .collect();
-        let new_content_len = self.index.truncate(index);
-        self.truncate_content_tail(new_content_len);
-        self.encode_row(&row);
-        for tail_row in tail {
-            self.encode_row(&tail_row);
-        }
-    }
-
-    /// T2 resize bridge: after the old reflow re-segments and re-encodes
-    /// every row at the new width, the storage must track that width WITHOUT
-    /// a second `Index::rebuild` (the rows are already wrapped).
-    pub(crate) fn set_columns_no_rebuild(&mut self, columns: usize) {
-        self.columns = columns;
     }
 
     /// T3 (D5-1): one-shot byte snapshot of the retained rows for the
@@ -348,7 +350,6 @@ impl FlatStorage {
 
     /// Re-wraps the index at a new column count. Content bytes, attribute
     /// maps, and offsets are untouched — that is the entire reflow story.
-    #[allow(dead_code)] // T5: resize protocol (D4 step 4) is the caller.
     pub(crate) fn set_columns(&mut self, new_columns: usize) {
         if self.columns == new_columns {
             return;
@@ -379,7 +380,7 @@ impl FlatStorage {
     }
 
     /// Rows evicted so far by the retention limit (monotonic).
-    #[allow(dead_code)] // T5: anchor-eviction diagnostics read this.
+    #[allow(dead_code)] // retention diagnostics; no production reader yet.
     pub(crate) fn num_truncated_rows(&self) -> u64 {
         self.num_truncated_rows
     }
@@ -578,6 +579,160 @@ impl FlatStorage {
         entry_builder.append_to_index(&mut self.index);
     }
 }
+
+/// D4 step 3: where the cursor sits in the content stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorAnchor {
+    /// Cursor is at the location with this byte offset.
+    AtPoint(ByteOffset),
+    /// Cursor is at the cell AFTER the grapheme starting at this byte
+    /// offset — the encoding for a cursor past a row's content end, and
+    /// for `wrap_pending` (Warp's `AtCellAfterPoint`).
+    AfterCell(ByteOffset),
+}
+
+impl FlatStorage {
+    /// Computes the cursor's content anchor from its (row, col) within the
+    /// flat rows.
+    ///
+    /// - `col == 0`: anchor at the row start. For a hard row boundary this
+    ///   is equivalent to Warp's `AtPoint` after their `cell_follows_newline`
+    ///   check — the cursor stays on its own (possibly empty) row.
+    /// - `col > 0` with content left of the cursor: anchor at the last
+    ///   grapheme starting left of `col`, so the position tracks that
+    ///   content through a re-wrap (Warp's `AtCellAfterPoint`).
+    /// - `col > 0` on a row with no content left of the cursor (a blank
+    ///   continuation row after a soft-wrapped line — a case Warp reaches
+    ///   via cross-row `wrapping_sub`): glue to the previous row's last
+    ///   content byte so the cursor cannot strand on a phantom blank row.
+    pub(crate) fn cursor_anchor(&self, row: usize, col: usize) -> CursorAnchor {
+        let Some(range) = self.index.content_range_for_row(row) else {
+            return CursorAnchor::AtPoint(ByteOffset::zero());
+        };
+        if col == 0 {
+            return CursorAnchor::AtPoint(range.start);
+        }
+        if let Some(start) = self.last_grapheme_start_before(row, col) {
+            return CursorAnchor::AfterCell(start);
+        }
+        // Blank continuation row: glue to the previous row's last grapheme;
+        // fall back to this row's start when there is none (empty history /
+        // empty previous row).
+        if row > 0 {
+            if let Some(start) = self.last_grapheme_start_before(row - 1, usize::MAX) {
+                return CursorAnchor::AfterCell(start);
+            }
+        }
+        CursorAnchor::AtPoint(range.start)
+    }
+
+    /// Start offset of the last grapheme in `row` whose column is strictly
+    /// left of `max_col` (`usize::MAX` = the row's last grapheme).
+    fn last_grapheme_start_before(&self, row: usize, max_col: usize) -> Option<ByteOffset> {
+        let range = self.index.content_range_for_row(row)?;
+        let runs = self.index.grapheme_runs_for_row(row)?;
+        let base = range.start;
+        let mut byte_off = 0usize;
+        let mut col = 0usize;
+        let mut last: Option<ByteOffset> = None;
+        for run in runs {
+            let (run_cols, run_bytes) = (
+                run.cols(),
+                run.count.get() as usize * run.info.utf8_bytes.get() as usize,
+            );
+            if col >= max_col {
+                break;
+            }
+            // Graphemes in this run cover columns [col, col + run_cols).
+            let visible = run_cols.min(max_col - col);
+            // Each grapheme is `width` columns; the last fully-visible one
+            // starts at column `col + (visible - 1) * width` rounded down to
+            // a grapheme start. With runs being uniform, the count of
+            // visible graphemes is `visible / width`.
+            let visible_graphemes = visible / run.info.cell_width as usize;
+            if visible_graphemes > 0 {
+                last = Some(
+                    base + ByteOffset::from_usize(
+                        byte_off + (visible_graphemes - 1) * run.info.utf8_bytes.get() as usize,
+                    ),
+                );
+            }
+            col += run_cols;
+            byte_off += run_bytes;
+        }
+        last
+    }
+
+    /// D4 step 5: maps a cursor anchor back to a (row, col, wrap_pending)
+    /// position at `new_cols` width. `AfterCell` re-finds the grapheme the
+    /// anchor points at, then advances past it — turning into
+    /// `wrap_pending` when that advance falls off a hard-terminated full
+    /// row (Warp's `input_needs_wrap` recomputation).
+    ///
+    /// Deliberate divergence from Warp: their post-anchor advance is a fixed
+    /// one-cell step, which can land the cursor ON a wide glyph's spacer
+    /// cell; weft advances by the grapheme's full width so the cursor always
+    /// rests on a writable lead cell (weft spacers are never cursor
+    /// positions).
+    pub(crate) fn cursor_point_from_anchor(
+        &self,
+        anchor: CursorAnchor,
+        new_cols: usize,
+    ) -> (usize, usize, bool) {
+        let total = self.len();
+        let fallback = (total.saturating_sub(1), 0, false);
+        let offset = match anchor {
+            CursorAnchor::AtPoint(offset) => offset,
+            CursorAnchor::AfterCell(offset) => offset,
+        };
+        let Ok(point) = self.index.content_offset_to_point(offset) else {
+            return fallback;
+        };
+        match anchor {
+            CursorAnchor::AtPoint(_) => (point.row, point.col, false),
+            CursorAnchor::AfterCell(_) => {
+                // Width of the grapheme the anchor points at.
+                let width = self
+                    .index
+                    .grapheme_runs_for_row(point.row)
+                    .unwrap_or(&[])
+                    .iter()
+                    .scan(0usize, |col, run| {
+                        let start = *col;
+                        *col += run.cols();
+                        Some((start, run.info.cell_width as usize))
+                    })
+                    .find(|(start, _)| *start == point.col)
+                    .map(|(_, width)| width)
+                    .unwrap_or(1);
+                let next_col = point.col + width;
+                if next_col < new_cols {
+                    (point.row, next_col, false)
+                } else if self.row_wraps(point.row) {
+                    // Soft wrap: the position continues on the next row.
+                    (point.row + 1, 0, false)
+                } else {
+                    // Hard-terminated full row: deferred wrap.
+                    (point.row, new_cols.saturating_sub(1), true)
+                }
+            }
+        }
+        .pipe(|pos| {
+            let (row, col, wrap) = pos;
+            // Defensive clamps: the mapped position must exist.
+            let row = row.min(total.saturating_sub(1));
+            (row, col.min(new_cols.saturating_sub(1)), wrap)
+        })
+    }
+}
+
+/// Tiny combinator so the mapping tail above stays a single expression.
+trait Pipe: Sized {
+    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
 
 /// Consumes `byte_len - 1` items from an offset-keyed attribute iterator and
 /// returns the value at the grapheme's first byte. `nth(len - 1)` (not

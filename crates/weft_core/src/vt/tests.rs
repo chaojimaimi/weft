@@ -5265,3 +5265,31 @@ fn extras_entries_are_multi_scalar_and_match_the_extra_flag() {
     // the 'e' (decomposed form, matching what the user's terminal shows).
     assert_eq!(t.grid().row_text(0), "e\u{0301}x👩\u{200d}🔬中*\u{fe0f}");
 }
+
+#[test]
+fn same_dims_pty_resize_preserves_ownership_evidence() {
+    // T5 review P2: `commit_pty_resize_result` may report a PTY resize that
+    // ended up dimension-identical; the candidate-path resize then produces
+    // an identity row map. The ownership reduction must not turn that into
+    // an empty mask (every ownership scrap wiped).
+    let mut terminal = Terminal::new(6, 18);
+    terminal.process(b"old shell heading\r\nold shell body\r\n");
+    terminal.process(b"\x1b]133;B\x07\x1b]133;C\x07startup linear output");
+    let mask_before = terminal.capabilities.primary_screen_ownership.clone();
+    assert!(
+        mask_before.viewport.is_some(),
+        "precondition: freeze left ownership evidence"
+    );
+
+    terminal.resize(6, 18); // same dims — the PTY raced back
+
+    let mask_after = &terminal.capabilities.primary_screen_ownership;
+    assert_eq!(
+        mask_after.viewport, mask_before.viewport,
+        "identity resize must preserve the viewport ownership mask"
+    );
+    assert_eq!(
+        mask_after.scrollback, mask_before.scrollback,
+        "identity resize must preserve the scrollback ownership mask"
+    );
+}

@@ -26,7 +26,6 @@ use super::content::ByteOffset;
 /// Absolute (row, col) address inside the flat index. weft has no global
 /// grid Point type, so flat defines the minimal shape it needs (Warp:
 /// `model::Point`).
-#[allow(dead_code)] // T5: resize protocol (D4 cursor-offset mapping) is the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Point {
     pub row: usize,
@@ -73,7 +72,7 @@ pub(crate) struct GraphemeRun {
 }
 
 impl GraphemeRun {
-    fn cols(&self) -> usize {
+    pub(crate) fn cols(&self) -> usize {
         self.count.get() as usize * self.info.cell_width as usize
     }
 }
@@ -159,71 +158,7 @@ impl Index {
         self.rows.len()
     }
 
-    /// Content byte offset for a (row, col) point.
-    ///
-    /// Errors when the point is out of bounds, or past the content cells of
-    /// a row (e.g. a non-zero column in an empty row).
-    #[allow(dead_code)] // T5: resize protocol (D4 step 3/5) is the caller.
-    pub(crate) fn content_offset_at_point(
-        &self,
-        point: Point,
-    ) -> Result<ByteOffset, ContentOffsetToPointError> {
-        let entry =
-            self.rows
-                .get(point.row)
-                .ok_or_else(|| ContentOffsetToPointError::RowOutOfBounds {
-                    row: point.row,
-                    max_row: self.rows.len().saturating_sub(1),
-                })?;
-
-        let runs = match &entry.grapheme_sizing {
-            GraphemeSizing::Uniform(grapheme_run) => std::slice::from_ref(grapheme_run),
-            GraphemeSizing::NonUniform => self
-                .grapheme_sizing
-                .get(&entry.content_offset)
-                .ok_or(ContentOffsetToPointError::MissingGraphemeSizing {
-                    content_offset: entry.content_offset,
-                })?
-                .as_slice(),
-            GraphemeSizing::EmptyRow => {
-                if point.col == 0 {
-                    return Ok(entry.content_offset);
-                }
-                return Err(ContentOffsetToPointError::NonZeroColumnInEmptyRow {
-                    row: point.row,
-                    col: point.col,
-                });
-            }
-        };
-
-        let mut offset = entry.content_offset;
-        let mut cols_remaining = point.col;
-
-        for run in runs {
-            if cols_remaining == 0 {
-                break;
-            }
-
-            let cols_from_run = run.cols().min(cols_remaining);
-            let graphemes_from_run = cols_from_run / run.info.cell_width as usize;
-
-            offset += graphemes_from_run * run.info.utf8_bytes.get() as usize;
-            cols_remaining -= cols_from_run;
-        }
-
-        if cols_remaining == 0 {
-            return Ok(offset);
-        }
-
-        // The requested column exceeded the content-ful cells of this row.
-        Err(ContentOffsetToPointError::ColumnExceedsContent {
-            row: point.row,
-            col: point.col,
-        })
-    }
-
     /// (row, col) point for a content byte offset.
-    #[allow(dead_code)] // T5: resize protocol (D4 step 5) is the caller.
     pub(crate) fn content_offset_to_point(
         &self,
         offset: ByteOffset,
@@ -339,24 +274,7 @@ impl Index {
     }
 }
 
-/// Errors from [`Index::content_offset_at_point`].
-#[allow(dead_code)] // T5: resize protocol (D4) is the caller.
-#[derive(Debug, Error)]
-pub(crate) enum ContentOffsetToPointError {
-    #[error("point row {row} is outside the bounds of the index (max: {max_row})")]
-    RowOutOfBounds { row: usize, max_row: usize },
-    #[error(
-        "missing grapheme sizing data for non-uniform row at content offset {content_offset:?}"
-    )]
-    MissingGraphemeSizing { content_offset: ByteOffset },
-    #[error("point column {col} is not 0 for empty row {row}")]
-    NonZeroColumnInEmptyRow { row: usize, col: usize },
-    #[error("point column {col} exceeds the number of content cells in row {row}")]
-    ColumnExceedsContent { row: usize, col: usize },
-}
-
 /// Errors from [`Index::content_offset_to_point`].
-#[allow(dead_code)] // T5: resize protocol (D4) is the caller.
 #[derive(Debug, Error)]
 pub(crate) enum PointFromContentOffsetError {
     #[error(
