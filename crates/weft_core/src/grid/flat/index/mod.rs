@@ -26,6 +26,7 @@ use super::content::ByteOffset;
 /// Absolute (row, col) address inside the flat index. weft has no global
 /// grid Point type, so flat defines the minimal shape it needs (Warp:
 /// `model::Point`).
+#[allow(dead_code)] // T5: resize protocol (D4 cursor-offset mapping) is the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Point {
     pub row: usize,
@@ -160,6 +161,7 @@ impl Index {
     ///
     /// Errors when the point is out of bounds, or past the content cells of
     /// a row (e.g. a non-zero column in an empty row).
+    #[allow(dead_code)] // T5: resize protocol (D4 step 3/5) is the caller.
     pub(crate) fn content_offset_at_point(
         &self,
         point: Point,
@@ -219,6 +221,7 @@ impl Index {
     }
 
     /// (row, col) point for a content byte offset.
+    #[allow(dead_code)] // T5: resize protocol (D4 step 5) is the caller.
     pub(crate) fn content_offset_to_point(
         &self,
         offset: ByteOffset,
@@ -333,6 +336,7 @@ impl Index {
 }
 
 /// Errors from [`Index::content_offset_at_point`].
+#[allow(dead_code)] // T5: resize protocol (D4) is the caller.
 #[derive(Debug, Error)]
 pub(crate) enum ContentOffsetToPointError {
     #[error("point row {row} is outside the bounds of the index (max: {max_row})")]
@@ -348,6 +352,7 @@ pub(crate) enum ContentOffsetToPointError {
 }
 
 /// Errors from [`Index::content_offset_to_point`].
+#[allow(dead_code)] // T5: resize protocol (D4) is the caller.
 #[derive(Debug, Error)]
 pub(crate) enum PointFromContentOffsetError {
     #[error(

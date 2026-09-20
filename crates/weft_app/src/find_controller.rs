@@ -441,8 +441,8 @@ impl App {
         let grid = term.grid_mut();
         let sb_len = grid.scrollback_len();
         let target_offset = grid_find_scroll_target(sb_len, grid.num_rows, m.row);
-        if grid.scroll_offset != target_offset {
-            grid.scroll_offset = target_offset;
+        if grid.scroll_offset() != target_offset {
+            grid.set_scroll_offset(target_offset);
             term.clear_hyperlink_cell_map();
         }
     }

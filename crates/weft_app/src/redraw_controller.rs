@@ -569,7 +569,7 @@ impl App {
                 let highlight = if !block_view {
                     let grid = terminal.grid();
                     let sb_len = grid.scrollback_len();
-                    let offset = grid.scroll_offset.min(sb_len);
+                    let offset = grid.scroll_offset().min(sb_len);
                     let unified_base = sb_len - offset;
                     self.find
                         .matches

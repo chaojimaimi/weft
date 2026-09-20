@@ -12,9 +12,10 @@ impl Grid {
         if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
+                // D1: history rows come from the materialized window; the
+                // window index equals `row` (see `Grid::cell`).
                 return self
-                    .scrollback
-                    .get(global)
+                    .history_window_row(row)
                     .is_some_and(|history| history.wrapped);
             }
             return self

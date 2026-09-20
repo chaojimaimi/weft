@@ -22,7 +22,7 @@ const HYPERLINK_COLOR: [f32; 4] = [0.36, 0.62, 0.94, 1.0];
 /// Build a 1-cell grid row with a single cell for SGR attribute tests.
 fn build_attr_cell(cell: &Cell, cursor: &Cursor, show: bool) -> super::GridRowInstances {
     let mut grid = Grid::new(1, 1);
-    grid.viewport[0].cells[0] = cell.clone();
+    grid.viewport[0].cells[0] = *cell;
     build_row_instances(
         &grid,
         &Color::standard_palette(),
@@ -289,7 +289,7 @@ fn grid_underline_renders_even_when_text_is_hidden() {
 /// char exemption.
 fn build_high_contrast_cell(cell: &Cell) -> super::GridRowInstances {
     let mut grid = Grid::new(1, 1);
-    grid.viewport[0].cells[0] = cell.clone();
+    grid.viewport[0].cells[0] = *cell;
     build_row_instances(
         &grid,
         &Color::standard_palette(),
@@ -523,7 +523,7 @@ fn grid_bold_is_bright_on_maps_ansi_to_bright_variant() {
     let mut cell = Cell::with_char('A');
     cell.fg = CellColor::Palette(1);
     cell.flags = CellFlags::BOLD;
-    grid.viewport[0].cells[0] = cell.clone();
+    grid.viewport[0].cells[0] = cell;
     let result = build_row_instances(
         &grid,
         &palette,
@@ -565,7 +565,7 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
         let mut cell = Cell::with_char('A');
         cell.fg = fg;
         cell.flags = CellFlags::BOLD;
-        grid.viewport[0].cells[0] = cell.clone();
+        grid.viewport[0].cells[0] = cell;
         let result = build_row_instances(
             &grid,
             &palette,
@@ -599,7 +599,7 @@ fn grid_bold_is_bright_leaves_high_index_and_rgb_alone() {
     let mut cell = Cell::with_char('A');
     cell.fg = CellColor::Rgb(Color::rgb(9, 8, 7));
     cell.flags = CellFlags::BOLD;
-    grid.viewport[0].cells[0] = cell.clone();
+    grid.viewport[0].cells[0] = cell;
     let result = build_row_instances(
         &grid,
         &palette,
@@ -640,7 +640,7 @@ fn grid_bold_is_bright_reverse_dim_order_stable() {
     cell.fg = CellColor::Palette(1); // text color → after REVERSE becomes bg
     cell.bg = CellColor::Palette(2); // → after REVERSE becomes text
     cell.flags = CellFlags::BOLD | CellFlags::REVERSE | CellFlags::DIM;
-    grid.viewport[0].cells[0] = cell.clone();
+    grid.viewport[0].cells[0] = cell;
     let result = build_row_instances(
         &grid,
         &palette,

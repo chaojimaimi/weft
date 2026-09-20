@@ -186,12 +186,16 @@ pub fn terminal_grapheme_glyph(grapheme: &str) -> char {
 /// grid/tests.rs `cell_struct_stays_at_24_bytes`).
 /// Design reference: Warp 24-byte Cell + Alacritty sparse extra.
 ///
+/// `derive(Copy)` (PLAN_S3 D1 评审 P1-1): every field is Copy, and the
+/// materialized-history window rebuilds rows by field-copying cells — the
+/// compiler now proves that is a pure memcpy (no hidden deep-clone cost).
+///
 /// Field budget (PLAN_v1113 §1.1): char4 + fg5 + bg5 + flags2 + width1 +
 /// style1 + color5 = 23B → align 4 → 24B. One padding byte remains; adding
 /// another >1B field must trigger an explicit budget re-evaluation
 /// (v0.8_PLAN §5). `Option<CellColor>` is 5B (not 6) via the `#[repr(u8)]`
 /// niche on [`CellColor`] — pinned by a size test.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Cell {
     pub character: char,
     pub fg: CellColor,

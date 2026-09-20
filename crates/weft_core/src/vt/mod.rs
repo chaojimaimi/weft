@@ -622,6 +622,10 @@ impl Terminal {
         }
         self.parser = parser;
         self.note_primary_screen_exit_activity();
+        // D1 sync point: streaming output mutates flat history (scroll-ups);
+        // the tail re-materializes the ≤ num_rows window so the &self
+        // observers (renderer, a11y) always see a fresh window.
+        self.grid.sync_history_window();
     }
 
     /// v1.11.2 X1: printable-ASCII fast path is allowed only when the OSC
@@ -661,7 +665,7 @@ impl Terminal {
         // Skipped while the user is browsing primary-screen TUI history so a
         // redraw cannot yank the viewport back to the live bottom.
         if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
-            self.grid.scroll_offset = 0;
+            self.grid.set_scroll_offset(0);
         }
         let num_cols = self.grid.num_cols;
         let fg = self.attrs.fg;

@@ -1,9 +1,9 @@
 // arch-gate: allow-over-800
-//! Terminal grid: Cell, Row, Grid, Scrollback
+//! Terminal grid: Cell, Row, Grid + the flat history storage (PLAN_S3).
 mod cell;
 mod cursor;
 mod display;
-pub(crate) mod flat;
+pub mod flat;
 mod reflow;
 mod row;
 mod row_extras;
@@ -19,6 +19,7 @@ pub use row::Row;
 pub use row_extras::{CellExtra, RowExtras};
 pub use scrollback::Scrollback;
 
+use flat::FlatStorage;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -37,10 +38,18 @@ pub struct Grid {
     scroll_bottom: usize,
     /// Tab stop positions (true = tab stop, false = no stop).
     tabstops: Vec<bool>,
-    /// Scrollback buffer for lines scrolled off the top.
-    pub scrollback: Scrollback,
-    /// Current scroll offset (0 = no scroll, >0 = viewing history).
-    pub scroll_offset: usize,
+    /// Scrollback history in flat form (PLAN_S3 T2: field name kept from
+    /// the Scrollback ring; D3 compat surface unchanged).
+    pub scrollback: FlatStorage,
+    /// Current scroll offset (0 = no scroll, >0 = viewing history). Private
+    /// as of T2 — every write goes through `set_scroll_offset` so the
+    /// materialized history window can follow; read via `scroll_offset()`.
+    scroll_offset: usize,
+    /// D1: bounded materialized history window (≤ num_rows rows), rebuilt by
+    /// `flat::window` at the sync points; see that module for the invariant.
+    history_window: Vec<Row>,
+    /// Whether `history_window` matches the current (scroll_offset, flat).
+    history_window_valid: bool,
     /// v1.0 P0-c: Pending viewport scroll delta for the renderer. Positive =
     /// rows scrolled up (content moved up, new blank rows at bottom).
     /// Negative = rows scrolled down (content moved down, new blank rows at
@@ -66,19 +75,12 @@ impl Grid {
             scroll_top: 0,
             scroll_bottom,
             tabstops,
-            scrollback: Scrollback::new(scrollback_lines),
+            scrollback: FlatStorage::new(cols, scrollback_lines),
             scroll_offset: 0,
+            history_window: Vec::new(),
+            history_window_valid: true,
             pending_scroll: std::cell::Cell::new(0),
         }
-    }
-
-    /// Initialize tab stops every 8 columns.
-    fn init_tabstops(cols: usize) -> Vec<bool> {
-        let mut stops = vec![false; cols + 1];
-        for i in (0..cols).step_by(8) {
-            stops[i] = true;
-        }
-        stops
     }
 
     // ── Cell access ──────────────────────────────────────────────
@@ -96,16 +98,19 @@ impl Grid {
         if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
-                if let Some(history_row) = self.scrollback.get(global) {
-                    // v1.10.23 (FIX_OMP_CONTENT_LOSS): history rows keep
-                    // their original width after a narrowing resize (>= the
-                    // current `num_cols`), so `col` is in bounds — the
-                    // `get().unwrap_or(BLANK_CELL)` guard is defensive only.
-                    return history_row.cells.get(col).unwrap_or(&cell::BLANK_CELL);
-                }
-            } else {
-                return &self.viewport[global - sb_len].cells[col];
+                // D1: history rows come from the materialized window (synced
+                // by `set_scroll_offset` / the process tail / resize tails).
+                // The window index equals `row` (global - window_base). The
+                // `get(col)` guard is defensive: materialized rows are
+                // `columns` wide, which a widening `resize_dims` can leave
+                // below `num_cols` — the blank fallback matches the old
+                // grow-only padding visually.
+                return self
+                    .history_window_row(row)
+                    .and_then(|history_row| history_row.cells.get(col))
+                    .unwrap_or(&cell::BLANK_CELL);
             }
+            return &self.viewport[global - sb_len].cells[col];
         }
         &self.viewport[row].cells[col]
     }
@@ -134,10 +139,7 @@ impl Grid {
         if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
-                return self
-                    .scrollback
-                    .get(global)
-                    .and_then(|r| r.extras.grapheme_at(col));
+                return self.history_window_row(row)?.extras.grapheme_at(col);
             }
             return self.viewport.get(global - sb_len)?.extras.grapheme_at(col);
         }
@@ -154,7 +156,7 @@ impl Grid {
         let extras = if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
-                &self.scrollback.get(global)?.extras
+                &self.history_window_row(row)?.extras
             } else {
                 &self.viewport.get(global - sb_len)?.extras
             }
@@ -184,7 +186,7 @@ impl Grid {
         let (cells, extras) = if offset > 0 {
             let global = sb_len - offset + row;
             if global < sb_len {
-                let r = self.scrollback.get(global)?;
+                let r = self.history_window_row(row)?;
                 (&r.cells, &r.extras)
             } else {
                 let r = self.viewport.get(global - sb_len)?;
@@ -599,7 +601,7 @@ impl Grid {
     /// Clear scrollback buffer (CSI 3 J).
     pub fn clear_scrollback(&mut self) {
         self.scrollback.clear();
-        self.scroll_offset = 0;
+        self.set_scroll_offset(0);
     }
 
     /// Clear line from cursor to end (CSI 0 K).
@@ -638,7 +640,7 @@ impl Grid {
         // have left the row temporarily wide (rows only grow); once the TUI
         // clears and rewrites the line at the new width, the stale right half
         // is dropped — "normalizing back to num_cols" is the intended outcome.
-        resize_row_cells(&mut self.viewport[row].cells, self.num_cols);
+        reflow::resize_row_cells(&mut self.viewport[row].cells, self.num_cols);
         self.viewport[row].mark_dirty(self.num_cols.saturating_sub(1));
     }
 
@@ -682,10 +684,8 @@ impl Grid {
             // Push all rows in the scroll region into scrollback
             if top == 0 {
                 for i in top..=bottom {
-                    self.scrollback.push(std::mem::replace(
-                        &mut self.viewport[i],
-                        Row::new(self.num_cols),
-                    ));
+                    let old_row = std::mem::replace(&mut self.viewport[i], Row::new(self.num_cols));
+                    self.push_history_row(old_row);
                 }
             } else {
                 for i in top..=bottom {
@@ -713,7 +713,7 @@ impl Grid {
             // empty Row at [0], then rotate — the empty Row ends up at [n-1].
             for _ in 0..n {
                 let old_top = std::mem::replace(&mut self.viewport[0], Row::new(self.num_cols));
-                self.scrollback.push(old_top);
+                self.push_history_row(old_top);
                 self.viewport.rotate_left(1);
             }
             self.pending_scroll
@@ -724,10 +724,8 @@ impl Grid {
             // rows to scrollback before rotating.
             if top == 0 {
                 for i in 0..n {
-                    self.scrollback.push(std::mem::replace(
-                        &mut self.viewport[i],
-                        Row::new(self.num_cols),
-                    ));
+                    let old_top = std::mem::replace(&mut self.viewport[i], Row::new(self.num_cols));
+                    self.push_history_row(old_top);
                 }
             }
             self.viewport[top..=bottom].rotate_left(n);
@@ -810,22 +808,22 @@ impl Grid {
         // Offset can never exceed the number of available history lines;
         // clamping to `scrollback.len()` keeps `cell()` indexing in bounds.
         let max = self.scrollback.len();
-        self.scroll_offset = (self.scroll_offset + lines).min(max);
+        self.set_scroll_offset((self.scroll_offset + lines).min(max));
     }
 
     /// Scroll viewport down (view newer content).
     pub fn scroll_down_history(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self.set_scroll_offset(self.scroll_offset.saturating_sub(lines));
     }
 
     /// Scroll to the very top of history.
     pub fn scroll_to_top(&mut self) {
-        self.scroll_offset = self.scrollback.len();
+        self.set_scroll_offset(self.scrollback.len());
     }
 
     /// Scroll to the bottom (current output).
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
+        self.set_scroll_offset(0);
     }
 
     /// Check if we're viewing history (scrolled up).
@@ -1094,14 +1092,17 @@ impl Grid {
         if new_cols != old_cols {
             for row in &mut self.viewport {
                 if row.cells.len() < new_cols {
-                    resize_row_cells(&mut row.cells, new_cols);
+                    reflow::resize_row_cells(&mut row.cells, new_cols);
                     row.repair_wide_pairs();
                 }
                 // Repaint the whole row: widening pads, narrowing resets the
                 // renderer's clip window to `num_cols` for the residual frame.
                 row.mark_dirty(new_cols.saturating_sub(1));
             }
-            self.scrollback.resize_cols(new_cols);
+            // T2: flat history needs no per-row reshaping — materialized rows
+            // clip at `num_cols` with blank fallback (the read-side twin of
+            // the old grow-only `resize_cols` padding). Re-wrapping happens
+            // in the full `resize` reflow / later via Index::rebuild (T5).
         }
 
         if new_rows > self.num_rows {
@@ -1120,7 +1121,7 @@ impl Grid {
         self.scroll_bottom = new_rows.saturating_sub(1);
         self.scroll_top = 0;
         self.tabstops = Self::init_tabstops(new_cols);
-        self.scroll_offset = 0;
+        self.set_scroll_offset(0);
 
         // Clamp the cursor into the new bounds. The app will reposition it on
         // its next paint; clamping here just keeps internal invariants safe.
@@ -1137,12 +1138,12 @@ impl Grid {
         }
 
         // ── Phase 1: Collect all rows ────────────────────────────────
-        // 3B: rows MOVE out of the ring (was per-row clone); Phase 4 rebuilds it.
-        let scrollback_max = self.scrollback.max_lines;
-        let mut all_rows: Vec<Row> = Scrollback::into_rows(std::mem::replace(
-            &mut self.scrollback,
-            Scrollback::new(scrollback_max),
-        ));
+        // 3B: rows MOVE out of the ring (was per-row clone); Phase 4 rebuilds
+        // it. T2 bridge: materialize the flat history (cold path) and drain
+        // the storage; Phase 4 re-encodes it. position / counters stay
+        // monotonic (D3 评审 P2-1: anchors survive the reflow instead of
+        // collapsing with the old ring swap).
+        let mut all_rows: Vec<Row> = self.scrollback.materialize_all();
         let scrollback_len = all_rows.len();
         for row in self.viewport.drain(..) {
             all_rows.push(row);
@@ -1346,7 +1347,8 @@ impl Grid {
                 }
 
                 if col < new_cols {
-                    current.cells[col] = cell.clone();
+                    // Cell is Copy (PLAN_S3 D1 评审 P1-1): a plain field copy.
+                    current.cells[col] = *cell;
                     current.mark_dirty(col);
 
                     if cell.width == CellWidth::Full && col + 1 < new_cols {
@@ -1403,13 +1405,16 @@ impl Grid {
             self.scrollback.extend(wrapped_rows);
             self.viewport = vp;
         }
+        // T2 bridge: rows were re-encoded at `new_cols` — track the width
+        // without a second Index::rebuild.
+        self.scrollback.set_columns_no_rebuild(new_cols);
 
         self.num_rows = new_rows;
         self.num_cols = new_cols;
         self.scroll_bottom = new_rows.saturating_sub(1);
         self.scroll_top = 0;
         self.tabstops = Self::init_tabstops(new_cols);
-        self.scroll_offset = 0;
+        self.set_scroll_offset(0);
 
         self.cursor.row = new_cursor_row.min(new_rows.saturating_sub(1));
         self.cursor.col = new_cursor_col.min(new_cols.saturating_sub(1));
@@ -1439,21 +1444,5 @@ impl Grid {
     /// Get scroll region boundaries (read-only).
     pub fn scroll_region(&self) -> (usize, usize) {
         (self.scroll_top, self.scroll_bottom)
-    }
-}
-
-/// Resize a single row's cell vector to `new_cols` in place: truncate if
-/// narrower, pad with default (blank) cells if wider. No content is moved
-/// between rows — this preserves the app's per-cell layout exactly, which is
-/// the point of the dimension-only alt-screen resize.
-fn resize_row_cells(cells: &mut Vec<Cell>, new_cols: usize) {
-    if cells.len() == new_cols {
-        return;
-    }
-    if cells.len() > new_cols {
-        cells.truncate(new_cols);
-    } else {
-        let extra = new_cols - cells.len();
-        cells.extend(std::iter::repeat_with(Cell::default).take(extra));
     }
 }

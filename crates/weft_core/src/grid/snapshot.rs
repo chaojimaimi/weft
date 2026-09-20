@@ -21,12 +21,15 @@ pub(crate) fn url_to_string(url: Arc<str>) -> String {
     url.to_string()
 }
 
-fn retained_row(grid: &Grid, index: usize) -> Option<&Row> {
+// T2: flat history materializes owned rows (no `&Row` to lend), so retained
+// rows are handed out by value. All uses are read-only cold paths.
+fn retained_row(grid: &Grid, index: usize) -> Option<Row> {
     if index < grid.scrollback.len() {
         grid.scrollback.get(index)
     } else {
         grid.viewport
             .get(index.saturating_sub(grid.scrollback.len()))
+            .cloned()
     }
 }
 
@@ -59,7 +62,7 @@ impl Grid {
         let scrollback_len = self.scrollback.len();
         let retained_len = scrollback_len.saturating_add(self.num_rows);
         let direct_column = retained_row(self, retained_index).and_then(|row| {
-            let end = row_content_end(row);
+            let end = row_content_end(&row);
             row.cells[..end]
                 .iter()
                 .position(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
@@ -71,7 +74,7 @@ impl Grid {
                 .rev()
                 .find_map(|index| {
                     let row = retained_row(self, index)?;
-                    let end = row_content_end(row);
+                    let end = row_content_end(&row);
                     row.cells[..end]
                         .iter()
                         .rposition(|cell| !cell.flags.contains(CellFlags::WIDE_SPACER))
@@ -83,24 +86,44 @@ impl Grid {
             };
             (row, column, true)
         };
-        let row = if marker_row < scrollback_len {
-            self.scrollback.get_mut(marker_row)
-        } else {
-            self.viewport
-                .get_mut(marker_row.saturating_sub(scrollback_len))
-        };
-        let Some(cell) = row.and_then(|row| row.cells.get_mut(marker_column)) else {
-            self.resize(new_rows, new_cols);
-            return document_start;
-        };
         const MARKER: CellColor = CellColor::Rgb(Color {
             r: 17,
             g: 29,
             b: 43,
             a: 0,
         });
-        let original_bg = cell.bg;
-        cell.bg = MARKER;
+        // T2 transitional adapter: flat rows materialize owned, so the marker
+        // is written back through a targeted re-encode (`replace_row`). T5
+        // deletes this whole marker-cell technique for a content-offset anchor.
+        let original_bg = if marker_row < scrollback_len {
+            let Some(mut row) = self.scrollback.get(marker_row) else {
+                self.resize(new_rows, new_cols);
+                return document_start;
+            };
+            let Some(cell) = row.cells.get_mut(marker_column) else {
+                self.resize(new_rows, new_cols);
+                return document_start;
+            };
+            let original_bg = cell.bg;
+            cell.bg = MARKER;
+            self.scrollback.replace_row(marker_row, row);
+            original_bg
+        } else {
+            let Some(row) = self
+                .viewport
+                .get_mut(marker_row.saturating_sub(scrollback_len))
+            else {
+                self.resize(new_rows, new_cols);
+                return document_start;
+            };
+            let Some(cell) = row.cells.get_mut(marker_column) else {
+                self.resize(new_rows, new_cols);
+                return document_start;
+            };
+            let original_bg = cell.bg;
+            cell.bg = MARKER;
+            original_bg
+        };
         self.resize(new_rows, new_cols);
 
         let marker = (0..self.scrollback.len().saturating_add(self.num_rows)).find_map(|index| {
@@ -112,7 +135,12 @@ impl Grid {
             return document_start;
         };
         if marker_row < self.scrollback.len() {
-            self.scrollback.get_mut(marker_row).unwrap().cells[marker_column].bg = original_bg;
+            let mut row = self
+                .scrollback
+                .get(marker_row)
+                .expect("marker row must exist in flat history");
+            row.cells[marker_column].bg = original_bg;
+            self.scrollback.replace_row(marker_row, row);
         } else {
             self.viewport[marker_row - self.scrollback.len()].cells[marker_column].bg = original_bg;
         }
@@ -329,7 +357,7 @@ impl Grid {
         let scrollback_tagged = scrollback.map(|row| (false, row));
         let viewport_tagged = viewport_indexed
             .into_iter()
-            .map(|(index, row)| (index == cursor_row, row));
+            .map(|(index, row)| (index == cursor_row, row.clone()));
         let mut text = String::new();
         let mut lines = Vec::new();
         let mut span_count = 0_usize;
@@ -345,7 +373,7 @@ impl Grid {
             let style_budget =
                 style_enabled.then(|| MAX_SNAPSHOT_COLOR_SPANS.saturating_sub(span_count));
             let row = styled_row(
-                row,
+                &row,
                 self.num_cols,
                 SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len()),
                 style_budget,
@@ -438,7 +466,7 @@ impl Grid {
             .filter_map(|index| {
                 let row = self.scrollback.get(index)?;
                 let snap = styled_row(
-                    row,
+                    &row,
                     self.num_cols,
                     MAX_OUTPUT_BYTES,
                     Some(MAX_SNAPSHOT_COLOR_SPANS),
@@ -761,7 +789,7 @@ mod tests {
         for index in 0..5 {
             grid.scrollback.push(row(&format!("answer {index}"), 24));
         }
-        grid.scrollback.resize(3, 24);
+        grid.scrollback.set_max_lines(3, 24);
 
         assert_eq!(
             grid.document_text_from(command_start),

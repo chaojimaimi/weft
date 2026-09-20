@@ -596,7 +596,7 @@ fn primary_screen_live_view_starts_at_the_owned_document_boundary() {
     assert_eq!(terminal.grid().row_text(5), "");
     assert_eq!(terminal.grid().row_text(6), "Claude Code");
 
-    terminal.grid_mut().scroll_offset = 1;
+    terminal.grid_mut().set_scroll_offset(1);
     assert_eq!(terminal.primary_screen_visible_row_start(), None);
     assert_eq!(terminal.primary_screen_viewport_ownership(), None);
 }
@@ -1916,7 +1916,7 @@ fn new_output_resets_scroll_offset() {
 
     // New PTY output must snap back to the live viewport.
     t.process(b"X");
-    assert_eq!(t.grid().scroll_offset, 0, "new output resets offset");
+    assert_eq!(t.grid().scroll_offset(), 0, "new output resets offset");
     assert!(!t.grid().is_scrolled());
 }
 
@@ -1945,12 +1945,12 @@ fn tui_redraw_preserves_scroll_offset_while_browsing_history() {
     }
     t.grid_mut().scroll_up_history(3);
     assert!(t.grid().is_scrolled(), "precondition: scrolled up");
-    let scrolled_offset = t.grid().scroll_offset;
+    let scrolled_offset = t.grid().scroll_offset();
 
     // TUI redraws (relative move + erase + text) while user browses history.
     t.process(b"\x1b[999D\x1b[3A\x1b[3B\x1b[Joption-a\r\noption-b\r\n");
     assert_eq!(
-        t.grid().scroll_offset,
+        t.grid().scroll_offset(),
         scrolled_offset,
         "TUI redraw must NOT reset scroll_offset while browsing history"
     );
@@ -1959,7 +1959,7 @@ fn tui_redraw_preserves_scroll_offset_while_browsing_history() {
     t.set_primary_history_view(false);
     t.process(b"X");
     assert_eq!(
-        t.grid().scroll_offset,
+        t.grid().scroll_offset(),
         0,
         "plain output still resets offset"
     );
@@ -1977,13 +1977,13 @@ fn large_cuu_clamps_cursor_and_repaints_visible_rows() {
     for i in 0..50 {
         t.process(format!("anim-row-{i}\r\n").as_bytes());
     }
-    assert_eq!(t.grid().scroll_offset, 0);
+    assert_eq!(t.grid().scroll_offset(), 0);
     assert_eq!(t.grid().cursor.row, 9, "cursor at viewport bottom");
 
     // Redraw: CUB 999 + CUU 1027 clamps at row 0; ED + repaint.
     t.process(b"\x1b[999D\x1b[1027A\x1b[Joption-a\r\noption-b\r\n");
     assert_eq!(t.grid().cursor.row, 2);
-    assert_eq!(t.grid().scroll_offset, 0, "clamp must not scroll");
+    assert_eq!(t.grid().scroll_offset(), 0, "clamp must not scroll");
     // The renderer reads through `cell()` (offset-mapped): at offset 0 the
     // live rows ARE the visible window, so the repaint is what the user sees.
     assert_eq!(
@@ -2018,7 +2018,7 @@ fn custom_scroll_region_clamps_cursor_without_viewport_scroll() {
         "cursor clamps at the custom region top"
     );
     assert_eq!(
-        t.grid().scroll_offset,
+        t.grid().scroll_offset(),
         0,
         "custom-region CUU must not scroll the viewport"
     );
@@ -3346,7 +3346,7 @@ fn osc8_link_survives_scroll_via_row_extras() {
     // Emit enough lines to force "link" into scrollback.
     t.process(b"line1\nline2\nline3");
     // Scroll up to view the "link" row.
-    t.grid_mut().scroll_offset = 3;
+    t.grid_mut().set_scroll_offset(3);
     // The link should resolve via RowExtras even though it's in scrollback.
     let id = t.grid().hyperlink_id_at(0, 0);
     assert!(
@@ -5120,4 +5120,24 @@ fn claude_caret_tracks_snapshot_line_matching_grid_cursor() {
     // Cleanup: settle leaves one block (screen-owned session finalizes).
     t.settle_primary_screen_exit();
     assert_eq!(t.block_tracker().blocks().len(), 1);
+}
+
+#[test]
+fn resize_widening_keeps_written_trailing_space_in_history() {
+    // PLAN_S3 T2 (rust-reviewer P2): a space PRINTED at the exact-fit wrap
+    // boundary carries CellFlags::DIRTY, so FlatStorage's content predicate
+    // (`!= ' ' || !flags.is_empty()`) must encode it. A later widening reflow
+    // consumes the flag via `row_content_end`: the space stays logical-line
+    // content and "abc e" must NOT collapse to "abce".
+    let mut term = Terminal::new(4, 4);
+    term.process(b"abc e");
+    term.resize(4, 8);
+    let merged = (0..term.grid().num_rows)
+        .map(|r| term.grid().row_text(r))
+        .find(|t| t.contains("abc"))
+        .expect("merged line must exist after widening");
+    assert!(
+        merged.starts_with("abc e"),
+        "written trailing space must survive the flat roundtrip, got {merged:?}"
+    );
 }

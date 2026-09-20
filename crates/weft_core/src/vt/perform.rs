@@ -28,7 +28,7 @@ impl vte::Perform for Terminal {
         // reading history. During CommandExecuting (output streaming) and in
         // non-integrated mode (plain grid terminal), new output resets scroll.
         if phase != ShellPhase::AtPrompt && !self.primary_history_view() {
-            self.grid.scroll_offset = 0;
+            self.grid.set_scroll_offset(0);
         }
 
         // Feed the printed char to the active sink: in-flight block capture

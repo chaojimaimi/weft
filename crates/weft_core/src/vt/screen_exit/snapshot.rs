@@ -111,7 +111,7 @@ impl Terminal {
         let entering = active && !self.capabilities.primary_history_view;
         self.capabilities.primary_history_view = active;
         if active {
-            self.grid.scroll_offset = 0;
+            self.grid.set_scroll_offset(0);
         } else {
             self.capabilities.primary_history_snapshot_at = None;
         }

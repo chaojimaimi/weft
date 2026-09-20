@@ -611,7 +611,7 @@ mod tests {
         let cols = cells.len().max(1);
         let mut grid = Grid::new(1, cols);
         for (i, cell) in cells.iter().enumerate() {
-            grid.viewport[0].cells[i] = cell.clone();
+            grid.viewport[0].cells[i] = *cell;
         }
         grid
     }

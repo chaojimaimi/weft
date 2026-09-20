@@ -25,6 +25,26 @@ fn row_content_end(row: &Row) -> usize {
         .map_or(0, |i| i + 1)
 }
 
+/// Resize a single row's cell vector to `new_cols` in place: truncate if
+/// narrower, pad with default (blank) cells if wider. No content is moved
+/// between rows — this preserves the app's per-cell layout exactly, which is
+/// the point of the dimension-only alt-screen resize.
+///
+/// (Moved from grid/mod.rs: T2 added the flat window fields against a file
+/// already at its line ceiling; this self-contained helper is the
+/// compensating move.)
+pub(super) fn resize_row_cells(cells: &mut Vec<Cell>, new_cols: usize) {
+    if cells.len() == new_cols {
+        return;
+    }
+    if cells.len() > new_cols {
+        cells.truncate(new_cols);
+    } else {
+        let extra = new_cols - cells.len();
+        cells.extend(std::iter::repeat_with(Cell::default).take(extra));
+    }
+}
+
 /// β-2 pre-scan result. `content_ends` has one entry per Phase 1 row (the
 /// exact content extent Phase 2 consumes, so it never re-scans); `line_caps`
 /// has one entry per Phase 2 line boundary (the exact cell total of the

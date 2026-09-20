@@ -239,7 +239,7 @@ fn scroll_up_history_never_exceeds_scrollback_len() {
     // Two lines of scrollback.
     grid.scrollback.push(Row::new(4));
     grid.scrollback.push(Row::new(4));
-    grid.scroll_offset = 1;
+    grid.set_scroll_offset(1);
     // Scrolling far past the top must clamp to scrollback length, not shrink.
     grid.scroll_up_history(5);
     assert_eq!(grid.scroll_offset, 2, "clamps to scrollback.len()");
@@ -719,7 +719,10 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
 
     grid.resize_dims(2, 5);
     grid.scroll_to_top();
-    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 5);
+    // T2: flat history rows materialize at their wrapped width (4) — the
+    // old grow-only padding is replaced by the `cell()` blank fallback, the
+    // read-side twin of the same guarantee.
+    assert_eq!(grid.scrollback.get(0).unwrap().cells.len(), 4);
     assert_eq!(grid.cell(0, 3).character, 'D');
     assert_eq!(grid.cell(0, 4).character, ' ');
 
@@ -733,8 +736,8 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     grid.scroll_to_top();
     assert_eq!(
         grid.scrollback.get(0).unwrap().cells.len(),
-        5,
-        "history rows keep their width when narrowing"
+        4,
+        "history rows keep their wrapped width when narrowing"
     );
     assert_eq!(grid.cell(0, 2).character, 'C');
     assert_eq!(
@@ -801,7 +804,7 @@ fn scrollback_row_cell_access_is_bounds_safe() {
     let mut row = Row::new(5);
     row.cells[0].character = 'x';
     grid.scrollback.push(row);
-    grid.scroll_offset = 1;
+    grid.set_scroll_offset(1);
 
     assert_eq!(grid.cell(0, 0).character, 'x');
     let out_of_range = grid.cell(0, 7);
@@ -1867,9 +1870,12 @@ fn row_plain_text(row: &Row) -> String {
 /// dropped (reflow's flush_line drops the same set).
 fn logical_lines(grid: &Grid) -> Vec<String> {
     let mut rows: Vec<&Row> = Vec::with_capacity(grid.scrollback.len() + grid.num_rows);
-    for i in 0..grid.scrollback.len() {
-        rows.push(grid.scrollback.get(i).unwrap());
-    }
+    // T2: flat history materializes owned rows — park them locally and lend
+    // them to the same `&Row` walk as the viewport.
+    let history: Vec<Row> = (0..grid.scrollback.len())
+        .map(|i| grid.scrollback.get(i).expect("history index in bounds"))
+        .collect();
+    rows.extend(history.iter());
     rows.extend(grid.viewport.iter());
     let mut lines: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -1976,7 +1982,7 @@ fn resize_move_keeps_scrollback_distribution_intact() {
     );
     let mut actual: Vec<String> = Vec::new();
     for i in 0..grid.scrollback.len() {
-        actual.push(row_plain_text(grid.scrollback.get(i).unwrap()));
+        actual.push(row_plain_text(&grid.scrollback.get(i).unwrap()));
     }
     for row in &grid.viewport {
         let text = row_plain_text(row);

@@ -1066,7 +1066,7 @@ impl App {
                 match terminal {
                     Some(t) => {
                         let grid = t.grid();
-                        let offset = grid.scroll_offset;
+                        let offset = grid.scroll_offset();
                         let max = grid.scrollback.len();
                         let new = if up {
                             (offset + lines).min(max)

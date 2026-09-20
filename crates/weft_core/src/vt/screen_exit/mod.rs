@@ -374,7 +374,7 @@ impl Terminal {
         let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
         if self.capabilities.alt_active
             || !owns_live_view
-            || self.grid.scroll_offset > 0
+            || self.grid.scroll_offset() > 0
             // v1.10.12-fix: only pure full-viewport CUP TUIs (claude code)
             // hide the shell rows above their document boundary. A sparse
             // repainter (omp/pi) paints incrementally — hiding rows before
@@ -413,7 +413,7 @@ impl Terminal {
         let owns_live_view = self.primary_screen_app_active() || self.primary_screen_exit_pending();
         if self.capabilities.alt_active
             || !owns_live_view
-            || self.grid.scroll_offset > 0
+            || self.grid.scroll_offset() > 0
             // v1.10.12-fix: sparse repainters never apply the ownership mask
             // (their partial row-touch pattern would hide the rest of the UI).
             || self.capabilities.primary_screen_relative_addressing_seen

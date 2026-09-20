@@ -1369,7 +1369,7 @@ fn snapshot_logical_lines(terminal: &Terminal, anchor: u64) -> Vec<String> {
     let mut physical: Vec<(String, bool)> = Vec::new();
     for index in scrollback_start..grid.scrollback.len() {
         if let Some(row) = grid.scrollback.get(index) {
-            physical.push((probe_row_text(row, grid.num_cols), row.wrapped));
+            physical.push((probe_row_text(&row, grid.num_cols), row.wrapped));
         }
     }
     for index in viewport_start..grid.num_rows {

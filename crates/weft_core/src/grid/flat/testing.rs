@@ -33,7 +33,14 @@ pub(crate) fn assert_rows_equal(actual: &[Row], expected: &[Row], msg: &str) {
             );
             assert_eq!(ac.fg, ec.fg, "{msg}: ({row_idx},{col}) fg");
             assert_eq!(ac.bg, ec.bg, "{msg}: ({row_idx},{col}) bg");
-            assert_eq!(ac.flags, ec.flags, "{msg}: ({row_idx},{col}) flags");
+            // DIRTY is the write-marker (D2: not persisted; materialization
+            // re-adds it per the VT print convention) — compare modulo it.
+            let flag_mask = CellFlags::DIRTY.complement();
+            assert_eq!(
+                ac.flags & flag_mask,
+                ec.flags & flag_mask,
+                "{msg}: ({row_idx},{col}) flags"
+            );
             assert_eq!(ac.width, ec.width, "{msg}: ({row_idx},{col}) width");
             assert_eq!(
                 ac.underline_style, ec.underline_style,

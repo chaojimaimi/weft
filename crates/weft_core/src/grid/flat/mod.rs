@@ -9,15 +9,18 @@
 //!   `wrapped == false` rows terminate with `'\n'`, `WIDE_SPACER` cells
 //!   produce no bytes, and default cells produce no bytes (interior runs are
 //!   backfilled with blank bytes to keep offsets column-aligned).
-//! - D3 (compat surface): `position` / `index_since` / `clear` transplant
+//! - D3 (compat surface): the method names/signatures mirror the `Scrollback`
+//!   ring this storage replaces (`push`/`extend`/`len`/`position`/
+//!   `index_since`/`max_lines`/`set_max_lines`/`clear`/`is_empty`/`get`);
+//!   `position` / `index_since` / `clear` transplant
 //!   `grid/scrollback.rs:96-108` semantics bit for bit — `position` is a
 //!   saturated count of rows ever pushed and survives `clear` (CSI 3J).
 //! - Width authority: `Cell.width` (评审 P2); nothing recomputes widths from
 //!   the text.
 //!
-//! T1 milestone: zero wiring. Everything here is crate-internal and unused
-//! by production code until T2 replaces `Grid.scrollback`.
-#![allow(dead_code)] // T1 zero-wiring: production callers arrive in T2 — remove then.
+//! T2: wired as `Grid.scrollback`. `materialize_all` / `replace_row` are the
+//! two transitional bridges for the old reflow and the marker-cell trick —
+//! both cold paths, both scheduled to die in T5/T6.
 
 mod attribute_map;
 mod content;
@@ -25,6 +28,7 @@ mod grapheme;
 mod hyperlink;
 pub(crate) mod index;
 mod style;
+mod window;
 
 #[cfg(test)]
 mod testing;
@@ -43,7 +47,11 @@ use style::{BgAndStyle, BgAndStyleMap, FgColorMap};
 
 /// Grid history storage in flat form: a chunked UTF-8 byte stream, a
 /// per-display-row index, and byte-offset attribute interval maps.
-pub(crate) struct FlatStorage {
+///
+/// `pub` because `Grid.scrollback` is a public field and weft_app reads
+/// `len()`/`max_lines()` across the crate boundary — the same surface the
+/// `Scrollback` ring had.
+pub struct FlatStorage {
     /// The grid content.
     content: Content,
 
@@ -79,7 +87,7 @@ pub(crate) struct FlatStorage {
 impl FlatStorage {
     /// Constructs a new storage wrapping `columns` columns with a retention
     /// limit of `max_lines` rows (0 = disabled, like `Scrollback::new`).
-    pub(crate) fn new(columns: usize, max_lines: usize) -> Self {
+    pub fn new(columns: usize, max_lines: usize) -> Self {
         Self {
             content: Content::new(),
             index: Index::new(columns, None),
@@ -99,7 +107,7 @@ impl FlatStorage {
     /// Mirrors `Scrollback::push` exactly: `max_lines == 0` makes this a
     /// complete no-op (position included), and `position` advances before
     /// any eviction so it counts rows *pushed*, not rows retained.
-    pub(crate) fn push(&mut self, row: Row) {
+    pub fn push(&mut self, row: Row) {
         if self.max_lines == 0 {
             return;
         }
@@ -110,7 +118,7 @@ impl FlatStorage {
 
     /// Pushes every row from `iter` (D3 signature-compat with
     /// `Scrollback::extend`).
-    pub(crate) fn extend<I: IntoIterator<Item = Row>>(&mut self, iter: I) {
+    pub fn extend<I: IntoIterator<Item = Row>>(&mut self, iter: I) {
         for row in iter {
             self.push(row);
         }
@@ -125,23 +133,23 @@ impl FlatStorage {
     }
 
     /// Number of retained rows.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.index.len()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Logical insertion position (u64, saturated; survives `clear`).
-    pub(crate) fn position(&self) -> u64 {
+    pub fn position(&self) -> u64 {
         self.position
     }
 
     /// Index of the oldest retained row inserted at or after `position`.
     ///
     /// Bit-for-bit transplant of `scrollback.rs:102-108`.
-    pub(crate) fn index_since(&self, position: u64) -> usize {
+    pub fn index_since(&self, position: u64) -> usize {
         if position > self.position {
             return 0; // The buffer was cleared and recreated.
         }
@@ -150,7 +158,7 @@ impl FlatStorage {
     }
 
     /// Configured retention limit.
-    pub(crate) fn max_lines(&self) -> usize {
+    pub fn max_lines(&self) -> usize {
         self.max_lines
     }
 
@@ -162,7 +170,7 @@ impl FlatStorage {
     /// `Scrollback::set_max_lines(usize, usize)`; per-row reshaping never
     /// happens here (width changes go through [`Self::set_columns`] /
     /// `Index::rebuild`).
-    pub(crate) fn set_max_lines(&mut self, max_lines: usize, _cols: usize) {
+    pub fn set_max_lines(&mut self, max_lines: usize, _cols: usize) {
         if max_lines == self.max_lines {
             return;
         }
@@ -181,16 +189,63 @@ impl FlatStorage {
 
     /// Drops every retained row without re-basing content offsets and
     /// without touching `position` / `num_truncated_rows` (CSI 3J).
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         let new_content_len = self.index.truncate(0);
+        self.truncate_content_tail(new_content_len);
+    }
+
+    /// Trims the content tail (and the attribute maps with it) to the given
+    /// absolute offset — the shared tail-trim behind clear, the resize
+    /// bridge, and single-row replacement.
+    fn truncate_content_tail(&mut self, new_content_len: ByteOffset) {
         self.content.truncate(new_content_len);
         self.fg_color_map.truncate(new_content_len);
         self.bg_and_style_map.truncate(new_content_len);
         self.hyperlink_id_map.truncate(new_content_len);
     }
 
+    /// T2 resize bridge (cold path): materializes every retained row as an
+    /// owned [`Row`] and drains the storage, ready for the reflowed rows to
+    /// be re-encoded via [`Self::extend`]. Position / counters stay
+    /// monotonic (D3 评审 P2-1: anchors now survive a full reflow instead of
+    /// collapsing with the old ring swap).
+    pub(crate) fn materialize_all(&mut self) -> Vec<Row> {
+        let rows: Vec<Row> = (0..self.len())
+            .map(|i| self.get(i).expect("materialize index must be in bounds"))
+            .collect();
+        let new_content_len = self.index.truncate(0);
+        self.truncate_content_tail(new_content_len);
+        rows
+    }
+
+    /// T2 transitional adapter for the two `Scrollback::get_mut` consumers
+    /// (the snapshot marker dance; T5 deletes the technique). Flat storage
+    /// is append-only, so an in-place edit re-encodes the edited row and
+    /// everything after it — O(rows), accepted because screen-exit runs it
+    /// at most once per command.
+    pub(crate) fn replace_row(&mut self, index: usize, row: Row) {
+        debug_assert!(index < self.len(), "replace_row index out of bounds");
+        let tail: Vec<Row> = ((index + 1)..self.len())
+            .map(|i| self.get(i).expect("tail index must be in bounds"))
+            .collect();
+        let new_content_len = self.index.truncate(index);
+        self.truncate_content_tail(new_content_len);
+        self.encode_row(&row);
+        for tail_row in tail {
+            self.encode_row(&tail_row);
+        }
+    }
+
+    /// T2 resize bridge: after the old reflow re-segments and re-encodes
+    /// every row at the new width, the storage must track that width WITHOUT
+    /// a second `Index::rebuild` (the rows are already wrapped).
+    pub(crate) fn set_columns_no_rebuild(&mut self, columns: usize) {
+        self.columns = columns;
+    }
+
     /// Re-wraps the index at a new column count. Content bytes, attribute
     /// maps, and offsets are untouched — that is the entire reflow story.
+    #[allow(dead_code)] // T5: resize protocol (D4 step 4) is the caller.
     pub(crate) fn set_columns(&mut self, new_columns: usize) {
         if self.columns == new_columns {
             return;
@@ -221,6 +276,7 @@ impl FlatStorage {
     }
 
     /// Rows evicted so far by the retention limit (monotonic).
+    #[allow(dead_code)] // T5: anchor-eviction diagnostics read this.
     pub(crate) fn num_truncated_rows(&self) -> u64 {
         self.num_truncated_rows
     }
@@ -232,7 +288,7 @@ impl FlatStorage {
     /// widths, and reconstructing `RowExtras` for multi-scalar clusters and
     /// hyperlinks. This is the weft replacement for Warp's `RowIterator`
     /// (weft materializes owned rows for the bounded history window, D1).
-    pub(crate) fn get(&self, index: usize) -> Option<Row> {
+    pub fn get(&self, index: usize) -> Option<Row> {
         let range = self.index.content_range_for_row(index)?;
         let entry = self.index.get_entry(index)?;
 
@@ -251,8 +307,9 @@ impl FlatStorage {
         for info in self.index.grapheme_infos_for_row(index)? {
             let byte_len = info.utf8_bytes.get() as usize;
             let text = &self.content[current..current + byte_len];
+            let grapheme = Grapheme::new_from_str_and_info(text, info);
 
-            if text == "\n" {
+            if grapheme.starts_new_row() {
                 break;
             }
 
@@ -260,7 +317,7 @@ impl FlatStorage {
             let bg_and_style = next_attribute(&mut bg_and_style_iter, byte_len);
             let hyperlink_id = next_attribute(&mut hyperlink_id_iter, byte_len);
 
-            let cell_width = info.cell_width as usize;
+            let cell_width = grapheme.cell_width() as usize;
             if cell_width == 0 {
                 current += byte_len;
                 continue;
@@ -275,12 +332,17 @@ impl FlatStorage {
                 break;
             }
 
-            let mut chars = text.chars();
+            let mut chars = grapheme.chars();
             let cell = &mut row.cells[col];
             cell.character = chars.next().expect("grapheme is non-empty");
             cell.fg = fg_color;
             cell.bg = bg_and_style.bg;
-            cell.flags = bg_and_style.flags;
+            // D2 drops DIRTY from the persisted style mask, but the flag is
+            // weft's write-marker: reflow (`row_content_end`) and the
+            // snapshot extents distinguish a written blank from a
+            // never-written one by it, and the VT print path sets it on
+            // every written cell. Re-add it on every cell a byte produced.
+            cell.flags = bg_and_style.flags | CellFlags::DIRTY;
             cell.underline_style = bg_and_style.underline_style;
             cell.underline_color = bg_and_style.underline_color;
             cell.width = if cell_width == 2 {
@@ -358,7 +420,12 @@ impl FlatStorage {
             }
 
             let cluster = row.extras.grapheme_at(idx as usize);
-            let mut needs_processing = cluster.is_some() || cell.character != ' ';
+            // A default cell is a NEVER-written blank. A written blank keeps
+            // its DIRTY flag — the same discriminator reflow's
+            // `row_content_end` uses — so an exactly-full wrapped row keeps
+            // its boundary space as a real byte.
+            let mut needs_processing =
+                cluster.is_some() || cell.character != ' ' || !cell.flags.is_empty();
 
             let fg = cell.fg;
             if fg != fg_color {

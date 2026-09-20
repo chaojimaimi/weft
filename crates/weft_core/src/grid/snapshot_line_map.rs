@@ -82,7 +82,7 @@ impl Grid {
             };
             // A non-empty row that overflows the text budget aborts the
             // snapshot; nothing after it exists in the document.
-            if walk_snapshot_row(&mut state, row, self.num_cols).is_some()
+            if walk_snapshot_row(&mut state, &row, self.num_cols).is_some()
                 && state.text_len > SNAPSHOT_TEXT_BUDGET
             {
                 return None;

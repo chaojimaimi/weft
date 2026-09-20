@@ -65,8 +65,7 @@ impl Terminal {
         } else {
             &mut self.grid
         };
-        let cols = primary.num_cols;
-        primary.scrollback.set_max_lines(max_lines, cols);
+        primary.set_scrollback_max_lines(max_lines);
         self.capabilities
             .primary_screen_ownership
             .retain_scrollback_suffix(primary.scrollback.len());

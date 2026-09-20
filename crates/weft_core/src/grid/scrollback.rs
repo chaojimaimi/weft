@@ -2,7 +2,8 @@
 //!
 //! Stores rows that have scrolled off the top of the viewport.
 
-use super::{resize_row_cells, row::Row};
+use super::reflow::resize_row_cells;
+use super::row::Row;
 
 pub struct Scrollback {
     /// Ring buffer of rows.
@@ -58,6 +59,7 @@ impl Scrollback {
     /// PLAN_audit_fix_batch3 3B: `Grid::resize` takes the whole ring before
     /// a reflow instead of cloning every row (~10k clones per resize step
     /// on a 10k buffer); the caller rebuilds the ring afterwards.
+    #[allow(dead_code)] // T5: deleted together with the Row-backed Scrollback.
     pub(super) fn into_rows(mut self) -> Vec<Row> {
         if self.len == self.max_lines && self.head > 0 {
             // Wrapped ring → logical order, rotated in place (no clones).
@@ -121,6 +123,7 @@ impl Scrollback {
         self.buffer.get(actual)
     }
 
+    #[allow(dead_code)] // T5: deleted together with the Row-backed Scrollback.
     pub(super) fn get_mut(&mut self, index: usize) -> Option<&mut Row> {
         if index >= self.len {
             return None;
@@ -145,6 +148,7 @@ impl Scrollback {
     /// irreversibly. Rows are therefore always at least `new_cols` wide, so
     /// column-indexed readers bounded by `num_cols` ([`super::Grid::cell`],
     /// renderer, selection) stay in bounds.
+    #[allow(dead_code)] // T5: deleted together with the Row-backed Scrollback.
     pub(super) fn resize_cols(&mut self, new_cols: usize) {
         for row in &mut self.buffer {
             if row.cells.len() < new_cols {

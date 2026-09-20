@@ -38,7 +38,7 @@ impl PrimaryScreenOwnership {
         for index in 0..grid.scrollback.len() {
             if let Some(row) = grid.scrollback.get(index) {
                 shadow.scrollback.push(marked_row(
-                    row,
+                    &row,
                     self.scrollback.get(index).copied().unwrap_or(false),
                 ));
             }
@@ -63,7 +63,12 @@ impl PrimaryScreenOwnership {
 
         Self {
             scrollback: (0..shadow.scrollback.len())
-                .map(|index| shadow.scrollback.get(index).is_some_and(row_is_owned))
+                .map(|index| {
+                    shadow
+                        .scrollback
+                        .get(index)
+                        .is_some_and(|row| row_is_owned(&row))
+                })
                 .collect(),
             viewport: self
                 .viewport

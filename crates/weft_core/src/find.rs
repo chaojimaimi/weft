@@ -94,9 +94,11 @@ impl Grid {
             // Borrow the right row: scrollback.get for history, viewport for live.
             let (cells, extras): (Vec<crate::grid::Cell>, crate::grid::RowExtras) =
                 if unified < sb_len {
+                    // T2: flat `get` returns an owned Row — the clone the
+                    // ring needed disappears.
                     self.scrollback
                         .get(unified)
-                        .map(|r| (r.cells.clone(), r.extras.clone()))
+                        .map(|r| (r.cells, r.extras))
                         .unwrap_or_default()
                 } else {
                     let vp = unified - sb_len;

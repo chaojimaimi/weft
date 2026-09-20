@@ -152,7 +152,7 @@ impl MetalRenderer {
         let selection_painted = sel_colors.painted;
 
         let force_full = self.force_full_grid.get()
-            || grid.scroll_offset != self.prev_scroll_offset.get()
+            || grid.scroll_offset() != self.prev_scroll_offset.get()
             || self.grid_cache_dims.get() != (num_rows, num_cols)
             || primary_screen_mask_changed(
                 self.prev_primary_screen_row_start.get(),
@@ -221,7 +221,7 @@ impl MetalRenderer {
         self.prev_cursor_row.set(Some(cursor.row));
         self.prev_cursor_col.set(Some(cursor.col));
         self.prev_show_cursor.set(policy.show_cursor);
-        self.prev_scroll_offset.set(grid.scroll_offset);
+        self.prev_scroll_offset.set(grid.scroll_offset());
         self.prev_primary_screen_row_start
             .set(policy.hidden_before_row);
         self.grid_cache_dims.set((num_rows, num_cols));
