@@ -3,6 +3,7 @@
 mod cell;
 mod cursor;
 mod display;
+pub(crate) mod flat;
 mod reflow;
 mod row;
 mod row_extras;
