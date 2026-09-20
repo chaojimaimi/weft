@@ -423,6 +423,15 @@ impl Config {
                 }
             }
         }
+        // v1.12.2 B2 (PLAN_S2_render): live-resize present-mode rollback
+        // switch. `false` is the default — only persist an explicit `true`
+        // so the minimal-write contract holds and a stale key can't override
+        // a future default change.
+        if self.window.presents_with_transaction_live_resize {
+            window["presents_with_transaction_live_resize"] = toml_edit::value(true);
+        } else if window.contains_key("presents_with_transaction_live_resize") {
+            window.remove("presents_with_transaction_live_resize");
+        }
 
         // [scrollback] section.
         let default_scrollback = ScrollbackConfig::default();

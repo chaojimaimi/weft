@@ -460,10 +460,19 @@ impl MetalRenderer {
     /// flush the stretched-frame artifact survives (bounds change and frame
     /// land in different transactions). No-op when no live resize is active.
     /// Typed `objc2-quartz-core` API, unwind-guarded per project rule.
+    ///
+    /// v1.12.2 B2 (PLAN_S2_render): also gated by the
+    /// `presents_with_transaction_live_resize` config switch (default off) —
+    /// the synchronous flush waits on the WindowServer for 0-33ms, which
+    /// stopped paying for itself once resize commits fell to ~3ms. Every
+    /// flush that passes the gate bumps `core_animation_flushes` so tests
+    /// can observe the gate end-to-end.
     fn flush_core_animation_if_live_resize(&self) {
-        if !self.live_resize_active {
+        if !self.live_resize_flip_enabled || !self.live_resize_active {
             return;
         }
+        self.core_animation_flushes
+            .set(self.core_animation_flushes.get().saturating_add(1));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             objc2_quartz_core::CATransaction::flush();
         }));

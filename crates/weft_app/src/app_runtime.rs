@@ -446,6 +446,13 @@ impl ApplicationHandler<AppEvent> for App {
             self.config_state.config.theme.semantic_output_enabled(),
             (win.padding_x, win.padding_y),
             win.opacity,
+            // v1.12.2 B2 (PLAN_S2_render): default false — live-resize keeps
+            // async present and skips the transaction flush; `true` in
+            // config.toml restores the v1.11.6 flip+flush carrier.
+            self.config_state
+                .config
+                .window
+                .presents_with_transaction_live_resize,
         );
         // v1.11.12 (PLAN_v11112 M-B): renderer-init phase boundary (shader
         // compile + pipelines happen inside `MetalRenderer::new`).

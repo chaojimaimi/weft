@@ -133,7 +133,28 @@ impl MetalRenderer {
     ///
     /// Early-returns when the state is unchanged (polled every frame); the
     /// layer property flips only on the transition.
+    ///
+    /// v1.12.2 B2 (PLAN_S2_render): the whole mechanism is now a config-gated
+    /// rollback carrier. With `presents_with_transaction_live_resize` unset
+    /// (the default → `live_resize_flip_enabled == false`) present mode never
+    /// engages: the layer stays NO and `flush_core_animation_if_live_resize`
+    /// never runs. The flip+flush premise (v1.11.6 M2 / v1.11.9 / v1.11.10)
+    /// was a 46-115ms frame budget; after S3/B1/B3 a commit is ~3ms and every
+    /// vsync has a frame, so the synchronous flush's 0-33ms WindowServer wait
+    /// became the dominant cost — see the FIX_DRAG_RESIZE_STUTTER.md
+    /// appendix "为何翻转 presentsWithTransaction".
     pub(crate) fn set_live_resize(&mut self, active: bool) {
+        if !self.live_resize_flip_enabled {
+            // Gate off (default): force the async-present invariant. With
+            // construction-time injection `live_resize_active` is already
+            // false here; the force-restore only guards a future live
+            // re-injection path.
+            if self.live_resize_active {
+                self.live_resize_active = false;
+                self.layer.set_presents_with_transaction(false);
+            }
+            return;
+        }
         if self.live_resize_active == active {
             return;
         }

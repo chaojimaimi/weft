@@ -147,6 +147,19 @@ pub struct MetalRenderer {
     /// `encode_and_present` also flushes the Core Animation transaction
     /// while active. Polled per-frame by the redraw controller.
     pub(crate) live_resize_active: bool,
+    /// v1.12.2 B2 (PLAN_S2_render): `[window]
+    /// presents_with_transaction_live_resize` config gate, injected once at
+    /// construction. `true` restores the v1.11.6 rollback carrier (flip the
+    /// layer + flush the transaction during live resize); `false` (the
+    /// default) keeps async present and never flushes — the 0-33ms
+    /// WindowServer wait stopped paying for itself once resize commits fell
+    /// to ~3ms and every vsync has a frame.
+    pub(crate) live_resize_flip_enabled: bool,
+    /// v1.12.2 B2 (PLAN_S2_render): count of `CATransaction::flush()` calls
+    /// that passed the config gate. Diagnostic/observability field — unit
+    /// tests assert the gate (config off ⇒ the counter never moves);
+    /// production cost is one increment per live-resize frame.
+    pub(crate) core_animation_flushes: Cell<u32>,
     /// v1.10.23 change 2: exact `block_scroll_metrics` memo — the fingerprint
     /// covers every input, so wheel + same-frame scrollbar share one scan.
     pub(crate) scroll_metrics_memo: Cell<BlockScrollMetricsMemo>,

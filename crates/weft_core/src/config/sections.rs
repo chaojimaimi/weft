@@ -209,6 +209,17 @@ pub struct WindowConfig {
     /// the user hasn't dragged the sidebar (falls back to the responsive
     /// `SidebarMetrics::for_logical_width`). Clamped to [240, 360] on load.
     pub sidebar_width: Option<f32>,
+    /// v1.12.2 B2 (PLAN_S2_render): live-resize present-mode rollback switch.
+    /// `false` (default) keeps `presentsWithTransaction` = NO while the
+    /// window is live-resizing and skips the synchronous
+    /// `CATransaction::flush` — once resize commits dropped to ~3ms (S3/B1),
+    /// the flush's 0-33ms WindowServer wait dominated the drag frame budget.
+    /// `true` restores the v1.11.6 behavior (flip the layer + flush so frames
+    /// commit atomically with the resized bounds — see
+    /// `docs/FIX_DRAG_RESIZE_STUTTER.md` appendix "为何翻转
+    /// presentsWithTransaction"). Injected into the renderer once at
+    /// construction; changing it requires an app restart.
+    pub presents_with_transaction_live_resize: bool,
 }
 
 impl Default for WindowConfig {
@@ -221,6 +232,7 @@ impl Default for WindowConfig {
             padding_x: 0,
             padding_y: 0,
             sidebar_width: None,
+            presents_with_transaction_live_resize: false,
         }
     }
 }

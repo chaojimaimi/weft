@@ -10,9 +10,19 @@ use weft_core::pane_layout::PaneId;
 /// successful PTY resize commits per pane. Live window dragging used to turn
 /// every redraw's ready pending resize into an `Effect::ResizePty`, paying
 /// the main-thread grid reflow once per frame (~17.7ms each at 10k
-/// scrollback); this interval caps it at one commit per pane per 30ms.
+/// scrollback); this interval caps it at one commit per pane per 8ms.
 ///
-/// Why 30ms is safe (margin invariant): interval (30ms) + frame budget
+/// Why 8ms (v1.12.2, PLAN_S2_render B1 downgrade from 30ms): 30ms was sized
+/// when a resize commit cost 15-42ms — throttling to one commit per ~2 frames
+/// matched the work's own cost. After S3 (reflow buffer reuse + incremental
+/// grid rebuild) a commit is ~3ms at the T4 bench's 50k scrollback, so 30ms
+/// had become a pure latency floor: on-device frame probes caught resize
+/// bursts spaced exactly 32.1-32.7ms apart (the 30ms floor + one frame),
+/// i.e. the window visibly resized at ~30fps while headroom vs the 8ms interval (frame budget from the live RESIZE_PROBE sessions; see PLAN_S2_render B1) existed.
+/// 8ms keeps commit spacing at ~every frame at 120Hz without letting a
+/// single frame carry two commits.
+///
+/// Why 8ms is safe (margin invariant): interval (8ms) + frame budget
 /// (~16ms) sits far inside the active-redraw window (`App::about_to_wait`
 /// requests redraws for 100ms after the last `Resized`), so an expired
 /// interval is guaranteed to be observed by a redraw that is still
@@ -22,7 +32,7 @@ use weft_core::pane_layout::PaneId;
 /// clears it, so the final size always lands (first resize is never delayed:
 /// the stamp is `None`/stale outside a drag). Single-switch rollback: set
 /// this to `Duration::ZERO`.
-pub(crate) const RESIZE_COMMIT_MIN_INTERVAL: Duration = Duration::from_millis(30);
+pub(crate) const RESIZE_COMMIT_MIN_INTERVAL: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Effect {
@@ -480,9 +490,34 @@ mod tests {
     /// State 1 — a commit inside the interval is filtered: during a live
     /// drag the pending slot is refreshed every frame, but at most one
     /// reflow per pane per `RESIZE_COMMIT_MIN_INTERVAL` may reach the apply
-    /// point.
+    /// point. 5ms sits inside the B1 8ms interval.
     #[test]
     fn resize_inside_commit_interval_is_filtered() {
+        use weft_core::pane_layout::PaneId;
+        let now = Instant::now();
+        let pending = [(
+            1,
+            vec![PendingPaneResize::new(
+                PaneId(1),
+                (30, 100),
+                false,
+                false,
+                Some(now - Duration::from_millis(5)),
+            )],
+        )];
+        assert!(
+            pending_resize_effects(&pending, 1, false, now).is_empty(),
+            "a commit 5ms after the last one must wait out the 8ms interval"
+        );
+    }
+
+    /// State 1 flip anchor (v1.12.2, PLAN_S2_render B1): the original state-1
+    /// fixture used a 10ms-old stamp and asserted suppression under the old
+    /// 30ms interval. At 8ms the same fixture flips to ADMITTED — 10ms is
+    /// past the interval. This test pins the downgrade: if someone restores
+    /// a larger interval (≥10ms) without revisiting the docs, this fails.
+    #[test]
+    fn resize_commit_10ms_after_last_is_admitted_at_8ms_interval() {
         use weft_core::pane_layout::PaneId;
         let now = Instant::now();
         let pending = [(
@@ -495,9 +530,41 @@ mod tests {
                 Some(now - Duration::from_millis(10)),
             )],
         )];
+        assert_eq!(
+            pending_resize_effects(&pending, 1, false, now),
+            [Effect::ResizePty {
+                session_id: 1,
+                pane_id: PaneId(1),
+                rows: 30,
+                cols: 100,
+            }],
+            "10ms after the last commit is past the 8ms interval — must emit"
+        );
+    }
+
+    /// B1 invariant anchor: the FIX-α margin argument (constant doc, and the
+    /// original rationale in FIX_DRAG_RESIZE_STUTTER.md) requires interval +
+    /// one 60Hz frame budget to stay far inside the 100ms active-redraw
+    /// window (`App::about_to_wait`'s post-Resized redraw proxy — winit 0.30
+    /// has no drag-end event). Anchored against the real constant so a
+    /// future bump that breaks the margin fails here instead of silently
+    /// delaying the final drag commit past the window.
+    #[test]
+    fn commit_interval_margin_invariant_holds_at_8ms() {
+        let frame_budget = Duration::from_millis(16);
+        let active_window = Duration::from_millis(100);
+        assert_eq!(
+            RESIZE_COMMIT_MIN_INTERVAL,
+            Duration::from_millis(8),
+            "B1 pinned the interval at 8ms; revisit the margin + doc if this changes"
+        );
         assert!(
-            pending_resize_effects(&pending, 1, false, now).is_empty(),
-            "a commit 10ms after the last one must wait out the 30ms interval"
+            RESIZE_COMMIT_MIN_INTERVAL + frame_budget < active_window,
+            "interval {:?} + frame budget {:?} must stay inside the {:?} \
+             active-redraw window",
+            RESIZE_COMMIT_MIN_INTERVAL,
+            frame_budget,
+            active_window
         );
     }
 

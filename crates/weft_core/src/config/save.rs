@@ -561,6 +561,13 @@ fn write_profile_sections(
                         }
                     }
                 }
+                // v1.12.2 B2 (PLAN_S2_render): persist only the non-default
+                // `true` (live-resize present-mode rollback switch).
+                if w.presents_with_transaction_live_resize {
+                    t["presents_with_transaction_live_resize"] = toml_edit::value(true);
+                } else if t.contains_key("presents_with_transaction_live_resize") {
+                    t.remove("presents_with_transaction_live_resize");
+                }
             }
         },
     );

@@ -23,6 +23,7 @@ use crate::renderer::MetalRenderer;
 use weft_core::config::{FontConfig, Theme};
 
 impl MetalRenderer {
+    #[allow(clippy::too_many_arguments)] // mirrors build_paint_core's arity (B2 config gate)
     pub fn new(
         window: &Window,
         font_config: FontConfig,
@@ -31,6 +32,10 @@ impl MetalRenderer {
         semantic_output_enabled: bool,
         padding_logical: (u32, u32),
         opacity: f32,
+        // v1.12.2 B2 (PLAN_S2_render): `[window]
+        // presents_with_transaction_live_resize`, injected once — flipping it
+        // at runtime requires an app restart (documented on the config key).
+        live_resize_flip_enabled: bool,
     ) -> Self {
         // v1.11.6 (PLAN_v1116 M3/D-b): the window-independent construction
         // core was extracted to `build_paint_core`; production `new()` is
@@ -54,6 +59,7 @@ impl MetalRenderer {
             opacity,
             scale,
             (size.width as f32, size.height as f32),
+            live_resize_flip_enabled,
         );
         unsafe {
             attach_layer_to_nsview(&renderer.layer, window, scale);
@@ -80,6 +86,9 @@ impl MetalRenderer {
         opacity: f32,
         scale: f64,
         viewport: (f32, f32),
+        // v1.12.2 B2 (PLAN_S2_render): config gate for the live-resize
+        // present mode (see `live_resize_flip_enabled`).
+        live_resize_flip_enabled: bool,
     ) -> Self {
         let queue = device.new_command_queue();
         let font_config = crate::settings_validation::runtime_font_config(&font_config);
@@ -291,6 +300,10 @@ impl MetalRenderer {
             // v1.11.6 (PLAN_v1116 M2): polled per-frame by the redraw
             // controller; flipped through `set_live_resize` (runtime.rs).
             live_resize_active: false,
+            // v1.12.2 B2 (PLAN_S2_render): config-gated rollback carrier +
+            // its flush observability counter (tests assert the gate).
+            live_resize_flip_enabled,
+            core_animation_flushes: Cell::new(0),
             scroll_metrics_memo: Cell::new(None),
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),
@@ -363,6 +376,11 @@ impl MetalRenderer {
             1.0,
             1.0,
             (840.0, 600.0),
+            // B2 (PLAN_S2_render): headless tests exercise the ROLLBACK
+            // CARRIER (flip + flush) side of the config gate — the disabled
+            // side is covered by setting `live_resize_flip_enabled = false`
+            // on a headless renderer (the `true` below mirrors a config with the key explicitly set; the default/absent key mirrors `false`).
+            true,
         );
         // v1.11.6 (PLAN_v1116 M3 / architect P0-2): the production draw()
         // entry builds LayoutCtx via terminal_layout_for_renderer +
@@ -427,5 +445,90 @@ mod tests {
         renderer.set_live_resize(false);
         assert!(!renderer.live_resize_active);
         assert!(!renderer.layer.presents_with_transaction());
+    }
+
+    // ── v1.12.2 B2 (PLAN_S2_render): config-gated live-resize present mode ──
+    //
+    // G-B bidirectional switch tests. The headless constructor injects
+    // `live_resize_flip_enabled = true` (the v1.11.6 rollback carrier) so the
+    // flip test above keeps covering the restored path; the OFF side (the
+    // new default) mirrors a config without the key by clearing the field.
+
+    /// Config OFF (default): `set_live_resize(true)` must NOT engage present
+    /// mode — the flag stays false, the layer keeps
+    /// `presentsWithTransaction = NO`, and the transaction flush is skipped
+    /// (observable via `core_animation_flushes` staying at zero even when
+    /// the encode paths call the flush hook every frame).
+    #[test]
+    fn live_resize_config_gate_off_keeps_layer_no_and_never_flushes() {
+        let Some(_device) = Device::system_default() else {
+            eprintln!("skipping live-resize gate-off test: no Metal device available");
+            return;
+        };
+        let mut renderer = MetalRenderer::new_headless_paint(weft_core::config::Theme::weft_dark());
+        renderer.live_resize_flip_enabled = false; // mirrors default config
+
+        renderer.set_live_resize(true);
+        assert!(
+            !renderer.live_resize_active,
+            "gate off: present mode must never engage"
+        );
+        assert!(
+            !renderer.layer.presents_with_transaction(),
+            "gate off: layer must stay in async-present mode"
+        );
+
+        // Simulate the two per-frame flush call sites (metal_backend
+        // mod.rs:187/:452): both must be no-ops under the gate.
+        renderer.flush_core_animation_if_live_resize();
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            0,
+            "gate off: CATransaction::flush must never run"
+        );
+
+        // Unchanged-value early return stays safe with the gate off.
+        renderer.set_live_resize(true);
+        assert!(!renderer.live_resize_active);
+        assert!(!renderer.layer.presents_with_transaction());
+    }
+
+    /// Config ON (`presents_with_transaction_live_resize = true`): the
+    /// v1.11.6 rollback carrier is restored — present mode engages, the
+    /// layer flips, and the transaction flush runs while active (counter
+    /// moves), stopping again when the resize ends.
+    #[test]
+    fn live_resize_config_gate_on_restores_flip_and_flush() {
+        let Some(_device) = Device::system_default() else {
+            eprintln!("skipping live-resize gate-on test: no Metal device available");
+            return;
+        };
+        let mut renderer = MetalRenderer::new_headless_paint(weft_core::config::Theme::weft_dark());
+        assert!(
+            renderer.live_resize_flip_enabled,
+            "headless constructor injects the rollback-carrier side"
+        );
+        assert_eq!(renderer.core_animation_flushes.get(), 0);
+
+        renderer.set_live_resize(true);
+        assert!(renderer.live_resize_active);
+        assert!(renderer.layer.presents_with_transaction());
+
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            1,
+            "gate on + active: flush must run"
+        );
+
+        // Resize ended: present mode disengages and the flush no-ops again.
+        renderer.set_live_resize(false);
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            1,
+            "no flush once live resize ended"
+        );
     }
 }

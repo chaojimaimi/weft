@@ -3248,3 +3248,52 @@ fn bundled_theme_assets_load_and_pass_hierarchy_contract() {
         "bundled themes contain no light variant: {names:?}"
     );
 }
+
+// ── v1.12.2 B2 (PLAN_S2_render): [window] presents_with_transaction_live_resize ──
+
+/// The live-resize present-mode rollback switch round-trips: an explicit
+/// `true` is the non-default value (persisted, reload keeps it), the default
+/// `false` is omitted from disk, and a stale `true` key is cleared on re-save
+/// after toggling back to false.
+#[test]
+fn presents_with_transaction_live_resize_roundtrip_and_default_omission() {
+    // Explicit true → written to disk → reload keeps it.
+    let path = unique_tmp_path("win-present-on").join("config.toml");
+    let cfg = Config {
+        window: WindowConfig {
+            presents_with_transaction_live_resize: true,
+            ..WindowConfig::default()
+        },
+        ..Default::default()
+    };
+    cfg.save_to_path(&path).expect("save should succeed");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("presents_with_transaction_live_resize = true"),
+        "text: {text}"
+    );
+    let reloaded: Config = toml::from_str(&text).unwrap();
+    assert!(reloaded.window.presents_with_transaction_live_resize);
+
+    // Toggle back to false (default): the stale key must be cleared, not
+    // left behind by the toml_edit incremental edit (v1.7.5 residue class).
+    let mut off: Config = toml::from_str(&text).unwrap();
+    off.window.presents_with_transaction_live_resize = false;
+    off.save_to_path(&path).expect("re-save should succeed");
+    let after_off = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !after_off.contains("presents_with_transaction"),
+        "stale key cleared: {after_off}"
+    );
+    let reloaded_off: Config = toml::from_str(&after_off).unwrap();
+    assert!(!reloaded_off.window.presents_with_transaction_live_resize);
+
+    // Default config: the key never appears on disk.
+    let path2 = unique_tmp_path("win-present-default").join("config.toml");
+    Config::default()
+        .save_to_path(&path2)
+        .expect("default save should succeed");
+    assert!(!std::fs::read_to_string(&path2)
+        .unwrap()
+        .contains("presents_with_transaction"));
+}
