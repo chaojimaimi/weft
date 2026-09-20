@@ -309,13 +309,14 @@ pub(crate) fn block_content_metrics_with_cache(
         let output_rows = cached
             .map(|c| {
                 if expired(c) {
-                    // 缓存过期(resize/折叠)回退;下一帧 ensure_cached 修复,罕见且正确。
-                    completed_block_output_rows(block, cols)
+                    // M5-a (PLAN_M5 §三): expired fallback reads the L1/L2 tables (hint_rows +
+                    // rows.len()); O(1) off a live entry, else a table rebuild, no re-wrap.
+                    crate::paint::grid_cache::completed_output_rows(block, cols, cached)
                 } else {
                     c.output_rows
                 }
             })
-            .unwrap_or_else(|| completed_block_output_rows(block, cols));
+            .unwrap_or_else(|| crate::paint::grid_cache::completed_output_rows(block, cols, None));
         let command_wrap_rows = cached
             .map(|c| {
                 if expired(c) {

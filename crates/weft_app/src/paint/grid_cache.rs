@@ -15,6 +15,8 @@ use std::rc::Rc;
 
 use weft_core::blocks::Block;
 
+mod visual_rows;
+pub(crate) use visual_rows::{completed_output_rows, trimmed_output_line_count};
 mod wrapping;
 pub(crate) use wrapping::{
     block_line_chunk_ranges, block_line_chunks, command_line_chunks,
@@ -22,19 +24,6 @@ pub(crate) use wrapping::{
 };
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
-
-pub(crate) fn trimmed_output_line_count(lines: &[&str]) -> usize {
-    let mut len = lines.len();
-    while len > 0 {
-        let text = lines[len - 1].trim();
-        if text.is_empty() || matches!(text, "%" | "$" | "#") {
-            len -= 1;
-        } else {
-            break;
-        }
-    }
-    len
-}
 
 /// Pre-computed wrapping data for a single output line of a block.
 #[derive(Clone)]
@@ -96,6 +85,10 @@ pub(crate) struct CachedBlockLayout {
     /// single-line). Same source as layout_pass's Command construction so
     /// `base_row_count` (prefix sum) and `block_total_height` can't drift.
     pub(crate) command_wrap_rows: usize,
+    /// M5-a (PLAN_M5 §二): L1 content layer (cols-independent, output-keyed).
+    pub(crate) content: visual_rows::ContentTable,
+    /// M5-a (PLAN_M5 §二): L2 width layer; `hint_rows + rows.len()` = O(1) rows.
+    pub(crate) width: visual_rows::WidthTable,
 }
 
 /// Per-renderer block layout cache. Keyed by `BlockId.0`.
@@ -401,6 +394,11 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         + command_wrap_rows
         + 1; // separator
 
+    // M5-a (PLAN_M5 §二): L1/L2 tables beside the legacy fields until M5-b migrates consumers.
+    let content = visual_rows::build_content_table(&block.output, block.screen_origin);
+    let hints = crate::block_component::command_resume_hints(block);
+    let width = visual_rows::build_width_table(&content, hints, cols);
+
     CachedBlockLayout {
         output_len: block.output.len(),
         output_identity: block.output.as_ptr() as usize,
@@ -413,6 +411,8 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         base_row_count,
         is_clear,
         command_wrap_rows,
+        content,
+        width,
     }
 }
 

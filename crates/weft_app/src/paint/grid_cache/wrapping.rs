@@ -1,91 +1,25 @@
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Wrap `text` into contiguous byte ranges whose terminal display width fits
-/// `cols`, keeping graphemes atomic (CJK counts 2 columns).
+use super::visual_rows::{text_graphemes, wrap_line_ranges, WrapMode};
+
+/// Test-only prose oracle: the shared M5-a wrap machine
+/// ([`super::visual_rows::wrap_line_ranges`] with [`WrapMode::Prose`]) fed
+/// from the raw-text iterator ([`text_graphemes`]). Production prose /
+/// structure dispatch goes through [`block_line_chunk_ranges`] /
+/// [`screen_origin_line_chunk_ranges`]; this entry stays for the word-aware
+/// tests below, which pin it byte-for-byte against the shared machine.
 ///
-/// v1.11.10 (PLAN_v11110 M-A/D-a): word-aware breaks. A trailing word (a
-/// run of non-whitespace after the last whitespace in the chunk) that fits
-/// alone on the next line moves there whole instead of being split mid-word
-/// (`skills` → `s|kills` was the character-count artifact). Lines without
-/// whitespace (CJK) and words wider than `cols` (git hashes, URLs) keep the
-/// historical character cut via the `byte > start` guard.
-///
-/// P2-1: a chunk's DISPLAYED width may exceed `cols` — trailing overflow
-/// whitespace absorbs into the chunk before the break (continuation lines
-/// never start with blank space). Consumers must handle the clip at render
-/// time and must NOT assume chunk width ≤ cols.
+/// Semantics (moved with the implementation to `visual_rows`): contiguous
+/// byte ranges whose terminal display width fits `cols`, graphemes atomic
+/// (CJK counts 2 columns); v1.11.10 word-aware breaks (a trailing word that
+/// fits alone moves to the next line whole); P2-1 trailing overflow
+/// whitespace absorbs into the chunk, so a chunk's DISPLAYED width may
+/// exceed `cols`; cols == 0 keeps the whole line as one chunk.
+#[cfg(test)]
 fn wrap_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
-    if cols == 0 {
-        return std::iter::once(0..text.len()).collect();
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    let mut col = 0usize;
-    // v1.11.10 (M-A): trailing-word state — byte offset where the current
-    // word started, and the chunk-relative column it started at.
-    let mut word_start: Option<usize> = None;
-    let mut col_at_word_start: Option<usize> = None;
-    for (byte, grapheme) in text.grapheme_indices(true) {
-        let width = weft_core::grid::terminal_text_width(grapheme);
-        if width == 0 {
-            continue;
-        }
-        if grapheme.chars().all(char::is_whitespace) {
-            // Overflowing or not, whitespace always terminates the trailing
-            // word (P1-2): a word ending exactly at the column boundary
-            // followed by absorbed overflow spaces must not keep its word
-            // state, or the next short word would be cut at the wrong
-            // point (`zz aaaaaaa␣␣XY` @ cols=10 → break must land at "XY").
-            col += width;
-            word_start = None;
-            col_at_word_start = None;
-            continue;
-        }
-        if word_start.is_none() {
-            word_start = Some(byte);
-            col_at_word_start = Some(col);
-        }
-        if col + width > cols {
-            // Overflow. Word-aware fallback decision:
-            if let (Some(ws), Some(c0)) = (word_start, col_at_word_start) {
-                // The whole word moved to the next line must fit there alone.
-                let word_fits_alone = (col - c0) + width <= cols;
-                if ws > start && word_fits_alone {
-                    // chunk1 keeps everything through the trailing padding
-                    // whitespace; the word (including the part already past
-                    // `cols` and the current grapheme) opens the next chunk.
-                    ranges.push(start..ws);
-                    start = ws;
-                    // New chunk's current column = the width the word has
-                    // already consumed. The word is now the chunk head, so
-                    // col_at_word_start becomes 0 — a stale pre-fallback
-                    // column must not leak into later overflow decisions.
-                    col -= c0;
-                    col_at_word_start = Some(0);
-                    // No continue: this grapheme counts into the new chunk
-                    // via `col += width` below.
-                } else {
-                    // Character hard cut — the `byte > start` guard stays
-                    // (P1-1): a single grapheme wider than cols (CJK w=2 @
-                    // cols=1) must not push an empty range; advance col only,
-                    // the next grapheme breaks.
-                    if byte > start {
-                        ranges.push(start..byte);
-                        start = byte;
-                        col = 0;
-                    }
-                }
-            } else if byte > start {
-                ranges.push(start..byte);
-                start = byte;
-                col = 0;
-            }
-        }
-        col += width;
-    }
-    ranges.push(start..text.len());
-    ranges
+    let entries: Vec<_> = text_graphemes(text).collect();
+    wrap_line_ranges(&entries, cols, WrapMode::Structure(StructureKind::None))
 }
 
 /// Wrap prose by terminal display width while keeping graphemes atomic.
@@ -102,50 +36,19 @@ pub(crate) fn wrap_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = 
 /// instead of owned wrapped strings avoids retaining a second copy of every
 /// completed block while preserving the exact same wrapping behavior.
 pub(crate) fn block_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
-    let kind = classify_structure_line(text);
-    if cols == 0 || kind == StructureKind::None {
-        return wrap_line_chunk_ranges(text, cols);
-    }
-    // Progress gauges (ollama pull, brew upgrade, …) carry ETA / speed / size
-    // info that users need to see. A *small* overflow (≤ 3 cols) is the common
-    // off-by-few case where a program emits cols+N chars due to ambiguous-width
-    // accounting; clipping avoids a dangling 1-2 char tail ("9s") on the next
-    // row. A *large* overflow means the window was narrowed (or the program
-    // hasn't caught up to the new SIGWINCH); wrapping preserves the trailing
-    // ETA/speed so the user can still read it instead of seeing it truncated.
-    if kind == StructureKind::ProgressGauge {
-        let total_width = weft_core::grid::terminal_text_width(text);
-        if total_width > cols.saturating_add(PROGRESS_GAUGE_CLIP_TOLERANCE) {
-            return wrap_line_chunk_ranges(text, cols);
-        }
-    }
-    std::iter::once(0..grapheme_prefix_end(text, cols)).collect()
+    let entries: Vec<_> = text_graphemes(text).collect();
+    wrap_line_ranges(
+        &entries,
+        cols,
+        WrapMode::Structure(classify_structure_line(text)),
+    )
 }
 
 /// Maximum overflow (in columns) for a progress gauge to be clipped rather
 /// than wrapped. Covers the common off-by-few case (ambiguous-width chars,
 /// SIGWINCH race) without truncating large overflows caused by window
-/// narrowing.
-const PROGRESS_GAUGE_CLIP_TOLERANCE: usize = 3;
-
-/// Longest grapheme-atomic prefix of `text` whose terminal display width fits
-/// within `cols` columns; returns the prefix's end byte index. Shared by the
-/// structural clip (`block_line_chunk_ranges`) and the screen-origin clip —
-/// identical prefix math, no per-site byte-loop duplication. `cols == 0` is
-/// handled by the call sites (whole line, see `wrap_line_chunk_ranges`).
-fn grapheme_prefix_end(text: &str, cols: usize) -> usize {
-    let mut end = 0usize;
-    let mut col = 0usize;
-    for (byte, grapheme) in text.grapheme_indices(true) {
-        let width = weft_core::grid::terminal_text_width(grapheme);
-        if width > 0 && col + width > cols {
-            break;
-        }
-        col += width;
-        end = byte + grapheme.len();
-    }
-    end
-}
+/// narrowing. Consumed by the shared machine (`visual_rows::wrap_line_ranges`).
+pub(crate) const PROGRESS_GAUGE_CLIP_TOLERANCE: usize = 3;
 
 /// Keep terminal-drawn structure atomic across history resizes; prose reflows.
 pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item = String> {
@@ -166,13 +69,8 @@ pub(crate) fn block_line_chunks(text: &str, cols: usize) -> impl Iterator<Item =
 /// returns exactly one source range; shell-output blocks keep soft-wrap via
 /// [`block_line_chunk_ranges`].
 pub(crate) fn screen_origin_line_chunk_ranges(text: &str, cols: usize) -> Vec<Range<usize>> {
-    // v1.10.26 Batch B review nit: cols == 0 must return the WHOLE line as a
-    // single chunk, aligned with `wrap_line_chunk_ranges` — a zero-width
-    // (degenerate/unit-test) layout must not produce an empty clipped row.
-    if cols == 0 {
-        return std::iter::once(0..text.len()).collect();
-    }
-    std::iter::once(0..grapheme_prefix_end(text, cols)).collect()
+    let entries: Vec<_> = text_graphemes(text).collect();
+    wrap_line_ranges(&entries, cols, WrapMode::ScreenOrigin)
 }
 
 /// Chunked view over [`screen_origin_line_chunk_ranges`] — always a single,
@@ -249,9 +147,11 @@ pub(crate) fn command_line_chunks(cmd: &str, first_cols: usize, cols: usize) -> 
     chunks
 }
 
-/// Classification of a terminal line for wrap/clip decisions.
+/// Classification of a terminal line for wrap/clip decisions. Consumed by
+/// both data sources: the text path here and the L1 content table
+/// (`visual_rows::LMeta::structure`) — one classification, no copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StructureKind {
+pub(crate) enum StructureKind {
     /// Prose / ordinary output — wraps freely.
     None,
     /// Pure Box Drawing / Block Elements line (table rules, separator bars).
@@ -265,7 +165,7 @@ enum StructureKind {
     TableRow,
 }
 
-fn classify_structure_line(text: &str) -> StructureKind {
+pub(crate) fn classify_structure_line(text: &str) -> StructureKind {
     let mut visible = 0usize;
     let mut box_drawing = 0usize;
     // U+2500..=U+257F — Box Drawing (lines, corners, branches):
