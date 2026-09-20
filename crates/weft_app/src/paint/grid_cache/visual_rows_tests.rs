@@ -2,12 +2,34 @@
 //! G4 property equivalence: the table-fed machine must match the legacy
 //! text-fed path byte-for-byte (PLAN_M5 §五 M5-a 验收门).
 
+use super::super::wrapping::{block_line_chunk_ranges, screen_origin_line_chunk_ranges};
 use super::*;
 use crate::block_component::{command_resume_hints, completed_block_output_rows};
-use crate::paint::grid_cache::{
-    block_line_chunk_ranges, block_line_chunks, screen_origin_line_chunk_ranges,
-};
+use crate::paint::grid_cache::{block_line_chunks, BlockLayoutCache};
 use weft_core::blocks::{Block, BlockId};
+
+/// INDEPENDENT text-path oracle for the row-count equivalence (M5-b: the
+/// production `completed_block_output_rows` itself migrated onto the L2
+/// tables, so the oracle here sums the legacy text-fed chunk ranges
+/// directly — hints via `block_line_chunks`, lines via
+/// `block_line_chunk_ranges`).
+fn legacy_output_rows(block: &Block, cols: usize) -> usize {
+    if block.collapsed {
+        return 0;
+    }
+    let hints: usize = command_resume_hints(block)
+        .iter()
+        .map(|hint| block_line_chunks(hint, cols).count())
+        .sum();
+    let mut lines: Vec<&str> = block.output.lines().collect();
+    let len = trimmed_output_line_count(&lines);
+    lines.truncate(len);
+    hints
+        + lines
+            .iter()
+            .map(|line| block_line_chunk_ranges(line, cols).len())
+            .sum::<usize>()
+}
 
 fn mk_block(command: &str, output: &str, screen_origin: bool, exit_code: Option<i32>) -> Block {
     Block {
@@ -183,9 +205,9 @@ fn property_l2_matches_legacy_wrap_across_cols_structures_and_origin() {
                 if !screen_origin {
                     assert_eq!(
                         l2.hint_rows as usize + l2.rows.len(),
-                        completed_block_output_rows(&block, cols),
+                        legacy_output_rows(&block, cols),
                         "trial {trial} cols {cols}: hint_rows + rows.len() must equal the
-                             completed_block_output_rows oracle"
+                             independent text-path oracle"
                     );
                 }
                 // Per-visual-row byte intervals == legacy chunk bounds.
@@ -342,12 +364,12 @@ fn resume_hints_are_counted_by_the_same_machine() {
         assert_eq!(l2.hint_rows as usize, legacy_hints, "cols {cols}");
         assert_eq!(
             l2.hint_rows as usize + l2.rows.len(),
-            completed_block_output_rows(&block, cols),
+            legacy_output_rows(&block, cols),
             "cols {cols}: hint_rows must be included in the output-row read"
         );
         assert_eq!(
             completed_output_rows(&block, cols, None),
-            completed_block_output_rows(&block, cols),
+            legacy_output_rows(&block, cols),
             "cols {cols}: the metrics fallback must equal the legacy oracle"
         );
     }
@@ -363,7 +385,7 @@ fn completed_output_rows_matches_legacy_and_collapses_to_zero() {
             // Screen-origin rows follow the cache semantics: one row per line.
             assert_eq!(rows, output.lines().count());
         } else {
-            assert_eq!(rows, completed_block_output_rows(&block, 80));
+            assert_eq!(rows, legacy_output_rows(&block, 80));
         }
         let mut collapsed = block.clone();
         collapsed.collapsed = true;
@@ -440,8 +462,8 @@ fn metrics_fallback_reads_stored_tables_without_drift() {
     // Cols-fresh, block still expanded: stored-L2 read == the entry's own count.
     assert_eq!(
         completed_output_rows(&block, 80, Some(cache.get(block.id.0))),
-        cache.get(block.id.0).output_rows,
-        "fresh entry: width tables must agree with output_rows"
+        cache.get(block.id.0).width.hint_rows as usize + cache.get(block.id.0).width.rows.len(),
+        "fresh entry: width tables must agree with output rows"
     );
     // Cols-fresh + collapsed mismatch: O(1) stored-L2 read, gated to 0.
     let mut collapsed = block.clone();
@@ -453,14 +475,123 @@ fn metrics_fallback_reads_stored_tables_without_drift() {
     // Cols-miss: L2-only rebuild from the stored L1.
     assert_eq!(
         completed_output_rows(&block, 20, Some(cache.get(block.id.0))),
-        completed_block_output_rows(&block, 20),
+        legacy_output_rows(&block, 20),
         "cols-miss: stored-L1 rebuild must equal the legacy oracle"
     );
     // Stale identity (output grew): full rebuild, still exact.
     let grown = mk_block("echo", &format!("{output}more\n"), false, Some(0));
     assert_eq!(
         completed_output_rows(&grown, 20, Some(cache.get(block.id.0))),
-        completed_block_output_rows(&grown, 20),
+        legacy_output_rows(&grown, 20),
         "stale-identity entry must fall through to a full table build"
+    );
+}
+
+#[test]
+fn migrated_completed_block_output_rows_matches_text_oracle() {
+    // M5-b migration equivalence: the production row-count (now L2-fed)
+    // must equal the independent text-path oracle across the cols sweep,
+    // including a resume-hint block and a screen-origin block.
+    for (command, output, exit_code, screen_origin) in [
+        (
+            "echo",
+            "prose line one\nwrapped prose line that keeps going and going on\n",
+            Some(0),
+            false,
+        ),
+        (
+            "echo",
+            "─── pure box ───\n中文中文中文中文中文\n",
+            Some(0),
+            false,
+        ),
+        ("echo", "[| tui frame |]\nsecond row\n", Some(0), true),
+        ("opencode", "failed session output line\n", Some(1), false),
+    ] {
+        let block = mk_block(command, output, screen_origin, exit_code);
+        // Screen-origin rows follow the screen-origin clip policy (the M5-a
+        // recorded deviation: the v1.12.2 fallback soft-wrapped there and
+        // disagreed with the cache; the L2-based count matches the cache).
+        let raw: Vec<&str> = block.output.lines().collect();
+        let trimmed = trimmed_output_line_count(&raw);
+        for cols in COLS_CASES {
+            let hints: usize = command_resume_hints(&block)
+                .iter()
+                .map(|hint| block_line_chunks(hint, cols).count())
+                .sum();
+            let oracle = if screen_origin {
+                hints
+                    + raw[..trimmed]
+                        .iter()
+                        .map(|line| screen_origin_line_chunk_ranges(line, cols).len())
+                        .sum::<usize>()
+            } else {
+                hints
+                    + raw[..trimmed]
+                        .iter()
+                        .map(|line| block_line_chunk_ranges(line, cols).len())
+                        .sum::<usize>()
+            };
+            assert_eq!(
+                completed_block_output_rows(&block, cols),
+                oracle,
+                "command {command} cols {cols} origin {screen_origin}"
+            );
+        }
+    }
+}
+
+#[test]
+fn collapse_toggle_reuses_l1_and_rebuilds_width_only() {
+    // M5-b P2-2: a collapse/expand toggle must take the WidthOnly rebuild
+    // path — the stored L1 table (per-cluster, the expensive enumeration)
+    // is preserved untouched, and only the cols/collapsed-derived fields
+    // are recomputed. Guards the three toggle call sites' no-invalidate
+    // contract (mouse_controller / mouse_press_controller / find_controller).
+    let mut cache = BlockLayoutCache::default();
+    let block = mk_block("echo", "hello wrapped world line\nsecond\n", false, Some(0));
+    cache.ensure_cached(&block, 80);
+    let content_len = cache.get(block.id.0).content.graphemes.len();
+    let rows_before = cache.get(block.id.0).width.rows.len();
+
+    // Collapse: WidthOnly — no L1 re-enumeration, L2 stays populated
+    // (collapse gates READS, not the table), row count reads 0.
+    let builds_before = CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut folded = block.clone();
+    folded.collapsed = true;
+    cache.ensure_cached(&folded, 80);
+    assert_eq!(
+        CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        builds_before,
+        "collapse toggle must not rebuild L1"
+    );
+    assert_eq!(
+        cache.get(block.id.0).content.graphemes.len(),
+        content_len,
+        "the L1 cluster table must be preserved by the move"
+    );
+    assert_eq!(cache.get(block.id.0).width.rows.len(), rows_before);
+    assert_eq!(
+        completed_output_rows(&folded, 80, Some(cache.get(block.id.0))),
+        0
+    );
+    assert_eq!(
+        cache.get(block.id.0).base_row_count,
+        2,
+        "collapsed base = cmd + sep"
+    );
+
+    // Expand: still WidthOnly, rows readable again.
+    let builds_before = CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    cache.ensure_cached(&block, 80);
+    assert_eq!(
+        CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        builds_before,
+        "expand toggle must not rebuild L1"
+    );
+    assert_eq!(
+        completed_output_rows(&block, 80, Some(cache.get(block.id.0))),
+        2,
+        "two fitting lines → two output rows"
     );
 }

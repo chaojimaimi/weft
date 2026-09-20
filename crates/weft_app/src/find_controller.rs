@@ -180,9 +180,8 @@ impl App {
                         if let Some(b) = block {
                             if b.collapsed {
                                 term.block_tracker_mut().toggle_collapse(b.id);
-                                if let Some(renderer) = &self.renderer {
-                                    renderer.block_layout_cache.borrow_mut().invalidate(b.id.0);
-                                }
+                                // M5-b P2-2: no invalidate — collapsed mismatch
+                                // takes the WidthOnly rebuild path (L1 kept).
                             }
                         }
                     }

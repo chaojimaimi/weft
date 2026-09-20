@@ -477,9 +477,8 @@ impl App {
                             if let Some(bid) = row.block_id {
                                 if let Some(term) = self.sessions.active_mut().terminal.as_mut() {
                                     term.block_tracker_mut().toggle_collapse(bid);
-                                    if let Some(renderer) = &self.renderer {
-                                        renderer.block_layout_cache.borrow_mut().invalidate(bid.0);
-                                    }
+                                    // M5-b P2-2: no invalidate — collapsed mismatch
+                                    // takes the WidthOnly rebuild path (L1 kept).
                                     self.request_redraw();
                                 }
                             }

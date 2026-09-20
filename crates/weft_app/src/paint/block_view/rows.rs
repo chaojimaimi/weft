@@ -121,35 +121,35 @@ impl MetalRenderer {
 
         // Shared layout pass (single source of truth for row geometry).
         // resolve_styles=false: hit-testing doesn't need StyledLine lookups.
+        // M5-b: laid rows borrow from the cache (zero-copy row text) — the
+        // borrow lives until bv_rows (owning Strings) is built.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
             cache.sync_blocks(blocks, cols);
         }
-        let layout_out = {
-            let cache = self.block_layout_cache.borrow();
-            compute_block_layout_pass(
-                LayoutPassInput {
-                    blocks,
-                    live,
-                    pane_session_id: cache_namespace,
-                    cwd,
-                    git_branch,
-                    block_scroll,
-                    viewport_rows,
-                    cols,
-                    pitch,
-                    header_height,
-                    content_bottom_y,
-                    clip_top: layout.clip_top,
-                    clip_bottom: content_bottom_y,
-                    resolve_styles: false,
-                    styled_lookup_counter: None,
-                    block_diagnose_state,
-                },
-                &cache,
-                &mut self.live_layout_cache.borrow_mut(),
-            )
-        };
+        let cache = self.block_layout_cache.borrow();
+        let layout_out = compute_block_layout_pass(
+            LayoutPassInput {
+                blocks,
+                live,
+                pane_session_id: cache_namespace,
+                cwd,
+                git_branch,
+                block_scroll,
+                viewport_rows,
+                cols,
+                pitch,
+                header_height,
+                content_bottom_y,
+                clip_top: layout.clip_top,
+                clip_bottom: content_bottom_y,
+                resolve_styles: false,
+                styled_lookup_counter: None,
+                block_diagnose_state,
+            },
+            &cache,
+            &mut self.live_layout_cache.borrow_mut(),
+        );
 
         // Extract bv_rows from the layout output. Hit-testing keeps the
         // historical full-row set (cull=false) so pointer mapping is
@@ -211,11 +211,15 @@ pub(super) fn build_bv_rows(
     } = geometry;
     let mut bv_rows = Vec::new();
     for (i, &dist) in rows.iter().enumerate() {
-        let row_top_y = content_bottom_y - dist + scroll_px;
-        let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
-            header_height
-        } else {
-            pitch
+        // M5-b: Output entries are per-visual-row and carry their chunk
+        // offset within the line — the row's own band sits `chunk_idx`
+        // pitches below the pushed (line-top) dist. Byte-equal to the
+        // legacy wrapped expansion (`y + ci * pitch`).
+        let top = content_bottom_y - dist + scroll_px;
+        let (row_top_y, row_height) = match &row_data[i] {
+            LaidRow::Output { chunk_idx, .. } => (top + *chunk_idx as f32 * pitch, pitch),
+            LaidRow::Header { .. } => (top, header_height),
+            _ => (top, pitch),
         };
         let visible = row_top_y + row_height >= clip_top && row_top_y <= clip_bottom;
         // v1.10.26: no selection retention — the keep set is the pure
@@ -225,9 +229,11 @@ pub(super) fn build_bv_rows(
         match &row_data[i] {
             LaidRow::Output {
                 text,
-                chunks,
+                line_text: _,
                 block_id,
                 line,
+                chunk_idx: _,
+                char_offset,
                 ..
             } => {
                 // v1.6.1: carry the line index so click-time hyperlink
@@ -235,40 +241,19 @@ pub(super) fn build_bv_rows(
                 // resume hints (line == usize::MAX) — they have no styled
                 // output and aren't clickable.
                 let line_idx = (*line != usize::MAX).then_some(*line);
-                if chunks.len() <= 1 {
-                    if !keep {
-                        continue;
-                    }
-                    bv_rows.push(BlockViewRow {
-                        kind: BlockViewRowKind::Output,
-                        text: text.to_string(),
-                        block_id: *block_id,
-                        y_top: y,
-                        y_bottom: y + pitch,
-                        line: line_idx,
-                        chunk_char_offset: 0,
-                        indent_cols: 0,
-                    });
-                } else {
-                    // Keep the whole wrapped row if any chunk is retained
-                    // (visible or a selected endpoint).
-                    if !chunks.iter().any(|_chunk| keep) {
-                        continue;
-                    }
-                    for (ci, cy, char_offset) in wrapped_row_positions(y, pitch, chunks) {
-                        let chunk = &chunks[ci];
-                        bv_rows.push(BlockViewRow {
-                            kind: BlockViewRowKind::Output,
-                            text: chunk.clone(),
-                            block_id: *block_id,
-                            y_top: cy,
-                            y_bottom: cy + pitch,
-                            line: line_idx,
-                            chunk_char_offset: char_offset,
-                            indent_cols: 0,
-                        });
-                    }
+                if !keep {
+                    continue;
                 }
+                bv_rows.push(BlockViewRow {
+                    kind: BlockViewRowKind::Output,
+                    text: text.to_string(),
+                    block_id: *block_id,
+                    y_top: y,
+                    y_bottom: y + pitch,
+                    line: line_idx,
+                    chunk_char_offset: *char_offset,
+                    indent_cols: 0,
+                });
             }
             LaidRow::Command {
                 chunks,

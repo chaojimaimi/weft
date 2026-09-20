@@ -87,13 +87,13 @@ fn scrolling_past_clear_keeps_older_output_visible() {
     );
 }
 
-fn completed_layout<'a>(blocks: &'a [Block], cache: &BlockLayoutCache) -> LayoutPassOutput<'a> {
+fn completed_layout<'a>(blocks: &'a [Block], cache: &'a BlockLayoutCache) -> LayoutPassOutput<'a> {
     completed_layout_cols(blocks, cache, 80)
 }
 
 fn completed_layout_cols<'a>(
     blocks: &'a [Block],
-    cache: &BlockLayoutCache,
+    cache: &'a BlockLayoutCache,
     cols: usize,
 ) -> LayoutPassOutput<'a> {
     let empty_map = std::collections::HashMap::new();
@@ -202,19 +202,24 @@ fn command_output_gap_is_a_shared_structural_row_for_live_and_completed_blocks()
             .any(|row| matches!(row, LaidRow::Blank)));
     }
 
-    let live = live_layout("printf result", "result\n");
+    let cache = BlockLayoutCache::default();
+    let live = live_layout("printf result", "result\n", &cache);
     assert!(matches!(live.row_data[0], LaidRow::Output { .. }));
     assert!(matches!(live.row_data[1], LaidRow::Blank));
     assert!(matches!(live.row_data[2], LaidRow::LiveCommand { .. }));
 
-    let empty_live = live_layout("true", "");
+    let empty_live = live_layout("true", "", &cache);
     assert!(!empty_live
         .row_data
         .iter()
         .any(|row| matches!(row, LaidRow::Blank)));
 }
 
-fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
+fn live_layout<'a>(
+    command: &'a str,
+    output: &'a str,
+    cache: &'a BlockLayoutCache,
+) -> LayoutPassOutput<'a> {
     let empty_map = std::collections::HashMap::new();
     compute_block_layout_pass(
         LayoutPassInput {
@@ -242,7 +247,7 @@ fn live_layout<'a>(command: &'a str, output: &'a str) -> LayoutPassOutput<'a> {
             styled_lookup_counter: None,
             block_diagnose_state: &empty_map,
         },
-        &BlockLayoutCache::default(),
+        cache,
         &mut LiveLayoutCache::default(),
     )
 }
@@ -256,6 +261,7 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
     let output = (0..20)
         .map(|line| format!("line-{line}\n"))
         .collect::<String>();
+    let cache = BlockLayoutCache::default();
     let mk = |scroll: f32| {
         let live = InFlightBlock {
             command: "long-running-command",
@@ -284,7 +290,7 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
                 styled_lookup_counter: None,
                 block_diagnose_state: &std::collections::HashMap::new(),
             },
-            &BlockLayoutCache::default(),
+            &cache,
             &mut LiveLayoutCache::default(),
         )
     };

@@ -10,35 +10,17 @@
 //! The live in-flight block is NOT cached (its output streams every frame).
 
 use std::collections::HashMap;
-use std::ops::Range;
-use std::rc::Rc;
 
 use weft_core::blocks::Block;
 
 mod visual_rows;
-pub(crate) use visual_rows::{completed_output_rows, trimmed_output_line_count};
+pub(crate) use visual_rows::{char_offset_at, completed_output_rows, trimmed_output_line_count};
+#[cfg(test)]
+pub(crate) use wrapping::block_line_chunk_ranges;
 mod wrapping;
-pub(crate) use wrapping::{
-    block_line_chunk_ranges, block_line_chunks, command_line_chunks,
-    screen_origin_line_chunk_ranges, screen_origin_line_chunks,
-};
+pub(crate) use wrapping::{block_line_chunks, command_line_chunks, screen_origin_line_chunks};
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
-
-/// Pre-computed wrapping data for a single output line of a block.
-#[derive(Clone)]
-pub(crate) struct CachedLine {
-    /// 0-based line index within the block's output (before trimming).
-    pub(crate) idx: usize,
-    /// Byte offset of this line's start within `block.output`.
-    pub(crate) byte_start: usize,
-    /// Byte offset of this line's end (exclusive) within `block.output`.
-    pub(crate) byte_end: usize,
-    /// Source-relative byte ranges for pre-wrapped chunks. The block's
-    /// immutable output remains the sole owner of text bytes; visible rows
-    /// materialize short strings only for the current frame.
-    pub(crate) chunk_ranges: Rc<[Range<usize>]>,
-}
 
 /// Cached layout for a single finished block.
 #[derive(Clone)]
@@ -59,15 +41,6 @@ pub(crate) struct CachedBlockLayout {
     /// Whether the block has any non-empty output lines (cached foldable
     /// check, avoids re-scanning the last 500 lines every frame).
     pub(crate) foldable: bool,
-    /// Pre-trimmed, pre-wrapped line metadata. Trailing empty/prompt lines
-    /// are already removed, matching the original trimming logic.
-    pub(crate) lines: Vec<CachedLine>,
-    /// R2-2: cached wrapped output row count (sum of chunks.len() across
-    /// all lines + command resume hints). Excludes the header/gap/spacer
-    /// because those depend on `header_rows` and `viewport_rows` which are
-    /// per-frame parameters, not per-block cache keys. This lets
-    /// `block_content_metrics` skip the O(m) re-wrap per block and read O(1).
-    pub(crate) output_rows: usize,
     /// R2-2 (Batch 7): base row count for prefix-sum = hint_rows +
     /// output_rows + 2 (command + separator). Excludes clear_rows (depends
     /// on per-frame viewport_rows) and header_height (per-frame). Used by
@@ -87,7 +60,9 @@ pub(crate) struct CachedBlockLayout {
     pub(crate) command_wrap_rows: usize,
     /// M5-a (PLAN_M5 §二): L1 content layer (cols-independent, output-keyed).
     pub(crate) content: visual_rows::ContentTable,
-    /// M5-a (PLAN_M5 §二): L2 width layer; `hint_rows + rows.len()` = O(1) rows.
+    /// M5-b (PLAN_M5 §二): L2 width layer — the ONLY row source. Output rows
+    /// read `hint_rows + rows.len()` (O(1)); visible frames slice
+    /// `rows` windows via `line_row_base` (no per-line materialization).
     pub(crate) width: visual_rows::WidthTable,
 }
 
@@ -159,6 +134,20 @@ impl BlockLayoutCache {
             for block in blocks {
                 self.ensure_cached(block, cols);
             }
+            // M5-b P2-1 (PLAN_M5 §二 内存): the set shrank or rotated (history
+            // retention, `clear`, tab switch) — evict entries for blocks no
+            // longer in the session set, or L1 tables (~8B/cluster) would
+            // accumulate across session lifetimes. The append-only scroll
+            // fast path above skips this (no shrink possible).
+            let ids: std::collections::HashSet<u64> =
+                blocks.iter().map(|block| block.id.0).collect();
+            let before = self.entries.len();
+            self.entries.retain(|id, _| ids.contains(id));
+            if self.entries.len() != before {
+                // Evicted entries change what get_if_cached/metrics compute.
+                self.prefix_sum_dirty = true;
+                self.misses_total = self.misses_total.wrapping_add(1);
+            }
         }
 
         for id in std::mem::take(&mut self.dirty_ids) {
@@ -173,13 +162,16 @@ impl BlockLayoutCache {
         self.build_prefix_sum(blocks);
     }
 
+    /// Explicitly evict one entry (M5-b P2-2: collapse toggles no longer
+    /// call this — the WidthOnly rebuild path preserves the L1 table).
+    #[cfg(test)]
     pub(crate) fn invalidate(&mut self, id: u64) {
         self.entries.remove(&id);
         if !self.dirty_ids.contains(&id) {
             self.dirty_ids.push(id);
         }
         self.prefix_sum_dirty = true;
-        // v1.10.23: invalidate changes what the metrics fallback computes
+        // v1.10.23: invalidation changes what the metrics fallback computes
         // (get_if_cached → None → direct), so it must bump the memo
         // fingerprint even before the entry is rebuilt.
         self.misses_total = self.misses_total.wrapping_add(1);
@@ -188,25 +180,54 @@ impl BlockLayoutCache {
     /// Ensure `block` has a cached layout for `cols`. Recomputes only if
     /// the block is new, its output/command changed, `collapsed` was
     /// toggled, or `cols` changed (resize).
+    /// M5-b (PLAN_M5 §二): L1 is keyed by output identity + len — a cols
+    /// change (or collapse toggle) reuses the stored L1 table and rebuilds
+    /// ONLY the L2 width table (never touches text), which is what keeps a
+    /// resize-commit frame inside the G2 budget for large histories.
     pub(crate) fn ensure_cached(&mut self, block: &Block, cols: usize) {
         let id = block.id.0;
+        enum Rebuild {
+            None,
+            WidthOnly,
+            Both,
+        }
         let needs_rebuild = match self.entries.get(&id) {
-            None => true,
+            None => Rebuild::Both,
             Some(c) => {
-                c.output_len != block.output.len()
-                    || c.output_identity != block.output.as_ptr() as usize
-                    || c.command_len != block.command.len()
-                    || c.collapsed != block.collapsed
-                    || c.cols != cols
+                let output_same = c.output_len == block.output.len()
+                    && c.output_identity == block.output.as_ptr() as usize
+                    && c.content.screen_origin == block.screen_origin;
+                let cols_or_collapse = c.cols != cols || c.collapsed != block.collapsed;
+                if output_same && c.command_len == block.command.len() {
+                    if cols_or_collapse {
+                        Rebuild::WidthOnly
+                    } else {
+                        Rebuild::None
+                    }
+                } else {
+                    // New output allocation: both layers are stale.
+                    Rebuild::Both
+                }
             }
         };
-        if needs_rebuild {
-            self.misses += 1;
-            self.misses_total = self.misses_total.wrapping_add(1);
-            self.prefix_sum_dirty = true;
-            self.entries.insert(id, compute_block_layout(block, cols));
-        } else {
-            self.hits += 1;
+        match needs_rebuild {
+            Rebuild::None => self.hits += 1,
+            Rebuild::WidthOnly => {
+                self.misses += 1;
+                self.misses_total = self.misses_total.wrapping_add(1);
+                self.prefix_sum_dirty = true;
+                // Take the old entry out so the L1 table MOVES into the new
+                // entry (no clone of the per-cluster tables).
+                let mut prev = self.entries.remove(&id).expect("checked above");
+                prev = compute_block_layout_with_content(block, cols, prev.content);
+                self.entries.insert(id, prev);
+            }
+            Rebuild::Both => {
+                self.misses += 1;
+                self.misses_total = self.misses_total.wrapping_add(1);
+                self.prefix_sum_dirty = true;
+                self.entries.insert(id, compute_block_layout(block, cols));
+            }
         }
     }
 
@@ -305,6 +326,17 @@ impl BlockLayoutCache {
 
 /// Compute the layout for a single block (expensive — call once, then cache).
 fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
+    let content = visual_rows::build_content_table(&block.output, block.screen_origin);
+    compute_block_layout_with_content(block, cols, content)
+}
+
+/// Same, with a caller-provided L1 table — the cols-only rebuild path moves
+/// the stored table in instead of re-enumerating the output (M5-b).
+fn compute_block_layout_with_content(
+    block: &Block,
+    cols: usize,
+    content: visual_rows::ContentTable,
+) -> CachedBlockLayout {
     // R2-2 fix: bare `clear` produces a viewport-sized spacer. Mirrors
     // `clear_block_spacer_rows`' command check.
     let is_clear = block.command.split_whitespace().next() == Some("clear");
@@ -319,73 +351,24 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
     // so scroll geometry can't drift between the two paths.
     let command_wrap_rows = crate::block_component::command_wrap_rows_for(block, cols, foldable);
 
-    // Collect raw lines and trim trailing empty/prompt lines.
-    let raw_lines: Vec<&str> = block.output.lines().collect();
-    let trimmed_len = trimmed_output_line_count(&raw_lines);
-
-    // Pre-compute wrapped chunks for each surviving line.
-    let lines: Vec<CachedLine> = raw_lines[..trimmed_len]
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let byte_start = line.as_ptr() as usize - block.output.as_ptr() as usize;
-            let byte_end = byte_start + line.len();
-            // v1.10.26 (FIX_WRAP_EPOCH_AND_VIEWPORT_KEEP B-1): the chunk
-            // strategy follows the block's ORIGIN. A screen-origin block (a
-            // primary-screen TUI document) clips overwide rows to a single
-            // chunk — its `|]` border must never fold onto the next line. A
-            // shell-output block keeps soft-wrap (logical lines may overflow).
-            let chunk_ranges: Rc<[Range<usize>]> = Rc::from(if block.screen_origin {
-                screen_origin_line_chunk_ranges(line, cols)
-            } else {
-                block_line_chunk_ranges(line, cols)
-            });
-            CachedLine {
-                idx,
-                byte_start,
-                byte_end,
-                chunk_ranges,
-            }
-        })
-        .collect();
-
-    // R2-2: cache the wrapped output row count so block_content_metrics can
-    // read O(1) instead of re-wrapping every block every frame. This sums
-    // command resume hints (static strings, opencode-only) + visible output
-    // lines — exactly what completed_block_output_rows computes, minus the
-    // per-frame header_rows/viewport_rows terms that don't belong in the cache.
-    // Collapsed blocks report 0 output rows (matching completed_block_output_rows)
-    // even though `lines` is still populated for foldable detection / uncollapse.
-    let output_rows = if block.collapsed {
-        0
-    } else {
-        let hint_rows: usize = crate::block_component::command_resume_hints(block)
-            .iter()
-            .map(|hint| block_line_chunks(hint, cols).count())
-            .sum();
-        let line_rows: usize = lines.iter().map(|l| l.chunk_ranges.len()).sum();
-        hint_rows + line_rows
-    };
+    // M5-b (PLAN_M5 §二/§五): L1/L2 tables are the SOLE layout source — the
+    // legacy per-line CachedLine build is gone (double-build made G2 worse
+    // than baseline). L2 re-runs the shared wrap machine over the L1 tables
+    // (never touches text).
+    let hints = crate::block_component::command_resume_hints(block);
+    let width = visual_rows::build_width_table(&content, hints, cols);
 
     // R2-2 (Batch 7): base_row_count for prefix-sum. Matches the
     // layout_pass formula: hint/output rows + the conditional command/output
     // breathing row + wrapped command rows + separator. clear_rows and
-    // header_height are per-frame and excluded.
-    let hint_rows_for_base = if block.collapsed {
-        0
-    } else {
-        crate::block_component::command_resume_hints(block)
-            .iter()
-            .map(|hint| block_line_chunks(hint, cols).count())
-            .sum::<usize>()
-    };
-    // R2-2 fix: avoid double-counting resume hints — `output_rows` above
-    // already includes them, so sum raw output line rows here instead.
+    // header_height are per-frame and excluded. Rows read straight off L2
+    // (hint_rows + rows.len()); collapsed blocks report 0 output rows
+    // (matching completed_block_output_rows) even though the tables are
+    // still populated for foldable detection / uncollapse.
     let content_rows = if block.collapsed {
         0
     } else {
-        let line_rows: usize = lines.iter().map(|l| l.chunk_ranges.len()).sum();
-        hint_rows_for_base + line_rows
+        width.hint_rows as usize + width.rows.len()
     };
     // R2-2 (stage 2): command counted by wrapped rows instead of a constant
     // 1. Single-line commands keep the old `+2` total (command + separator).
@@ -394,11 +377,6 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         + command_wrap_rows
         + 1; // separator
 
-    // M5-a (PLAN_M5 §二): L1/L2 tables beside the legacy fields until M5-b migrates consumers.
-    let content = visual_rows::build_content_table(&block.output, block.screen_origin);
-    let hints = crate::block_component::command_resume_hints(block);
-    let width = visual_rows::build_width_table(&content, hints, cols);
-
     CachedBlockLayout {
         output_len: block.output.len(),
         output_identity: block.output.as_ptr() as usize,
@@ -406,8 +384,6 @@ fn compute_block_layout(block: &Block, cols: usize) -> CachedBlockLayout {
         collapsed: block.collapsed,
         cols,
         foldable,
-        lines,
-        output_rows,
         base_row_count,
         is_clear,
         command_wrap_rows,
@@ -440,9 +416,7 @@ mod tests {
     fn block_layout_cache_computes_on_first_access() {
         let block = mk_block_with_output(1, "echo hello", "hello\nworld\n");
         let layout = compute_block_layout(&block, 80);
-        assert_eq!(layout.lines.len(), 2);
-        assert_eq!(layout.lines[0].idx, 0);
-        assert_eq!(layout.lines[1].idx, 1);
+        assert_eq!(layout.content.line_meta.len(), 2);
         assert!(layout.foldable);
     }
 
@@ -451,14 +425,11 @@ mod tests {
         let block = mk_block_with_output(1, "echo", "output\n\n\n");
         let layout = compute_block_layout(&block, 80);
         assert_eq!(
-            layout.lines.len(),
+            layout.content.line_meta.len(),
             1,
             "trailing empty lines should be trimmed"
         );
-        assert_eq!(
-            &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end],
-            "output"
-        );
+        assert_eq!(&block.output[layout.content.line_range(0)], "output");
     }
 
     #[test]
@@ -466,7 +437,7 @@ mod tests {
         let block = mk_block_with_output(1, "echo", "output\n%\n$\n#\n");
         let layout = compute_block_layout(&block, 80);
         assert_eq!(
-            layout.lines.len(),
+            layout.content.line_meta.len(),
             1,
             "trailing prompt lines should be trimmed"
         );
@@ -476,19 +447,10 @@ mod tests {
     fn block_layout_cache_byte_offsets_correct() {
         let block = mk_block_with_output(1, "echo", "first\nsecond\nthird\n");
         let layout = compute_block_layout(&block, 80);
-        assert_eq!(layout.lines.len(), 3);
-        assert_eq!(
-            &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end],
-            "first"
-        );
-        assert_eq!(
-            &block.output[layout.lines[1].byte_start..layout.lines[1].byte_end],
-            "second"
-        );
-        assert_eq!(
-            &block.output[layout.lines[2].byte_start..layout.lines[2].byte_end],
-            "third"
-        );
+        assert_eq!(layout.content.line_meta.len(), 3);
+        assert_eq!(&block.output[layout.content.line_range(0)], "first");
+        assert_eq!(&block.output[layout.content.line_range(1)], "second");
+        assert_eq!(&block.output[layout.content.line_range(2)], "third");
     }
 
     #[test]
@@ -496,15 +458,13 @@ mod tests {
         // 20 chars at cols=10 → 2 chunks
         let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
         let layout = compute_block_layout(&block, 10);
-        assert_eq!(layout.lines.len(), 1);
-        assert_eq!(
-            layout.lines[0].chunk_ranges.len(),
-            2,
-            "20 chars at cols=10 → 2 chunks"
-        );
-        let line = &block.output[layout.lines[0].byte_start..layout.lines[0].byte_end];
-        assert_eq!(&line[layout.lines[0].chunk_ranges[0].clone()], "0123456789");
-        assert_eq!(&line[layout.lines[0].chunk_ranges[1].clone()], "abcdefghij");
+        assert_eq!(layout.content.line_meta.len(), 1);
+        assert_eq!(layout.width.rows.len(), 2, "20 chars at cols=10 → 2 chunks");
+        let line = &block.output[layout.content.line_range(0)];
+        let base = layout.width.line_row_base[0] as usize;
+        let row_text = |r: usize| layout.content.row_text(line, &layout.width.rows[base + r]);
+        assert_eq!(row_text(0), "0123456789");
+        assert_eq!(row_text(1), "abcdefghij");
     }
 
     #[test]
@@ -512,7 +472,7 @@ mod tests {
         let block = mk_block_with_output(1, "true", "\n\n\n");
         let layout = compute_block_layout(&block, 80);
         assert!(!layout.foldable, "all-empty output should not be foldable");
-        assert_eq!(layout.lines.len(), 0, "all lines trimmed");
+        assert_eq!(layout.content.line_meta.len(), 0, "all lines trimmed");
     }
 
     #[test]
@@ -525,7 +485,10 @@ mod tests {
         // Same content + cols → should NOT rebuild (same instance).
         cache.ensure_cached(&block, 80);
         let layout2 = cache.get(1).clone();
-        assert_eq!(layout1.lines.len(), layout2.lines.len());
+        assert_eq!(
+            layout1.content.line_meta.len(),
+            layout2.content.line_meta.len()
+        );
         assert_eq!(layout1.cols, layout2.cols);
     }
 
@@ -534,13 +497,13 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let block = mk_block_with_output(1, "echo", "hello\n");
         cache.ensure_cached(&block, 80);
-        assert_eq!(cache.get(1).lines.len(), 1);
+        assert_eq!(cache.get(1).content.line_meta.len(), 1);
 
         // Output grew → cache should detect and rebuild.
         let block2 = mk_block_with_output(1, "echo", "hello\nworld\n");
         cache.ensure_cached(&block2, 80);
         assert_eq!(
-            cache.get(1).lines.len(),
+            cache.get(1).content.line_meta.len(),
             2,
             "output change should trigger rebuild"
         );
@@ -551,7 +514,7 @@ mod tests {
         let mut cache = BlockLayoutCache::default();
         let block = mk_block_with_output(1, "echo", "abcdef\n");
         cache.ensure_cached(&block, 80);
-        assert_eq!(cache.get(1).lines[0].byte_end, 6);
+        assert_eq!(cache.get(1).content.line_range(0).end, 6);
 
         // Same BlockId and byte length, but a different immutable allocation
         // and UTF-8 boundary. Reusing the old byte range could panic while
@@ -559,8 +522,8 @@ mod tests {
         let replacement = mk_block_with_output(1, "echo", "中文\n");
         assert_eq!(block.output.len(), replacement.output.len());
         cache.ensure_cached(&replacement, 80);
-        let line = &cache.get(1).lines[0];
-        assert_eq!(&replacement.output[line.byte_start..line.byte_end], "中文");
+        let range = cache.get(1).content.line_range(0);
+        assert_eq!(&replacement.output[range], "中文");
     }
 
     #[test]
@@ -569,7 +532,7 @@ mod tests {
         let block = mk_block_with_output(1, "echo", "0123456789abcdefghij");
         cache.ensure_cached(&block, 10);
         assert_eq!(
-            cache.get(1).lines[0].chunk_ranges.len(),
+            cache.get(1).width.rows.len(),
             2,
             "20 chars / cols=10 → 2 chunks"
         );
@@ -577,7 +540,7 @@ mod tests {
         // Resize to cols=20 → should rebuild with 1 chunk.
         cache.ensure_cached(&block, 20);
         assert_eq!(
-            cache.get(1).lines[0].chunk_ranges.len(),
+            cache.get(1).width.rows.len(),
             1,
             "20 chars / cols=20 → 1 chunk"
         );
@@ -635,7 +598,7 @@ mod tests {
     fn block_layout_cache_empty_output() {
         let block = mk_block_with_output(1, "true", "");
         let layout = compute_block_layout(&block, 80);
-        assert_eq!(layout.lines.len(), 0);
+        assert_eq!(layout.content.line_meta.len(), 0);
         assert!(!layout.foldable);
     }
 

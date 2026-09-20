@@ -257,7 +257,7 @@ pub(crate) const IS_TAB_ZERO_W: u8 = 1 << 1;
 pub(crate) struct GEntry {
     /// Byte offset of the cluster within its LINE (line-relative, matching
     /// the legacy per-line chunk ranges; output-relative =
-    /// `CachedLine::byte_start` + this).
+    /// `LMeta::line_byte_start` + this).
     pub(crate) byte_offset: u32,
     /// `terminal_text_width(整簇)` — never a per-char sum.
     pub(crate) width: u8,
@@ -277,6 +277,9 @@ pub(crate) struct LMeta {
     pub(crate) char_count: u32,
     /// Line byte length (the line's clusters tile `0..byte_len`).
     pub(crate) byte_len: u32,
+    /// Byte offset of the line within `block.output` (M5-b: zero-copy row
+    /// text slicing after `CachedLine` was deleted).
+    pub(crate) line_byte_start: u32,
     /// Verbatim `classify_structure_line` result (not a copy); Prose ≙ `None`.
     pub(crate) structure: StructureKind,
 }
@@ -293,15 +296,26 @@ pub(crate) struct ContentTable {
     pub(crate) trailing_trim_lines: u32,
 }
 
+/// Test-only counter of full L1 builds — the collapse-toggle test pins the
+/// WidthOnly path (ensure_cached must NOT re-enumerate the output).
+#[cfg(test)]
+pub(crate) static CONTENT_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Build L1 from a block output. Grapheme enumeration and width judgement
 /// use the same call sites as the legacy wrap path.
 pub(crate) fn build_content_table(output: &str, screen_origin: bool) -> ContentTable {
+    #[cfg(test)]
+    {
+        CONTENT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let raw_lines: Vec<&str> = output.lines().collect();
     let trimmed_len = trimmed_output_line_count(&raw_lines);
     let mut graphemes: Vec<GEntry> = Vec::new();
     let mut line_meta: Vec<LMeta> = Vec::with_capacity(trimmed_len);
     for line in &raw_lines[..trimmed_len] {
         let grapheme_start = to_u32(graphemes.len());
+        let line_byte_start = line.as_ptr() as usize - output.as_ptr() as usize;
         let mut char_count = 0u32;
         let mut byte_offset = 0usize;
         for grapheme in line.graphemes(true) {
@@ -325,6 +339,7 @@ pub(crate) fn build_content_table(output: &str, screen_origin: bool) -> ContentT
             grapheme_len: to_u32(graphemes.len()) - grapheme_start,
             char_count,
             byte_len: to_u32(line.len()),
+            line_byte_start: to_u32(line_byte_start),
             structure: classify_structure_line(line),
         });
         debug_assert_eq!(
@@ -347,13 +362,45 @@ pub(crate) fn build_content_table(output: &str, screen_origin: bool) -> ContentT
     table
 }
 
+impl ContentTable {
+    /// Byte offset of a visual row within its source line; the row's text is
+    /// `&line_text[start..start + row.byte_len]`.
+    pub(crate) fn row_byte_start(&self, row: &VisualRow) -> usize {
+        self.graphemes[row.g_start as usize].byte_offset as usize
+    }
+
+    /// Zero-copy text of one visual row — a byte slice of the source line
+    /// derived from the L1 cluster offsets (no String materialization,
+    /// PLAN_M5 §三 R-a).
+    pub(crate) fn row_text<'t>(&self, line_text: &'t str, row: &VisualRow) -> &'t str {
+        let start = self.row_byte_start(row);
+        &line_text[start..start + row.byte_len as usize]
+    }
+
+    /// Byte range of surviving source line `line` within `block.output`.
+    pub(crate) fn line_range(&self, line: usize) -> Range<usize> {
+        let meta = &self.line_meta[line];
+        let start = meta.line_byte_start as usize;
+        start..start + meta.byte_len as usize
+    }
+}
+
+/// Number of chars before `byte_start` in `line_text` — the consumption-time
+/// derivation of `chunk_char_offset` (PLAN_M5 §三): the row prefix is walked
+/// as UTF-8 bytes only, O(行前缀字节), replacing the legacy per-frame
+/// per-line chunk prefix sums. Chunks tile the line byte-wise (G4), so this
+/// equals the legacy sum of preceding chunk char counts exactly.
+pub(crate) fn char_offset_at(line_text: &str, byte_start: usize) -> usize {
+    line_text[..byte_start].chars().count()
+}
+
 // ── L2 width layer (key = cols, single active entry) ────────────────────
 
 /// One visual row: 16 bytes, all `u32` — trailing-whitespace absorption can
 /// push a row past `cols`; u16 would silently overflow (PLAN_M5 §二 P1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct VisualRow {
-    /// Surviving-line index (same numbering as `CachedLine.idx`).
+    /// Surviving-line index (same numbering as the legacy `CachedLine.idx`).
     pub(crate) line_idx: u32,
     /// First cluster of the row — ABSOLUTE index into
     /// [`ContentTable::graphemes`].
@@ -417,6 +464,22 @@ pub(crate) fn build_width_table(l1: &ContentTable, hints: &[&str], cols: usize) 
             width: e.width,
             is_whitespace: e.flags & IS_WHITESPACE != 0,
         }));
+        // Fast path (the common transcript case): a line whose total display
+        // width fits `cols` is ONE whole-line row in EVERY mode — prose wrap
+        // never breaks a fitting line, and every clip prefix ends at the
+        // line end — so the machine and its scratch materialization are
+        // skipped entirely.
+        let total_width: usize = entries.iter().map(|e| usize::from(e.width)).sum();
+        if cols == 0 || total_width <= cols {
+            rows.push(VisualRow {
+                line_idx: to_u32(line_idx),
+                g_start: to_u32(g0),
+                g_len: meta.grapheme_len,
+                byte_len: meta.byte_len,
+            });
+            line_row_base.push(to_u32(rows.len()));
+            continue;
+        }
         let ranges = wrap_line_ranges(&scratch, cols, mode);
         // Byte ranges always land on cluster boundaries (the machine only
         // breaks at cluster starts / prefix ends), so the window walk below

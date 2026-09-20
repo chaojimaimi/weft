@@ -78,11 +78,8 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
     };
-    let out = compute_block_layout_pass(
-        input,
-        &BlockLayoutCache::default(),
-        &mut LiveLayoutCache::default(),
-    );
+    let cache = BlockLayoutCache::default();
+    let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
     assert!(!out.rows.is_empty(), "layout pass must emit live rows");
 
     let matched_idx = out.row_data.iter().position(|row| match row {
@@ -154,11 +151,8 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
     };
-    let out = compute_block_layout_pass(
-        input,
-        &BlockLayoutCache::default(),
-        &mut LiveLayoutCache::default(),
-    );
+    let cache = BlockLayoutCache::default();
+    let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
     let matched = out.row_data.iter().any(|row| match row {
         LaidRow::Output {
             block_id: None,
@@ -211,11 +205,8 @@ fn b_path_anchor_never_falls_below_layout_window_base() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
     };
-    let out = compute_block_layout_pass(
-        input,
-        &BlockLayoutCache::default(),
-        &mut LiveLayoutCache::default(),
-    );
+    let cache = BlockLayoutCache::default();
+    let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
     let live_rows: Vec<usize> = out
         .row_data
         .iter()
@@ -273,34 +264,27 @@ fn b_path_wrapped_row_caret_chunk_selection_is_consistent() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
     };
-    let out = compute_block_layout_pass(
-        input,
-        &BlockLayoutCache::default(),
-        &mut LiveLayoutCache::default(),
-    );
+    let cache = BlockLayoutCache::default();
+    let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
     let cursor_line = 0;
-    let (_, chunks) = out
+    // M5-b: one LaidRow::Output per visual row — the caret line's row count
+    // IS its chunk count.
+    let chunk_rows: Vec<&LaidRow<'_>> = out
         .row_data
         .iter()
-        .enumerate()
-        .find_map(|(i, row)| match row {
-            LaidRow::Output {
-                block_id: None,
-                line,
-                chunks,
-                ..
-            } if crate::block_component::tui_caret_row_matches(None, *line, cursor_line) => {
-                Some((i, chunks.clone()))
-            }
-            _ => None,
+        .filter(|row| {
+            matches!(row, LaidRow::Output { block_id: None, line, .. }
+                if crate::block_component::tui_caret_row_matches(None, *line, cursor_line))
         })
-        .expect("live row must match the caret line");
+        .collect();
+    assert!(!chunk_rows.is_empty(), "live row must match the caret line");
     // The wrapped branch's guard — caret lands in chunk `cursor_col / cols`.
     let cursor_col = 4;
     let chunk_idx = cursor_col / 4;
     assert!(
-        chunk_idx < chunks.len(),
-        "caret chunk {chunk_idx} must exist in {chunks:?}"
+        chunk_idx < chunk_rows.len(),
+        "caret chunk {chunk_idx} must exist across {} row(s)",
+        chunk_rows.len()
     );
     // The preedit overlay's own wrap must not change the caret chunk's bytes
     // (both sides wrap from the line text; byte source is preserved).
@@ -414,11 +398,8 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
     };
-    let out = compute_block_layout_pass(
-        input,
-        &BlockLayoutCache::default(),
-        &mut LiveLayoutCache::default(),
-    );
+    let cache = BlockLayoutCache::default();
+    let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
     assert!(!out.row_data.is_empty(), "new live block must lay out rows");
     let matched = out.row_data.iter().any(|row| match row {
         LaidRow::Output {

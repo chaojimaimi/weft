@@ -1,6 +1,7 @@
 //! Shared layout pass for BlockView: walk blocks bottom-to-top, accumulate
 //! `cursor_dist`, push `LaidRow` rows (paint + hit-testing both consume this).
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -9,21 +10,46 @@ use crate::block_component::{
     BlockTone,
 };
 use crate::paint::grid_cache::{
-    block_line_chunks, command_line_chunks, screen_origin_line_chunks, BlockLayoutCache,
+    block_line_chunks, char_offset_at, command_line_chunks, screen_origin_line_chunks,
+    BlockLayoutCache,
 };
+
+#[cfg(test)]
+#[path = "layout_pass/bench.rs"]
+mod bench;
+mod bounds;
+#[cfg(test)]
+#[path = "layout_pass/window_tests.rs"]
+mod window_tests;
 use crate::paint::live_cache::LiveLayoutCache;
 use crate::paint::ui_helpers::strip_prompt_prefix;
+use bounds::{lower_bound_height, upper_bound_height};
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
 
 /// A laid-out row in the block view. Paint-superset fields (`line`/`style`/
 /// `collapsed`/`foldable`/`tone`) are ignored by hit-testing.
 pub(super) enum LaidRow<'a> {
+    /// ONE visual output row (M5-b, PLAN_M5 §三 R-a: one entry per EMITTED
+    /// visual row, not per source line). `text` is the row's own text —
+    /// zero-copy byte slice of `block.output` for finished blocks, an owned
+    /// clone for hints/live lines (not L2-backed). `line_text` is the full
+    /// source line (semantic text for styled paint and find ranges); a row
+    /// that spans its whole line carries `text == line_text` so the legacy
+    /// single-chunk behavior (paint the line, renderer `max_cols` clips —
+    /// relied on by screen-origin rows) is preserved byte-for-byte.
+    /// `chunk_idx` is the row's index within its line's visual rows — the
+    /// styled cache key `chunk_idx` AND the y offset (`y + chunk_idx *
+    /// pitch`, byte-equal to the legacy per-line push plus per-chunk
+    /// offsets). `char_offset` counts the chars before this row within the
+    /// source line (consumption-time UTF-8 prefix count, `char_offset_at`).
     Output {
-        text: &'a str,
-        chunks: Rc<[String]>,
+        line_text: &'a str,
+        text: Cow<'a, str>,
         block_id: Option<BlockId>,
         /// Line index into the block's output; `usize::MAX` for resume hints.
         line: usize,
+        chunk_idx: usize,
+        char_offset: usize,
         /// Resolved styled line for syntax highlighting. `None` for hit-testing.
         style: Option<&'a StyledLine>,
     },
@@ -109,13 +135,15 @@ pub(super) struct LayoutPassInput<'a, 'b> {
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
 /// `cursor_dist`, apply visibility culling, emit `LaidRow` rows (paint +
 /// hit-testing both call this). Caller must `ensure_cached` every block.
-/// Output borrows from `blocks`/`live`, not `cache` — visible rows only are
-/// materialized into `Rc<[String]>`, keeping offscreen history un-duplicated.
-/// v1.10.23: `live_cache` (synced internally) locates the visible live-line
-/// window via cumulative prefix sums — no per-frame full-document scan.
+/// M5-b (PLAN_M5 §三 R-a): output rows are emitted O(visible rows) — the
+/// L2 `line_row_base` is binary-searched per block and only visible visual
+/// rows slice the block's immutable `output` (zero-copy). The output DOES
+/// borrow from `cache` now (row text derives from `CachedBlockLayout`),
+/// so the cache borrow must outlive the laid rows. Live rows materialize
+/// per-chunk strings as before (`LiveLayoutCache` is out of M5 scope).
 pub(super) fn compute_block_layout_pass<'a, 'b>(
     input: LayoutPassInput<'a, 'b>,
-    cache: &BlockLayoutCache,
+    cache: &'a BlockLayoutCache,
     live_cache: &mut LiveLayoutCache,
 ) -> LayoutPassOutput<'a> {
     let LayoutPassInput {
@@ -184,23 +212,32 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             } else {
                 Rc::from(block_line_chunks(line, cols).collect::<Vec<_>>())
             };
-            let vis_rows = chunks.len();
-            cursor_dist += vis_rows as f32 * pitch;
-            rows.push(cursor_dist);
-            row_data.push(LaidRow::Output {
-                text: line,
-                chunks,
-                block_id: None,
-                line: line_idx,
-                style: if resolve_styles {
-                    live.styled_output.and_then(|styled| {
-                        bump_styled(1);
-                        styled.line(line_idx)
-                    })
-                } else {
-                    None
-                },
-            });
+            cursor_dist += chunks.len() as f32 * pitch;
+            let style = if resolve_styles {
+                live.styled_output.and_then(|styled| {
+                    bump_styled(1);
+                    styled.line(line_idx)
+                })
+            } else {
+                None
+            };
+            // One entry per visual row; pushed dist = the line's top (the
+            // legacy per-line value) and the paint adds `chunk_idx * pitch` —
+            // byte-equal to the legacy single-entry-per-line rendering.
+            let mut char_offset = 0usize;
+            for (ci, chunk) in chunks.iter().enumerate() {
+                rows.push(cursor_dist);
+                row_data.push(LaidRow::Output {
+                    line_text: line,
+                    text: Cow::Owned(chunk.clone()),
+                    block_id: None,
+                    line: line_idx,
+                    chunk_idx: ci,
+                    char_offset,
+                    style,
+                });
+                char_offset += chunk.chars().count();
+            }
         }
         if live_cache.total_lines() > 0 {
             // Blank sits above the output at the FULL layout height.
@@ -318,16 +355,20 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             .map(|r| r.is_err())
             .unwrap_or(false);
 
-        // Block height without expanding lines; cached.output_rows is O(1).
-        let hint_rows: usize = if b.collapsed {
+        // Block height without expanding lines; L2 tables are O(1) reads.
+        // M5-b: hint/output rows read straight off the L2 width table — the
+        // legacy per-frame hint re-wrap is gone (same shared machine, same
+        // numbers, pinned by the visual_rows tests).
+        let hint_rows = if b.collapsed {
             0
         } else {
-            command_resume_hints(b)
-                .iter()
-                .map(|hint| block_line_chunks(hint, cols).count())
-                .sum()
+            cached.width.hint_rows as usize
         };
-        let output_rows = if b.collapsed { 0 } else { cached.output_rows };
+        let output_rows = if b.collapsed {
+            0
+        } else {
+            cached.width.rows.len()
+        };
         let clear_rows = clear_block_spacer_rows(&b.command, viewport_rows);
         let output_gap_rows = command_output_gap_rows(hint_rows + output_rows);
         let block_total_height = (hint_rows + output_rows) as f32 * pitch
@@ -348,43 +389,119 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
 
         if is_visible && !b.collapsed {
             expanded_block_count += 1;
+            // Resume hints: two static strings, wrapped on demand (not worth
+            // an L2 entry). One entry per visual row, pushed dist = hint top.
             for hint in command_resume_hints(b).iter().rev() {
                 let chunks: Rc<[String]> =
                     Rc::from(block_line_chunks(hint, cols).collect::<Vec<_>>());
                 cursor_dist += chunks.len() as f32 * pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Output {
-                    text: hint,
-                    chunks,
-                    block_id: Some(b.id),
-                    line: usize::MAX,
-                    style: None,
-                });
+                let mut char_offset = 0usize;
+                for (ci, chunk) in chunks.iter().enumerate() {
+                    rows.push(cursor_dist);
+                    row_data.push(LaidRow::Output {
+                        line_text: hint,
+                        text: Cow::Owned(chunk.clone()),
+                        block_id: Some(b.id),
+                        line: usize::MAX,
+                        chunk_idx: ci,
+                        char_offset,
+                        style: None,
+                    });
+                    char_offset += chunk.chars().count();
+                }
             }
-            for line in cached.lines.iter().rev() {
-                let text = &b.output[line.byte_start..line.byte_end];
-                let vis_rows = line.chunk_ranges.len();
-                cursor_dist += vis_rows as f32 * pitch;
-                rows.push(cursor_dist);
-                row_data.push(LaidRow::Output {
-                    text,
-                    chunks: Rc::from(
-                        line.chunk_ranges
-                            .iter()
-                            .map(|range| text[range.clone()].to_string())
-                            .collect::<Vec<_>>(),
-                    ),
-                    block_id: Some(b.id),
-                    line: line.idx,
-                    style: if resolve_styles {
-                        b.styled_output.as_deref().and_then(|styled| {
-                            bump_styled(1);
-                            styled.line(line.idx)
-                        })
-                    } else {
-                        None
-                    },
-                });
+            // Output lines (M5-b R-a): binary-search the L2 window per block
+            // and emit one row per VISIBLE visual row — zero-copy slices of
+            // the block's immutable output, no per-line Rc<[String]>.
+            // Skipped lines still advance cursor_dist by their exact legacy
+            // per-line `+= rows * pitch` increments, so every pushed dist
+            // (a line's top) is byte-identical to the legacy pass.
+            let table = &cached.content;
+            let width = &cached.width;
+            let total_rows = width.rows.len();
+            if total_rows > 0 {
+                // Row r (0-based from the lines-region top) spans dist
+                // [region_top - (r+1)*pitch, region_top - r*pitch]; its top
+                // band must intersect [clip_top, clip_bottom] (the paint
+                // loop's own keep test — block-level overscan already
+                // bounded `is_visible`).
+                let region_top = cursor_dist + total_rows as f32 * pitch;
+                let row_top_y =
+                    |r: usize| content_bottom_y + scroll_px - (region_top - r as f32 * pitch);
+                let first_raw = ((clip_top - row_top_y(0)) / pitch).floor() as isize;
+                let last_raw = ((clip_bottom - row_top_y(0)) / pitch).ceil() as isize;
+                if first_raw <= last_raw {
+                    // One row of slack for f32 wobble; the paint loop /
+                    // bv_rows keep-test re-filters exactly.
+                    let first_row = (first_raw.max(0) as usize)
+                        .saturating_sub(1)
+                        .min(total_rows - 1);
+                    let last_row = ((last_raw.max(0) as usize).saturating_add(1))
+                        .min(total_rows - 1)
+                        .max(first_row);
+                    let base = &width.line_row_base;
+                    // Line containing a row index (line_row_base is strictly
+                    // increasing — every line owns ≥ 1 row).
+                    let line_of = |r: usize| {
+                        base.partition_point(|&b| (b as usize) <= r)
+                            .saturating_sub(1)
+                    };
+                    let l_first = line_of(first_row);
+                    let l_last = line_of(last_row);
+                    let n_lines = table.line_meta.len();
+                    // Fast-forward: lines BELOW the window (bottom-up walk).
+                    for l in ((l_last + 1)..n_lines).rev() {
+                        cursor_dist += (base[l + 1] - base[l]) as f32 * pitch;
+                    }
+                    for l in (l_first..=l_last).rev() {
+                        // The line's own legacy increment → cursor now sits
+                        // at the line's TOP dist (the legacy pushed value).
+                        cursor_dist += (base[l + 1] - base[l]) as f32 * pitch;
+                        let line_range = table.line_range(l);
+                        let line_text = &b.output[line_range];
+                        let lo = (first_row as u32).max(base[l]);
+                        let hi = (last_row as u32 + 1).min(base[l + 1]);
+                        let style = if resolve_styles {
+                            b.styled_output.as_deref().and_then(|styled| {
+                                bump_styled(1);
+                                styled.line(l)
+                            })
+                        } else {
+                            None
+                        };
+                        // Top-down within the line: the legacy paint path
+                        // emitted chunk 0..n vertices in that order, and the
+                        // vertex goldens lock the buffer sequence.
+                        for r in lo..hi {
+                            let row = &width.rows[r as usize];
+                            let chunk_idx = (r - base[l]) as usize;
+                            rows.push(cursor_dist);
+                            row_data.push(LaidRow::Output {
+                                line_text,
+                                // A single-row line paints its FULL text
+                                // (legacy single-chunk path behavior —
+                                // screen-origin rows rely on max_cols clip).
+                                text: if base[l + 1] - base[l] == 1 {
+                                    Cow::Borrowed(line_text)
+                                } else {
+                                    Cow::Borrowed(table.row_text(line_text, row))
+                                },
+                                block_id: Some(b.id),
+                                line: l,
+                                chunk_idx,
+                                char_offset: char_offset_at(line_text, table.row_byte_start(row)),
+                                style,
+                            });
+                        }
+                    }
+                    // Fast-forward: lines ABOVE the window.
+                    for l in (0..l_first).rev() {
+                        cursor_dist += (base[l + 1] - base[l]) as f32 * pitch;
+                    }
+                } else {
+                    // Nothing visible: advance by the whole lines region.
+                    cursor_dist += total_rows as f32 * pitch;
+                }
             }
             // Diagnose panel rows after output; reading order is top-down,
             // the layout walks bottom-to-top, so iterate in reverse.
@@ -429,7 +546,8 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             foldable: cached.foldable,
             block_id: b.id,
         });
-        let presentation = block_presentation(b, cached.lines.len());
+        // M5-b: surviving source-line count reads L1 (no legacy lines vec).
+        let presentation = block_presentation(b, cached.content.line_meta.len());
         cursor_dist += header_height;
         rows.push(cursor_dist);
         row_data.push(LaidRow::Header {
@@ -454,59 +572,6 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         row_data,
         expanded_block_count,
     }
-}
-
-/// Smallest j where `prefix_sum[j]*pitch + j*header_height +
-/// clear_ps[j]*clear_pitch >= threshold`; `len` if none. `clear_pitch`
-/// recovers the per-frame clear-block spacer excluded from the prefix sum.
-fn lower_bound_height(
-    prefix_sum: &[usize],
-    clear_ps: &[usize],
-    pitch: f32,
-    header_height: f32,
-    clear_pitch: f32,
-    threshold: f32,
-) -> usize {
-    let mut lo = 0usize;
-    let mut hi = prefix_sum.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let height = prefix_sum[mid] as f32 * pitch
-            + mid as f32 * header_height
-            + clear_ps[mid] as f32 * clear_pitch;
-        if height < threshold {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
-}
-
-/// Smallest j where the height formula is `> threshold` (strict upper
-/// bound); `len` if none.
-fn upper_bound_height(
-    prefix_sum: &[usize],
-    clear_ps: &[usize],
-    pitch: f32,
-    header_height: f32,
-    clear_pitch: f32,
-    threshold: f32,
-) -> usize {
-    let mut lo = 0usize;
-    let mut hi = prefix_sum.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let height = prefix_sum[mid] as f32 * pitch
-            + mid as f32 * header_height
-            + clear_ps[mid] as f32 * clear_pitch;
-        if height <= threshold {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
 }
 
 #[cfg(test)]
@@ -577,11 +642,8 @@ mod tests {
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
         };
-        let out = compute_block_layout_pass(
-            input,
-            &BlockLayoutCache::default(),
-            &mut LiveLayoutCache::default(),
-        );
+        let cache = BlockLayoutCache::default();
+        let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
         let newest = out
             .row_data
             .iter()
@@ -733,113 +795,5 @@ mod tests {
         let end = (j_high + 1).min(10);
         assert_eq!(start, 1);
         assert_eq!(end, 8);
-    }
-
-    /// Criterion micro-benchmark (run with `--release --ignored
-    /// --nocapture --test-threads=1`): all_visible (±∞ clip) vs.
-    /// culling_heavy (800px viewport) at 1k/5k/10k/50k blocks; the ratio
-    /// shows whether visibility culling is effective.
-    #[test]
-    #[ignore = "criterion micro-benchmark; run with --release --ignored --nocapture"]
-    fn bench_layout_pass() {
-        use criterion::{black_box, Criterion};
-        use std::sync::Arc;
-        use std::time::SystemTime;
-        use weft_core::blocks::{Block, BlockId};
-
-        fn make_blocks(count: usize) -> Vec<Block> {
-            let line = "x".repeat(80);
-            let output: Arc<str> = Arc::from(
-                (0..20u32)
-                    .map(|i| format!("{i:03}: {line}\n"))
-                    .collect::<String>()
-                    .as_str(),
-            );
-            (0..count)
-                .map(|i| Block {
-                    id: BlockId(i as u64),
-                    command: format!("echo test_{i}"),
-                    cwd: Some("/home/user".into()),
-                    output: Arc::clone(&output),
-                    styled_output: None,
-                    exit_code: Some(0),
-                    started_at: SystemTime::now(),
-                    finished_at: Some(SystemTime::now()),
-                    collapsed: false,
-                    screen_origin: false,
-                })
-                .collect()
-        }
-
-        let mut criterion = Criterion::default().sample_size(10);
-        let mut group = criterion.benchmark_group("layout_pass");
-
-        for &count in &[1_000usize, 5_000, 10_000, 50_000] {
-            let blocks = make_blocks(count);
-            let mut cache = BlockLayoutCache::default();
-            for b in &blocks {
-                cache.ensure_cached(b, 80);
-            }
-            // Build prefix sum so the binary-search fast path is exercised.
-            cache.build_prefix_sum(&blocks);
-
-            // Scenario 1: all blocks visible (clip bounds = ±∞)
-            group.bench_function(format!("all_visible/{count}"), |b| {
-                b.iter(|| {
-                    let input = LayoutPassInput {
-                        blocks: &blocks,
-                        live: None,
-                        pane_session_id: 1,
-                        cwd: None,
-                        git_branch: None,
-                        block_scroll: 0.0,
-                        viewport_rows: 40,
-                        cols: 80,
-                        pitch: 20.0,
-                        header_height: 24.0,
-                        content_bottom_y: 800.0,
-                        clip_top: -1e9,
-                        clip_bottom: 1e9,
-                        resolve_styles: true,
-                        styled_lookup_counter: None,
-                        block_diagnose_state: &std::collections::HashMap::new(),
-                    };
-                    let out =
-                        compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
-                    black_box(out.expanded_block_count);
-                });
-            });
-
-            // Heavy culling: 800px viewport, scroll=0 — only ~2 blocks
-            // visible; the rest accumulate cursor_dist without expansion.
-            group.bench_function(format!("culling_heavy/{count}"), |b| {
-                b.iter(|| {
-                    let input = LayoutPassInput {
-                        blocks: &blocks,
-                        live: None,
-                        pane_session_id: 1,
-                        cwd: None,
-                        git_branch: None,
-                        block_scroll: 0.0,
-                        viewport_rows: 40,
-                        cols: 80,
-                        pitch: 20.0,
-                        header_height: 24.0,
-                        content_bottom_y: 800.0,
-                        clip_top: 0.0,
-                        clip_bottom: 800.0,
-                        resolve_styles: true,
-                        styled_lookup_counter: None,
-                        block_diagnose_state: &std::collections::HashMap::new(),
-                    };
-                    let out =
-                        compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
-                    black_box(out.expanded_block_count);
-                });
-            });
-        }
-
-        group.finish();
-        criterion.final_summary();
     }
 }

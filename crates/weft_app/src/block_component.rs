@@ -161,25 +161,11 @@ pub(crate) fn clear_block_spacer_rows(command: &str, viewport_rows: usize) -> us
     usize::from(command.split_whitespace().next() == Some("clear")) * viewport_rows.max(1)
 }
 
-fn completed_block_visible_lines(block: &Block) -> Vec<&str> {
-    if block.collapsed {
-        return Vec::new();
-    }
-    let lines: Vec<&str> = block.output.lines().collect();
-    let len = crate::paint::grid_cache::trimmed_output_line_count(&lines);
-    lines[..len].to_vec()
-}
-
+/// M5-b (PLAN_M5 §三): the row count reads the L1/L2 tables via the shared
+/// machine (`hint_rows + rows.len()`); the legacy per-line collect +
+/// re-wrap (`completed_block_visible_lines`) is deleted.
 pub(crate) fn completed_block_output_rows(block: &Block, cols: usize) -> usize {
-    if block.collapsed {
-        return 0;
-    }
-    command_resume_hints(block)
-        .iter()
-        .copied()
-        .chain(completed_block_visible_lines(block))
-        .map(|line| block_line_chunks(line, cols).count())
-        .sum()
+    crate::paint::grid_cache::completed_output_rows(block, cols, None)
 }
 
 pub(crate) fn completed_block_layout_rows(
@@ -208,7 +194,12 @@ pub(crate) fn completed_block_match_row_from_bottom(
         .iter()
         .map(|hint| block_line_chunks(hint, cols).count())
         .sum::<usize>();
-    let lines = completed_block_visible_lines(block);
+    // Per-hit find-jump geometry stays on the text path (shared wrap
+    // machine keeps it consistent with the L2 tables; not a per-frame cost).
+    // Same trailing trim the L1 builder applies.
+    let mut lines: Vec<&str> = block.output.lines().collect();
+    let visible_len = crate::paint::grid_cache::trimmed_output_line_count(&lines);
+    lines.truncate(visible_len);
     if hit.is_command {
         let output_rows = hints
             + lines
@@ -300,7 +291,7 @@ pub(crate) fn block_content_metrics_with_cache(
     let mut total = 0;
     let viewport_rows = terminal.grid().num_rows.max(1);
     for block in terminal.block_tracker().session_blocks() {
-        // R2-2: 命中缓存 O(1) 读 output_rows/command_wrap_rows,未命中
+        // R2-2: 命中缓存 O(1) 读 L2 行数/command_wrap_rows,未命中
         // (末帧后才 finalized 的块)回退直接计算。
         let cached = cache.and_then(|c| c.get_if_cached(block.id.0));
         let expired = |c: &crate::paint::grid_cache::CachedBlockLayout| {
@@ -309,11 +300,15 @@ pub(crate) fn block_content_metrics_with_cache(
         let output_rows = cached
             .map(|c| {
                 if expired(c) {
-                    // M5-a (PLAN_M5 §三): expired fallback reads the L1/L2 tables (hint_rows +
-                    // rows.len()); O(1) off a live entry, else a table rebuild, no re-wrap.
+                    // M5-a/b (PLAN_M5 §三): expired fallback reads the L1/L2 tables
+                    // (hint_rows + rows.len()); O(1) off a live entry, else a table
+                    // rebuild, no re-wrap.
                     crate::paint::grid_cache::completed_output_rows(block, cols, cached)
+                } else if block.collapsed {
+                    0
                 } else {
-                    c.output_rows
+                    // M5-b: O(1) read off the stored L2 width table.
+                    c.width.hint_rows as usize + c.width.rows.len()
                 }
             })
             .unwrap_or_else(|| crate::paint::grid_cache::completed_output_rows(block, cols, None));
@@ -890,6 +885,8 @@ mod tests {
         assert_eq!(visible2, 50);
     }
 
+    use crate::paint::grid_cache::completed_output_rows;
+
     /// 假设5: 缓存已存折行块,直接计算为冗余重折行;钉住两者结果一致,验证可安全走缓存。
     #[test]
     fn r22_cached_chunks_match_completed_block_output_rows() {
@@ -897,23 +894,20 @@ mod tests {
         let b = r22_block("echo hi", "short line\na much longer line that surely wraps past eighty columns when rendered at eighty cols\n");
         let cols = 80;
 
-        // 缓存路径:ensure_cached + 逐行求和。
+        // M5-b:缓存路径 = L2 行表行数(无 hints 输出)。
         let mut cache = BlockLayoutCache::default();
         cache.ensure_cached(&b, cols);
         let cached = cache.get(b.id.0);
-        let cached_rows: usize = cached
-            .lines
-            .iter()
-            .map(|line| line.chunk_ranges.len())
-            .sum();
+        let cached_rows: usize = cached.width.rows.len();
 
-        // 直接路径:completed_block_output_rows 重折行。
+        // L2 回退路径(completed_block_output_rows 现为 L2 委托)。
         let direct_rows = completed_block_output_rows(&b, cols);
 
         assert_eq!(
             cached_rows, direct_rows,
-            "cache chunks must match direct wrap count"
+            "L2 row table must match the completed-block row count"
         );
+        // 独立文本源 oracle(visual_rows_tests 持有)另测,防同源漂移。
     }
 
     /// R2-2 回归:折叠块缓存 output_rows 必须为 0,否则滚动条拇指按可见输出尺寸化。
@@ -926,13 +920,13 @@ mod tests {
         // 未折叠:output_rows 非零。
         let mut cache = BlockLayoutCache::default();
         cache.ensure_cached(&b, cols);
-        let uncollapsed_rows = cache.get(b.id.0).output_rows;
+        let uncollapsed_rows = completed_output_rows(&b, cols, Some(cache.get(b.id.0)));
         assert_eq!(uncollapsed_rows, 3);
 
         // 折叠后缓存重建,output_rows 必须为 0。
         b.collapsed = true;
         cache.ensure_cached(&b, cols);
-        assert_eq!(cache.get(b.id.0).output_rows, 0);
+        assert_eq!(completed_output_rows(&b, cols, Some(cache.get(b.id.0))), 0);
 
         // 缓存路径必须与回退路径一致。
         let mut terminal = Terminal::new(24, 80);

@@ -646,11 +646,11 @@ impl App {
             }
         }
         // Terminal borrow dropped — annotation/export actions run here.
-        if action == "toggle_fold" {
-            if let (Some(renderer), Some(id)) = (&self.renderer, block_id) {
-                renderer.block_layout_cache.borrow_mut().invalidate(id.0);
-            }
-        }
+        // M5-b P2-2: toggle_fold needs no cache invalidation — the collapsed
+        // mismatch routes ensure_cached into the WidthOnly rebuild (L1
+        // reused, L2 rebuilt); invalidate() would force a full L1
+        // re-enumeration of the block's output. Redraw comes from
+        // execute_context_menu's unconditional tail.
         if matches!(action, "toggle_bookmark" | "add_note" | "export_block") {
             self.run_annotation_action_with_export(block_id, action, export_block_data);
         }

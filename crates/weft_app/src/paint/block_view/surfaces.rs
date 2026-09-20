@@ -126,27 +126,32 @@ pub(super) fn push_block_surfaces(
     };
     let mut bounds: HashMap<BlockId, (f32, f32, BlockTone)> = HashMap::new();
     for (distance, row) in rows.iter().copied().zip(row_data) {
-        let (id, height, tone) = match row {
+        // M5-b: Output entries are per-visual-row — the entry's own band
+        // sits `chunk_idx` pitches below the pushed (line-top) dist; the
+        // per-block bounds union below reassembles the full output band.
+        let (id, chunk_y_offset, height, tone) = match row {
             LaidRow::Output {
                 block_id: Some(id),
-                chunks,
+                chunk_idx,
                 ..
             } => (
                 *id,
-                chunks.len().max(1) as f32 * paint.pitch,
+                *chunk_idx as f32 * paint.pitch,
+                paint.pitch,
                 BlockTone::Success,
             ),
             LaidRow::Command {
                 block_id, chunks, ..
             } => (
                 *block_id,
+                0.0,
                 chunks.len().max(1) as f32 * paint.pitch,
                 BlockTone::Success,
             ),
-            LaidRow::Header { block_id, tone, .. } => (*block_id, paint.header_height, *tone),
+            LaidRow::Header { block_id, tone, .. } => (*block_id, 0.0, paint.header_height, *tone),
             _ => continue,
         };
-        let top = paint.content_bottom - distance + paint.scroll_px;
+        let top = paint.content_bottom - distance + paint.scroll_px + chunk_y_offset;
         let bottom = top + height;
         bounds
             .entry(id)

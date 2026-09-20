@@ -9,6 +9,8 @@ use crate::paint::ui_helpers::abbreviate_path;
 use crate::renderer::MetalRenderer;
 
 mod actions;
+#[cfg(test)]
+mod bench;
 mod find;
 mod layout_pass;
 mod output_paint;
@@ -136,6 +138,19 @@ impl MetalRenderer {
 
         use layout_pass::{compute_block_layout_pass, LaidRow, LayoutPassInput, LayoutPassOutput};
 
+        /// v1.10.26: the owning segment key of a structural row. A Separator
+        /// follows its block's Header (or the live header), so its association is
+        /// the PRECEDING row's key. LiveCommand/LiveHeader/Separator → live segment.
+        fn row_block_key(row: &LaidRow<'_>) -> Option<u64> {
+            match row {
+                LaidRow::Output { block_id, .. } => block_id.map(|b| b.0),
+                LaidRow::Command { block_id, .. } => Some(block_id.0),
+                LaidRow::Header { block_id, .. } => Some(block_id.0),
+                LaidRow::DiagnosePanel { block_id, .. } => Some(block_id.0),
+                _ => None,
+            }
+        }
+
         {
             let mut cache = self.block_layout_cache.borrow_mut();
             cache.sync_blocks(blocks, cols);
@@ -152,31 +167,31 @@ impl MetalRenderer {
         // extracted BEFORE the layout pass moves `live` (raw &str into the
         // terminal's block storage; outlives the frame).
         let live_output_for_source = live.as_ref().map(|live| live.output);
-        let layout_out = {
-            let cache = self.block_layout_cache.borrow();
-            compute_block_layout_pass(
-                LayoutPassInput {
-                    blocks,
-                    live,
-                    pane_session_id: cache_namespace,
-                    cwd,
-                    git_branch,
-                    block_scroll,
-                    viewport_rows,
-                    cols,
-                    pitch,
-                    header_height,
-                    content_bottom_y,
-                    clip_top: layout.clip_top,
-                    clip_bottom: content_bottom_y,
-                    resolve_styles: true,
-                    styled_lookup_counter: Some(&self.styled_lookup_counter),
-                    block_diagnose_state,
-                },
-                &cache,
-                &mut self.live_layout_cache.borrow_mut(),
-            )
-        };
+        // M5-b: laid rows borrow from the cache (zero-copy row text) — the
+        // borrow lives until the last read of `row_data` (paint loop end).
+        let cache = self.block_layout_cache.borrow();
+        let layout_out = compute_block_layout_pass(
+            LayoutPassInput {
+                blocks,
+                live,
+                pane_session_id: cache_namespace,
+                cwd,
+                git_branch,
+                block_scroll,
+                viewport_rows,
+                cols,
+                pitch,
+                header_height,
+                content_bottom_y,
+                clip_top: layout.clip_top,
+                clip_bottom: content_bottom_y,
+                resolve_styles: true,
+                styled_lookup_counter: Some(&self.styled_lookup_counter),
+                block_diagnose_state,
+            },
+            &cache,
+            &mut self.live_layout_cache.borrow_mut(),
+        );
         let LayoutPassOutput {
             rows,
             row_data,
@@ -335,21 +350,14 @@ impl MetalRenderer {
         };
 
         for (i, &dist) in rows.iter().enumerate() {
-            // v1.10.26: the owning segment key of a structural row. A
-            // Separator follows its block's Header (or the live header), so
-            // its association is the PRECEDING row's key.
-            let row_block_key = |row: &LaidRow<'_>| match row {
-                LaidRow::Output { block_id, .. } => block_id.map(|b| b.0),
-                LaidRow::Command { block_id, .. } => Some(block_id.0),
-                LaidRow::Header { block_id, .. } => Some(block_id.0),
-                LaidRow::DiagnosePanel { block_id, .. } => Some(block_id.0),
-                _ => None, // LiveCommand/LiveHeader/Separator → live segment
-            };
             let row_top_y = content_bottom_y - dist + scroll_px;
-            let row_height = if matches!(row_data[i], LaidRow::Header { .. }) {
-                header_height
-            } else {
-                pitch
+            // M5-b: Output entries are per-visual-row — their band sits
+            // `chunk_idx` pitches below the pushed (line-top) dist, exactly
+            // the legacy `y + ci * pitch` expression.
+            let (row_top_y, row_height) = match &row_data[i] {
+                LaidRow::Output { chunk_idx, .. } => (row_top_y + *chunk_idx as f32 * pitch, pitch),
+                LaidRow::Header { .. } => (row_top_y, header_height),
+                _ => (row_top_y, pitch),
             };
             let row_bottom_y = row_top_y + row_height;
 
@@ -360,22 +368,8 @@ impl MetalRenderer {
             let y = row_top_y;
 
             match &row_data[i] {
-                LaidRow::Output {
-                    text,
-                    chunks,
-                    block_id,
-                    line,
-                    style,
-                } => {
-                    if chunks.len() <= 1 {
-                        output_paint::paint_output_single_chunk(
-                            &mut pctx, text, *block_id, *line, *style, y,
-                        );
-                    } else {
-                        output_paint::paint_output_multi_chunk(
-                            &mut pctx, text, chunks, *block_id, *line, *style, y,
-                        );
-                    }
+                LaidRow::Output { .. } => {
+                    output_paint::paint_output_row(&mut pctx, &row_data[i], y);
                 }
                 LaidRow::Command {
                     command,
