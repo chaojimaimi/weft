@@ -8,21 +8,42 @@ use crate::blocks::{StyledOutput, MAX_OUTPUT_BYTES};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-/// C1 (PLAN_S2_render Stream C): env switch shared with the app-side
-/// performance probe (`weft_app::performance_probe::ENV_NAME`). weft_core
-/// self-reads the same string — the crates are peers, so the single
-/// `WEFT_GUI_PERF_PROBE=1` switch drives both without a dependency edge.
+/// C1 (PLAN_S2_render Stream C) + M4.1: diagnostic-channel switches.
+///
+/// `WEFT_GUI_PERF_PROBE=1` drives the app-side acceptance probe, which by
+/// design warms up, samples for a fixed window, prints `V110_METRIC` lines
+/// and EXITS (performance_probe.rs). Coupling the snapshot phase log to it
+/// made an instrumented interactive drag impossible (the app quits after
+/// ~8s), so the log channel also accepts a dedicated
+/// `WEFT_TRACE_CHANNELS=1` switch that ONLY enables the diagnostic log
+/// lines and never exits. `WEFT_GUI_PERF_PROBE=1` still implies the
+/// channels for the scripted acceptance gate.
 const PERF_PROBE_ENV: &str = "WEFT_GUI_PERF_PROBE";
+const TRACE_CHANNELS_ENV: &str = "WEFT_TRACE_CHANNELS";
 
-/// C1: cached probe flag. Snapshot composition runs on every full-frame
+/// M4.1: cached channel flag. Snapshot composition runs on every full-frame
 /// repaint; `std::env::var_os` per call would put a syscall on that path.
-/// Process-lifetime caching is correct — the probe is a launch-time switch.
+/// Process-lifetime caching is correct — both switches are launch-time.
 static PERF_PROBE_CACHE: OnceLock<bool> = OnceLock::new();
 
-/// C1: probe gate for the snapshot phase log (cached; see
+/// C1/M4.1: gate for the snapshot phase log (cached; see
 /// [`PERF_PROBE_CACHE`]).
 fn perf_probe_enabled() -> bool {
-    *PERF_PROBE_CACHE.get_or_init(|| env_flag_enabled(std::env::var_os(PERF_PROBE_ENV).as_deref()))
+    *PERF_PROBE_CACHE.get_or_init(|| {
+        perf_probe_enabled_impl(
+            std::env::var_os(TRACE_CHANNELS_ENV).as_deref(),
+            std::env::var_os(PERF_PROBE_ENV).as_deref(),
+        )
+    })
+}
+
+/// M4.1: pure decision over both switches — the dedicated channel switch
+/// OR the acceptance probe implies the diagnostic log lines.
+fn perf_probe_enabled_impl(
+    trace_channels: Option<&std::ffi::OsStr>,
+    perf_probe: Option<&std::ffi::OsStr>,
+) -> bool {
+    env_flag_enabled(trace_channels) || env_flag_enabled(perf_probe)
 }
 
 /// C1: pure decision over one env value — mirrors the app-side
@@ -344,6 +365,26 @@ mod perf_probe_tests {
 
     /// The env name must stay byte-identical to the app-side probe so the
     /// single `WEFT_GUI_PERF_PROBE=1` switch drives both crates.
+    #[test]
+    fn trace_channels_switch_enables_without_the_probe() {
+        // M4.1: the dedicated channel switch alone must enable the log; the
+        // probe env still implies it (acceptance-gate back-compat).
+        assert!(super::env_flag_enabled(Some(std::ffi::OsStr::new("1"))));
+        assert!(super::perf_probe_enabled_impl(
+            Some(std::ffi::OsStr::new("1")),
+            None
+        ));
+        assert!(super::perf_probe_enabled_impl(
+            None,
+            Some(std::ffi::OsStr::new("1"))
+        ));
+        assert!(!super::perf_probe_enabled_impl(None, None));
+        assert!(!super::perf_probe_enabled_impl(
+            Some(std::ffi::OsStr::new("true")),
+            None
+        ));
+    }
+
     #[test]
     fn env_name_matches_app_side_probe() {
         assert_eq!(PERF_PROBE_ENV, "WEFT_GUI_PERF_PROBE");

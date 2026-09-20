@@ -23,6 +23,7 @@ pub(crate) use rows::sticky_block_id;
 #[cfg(test)]
 #[path = "block_view/b_path_tests.rs"]
 mod b_path_tests;
+
 impl MetalRenderer {
     pub(crate) fn build_block_view_vertices(
         &self,
