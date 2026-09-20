@@ -21,6 +21,42 @@ use weft_core::selection::SelectionHandler;
 /// as a stable local alias (decoupling it from future B2 renames).
 pub(crate) type GridRowDualCache = GridRowInstances;
 
+/// v1.12.2 B3-2 (PLAN_S2_render): per-background-pane row cache, keyed by
+/// `pane_session_id` on `MetalRenderer::background_grid_row_caches`. Gives
+/// background panes the same dirty-row incremental rebuild the active pane
+/// has; the fingerprint fields mirror the active path's force-full
+/// conditions (plus the layout origin, which the active path gets for free
+/// via its per-resize force_full).
+#[derive(Default)]
+pub(crate) struct BackgroundGridRowCache {
+    /// Cached per-row instances (same shape as the active `grid_row_cache`).
+    rows: Vec<GridRowInstances>,
+    /// Grid dims the rows were built at — any change (live-resize included)
+    /// forces a full rebuild, matching the active path's semantics.
+    dims: (usize, usize),
+    /// Grid scroll offset at build time (scroll → full, like the active path).
+    scroll_offset: usize,
+    /// Layout origin the row coordinates were baked with — a pane move
+    /// (split drag, sidebar, chrome change) without a grid dims change must
+    /// still invalidate, or cached rows render at stale positions.
+    origin: (f32, f32),
+    /// Primary-screen visible-row start (the only mask component the active
+    /// path fingerprints — mirrored for consistency).
+    hidden_before_row: Option<usize>,
+    /// P1 fix (rust-reviewer, 2nd round): alt-screen state at build time.
+    /// Exiting alt (DEC 1049/1047 reset) restores the primary screen WITHOUT
+    /// marking any row dirty and without touching dims/scroll/origin —
+    /// without this fingerprint the cache kept showing alt (vim/less/htop)
+    /// remnants until a focus change or resize.
+    alt_active: bool,
+    /// Cache-generation snapshot. `MetalRenderer::background_grid_generation`
+    /// bumps on theme / minimum-contrast / bold-is-bright changes (colors are
+    /// baked into the cached rows) — the active path gets this via
+    /// `force_full_grid`, which the background path must not read (multi-pane
+    /// frames set it unconditionally).
+    generation: u64,
+}
+
 fn primary_screen_row_hidden(
     row: usize,
     hidden_before_row: Option<usize>,
@@ -305,17 +341,27 @@ impl MetalRenderer {
 
     /// v1.3 Batch 5 / v1.4.2 Phase B3: Build grid instances for a
     /// **background** (non-active) pane. Returns a dual-stream
-    /// `GridInstanceBatch` (bg + glyph) instead of a flat `Vec<f32>`.
+    /// `GridInstanceBatch` (bg + glyph) plus the number of rows rebuilt
+    /// this frame (test/observability hook, mirroring the active path).
     ///
     /// - Does NOT touch `grid_row_cache` / `prev_cursor_*` / `force_full_grid`
     ///   or any other active-pane cache state.
     /// - Does NOT render the cursor or selection (active pane only).
-    /// - Rebuilds every cell every frame (no dirty-row tracking). Acceptable
-    ///   because background panes are typically idle.
+    /// - Does NOT consume the grid's pending-scroll delta (that belongs to
+    ///   the active pane's GPU scroll-blit path).
+    ///
+    /// v1.12.2 B3-2 (PLAN_S2_render): the old "rebuilds every cell every
+    /// frame" loop is gone — rows come from a per-pane cache keyed by
+    /// `pane_session_id` (the same namespace pattern as the styled-line
+    /// vertex cache), rebuilt only for the grid's dirty rows. A full rebuild
+    /// happens on any fingerprint change: grid dims (live-resize included),
+    /// scroll offset, layout-origin move, or primary-screen mask movement —
+    /// the same invalidation conditions as the active path.
     pub(crate) fn build_grid_instances_for_background_pane(
         &self,
         terminal: &weft_core::vt::Terminal,
-    ) -> GridInstanceBatch {
+        pane_session_id: u64,
+    ) -> (GridInstanceBatch, usize) {
         let grid = terminal.grid();
         let palette = terminal.palette();
         let cw = self.cell_width() as f32;
@@ -350,12 +396,55 @@ impl MetalRenderer {
         let hidden_before_row = terminal.primary_screen_visible_row_start();
         let owned_rows = terminal.primary_screen_viewport_ownership();
 
-        let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
-        for row in 0..num_rows {
+        // ── B3-2: fingerprint the cache entry ────────────────────────────
+        let mut caches = self.background_grid_row_caches.borrow_mut();
+        let entry = caches.entry(pane_session_id).or_default();
+        let force_full = entry.dims != (num_rows, num_cols)
+            || entry.scroll_offset != grid.scroll_offset()
+            || entry.origin.0 != origin_x
+            || entry.origin.1 != origin_y_base
+            || entry.hidden_before_row != hidden_before_row
+            // P1 fix (rust-reviewer, 2nd round): the alt→primary flip (DEC
+            // 1049/1047 exit) restores the primary screen with no dirty rows
+            // and identical dims/scroll/origin — only this bool changes.
+            || entry.alt_active != terminal.is_alt_screen_active()
+            // P0 fix (rust-reviewer): a full-viewport scroll records ONLY a
+            // pending_scroll delta and marks no rows dirty — without this
+            // fingerprint the cache lagged streamed content by a row forever.
+            || grid.pending_scroll() != 0
+            // P1-1 fix (rust-reviewer): theme/contrast/bold-is-bright changes
+            // invalidate baked colors via the generation counter (the active
+            // path's force_full_grid is set unconditionally on multi-pane
+            // frames and must not be read here).
+            || entry.generation != self.background_grid_generation.get();
+
+        let rows_to_rebuild: Vec<usize> = if force_full {
+            (0..num_rows).collect()
+        } else {
+            grid.dirty_rows().map(|(r, _)| r).collect()
+        };
+
+        // Keep the fingerprint fresh for the next frame.
+        entry.dims = (num_rows, num_cols);
+        entry.scroll_offset = grid.scroll_offset();
+        entry.origin = (origin_x, origin_y_base);
+        entry.hidden_before_row = hidden_before_row;
+        entry.alt_active = terminal.is_alt_screen_active();
+        entry.generation = self.background_grid_generation.get();
+        if entry.rows.len() != num_rows {
+            entry.rows.resize(num_rows, GridRowInstances::default());
+        }
+
+        let mut rebuilt_rows = 0usize;
+        for &row in &rows_to_rebuild {
             if primary_screen_row_hidden(row, hidden_before_row, owned_rows) {
+                // Hidden rows carry no instances — mirror the active path's
+                // "hidden row ⇒ default cache entry" handling.
+                entry.rows[row] = GridRowInstances::default();
                 continue;
             }
-            let row_inst = build_row_instances(
+            rebuilt_rows += 1;
+            entry.rows[row] = build_row_instances(
                 grid,
                 palette,
                 row,
@@ -377,11 +466,15 @@ impl MetalRenderer {
                 self.bold_is_bright,
                 self.theme.link,
             );
-            batch.push_row(&row_inst, &|ch, cluster, style| {
+        }
+
+        let mut batch = GridInstanceBatch::with_capacity(num_rows, num_cols);
+        for row_inst in entry.rows.iter() {
+            batch.push_row(row_inst, &|ch, cluster, style| {
                 self.resolve_glyph_uv(ch, cluster, style)
             });
         }
-        batch
+        (batch, rebuilt_rows)
     }
 
     /// Resolve a cell's glyph UV rect (+ color-atlas flag) from the atlas.
@@ -440,127 +533,4 @@ impl MetalRenderer {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        alt_screen_cursor_color, grid_content_origin_x, primary_screen_mask_changed,
-        primary_screen_row_hidden,
-    };
-    use crate::layout::LayoutCtx;
-    use weft_core::grid::CursorStyle;
-
-    #[test]
-    fn primary_screen_mask_hides_unowned_rows_without_mutating_the_grid() {
-        let owned = [false, true, false, true];
-        assert!(primary_screen_row_hidden(0, Some(1), Some(&owned)));
-        assert!(!primary_screen_row_hidden(1, Some(1), Some(&owned)));
-        assert!(primary_screen_row_hidden(2, Some(1), Some(&owned)));
-        assert!(!primary_screen_row_hidden(3, Some(1), Some(&owned)));
-        assert!(!primary_screen_row_hidden(3, None, None));
-    }
-
-    #[test]
-    fn moving_or_removing_the_primary_screen_mask_invalidates_cached_rows() {
-        assert!(primary_screen_mask_changed(Some(5), Some(2)));
-        assert!(primary_screen_mask_changed(Some(5), None));
-        assert!(primary_screen_mask_changed(None, Some(5)));
-        assert!(!primary_screen_mask_changed(Some(5), Some(5)));
-        assert!(!primary_screen_mask_changed(None, None));
-    }
-
-    // ── v1.10.4: alt-screen cursor color softening ──────────────────────
-
-    #[test]
-    fn alt_screen_blends_underline_cursor_toward_foreground() {
-        let cursor = [0.94, 0.83, 0.66, 1.0]; // #f0d4a8 amber-white
-        let fg = [0.88, 0.83, 0.77, 1.0]; // #e0d4c4 warm cream
-        let softened = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Underline);
-        // 50% blend: each channel = (cursor + fg) / 2
-        for i in 0..3 {
-            assert!((softened[i] - (cursor[i] + fg[i]) * 0.5).abs() < 1e-6);
-        }
-        assert_eq!(softened[3], cursor[3], "alpha unchanged");
-    }
-
-    #[test]
-    fn alt_screen_keeps_block_cursor_at_full_intensity() {
-        let cursor = [0.94, 0.83, 0.66, 1.0];
-        let fg = [0.88, 0.83, 0.77, 1.0];
-        let result = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Block);
-        assert_eq!(
-            result, cursor,
-            "Block cursor keeps full intensity in alt-screen"
-        );
-    }
-
-    #[test]
-    fn primary_screen_keeps_cursor_at_full_intensity() {
-        let cursor = [0.94, 0.83, 0.66, 1.0];
-        let fg = [0.5, 0.5, 0.5, 1.0];
-        let result = alt_screen_cursor_color(cursor, fg, false, CursorStyle::Underline);
-        assert_eq!(
-            result, cursor,
-            "non-alt-screen keeps cursor at full intensity"
-        );
-    }
-
-    #[test]
-    fn alt_screen_bar_cursor_also_blended() {
-        let cursor = [0.94, 0.83, 0.66, 1.0];
-        let fg = [0.2, 0.2, 0.2, 1.0];
-        let result = alt_screen_cursor_color(cursor, fg, true, CursorStyle::Bar);
-        assert_ne!(result, cursor, "Bar cursor is softened in alt-screen");
-        assert!(result[0] < cursor[0], "blended toward darker fg");
-    }
-
-    // ── v1.10.19: grid ↔ BlockView content x alignment (Fix A) ──────────
-
-    /// v1.10.19: at the same geometry, the inset grid origin and the
-    /// BlockView content left edge must coincide — scrolling a primary-screen
-    /// TUI up into `primary_history_view` switches grid → BlockView and
-    /// every column must stay at the same physical x (no 1.5-col shift).
-    #[test]
-    fn grid_origin_x_matches_block_view_content_left_at_same_geometry() {
-        let ctx = LayoutCtx {
-            viewport: (1080.0, 720.0),
-            cell_w: 10.0,
-            cell_h: 20.0,
-            padding_x: 8.0,
-            padding_y: 8.0,
-            chrome_top: 28.0,
-            chrome_left: 60.0,
-            pane_origin: (0.0, 0.0),
-            clip: None,
-        };
-        let (block_left, _) = crate::layout::block_content_x_bounds(&ctx);
-        assert_eq!(
-            grid_content_origin_x(&ctx, true),
-            block_left,
-            "inset grid origin == BlockView content left edge"
-        );
-        // The inset is exactly the BlockView gutter (1.5 cells at this size).
-        assert!((grid_content_origin_x(&ctx, true) - ctx.left() - ctx.cell_w * 1.5).abs() < 1e-6);
-        // Alt-screen TUIs keep the pane edge (edge-to-edge, no gutter).
-        assert_eq!(grid_content_origin_x(&ctx, false), ctx.left());
-    }
-
-    /// v1.10.19: the same alignment must hold for a split-pane context
-    /// (pane_origin + clip): grid and BlockView are both pane-local.
-    #[test]
-    fn grid_origin_alignment_holds_for_pane_local_context() {
-        let ctx = LayoutCtx {
-            viewport: (1080.0, 720.0),
-            cell_w: 10.0,
-            cell_h: 20.0,
-            padding_x: 8.0,
-            padding_y: 8.0,
-            chrome_top: 28.0,
-            chrome_left: 0.0,
-            pane_origin: (0.0, 0.0),
-            clip: None,
-        };
-        let pane_ctx = ctx.for_pane([100.0, 100.0, 600.0, 500.0]);
-        let (block_left, _) = crate::layout::block_content_x_bounds(&pane_ctx);
-        assert_eq!(grid_content_origin_x(&pane_ctx, true), block_left);
-        assert_eq!(grid_content_origin_x(&pane_ctx, false), pane_ctx.left());
-    }
-}
+mod tests;

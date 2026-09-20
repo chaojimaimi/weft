@@ -41,33 +41,108 @@ pub(crate) struct BgStream {
 
 // v1.11.6: the constructor impl (new/build_paint_core/new_headless_paint)
 // moved to `constructor.rs`; this impl holds the frame-encoding methods.
+
+/// B3-1 (PLAN_S2_render): offscreen capacity granularity, in physical px.
+/// A live-resize tick moves the viewport by a few px; rounding the allocated
+/// capacity up to 256-px steps means a 10-25MB texture realloc happens only
+/// every ~256px of growth instead of on every `Resized` tick. Shrinks never
+/// realloc (grow-only capacity — see `ensure_offscreen_texture`).
+const OFFSCREEN_CAPACITY_STEP_PX: f32 = 256.0;
+
+/// B3-1: round a physical-pixel dimension up to the capacity step. Pure
+/// helper (unit-tested): the offscreen texture is allocated at this rounded
+/// size so consecutive resize ticks within one step reuse the texture.
+fn ceil_to_capacity_step(v: f32) -> u64 {
+    let steps = (v / OFFSCREEN_CAPACITY_STEP_PX).ceil().max(1.0);
+    steps as u64 * OFFSCREEN_CAPACITY_STEP_PX as u64
+}
+
+/// B3-1: rasterization viewport for a render target. Pure helper (unit
+/// tested): for the capacity-sized offscreen this is exactly the viewport
+/// (capacity ≥ viewport by construction); for the drawable fallback
+/// (vp_mismatch frames, where the drawable may be smaller/staler than the
+/// viewport) it clamps to the drawable — identical to the pre-B3-1 default
+/// full-target viewport, so the async-lag frame's stretch semantics are
+/// unchanged.
+fn render_viewport_for_target(viewport: (f32, f32), target: (f32, f32)) -> metal::MTLViewport {
+    metal::MTLViewport {
+        originX: 0.0,
+        originY: 0.0,
+        width: (viewport.0.min(target.0)).max(0.0) as f64,
+        height: (viewport.1.min(target.1)).max(0.0) as f64,
+        znear: 0.0,
+        zfar: 1.0,
+    }
+}
+
+/// B3-1: offscreen → drawable blit region. Pure helper (unit-tested): the
+/// blit covers the viewport, clamped to the drawable — never the (possibly
+/// larger) offscreen capacity, so a retained oversized texture can never
+/// inflate the copy.
+fn offscreen_blit_size(viewport: (f32, f32), drawable: (f32, f32)) -> (u64, u64) {
+    (
+        (viewport.0.min(drawable.0)).max(0.0) as u64,
+        (viewport.1.min(drawable.1)).max(0.0) as u64,
+    )
+}
+
 impl MetalRenderer {
-    /// v1.0 P0-c: Ensure the offscreen texture exists and matches the current
-    /// viewport size. Recreates the texture on resize. Returns true if the
-    /// texture is usable (false on first frame or after a failed allocation).
+    /// v1.0 P0-c: Ensure the offscreen texture exists and can hold the
+    /// current viewport. Returns true if the texture is usable (false on the
+    /// first frame or after a failed allocation).
+    ///
+    /// v1.12.2 B3-1 (PLAN_S2_render): **capacity-based reuse**. The texture
+    /// used to be recreated whenever the viewport changed — one 10-25MB GPU
+    /// allocation per `Resized` tick during a drag. Now it is allocated at a
+    /// 256-px-rounded capacity and only reallocated when the viewport out
+    /// grows it (grow-only: shrinks keep the larger texture). Rendering,
+    /// sampling, and the presentation blit all operate on the top-left
+    /// `viewport` sub-region:
+    /// - the render pass declares an explicit viewport (see
+    ///   `render_viewport_for_target` at the encoder site), so the shader's
+    ///   NDC mapping (which divides by `viewport_size`) never stretches
+    ///   content over the capacity;
+    /// - the presentation/scroll blits were already viewport-clamped.
+    ///
+    /// `offscreen_dims` tracks the *valid rendered region* (== current
+    /// viewport), not the texture size. A full rebuild is forced when the
+    /// texture is (re)allocated (undefined content) **or** when the valid
+    /// region grows without a realloc (the newly exposed area was never
+    /// rendered) — a shrink needs neither, the old top-left content stays
+    /// valid under Load.
     pub(crate) fn ensure_offscreen_texture(&self) -> bool {
         let (vw, vh) = (self.viewport.0, self.viewport.1);
         if vw <= 0.0 || vh <= 0.0 {
             return false;
         }
-        // Recreate if missing or dimensions changed.
-        if self.offscreen_dims.get() != (vw, vh) {
+        let insufficient = match self.offscreen_texture.borrow().as_ref() {
+            None => true,
+            Some(tex) => (tex.width() as f32) < vw || (tex.height() as f32) < vh,
+        };
+        if insufficient {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_texture_type(metal::MTLTextureType::D2);
             descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-            descriptor.set_width(vw as u64);
-            descriptor.set_height(vh as u64);
+            descriptor.set_width(ceil_to_capacity_step(vw));
+            descriptor.set_height(ceil_to_capacity_step(vh));
             descriptor.set_usage(
                 metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
             );
             let tex = self.device.new_texture(&descriptor);
             *self.offscreen_texture.borrow_mut() = Some(tex);
-            self.offscreen_dims.set((vw, vh));
             // New textures have undefined content. Force a full redraw so the
             // offscreen is fully rendered with Clear + all rows before any
             // incremental Load path is used.
             self.force_full_grid.set(true);
+        } else {
+            // Capacity retained. Force a rebuild only if the valid region
+            // grew into previously-unrendered texture area.
+            let (prev_w, prev_h) = self.offscreen_dims.get();
+            if vw > prev_w || vh > prev_h {
+                self.force_full_grid.set(true);
+            }
         }
+        self.offscreen_dims.set((vw, vh));
         self.offscreen_texture.borrow().is_some()
     }
 
@@ -152,8 +227,9 @@ impl MetalRenderer {
                 let src_tex = cache.as_ref().unwrap();
                 // v1.0 fix: clamp blit to the drawable's actual texture size
                 // to prevent out-of-bounds writes during live resize.
-                let blit_w = self.viewport.0.min(drawable_tex_size.0) as u64;
-                let blit_h = self.viewport.1.min(drawable_tex_size.1) as u64;
+                // B3-1: also never larger than the viewport — the offscreen
+                // capacity may exceed it (shared helper with the main path).
+                let (blit_w, blit_h) = offscreen_blit_size(self.viewport, drawable_tex_size);
                 blit.copy_from_texture(
                     src_tex,
                     0,
@@ -367,6 +443,20 @@ impl MetalRenderer {
         color_att.set_store_action(MTLStoreAction::Store);
 
         let encoder = command_buffer.new_render_command_encoder(pass_desc);
+        // B3-1 (PLAN_S2_render): explicit viewport. Metal's default viewport
+        // is the whole render target; with the capacity-sized offscreen that
+        // would stretch the NDC mapping (text_shader.metal divides by
+        // viewport_size) across the full texture. Clamped to the target so
+        // the drawable-fallback frame keeps the pre-B3-1 full-target behavior.
+        let target_dims: (f32, f32) = if has_offscreen {
+            let cache = self.offscreen_texture.borrow();
+            let tex = cache.as_ref().expect("has_offscreen implies texture");
+            (tex.width() as f32, tex.height() as f32)
+        } else {
+            let d = drawable.texture();
+            (d.width() as f32, d.height() as f32)
+        };
+        encoder.set_viewport(render_viewport_for_target(self.viewport, target_dims));
 
         // v1.0 P1.5-B1: Draw 1 — grid instances (instanced pipeline).
         // Extracted to grid_instances.rs (v1.4.2 B1).
@@ -420,8 +510,9 @@ impl MetalRenderer {
             // v1.0 fix: clamp blit to the drawable's actual texture size to
             // prevent out-of-bounds writes during macOS live resize (when
             // next_drawable returns a texture with the previous dimensions).
-            let blit_w = self.viewport.0.min(drawable_tex_size.0) as u64;
-            let blit_h = self.viewport.1.min(drawable_tex_size.1) as u64;
+            // B3-1: also never larger than the viewport — the offscreen
+            // capacity may exceed it after grow-only reuse.
+            let (blit_w, blit_h) = offscreen_blit_size(self.viewport, drawable_tex_size);
             blit.copy_from_texture(
                 src_tex,
                 0,
@@ -515,4 +606,119 @@ fn register_gpu_completion_handler(command_buffer: &metal::CommandBufferRef) {
     })
     .copy();
     command_buffer.add_completed_handler(&block);
+}
+
+#[cfg(test)]
+mod offscreen_capacity_tests {
+    use super::{ceil_to_capacity_step, offscreen_blit_size, render_viewport_for_target};
+    use crate::renderer::MetalRenderer;
+    use weft_core::config::Theme;
+
+    /// Mirror the golden skip precedent: no Metal device (CI without GPU)
+    /// skips instead of failing.
+    fn headless_or_skip() -> Option<MetalRenderer> {
+        metal::Device::system_default()?;
+        Some(MetalRenderer::new_headless_paint(Theme::weft_dark()))
+    }
+
+    fn texture_dims(renderer: &MetalRenderer) -> (u64, u64) {
+        let cache = renderer.offscreen_texture.borrow();
+        let tex = cache
+            .as_ref()
+            .expect("ensure_offscreen_texture must have allocated");
+        (tex.width(), tex.height())
+    }
+
+    #[test]
+    fn capacity_step_rounds_up_to_256px() {
+        assert_eq!(ceil_to_capacity_step(0.0), 256);
+        assert_eq!(ceil_to_capacity_step(1.0), 256);
+        assert_eq!(ceil_to_capacity_step(256.0), 256);
+        assert_eq!(ceil_to_capacity_step(257.0), 512);
+        assert_eq!(ceil_to_capacity_step(840.0), 1024);
+        assert_eq!(ceil_to_capacity_step(600.0), 768);
+    }
+
+    #[test]
+    fn render_viewport_is_viewport_for_capacity_and_target_for_fallback() {
+        // Capacity-sized offscreen: NDC maps exactly over the viewport —
+        // this is the B3-1 anti-stretch guarantee for set_viewport.
+        let vp = render_viewport_for_target((840.0, 600.0), (1024.0, 768.0));
+        assert_eq!((vp.originX, vp.originY), (0.0, 0.0));
+        assert_eq!((vp.width, vp.height), (840.0, 600.0));
+        // Drawable fallback (vp_mismatch frame): clamps to the drawable —
+        // identical to the pre-B3-1 default full-target viewport, so the
+        // async-lag frame's behavior is unchanged.
+        let vp2 = render_viewport_for_target((840.0, 600.0), (800.0, 500.0));
+        assert_eq!((vp2.width, vp2.height), (800.0, 500.0));
+    }
+
+    #[test]
+    fn blit_region_is_viewport_scoped_never_capacity() {
+        // A retained oversized texture must never inflate the copy…
+        assert_eq!(
+            offscreen_blit_size((840.0, 600.0), (2048.0, 1536.0)),
+            (840, 600)
+        );
+        // …and the live-resize drawable clamp is preserved.
+        assert_eq!(
+            offscreen_blit_size((840.0, 600.0), (800.0, 500.0)),
+            (800, 500)
+        );
+    }
+
+    /// The B3-1 core scenario: shrink keeps the texture (no realloc, no
+    /// forced rebuild), growth within capacity keeps it too (but forces one
+    /// full redraw for the newly exposed region), and only growth beyond the
+    /// capacity reallocates.
+    #[test]
+    fn offscreen_capacity_survives_shrink_and_grows_only_when_insufficient() {
+        let Some(mut renderer) = headless_or_skip() else {
+            eprintln!("skipping offscreen capacity test: no Metal device available");
+            return;
+        };
+        renderer.viewport = (840.0, 600.0);
+        assert!(renderer.ensure_offscreen_texture());
+        assert_eq!(texture_dims(&renderer), (1024, 768));
+        renderer.force_full_grid.set(false);
+
+        // Shrink: capacity retained, no rebuild, valid region tracked.
+        renderer.viewport = (400.0, 300.0);
+        assert!(renderer.ensure_offscreen_texture());
+        assert_eq!(
+            texture_dims(&renderer),
+            (1024, 768),
+            "shrink must not realloc"
+        );
+        assert!(
+            !renderer.force_full_grid.get(),
+            "shrink keeps the rendered top-left valid"
+        );
+        assert_eq!(renderer.offscreen_dims.get(), (400.0, 300.0));
+
+        // Grow within capacity: no realloc, but the new region was never
+        // rendered → exactly one forced rebuild.
+        renderer.viewport = (1000.0, 700.0);
+        assert!(renderer.ensure_offscreen_texture());
+        assert_eq!(
+            texture_dims(&renderer),
+            (1024, 768),
+            "in-capacity growth must not realloc"
+        );
+        assert!(
+            renderer.force_full_grid.get(),
+            "region growth into unrendered texture must force a full redraw"
+        );
+        renderer.force_full_grid.set(false);
+
+        // Grow beyond capacity: realloc at the new rounded capacity.
+        renderer.viewport = (1500.0, 900.0);
+        assert!(renderer.ensure_offscreen_texture());
+        assert_eq!(texture_dims(&renderer), (1536, 1024));
+        assert!(
+            renderer.force_full_grid.get(),
+            "realloc forces full redraw (undefined content)"
+        );
+        assert_eq!(renderer.offscreen_dims.get(), (1500.0, 900.0));
+    }
 }

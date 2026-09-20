@@ -56,6 +56,11 @@ impl MetalRenderer {
         viewport_h: f32,
         panes: &[PaneRenderInfo<'_>],
         tab_bar: &TabBarDrawState,
+        // v1.12.2 B3-3 (PLAN_S2_render): drag-time incremental block scan —
+        // each background pane warms under its own namespace (session id;
+        // P2: namespaces must be per-pane, never a shared constant).
+        live_resize: bool,
+        watermarks: &std::cell::RefCell<crate::renderer::atlas_warmup::BlockScanWatermarks>,
     ) {
         let no_find: Option<FindDrawState> = None;
         let no_note: Option<crate::paint::overlays::NoteEditorDrawState> = None;
@@ -77,6 +82,9 @@ impl MetalRenderer {
                 tab_bar,
                 // Background panes don't render diagnose panels.
                 &[],
+                live_resize,
+                watermarks,
+                pane.pane_session_id,
             );
         }
     }
@@ -97,7 +105,10 @@ impl MetalRenderer {
             PaneBaseView::Grid => {
                 let bg_start = bg_stream.len();
                 let glyph_start = glyph_stream.len();
-                let pane_batch = self.build_grid_instances_for_background_pane(pane.terminal);
+                // v1.12.2 B3-2: per-pane incremental rebuild — the returned
+                // count reports how many rows were dirty this frame.
+                let (pane_batch, rebuilt_rows) = self
+                    .build_grid_instances_for_background_pane(pane.terminal, pane.pane_session_id);
                 bg_stream.extend(pane_batch.bg_stream);
                 glyph_stream.extend(pane_batch.glyph_stream);
                 let bg_end = bg_stream.len();
@@ -115,6 +126,7 @@ impl MetalRenderer {
                     glyph_instance_count = (glyph_end - glyph_start) / 16,
                     grid_rows = pane.terminal.grid().num_rows,
                     grid_cols = pane.terminal.grid().num_cols,
+                    rebuilt_rows,
                     "built background grid pane"
                 );
                 Vec::new()

@@ -13,6 +13,15 @@ impl MetalRenderer {
     /// Swap the active theme. Recolors the whole screen on the next draw
     /// (colors are resolved per-frame from cells' color-origins + this theme +
     /// the terminal palette, so no rebuild is needed).
+    /// B3-2 P1 fix (rust-reviewer): invalidate every background-pane row
+    /// cache (same trigger family as `styled_line_cache.bump_generation`).
+    /// Starts at 1; `wrapping_add(1).max(1)` keeps 0 unreachable so a
+    /// zero-initialized cache entry never spuriously matches.
+    fn bump_background_grid_generation(&self) {
+        self.background_grid_generation
+            .set(self.background_grid_generation.get().wrapping_add(1).max(1));
+    }
+
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;
         // Colors are baked into cached vertices — force a full rebuild.
@@ -21,6 +30,9 @@ impl MetalRenderer {
         // cached block-view vertices, so a theme change requires re-rendering
         // all styled lines from scratch.
         self.styled_line_cache.borrow_mut().bump_generation();
+        // B3-2 P1 fix (rust-reviewer): theme colors are baked into the
+        // background-pane row caches too.
+        self.bump_background_grid_generation();
     }
 
     pub fn set_minimum_contrast(&mut self, minimum_contrast: f32) {
@@ -32,6 +44,7 @@ impl MetalRenderer {
         self.minimum_contrast = minimum_contrast;
         self.force_full_grid.set(true);
         self.styled_line_cache.borrow_mut().bump_generation();
+        self.bump_background_grid_generation();
     }
 
     pub fn set_semantic_output_enabled(&mut self, enabled: bool) {
@@ -57,6 +70,7 @@ impl MetalRenderer {
         self.bold_is_bright = flag;
         self.force_full_grid_redraw();
         self.styled_line_cache.borrow_mut().bump_generation();
+        self.bump_background_grid_generation();
     }
 
     /// v1.0 P0-b: Force a full grid redraw on the next draw. Call on resize,
@@ -217,6 +231,13 @@ impl MetalRenderer {
         self.padding_x = padding_logical.0 as f32 * scale as f32;
         self.padding_y = padding_logical.1 as f32 * scale as f32;
         self.atlas = GlyphAtlas::new(&self.device, &self.font_config, scale);
+        // v1.12.2 B3-3 (PLAN_S2_render): a fresh empty atlas invalidates every
+        // warmup watermark — stale "already scanned" marks would skip glyphs
+        // the new atlas needs (fragmented-output bug class).
+        self.block_scan_watermarks.borrow_mut().clear();
+        // B3-2 P1 fix (rust-reviewer): cell metrics change → baked row
+        // coordinates are stale until the PTY resize arrives.
+        self.bump_background_grid_generation();
 
         // CAMetalLayer contentsScale is not exposed by metal-rs. Keep the raw
         // Objective-C message contained and unwind-protected per project rule.
@@ -359,6 +380,9 @@ impl MetalRenderer {
         // v1.4.1: font/line-height change invalidates glyph UVs and cell
         // geometry baked into cached block-view vertices.
         self.styled_line_cache.borrow_mut().bump_generation();
+        // v1.12.2 B3-3 (PLAN_S2_render): same watermark invalidation as
+        // update_scale — the new atlas starts empty.
+        self.block_scan_watermarks.borrow_mut().clear();
         (self.atlas.cell_width, self.atlas.cell_height)
     }
 

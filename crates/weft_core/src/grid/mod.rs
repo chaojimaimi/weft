@@ -1012,6 +1012,16 @@ impl Grid {
         self.pending_scroll.take()
     }
 
+    /// v1.12.2 B3-2 (PLAN_S2_render): non-consuming read of the pending
+    /// scroll delta. The background-pane incremental row cache fingerprints
+    /// this: a full-viewport scroll records ONLY this delta (it marks no
+    /// rows dirty), so `pending_scroll != 0` must force one full cache
+    /// rebuild or cached rows lag streamed content forever. The active path
+    /// consumes the delta via [`take_pending_scroll`] instead.
+    pub fn pending_scroll(&self) -> i32 {
+        self.pending_scroll.get()
+    }
+
     /// v1.0 fix: discard the pending scroll delta AND mark every viewport row
     /// dirty. Used for alt-screen apps (vim/less/man) after a scroll: those
     /// apps repaint their whole screen after scrolling, so the renderer's

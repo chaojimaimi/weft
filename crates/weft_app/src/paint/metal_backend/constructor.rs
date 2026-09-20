@@ -12,6 +12,7 @@ use metal::{
     RenderPipelineDescriptor, SamplerDescriptor, VertexDescriptor,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use tracing::info;
 use winit::window::Window;
 
@@ -304,6 +305,14 @@ impl MetalRenderer {
             // its flush observability counter (tests assert the gate).
             live_resize_flip_enabled,
             core_animation_flushes: Cell::new(0),
+            // v1.12.2 B3-2/B3-3 (PLAN_S2_render): background-pane row caches
+            // + the drag-time warmup watermark table (cleared on atlas
+            // rebuilds by update_scale/rebuild_atlas).
+            background_grid_row_caches: RefCell::new(HashMap::new()),
+            background_grid_generation: Cell::new(1),
+            block_scan_watermarks: RefCell::new(
+                crate::renderer::atlas_warmup::BlockScanWatermarks::default(),
+            ),
             scroll_metrics_memo: Cell::new(None),
             cached_scroll_metrics: Cell::new(None),
             cached_panel_scroll_metrics: Cell::new(None),

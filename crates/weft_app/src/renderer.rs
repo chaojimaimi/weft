@@ -3,6 +3,7 @@
 
 use metal::{Device, MetalLayer};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use crate::glyph::GlyphAtlas;
 use crate::paint::grid_cache::BlockLayoutCache;
@@ -15,7 +16,7 @@ use weft_core::config::{FontConfig, Theme};
 use weft_core::selection::SelectionHandler;
 use weft_core::vt::Terminal;
 
-mod atlas_warmup;
+pub(crate) mod atlas_warmup;
 mod panes;
 mod runtime;
 pub use panes::PaneRenderInfo;
@@ -244,9 +245,38 @@ pub struct MetalRenderer {
     /// The offscreen is blitted to the drawable at the end of the frame.
     /// Recreated on viewport resize.
     pub(crate) offscreen_texture: RefCell<Option<metal::Texture>>,
-    /// v1.0 P0-c: Dimensions of the current offscreen texture (w, h) in
-    /// physical pixels. Used to detect resize → recreate offscreen.
+    /// v1.0 P0-c: Dimensions of the **valid rendered region** (w, h) in
+    /// physical pixels — always equal to the current viewport, NOT the
+    /// texture size. v1.12.2 B3-1 (PLAN_S2_render): the offscreen texture is
+    /// capacity-sized (grow-only, 256-px rounded) and survives shrinks;
+    /// `ensure_offscreen_texture` uses this field to decide whether the valid
+    /// region grew into never-rendered texture (→ force full redraw).
     pub(crate) offscreen_dims: Cell<(f32, f32)>,
+    /// v1.12.2 B3-2 (PLAN_S2_render): per-background-pane dual-stream row
+    /// caches, keyed by `pane_session_id` (global, monotonic — closed panes'
+    /// entries are pruned each frame from the live pane list). Gives
+    /// background panes the same dirty-row incremental rebuild the active
+    /// pane has had since v1.4.2; entries rest on PTY dirty rows and go full
+    /// on dimension change (live-resize), scroll change, layout-origin move,
+    /// or primary-screen mask movement.
+    pub(crate) background_grid_row_caches:
+        RefCell<HashMap<u64, crate::paint::grid::BackgroundGridRowCache>>,
+    /// v1.12.2 B3-2 P1 fix (rust-reviewer): monotonically increasing invalida-
+    /// tion counter for [`Self::background_grid_row_caches`]. Bumped by
+    /// `set_theme` / `set_minimum_contrast` / `set_bold_is_bright` (colors are
+    /// baked into cached rows) and `update_scale`. The background builder
+    /// fingerprints this instead of `force_full_grid`, which multi-pane frames
+    /// set unconditionally every frame.
+    pub(crate) background_grid_generation: Cell<u64>,
+    /// v1.12.2 B3-3 (PLAN_S2_render): per-namespace block output scan
+    /// watermarks for the drag-time incremental atlas warmup. Namespaces are
+    /// per-pane `pane_session_id`s — the active pane warms under its own id
+    /// (P2 fix: BlockIds are per-Terminal, so a shared constant would leak
+    /// watermarks across tab/focus switches). Cleared by `update_scale` /
+    /// `rebuild_atlas` — a rebuilt atlas is empty, so stale "already
+    /// scanned" marks would skip glyphs the new atlas needs (the
+    /// fragmented-output bug class).
+    pub(crate) block_scan_watermarks: RefCell<crate::renderer::atlas_warmup::BlockScanWatermarks>,
     /// v1.0 P0-c: Pending scroll delta captured during build_grid_vertices
     /// (via grid.take_pending_scroll()). Used by the draw() epilogue to
     /// decide whether to issue a GPU blit before the render pass.
@@ -567,12 +597,22 @@ impl MetalRenderer {
             settings,
             tab_bar,
             &diagnose_texts,
+            // B3-3 + P2 fix (rust-reviewer): drag-time incremental block scan.
+            // The active pane warms under its OWN session id (not a shared
+            // constant): BlockIds are allocated per-Terminal, so after a tab /
+            // focus switch the new active terminal's BlockId(1..N) must not
+            // hit the previous tenant's leftover watermarks.
+            self.live_resize_active,
+            &self.block_scan_watermarks,
+            active_pane_session_id,
         );
         Self::warm_background_pane_atlases(
             &mut self.atlas,
             self.viewport.1,
             background_panes,
             tab_bar,
+            self.live_resize_active,
+            &self.block_scan_watermarks,
         );
 
         // Editor mode (at the prompt): full block history + input box.
@@ -679,6 +719,19 @@ impl MetalRenderer {
             // pane so its grid renders correctly on the first multi-pane frame.
             self.force_full_grid_redraw();
         }
+        // B3-2 (PLAN_S2_render): prune row caches of panes that no longer
+        // exist this frame (session ids are monotonic, so a plain retain
+        // against the live background list keeps the map bounded). Deliberately
+        // OUTSIDE the `if !background_panes.is_empty()` block above: with no
+        // background panes there is no build consumer, and the retain must
+        // still run so closing the LAST background pane clears the map; a pane
+        // promoted to active is pruned here too — its fingerprint is re-checked
+        // from scratch when it returns to the background set.
+        let live_ids: std::collections::HashSet<u64> =
+            background_panes.iter().map(|p| p.pane_session_id).collect();
+        self.background_grid_row_caches
+            .borrow_mut()
+            .retain(|id, _| live_ids.contains(id));
 
         let active_vertices: Vec<f32> = if show_blocks {
             let (v, regions, bv_rows) = if let Some(p) = prompt {

@@ -808,6 +808,10 @@ impl App {
         if let Some(t) = &mut tab.terminal {
             t.grid_mut().clear_all_dirty();
         }
+        // v1.12.2 B3-2 (PLAN_S2_render): background panes' dirty flags are
+        // consumed by the per-pane incremental row caches the same way —
+        // clear them so the next frame marks only newly written rows.
+        tab.clear_background_grid_dirty(active_pane_id);
         self.sessions.set_prev_drawn_tab(active);
         self.update_accessibility_tree();
 

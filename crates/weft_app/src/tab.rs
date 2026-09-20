@@ -244,6 +244,23 @@ impl Tab {
         self.panes.get_mut(&id)
     }
 
+    /// v1.12.2 B3-2 (PLAN_S2_render): clear the dirty-row flags of every
+    /// non-active pane after the frame consumed them. Mirrors the active
+    /// pane's post-draw `clear_all_dirty` (redraw_controller): background
+    /// grids are never cleared otherwise, so their dirty set only grows and
+    /// the per-pane incremental row cache would keep rebuilding long-idle
+    /// rows.
+    pub(crate) fn clear_background_grid_dirty(&mut self, active_id: PaneId) {
+        for (id, pane) in self.panes.iter_mut() {
+            if *id == active_id {
+                continue;
+            }
+            if let Some(t) = pane.terminal.as_mut() {
+                t.grid_mut().clear_all_dirty();
+            }
+        }
+    }
+
     /// v1.5.0: Mutable iterator over all panes. Used by `apply_config` to
     /// reseed palette / scrollback on every pane in every tab when a
     /// profile switch or config reload fires.
