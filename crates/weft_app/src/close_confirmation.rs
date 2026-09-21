@@ -173,13 +173,21 @@ impl App {
 
     fn perform_clean_shutdown(&mut self, event_loop: &ActiveEventLoop) {
         tracing::info!("application close confirmed");
+        // DIAGNOSTIC step markers (hang-after-confirm, v1.12.5): the confirm
+        // line is the LAST log the field shows -- these pinpoint which
+        // teardown stage stops emitting.
         let blocks = self.finish_all_pending_blocks();
+        tracing::info!(
+            count = blocks.len(),
+            "teardown step 1: pending blocks finished"
+        );
         let mut effects = Vec::new();
         if !blocks.is_empty() {
             effects.push(crate::effect::Effect::PersistBlocks { blocks });
         }
         effects.push(crate::effect::Effect::PersistTabs);
         self.drain_effects(effects);
+        tracing::info!("teardown step 2: persistence effects drained");
         if let Some(workspace) = self.capture_workspace("recovery".into()) {
             // v1.10.31: Final snapshot write is dispatched to a background thread
             // ("weft-recovery-writer") and immediately followed by event_loop.exit(),
@@ -197,7 +205,9 @@ impl App {
                 tracing::warn!(error = %error, "final recovery snapshot write failed");
             }
         }
+        tracing::info!("teardown step 3: recovery snapshot handled");
         self.recovery.mark_clean_shutdown();
+        tracing::info!("teardown step 4: clean marker written, requesting event-loop exit");
         // FIX_close_exit_after_modal: when the modal confirmation path ran in
         // this handler, exit() alone sets a flag no observer ever reads — pair
         // it with a Wake so the main runloop turns one more revolution and

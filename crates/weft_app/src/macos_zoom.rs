@@ -177,6 +177,21 @@ unsafe extern "C" fn will_resize_imp(
         // borrowed pointers (never released here), so the borrows below are
         // valid for the callback's duration.
         let view = unsafe { &*(ns_view as *const AnyObject) };
+        // DIAGNOSTIC (zoom-still-distorts, v1.12.5): is the delegate hook
+        // invoked at all, and is the callback classified as a drag? 17
+        // forced=false zoom frames in the field log say the Z-b gate never
+        // saw a stamp -- this line discriminates "hook not called" from
+        // "called but exempted as a drag".
+        let window_probe: *mut AnyObject = msg_send![view, window];
+        let dragging_probe: bool = if window_probe.is_null() {
+            false
+        } else {
+            unsafe { msg_send![window_probe, inLiveResize] }
+        };
+        tracing::info!(
+            dragging = dragging_probe,
+            "windowWillResize callback reached the injected IMP"
+        );
         // SAFETY: `layer` on a layer-backed view always returns a non-null
         // borrowed CALayer.
         let layer: *mut AnyObject = unsafe { msg_send![view, layer] };
@@ -197,12 +212,8 @@ unsafe extern "C" fn will_resize_imp(
             let _: () = msg_send![layer, setDrawableSize: drawable];
             // HIGH-2: a user drag runs inside inLiveResize — the zoom
             // channel is for PROGRAMMATIC resizes only (double-click zoom).
-            let window: *mut AnyObject = msg_send![view, window];
-            if !window.is_null() {
-                let dragging: bool = msg_send![window, inLiveResize];
-                if !dragging {
-                    ZOOM_LAST_ACTIVITY_MS.store(now_ms(), Ordering::Release);
-                }
+            if !dragging_probe {
+                ZOOM_LAST_ACTIVITY_MS.store(now_ms(), Ordering::Release);
             }
         }
     }))
