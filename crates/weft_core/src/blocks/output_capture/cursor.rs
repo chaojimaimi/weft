@@ -1,12 +1,26 @@
+use std::sync::atomic::Ordering;
+
 use super::{CapturedStyle, OutputCapture};
 
 impl OutputCapture {
     pub(crate) fn carriage_return(&mut self) {
         self.cursor = self.line_start();
         self.char_cursor = self.line_start_char;
+        // M6-a watermark: the line start of the CURRENT line. While the
+        // cursor is on the tail line this equals the sync boundary exactly
+        // (`>=` in the guard, so a CRLF spinner never false-trips); after a
+        // CSI A up-move it is an early row start, which correctly pulls the
+        // watermark below the boundary.
+        self.min_write_offset
+            .fetch_min(self.cursor, Ordering::Relaxed);
     }
 
     pub(crate) fn set_cursor_column(&mut self, column: usize, max_bytes: usize) {
+        // M6-a watermark: the movement itself is NOT recorded — it is
+        // line-confined (cursor lands within `[line_start, line_end]`, and
+        // the current line's start IS the sync boundary) and changes no
+        // bytes. The column padding below emits through `print`, which
+        // records its own offsets.
         let start = self.line_start();
         let end = self.line_end();
         let line = &self.text[start..end];
@@ -31,6 +45,9 @@ impl OutputCapture {
     }
 
     pub(crate) fn move_cursor_columns(&mut self, delta: isize, max_bytes: usize) {
+        // M6-a watermark: NOT recorded — same line-confined argument as
+        // `set_cursor_column` (which this delegates to; its padding path
+        // records through `print`).
         let start = self.line_start();
         let current = crate::grid::terminal_text_width(&self.text[start..self.cursor]);
         self.set_cursor_column(current.saturating_add_signed(delta), max_bytes);
@@ -45,6 +62,11 @@ impl OutputCapture {
             }
             self.char_cursor = self.char_cursor.saturating_sub(1);
         }
+        // M6-a watermark: the POST-move cursor — the next write overwrites
+        // from here, and the move never crosses the current line's start
+        // (== the sync boundary while on the tail line).
+        self.min_write_offset
+            .fetch_min(self.cursor, Ordering::Relaxed);
     }
 
     /// Move the capture cursor by `delta` rows (negative = up, positive =
@@ -90,6 +112,11 @@ impl OutputCapture {
         self.cursor = target;
         self.char_cursor = self.text[..target].chars().count() as u32;
         self.line_start_char = self.char_cursor;
+        // M6-a watermark: the TARGET cursor. A negative move (CSI A — the
+        // `ollama pull` / `brew upgrade` progress-bar repaint) lands on an
+        // early row, pulling the watermark below the sync boundary so the
+        // live layout cache's append fast path falls back to a full rebuild.
+        self.min_write_offset.fetch_min(target, Ordering::Relaxed);
     }
 }
 
@@ -286,5 +313,49 @@ mod tests {
         output.carriage_return();
         output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
         assert_eq!(output.as_str(), "LINE1\nline2");
+    }
+
+    // ── M6-a (PLAN_M6 §A-1): rewrite watermark accounting ───────────────
+
+    /// Backspace and row moves record their (post-move) cursor: inside the
+    /// tail line that stays at/above the boundary; a negative row move (CSI
+    /// A) lands on an early row and pulls the watermark below it.
+    #[test]
+    fn watermark_backspace_and_row_moves_follow_the_cursor() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"one\ntwo", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.take_min_write_offset();
+        // Tail line "two" starts at byte 4; cursor 7.
+        output.backspace();
+        assert_eq!(
+            output.min_write_offset_value(),
+            6,
+            "backspace records its post-move cursor"
+        );
+        output.move_cursor_rows(-1);
+        assert_eq!(
+            output.min_write_offset_value(),
+            0,
+            "negative row move must invalidate the append fast path"
+        );
+    }
+
+    /// CHA/CUB horizontal moves are line-confined and touch no bytes — they
+    /// must NOT record (the tail line's start equals the sync boundary, so
+    /// a record could only be redundant; recording nothing keeps the
+    /// watermark "pure append" for pure cursor traffic).
+    #[test]
+    fn watermark_horizontal_moves_never_record() {
+        let mut output = OutputCapture::default();
+        output.print_ascii(b"one\ntwo", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.take_min_write_offset();
+        output.set_cursor_column(1, MAX_OUTPUT_BYTES);
+        output.move_cursor_columns(-2, MAX_OUTPUT_BYTES);
+        assert_eq!(
+            output.min_write_offset_value(),
+            usize::MAX,
+            "line-confined moves must not lower the watermark"
+        );
+        assert_eq!(output.as_str(), "one\ntwo");
     }
 }

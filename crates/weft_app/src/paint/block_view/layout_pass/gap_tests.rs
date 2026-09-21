@@ -231,6 +231,7 @@ fn live_layout<'a>(
                 styled_output: None,
                 version: 1,
                 screen_origin: false,
+                min_write_offset: InFlightBlock::detached_watermark(),
             }),
             pane_session_id: 1,
             cwd: None,
@@ -270,6 +271,7 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
             styled_output: None,
             version: 1,
             screen_origin: false,
+            min_write_offset: InFlightBlock::detached_watermark(),
         };
         compute_block_layout_pass(
             LayoutPassInput {

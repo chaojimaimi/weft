@@ -1,5 +1,5 @@
 //! Live (in-flight) block layout cache — v1.10.23 Phase 3
-//! (FIX_LIVE_BLOCK_SCROLL_PERF).
+//! (FIX_LIVE_BLOCK_SCROLL_PERF); M6-a incremental sync (PLAN_M6 §A-2).
 //!
 //! The live block's output streams (omp snapshots at ~50ms, regular commands
 //! per print), so wrapping it every scroll tick was O(document): 3×
@@ -7,17 +7,33 @@
 //! String clones. This cache keys on the block tracker's content `version`
 //! (bumped on EVERY mutation — version equality ⇔ byte-identical output)
 //! plus `cols` AND the pane's `pane_session_id` (one global cache is shared
-//! by every tab/pane, and per-Tab version counters start at 0), and stores:
+//! by every tab/pane, and per-Tab version counters start at 0).
 //!
-//! - `cumulative`: prefix sums of per-line display rows (wrap counts), for
-//!   O(log n) binary-search location of the visible logical-line window,
-//!   mirroring the finished-blocks prefix-sum culling in `layout_pass.rs`.
-//! - `line_ranges`: byte ranges of each tail-window line into the live
-//!   output (exact `str::lines()` semantics), so the layout pass slices only
-//!   the visible lines — no `lines().collect()` on the scroll tick.
+//! M6-a: a version bump no longer means a full O(document) rescan. The cache
+//! keeps `synced_byte_end` (the offset after the last consumed complete
+//! line) plus a bounded suffix window; when the capture's rewrite watermark
+//! proves nothing below that boundary was touched since the last sync, only
+//! the newly appended tail is folded in — O(new bytes + one partial line).
+//! Streaming output is not always pure append (`on_move_cursor_rows` mirrors
+//! CSI A/B/E/F so progress bars repaint early rows), hence the watermark
+//! (`min_write_offset`) recorded per capture op is the authoritative guard;
+//! the byte-level "\n at boundary" canary is depth-on-defense only.
 //!
-//! Rebuild is O(document) but happens once per content version (snapshot
-//! rate-limited to ~50ms), never per scroll tick.
+//! Stored state per version:
+//!
+//! - `window`: the newest `min(doc_lines, MAX_LAYOUT_LINES_LIVE)` lines
+//!   (continuously capped — every append pops the head as needed), each with
+//!   its byte range into the live output.
+//! - `abs_cum` / `abs_cums`: display-row prefix sums in REBUILD-EPOCH
+//!   absolute space. "Absolute" means: not renumbered when the window's head
+//!   is popped, so popping is O(1) amortized. The origin is re-seeded at each
+//!   full rebuild; only differences within an epoch are ever consumed.
+//! - `cumulative`: the window-RELATIVE prefix the `cumulative()` accessor
+//!   contracts to, materialized at sync time (O(MAX) ≈ 8KB, bounded).
+
+use std::collections::VecDeque;
+
+use weft_core::grid::terminal_text_width;
 
 use crate::paint::grid_cache::{
     block_line_chunks, screen_origin_line_chunks, MAX_LAYOUT_LINES_LIVE,
@@ -54,6 +70,18 @@ pub(crate) struct BlockScrollMetricsKey {
     pub(crate) cwd_present: bool,
 }
 
+/// One line of the bounded suffix window.
+#[derive(Clone, Copy)]
+struct WindowLine {
+    /// Byte range `(start, end)` into the live output, mirroring
+    /// `str::lines()` exactly (trailing `\r` stripped).
+    byte_range: (usize, usize),
+    /// Display rows of all window lines BEFORE this one, in rebuild-epoch
+    /// absolute space (saturating — 1MiB-capped documents cannot overflow
+    /// u32 rows, the guard is belt-and-braces).
+    abs_cum: u32,
+}
+
 /// Cumulative layout of the live block's output tail window
 /// (newest `MAX_LAYOUT_LINES_LIVE` lines, oldest-first indexing).
 #[derive(Default)]
@@ -71,19 +99,32 @@ pub(crate) struct LiveLayoutCache {
     /// bump (`on_command_start` clears / `begin_screen_owned_output` sets), but
     /// keeping it in the equality test makes the split explicit and future-proof.
     screen_origin: bool,
-    /// Number of logical lines in the tail window.
-    total_lines: usize,
-    /// Raw index of the window's first line within the full document
-    /// (= `max(0, doc_lines - MAX_LAYOUT_LINES_LIVE)`).
-    base_idx: usize,
-    /// `cumulative[i]` = display rows of window lines `[0..i)`; len = total+1.
+    /// M6-a: offset after the last consumed COMPLETE line (the append fast
+    /// path's invariant: `window`'s last entry starts here exactly when the
+    /// document's final line is still growing). Reset on every full rebuild.
+    synced_byte_end: usize,
+    /// Bounded suffix window, oldest-first; length is always
+    /// `min(doc_lines, MAX_LAYOUT_LINES_LIVE)` (continuous cap — no slack
+    /// band, so the accessors stay value-identical to a full rebuild).
+    window: VecDeque<WindowLine>,
+    /// Epoch-absolute row prefix per window line + the end value:
+    /// `abs_cums[i] = window[i].abs_cum` for `i < len`, `abs_cums[len]` =
+    /// prefix AFTER the window's last line. Kept contiguous for the
+    /// `visible_window` binary search.
+    abs_cums: Vec<u32>,
+    /// Absolute line index of the window's first line (= `base_idx`).
+    abs_first_line: usize,
+    /// Window-relative cumulative: `cumulative[i]` = display rows of window
+    /// lines `[0..i)`; len = window + 1. Materialized per mutating sync for
+    /// the `cumulative() -> &[u32]` contract.
     cumulative: Vec<u32>,
-    /// Byte range `(start, end)` into the live output for each window line,
-    /// mirroring `str::lines()` exactly (trailing `\r` stripped).
-    line_ranges: Vec<(usize, usize)>,
-    /// Rebuilds since creation (test observability for the hit/miss keys).
+    /// Full rebuilds since creation (test observability — a HIT or an
+    /// incremental append does not count).
     #[cfg(test)]
     rebuilds: usize,
+    /// Incremental appends since creation (test observability).
+    #[cfg(test)]
+    appends: usize,
 }
 
 impl LiveLayoutCache {
@@ -96,6 +137,12 @@ impl LiveLayoutCache {
     /// (silent misrender or a mid-multibyte-char slice panic). `screen_origin`
     /// flips exactly at a version bump, but joining it keeps the wrap-vs-clip
     /// split explicit in the key.
+    ///
+    /// M6-a: `min_write_offset` is the capture's rewrite watermark taken via
+    /// `InFlightBlock::take_min_write_offset()` — EVERY sync call must pass a
+    /// freshly taken value (take and sync are 1:1), or the append guard's
+    /// authority is lost. On a key hit nothing was mutated since the last
+    /// consumption, so the (already reset) watermark is untouched here.
     pub(crate) fn sync(
         &mut self,
         output: &str,
@@ -103,6 +150,7 @@ impl LiveLayoutCache {
         version: u64,
         cols: usize,
         screen_origin: bool,
+        min_write_offset: usize,
     ) {
         if self.pane_session_id == pane_session_id
             && self.version == version
@@ -111,50 +159,54 @@ impl LiveLayoutCache {
         {
             return;
         }
-        #[cfg(test)]
-        {
-            self.rebuilds += 1;
+
+        // Incremental guard chain (PLAN_M6 §A-2): every condition must prove
+        // `output[..synced_byte_end]` is byte-identical to what the window
+        // was built from, so the tail can be folded in without a rescan.
+        // Any failure falls back to the full rebuild (= the pre-M6-a path)
+        // and resets the consumption boundary.
+        let can_append = self.pane_session_id == pane_session_id
+            && self.cols == cols
+            && !screen_origin
+            && self.screen_origin == screen_origin
+            && output.len() >= self.synced_byte_end
+            // Authoritative guard: any capture op touching below the
+            // consumption boundary pulls the watermark under it (CSI A
+            // progress-bar repaints, backspace-into-history, early gotos).
+            && min_write_offset >= self.synced_byte_end
+            // Depth-on-defense canary: the boundary must still sit right
+            // after a '\n' (or at the document start).
+            && (self.synced_byte_end == 0
+                || output.as_bytes()[self.synced_byte_end - 1] == b'\n');
+
+        if can_append {
+            self.append_tail(output, cols);
+            #[cfg(test)]
+            {
+                self.appends += 1;
+            }
+        } else {
+            self.rebuild_full(output, cols, screen_origin);
+            #[cfg(test)]
+            {
+                self.rebuilds += 1;
+            }
         }
+
         self.pane_session_id = pane_session_id;
         self.version = version;
         self.cols = cols;
         self.screen_origin = screen_origin;
-        self.line_ranges.clear();
-        self.cumulative.clear();
-        for line in output.lines() {
-            let start = line.as_ptr() as usize - output.as_ptr() as usize;
-            self.line_ranges.push((start, start + line.len()));
-        }
-        let skip = self.line_ranges.len().saturating_sub(MAX_LAYOUT_LINES_LIVE);
-        self.base_idx = skip;
-        self.total_lines = self.line_ranges.len() - skip;
-        self.cumulative.reserve(self.total_lines + 1);
-        self.cumulative.push(0);
-        let mut acc = 0u32;
-        for &(start, end) in &self.line_ranges[skip..] {
-            // v1.10.26 Batch B review blocker (BL-1): the live layout splits by
-            // screen_origin. Screen-owned TUI frames are hard terminal rows —
-            // one clipped row per line no matter the width. Ordinary shell
-            // output soft-wraps: each line counts as many rows as its wrapped
-            // chunks. Must stay in lockstep with layout_pass's per-line chunk
-            // function (driven by the same `live.screen_origin`), or the
-            // visible-window prefix sums drift from the laid-out rows.
-            let rows = if self.screen_origin {
-                screen_origin_line_chunks(&output[start..end], cols).count() as u32
-            } else {
-                block_line_chunks(&output[start..end], cols).count() as u32
-            };
-            acc += rows;
-            self.cumulative.push(acc);
-        }
     }
 
-    /// Total display rows of the tail window (= `cumulative.last()`).
-    /// Identical to the pre-cache formula
-    /// `lines()[skip..].map(|l| <chunk_count>).sum()` — `screen_origin` lines
-    /// are one row each (clip); ordinary lines count their soft-wrap chunks.
+    /// Total display rows of the tail window. Identical to the pre-cache
+    /// formula `lines()[skip..].map(|l| <chunk_count>).sum()` — screen-origin
+    /// lines are one row each (clip); ordinary lines count their soft-wrap
+    /// chunks.
     pub(crate) fn total_display_rows(&self) -> usize {
-        self.cumulative.last().copied().unwrap_or(0) as usize
+        let base = self.abs_cums.first().copied().unwrap_or(0);
+        let end = self.abs_cums.last().copied().unwrap_or(0);
+        end.saturating_sub(base) as usize
     }
 
     pub(crate) fn cumulative(&self) -> &[u32] {
@@ -162,34 +214,47 @@ impl LiveLayoutCache {
     }
 
     pub(crate) fn total_lines(&self) -> usize {
-        self.total_lines
+        self.window.len()
     }
 
     pub(crate) fn base_idx(&self) -> usize {
-        self.base_idx
+        self.abs_first_line
     }
 
     /// Byte range of window line `i` (oldest-first) into the live output.
     pub(crate) fn line_range(&self, i: usize) -> (usize, usize) {
-        self.line_ranges[self.base_idx + i]
+        self.window[i].byte_range
     }
 
-    /// Rebuild count since creation — a cache HIT is a `sync` that returns
-    /// without incrementing this. Test-only (asserts hit/miss keys).
+    /// Full-rebuild count since creation — a cache HIT and an incremental
+    /// append are both `sync` calls that return without incrementing this.
+    /// Test-only (asserts hit/miss keys and guard fallbacks).
     #[cfg(test)]
     pub(crate) fn rebuilds(&self) -> usize {
         self.rebuilds
     }
 
+    /// Incremental-append count since creation. Test-only (asserts the fast
+    /// path is actually taken by the guard chain).
+    #[cfg(test)]
+    pub(crate) fn appends(&self) -> usize {
+        self.appends
+    }
+
     /// Visible logical-line window `[start, end)` (oldest-first index space)
-    /// via binary search on `cumulative`, +overscan per side — the live
-    /// analogue of the finished-blocks prefix-sum culling.
+    /// via binary search on the epoch-absolute row table, +overscan per side
+    /// — the live analogue of the finished-blocks prefix-sum culling.
     ///
     /// Geometry (distance-from-content-bottom space, matching the layout
     /// pass): the live block sits at the bottom; line `i` (oldest-first)
     /// spans `[total - cumulative[i+1], total - cumulative[i]) * pitch`,
     /// so the newest line is lowest and `threshold_low`/`threshold_high`
     /// are the viewport's bottom/top edges.
+    ///
+    /// Searches the ABSOLUTE table with thresholds translated by the window
+    /// total (`cum_rel[j] <= total_rel - t  ⇔  abs[j] <= abs[n] - t`, since
+    /// both sides shift by the window base) — no relative re-materialization
+    /// on this per-frame path.
     pub(crate) fn visible_window(
         &self,
         pitch: f32,
@@ -198,20 +263,20 @@ impl LiveLayoutCache {
         overscan_px: f32,
     ) -> (usize, usize) {
         let overscan_lines = (overscan_px / pitch).ceil() as usize + 1;
-        let n = self.total_lines;
-        if n == 0 || self.cumulative.len() != n + 1 {
+        let n = self.total_lines();
+        if n == 0 || self.abs_cums.len() != n + 1 {
             return (0, 0);
         }
-        let total = self.cumulative[n] as f32;
+        let total = self.abs_cums[n] as f32;
         // Mirror the viewport band into cumulative-row space (cumulative is
         // an oldest-first prefix, so the band's top edge maps to a lower
         // bound and its bottom edge to an upper bound).
         let top_rows = total - threshold_high / pitch; // line tops must be >= this
         let bottom_rows = total - threshold_low / pitch; // line bottoms must be <= this
-                                                         // bottommost visible line: largest i with cumulative[i+1] <= bottom_rows
-        let newest_visible = last_le(&self.cumulative, bottom_rows).saturating_sub(1);
-        // topmost visible line: smallest i with cumulative[i] >= top_rows
-        let oldest_visible = first_ge(&self.cumulative, top_rows);
+                                                         // bottommost visible line: largest i with abs_cums[i+1] <= bottom_rows
+        let newest_visible = last_le(&self.abs_cums, bottom_rows).saturating_sub(1);
+        // topmost visible line: smallest i with abs_cums[i] >= top_rows
+        let oldest_visible = first_ge(&self.abs_cums, top_rows);
         (
             oldest_visible.saturating_sub(overscan_lines),
             (newest_visible + 1 + overscan_lines).min(n),
@@ -232,6 +297,188 @@ impl LiveLayoutCache {
         let dist_at_end = self.total_display_rows() as f32 * pitch
             - self.cumulative().get(end).copied().unwrap_or(0) as f32 * pitch;
         (start, end, dist_at_end)
+    }
+
+    // ── M6-a incremental append (PLAN_M6 §A-2, guard chain passed) ──────
+
+    /// Fold the bytes after `synced_byte_end` into the window. The tail's
+    /// complete lines are appended (the first replaces the previous sync's
+    /// still-growing partial line when one exists); a document not ending
+    /// with '\n' leaves its last line growing — the boundary stays at its
+    /// start so the next sync re-reads it. Cost: O(new bytes + one partial).
+    fn append_tail(&mut self, output: &str, cols: usize) {
+        let tail_start = self.synced_byte_end;
+        debug_assert!(output.is_char_boundary(tail_start));
+        let tail = &output[tail_start..];
+        let ends_with_newline = output.ends_with('\n');
+        let base = tail.as_ptr() as usize;
+        let tail_ranges: Vec<(usize, usize)> = tail
+            .lines()
+            .map(|line| {
+                let start = tail_start + (line.as_ptr() as usize - base);
+                (start, start + line.len())
+            })
+            .collect();
+        // The window's last entry is the growing partial line iff it starts
+        // exactly at the consumption boundary (complete lines always end
+        // before it — the boundary sits right after their '\n').
+        let replaces_partial =
+            matches!(self.window.back(), Some(w) if w.byte_range.0 == tail_start);
+
+        if tail_ranges.is_empty() {
+            // No new bytes since the last sync. If the previous partial line
+            // was erased in the meantime (EL on the tail), drop it — the
+            // document now ends at the boundary. Otherwise nothing changed.
+            if replaces_partial {
+                self.window.pop_back();
+                let end = self.window_end_cum(cols, output);
+                self.refresh_window_tables(end);
+            }
+            return;
+        }
+
+        let mut end_cum = self.abs_cums.last().copied().unwrap_or(0);
+        for (i, &(start, end)) in tail_ranges.iter().enumerate() {
+            let rows = count_line_chunks(&output[start..end], cols);
+            if i == 0 && replaces_partial {
+                // The partial line grew (or was rewritten in place): replace
+                // it, keeping its epoch-absolute row prefix.
+                let back = self.window.back_mut().expect("replaces_partial");
+                back.byte_range = (start, end);
+                end_cum = back.abs_cum.saturating_add(rows);
+            } else {
+                self.window.push_back(WindowLine {
+                    byte_range: (start, end),
+                    abs_cum: end_cum,
+                });
+                end_cum = end_cum.saturating_add(rows);
+            }
+        }
+        // Continuous cap: the window is always the newest min(doc, MAX)
+        // lines — pop per overflow, no renumbering (absolute prefix space).
+        while self.window.len() > MAX_LAYOUT_LINES_LIVE {
+            self.window.pop_front();
+            self.abs_first_line += 1;
+        }
+        self.synced_byte_end = if ends_with_newline {
+            output.len()
+        } else {
+            // The last tail line is still growing — do not consume past it.
+            tail_ranges[tail_ranges.len() - 1].0
+        };
+        self.refresh_window_tables(end_cum);
+    }
+
+    /// Full rebuild — the pre-M6-a path, now bounded-memory: a single
+    /// O(document) `lines()` scan keeps only the newest MAX line ranges,
+    /// then chunk-counts just the window. Re-seeds the epoch origin and the
+    /// consumption boundary (past the last COMPLETE line).
+    fn rebuild_full(&mut self, output: &str, cols: usize, screen_origin: bool) {
+        self.window.clear();
+        self.abs_first_line = 0;
+        let base = output.as_ptr() as usize;
+        let mut ranges: VecDeque<(usize, usize)> = VecDeque::new();
+        let mut total_lines = 0usize;
+        for line in output.lines() {
+            let start = line.as_ptr() as usize - base;
+            ranges.push_back((start, start + line.len()));
+            if ranges.len() > MAX_LAYOUT_LINES_LIVE {
+                ranges.pop_front();
+            }
+            total_lines += 1;
+        }
+        self.abs_first_line = total_lines - ranges.len();
+        // The window restarts the epoch-absolute row prefix at zero: only
+        // differences within an epoch are ever consumed, so the origin is
+        // arbitrary.
+        let mut acc = 0u32;
+        for &(start, end) in &ranges {
+            // v1.10.26 Batch B review blocker (BL-1): the live layout splits
+            // by screen_origin. Screen-owned TUI frames are hard terminal
+            // rows — one clipped row per line no matter the width. Ordinary
+            // shell output soft-wraps. Must stay in lockstep with
+            // layout_pass's per-line chunk function (driven by the same
+            // `screen_origin`), or the visible-window prefix sums drift
+            // from the laid-out rows.
+            let rows = if screen_origin {
+                screen_origin_line_chunks(&output[start..end], cols).count() as u32
+            } else {
+                count_line_chunks(&output[start..end], cols)
+            };
+            self.window.push_back(WindowLine {
+                byte_range: (start, end),
+                abs_cum: acc,
+            });
+            acc = acc.saturating_add(rows);
+        }
+        self.synced_byte_end = if output.ends_with('\n') || ranges.is_empty() {
+            output.len()
+        } else {
+            // Leave the growing final line unconsumed — its start becomes
+            // the append path's partial-line anchor.
+            ranges.back().expect("non-empty ranges").0
+        };
+        self.refresh_window_tables(acc);
+    }
+
+    /// Rebuild the materialized tables from the window: `abs_cums` gets the
+    /// per-line epoch-absolute prefixes plus the end value (len = window+1),
+    /// `cumulative` the window-relative view `cumulative()` contracts to —
+    /// `cumulative[i+1]` is the INCLUSIVE prefix of window lines `[0..=i]`,
+    /// i.e. `abs_cums[i+1] - base` (the per-line `abs_cum` is exclusive).
+    /// O(MAX) per mutating sync (≈8KB — bounded, not O(document)).
+    fn refresh_window_tables(&mut self, end_cum: u32) {
+        let base = self.window.front().map_or(0, |w| w.abs_cum);
+        self.abs_cums.clear();
+        self.cumulative.clear();
+        self.abs_cums.reserve(self.window.len() + 1);
+        self.cumulative.reserve(self.window.len() + 1);
+        for w in &self.window {
+            self.abs_cums.push(w.abs_cum);
+        }
+        self.abs_cums.push(end_cum);
+        self.cumulative.push(0);
+        for i in 1..=self.window.len() {
+            let inclusive = self.abs_cums[i];
+            self.cumulative.push(inclusive.saturating_sub(base));
+        }
+    }
+
+    /// Row prefix after the window's last line — recomputed from the output
+    /// (only used on the rare erased-partial path where the stored end value
+    /// is stale). Append path only, so plain soft-wrap chunking applies.
+    fn window_end_cum(&self, cols: usize, output: &str) -> u32 {
+        match self.window.back() {
+            None => 0,
+            Some(w) => {
+                let (start, end) = w.byte_range;
+                w.abs_cum
+                    .saturating_add(count_line_chunks(&output[start..end], cols))
+            }
+        }
+    }
+}
+
+/// Chunk (visual-row) count of one ordinary live-layout line.
+///
+/// M6-a fast path: a line whose WHOLE display width fits `cols` is always
+/// exactly one chunk, so the full grapheme + wrap machine only runs for
+/// overflowing lines (the append path's per-line cost collapses from
+/// grapheme segmentation + String materialization to one width scan).
+/// Equivalence argument over `wrap_line_ranges` (all branches):
+/// - `cols == 0` → `once(0..line_len)` — one chunk for any line;
+/// - prose (`Structure(None)`): a break requires `col + width > cols` for
+///   some cluster; with whole-line width ≤ cols (widths are additive, see
+///   the gauge branch's verified comment) no cluster overflows → the single
+///   final `start..line_byte_len` range;
+/// - every structure kind (PureBox / ProgressGauge under tolerance /
+///   TableRow) emits `once(0..grapheme_prefix_end(entries, cols))`, which
+///   consumes the whole line when it fits.
+fn count_line_chunks(line: &str, cols: usize) -> u32 {
+    if cols == 0 || terminal_text_width(line) <= cols {
+        1
+    } else {
+        block_line_chunks(line, cols).count() as u32
     }
 }
 
@@ -266,374 +513,4 @@ fn first_ge(cumulative: &[u32], rows: f32) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Fixed pane_session_id for the shared-key tests; the session-scoping
-    /// tests below pass ids explicitly. Defaults to the screen-origin (TUI)
-    /// slice so the layout-math tests keep one-clipped-row-per-line geometry;
-    /// the ordinary soft-wrap split is exercised by the dedicated tests under
-    /// `sync(..., screen_origin: false)`.
-    fn sync(cache: &mut LiveLayoutCache, output: &str, version: u64, cols: usize) {
-        cache.sync(output, 0, version, cols, true);
-    }
-
-    /// Rows-per-line by the live layout split (v1.10.26 Batch B review
-    /// blocker BL-1): screen-origin lines clip to exactly one row regardless
-    /// of width; ordinary shell-output lines count their soft-wrap chunks.
-    fn wrap_counts(output: &str, cols: usize, screen_origin: bool) -> Vec<usize> {
-        output
-            .lines()
-            .map(|line| {
-                if screen_origin {
-                    screen_origin_line_chunks(line, cols).count()
-                } else {
-                    block_line_chunks(line, cols).count()
-                }
-            })
-            .collect()
-    }
-
-    #[test]
-    fn cumulative_screen_origin_counts_one_per_line() {
-        let output = "0123456789abcdefghij\none\ntwo lines\n";
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, output, 7, 8);
-        // B-1: a 20-char line at cols 8 (screen-origin) is CLIPPED to one
-        // display row (no soft-wrap) — screen-origin counts are 1 per line.
-        let counts = wrap_counts(output, 8, true);
-        assert_eq!(counts, vec![1, 1, 1]);
-        let mut acc = 0;
-        for (i, c) in counts.iter().enumerate() {
-            acc += c;
-            assert_eq!(cache.cumulative()[i + 1] as usize, acc, "prefix at {i}");
-        }
-        assert_eq!(cache.total_display_rows(), 3);
-        assert_eq!(cache.total_lines(), 3);
-        assert_eq!(cache.base_idx(), 0);
-        // line_ranges must slice back the exact lines() texts (incl. \r strip).
-        assert_eq!(
-            &output[cache.line_range(0).0..cache.line_range(0).1],
-            "0123456789abcdefghij"
-        );
-        assert_eq!(
-            &output[cache.line_range(2).0..cache.line_range(2).1],
-            "two lines"
-        );
-    }
-
-    #[test]
-    fn cr_stripped_ranges_match_lines() {
-        let output = "a\r\nb\r\nc";
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, output, 1, 80);
-        let lines: Vec<&str> = output.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            let (s, e) = cache.line_range(i);
-            assert_eq!(&output[s..e], *line, "range {i}");
-        }
-    }
-
-    #[test]
-    fn cache_hit_skips_rebuild_version_and_cols_keys() {
-        // B-1: the live layout is screen-origin (clip-not-wrap), so wrapping
-        // is cols-INDEPENDENT — the cache still re-keys on cols/version, but
-        // a rebuild produces identical cumulative.
-        let output = format!("{}\nbbb\n", "x".repeat(60));
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, &output, 3, 80);
-        assert_eq!(cache.rebuilds(), 1);
-        let cumulative = cache.cumulative().to_vec();
-
-        // Same version + cols → HIT: no rebuild, cumulative identical.
-        sync(&mut cache, &output, 3, 80);
-        assert_eq!(cache.rebuilds(), 1, "same version+cols must be a hit");
-        assert_eq!(cache.cumulative(), cumulative.as_slice());
-
-        // cols change → MISS (re-key) but cumulative IDENTICAL: the
-        // screen-origin clip layout yields one row per line regardless of
-        // width.
-        sync(&mut cache, &output, 3, 40);
-        assert_eq!(cache.rebuilds(), 2, "cols change must be a miss");
-        assert_eq!(
-            cache.cumulative().last().copied().unwrap_or(0),
-            2,
-            "60-char line clips to 1 row + 'bbb' = 2 rows total"
-        );
-
-        // version change → MISS even with same cols (and identical bytes:
-        // the reset must re-key, not reuse).
-        sync(&mut cache, &output, 4, 40);
-        let cumulative2 = cache.cumulative().to_vec();
-        assert_eq!(cache.rebuilds(), 3, "version change must be a miss");
-        sync(&mut cache, &output, 5, 40);
-        assert_eq!(cache.rebuilds(), 4, "version change must be a miss");
-        // Same bytes + same cols → identical layout after rebuild (no drift).
-        assert_eq!(cache.cumulative(), cumulative2.as_slice());
-    }
-
-    /// B1 (review blocker): the cache is shared across panes but version
-    /// counters are per-Tab (start at 0) — two panes coincidentally at the
-    /// same version+cols must NOT hit each other's entries (slicing one
-    /// pane's bytes with the other's ranges).
-    #[test]
-    fn different_pane_session_same_version_cols_misses() {
-        let output = "aaa\nbbb\n";
-        let mut cache = LiveLayoutCache::default();
-        cache.sync(output, 10, 7, 8, true); // pane A, version 7, screen-origin
-        assert_eq!(cache.rebuilds(), 1);
-        let pane_a_cumulative = cache.cumulative().to_vec();
-        // Pane B: same version+cols, different session → MISS.
-        cache.sync(output, 11, 7, 8, true);
-        assert_eq!(
-            cache.rebuilds(),
-            2,
-            "same version+cols across sessions must miss"
-        );
-        // Alternating back to pane A rebuilds again — no cross-session reuse.
-        cache.sync(output, 10, 7, 8, true);
-        assert_eq!(cache.rebuilds(), 3, "session switch must not reuse");
-        assert_eq!(cache.cumulative(), pane_a_cumulative.as_slice());
-        cache.sync(output, 11, 7, 8, true);
-        assert_eq!(cache.rebuilds(), 4);
-    }
-
-    #[test]
-    fn same_pane_session_same_version_cols_hits() {
-        let output = "aaa\nbbb\n";
-        let mut cache = LiveLayoutCache::default();
-        cache.sync(output, 10, 7, 8, true);
-        assert_eq!(cache.rebuilds(), 1);
-        cache.sync(output, 10, 7, 8, true);
-        assert_eq!(cache.rebuilds(), 1, "same session+version+cols is a hit");
-    }
-
-    // ── BL-1 (Batch B review blocker): split the live layout by screen_origin
-    // ────────────────────────────────────────────────────────────────────────
-
-    /// A plain shell command (no `screen_document_start`) emits long streaming
-    /// lines. While the command is in flight they must SOFT-WRAP like finished
-    /// shell-output blocks — the initial Batch B "live is always screen-origin"
-    /// clip was a functional regression (a `make` diagnostic line was chopped
-    /// at the window edge mid-stream).
-    #[test]
-    fn ordinary_live_long_line_soft_wraps_with_complete_content() {
-        let output = format!("{}\nshort line\n", "x".repeat(40));
-        let mut cache = LiveLayoutCache::default();
-        // screen_origin = false: ordinary streaming output.
-        cache.sync(&output, 0, 3, 8, false);
-        // 40-char line at cols 8 → 5 wrapped rows; "short line" (10 cols) → 2.
-        let counts = wrap_counts(&output, 8, false);
-        assert_eq!(counts, vec![5, 2], "ordinary long line soft-wraps");
-        assert_eq!(cache.total_display_rows(), 7);
-        // Content is preserved across the wrapped rows (nothing clipped).
-        let mut reconstructed = String::new();
-        for i in 0..cache.total_lines() {
-            let (s, e) = cache.line_range(i);
-            reconstructed.push_str(&output[s..e]);
-            reconstructed.push('\n');
-        }
-        assert_eq!(reconstructed, output, "soft-wrap must not lose text");
-    }
-
-    /// The screen-owned TUI case: a long frame row is a hard terminal row that
-    /// CLIPS to one display row — the `|]` border must never fold.
-    #[test]
-    fn screen_owned_live_long_line_clips_to_one_row() {
-        let line = format!("[|{}|]", "x".repeat(40));
-        let output = format!("{line}\n");
-        let mut cache = LiveLayoutCache::default();
-        cache.sync(&output, 0, 3, 8, true);
-        assert_eq!(
-            cache.total_display_rows(),
-            1,
-            "screen-origin long line is clipped, not wrapped ({line})"
-        );
-        assert_eq!(cache.total_lines(), 1);
-        let counts = wrap_counts(&output, 8, true);
-        assert_eq!(counts, vec![1]);
-    }
-
-    /// The two live modes flip mid-command (`begin_screen_owned_output` after
-    /// plain streaming): the version bump must invalidate the cache and the
-    /// rebuilt layout must switch to clip — same bytes, different row counts.
-    #[test]
-    fn screen_origin_switch_invalidates_cache_and_clips() {
-        let output = format!("{}\n", "y".repeat(40));
-        let mut cache = LiveLayoutCache::default();
-        // Ordinary phase: long line soft-wraps → 40-col line at cols 10 = 4 rows.
-        cache.sync(&output, 0, 7, 10, false);
-        assert_eq!(cache.rebuilds(), 1);
-        assert_eq!(cache.total_display_rows(), 4, "ordinary: wrapped rows");
-        // Same bytes+cols, but the tracker bump from screen handoff changed
-        // state → the flag join forces a MISS, and the rebuilt layout clips.
-        cache.sync(&output, 0, 8, 10, true);
-        assert_eq!(cache.rebuilds(), 2, "screen_origin flip must invalidate");
-        assert_eq!(
-            cache.total_display_rows(),
-            1,
-            "same bytes now clip to one row — the switch took effect"
-        );
-        // Flipping back (new command, plain output) rebuilds again.
-        cache.sync(&output, 0, 9, 10, false);
-        assert_eq!(cache.rebuilds(), 3);
-        assert_eq!(cache.total_display_rows(), 4);
-    }
-
-    #[test]
-    fn tail_window_caps_at_max_layout_lines() {
-        let output = (0..3000).map(|i| format!("line {i}\n")).collect::<String>();
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, &output, 1, 80);
-        assert_eq!(cache.total_lines(), MAX_LAYOUT_LINES_LIVE);
-        assert_eq!(cache.base_idx(), 1000);
-        // The window starts at raw line 1000 ("line 999\n" is the last
-        // excluded line); ranges slice the exact line bytes (no newline).
-        let (s, e) = cache.line_range(0);
-        assert_eq!(&output[s..e], "line 1000");
-        let (_, e) = cache.line_range(MAX_LAYOUT_LINES_LIVE - 1);
-        assert_eq!(&output[e - "line 2999".len()..e], "line 2999");
-    }
-
-    // ── visible_window: cumulative 二分窗口边界 ─────────────────────────
-
-    /// Viewport sits at the bottom (following live): the window hugs the
-    /// NEWEST lines — line 19 (newest) stays inside, the older lines are
-    /// culled. 20 lines × 1 display row @ pitch 20 → total 400px; viewport
-    /// 6 rows (120px), overscan 3 lines.
-    #[test]
-    fn visible_window_following_bottom_hugs_newest() {
-        let output = (0..20).map(|i| format!("l{i}\n")).collect::<String>();
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, &output, 1, 80);
-        let pitch = 20.0;
-        // scroll_px = 0 → bottom edge at -overscan(64px), top edge at
-        // 160px; overscan 64px → 5 lines.
-        let (start, end) = cache.visible_window(pitch, -40.0, 160.0, 64.0);
-        assert_eq!((start, end), (7, 20));
-        assert!(start <= 19 && end > 19, "newest line must stay in window");
-        // Only 13 of 20 lines materialized.
-        assert!(end - start < 20);
-        // The visible band (120px = 6 rows) is fully covered: lines 12..19
-        // are inside [start, end).
-        assert!(start <= 12 && end > 19);
-    }
-
-    #[test]
-    fn visible_window_tail_less_than_one_screen() {
-        // 3 lines, viewport 6 rows → whole document visible, full window.
-        let output = "a\nb\nc\n";
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, output, 1, 80);
-        let (start, end) = cache.visible_window(20.0, -40.0, 160.0, 64.0);
-        assert_eq!((start, end), (0, 3));
-    }
-
-    #[test]
-    fn visible_window_scrolled_to_oldest_edge() {
-        // 100 lines → total 2000px. Scroll far past the block: the window
-        // falls back to the top (oldest) lines nearest the band.
-        let output = (0..100).map(|i| format!("l{i}\n")).collect::<String>();
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, &output, 1, 80);
-        let (start, end) = cache.visible_window(20.0, 10_000.0, 10_400.0, 64.0);
-        assert_eq!((start, end), (0, 6));
-
-        // Band [1900, 1950]px cuts lines 2..4 (tops 1960/1940/1920,
-        // bottoms 1940/1920/1900); window = [l-5, f+1+5).
-        let (start2, end2) = cache.visible_window(20.0, 1900.0, 1950.0, 64.0);
-        assert_eq!((start2, end2), (0, 10));
-        assert!(start2 <= 2 && end2 > 4, "band lines 2..4 must be inside");
-        // Window covers the band in cumulative-row space: start row <= top
-        // bound (2.5), end row >= bottom bound (5).
-        let cum = cache.cumulative();
-        assert!(cum[start2] as f32 <= 2.5);
-        assert!(cum[end2] as f32 >= 5.0);
-    }
-
-    #[test]
-    fn visible_window_empty_output() {
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, "", 1, 80);
-        assert_eq!(cache.visible_window(20.0, 0.0, 100.0, 64.0), (0, 0));
-        assert_eq!(cache.total_display_rows(), 0);
-    }
-
-    /// The `BlockTracker` live-output version — the cache key — bumps on
-    /// every mutation (print/newline/ascii/snapshot-replace/clear) and stays
-    /// put while the output is unchanged (scroll ticks don't invalidate).
-    #[test]
-    fn tracker_live_output_version_tracks_mutations() {
-        use weft_core::blocks::{BlockTracker, CapturedStyle, StyledOutput};
-        let mut t = BlockTracker::new();
-        t.on_prompt_start();
-        let v_before = t.in_flight().map(|l| l.version);
-        // Not capturing: prints must NOT bump (output unchanged).
-        t.on_print('x', CapturedStyle::default());
-        assert_eq!(t.in_flight().map(|l| l.version), v_before);
-
-        t.on_command_start("echo".to_string());
-        let v0 = t.in_flight().expect("command executing").version;
-        t.on_print('a', CapturedStyle::default());
-        assert_eq!(t.in_flight().unwrap().version, v0 + 1, "print bumps");
-        t.on_newline();
-        t.on_print_ascii_run(b"bcd", CapturedStyle::default());
-        assert_eq!(t.in_flight().unwrap().version, v0 + 3, "newline+ascii bump");
-
-        // Screen-owned path: handoff clears output, snapshot replace bumps.
-        t.on_command_end(0);
-        t.on_prompt_start();
-        t.on_command_start("tui".to_string());
-        let v_owned = t.in_flight().unwrap().version;
-        t.begin_screen_owned_output(0);
-        assert_eq!(
-            t.in_flight().unwrap().version,
-            v_owned + 1,
-            "screen handoff clears output"
-        );
-        let styled = StyledOutput { lines: Vec::new() };
-        t.replace_screen_snapshot("frame one\n", styled.clone());
-        let v1 = t.in_flight().unwrap().version;
-        t.replace_screen_snapshot("frame two\n", styled);
-        assert_eq!(
-            t.in_flight().unwrap().version,
-            v1 + 1,
-            "snapshot replace bumps"
-        );
-    }
-
-    /// The window never skips a line the old full materialization showed:
-    /// every line whose band intersects the viewport must be inside the
-    /// emitted window, and the emitted count stays bounded.
-    #[test]
-    fn visible_window_covers_band_exactly() {
-        let output = (0..50).map(|i| format!("l{i}\n")).collect::<String>();
-        let mut cache = LiveLayoutCache::default();
-        sync(&mut cache, &output, 1, 80);
-        let pitch = 20.0;
-        let total = 50.0_f32 * pitch; // 1000px
-        for band_top in [0.0_f32, 200.0, 500.0, 900.0, 980.0] {
-            let band_bottom = band_top + 200.0;
-            let (start, end) = cache.visible_window(pitch, band_top, band_bottom, 40.0);
-            assert!(start < end, "band {band_top}");
-            // Every visible line (top >= band_top, bottom <= band_bottom)
-            // is inside the window.
-            for i in 0..50usize {
-                let top = total - cache.cumulative()[i] as f32 * pitch;
-                let bottom = total - cache.cumulative()[i + 1] as f32 * pitch;
-                if top >= band_top && bottom <= band_bottom {
-                    assert!(
-                        start <= i && i < end,
-                        "band {band_top}: visible line {i} culled"
-                    );
-                }
-            }
-            // Materialization bounded: band rows + 2×overscan + slack.
-            let band_rows = (band_bottom - band_top) / pitch;
-            assert!(
-                end - start <= band_rows as usize + 2 * 2 + 4,
-                "band {band_top}"
-            );
-        }
-    }
-}
+mod tests;

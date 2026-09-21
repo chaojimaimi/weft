@@ -57,6 +57,7 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
         styled_output: None,
         version: 1,
         screen_origin: true,
+        min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
     let viewport_rows = 10;
@@ -130,6 +131,7 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
     let viewport_rows = grid_rows + 2;
@@ -184,6 +186,7 @@ fn b_path_anchor_never_falls_below_layout_window_base() {
         styled_output: None,
         version: 1,
         screen_origin: true,
+        min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
     let viewport_rows = 40;
@@ -243,6 +246,7 @@ fn b_path_wrapped_row_caret_chunk_selection_is_consistent() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
     let viewport_rows = 6;
@@ -377,6 +381,7 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        min_write_offset: weft_core::blocks::InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
     let viewport_rows = 26;

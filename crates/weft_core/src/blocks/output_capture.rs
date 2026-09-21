@@ -8,6 +8,8 @@
 //! default-styled ranges are implicit (no run). Over-limit runs set
 //! `style_overflow` and are dropped; text is never affected.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use super::style::{
     build_styled_output_from_runs, CapturedStyle, CapturedStyleRun, MAX_STYLE_RUNS_PER_BLOCK,
 };
@@ -17,8 +19,10 @@ mod crlf_tests;
 mod cursor;
 #[cfg(test)]
 mod prompt_sp_tests;
+#[cfg(test)]
+mod watermark_tests;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct OutputCapture {
     text: String,
     cursor: usize,
@@ -52,11 +56,90 @@ pub(crate) struct OutputCapture {
     /// Invariant tests pin counter == recompute
     /// (`vt/screen_exit/tests.rs`).
     line_count: usize,
+    /// M6-a (PLAN_M6 §A-1): rewrite watermark — the EARLIEST byte offset any
+    /// content/cursor operation touched since the last sync consumption.
+    /// `usize::MAX` means "pure append since the last take". Every mutation
+    /// op records its earliest-reachable offset; the live layout cache's
+    /// incremental append path consumes this via `take_min_write_offset` as
+    /// its authoritative guard: a value below the synced boundary means the
+    /// document was rewritten in place and the fast path must fall back to a
+    /// full rebuild. Atomic only so the always-fresh handle can be shared
+    /// through `InFlightBlock` (see `InFlightBlock::detached_watermark`).
+    min_write_offset: AtomicUsize,
+}
+
+impl Clone for OutputCapture {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            cursor: self.cursor,
+            char_cursor: self.char_cursor,
+            line_start_char: self.line_start_char,
+            truncated: self.truncated,
+            style_runs: self.style_runs.clone(),
+            style_overflow: self.style_overflow,
+            screen_prefix: self.screen_prefix.clone(),
+            screen_prefix_styled: self.screen_prefix_styled.clone(),
+            line_count: self.line_count,
+            // The clone inherits the current watermark value (clones of a
+            // capture are snapshots; the atomic itself must stay unique to
+            // the live handle chain).
+            min_write_offset: AtomicUsize::new(self.min_write_offset.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Default for OutputCapture {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+            char_cursor: 0,
+            line_start_char: 0,
+            truncated: false,
+            style_runs: Vec::new(),
+            style_overflow: false,
+            screen_prefix: String::new(),
+            screen_prefix_styled: None,
+            line_count: 0,
+            min_write_offset: AtomicUsize::new(usize::MAX),
+        }
+    }
 }
 
 impl OutputCapture {
     pub(crate) fn as_str(&self) -> &str {
         &self.text
+    }
+
+    // ── M6-a rewrite watermark (PLAN_M6 §A-1) ────────────────────────────
+
+    /// Record the earliest byte offset an operation touched. `fetch_min`
+    /// keeps the low-water mark; `usize::MAX` means "pure append so far".
+    fn note_min_write_offset(&self, offset: usize) {
+        self.min_write_offset.fetch_min(offset, Ordering::Relaxed);
+    }
+
+    /// Read and reset the watermark (take semantics — the live layout
+    /// cache's sync consumes it exactly once, after which the capture is
+    /// "pure append" again until the next in-place op). Production
+    /// consumers go through `InFlightBlock::take_min_write_offset` (which
+    /// swaps the shared handle); this direct twin serves the unit tests.
+    #[cfg(test)]
+    pub(crate) fn take_min_write_offset(&self) -> usize {
+        self.min_write_offset.swap(usize::MAX, Ordering::Relaxed)
+    }
+
+    /// Shared handle for `InFlightBlock` — lets the renderer's two sync call
+    /// sites take the watermark through an immutable borrow of the tracker.
+    pub(crate) fn min_write_offset_handle(&self) -> &AtomicUsize {
+        &self.min_write_offset
+    }
+
+    /// Current watermark value without consuming (test observability).
+    #[cfg(test)]
+    pub(crate) fn min_write_offset_value(&self) -> usize {
+        self.min_write_offset.load(Ordering::Relaxed)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -72,9 +155,22 @@ impl OutputCapture {
         // v1.11.12 (PLAN_v11112 M-A): the second reset mechanism (alongside
         // `ScreenHistory::default`) — the ledger must be zeroed with the text.
         self.line_count = 0;
+        // M6-a: the cleared document shares no bytes with the prefix the live
+        // cache already consumed. Recording offset 0 makes the next sync's
+        // watermark guard fail whenever a consumption boundary exists
+        // (synced_byte_end > 0), forcing the full rebuild the new document
+        // needs. When synced_byte_end == 0 the cache's window is empty or a
+        // single partial line at offset 0, which the append path's
+        // partial-line replacement reconciles without a rebuild.
+        self.min_write_offset.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn replace(&mut self, text: &str, max_bytes: usize) {
+        // M6-a watermark: NOT recorded — `replace` is the screen-snapshot
+        // path only (`replace_screen_snapshot` gates on
+        // `screen_document_start.is_some()`), and a screen-origin live
+        // document never takes the append fast path (the sync guard requires
+        // `screen_origin == false`), so the existing guard compensates.
         // v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): the screen prefix is NOT
         // reset here — the composed text passed in already folds the prefix
         // in (the Terminal builds it from the tracker's prefix copy), and
@@ -122,6 +218,10 @@ impl OutputCapture {
         // Style RLE: overwrite the char at char_cursor with `style`. The
         // replaced char (if any) is a single Unicode scalar — its char index
         // is char_cursor, and the new char occupies the same index.
+        // M6-a watermark: record the pre-write cursor — an overwrite may
+        // touch any byte from the cursor onward, an append only appends at
+        // it; both are covered by the cursor itself.
+        self.note_min_write_offset(self.cursor);
         let replaced_char_count = if replaced_len > 0 { 1u32 } else { 0u32 };
         if replaced_char_count > 0 {
             self.splice_style(
@@ -148,6 +248,11 @@ impl OutputCapture {
             return;
         }
         if self.cursor == self.text.len() {
+            // M6-a watermark: NOT recorded — this fast path is append-only
+            // (cursor sits at the document end, bytes are pushed at the tail
+            // and no existing byte is touched), so it can never lower the
+            // watermark below an existing consumption boundary. The per-byte
+            // slow path below delegates to `print`, which records.
             let remaining = max_bytes.saturating_sub(self.text.len());
             let accepted = remaining.min(bytes.len());
             if accepted > 0 {
@@ -176,6 +281,10 @@ impl OutputCapture {
         if self.truncated {
             return;
         }
+        // M6-a watermark: pre-write cursor — the LF may overwrite from the
+        // cursor to the line end and the cursor is always within the tail
+        // line (>= the sync boundary), so this records conservatively.
+        self.note_min_write_offset(self.cursor);
         let line_start = self.line_start();
         self.cursor = self.line_end();
         // PTYs commonly translate LF to CRLF. The preceding CR leaves the
@@ -202,6 +311,11 @@ impl OutputCapture {
     }
 
     pub(crate) fn erase_line(&mut self, mode: u16) {
+        // M6-a watermark: pre-write cursor. Modes 0/1/2 all rewrite inside the
+        // current line, whose start is the consumption boundary (tail line)
+        // or below it (cursor parked on an early row after CSI A — the
+        // recorded cursor then forces the full-rebuild fallback).
+        self.note_min_write_offset(self.cursor);
         let start = self.line_start();
         let end = self.line_end();
         let line_start_char = self.line_start_char;
@@ -258,6 +372,12 @@ impl OutputCapture {
                 .nth(row - 1)
                 .map_or(self.text.len(), |(index, _)| index + 1)
         };
+        // M6-a watermark: the TARGET row's start — every byte this op touches
+        // (column-walk inserts, subsequent prints at the landed cursor) is at
+        // or after it, and the row-materialization loop above only appends at
+        // the document end. An early-row jump records below the consumption
+        // boundary, which invalidates the append fast path (the intent).
+        self.note_min_write_offset(line_start);
         let line_end = self.text[line_start..]
             .find('\n')
             .map_or(self.text.len(), |offset| line_start + offset);

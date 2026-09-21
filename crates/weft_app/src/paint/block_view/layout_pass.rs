@@ -187,6 +187,12 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             live.version,
             cols,
             live.screen_origin,
+            // M6-a: the capture's rewrite watermark — the append guard's
+            // authoritative signal. Take + sync are 1:1; a real value here
+            // and in block_scroll_metrics (either may be the frame's first
+            // consumer) is mandatory, a dummy MAX would short-circuit the
+            // guard at whichever call runs first.
+            live.take_min_write_offset(),
         );
         // threshold_low/high = viewport bottom/top edges (bottom-space).
         let (start_idx, end_idx, start_dist) = live_cache.visible_range(
@@ -626,6 +632,7 @@ mod tests {
                 styled_output: None,
                 version: 1,
                 screen_origin: false,
+                min_write_offset: InFlightBlock::detached_watermark(),
             }),
             pane_session_id: 1,
             cwd: None,

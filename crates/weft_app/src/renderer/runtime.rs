@@ -355,6 +355,11 @@ impl MetalRenderer {
                 live.version,
                 cols,
                 live.screen_origin,
+                // M6-a: this is usually the frame's FIRST sync consumer — the
+                // real watermark must flow through here (take + sync are 1:1;
+                // the layout pass, as second consumer, re-syncs the same
+                // version and early-exits on the key).
+                live.take_min_write_offset(),
             );
         }
         let (total, _) = crate::block_component::block_content_metrics_with_cache(

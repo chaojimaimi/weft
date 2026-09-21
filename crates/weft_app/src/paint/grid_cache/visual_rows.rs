@@ -296,19 +296,39 @@ pub(crate) struct ContentTable {
     pub(crate) trailing_trim_lines: u32,
 }
 
-/// Test-only counter of full L1 builds — the collapse-toggle test pins the
-/// WidthOnly path (ensure_cached must NOT re-enumerate the output).
+// Test-only counter of full L1 builds — the collapse-toggle test pins the
+// WidthOnly path (ensure_cached must NOT re-enumerate the output).
+//
+// THREAD-LOCAL, not process-global: the counter used to be a shared
+// `AtomicUsize`, so a build from ANY concurrently-running test that landed
+// inside the pin's read→toggle→read window false-failed it (observed
+// intermittently once the M6-a live-cache test suite enlarged the test
+// set's parallel scheduling; a single concurrent build spans the whole
+// window, so even retries cannot absorb it). Per-thread counting makes the
+// pin scheduling-independent: the toggle and its counter read/writes run
+// on one thread; builders on other threads are invisible.
 #[cfg(test)]
-pub(crate) static CONTENT_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static CONTENT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the CALLING thread's L1 build counter (see `CONTENT_BUILDS`).
+#[cfg(test)]
+pub(crate) fn note_content_build() {
+    CONTENT_BUILDS.with(|count| count.set(count.get() + 1));
+}
+
+/// Read the calling thread's L1 build counter (test assertions only).
+#[cfg(test)]
+pub(crate) fn content_builds() -> usize {
+    CONTENT_BUILDS.with(std::cell::Cell::get)
+}
 
 /// Build L1 from a block output. Grapheme enumeration and width judgement
 /// use the same call sites as the legacy wrap path.
 pub(crate) fn build_content_table(output: &str, screen_origin: bool) -> ContentTable {
     #[cfg(test)]
-    {
-        CONTENT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    note_content_build();
     let raw_lines: Vec<&str> = output.lines().collect();
     let trimmed_len = trimmed_output_line_count(&raw_lines);
     let mut graphemes: Vec<GEntry> = Vec::new();

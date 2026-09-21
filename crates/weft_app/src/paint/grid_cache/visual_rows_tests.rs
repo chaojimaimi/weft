@@ -556,12 +556,17 @@ fn collapse_toggle_reuses_l1_and_rebuilds_width_only() {
 
     // Collapse: WidthOnly — no L1 re-enumeration, L2 stays populated
     // (collapse gates READS, not the table), row count reads 0.
-    let builds_before = CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    //
+    // `content_builds()` counts THIS THREAD's builds only (see the
+    // `CONTENT_BUILDS` thread-local in visual_rows.rs): the counter used to
+    // be a process global, and any concurrently-running test's cold build
+    // landing inside the read→toggle→read window false-failed this pin.
     let mut folded = block.clone();
     folded.collapsed = true;
+    let builds_before = content_builds();
     cache.ensure_cached(&folded, 80);
     assert_eq!(
-        CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        content_builds(),
         builds_before,
         "collapse toggle must not rebuild L1"
     );
@@ -582,10 +587,10 @@ fn collapse_toggle_reuses_l1_and_rebuilds_width_only() {
     );
 
     // Expand: still WidthOnly, rows readable again.
-    let builds_before = CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed);
+    let builds_before = content_builds();
     cache.ensure_cached(&block, 80);
     assert_eq!(
-        CONTENT_BUILDS.load(std::sync::atomic::Ordering::Relaxed),
+        content_builds(),
         builds_before,
         "expand toggle must not rebuild L1"
     );

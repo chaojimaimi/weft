@@ -138,6 +138,34 @@ pub struct InFlightBlock<'a> {
     /// the initial Batch B "live is always screen-origin" clip was a functional
     /// regression for plain commands emitting long lines.
     pub screen_origin: bool,
+    /// M6-a (PLAN_M6 §A-1): shared handle to the capture's rewrite watermark.
+    /// Both `LiveLayoutCache::sync` call sites must `take_min_write_offset()`
+    /// here and pass the value as the sync's authoritative append guard —
+    /// the watermark proves "no byte below the synced boundary was rewritten
+    /// since the last consumption". Public like the other fields (detached
+    /// test/bench handles use [`InFlightBlock::detached_watermark`]).
+    pub min_write_offset: &'a std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> InFlightBlock<'a> {
+    /// Read and reset the rewrite watermark of the backing capture (take
+    /// semantics: the value is consumed and the capture is "pure append"
+    /// again). Must be called exactly once per `LiveLayoutCache::sync`, by
+    /// the caller passing the value in.
+    pub fn take_min_write_offset(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.min_write_offset.swap(usize::MAX, Ordering::Relaxed)
+    }
+
+    /// Always-fresh watermark for detached handles (tests/benches construct
+    /// an `InFlightBlock` without a backing capture). Swapping `usize::MAX`
+    /// for MAX is a no-op, so sharing one static across tests is safe.
+    pub fn detached_watermark() -> &'static std::sync::atomic::AtomicUsize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DETACHED: AtomicUsize = AtomicUsize::new(usize::MAX);
+        debug_assert_eq!(DETACHED.load(Ordering::Relaxed), usize::MAX);
+        &DETACHED
+    }
 }
 
 /// v1.10.34: combined block copy ("Copy Block" context action) — format a
@@ -436,6 +464,7 @@ impl BlockTracker {
                 .or(self.styled_output.as_ref()),
             version: self.live_output_version,
             screen_origin: self.screen_document_start.is_some(),
+            min_write_offset: self.output.min_write_offset_handle(),
         })
     }
 
