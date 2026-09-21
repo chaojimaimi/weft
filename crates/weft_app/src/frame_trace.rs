@@ -14,10 +14,13 @@
 //! GPU completion for frame N is recorded against frame N's `frame_id` and
 //! drained on a later frame, so the report is eventual but complete.
 //!
-//! All recording is gated by the existing `WEFT_GUI_PERF_PROBE=1` flag (see
-//! `performance_probe.rs`). Normal runs pay only a disabled-bool check per
-//! frame — the `Instant::now()` calls inside the probe path are nanosecond
-//! overhead, dwarfed by the Metal work they bracket.
+//! All recording is gated by the frame-trace output gate: the acceptance
+//! probe `WEFT_GUI_PERF_PROBE=1` (see `performance_probe.rs`) or, since M6-d
+//! (PLAN_M6 §三), the dedicated `WEFT_TRACE_CHANNELS=1` diagnostic channel
+//! that never exits (see `trace_enabled`). Normal runs pay only a
+//! disabled-bool check per frame — the `Instant::now()` calls inside the
+//! probe path are nanosecond overhead, dwarfed by the Metal work they
+//! bracket.
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
@@ -176,6 +179,55 @@ pub(crate) fn gpu_completion_rx() -> Receiver<FrameGpuComplete> {
 /// caller simply skips registering the handler in that case.
 pub(crate) fn gpu_completion_tx() -> Option<&'static Sender<FrameGpuComplete>> {
     GPU_CHANNEL.get()
+}
+
+/// M6-d (PLAN_M6 §三): frame-trace output-channel switches.
+///
+/// The `frame frame_id=…` DEBUG line was historically emitted only while the
+/// acceptance probe ran (`WEFT_GUI_PERF_PROBE=1`). That env also drives the
+/// probe's warmup + sample + auto-exit (`performance_probe.rs`), which made
+/// an instrumented interactive drag impossible (the app quits after ~8s).
+/// M4.1 added the dedicated `WEFT_TRACE_CHANNELS=1` switch that ONLY enables
+/// diagnostic log lines and never exits (weft_core
+/// `vt/screen_exit/snapshot.rs`); M6-d unifies this gate onto the same pair:
+/// the line emits when EITHER switch is on. The probe's own
+/// warmup/sample/exit logic is untouched — it still runs only under
+/// `WEFT_GUI_PERF_PROBE=1`. Only the literal `"1"` enables (M4.1 contract;
+/// `true`/`yes`/`0`/unset do not).
+const TRACE_CHANNELS_ENV: &str = "WEFT_TRACE_CHANNELS";
+
+/// M6-d: cached raw channel-switch value. `trace_enabled` currently runs
+/// once per process (main.rs startup); the OnceLock keeps it idempotent and
+/// future-proofs any per-frame call site (the weft_core snapshot gate caches
+/// for exactly that reason — it IS called per repaint). Process-lifetime
+/// caching is correct — the switch is launch-time. The raw value (not the
+/// decoded bool) is cached so the pure [`trace_enabled_impl`] stays on the
+/// production path.
+static TRACE_CHANNELS_CACHE: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+
+/// M6-d: output gate for the frame-trace line — the acceptance probe is
+/// active OR the dedicated diagnostic channel is enabled. A channels-only
+/// run never triggers the probe's warmup/sample/auto-exit: those live behind
+/// `PerformanceProbe::enabled`, which reads only `WEFT_GUI_PERF_PROBE`.
+pub(crate) fn trace_enabled(probe_enabled: bool) -> bool {
+    let trace_channels = TRACE_CHANNELS_CACHE.get_or_init(|| std::env::var_os(TRACE_CHANNELS_ENV));
+    trace_enabled_impl(trace_channels.as_deref(), probe_enabled)
+}
+
+/// M6-d: pure decision over both switches — mirrors the weft_core M4.1
+/// reader (`vt/screen_exit/snapshot.rs::perf_probe_enabled_impl`): the
+/// dedicated channel switch OR the acceptance probe enables the line.
+/// Unit-tested below as the gate truth table (the process-level [`OnceLock`]
+/// cache itself is not runtime-injectable).
+fn trace_enabled_impl(trace_channels: Option<&std::ffi::OsStr>, perf_probe: bool) -> bool {
+    env_flag_enabled(trace_channels) || perf_probe
+}
+
+/// M6-d: pure decision over one env value — mirrors the app-side
+/// `performance_probe::flag_enabled` exactly: only the literal `"1"`
+/// enables; `true`/`yes`/`0`/unset do not.
+fn env_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
 }
 
 /// Records one frame's three CPU segments and its counters, then awaits GPU
@@ -609,5 +661,44 @@ mod tests {
             bytes >= 100 * 1024,
             "resident_bytes returned {bytes}, expected at least ~100 KiB"
         );
+    }
+
+    // ── M6-d (PLAN_M6 §三): output-gate truth table ────────────────────────
+    // The gate decides whether the `frame frame_id=…` line is emitted at
+    // all: default (both switches off) must stay silent so production logs
+    // do not grow, probe-on keeps the acceptance-gate path, and
+    // channels-only is the new interactive-capture path (emit, but no probe
+    // warmup/sample/auto-exit — those live behind PerformanceProbe::enabled).
+
+    #[test]
+    fn trace_gate_default_silent_probe_or_channels_open() {
+        // probe off + channels off → closed (default runs emit nothing).
+        assert!(!trace_enabled_impl(None, false));
+        assert!(!trace_enabled_impl(Some(std::ffi::OsStr::new("0")), false));
+        assert!(!trace_enabled_impl(
+            Some(std::ffi::OsStr::new("yes")),
+            false
+        ));
+        // probe on → open regardless of the channel switch (the scripted
+        // acceptance gate keeps its frame lines).
+        assert!(trace_enabled_impl(None, true));
+        assert!(trace_enabled_impl(Some(std::ffi::OsStr::new("0")), true));
+        // channels only → open: the M6-d headline case (interactive drag
+        // capture without the auto-exiting probe).
+        assert!(trace_enabled_impl(Some(std::ffi::OsStr::new("1")), false));
+    }
+
+    #[test]
+    fn trace_channels_flag_requires_exactly_one() {
+        // Literal-"1" contract (M4.1): mirrors performance_probe::flag_enabled.
+        assert!(env_flag_enabled(Some(std::ffi::OsStr::new("1"))));
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("0")),
+            Some(std::ffi::OsStr::new("true")),
+            Some(std::ffi::OsStr::new("yes")),
+        ] {
+            assert!(!env_flag_enabled(value));
+        }
     }
 }

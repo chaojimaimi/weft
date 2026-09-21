@@ -383,7 +383,13 @@ impl App {
         // is fully built here (the PATH scan above is NOT part of it).
         performance_probe::report_phase(performance_probe::StartupPhase::Config);
         let probe = performance_probe::PerformanceProbe::from_env();
-        let frame_trace_enabled = probe.enabled();
+        // M6-d (PLAN_M6 §三): the frame-trace line's output gate widens from
+        // probe-only to probe OR the M4.1 `WEFT_TRACE_CHANNELS=1` channel.
+        // The probe's warmup/sample/auto-exit logic still runs only under
+        // `WEFT_GUI_PERF_PROBE=1` — a channels-only run emits frame lines
+        // forever and never exits, which is what makes an instrumented
+        // interactive drag possible.
+        let frame_trace_enabled = frame_trace::trace_enabled(probe.enabled());
         let completion_proxy = proxy.clone();
         let runbook_proxy = proxy.clone();
         // v1.8.7: AI waker — wakes the event loop when background AI tasks
@@ -413,9 +419,10 @@ impl App {
             accessibility: accessibility::AccessibilityBridge::default(),
             performance_probe: probe,
             frame_id: 0,
-            // Frame trace follows the probe gate: only pay the instrumentation
-            // cost when the acceptance probe is active. Idle production runs
-            // keep the recorder in its disabled no-op mode.
+            // Frame trace follows the M6-d output gate (probe OR
+            // WEFT_TRACE_CHANNELS): only pay the instrumentation cost when a
+            // capture switch is active. Idle production runs keep the
+            // recorder in its disabled no-op mode.
             frame_trace_enabled,
             gpu_completion_rx: frame_trace::gpu_completion_rx(),
             should_exit: false,
