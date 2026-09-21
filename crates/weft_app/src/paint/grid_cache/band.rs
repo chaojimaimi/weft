@@ -134,7 +134,11 @@ pub(super) fn classify(
 /// correction for walk 1's giant-shrink misclassification, not a redundant
 /// re-walk. Reordering the two walks would silently reintroduce a one-frame
 /// misplacement (see the regression test).
-fn for_each_stale_interval(
+///
+/// M6-c: also the shared interval source for the budget's band-intersection
+/// exemptions (`enforce_table_budget`) — pub(super) so the parent module can
+/// reuse the single walk instead of growing a drifting second one.
+pub(super) fn for_each_stale_interval(
     cache: &BlockLayoutCache,
     blocks: &[Block],
     mut f: impl FnMut(usize, usize, usize),
@@ -177,13 +181,22 @@ impl BlockLayoutCache {
     /// same frame (P1: streaming gates the idle pump off, so this is the only
     /// correction path while output flows). Appends never shrink the set, so
     /// every pending id is still present; orphans are impossible.
+    ///
+    /// M6-c: the pending set is `deferred_ids ∪ degraded_ids`. A DEGRADED
+    /// block (budget dropped its tables) intersecting the band rebuilds
+    /// BOTH: the degraded verdict takes priority over the deferred one, and
+    /// `ensure_cached` enforces it by checking the flag before the
+    /// three-state verdict — a WidthOnly over the emptied L1 would produce
+    /// empty tables (never allowed). An id sitting in both sets (degraded,
+    /// then cols-mismatch deferred above the band) dedupes through this
+    /// single rebuild + `remove_pending`.
     pub(super) fn rebuild_pending_in_band(
         &mut self,
         blocks: &[Block],
         cols: usize,
         band: BandSync,
     ) {
-        if self.deferred_ids.is_empty() {
+        if self.deferred_ids.is_empty() && self.degraded_ids.is_empty() {
             return;
         }
         let mut rebuild_now: Vec<usize> = Vec::new();
@@ -194,16 +207,17 @@ impl BlockLayoutCache {
             // block also has `bottom < high_rows` (P3-1: the top/low terms
             // of a rectangle-intersect check add nothing here, the block's
             // bottom edge decides).
-            if self.deferred_ids.contains(&id) && !band.fully_above(bottom) {
+            let pending = self.deferred_ids.contains(&id) || self.degraded_ids.contains(&id);
+            if pending && !band.fully_above(bottom) {
                 rebuild_now.push(index);
             }
         });
         for index in rebuild_now {
+            // Degraded → Both via ensure_cached's degraded-first check;
+            // plain deferred → WidthOnly via the normal verdict.
             self.ensure_cached(&blocks[index], cols);
             let id = blocks[index].id.0;
-            if let Some(pos) = self.deferred_ids.iter().position(|&p| p == id) {
-                self.deferred_ids.swap_remove(pos);
-            }
+            self.remove_pending(id);
         }
     }
 
@@ -238,11 +252,10 @@ impl BlockLayoutCache {
         // Non-above (intersect/below) first, then nearest-to-band first.
         candidates.sort_by_key(|&(bottom, _)| (u8::from(band.fully_above(bottom)), bottom));
         for &(_, index) in candidates.iter().take(max_n) {
+            // M6-c: an id degraded AND deferred gets a Both rebuild here
+            // (ensure_cached's degraded-first check) and leaves both sets.
             self.ensure_cached(&blocks[index], cols);
-            let id = blocks[index].id.0;
-            if let Some(pos) = self.deferred_ids.iter().position(|&p| p == id) {
-                self.deferred_ids.swap_remove(pos);
-            }
+            self.remove_pending(blocks[index].id.0);
         }
         self.build_prefix_sum(blocks);
     }

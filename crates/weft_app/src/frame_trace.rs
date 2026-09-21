@@ -138,6 +138,14 @@ pub(crate) struct FrameCounters {
     /// the GO threshold is grid_build_us + encode_us p95 ≥ 1.0 ms OR
     /// ≥ 15% of cpu_total_us p95.
     pub(crate) grid_build_us: u64,
+    /// M6-c (PLAN_M6 §三): total bytes held by the block layout cache's
+    /// L1/L2 tables (`BlockLayoutCache::table_bytes_total`). Watch it
+    /// plateau under the 256MiB budget (R5): drops mean budget degradation,
+    /// one-frame jumps mean band-entry Both rebuilds of degraded blocks.
+    pub(crate) layout_table_bytes: u64,
+    /// M6-c: blocks currently deferred above the sync band (B-2). Grows with
+    /// history size during a drag; the idle pump drains it after cols settle.
+    pub(crate) deferred_blocks: usize,
 }
 
 /// Async GPU-completion message posted from `add_completed_handler` on a Metal
@@ -342,6 +350,8 @@ impl FrameTraceRecorder {
             styled_cache_misses = counters.styled_cache_misses,
             styled_cache_bytes = counters.styled_cache_bytes,
             grid_build_us = counters.grid_build_us,
+            layout_table_bytes = counters.layout_table_bytes,
+            deferred_blocks = counters.deferred_blocks,
             gpu_completions_this_frame = gpu_count,
             gpu_max_us,
             "frame",
@@ -499,6 +509,10 @@ mod tests {
             styled_cache_misses: 0,
             styled_cache_bytes: 0,
             grid_build_us: 0,
+            // M6-c: new field-existence pins — the trace line grows with the
+            // layout-table budget observability.
+            layout_table_bytes: 983_041,
+            deferred_blocks: 3,
         });
         r.encode_start();
         std::thread::sleep(Duration::from_micros(50));
@@ -523,6 +537,10 @@ mod tests {
         assert_eq!(r.counters.vertex_count, 100);
         assert_eq!(r.counters.instance_count, 2000);
         assert_eq!(r.counters.dirty_rows, 5);
+        // M6-c: the two new counter fields must survive build_end intact —
+        // they feed the frame trace's `layout_table_bytes` / `deferred_blocks`.
+        assert_eq!(r.counters.layout_table_bytes, 983_041);
+        assert_eq!(r.counters.deferred_blocks, 3);
         assert_eq!(r.frame_id, 42);
         let (_, rx) = mpsc::channel();
         r.finish(&rx);

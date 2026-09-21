@@ -25,6 +25,18 @@ pub(crate) use wrapping::{block_line_chunks, command_line_chunks, screen_origin_
 
 pub(crate) const MAX_LAYOUT_LINES_LIVE: usize = 2000;
 
+/// M6-c (PLAN_M6 §三): total byte budget across all cached L1/L2 layout
+/// tables. A 1MiB block's tables are ~6-8MB, so the budget tolerates ~30-40
+/// giant blocks; normal sessions never approach it. Exceeding it degrades
+/// the OLDEST non-exempt blocks to metrics-only shells (R5: a degraded block
+/// re-entering the band pays one ~15-20ms Both rebuild — accepted, single).
+const LAYOUT_TABLE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// M6-c: the newest K blocks always keep their tables (never degraded) — the
+/// live block's neighborhood is the highest-frequency render/hit-test target
+/// and re-degrading it would thrash against the band check every frame.
+const BUDGET_EXEMPT_NEWEST_BLOCKS: usize = 4;
+
 /// Cached layout for a single finished block.
 #[derive(Clone)]
 pub(crate) struct CachedBlockLayout {
@@ -72,6 +84,37 @@ pub(crate) struct CachedBlockLayout {
     /// even when the entry's `cols` are stale (band-deferred; M6-c degraded)
     /// so metrics stay同源 with the prefix sum's stale `base_row_count`.
     pub(crate) stale_output_rows: usize,
+    /// M6-c (PLAN_M6 §三): tables dropped by the memory budget
+    /// (`enforce_table_budget`). A degraded entry is a metrics-only shell:
+    /// every scalar (base_row_count / stale_output_rows / command_wrap_rows /
+    /// is_clear / cols / foldable / collapsed) stays exact, so the prefix sum
+    /// and the metrics path have zero drift — but `content`/`width` are
+    /// empty. Revived exclusively by a Both rebuild (the band check rebuilds
+    /// a degraded block when it scrolls into the band); `ensure_cached`
+    /// checks this flag BEFORE the three-state verdict because a WidthOnly
+    /// over the emptied L1 would produce empty tables.
+    pub(crate) degraded: bool,
+}
+
+impl CachedBlockLayout {
+    /// M6-c: byte estimate of the L1/L2 tables ONLY (all scalars excluded —
+    /// they survive degradation). Formula mapped onto the M5 structures:
+    /// - L1 `ContentTable`: `graphemes.len() × size_of::<GEntry>()` (8B:
+    ///   u32 span + width + flags + padding) + `line_meta.len() ×
+    ///   size_of::<LMeta>()` (one entry per surviving source line);
+    /// - L2 `WidthTable`: `rows.len() × size_of::<VisualRow>()` (16B,
+    ///   compile-pinned in visual_rows.rs) + `line_row_base.len() ×
+    ///   size_of::<u32>()`.
+    ///
+    /// Estimate purpose: budget governance, NOT exact measurement — Vec
+    /// capacities and allocator overhead are deliberately ignored.
+    pub(crate) fn estimated_table_bytes(&self) -> usize {
+        let l1 = self.content.graphemes.len() * std::mem::size_of::<visual_rows::GEntry>()
+            + self.content.line_meta.len() * std::mem::size_of::<visual_rows::LMeta>();
+        let l2 = self.width.rows.len() * std::mem::size_of::<visual_rows::VisualRow>()
+            + self.width.line_row_base.len() * std::mem::size_of::<u32>();
+        l1 + l2
+    }
 }
 
 /// M6-b (PLAN_M6 §三 B-1): viewport row band in distance-from-content-bottom
@@ -137,6 +180,18 @@ pub(crate) struct BlockLayoutCache {
     /// during a drag every frame re-defers whatever the pump rebuilt, so
     /// pumping there is pure waste.
     last_sync_stable: bool,
+    /// M6-c: running byte total of all entries' L1/L2 tables (Σ
+    /// `estimated_table_bytes`), maintained incrementally at every
+    /// insert/evict/degrade/rebuild point; tests pin it against a full
+    /// recompute. `enforce_table_budget` early-returns on one compare while
+    /// under budget.
+    table_bytes_total: usize,
+    /// M6-c: ids whose tables the budget dropped. Unioned into the B-1
+    /// per-frame band check (`rebuild_pending_in_band`): a degraded block
+    /// scrolling into the band Both-rebuilds the same frame. Without
+    /// membership in the pending set, a cols-fresh degraded entry would
+    /// report a Hit forever and the render would read empty tables.
+    degraded_ids: Vec<u64>,
 }
 
 impl BlockLayoutCache {
@@ -183,7 +238,16 @@ impl BlockLayoutCache {
             let ids: std::collections::HashSet<u64> =
                 blocks.iter().map(|block| block.id.0).collect();
             let before = self.entries.len();
+            // M6-c: evicted entries' tables leave the running byte total.
+            self.table_bytes_total -= self
+                .entries
+                .iter()
+                .filter(|(id, _)| !ids.contains(id))
+                .map(|(_, c)| c.estimated_table_bytes())
+                .sum::<usize>();
             self.entries.retain(|id, _| ids.contains(id));
+            // M6-c: degraded markers for vanished blocks would be orphans.
+            self.degraded_ids.retain(|id| ids.contains(id));
             if self.entries.len() != before {
                 // Evicted entries change what get_if_cached/metrics compute.
                 self.prefix_sum_dirty = true;
@@ -200,6 +264,10 @@ impl BlockLayoutCache {
         self.synced_first_id = first_id;
         self.synced_last_id = last_id;
         self.build_prefix_sum(blocks);
+        // M6-c: budget enforcement runs LAST (after the band check and the
+        // prefix-sum refresh). Degrading never touches scalars, so the just-
+        // built prefix sum stays valid. One usize compare while under budget.
+        self.enforce_table_budget(blocks, band, LAYOUT_TABLE_BUDGET_BYTES);
         // M6-b P2-1: append-only is the cols-stable criterion — the pump
         // reads this to stay idle while `cols` keeps changing.
         self.last_sync_stable = append_only;
@@ -209,7 +277,10 @@ impl BlockLayoutCache {
     /// call this — the WidthOnly rebuild path preserves the L1 table).
     #[cfg(test)]
     pub(crate) fn invalidate(&mut self, id: u64) {
-        self.entries.remove(&id);
+        if let Some(c) = self.entries.remove(&id) {
+            self.table_bytes_total -= c.estimated_table_bytes();
+        }
+        self.remove_pending(id);
         if !self.dirty_ids.contains(&id) {
             self.dirty_ids.push(id);
         }
@@ -231,6 +302,11 @@ impl BlockLayoutCache {
         let id = block.id.0;
         let needs_rebuild = match self.entries.get(&id) {
             None => RebuildKind::Both,
+            // M6-c: degraded check BEFORE the three-state verdict — the entry's
+            // tables are gone, so a WidthOnly would wrap the EMPTY L1 into
+            // empty tables and a Hit would hand the render an empty entry.
+            // Only a full Both rebuild restores a degraded entry.
+            Some(c) if c.degraded => RebuildKind::Both,
             Some(c) => rebuild_kind(c, block, cols),
         };
         match needs_rebuild {
@@ -240,16 +316,32 @@ impl BlockLayoutCache {
                 self.misses_total = self.misses_total.wrapping_add(1);
                 self.prefix_sum_dirty = true;
                 // Take the old entry out so the L1 table MOVES into the new
-                // entry (no clone of the per-cluster tables).
+                // entry (no clone of the per-cluster tables). Pending-set
+                // membership is NOT touched here — M6-b semantics: the
+                // append-only ensure-last path can WidthOnly-rebuild the
+                // newest deferred block while its stale marker survives
+                // (self-healed by the band check's Hit-path removal); only
+                // the band check and Both rebuilds retire pending ids.
                 let mut prev = self.entries.remove(&id).expect("checked above");
+                self.table_bytes_total -= prev.estimated_table_bytes();
                 prev = compute_block_layout_with_content(block, cols, prev.content);
+                self.table_bytes_total += prev.estimated_table_bytes();
                 self.entries.insert(id, prev);
             }
             RebuildKind::Both => {
                 self.misses += 1;
                 self.misses_total = self.misses_total.wrapping_add(1);
                 self.prefix_sum_dirty = true;
-                self.entries.insert(id, compute_block_layout(block, cols));
+                let prev_bytes = self
+                    .entries
+                    .get(&id)
+                    .map(|c| c.estimated_table_bytes())
+                    .unwrap_or(0);
+                let next = compute_block_layout(block, cols);
+                self.table_bytes_total -= prev_bytes;
+                self.table_bytes_total += next.estimated_table_bytes();
+                self.entries.insert(id, next);
+                self.remove_pending(id);
             }
         }
     }
@@ -345,6 +437,118 @@ impl BlockLayoutCache {
     pub(crate) fn clear_prefix_sum(&self) -> &[usize] {
         &self.clear_prefix_sum
     }
+
+    /// M6-c: current total table bytes — frame_trace `layout_table_bytes`
+    /// plus tests.
+    pub(crate) fn table_bytes_total(&self) -> usize {
+        self.table_bytes_total
+    }
+
+    /// M6-c: blocks currently deferred above the sync band (frame_trace
+    /// `deferred_blocks`).
+    pub(crate) fn deferred_blocks(&self) -> usize {
+        self.deferred_ids.len()
+    }
+
+    /// M6-c: drop `id` from BOTH pending sets (deferred + degraded). The
+    /// dedup point for the `deferred ∪ degraded` pending union: whichever way
+    /// an id became pending, one rebuild retires it everywhere.
+    fn remove_pending(&mut self, id: u64) {
+        if let Some(pos) = self.deferred_ids.iter().position(|&p| p == id) {
+            self.deferred_ids.swap_remove(pos);
+        }
+        if let Some(pos) = self.degraded_ids.iter().position(|&p| p == id) {
+            self.degraded_ids.swap_remove(pos);
+        }
+    }
+
+    /// M6-c: drop one entry's L1/L2 tables, keeping every scalar. The
+    /// metrics/prefix-sum inputs (base_row_count, stale_output_rows,
+    /// command_wrap_rows, is_clear, cols, foldable, collapsed) are untouched,
+    /// so degradation is zero-drift by construction. Returns true if THIS
+    /// call degraded the entry (already-degraded entries are skipped).
+    fn degrade_entry(&mut self, id: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if entry.degraded {
+            return false;
+        }
+        let before = entry.estimated_table_bytes();
+        entry.content = visual_rows::ContentTable {
+            graphemes: Vec::new(),
+            line_meta: Vec::new(),
+            screen_origin: entry.content.screen_origin,
+            trailing_trim_lines: entry.content.trailing_trim_lines,
+        };
+        // line_row_base keeps the documented prefix invariant
+        // (`len == line_meta.len() + 1`, `last == rows.len()`): an L2 of zero
+        // lines is `[0]`.
+        entry.width = visual_rows::WidthTable {
+            rows: Vec::new(),
+            line_row_base: vec![0],
+            hint_rows: entry.width.hint_rows,
+        };
+        entry.degraded = true;
+        self.table_bytes_total = self.table_bytes_total - before + entry.estimated_table_bytes();
+        if !self.degraded_ids.contains(&id) {
+            self.degraded_ids.push(id);
+        }
+        true
+    }
+
+    /// M6-c: enforce the total table-byte budget. Over budget, degrade the
+    /// OLDEST eligible blocks first (single oldest-first walk — each round
+    /// continues from the oldest not-yet-degraded block) to metrics-only
+    /// entries. Exempt: blocks intersecting `band` (they are rendered this
+    /// frame) and the newest [`BUDGET_EXEMPT_NEWEST_BLOCKS`] blocks (live
+    /// neighborhood). When every remaining block is exempt the total may
+    /// legitimately stay over budget (e.g. one giant block larger than the
+    /// budget itself) — the walk simply runs out of candidates and the next
+    /// frame's early return is skipped until something degradable appears.
+    /// `budget` is a parameter so tests can pin the behavior with tiny
+    /// values; production passes [`LAYOUT_TABLE_BUDGET_BYTES`].
+    fn enforce_table_budget(&mut self, blocks: &[Block], band: BandSync, budget: usize) {
+        // Per-frame budget check: zero cost while under budget.
+        if self.table_bytes_total <= budget {
+            return;
+        }
+        // Band-intersection exemptions, from the same interval walk the band
+        // classification uses (entries are post-sync fresh here).
+        let mut band_exempt: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        band::for_each_stale_interval(self, blocks, |index, bottom, top| {
+            // Intersect = not fully above AND not fully below the band.
+            if bottom < band.high_rows && top > band.low_rows {
+                band_exempt.insert(blocks[index].id.0);
+            }
+        });
+        let first_exempt_index = blocks.len().saturating_sub(BUDGET_EXEMPT_NEWEST_BLOCKS);
+        for (index, block) in blocks.iter().enumerate() {
+            if self.table_bytes_total <= budget {
+                break;
+            }
+            if index >= first_exempt_index || band_exempt.contains(&block.id.0) {
+                continue;
+            }
+            self.degrade_entry(block.id.0);
+        }
+    }
+
+    /// M6-c: full recompute of the byte total — the test-only oracle for the
+    /// incremental-maintenance invariant.
+    #[cfg(test)]
+    fn recomputed_table_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|c| c.estimated_table_bytes())
+            .sum()
+    }
+
+    /// M6-c: degraded-entry count (tests).
+    #[cfg(test)]
+    pub(crate) fn degraded_count(&self) -> usize {
+        self.degraded_ids.len()
+    }
 }
 
 /// Compute the layout for a single block (expensive — call once, then cache).
@@ -413,10 +617,17 @@ fn compute_block_layout_with_content(
         content,
         stale_output_rows: width.hint_rows as usize + width.rows.len(),
         width,
+        degraded: false,
     }
 }
 
 // Tests live in grid_cache/tests.rs (commit-gate-exempt) — the file sat at
-// its audited ceiling when M6-b added the band-gated sync surface.
+// its audited ceiling when M6-b added the band-gated sync surface. M6-c adds
+// the budget/degradation suite as a second companion file (same `#[path]`
+// pattern as visual_rows_tests.rs; the path is relative to paint/ because
+// grid_cache.rs is a non-mod.rs file).
+#[cfg(test)]
+#[path = "grid_cache/budget_tests.rs"]
+mod budget_tests;
 #[cfg(test)]
 mod tests;

@@ -1114,6 +1114,12 @@ impl MetalRenderer {
         // Step 1: drain per-frame block layout cache hit/miss counters.
         let (cache_hits, cache_misses) =
             self.block_layout_cache.borrow_mut().take_hit_miss_counts();
+        // M6-c (PLAN_M6 §三): layout-table budget observability — total
+        // cached table bytes + blocks still deferred above the sync band.
+        let (layout_table_bytes, deferred_blocks) = {
+            let cache = self.block_layout_cache.borrow();
+            (cache.table_bytes_total() as u64, cache.deferred_blocks())
+        };
         let (styled_cache_hits, styled_cache_misses) =
             self.styled_line_cache.borrow_mut().take_hit_miss_counts();
         let styled_cache_bytes = self.styled_line_cache.borrow().bytes() as u64;
@@ -1149,6 +1155,8 @@ impl MetalRenderer {
                 styled_cache_misses,
                 styled_cache_bytes,
                 grid_build_us,
+                layout_table_bytes,
+                deferred_blocks,
             });
         self.frame_trace.borrow_mut().encode_start();
 

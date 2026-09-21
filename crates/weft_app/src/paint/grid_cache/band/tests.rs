@@ -504,6 +504,82 @@ fn block_of_line_width(id: u64, lines: usize, line_chars: usize) -> Block {
     }
 }
 
+/// M6-c P3 overlap: a degraded block that hits a cols change lands in the
+/// deferred set TOO (its verdict is still the tabled WidthOnly path) — but
+/// the degraded marker takes priority in the band check: on band entry it
+/// rebuilds BOTH (full re-enumeration), never a WidthOnly over the emptied
+/// L1 (which would produce empty tables).
+#[test]
+fn degraded_block_with_cols_mismatch_band_check_rebuilds_both_not_width_only() {
+    let blocks: Vec<Block> = (1..=6).map(|i| block(i, 4 + i as usize)).collect();
+    let mut cache = fresh_synced(&blocks, 80);
+
+    // Degrade the only block outside the newest-4 exemption (id 1).
+    let budget = cache.table_bytes_total() - cache.get(1).estimated_table_bytes()
+        + std::mem::size_of::<u32>();
+    cache.enforce_table_budget(
+        &blocks,
+        BandSync {
+            low_rows: 0,
+            high_rows: 0,
+        },
+        budget,
+    );
+    assert_eq!(cache.degraded_count(), 1);
+    assert!(cache.get(1).content.line_meta.is_empty());
+
+    // Cols change with the band above id 1: the stale-cols verdict is Defer
+    // (never a WidthOnly rebuild — the L1 is empty), so the id joins BOTH
+    // pending sets.
+    let content_builds = || crate::paint::grid_cache::visual_rows::content_builds();
+    let builds_before = content_builds();
+    let bottom1: usize = blocks[1..]
+        .iter()
+        .map(|b| cache.get(b.id.0).base_row_count)
+        .sum();
+    cache.sync_blocks(
+        &blocks,
+        78,
+        BandSync {
+            low_rows: 0,
+            high_rows: bottom1,
+        },
+    );
+    assert_eq!(
+        cache.deferred_count(),
+        1,
+        "degraded block defers on cols mismatch"
+    );
+    assert_eq!(cache.degraded_count(), 1, "degraded marker persists");
+    assert!(
+        cache.get(1).content.line_meta.is_empty(),
+        "no rebuild above the band"
+    );
+    assert_eq!(
+        content_builds(),
+        builds_before,
+        "WidthOnly over the empty L1 must not fire"
+    );
+
+    // Scroll id 1 into the band (cols settled → append-only): the degraded
+    // marker wins → Both rebuild → full tables at the NEW cols.
+    cache.sync_blocks(&blocks, 78, full_band());
+    let entry = cache.get(1);
+    assert!(!entry.degraded);
+    assert_eq!(cache.degraded_count(), 0);
+    assert_eq!(cache.deferred_count(), 0);
+    assert_eq!(entry.cols, 78);
+    assert!(
+        !entry.content.line_meta.is_empty(),
+        "Both re-enumerated the output"
+    );
+    assert_eq!(
+        content_builds(),
+        builds_before + 1,
+        "exactly one Both rebuild"
+    );
+}
+
 /// P2-2(b) regression: on a cols-GROW frame the in-band giant block rebuilds
 /// SHORTER, so walk 1's pre-rebuild estimate sits ABOVE the neighbor's true
 /// position and misclassifies it `Defer`. The correctness contract is the
