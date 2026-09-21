@@ -4,7 +4,7 @@ use weft_core::blocks::ShellPhase;
 use winit::event_loop::ActiveEventLoop;
 
 use crate::tab::Tab;
-use crate::{App, Effect};
+use crate::{App, AppEvent, Effect};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseScope {
@@ -54,6 +54,29 @@ fn bounded_command_summary(command: &str) -> String {
 
 pub(crate) fn run_if_confirmed<R>(confirmed: bool, operation: impl FnOnce() -> R) -> Option<R> {
     confirmed.then(operation)
+}
+
+/// Final shutdown pair (FIX_close_exit_after_modal): request loop exit, then
+/// nudge the main runloop so that request is actually observed.
+///
+/// WHY the wake is load-bearing: `ActiveEventLoop::exit()` only sets winit's
+/// exit flag (winit 0.30.13 app_state.rs:245-247); the flag is read by the
+/// RunLoopObserver's `cleared()` callback (app_state.rs:394-398). When a modal
+/// confirmation ran earlier in this same event handler, `runModal`'s nested
+/// runloop returns into a main runloop with no pending event source — it never
+/// turns another revolution, `cleared()` never runs, and the process stays
+/// alive with the flag set (docs/FIX_close_exit_after_modal.md §一).
+/// `EventLoopProxy::send_event` fires CFRunLoopSourceSignal + CFRunLoopWakeUp
+/// (winit event_loop.rs:513-522), driving exactly that revolution; winit's own
+/// `stop_app_immediately` pairs `stop:` with a dummy event the same way
+/// (winit event_loop.rs:411-418). Closures instead of the real proxy keep the
+/// exit→wake contract unit-testable — `EventLoopProxy` cannot be constructed
+/// in tests.
+fn exit_then_request_wake<E>(exit: impl FnOnce(), wake: impl FnOnce() -> Result<(), E>) {
+    exit();
+    // EventLoopClosed = loop already gone — silent by design, the repo-wide
+    // convention for every wakeup-class send (app_runtime.rs:145-150).
+    let _ = wake();
 }
 
 fn pane_running_command(pane: &crate::pane::Pane) -> Option<String> {
@@ -175,7 +198,15 @@ impl App {
             }
         }
         self.recovery.mark_clean_shutdown();
-        event_loop.exit();
+        // FIX_close_exit_after_modal: when the modal confirmation path ran in
+        // this handler, exit() alone sets a flag no observer ever reads — pair
+        // it with a Wake so the main runloop turns one more revolution and
+        // winit's `cleared()` checkpoint sees the flag. Mechanism chain and
+        // winit source anchors: `exit_then_request_wake` doc + FIX doc §一/§二.
+        exit_then_request_wake(
+            || event_loop.exit(),
+            || self.proxy.send_event(AppEvent::Wake),
+        );
     }
 
     fn confirm_tab_close(&self, index: usize) -> bool {
@@ -209,8 +240,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        bounded_command_summary, command_is_running, foreground_process_group, run_if_confirmed,
-        CloseScope,
+        bounded_command_summary, command_is_running, exit_then_request_wake,
+        foreground_process_group, run_if_confirmed, CloseScope,
     };
     use weft_core::blocks::ShellPhase;
 
@@ -263,6 +294,24 @@ mod tests {
         assert_eq!(calls, 0);
         assert_eq!(run_if_confirmed(true, || calls += 1), Some(()));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn clean_shutdown_exits_then_requests_wake_and_swallows_closed() {
+        // FIX_close_exit_after_modal §三: the exit→wake ordering IS the fix —
+        // exit() alone strands the flag after runModal starves the main
+        // runloop, and EventLoopClosed (loop already gone) must stay silent.
+        // Any deviation — wake before exit, missing wake, propagated/panicking
+        // error — fails this assertion.
+        let events = std::cell::RefCell::new(Vec::<&'static str>::new());
+        exit_then_request_wake(
+            || events.borrow_mut().push("exit"),
+            || {
+                events.borrow_mut().push("wake");
+                Err(winit::event_loop::EventLoopClosed(crate::AppEvent::Wake))
+            },
+        );
+        assert_eq!(*events.borrow(), ["exit", "wake"]);
     }
 
     #[test]
