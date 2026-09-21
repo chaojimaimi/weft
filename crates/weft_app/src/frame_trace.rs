@@ -235,9 +235,16 @@ impl FrameTraceRecorder {
 
     /// Mark the start of the BUILD-VERTICES segment (grid/block/overlay builders).
     pub(crate) fn build_start(&mut self) {
-        if self.enabled {
-            self.build_start = Some(Instant::now());
-        }
+        // M6-b: armed even when the probe is disabled — build_us is the only
+        // always-running per-frame timer, and the block-view convergence pump
+        // reads the PREVIOUS frame's value as its idle gate.
+        self.build_start = Some(Instant::now());
+    }
+
+    /// M6-b B-5: previous build-segment duration in µs. Recorded regardless
+    /// of the probe (see `build_start`); 0 before the first completed frame.
+    pub(crate) fn build_us(&self) -> u64 {
+        self.build_us
     }
 
     /// Mark the end of BUILD-VERTICES and record the per-frame counters.
@@ -248,8 +255,10 @@ impl FrameTraceRecorder {
     /// Preserving the begin-time sample keeps the trace honest.
     pub(crate) fn build_end(&mut self, counters: FrameCounters) {
         if let Some(start) = self.build_start.take() {
+            // build_us records unconditionally (pump-gate port); the trace
+            // line and counters stay probe-gated.
+            self.build_us = start.elapsed().as_micros() as u64;
             if self.enabled {
-                self.build_us = start.elapsed().as_micros() as u64;
                 // Preserve resident_bytes captured at begin(); the caller
                 // (renderer thread) doesn't collect RSS, so its value is 0.
                 let resident_bytes = self.counters.resident_bytes;
@@ -517,6 +526,21 @@ mod tests {
         assert_eq!(r.frame_id, 42);
         let (_, rx) = mpsc::channel();
         r.finish(&rx);
+    }
+
+    #[test]
+    fn disabled_recorder_still_records_build_us_for_pump_gate() {
+        // M6-b B-5: build_us is the always-on port the convergence pump
+        // reads — a disabled (probe-off) recorder must still time the build
+        // segment, even though it emits no trace line.
+        let mut r = FrameTraceRecorder::disabled();
+        assert_eq!(r.build_us(), 0);
+        r.build_start();
+        std::thread::sleep(Duration::from_micros(50));
+        r.build_end(FrameCounters::default());
+        assert!(r.build_us() >= 40, "build_us={}", r.build_us());
+        let (_, rx) = mpsc::channel();
+        r.finish(&rx); // disabled: no output, no panic.
     }
 
     #[test]

@@ -12,7 +12,16 @@ use weft_core::blocks::{Block, BlockId};
 use super::{
     compute_block_layout_pass, BlockLayoutCache, LaidRow, LayoutPassInput, LayoutPassOutput,
 };
+use crate::paint::grid_cache::BandSync;
 use crate::paint::live_cache::LiveLayoutCache;
+
+/// Pre-M6-b semantics: a band covering everything defers nothing.
+fn full_band() -> BandSync {
+    BandSync {
+        low_rows: 0,
+        high_rows: usize::MAX,
+    }
+}
 
 const LINES: usize = 118_000;
 const PITCH: f32 = 17.0;
@@ -140,7 +149,7 @@ fn windowed_emission_is_a_contiguous_bitwise_equal_slice_of_full() {
     let blocks = vec![make_block()];
     let mut cache = BlockLayoutCache::default();
     let mut live = LiveLayoutCache::default();
-    cache.sync_blocks(&blocks, 88);
+    cache.sync_blocks(&blocks, 88, full_band());
     let total_rows = cache.get(1).width.rows.len() as f32;
 
     // Full reference: everything visible.
@@ -282,7 +291,7 @@ fn dense_scroll_sweep_covers_the_full_emission() {
     }];
     let mut cache = BlockLayoutCache::default();
     let mut live = LiveLayoutCache::default();
-    cache.sync_blocks(&blocks, 88);
+    cache.sync_blocks(&blocks, 88, full_band());
 
     // Full reference.
     let full = run_pass(&cache, &mut live, &blocks, 0.0, -1.0e9, 1.0e9);
@@ -359,12 +368,12 @@ fn repeated_sync_keeps_windowed_emission_stable() {
     let blocks = vec![make_block()];
     let mut cache = BlockLayoutCache::default();
     let mut live = LiveLayoutCache::default();
-    cache.sync_blocks(&blocks, 88);
+    cache.sync_blocks(&blocks, 88, full_band());
 
     let first = run_pass(&cache, &mut live, &blocks, 0.0, 0.0, VIEWPORT);
     let keys_first = output_keys(&first);
     // Scroll frame: append-only sync (newest block re-checked).
-    cache.sync_blocks(&blocks, 88);
+    cache.sync_blocks(&blocks, 88, full_band());
     let second = run_pass(&cache, &mut live, &blocks, 0.0, 0.0, VIEWPORT);
     let keys_second = output_keys(&second);
 

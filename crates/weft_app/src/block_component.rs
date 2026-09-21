@@ -291,35 +291,27 @@ pub(crate) fn block_content_metrics_with_cache(
     let mut total = 0;
     let viewport_rows = terminal.grid().num_rows.max(1);
     for block in terminal.block_tracker().session_blocks() {
-        // R2-2: 命中缓存 O(1) 读 L2 行数/command_wrap_rows,未命中
-        // (末帧后才 finalized 的块)回退直接计算。
+        // M6-b B-3 (PLAN_M6 §三, 评审 P0-2): a PRESENT entry is read as
+        // scalars only — even when its cols are stale (band-deferred; M6-c
+        // degraded). `stale_output_rows` / `command_wrap_rows` are the same
+        // snapshots the prefix sum's stale `base_row_count` was composed
+        // from, so the scrollbar total can't disagree with laid-out geometry,
+        // and the old expired branch's per-frame L2 rebuild (~11.5ms per
+        // 1MiB block) is gone. Uncached blocks still fall back to a direct
+        // computation (memo 兜底), counted by `metrics_fallback_rebuilds`.
         let cached = cache.and_then(|c| c.get_if_cached(block.id.0));
-        let expired = |c: &crate::paint::grid_cache::CachedBlockLayout| {
-            c.cols != cols || c.collapsed != block.collapsed
+        let output_rows = match cached {
+            None => {
+                if let Some(c) = cache {
+                    c.note_metrics_fallback();
+                }
+                crate::paint::grid_cache::completed_output_rows(block, cols, None)
+            }
+            Some(_) if block.collapsed => 0,
+            Some(c) => c.stale_output_rows,
         };
-        let output_rows = cached
-            .map(|c| {
-                if expired(c) {
-                    // M5-a/b (PLAN_M5 §三): expired fallback reads the L1/L2 tables
-                    // (hint_rows + rows.len()); O(1) off a live entry, else a table
-                    // rebuild, no re-wrap.
-                    crate::paint::grid_cache::completed_output_rows(block, cols, cached)
-                } else if block.collapsed {
-                    0
-                } else {
-                    // M5-b: O(1) read off the stored L2 width table.
-                    c.width.hint_rows as usize + c.width.rows.len()
-                }
-            })
-            .unwrap_or_else(|| crate::paint::grid_cache::completed_output_rows(block, cols, None));
         let command_wrap_rows = cached
-            .map(|c| {
-                if expired(c) {
-                    command_wrap_rows_for(block, cols, block_foldable(block))
-                } else {
-                    c.command_wrap_rows
-                }
-            })
+            .map(|c| c.command_wrap_rows)
             .unwrap_or_else(|| command_wrap_rows_for(block, cols, block_foldable(block)));
         total += completed_block_row_count(output_rows, header_rows, command_wrap_rows)
             + clear_block_spacer_rows(&block.command, viewport_rows);

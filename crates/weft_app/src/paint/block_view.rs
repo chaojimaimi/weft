@@ -2,6 +2,7 @@ use crate::paint::block_view::actions::{
     block_header_band_height, push_block_header_actions, BlockHeaderActionPaint,
 };
 use crate::paint::block_view_model::BlockViewPaintModel;
+use crate::paint::grid_cache::BandSync;
 use crate::paint::primitives::{
     color_to_normalized, push_quad, scale_color_alpha, snap_physical_rect,
 };
@@ -153,7 +154,12 @@ impl MetalRenderer {
 
         {
             let mut cache = self.block_layout_cache.borrow_mut();
-            cache.sync_blocks(blocks, cols);
+            // M6-b B-1: same band as rows.rs; B-5 pump gate also in rows.rs.
+            let band = BandSync::for_viewport(block_scroll as usize, viewport_rows);
+            cache.sync_blocks(blocks, cols, band);
+            if self.block_view_pump_idle(live.as_ref()) {
+                cache.pump_deferred(blocks, cols, band, 1);
+            }
         }
         self.styled_lookup_counter.set(0);
         self.styled_paint_us_counter.set(0);

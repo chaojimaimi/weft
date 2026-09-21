@@ -58,6 +58,20 @@ pub(super) fn wrapped_row_positions(
 }
 
 impl MetalRenderer {
+    /// M6-b B-5: idle-pump gate for the paint path's convergence pump. The
+    /// pump only runs when no live capture owns the view — a screen-owned
+    /// in-flight document is NOT capturing (its history is the screen), and
+    /// the 200ms deferred-exit settle window stays inert — and the previous
+    /// frame's build segment was cheap. `build_us` comes from frame_trace's
+    /// always-on segment timer (recorded even with the probe disabled), read
+    /// before this frame's own build_end overwrites it.
+    pub(super) fn block_view_pump_idle(
+        &self,
+        live: Option<&weft_core::blocks::InFlightBlock>,
+    ) -> bool {
+        live.map_or(true, |l| l.screen_origin) && self.frame_trace.borrow().build_us() < 8_000
+    }
+
     /// Compute block-view rows for hit-testing WITHOUT building vertices.
     /// This is the M1 on-demand alternative to caching `block_view_rows`
     /// during `draw()`. The geometry_controller calls this when a mouse
@@ -125,7 +139,13 @@ impl MetalRenderer {
         // borrow lives until bv_rows (owning Strings) is built.
         {
             let mut cache = self.block_layout_cache.borrow_mut();
-            cache.sync_blocks(blocks, cols);
+            // M6-b B-1: same band derivation as the paint path (block_view.rs)
+            // so hit-testing geometry matches what sync classified.
+            let band = crate::paint::grid_cache::BandSync::for_viewport(
+                block_scroll as usize,
+                viewport_rows,
+            );
+            cache.sync_blocks(blocks, cols, band);
         }
         let cache = self.block_layout_cache.borrow();
         let layout_out = compute_block_layout_pass(
