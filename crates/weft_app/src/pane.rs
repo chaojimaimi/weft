@@ -339,6 +339,21 @@ impl Pane {
         last_sent_winsize != Some(requested)
     }
 
+    /// FIX (field run, v1.12.6): release the PTY's reaper BEFORE the tokio
+    /// runtime tears down. The waitpid thread lives in the runtime's
+    /// blocking pool and parks in `wait4(shell)`; if the shell outlives the
+    /// app teardown (a full-screen TUI like top does not exit from a late
+    /// SIGHUP, and nobody else delivers one once the event loop is gone),
+    /// the runtime's `BlockingPool` teardown waits for it on the main
+    /// thread -- the sampled "not responding" stall. Dropping the Pty sends
+    /// SIGHUP and closes the master fd, which lets the wait4 return.
+    pub(crate) fn release_pty(&mut self) {
+        self.pending_pty_resize = None;
+        if let Some(pty) = self.pty.take() {
+            drop(pty);
+        }
+    }
+
     /// v1.10.19: Send a queued winsize to the PTY via TIOCSWINSZ, deduping
     /// against the last size actually sent (see [`should_send_winsize_ioctl`]).
     ///

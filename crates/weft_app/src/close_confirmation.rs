@@ -176,6 +176,15 @@ impl App {
         // DIAGNOSTIC step markers (hang-after-confirm, v1.12.5): the confirm
         // line is the LAST log the field shows -- these pinpoint which
         // teardown stage stops emitting.
+        // FIX (field run, v1.12.6): release every pane's PTY first -- the
+        // waitpid reaper threads live in the tokio blocking pool, and the
+        // pool must be free before the runtime drops on main (see
+        // Pane::release_pty for the sampled stall).
+        for tab in self.sessions.tabs_mut() {
+            for pane in tab.panes_mut() {
+                pane.release_pty();
+            }
+        }
         let blocks = self.finish_all_pending_blocks();
         tracing::info!(
             count = blocks.len(),

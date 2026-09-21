@@ -645,5 +645,16 @@ fn main() {
     // + exception::catch inside; no-op for dev binaries).
     crate::macos_notifications::install_early_delegate(&proxy);
     let mut app = App::new(proxy);
-    event_loop.run_app(&mut app).unwrap();
+    // A run-loop error falls through to the hard exit below as well -- the
+    // old destructor-order stall is worse than a lost panic message here.
+    let _ = event_loop.run_app(&mut app);
+    // FIX (field run, v1.12.6): everything that matters (block persistence,
+    // tab snapshots, the recovery snapshot, the clean-exit marker) was
+    // already written by the teardown before the loop stopped, and every
+    // PTY was signalled. Skip the long tail of destructors: the tokio
+    // blocking pool would otherwise wait for a PTY waitpid thread whose
+    // child can outlive us (a full-screen TUI), which is the sampled
+    // "still running after close" state. Orphaned children are reaped by
+    // launchd.
+    std::process::exit(0);
 }

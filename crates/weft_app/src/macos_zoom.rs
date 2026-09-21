@@ -46,6 +46,23 @@ pub(crate) fn zoom_sequence_active() -> bool {
     sequence_active_at(ZOOM_LAST_ACTIVITY_MS.load(Ordering::Acquire), now_ms())
 }
 
+/// PLAN_zoom (field run fix): a PROGRAMMATIC zoom shows up on the Resized
+/// event as a one-shot jump (hundreds of points) with inLiveResize already
+/// false, while a drag streams small steps with inLiveResize true. The first
+/// Resized of a fresh window carries no previous size and never counts.
+pub(crate) fn is_programmatic_resize_jump(prev: Option<(u32, u32)>, next: (u32, u32)) -> bool {
+    /// Threshold in PHYSICAL pixels (a 2x screen arm at 60 pt -- sensitive
+    /// side; arming is benign with the inLiveResize guard).
+    const JUMP_POINTS: i64 = 120;
+    match prev {
+        None => false,
+        Some((w, h)) => {
+            (next.0 as i64 - w as i64).abs() > JUMP_POINTS
+                || (next.1 as i64 - h as i64).abs() > JUMP_POINTS
+        }
+    }
+}
+
 /// Pure Z-b gate core (testable): a sequence is active when a callback was
 /// seen at `last_ms` and `now_ms` is within the silence window. `last_ms == 0`
 /// means "never active".
@@ -188,7 +205,9 @@ unsafe extern "C" fn will_resize_imp(
         } else {
             unsafe { msg_send![window_probe, inLiveResize] }
         };
-        tracing::info!(
+        // debug level (round 3 MEDIUM-1): one line per resize callback is a
+        // firehose at info; `RUST_LOG=debug` re-enables the field run.
+        tracing::debug!(
             dragging = dragging_probe,
             "windowWillResize callback reached the injected IMP"
         );
@@ -228,6 +247,41 @@ unsafe extern "C" fn will_resize_imp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zoom_jump_detection_truth_table() {
+        let big = (1440, 900);
+        let small = (800, 600);
+        assert!(
+            !is_programmatic_resize_jump(None, big),
+            "first resize never counts"
+        );
+        assert!(
+            !is_programmatic_resize_jump(Some(small), small),
+            "no change"
+        );
+        assert!(
+            is_programmatic_resize_jump(Some(small), big),
+            "hundreds of points: programmatic zoom"
+        );
+        assert!(
+            is_programmatic_resize_jump(Some(big), small),
+            "zoom-out jumps too"
+        );
+        // Sub-threshold: drags and divider moves stream steps this small.
+        assert!(!is_programmatic_resize_jump(
+            Some(small),
+            (small.0 + 100, small.1 + 60)
+        ));
+        assert!(
+            !is_programmatic_resize_jump(Some(small), (small.0 + 120, small.1)),
+            "exactly at the threshold is still below (strict >)"
+        );
+        assert!(
+            is_programmatic_resize_jump(Some(small), (small.0 + 121, small.1)),
+            "width past threshold counts"
+        );
+    }
 
     #[test]
     fn sequence_gate_truth_table() {

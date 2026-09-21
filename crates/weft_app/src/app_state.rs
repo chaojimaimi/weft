@@ -291,6 +291,17 @@ pub struct WindowRuntimeState {
     pub cursor_anim_active: Arc<AtomicBool>,
     pub synchronized_output_watchdog_pending: Arc<AtomicBool>,
     pub last_resize_instant: Instant,
+    /// PLAN_zoom (field run, 1.12.6 diagnostics): until when a PROGRAMMATIC
+    /// resize jump (double-click zoom: one-shot size jump with
+    /// inLiveResize already false by the time the Resized event is
+    /// dispatched) keeps the zoom channel hot. The zoom: animation is a
+    /// live-resize internally (the injected windowWillResize callback sees
+    /// inLiveResize == true), so the callback stamp is exempted there; the
+    /// jump detection on the Resized event is the reliable signal.
+    pub zoom_jump_until: Option<Instant>,
+    /// Companion to `zoom_jump_until`: the physical size at the previous
+    /// Resized event, for the jump test.
+    pub last_resized_physical: Option<(u32, u32)>,
     pub last_system_appearance_dark: Option<bool>,
     pub last_appearance_check: Instant,
     pub current_logo_variant: weft_core::config::LogoVariant,
@@ -329,6 +340,8 @@ impl WindowRuntimeState {
             cursor_anim_active: Arc::new(AtomicBool::new(true)),
             synchronized_output_watchdog_pending: Arc::new(AtomicBool::new(false)),
             last_resize_instant: Instant::now(),
+            zoom_jump_until: None,
+            last_resized_physical: None,
             last_system_appearance_dark: None,
             last_appearance_check: Instant::now(),
             current_logo_variant: weft_core::config::LogoVariant::Cool,
@@ -340,6 +353,12 @@ impl WindowRuntimeState {
             increase_contrast: false,
             tab_snapshots: crate::snapshot_persistence::SnapshotPersistenceState::default(),
         }
+    }
+    /// PLAN_zoom: whether the programmatic-zoom channel (armed by a one-shot
+    /// size jump) is still hot.
+    pub fn zoom_jump_hot(&self) -> bool {
+        self.zoom_jump_until
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 }
 

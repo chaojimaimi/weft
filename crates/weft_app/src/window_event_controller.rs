@@ -13,6 +13,19 @@ impl App {
                 self.request_application_close(event_loop);
             }
             WindowEvent::Resized(physical_size) => {
+                // PLAN_zoom (field run): a PROGRAMMATIC zoom (double-click)
+                // shows up here as a one-shot size jump with inLiveResize
+                // already FALSE (the zoom's internal live-resize window has
+                // closed before winit dispatches Resized) -- while a drag
+                // streams small steps with inLiveResize true. Detect the
+                // jump to arm the zoom channel; a full-screen zoom moves
+                // hundreds of points, drags and divider moves move dozens.
+                let jump = crate::macos_zoom::is_programmatic_resize_jump(
+                    self.window_runtime.last_resized_physical,
+                    (physical_size.width, physical_size.height),
+                );
+                self.window_runtime.last_resized_physical =
+                    Some((physical_size.width, physical_size.height));
                 // Grid/PTY tracks the renderer's visible terminal content
                 // rectangle. The editor box is an overlay, but title/tab
                 // chrome is outside that rectangle and must be subtracted.
@@ -132,15 +145,34 @@ impl App {
                     // enters inLiveResize — the zoom-sequence marker stamped
                     // by the injected windowWillResize hook extends the
                     // same-tick draw to it.
+                    // HIGH-1 (round 3): arm the zoom channel ONLY outside a
+                    // live-resize gesture -- a fast drag coalesces Resized
+                    // events with >120 physical-px deltas (2x screen: 60 pt),
+                    // which would re-arm it (per-frame CA flush through the
+                    // drag plus a 300 ms tail, the cost PLAN §四 froze). The
+                    // zoom's own Resized arrives with inLiveResize already
+                    // false, so the guard separates the two cleanly. Arm
+                    // BEFORE the zoom_jump_hot read: the zoom's own final
+                    // Resized then engages the channel same-frame.
+                    let in_live_resize_now =
+                        window.is_some_and(crate::macos_window::window_in_live_resize);
+                    if jump && !in_live_resize_now {
+                        self.window_runtime.zoom_jump_until =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+                    }
+                    let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
                     let live_resize = window
                         .is_some_and(crate::macos_window::window_in_live_resize)
-                        || crate::macos_zoom::zoom_sequence_active();
+                        || crate::macos_zoom::zoom_sequence_active()
+                        || zoom_jump_hot;
                     // PLAN_zoom Z-c: set_zoom_sequence runs AFTER
                     // set_live_resize so the release path (both flags false)
                     // lands the async-present restore before the zoom flip
                     // re-binds the transaction.
                     renderer.set_live_resize(live_resize);
-                    renderer.set_zoom_sequence(crate::macos_zoom::zoom_sequence_active());
+                    renderer.set_zoom_sequence(
+                        crate::macos_zoom::zoom_sequence_active() || zoom_jump_hot,
+                    );
                     if live_resize {
                         self.handle_redraw_requested_forced();
                     }
@@ -188,7 +220,8 @@ impl App {
                     .window
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
-                let zoom_sequence = crate::macos_zoom::zoom_sequence_active();
+                let zoom_sequence = crate::macos_zoom::zoom_sequence_active()
+                    || self.window_runtime.zoom_jump_hot();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.set_live_resize(in_live_resize || zoom_sequence);
                     renderer.set_zoom_sequence(zoom_sequence);
