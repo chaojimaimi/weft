@@ -727,14 +727,14 @@ impl App {
                 if since_ms > 2 {
                     tracing::warn!(
                         since_resize_ms = since_ms,
-                        live_resize = renderer.live_resize_active,
+                        live_resize = renderer.live_resize_active || renderer.zoom_sequence_flip,
                         forced,
                         "RESIZE_PROBE first_present",
                     );
                 } else {
                     tracing::debug!(
                         since_resize_ms = since_ms,
-                        live_resize = renderer.live_resize_active,
+                        live_resize = renderer.live_resize_active || renderer.zoom_sequence_flip,
                         forced,
                         "RESIZE_PROBE first_present",
                     );

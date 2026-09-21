@@ -301,6 +301,9 @@ impl MetalRenderer {
             // v1.11.6 (PLAN_v1116 M2): polled per-frame by the redraw
             // controller; flipped through `set_live_resize` (runtime.rs).
             live_resize_active: false,
+            // PLAN_zoom Z-c: independent zoom-sequence channel (never gate-
+            // coupled to the M2 switch); flipped via set_zoom_sequence.
+            zoom_sequence_flip: false,
             // v1.12.2 B2 (PLAN_S2_render): config-gated rollback carrier +
             // its flush observability counter (tests assert the gate).
             live_resize_flip_enabled,
@@ -501,6 +504,75 @@ mod tests {
         renderer.set_live_resize(true);
         assert!(!renderer.live_resize_active);
         assert!(!renderer.layer.presents_with_transaction());
+    }
+
+    // ── PLAN_zoom Z-c: the zoom-sequence present channel ──
+    //
+    // Flush truth table: (enabled && active) || zoom. The zoom channel is an
+    // INDEPENDENT input — it must flush with the M2 switch off (a double-click
+    // zoom never enters inLiveResize, so set_live_resize never engages), and
+    // it must not change drag behaviour with the switch on.
+
+    #[test]
+    fn zoom_sequence_flip_flushes_without_the_config_gate() {
+        let Some(_device) = Device::system_default() else {
+            eprintln!("skipping zoom-flip gate test: no Metal device available");
+            return;
+        };
+        let mut renderer = MetalRenderer::new_headless_paint(weft_core::config::Theme::weft_dark());
+        renderer.live_resize_flip_enabled = false; // mirrors default config
+        renderer.live_resize_active = false;
+        assert_eq!(renderer.core_animation_flushes.get(), 0);
+
+        // PLAN_zoom rust-reviewer MEDIUM-R1: drive the channel through the
+        // SETTER and pin the presents binding it must perform (a bare field
+        // write would bypass exactly the mechanism HIGH-1 added).
+        renderer.set_zoom_sequence(true);
+        assert!(renderer.zoom_sequence_flip);
+        assert!(
+            renderer.layer.presents_with_transaction(),
+            "zoom channel must bind the present with the M2 switch off"
+        );
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            1,
+            "zoom channel: flush must run with the M2 switch off"
+        );
+
+        renderer.set_zoom_sequence(false);
+        assert!(!renderer.zoom_sequence_flip);
+        assert!(
+            !renderer.layer.presents_with_transaction(),
+            "zoom channel release must restore async present"
+        );
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            1,
+            "channels off: no flush (default semantics re-pinned)"
+        );
+    }
+
+    /// Drag semantics with the switch ON are unchanged by the zoom channel:
+    /// enabled && active still flushes, and channels-off still does not.
+    #[test]
+    fn drag_flush_with_switch_on_survives_the_zoom_channel() {
+        let Some(_device) = Device::system_default() else {
+            eprintln!("skipping drag-flush survival test: no Metal device available");
+            return;
+        };
+        let mut renderer = MetalRenderer::new_headless_paint(weft_core::config::Theme::weft_dark());
+        assert!(renderer.live_resize_flip_enabled);
+        assert_eq!(renderer.core_animation_flushes.get(), 0);
+
+        renderer.set_live_resize(true);
+        renderer.flush_core_animation_if_live_resize();
+        assert_eq!(
+            renderer.core_animation_flushes.get(),
+            1,
+            "drag with the switch on: flush unchanged"
+        );
     }
 
     /// Config ON (`presents_with_transaction_live_resize = true`): the

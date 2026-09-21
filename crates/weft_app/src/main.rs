@@ -56,6 +56,7 @@ mod macos_appearance;
 mod macos_notifications;
 mod macos_system;
 mod macos_window;
+mod macos_zoom;
 mod menu;
 mod mouse_controller;
 mod mouse_press_controller;

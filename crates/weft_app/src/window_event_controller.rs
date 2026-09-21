@@ -128,9 +128,19 @@ impl App {
                 // later RedrawRequested arriving (the last drag event can be
                 // a Resized).
                 if let (Some(renderer), window) = (&mut self.renderer, self.window.as_ref()) {
-                    let live_resize =
-                        window.is_some_and(crate::macos_window::window_in_live_resize);
+                    // PLAN_zoom Z-b: a programmatic (double-click) zoom never
+                    // enters inLiveResize — the zoom-sequence marker stamped
+                    // by the injected windowWillResize hook extends the
+                    // same-tick draw to it.
+                    let live_resize = window
+                        .is_some_and(crate::macos_window::window_in_live_resize)
+                        || crate::macos_zoom::zoom_sequence_active();
+                    // PLAN_zoom Z-c: set_zoom_sequence runs AFTER
+                    // set_live_resize so the release path (both flags false)
+                    // lands the async-present restore before the zoom flip
+                    // re-binds the transaction.
                     renderer.set_live_resize(live_resize);
+                    renderer.set_zoom_sequence(crate::macos_zoom::zoom_sequence_active());
                     if live_resize {
                         self.handle_redraw_requested_forced();
                     }
@@ -168,12 +178,20 @@ impl App {
                 // winit dispatch point) rather than at the draw call site in
                 // redraw_controller.rs because that file sits at its audited
                 // 866-line ceiling; same frame, same result.
-                let live_resize = self
+                // PLAN_zoom Z-c: the zoom sequence rides the same path —
+                // polled here so the flip releases when the 300 ms
+                // silence window lapses even without a Resized event.
+                // The zoom flip stays a SEPARATE flag from live_resize so
+                // the M2 rollback switch's semantics are untouched (the
+                // flush gate ORs the two).
+                let in_live_resize = self
                     .window
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
+                let zoom_sequence = crate::macos_zoom::zoom_sequence_active();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.set_live_resize(live_resize);
+                    renderer.set_live_resize(in_live_resize || zoom_sequence);
+                    renderer.set_zoom_sequence(zoom_sequence);
                 }
                 self.handle_redraw_requested();
                 self.performance_probe.record_redraw(started.elapsed());

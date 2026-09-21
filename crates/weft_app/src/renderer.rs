@@ -148,6 +148,14 @@ pub struct MetalRenderer {
     /// `encode_and_present` also flushes the Core Animation transaction
     /// while active. Polled per-frame by the redraw controller.
     pub(crate) live_resize_active: bool,
+    /// PLAN_zoom Z-c: true while the programmatic-zoom sequence (double-click
+    /// zoom never enters inLiveResize) is active. Independent of the M2
+    /// rollback switch: the Core Animation flush gate ORs this with the
+    /// live-resize pair, so zoom frames bind their present to the CA
+    /// transaction regardless of `[window]
+    /// presents_with_transaction_live_resize`. Polled per-frame from
+    /// `macos_zoom::zoom_sequence_active()` by the redraw controller.
+    pub(crate) zoom_sequence_flip: bool,
     /// v1.12.2 B2 (PLAN_S2_render): `[window]
     /// presents_with_transaction_live_resize` config gate, injected once at
     /// construction. `true` restores the v1.11.6 rollback carrier (flip the
