@@ -150,7 +150,7 @@ fn schedule_primary_history_refresh_wakes(
     // delivered after exit, so a warn would be pure teardown noise.
     for delay in tabs
         .iter_mut()
-        .filter_map(Tab::take_primary_history_refresh_wake_delay)
+        .flat_map(Tab::take_primary_history_refresh_wake_delays)
     {
         let proxy = proxy.clone();
         std::thread::Builder::new()

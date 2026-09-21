@@ -1,4 +1,5 @@
 use super::Tab;
+use crate::pane::Pane;
 use weft_core::persistence::TabSnapshot;
 
 /// Block-view scroll anchor (R2-1).
@@ -89,7 +90,6 @@ impl Tab {
     pub fn block_scroll(&self) -> usize {
         self.block_scroll_anchor.offset_value()
     }
-
     pub(crate) fn block_scroll_position(&self) -> f32 {
         self.block_scroll_anchor.offset_value() as f32 + self.block_scroll_fraction
     }
@@ -138,17 +138,11 @@ impl Tab {
     /// accepted — see `split_head_anchor_compensation` for the floor
     /// caveat. FollowBottom is untouched — the live tail keeps the view
     /// pinned to the bottom.
+    ///
+    /// Active-pane delegate — the per-pane body lives on [`Pane`] for the
+    /// FIX_background_pane_pump consume pass.
     pub(crate) fn compensate_anchor_for_split(&mut self, heads: usize) {
-        if heads == 0 {
-            return;
-        }
-        let delta = crate::tab::scroll::split_head_anchor_compensation(heads);
-        if delta == 0 {
-            return;
-        }
-        if let BlockScrollAnchor::FixedDocumentRow(n) = self.block_scroll_anchor {
-            self.block_scroll_anchor = BlockScrollAnchor::FixedDocumentRow(n.saturating_add(delta));
-        }
+        self.active_mut().compensate_anchor_for_split(heads);
     }
 
     /// v1.10.24 (FIX_RECOVERY_DESIGN_ALIGNMENT Fix 2): Attach a persisted
@@ -196,32 +190,7 @@ impl Tab {
     }
 
     pub fn snap_to_bottom(&mut self) {
-        self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
-        self.block_scroll_fraction = 0.0;
-        // v1.10.21: snapshot the peek flag BEFORE the mutable terminal
-        // borrow — the entry gate is a sibling Tab field and the closure
-        // below can't touch it while `self.terminal` is borrowed through
-        // DerefMut (disjoint-field borrows don't work through Deref).
-        let peek_was_active = self
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
-        let changed = self.terminal.as_mut().is_some_and(|terminal| {
-            let changed = terminal.primary_history_view();
-            terminal.set_primary_history_view(false);
-            // v1.10.12: also leave any alt-screen history peek.
-            terminal.set_alt_screen_history_peek(false);
-            changed
-        });
-        // v1.10.21: arm the re-entry lockout only on a REAL exit (the flag
-        // was set) — an unconditional note_exit would lock out peek entry
-        // after every keystroke/snap, even with no peek.
-        if peek_was_active {
-            self.alt_peek_gate.note_exit();
-        }
-        if changed {
-            self.reset_primary_history_refresh();
-        }
+        self.active_mut().snap_to_bottom();
     }
 
     pub fn scroll_up_by(&mut self, rows: usize) {
@@ -299,6 +268,57 @@ impl Tab {
         // cleared an active peek (`!detached && peek_was_active`) — see
         // snap_to_bottom for why the note is conditional.
         if !detached && peek_was_active {
+            self.alt_peek_gate.note_exit();
+        }
+        if changed {
+            self.reset_primary_history_refresh();
+        }
+    }
+}
+
+/// Pane-level scroll primitives for the FIX_background_pane_pump per-pane
+/// consume pass — the `Tab` methods above deref to the active pane, which
+/// used to make every scroll side effect active-pane-only. The bodies are
+/// moved verbatim; see the `Tab` delegates for their history.
+impl Pane {
+    /// Advance this pane's detached anchor past `heads` settled split
+    /// chrome rows (D-3; see [`Tab::compensate_anchor_for_split`]).
+    pub(super) fn compensate_anchor_for_split(&mut self, heads: usize) {
+        if heads == 0 {
+            return;
+        }
+        let delta = split_head_anchor_compensation(heads);
+        if delta == 0 {
+            return;
+        }
+        if let BlockScrollAnchor::FixedDocumentRow(n) = self.block_scroll_anchor {
+            self.block_scroll_anchor = BlockScrollAnchor::FixedDocumentRow(n.saturating_add(delta));
+        }
+    }
+
+    /// Restore this pane's FollowBottom anchor and leave any detached
+    /// browsing view (see [`Tab::snap_to_bottom`]).
+    pub(super) fn snap_to_bottom(&mut self) {
+        self.block_scroll_anchor = BlockScrollAnchor::FollowBottom;
+        self.block_scroll_fraction = 0.0;
+        // v1.10.21: snapshot the peek flag BEFORE the mutable terminal
+        // borrow — the entry gate is a sibling field and the closure
+        // below can't touch it while `self.terminal` is borrowed.
+        let peek_was_active = self
+            .terminal
+            .as_ref()
+            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
+        let changed = self.terminal.as_mut().is_some_and(|terminal| {
+            let changed = terminal.primary_history_view();
+            terminal.set_primary_history_view(false);
+            // v1.10.12: also leave any alt-screen history peek.
+            terminal.set_alt_screen_history_peek(false);
+            changed
+        });
+        // v1.10.21: arm the re-entry lockout only on a REAL exit (the flag
+        // was set) — an unconditional note_exit would lock out peek entry
+        // after every keystroke/snap, even with no peek.
+        if peek_was_active {
             self.alt_peek_gate.note_exit();
         }
         if changed {

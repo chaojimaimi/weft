@@ -6,76 +6,16 @@ const MAX_CLOSE_TAIL_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_CLOSE_TAIL_EVENTS: usize = 256;
 
 impl Tab {
+    /// Active-pane entry to the PTY output processor. FIX_background_pane_pump
+    /// §2.2: the body moved to `tab/pane_pump.rs`
+    /// ([`Tab::process_pty_output_for_pane`]) so the per-pane consume pass and
+    /// this path share one implementation; the alt-flip recording there now
+    /// carries the pane id (`record_alt_flip_instants(pane_id, flips)`).
+    /// Kept for the tab-close tail drain (`finish_pending_blocks` →
+    /// `drain_bounded_close_tail`) and the tab tests, which all operate on
+    /// the active pane.
     pub(super) fn process_pty_output(&mut self, data: &[u8]) -> bool {
-        // v1.10.4: detect alt-screen (DEC 1049) enter/exit. When a TUI
-        // toggles between alt-screen and primary screen, the PTY cols must
-        // switch between full-width (alt-screen: TUI needs every column to
-        // paint borders/layout) and gutter-subtracted (primary screen:
-        // BlockView reserves breathing room).
-        //
-        // v1.10.26 Batch D (D-2): alt toggles are detected by the terminal's
-        // u64 flip-counter diff across the `process()` batch, not by
-        // comparing the `alt_active` boolean before/after — a batch that
-        // contains an h→l pair nets the boolean to zero yet still performed
-        // two real flips, and those must refresh the flip history / debounce
-        // window or the burst lock expires early (v1.10.19 loop loophole).
-        //
-        // v1.10.21: same capture-before pattern for the alt-screen history
-        // peek — the VT core clears the flag itself on CSI ?1049l (deep in
-        // the parser, unreachable from the app layer), and the entry gate's
-        // re-entry lockout must arm on that exit too. `note_exit` runs after
-        // the terminal borrow ends because the gate is a sibling Pane field.
-        let was_peeking = self
-            .terminal
-            .as_ref()
-            .is_some_and(weft_core::vt::Terminal::is_alt_screen_history_peek);
-        let (response, alt_flips) = match &mut self.terminal {
-            Some(terminal) => {
-                let before = terminal.alt_flip_count();
-                terminal.process(data);
-                let flips = terminal.alt_flip_count().saturating_sub(before);
-                (terminal.take_response(), flips)
-            }
-            None => return false,
-        };
-        // v1.10.25 Batch 3 (FIX_SELECTION_AND_RESIZE_REMAINING) DEBUG probe
-        // (stage 3/4): first PTY output after a committed resize — measures
-        // when omp starts repainting (the ioctl-to-repaint gap). Fires once
-        // per resize, then disarms.
-        if let Some(since_ioctl) = self.take_resize_output_probe() {
-            tracing::debug!(
-                since_ioctl_ms = since_ioctl.as_millis(),
-                bytes = data.len(),
-                "RESIZE_PROBE first_pty_output",
-            );
-        }
-        if alt_flips > 0 {
-            self.pending_alt_rescale = true;
-            // v1.10.19: arm the debounce window — take_pending_alt_rescale
-            // holds the recompute while toggles repeat inside it so a burst
-            // coalesces into one recompute (see tab/resize.rs).
-            // v1.10.26 (D-1/D-2) + v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): the
-            // flip history (last two instants + source pane) is driven off the
-            // counter diff — the burst-storm signature for the cols mirror
-            // freeze (`burst_locked_cols`).
-            self.record_alt_flip_instants(alt_flips);
-        }
-        if was_peeking
-            && !self
-                .terminal
-                .as_ref()
-                .is_some_and(|t| t.is_alt_screen_history_peek())
-        {
-            self.alt_peek_gate.note_exit();
-        }
-        if !response.is_empty() {
-            if let Some(pty) = &self.pty {
-                if let Err(error) = pty.write_sync(&response) {
-                    tracing::warn!(%error, "failed to write terminal response");
-                }
-            }
-        }
-        true
+        self.process_pty_output_for_pane(self.active_pane, data)
     }
 
     pub fn finish_pending_blocks(&mut self) -> Vec<weft_core::blocks::Block> {

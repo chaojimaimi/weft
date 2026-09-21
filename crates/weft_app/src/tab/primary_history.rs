@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 use super::Tab;
+use crate::pane::Pane;
 
 #[derive(Default)]
 pub(crate) struct PrimaryHistoryRefresh {
@@ -40,9 +41,39 @@ impl PrimaryHistoryRefresh {
 }
 
 impl Tab {
-    /// Refresh the detached primary-screen document after PTY output. When the
-    /// core's 50ms limiter rejects an early update, retain one deadline so a
-    /// quiet TUI still publishes its final frame after output stops.
+    /// Reset the ACTIVE pane's rate-limit state (keystroke-path Deref caller).
+    pub(super) fn reset_primary_history_refresh(&mut self) {
+        self.active_mut().reset_primary_history_refresh();
+    }
+
+    /// FIX_background_pane_pump (rust-reviewer M-1): claim a wake for EVERY
+    /// pane with a pending, unclaimed snapshot deadline — a quiet background
+    /// TUI's final rate-limited frame must still publish. Each pane's claim
+    /// is released by its own `refresh_primary_history_snapshot`
+    /// deadline branch, so the delays are independent; the caller schedules
+    /// one timer per entry.
+    pub(crate) fn take_primary_history_refresh_wake_delays(&mut self) -> Vec<Duration> {
+        let now = Instant::now();
+        self.panes
+            .values_mut()
+            .filter_map(|pane| {
+                let slot = &mut pane.primary_history_refresh;
+                let due = slot.due?;
+                if slot.wake_scheduled {
+                    return None;
+                }
+                slot.wake_scheduled = true;
+                Some(due.saturating_duration_since(now))
+            })
+            .collect()
+    }
+}
+
+impl Pane {
+    /// Rate-limited primary-screen snapshot refresh for THIS pane — the
+    /// per-pane consume pass calls it directly for every pane
+    /// (FIX_background_pane_pump §2.2); the old active-pane-only delegate
+    /// was a plain Deref to this body.
     pub(super) fn refresh_primary_history_snapshot(&mut self, output_arrived: bool) -> bool {
         let now = Instant::now();
         let deadline_reached = self
@@ -109,16 +140,6 @@ impl Tab {
 
     pub(super) fn reset_primary_history_refresh(&mut self) {
         self.primary_history_refresh = PrimaryHistoryRefresh::default();
-    }
-
-    /// Claim the single runtime wake that will flush a rate-limited snapshot.
-    pub(crate) fn take_primary_history_refresh_wake_delay(&mut self) -> Option<Duration> {
-        let due = self.primary_history_refresh.due?;
-        if self.primary_history_refresh.wake_scheduled {
-            return None;
-        }
-        self.primary_history_refresh.wake_scheduled = true;
-        Some(due.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -205,7 +226,7 @@ mod tests {
             "browsing must freeze the live snapshot (no refresh scheduled)"
         );
         assert!(
-            tab.take_primary_history_refresh_wake_delay().is_none(),
+            tab.take_primary_history_refresh_wake_delays().is_empty(),
             "browsing must not schedule a refresh wake"
         );
 
@@ -234,7 +255,7 @@ mod tests {
             .unwrap();
         tab.process_messages();
         assert!(
-            tab.take_primary_history_refresh_wake_delay().is_some(),
+            !tab.take_primary_history_refresh_wake_delays().is_empty(),
             "following the tail must resume snapshot refresh scheduling"
         );
     }
@@ -252,7 +273,7 @@ mod tests {
             .send(AppMsg::PtyOutput(b"\x1b[2K\x1b[1Gsecond".to_vec()))
             .unwrap();
         tab.process_messages();
-        assert!(tab.take_primary_history_refresh_wake_delay().is_some());
+        assert!(!tab.take_primary_history_refresh_wake_delays().is_empty());
 
         // Leave (browse) and come back before the old wake: browsing freezes
         // the refresh state; returning to the tail must start a fresh
@@ -268,7 +289,9 @@ mod tests {
             .unwrap();
         tab.process_messages();
         let delay = tab
-            .take_primary_history_refresh_wake_delay()
+            .take_primary_history_refresh_wake_delays()
+            .into_iter()
+            .min()
             .expect("follow after browsing must schedule its own refresh wake");
         std::thread::sleep(delay + Duration::from_millis(5));
 

@@ -174,14 +174,19 @@ impl DockBadgeDebounce {
 
 impl App {
     /// v1.11.5 (PLAN_v1115 §M2): dispatch one batch of drained ui events.
-    pub(crate) fn dispatch_ui_events(&mut self, events: Vec<UiEvent>) {
-        for event in events {
+    /// FIX_background_pane_pump §2.4: events arrive as `(source pane, event)`
+    /// pairs — every pane is drained now, and the OSC 52 read request needs
+    /// its source to route the reply (the write/notify/progress arms don't
+    /// care where the event came from; their gates are config/state-driven
+    /// and deliberately unchanged).
+    pub(crate) fn dispatch_ui_events(&mut self, events: Vec<(PaneId, UiEvent)>) {
+        for (pane_id, event) in events {
             match event {
                 UiEvent::RemoteNotify { title, body } => self.on_remote_notify(title, body),
                 UiEvent::ClipboardWrite { data, truncated } => {
                     self.on_clipboard_write(data, truncated);
                 }
-                UiEvent::ClipboardReadRequest => self.on_clipboard_read_request(),
+                UiEvent::ClipboardReadRequest => self.on_clipboard_read_request(pane_id),
                 // v1.11.13 (PLAN_v11113 §M1): the enum rides through — the
                 // graphic layer needs the shape, no badge_text folding.
                 UiEvent::DockProgress(progress) => {
@@ -270,11 +275,17 @@ impl App {
     /// cooldown → silent (no prompt, no answer); otherwise park the request
     /// (single slot — an occupied slot DROPS the new request with a warn,
     /// H-i) and prompt off the winit handler.
-    fn on_clipboard_read_request(&mut self) {
+    ///
+    /// FIX_background_pane_pump §2.4: `pane_id` is the SOURCE pane, tagged
+    /// at the drain point — it used to be assumed to be the active pane
+    /// (only the active pane was ever drained). The AUTHORIZATION gate is
+    /// unchanged (config + cooldown, independent of focus or source); only
+    /// the reply ROUTING is source-accurate now.
+    fn on_clipboard_read_request(&mut self, pane_id: PaneId) {
         // v1.11.15 (FIX B, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §2): a stale OSC
-        // 52 read request can outlive the last tab; both the Allow and
-        // Prompt branches deref sessions.active() below. Drop the request
-        // with a debug trail instead of indexing past the end.
+        // 52 read request can outlive the last tab; the parked prompt would
+        // resolve against a dead session. Drop the request with a debug
+        // trail instead of prompting for a session that no longer exists.
         if self.sessions.tabs().is_empty() {
             tracing::debug!("dropping stale OSC 52 read request — no tabs left");
             return;
@@ -288,16 +299,16 @@ impl App {
             }
             ReadGate::Allow => {
                 // Unrestricted: read + reply now, no prompt, no park
-                // (reviewer P1-1 — the mode's config/UI promise).
-                let pane_id = self.sessions.active().active_pane_id();
+                // (reviewer P1-1 — the mode's config/UI promise). The reply
+                // goes straight to the SOURCE pane's PTY.
                 self.deliver_osc52_read_reply(
                     NEXT_OSC52_READ_SEQ.fetch_add(1, Ordering::Relaxed),
                     pane_id,
                 );
             }
             ReadGate::Prompt => {
-                // F18: the request came from the active pane's terminal.
-                let pane_id = self.sessions.active().active_pane_id();
+                // Park + prompt; the decision echoes back to `pane_id` via
+                // the parked slot (peek-compare-take on seq).
                 self.park_and_prompt_osc52_read(pane_id);
             }
         }

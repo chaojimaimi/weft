@@ -21,7 +21,9 @@ use weft_core::pty::PtyError;
 use weft_core::vt::Terminal;
 
 use crate::pane::Pane;
-use crate::{AppEvent, AppMsg};
+use crate::AppEvent;
+#[cfg(test)]
+use crate::AppMsg;
 
 /// v1.3.4: Geometry inputs for `Tab::split_active_pane`. Bundles the
 /// renderer's current content rect + cell size into a single value so the
@@ -40,6 +42,7 @@ pub(crate) struct PaneSplitGeometry {
 }
 
 mod lifecycle;
+mod pane_pump;
 mod primary_history;
 mod resize;
 mod scroll;
@@ -51,8 +54,10 @@ pub(crate) use tui_scroll::PendingTuiScroll;
 pub use tui_scroll::TuiScrollResolution;
 
 /// v1.10.26 (D-1) + v1.10.27 (FIX_RESIZE_DOUBLE_REDRAW): the two most recent
-/// alt-screen flips from the same source pane — the burst-storm signature
-/// for `burst_locked_cols`.
+/// alt-screen flips from one source pane — the burst-storm signature for
+/// `burst_locked_cols`. FIX_background_pane_pump §2.5: stored per source
+/// pane (`Tab::alt_flip_history` map), so one pane's record can never be
+/// reset by another pane's flip.
 ///
 /// A real alt TUI (vim/less) enters with ONE flip and goes quiet; an omp
 /// repaint feedback loop toggles DEC 1049 every ~130ms. The freeze needs the
@@ -64,9 +69,9 @@ pub use tui_scroll::TuiScrollResolution;
 /// how fresh it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AltFlipHistory {
-    /// Pane that produced these flips (the active pane at detection time).
-    /// The lock is scoped to this pane: pane A's storm cannot widen pane B's
-    /// real TUI target (v1.10.19 "A 面板风暴误伤 B 面板").
+    /// Pane that produced these flips. The lock is scoped to this pane:
+    /// pane A's storm cannot widen pane B's real TUI target (v1.10.19
+    /// "A 面板风暴误伤 B 面板").
     pub(crate) src_pane: PaneId,
     /// The older of the two most recent flips (`count == 1` → not meaningful).
     pub(crate) older: std::time::Instant,
@@ -100,7 +105,7 @@ pub struct Tab {
     /// Currently focused pane. Keyboard input, IME, and Deref forward here.
     /// Always points at a leaf present in `split_tree` / `panes`.
     active_pane: PaneId,
-    /// v1.10.4: set when the active pane enters/exits alt-screen (DEC 1049).
+    /// v1.10.4: set when any pane enters/exits alt-screen (DEC 1049).
     /// The redraw loop checks this to trigger a geometry recompute so PTY
     /// cols switch between full-width (TUI) and gutter-subtracted (BlockView
     /// shell output). Consumed only when the tab is active; a background
@@ -112,13 +117,31 @@ pub struct Tab {
     /// coalesces into one recompute instead of one per flip. v1.10.26 (D-2):
     /// armed off the u64 flip-counter diff, so even-count batches (h→l
     /// net-zero) still refresh the window.
+    ///
+    /// FIX_background_pane_pump §2.4 (2): "any pane" is literal now —
+    /// background panes are pumped and consumed too, so their flips arm
+    /// this flag. The single merged value is deliberate: one main thread
+    /// consumes all panes in order (no lost-write race), and the resize
+    /// commit itself walks every pane (`resize_all_panes_for_rect`), so one
+    /// armed recompute serves all sources.
     pending_alt_rescale: bool,
-    /// v1.10.19/26 (D-1)/27: flip history of the last alt-screen toggles that
-    /// armed `pending_alt_rescale` — the last two flip instants + their
-    /// source pane. `None` until the first flip. Drives both the
-    /// `take_pending_alt_rescale` debounce freshness and the
-    /// `burst_locked_cols` storm freeze (see `tab/resize.rs`).
-    alt_flip_history: Option<AltFlipHistory>,
+    /// FIX_background_pane_pump §2.5 (was a single `Option<AltFlipHistory>`
+    /// slot): per-pane flip history of the last alt-screen toggles that
+    /// armed `pending_alt_rescale` — the last two flip instants of THAT
+    /// pane. Keyed by `PaneId`; absent until the pane's first flip. Drives
+    /// both the `take_pending_alt_rescale` debounce freshness and the
+    /// `burst_locked_cols` storm freeze (see `tab/resize.rs`). Per-pane
+    /// storage is the point: a single slot let pane B's isolated flip
+    /// discard pane A's accumulated record, un-freezing A's storm early
+    /// (the v1.10.19 "A 面板风暴误伤 B 面板" mirror regression).
+    alt_flip_history: HashMap<PaneId, AltFlipHistory>,
+    /// FIX_background_pane_pump (rust-reviewer H-1): the FIRST pane the LAST
+    /// frame's shared budget deferred (`Some` only when panes were left for
+    /// the next frame). The next frame's per-pane pass rotates the sorted
+    /// order to start AT that pane, so a persistently saturating sibling
+    /// defers panes round-robin instead of pinning the deferral on one
+    /// arbitrary (HashMap-order) target.
+    pump_rotation: Option<PaneId>,
     /// v1.10.19: time the pending rescale was last consumed by
     /// `take_pending_alt_rescale`. A fresh toggle inside the debounce window
     /// after a consumed recompute marks a burst (the SIGWINCH feedback loop
@@ -473,6 +496,10 @@ impl Tab {
             self.active_pane = id;
         }
         self.panes.remove(&closing);
+        // FIX_background_pane_pump §2.5: the per-pane storm record dies with
+        // the pane — a stale entry would keep freezing layout for a pane
+        // that no longer exists and would grow the map over tab lifetime.
+        self.alt_flip_history.remove(&closing);
         Ok(new_active.is_none())
     }
 
@@ -571,8 +598,9 @@ impl Tab {
             panes,
             active_pane: pane_id,
             pending_alt_rescale: false,
-            alt_flip_history: None,
+            alt_flip_history: HashMap::new(),
             alt_rescale_last_taken: None,
+            pump_rotation: None,
             resize_output_probe: None,
         }
     }
@@ -713,8 +741,12 @@ impl Tab {
     }
 
     /// Non-blocking drain of PTY events into channel. Capped per frame.
+    /// FIX_background_pane_pump §2.1: pumps EVERY pane (was active-only);
+    /// the implementation lives in `tab/pane_pump.rs` with the consume half.
     pub fn pump_pty(&mut self) {
-        self.active_mut().pump_pty()
+        for pane in self.panes.values_mut() {
+            pane.pump_pty();
+        }
     }
 
     /// v1.11.15 (FIX A, PLAN_v11115 §1.2): whether the active pane's PTY
@@ -836,134 +868,6 @@ impl Tab {
             ))
         })?;
         pty.write_sync_reported(data)
-    }
-
-    /// Process queued messages into the terminal and drain finished blocks.
-    /// v1.0 P1.5-C3: Time-bounded processing. The loop drains messages until
-    /// either the channel is empty OR a ~8ms wall-clock budget is exhausted.
-    /// This keeps the render thread responsive during huge PTY bursts (e.g.
-    /// `cat huge.log`): instead of blocking for 100ms+ processing a full read
-    /// buffer, we process ~8ms worth, yield to the renderer, then resume next
-    /// frame. The byte budget (`MAX_BYTES_PER_MESSAGE`) only governs splitting
-    /// a single oversized message so one message can't monopolize a frame.
-    ///
-    /// Returns `(alive, drained_blocks, need_redraw, ui_events)`. v1.11.5
-    /// (PLAN_v1115 §M2): the 4th element drains `Terminal::take_ui_events()`
-    /// (OSC 52 / 9 / 777 app-facing events) at the same point where
-    /// `take_response` is consumed inside `process_pty_output`. Note (F18):
-    /// only the ACTIVE pane is pumped (`pump_pty`), so every drained ui
-    /// event comes from the active pane — would-be producers in background
-    /// panes simply don't run, same as their output; the app layer needs no
-    /// source disambiguation. Do not "fix" this by pumping every pane here.
-    pub fn process_messages(
-        &mut self,
-    ) -> (
-        bool,
-        Vec<weft_core::blocks::Block>,
-        bool,
-        Vec<weft_core::vt::UiEvent>,
-    ) {
-        let mut need_redraw = false;
-        // Split threshold for a single oversized message (matches the PTY
-        // read buffer size). Messages larger than this are split: head is
-        // processed now, tail is re-queued for the next frame.
-        const MAX_BYTES_PER_MESSAGE: usize = 256 * 1024;
-        // 8ms leaves ~8ms for rendering at 60fps. We check the clock at most
-        // every MIN_BYTES_FOR_TIME_CHECK bytes to avoid Instant::now() overhead
-        // dominating for tiny messages.
-        const FRAME_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
-        const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
-        let frame_start = std::time::Instant::now();
-        let mut bytes_since_check = 0usize;
-        let mut processed_pty_output = false;
-        let mut alive = true;
-
-        let mut carried = self.pending_pty_output.take().map(AppMsg::PtyOutput);
-        loop {
-            let msg = match carried.take() {
-                Some(msg) => msg,
-                None => match self.msg_rx.try_recv() {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                },
-            };
-            match msg {
-                AppMsg::PtyOutput(mut data) => {
-                    if data.len() > MAX_BYTES_PER_MESSAGE {
-                        // Keep the remainder ahead of every later AppMsg,
-                        // especially PtyExit. Re-queueing it at the channel
-                        // tail would invert the original PTY byte order.
-                        let tail = data.split_off(MAX_BYTES_PER_MESSAGE);
-                        self.pending_pty_output = Some(tail);
-                        need_redraw |= self.process_pty_output(&data);
-                        processed_pty_output = true;
-                        break;
-                    }
-                    bytes_since_check += data.len();
-                    need_redraw |= self.process_pty_output(&data);
-                    processed_pty_output = true;
-                    // Cooperative yield: over budget, drain stops (queued).
-                    if bytes_since_check >= MIN_BYTES_FOR_TIME_CHECK
-                        && frame_start.elapsed() >= FRAME_TIME_BUDGET
-                    {
-                        break;
-                    }
-                }
-                AppMsg::PtyExit(code) => {
-                    tracing::info!("Shell exited: {:?}", code);
-                    // v1.11.4: flags die with the shell.
-                    if let Some(t) = self.terminal.as_mut() {
-                        t.kitty_reset();
-                    }
-                    alive = false;
-                    break;
-                }
-            }
-        }
-
-        // v1.10.4: keypress bypass window — publish now (gated).
-        need_redraw |= if processed_pty_output && self.primary_history_refresh.take_force() {
-            self.terminal
-                .as_mut()
-                .is_some_and(weft_core::vt::Terminal::refresh_primary_history_snapshot_now)
-        } else {
-            self.refresh_primary_history_snapshot(processed_pty_output)
-        };
-        let mut drained = Vec::new();
-        let mut ui_events = Vec::new();
-        let mut reset_scroll = false;
-        let mut split_heads = 0usize;
-        if let Some(terminal) = &mut self.terminal {
-            let settled = if alive {
-                terminal.settle_primary_screen_exit_if_idle(std::time::Instant::now())
-            } else {
-                terminal.settle_primary_screen_exit()
-            };
-            if settled {
-                need_redraw = true;
-            }
-            drained = terminal.block_tracker_mut().drain_unpersisted();
-            // v1.11.5 (PLAN_v1115 §M2): drain app-facing ui events at the
-            // response drain point (see the fn doc for the F18 note).
-            ui_events = terminal.take_ui_events();
-            // v1.10.26 Batch D (D-3): collect any 1MiB history-split head
-            // count settled this frame; the anchor compensation runs after
-            // the terminal borrow ends (disjoint-pane field).
-            split_heads = terminal.take_pending_screen_split_heads().unwrap_or(0);
-            // v1.10.21: don't yank an active history peek (user browsing).
-            reset_scroll = crate::tab::scroll::block_completion_should_snap(terminal, &drained);
-            if terminal.synchronized_output() {
-                need_redraw = false;
-            }
-        }
-        if split_heads > 0 {
-            self.compensate_anchor_for_split(split_heads);
-        }
-        if reset_scroll {
-            self.snap_to_bottom();
-        }
-
-        (alive, drained, need_redraw, ui_events)
     }
 
     /// Whether this tab's terminal + pty are initialized.

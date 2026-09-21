@@ -764,13 +764,18 @@ fn transient_1049_toggle_storm_hysteresis_bounds_ioctl_count() {
 /// storm signature (simulate the 150ms debounce window elapsing) without
 /// sleeping.
 fn expire_alt_flip_history(tab: &mut Tab) {
+    // FIX_background_pane_pump §2.5: the storm record lives in the pane's
+    // own map slot now.
     let stale = std::time::Instant::now() - std::time::Duration::from_millis(300);
-    tab.alt_flip_history = Some(AltFlipHistory {
-        src_pane: tab.active_pane,
-        older: stale,
-        newer: stale,
-        count: 2,
-    });
+    tab.alt_flip_history.insert(
+        tab.active_pane,
+        AltFlipHistory {
+            src_pane: tab.active_pane,
+            older: stale,
+            newer: stale,
+            count: 2,
+        },
+    );
 }
 
 /// v1.10.28 (FIX_TRANSIENT_ALT_COLS_FLIP): let a real alt TUI's CONTINUOUS
@@ -847,12 +852,15 @@ fn resize_followed_by_toggle_pair_emits_exactly_two_ioctls_no_intermediate() {
     // ONLY the app's own dance flips drive the storm signature (a real
     // double-click zoom is seconds after launch).
     let stale = std::time::Instant::now() - std::time::Duration::from_secs(5);
-    tab.alt_flip_history = Some(AltFlipHistory {
-        src_pane: src,
-        older: stale,
-        newer: stale,
-        count: 1,
-    });
+    tab.alt_flip_history.insert(
+        src,
+        AltFlipHistory {
+            src_pane: src,
+            older: stale,
+            newer: stale,
+            count: 1,
+        },
+    );
 
     // (1) Window resize (double-click zoom): new geometry Full=94, Content=91.
     // No flips have happened yet — the first target computes and ships
@@ -949,6 +957,8 @@ fn batch_internal_h_l_pair_counts_two_flips_and_refreshes_history() {
     );
     let hist = tab
         .alt_flip_history
+        .get(&tab.active_pane)
+        .copied()
         .expect("the flip diff must refresh the flip history");
     assert_eq!(hist.count, 2, "two real flips recorded in the history");
     assert_eq!(hist.src_pane, tab.active_pane);

@@ -516,7 +516,11 @@ impl App {
         let mut had_pty_output = false;
         let mut deferred_local_scroll = 0_i32;
         let mut drained_blocks: Vec<weft_core::blocks::Block> = Vec::new();
-        let mut drained_ui_events: Vec<weft_core::vt::UiEvent> = Vec::new();
+        // FIX_background_pane_pump §2.4: events are (source pane, event)
+        // pairs — every pane is drained now, so the OSC 52 read path can
+        // route its reply back to the pane that asked.
+        let mut drained_ui_events: Vec<(weft_core::pane_layout::PaneId, weft_core::vt::UiEvent)> =
+            Vec::new();
         let mut exit_requested = false;
         for i in 0..self.sessions.len() {
             let (alive, drained, need_redraw, ui_events) =
@@ -524,7 +528,8 @@ impl App {
             // Collect final blocks before handling a shell exit.
             drained_blocks.extend(drained);
             // v1.11.5 (PLAN_v1115 §M2): app-facing ui events (OSC 52 / 9 /
-            // 777) — dispatch after the loop, once tab borrows are released.
+            // 777), source-pane tagged — dispatch after the loop, once tab
+            // borrows are released.
             drained_ui_events.extend(ui_events);
             if !alive {
                 // Exit the app only when the last shell exits; Cmd+W is separate.
@@ -591,8 +596,10 @@ impl App {
         // v1.11.5 (PLAN_v1115 §M2): app-facing ui events (OSC 52 clipboard,
         // OSC 9/777 notify, OSC 9;4 Dock progress) — dispatched after all
         // tab borrows are released. Each arm gates against config + state;
-        // the sink calls land in later modules (M3 read prompt, M4 notify
-        // sink, M7 Dock badge).
+        // the sinks land in later modules (M3 read prompt, M4 notify sink,
+        // M7 Dock badge). FIX_background_pane_pump §2.4: the events carry
+        // their source pane, so the OSC 52 read reply routes to the asking
+        // pane instead of assuming the active one.
         if !drained_ui_events.is_empty() {
             self.dispatch_ui_events(drained_ui_events);
         }

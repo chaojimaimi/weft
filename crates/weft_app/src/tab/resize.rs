@@ -1,6 +1,7 @@
 use super::{AltFlipHistory, Tab};
 use crate::effect::PendingPaneResize;
 use std::time::{Duration, Instant};
+use weft_core::pane_layout::PaneId;
 use weft_core::vt::{Terminal, TuiColsKind};
 
 /// v1.10.19: How long a repeated alt-screen toggle delays the pending
@@ -80,17 +81,23 @@ impl Tab {
     /// method — and the ioctl dedup is a simple inequality that cannot
     /// suppress an alternating Full/Content pair. The anti-cycle guard is
     /// [`Tab::burst_locked_cols`], applied at both cols mirror sites.
+    ///
+    /// FIX_background_pane_pump §2.4 (2): the flip history is a per-pane map
+    /// now — freshness is read across ALL panes' newest flips (the single
+    /// merged `pending_alt_rescale` flag is intentional: one main thread,
+    /// per-pane resize commit).
     pub(crate) fn take_pending_alt_rescale(&mut self) -> bool {
         if !self.pending_alt_rescale {
             return false;
         }
         let now = Instant::now();
-        // The recent-flip freshness is read from the flip history's newest
-        // instant (v1.10.26 D-2: armed even by an even-count batch, because
-        // the history is driven by the u64 flip-counter diff).
+        // The recent-flip freshness is read from each pane's flip history
+        // newest instant (v1.10.26 D-2: armed even by an even-count batch,
+        // because the history is driven by the u64 flip-counter diff).
         let fresh_flip = self
             .alt_flip_history
-            .is_some_and(|h| now.duration_since(h.newer) < ALT_RESCALE_DEBOUNCE);
+            .values()
+            .any(|h| now.duration_since(h.newer) < ALT_RESCALE_DEBOUNCE);
         let fresh_take = self
             .alt_rescale_last_taken
             .is_some_and(|at| now.duration_since(at) < ALT_RESCALE_DEBOUNCE);
@@ -157,7 +164,8 @@ impl Tab {
         let current = (terminal.grid().num_rows, terminal.grid().num_cols);
         if let Some(frozen) = cols_target_with_burst_freeze(
             Instant::now(),
-            self.alt_flip_history,
+            // FIX_background_pane_pump §2.5: read THIS pane's storm record.
+            self.alt_flip_history.get(&pane_id).copied(),
             pane_id,
             current,
             ALT_RESCALE_DEBOUNCE,
@@ -174,43 +182,57 @@ impl Tab {
 
     /// v1.10.26 Batch D (D-1/D-2): record the alt-screen flips detected in
     /// one PTY batch, driving the storm signature for `burst_locked_cols`.
-    /// The source pane is the active pane (only the active pane's terminal is
-    /// processed). `batch_flips` is the `Terminal::alt_flip_count` diff across
-    /// a `process()` call — ≥1 guarantees a real flip; a batch-internal h→l
+    /// `pane_id` is the pane whose terminal produced the batch;
+    /// `batch_flips` is the `Terminal::alt_flip_count` diff across a
+    /// `process()` call — ≥1 guarantees a real flip; a batch-internal h→l
     /// pair (net-zero `alt_active`) still counts as two flips (D-2) and
     /// refreshes the debounce window the old boolean detection missed.
-    pub(crate) fn record_alt_flip_instants(&mut self, batch_flips: u64) {
+    ///
+    /// FIX_background_pane_pump §2.5: the record lives in a per-pane map
+    /// slot (was a single tab-level slot) — pane B's isolated flip can no
+    /// longer discard pane A's accumulated record, so A's burst signature
+    /// survives and "different panes' storms never freeze each other"
+    /// holds by construction.
+    pub(crate) fn record_alt_flip_instants(&mut self, pane_id: PaneId, batch_flips: u64) {
         debug_assert!(batch_flips > 0);
         let now = std::time::Instant::now();
-        let src_pane = self.active_pane;
         if batch_flips >= 2 {
             // A single batch with ≥2 toggles lands both storm instants at
             // `now` — a sub-µs double flip, the tightest possible storm.
-            self.alt_flip_history = Some(AltFlipHistory {
-                src_pane,
-                older: now,
-                newer: now,
-                count: 2,
-            });
+            self.alt_flip_history.insert(
+                pane_id,
+                AltFlipHistory {
+                    src_pane: pane_id,
+                    older: now,
+                    newer: now,
+                    count: 2,
+                },
+            );
             return;
         }
-        // A single flip: append to the same pane's record. A pane switch
-        // restarts the record so pane A's storm cannot arm pane B's lock.
-        let prior = match self.alt_flip_history {
-            Some(h) if h.src_pane == src_pane => h,
+        // A single flip: append to THIS pane's record. Another pane's entry
+        // is a different map slot and cannot reset it. (The `src_pane ==
+        // pane_id` guard below is tautological since the per-pane map move --
+        // every insert writes src_pane == key; kept as a plain defensive
+        // read, not a third state.)
+        let prior = match self.alt_flip_history.get(&pane_id) {
+            Some(h) if h.src_pane == pane_id => *h,
             _ => AltFlipHistory {
-                src_pane,
+                src_pane: pane_id,
                 older: now,
                 newer: now,
                 count: 0,
             },
         };
-        self.alt_flip_history = Some(AltFlipHistory {
-            src_pane,
-            older: prior.newer,
-            newer: now,
-            count: prior.count.saturating_add(1).min(2),
-        });
+        self.alt_flip_history.insert(
+            pane_id,
+            AltFlipHistory {
+                src_pane: pane_id,
+                older: prior.newer,
+                newer: now,
+                count: prior.count.saturating_add(1).min(2),
+            },
+        );
     }
 
     /// Read every pane's pending PTY resize and synchronized-frame state.
@@ -284,7 +306,8 @@ mod tests {
 
         // Single toggle (a TUI launch): recompute immediately, no debounce.
         tab.pending_alt_rescale = true;
-        tab.alt_flip_history = Some(single_flip(src, Instant::now()));
+        tab.alt_flip_history
+            .insert(src, single_flip(src, Instant::now()));
         assert!(
             tab.take_pending_alt_rescale(),
             "a lone toggle must recompute right away"
@@ -294,7 +317,8 @@ mod tests {
         // Burst: a fresh toggle right after the consumed recompute is held
         // until the toggles go quiet (the ~130ms SIGWINCH feedback loop).
         tab.pending_alt_rescale = true;
-        tab.alt_flip_history = Some(single_flip(src, Instant::now()));
+        tab.alt_flip_history
+            .insert(src, single_flip(src, Instant::now()));
         assert!(
             !tab.take_pending_alt_rescale(),
             "a burst inside the window must hold the recompute"
@@ -318,10 +342,13 @@ mod tests {
         // A flip older than the debounce window (e.g. a legit re-toggle
         // minutes later) must not be held.
         tab.pending_alt_rescale = true;
-        tab.alt_flip_history = Some(single_flip(
+        tab.alt_flip_history.insert(
             src,
-            Instant::now() - ALT_RESCALE_DEBOUNCE - Duration::from_millis(50),
-        ));
+            single_flip(
+                src,
+                Instant::now() - ALT_RESCALE_DEBOUNCE - Duration::from_millis(50),
+            ),
+        );
         assert!(tab.take_pending_alt_rescale());
     }
 
