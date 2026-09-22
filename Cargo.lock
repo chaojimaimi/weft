@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "weft_app"
-version = "1.12.8"
+version = "1.12.9"
 dependencies = [
  "block",
  "block2",
@@ -3321,7 +3321,7 @@ dependencies = [
 
 [[package]]
 name = "weft_core"
-version = "1.12.8"
+version = "1.12.9"
 dependencies = [
  "base64",
  "bitflags 2.13.1",
