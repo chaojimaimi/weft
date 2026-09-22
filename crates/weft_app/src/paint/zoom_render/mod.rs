@@ -52,7 +52,7 @@ use crate::renderer::MetalRenderer;
 // watch state and the Metal/cache plumbing.
 mod policy;
 pub(crate) use policy::{
-    pull_can_freshen, pull_degrade_verdict, zoom_flush_action, ZoomFlushAction,
+    pull_can_freshen, pull_degrade_verdict, zoom_flush_action, zoom_window_active, ZoomFlushAction,
 };
 
 /// `presentsWithTransaction` staleness bound (E-2): the bind state is reset
@@ -390,6 +390,7 @@ fn zoom_watch() -> MutexGuard<'static, Option<(Instant, u64, u32)>> {
 /// animation); later steps extend the CURRENT window -- overlapping windows
 /// join the live one and the baseline keeps its pre-animation value.
 pub(crate) fn note_zoom_step() {
+    policy::set_zoom_window_active(true);
     let mut watch = zoom_watch();
     if let Some((_, _, steps)) = watch.as_mut() {
         *steps += 1;
@@ -409,6 +410,7 @@ pub(crate) fn note_zoom_step() {
 /// `steps >= 1` always holds for a live watch (`note_zoom_step` opens at 1),
 /// so no separate guard is needed (review L2).
 pub(crate) fn zoom_window_finished() {
+    policy::set_zoom_window_active(false);
     let mut watch = zoom_watch();
     let Some((_start, baseline, steps)) = *watch else {
         return;

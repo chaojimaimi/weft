@@ -177,41 +177,32 @@ unsafe extern "C" fn set_frame_size_imp(
             let drawable = objc2_foundation::NSSize::new(size.width * scale, size.height * scale);
             let _: () = msg_send![layer, setDrawableSize: drawable];
         }
-        // PLAN_zoom appendix F-3A (A2, belt-and-braces with A1's
-        // setNeedsDisplayOnBoundsChange pin): explicitly mark the layer dirty
-        // on every drawable sync, so the CA commit still has a display
-        // request to honor even if the bounds-change pin is missed (Warp
-        // window.m:535 setNeedsDisplayAsync, same shape). Either trigger
-        // alone reaches displayLayer:. Registered drag semantics (F-3A): the
-        // mark can commit one pull frame ahead of the asynchronously
-        // dispatched Resized draw -- one 1:1 frame of lag, never a stretch;
-        // Warp is the accepted same-architecture baseline.
-        //
-        // FIELD CRASH 1.12.12 (both .ips stacks, `set_frame_size_imp`): the
-        // one-argument `setNeedsDisplay:(BOOL)` is an NSVIEW method (what
-        // Warp's setNeedsDisplayAsync targets on the content view);
-        // CALayer's whole-layer dirty mark is the ZERO-argument
-        // `setNeedsDisplay`. Sending the view form to the CAMetalLayer
-        // raised NSInvalidArgumentException (doesNotRecognizeSelector),
-        // which no catch_unwind can intercept across an extern "C" IMP --
-        // the injected setFrameSize runs only on real resizes after the
-        // hook installs, so the first zoom double-click was the first ever
-        // invocation and killed the process on the spot.
-        // SAFETY: `setNeedsDisplay` is core CALayer API (declared on the
-        // inherited layer class); the responds-check below additionally
-        // converts any future lookup failure into a skipped mark instead
-        // of an exception, per this file's guard convention.
-        unsafe {
-            let sel = objc2::sel!(setNeedsDisplay);
-            // Pure class lookup + selector check, no side effects (same
-            // shape as the install path's `pre_responds` probe); already
-            // inside the enclosing catch_unwind safety domain.
-            let layer_class = objc2::ffi::objc_getClass(b"CALayer\0".as_ptr().cast()) as *mut _;
-            let responds: bool = objc2::ffi::class_respondsToSelector(layer_class, sel.as_ptr());
-            if responds {
-                let _: () = msg_send![layer, setNeedsDisplay];
-            } else {
-                tracing::debug!("setNeedsDisplay missing on the layer class; A2 mark skipped");
+        // PLAN_zoom appendix G (field round 3): supply the animation frame
+        // HERE. `displayLayer:` never dispatched in this environment -- the
+        // probe rig proved the chain otherwise complete (makeBackingLayer
+        // adoption, delegate == view, needsDisplay == true across ~150
+        // commits; field: 41-step zoom, zero pulls, both with and without
+        // managed hosting) -- so the trigger cannot be waited on. The
+        // injected `setFrameSize:` IS the per-step callback (it runs on
+        // every zoom step by construction), so the pull presents from here,
+        // bound to the current CA transaction: bounds and pixels commit
+        // atomically, no one-beat gap for the compositor to stretch.
+        // Gate = the zoom-window flag AND the same freshen predicate the
+        // draw-suppression uses, so drags (flag false -- armed only outside
+        // a live-resize gesture) never take the extra present, start-up
+        // (cache empty) never presents a phantom, and the lever stays
+        // authoritative. The displayLayer: delegate + A1 bounds pin remain
+        // armed as an inert bonus trigger: should CA ever dispatch it, its
+        // watermark dedup makes a double present a no-op.
+        if crate::paint::zoom_render::zoom_window_active() {
+            let fresh =
+                crate::paint::zoom_render::pull_can_freshen(size.width as f32, size.height as f32);
+            if fresh {
+                crate::paint::zoom_render::bind_pull_transaction();
+                let presented =
+                    crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
+                crate::paint::zoom_render::unbind_pull_transaction();
+                tracing::debug!(presented, "setFrameSize inline pull");
             }
         }
         // PLAN Z-d C-3: callback density + sync timing are observable at
@@ -329,10 +320,8 @@ pub(crate) fn install_display_layer_hook(window: &winit::window::Window) {
                 NSViewLayerContentsRedrawPolicy::NSViewLayerContentsRedrawDuringViewResize,
             );
         }
-        // layer.delegate = view. Manual `setLayer:` mode does not get this
-        // for free from AppKit (Warp sets it the same way). CALayer.delegate
-        // is unretained (assign): the view owns the layer, so the reference
-        // can never dangle.
+        // layer.delegate = view. CALayer.delegate is unretained (assign):
+        // the view owns the layer, so the reference can never dangle.
         // SAFETY: `layer` on a live view returns the attached CAMetalLayer
         // (renderer construction has already attached it); plain getter.
         let layer: *mut AnyObject = unsafe { msg_send![Retained::as_ptr(&view), layer] };
