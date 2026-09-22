@@ -51,3 +51,5 @@ pub(crate) mod tab_bar;
 pub(crate) mod text;
 pub(crate) mod ui_helpers;
 pub(crate) mod underline;
+// PLAN_zoom Z-f (Appendix E-1): global frame cache + displayLayer pull entry.
+pub(crate) mod zoom_render;

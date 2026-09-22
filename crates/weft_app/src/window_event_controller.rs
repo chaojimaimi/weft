@@ -155,17 +155,26 @@ impl App {
                     // false, so the guard separates the two cleanly. Arm
                     // BEFORE the zoom_jump_hot read: the zoom's own final
                     // Resized then engages the channel same-frame.
-                    // v4: arm on EVERY non-gesture Resized with a size
-                    // change -- the zoom animates in small steps, so the
-                    // per-step re-arm keeps the forced renderer + CA present
-                    // bound for the whole animation. Drags stream with
-                    // inLiveResize true and are excluded by the same guard
-                    // (their sync draw comes from the inLiveResize half).
+                    // v4/Z-f: arm on EVERY non-gesture Resized with a size
+                    // change (the zoom animates in small steps). Z-f retires
+                    // the per-step forced DRAW below -- the arming survives
+                    // as observation/degrade marking only; animation-step
+                    // frames are supplied by the displayLayer pull
+                    // (paint/zoom_render.rs). Drags stream with inLiveResize
+                    // true and are excluded by the same guard (their sync
+                    // draw comes from the inLiveResize half).
                     let in_live_resize_now =
                         window.is_some_and(crate::macos_window::window_in_live_resize);
-                    if size_changed && !in_live_resize_now {
+                    if crate::paint::zoom_render::zoom_jump_should_arm(
+                        size_changed,
+                        in_live_resize_now,
+                    ) {
                         self.window_runtime.zoom_jump_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+                        // Review flow item: arm the pull-degrade watch so a
+                        // silently dead displayLayer path is discoverable in
+                        // the debug log instead of only as an odd stretch.
+                        crate::paint::zoom_render::mark_zoom_window_started();
                     }
                     let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
                     let live_resize = window
@@ -176,7 +185,14 @@ impl App {
                     // lands the async-present restore before the zoom flip
                     // re-binds the transaction.
                     renderer.set_live_resize(live_resize);
-                    if live_resize {
+                    // PLAN_zoom Z-f (Appendix E-3): the v4 per-step forced
+                    // draw is RETIRED for the zoom channel -- a 5-9 ms
+                    // synchronous draw per animation step blocked the
+                    // system's zoom animation itself, which stretched the
+                    // distortion window (Appendix D-0). Only a real drag
+                    // gesture (inLiveResize true at dispatch) keeps the
+                    // same-tick synchronous draw.
+                    if crate::paint::zoom_render::forced_sync_draw_for_resize(in_live_resize_now) {
                         self.handle_redraw_requested_forced();
                     }
                 }
@@ -223,6 +239,12 @@ impl App {
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
                 let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
+                if zoom_jump_hot {
+                    // Review flow item: sweep the pull-degrade watch while a
+                    // zoom window is open -- a zero pull count inside the
+                    // window means the displayLayer path never dispatched.
+                    crate::paint::zoom_render::warn_if_pull_degraded();
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.set_live_resize(in_live_resize || zoom_jump_hot);
                 }

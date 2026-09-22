@@ -10,6 +10,7 @@
 use metal::{MTLClearColor, MTLLoadAction, MTLPixelFormat, MTLStoreAction, RenderPassDescriptor};
 use std::cell::{Cell, RefCell};
 
+use crate::paint::zoom_render;
 use crate::renderer::MetalRenderer;
 
 mod buffer_capacity;
@@ -155,15 +156,34 @@ impl MetalRenderer {
     pub(crate) fn encode_and_present(
         &self,
         drawable: &metal::MetalDrawableRef,
-        vertices: &[f32],
-        bg_instances: &[f32],
-        glyph_instances: &[f32],
+        // PLAN_zoom Z-f: `&mut Vec` so the frame cache handoff at the two
+        // present->flush gaps below can `mem::take` the streams (zero copy).
+        // The caller's Vecs come back EMPTY.
+        vertices: &mut Vec<f32>,
+        bg_instances: &mut Vec<f32>,
+        glyph_instances: &mut Vec<f32>,
         clear_color: (f64, f64, f64, f64),
         drawable_tex_size: (f32, f32),
         vp_mismatch: bool,
         view_switched: bool,
     ) {
         let (bg_r, bg_g, bg_b, clear_a) = clear_color;
+
+        // PLAN_zoom Z-f: retain the session-invariant lean-encode handles
+        // once (a cheap flag check on every later frame) so the displayLayer
+        // pull path can present without ever touching this renderer. The
+        // atlas textures are NOT here: they refresh per stashed frame
+        // (zoom_render H-1 -- atlas rebuilds replace the whole GlyphAtlas).
+        zoom_render::ensure_handles_registered(
+            &self.device,
+            &self.queue,
+            &self.layer,
+            &self.pipeline,
+            &self.instanced_pipeline,
+            &self.bg_stream.pipeline,
+            &self.sampler,
+            &self.index_buffer,
+        );
 
         // v1.0 P1.5-B1: early-exit only when BOTH instances (grid) and
         // vertices (overlays / block view) are empty. In grid view with no
@@ -260,6 +280,22 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             register_gpu_completion_handler(command_buffer);
             command_buffer.commit();
+            // PLAN_zoom Z-f (E-3 nesting rule): hand off BEFORE the flush --
+            // a displayLayer nested in this flush must see the new drawable
+            // size as the watermark and skip instead of overwriting the
+            // fresh frame. Idle path: all streams empty -> the cache keeps
+            // its previous content, only the watermark advances.
+            zoom_render::stash_frame(
+                std::mem::take(vertices),
+                std::mem::take(bg_instances),
+                std::mem::take(glyph_instances),
+                (bg_r, bg_g, bg_b, clear_a),
+                self.viewport,
+                std::mem::take(&mut *self.pane_instance_ranges.borrow_mut()),
+                std::mem::take(&mut *self.pane_vertex_ranges.borrow_mut()),
+                &self.atlas,
+                drawable_tex_size,
+            );
             self.flush_core_animation_if_live_resize();
             return;
         }
@@ -270,7 +306,9 @@ impl MetalRenderer {
         // exceeded (e.g. on first frame or after resize to a larger grid).
         // v1.0 P1.5-B1: skip upload when `vertices` is empty (grid view with
         // no overlays); only the instance buffer is uploaded in that case.
-        let vertex_data_size = std::mem::size_of_val(vertices) as u64;
+        // Z-f: byte length spelled out -- `size_of_val` on the `&mut Vec`
+        // would measure the Vec header, not the slice.
+        let vertex_data_size = (vertices.len() * std::mem::size_of::<f32>()) as u64;
         let mut ring_idx: usize = 0;
         {
             let mut ring = self.vertex_buffer_ring.borrow_mut();
@@ -540,6 +578,22 @@ impl MetalRenderer {
         self.frame_trace.borrow_mut().encode_end();
         register_gpu_completion_handler(command_buffer);
         command_buffer.commit();
+        // PLAN_zoom Z-f (E-3 nesting rule): same handoff point as the idle
+        // path above -- streams + watermark move into the frame cache before
+        // the flush so a nested displayLayer dedups against the new drawable
+        // size. At least one stream is non-empty here (the idle branch
+        // returned), so the cache does a full content replace.
+        zoom_render::stash_frame(
+            std::mem::take(vertices),
+            std::mem::take(bg_instances),
+            std::mem::take(glyph_instances),
+            (bg_r, bg_g, bg_b, clear_a),
+            self.viewport,
+            std::mem::take(&mut *self.pane_instance_ranges.borrow_mut()),
+            std::mem::take(&mut *self.pane_vertex_ranges.borrow_mut()),
+            &self.atlas,
+            drawable_tex_size,
+        );
         self.flush_core_animation_if_live_resize();
     }
 

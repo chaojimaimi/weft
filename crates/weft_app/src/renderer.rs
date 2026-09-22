@@ -1160,11 +1160,16 @@ impl MetalRenderer {
             });
         self.frame_trace.borrow_mut().encode_start();
 
+        // PLAN_zoom Z-f: the three streams are handed to the zoom frame cache
+        // inside `encode_and_present` (mem::take at its present->flush gaps),
+        // so they come back EMPTY. Nothing below re-reads them: the frame
+        // counters above were captured before the call, and only hit regions
+        // are assigned afterwards.
         self.encode_and_present(
             drawable,
-            &vertices,
-            &bg_stream,
-            &glyph_stream,
+            &mut vertices,
+            &mut bg_stream,
+            &mut glyph_stream,
             (bg_r, bg_g, bg_b, clear_a),
             drawable_tex_size,
             vp_mismatch,

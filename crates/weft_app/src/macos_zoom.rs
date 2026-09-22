@@ -1,4 +1,5 @@
-//! Programmatic-zoom sequence ownership (PLAN_zoom_sequence_ownership Z-d).
+//! Programmatic-zoom sequence ownership (PLAN_zoom_sequence_ownership Z-d)
+//! and the displayLayer pull wiring (Appendix E-2, Z-f).
 //!
 //! Double-clicking the titlebar zooms the window programmatically. The zoom
 //! runs INSIDE a live-resize window (`inLiveResize == true` at the old
@@ -186,5 +187,195 @@ unsafe extern "C" fn set_frame_size_imp(
     }))
     .unwrap_or_else(|_| {
         tracing::error!("setFrameSize IMP panicked; drawable sync skipped for this callback");
+    });
+}
+
+/// PLAN_zoom Z-f (Appendix E-2): add `displayLayer:` to the winit view class
+/// and wire the view as its Metal layer's delegate -- the Warp pull-model
+/// pair (host_view.m:147-151 `displayLayer:` -> `warp_update_layer`). Called
+/// AFTER the renderer attached the layer (constructor.rs): the delegate and
+/// the redraw policy pin need the live layer, which does not exist yet where
+/// `install_zoom_sequence_hook` runs (pre-`MetalRenderer::new`).
+///
+/// `displayLayer:` is a CALayerDelegate method, NOT an NSView lifecycle
+/// method: the base NSView class has no implementation, so there is no super
+/// obligation and nothing to forward to (logged pre-install via
+/// `class_respondsToSelector` -- the stage-B first acceptance item). Once the
+/// class implements it, layer content updates route through the delegate
+/// instead of `drawRect:` -- THAT is the real switch; the
+/// `layerContentsRedrawPolicy` write below is a defensive pin of the
+/// documented default (`RedrawDuringViewResize`), not a behavior change.
+pub(crate) fn install_display_layer_hook(window: &winit::window::Window) {
+    use objc2::rc::Retained;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    // M-3: class_addMethod is class-level and idempotent-false on re-call --
+    // without this flag a second invocation (a second window/renderer) would
+    // misread its OWN earlier install as "winit implements it" and silently
+    // skip the delegate/policy arming the new layer needs.
+    static INSTALLED_BY_THIS_MODULE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: the raw-window-handle AppKit view is the live winit-owned
+    // NSView for the window's lifetime; `retain` on a live object is sound.
+    let Some(view) =
+        (unsafe { Retained::retain(appkit.ns_view.as_ptr().cast::<objc2_app_kit::NSView>()) })
+    else {
+        return;
+    };
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::NSViewLayerContentsRedrawPolicy;
+
+        if !INSTALLED_BY_THIS_MODULE.load(std::sync::atomic::Ordering::Acquire) {
+            // SAFETY: `object_getClass` on a live object always returns the
+            // initialized class object.
+            let view_class = unsafe {
+                objc2::ffi::object_getClass(Retained::as_ptr(&view) as *mut AnyObject as *mut _)
+            } as *mut _;
+            let sel = objc2::sel!(displayLayer:);
+            // SAFETY: class/selector pair from the live view's class; a pure
+            // lookup with no side effects. (objc-sys defines BOOL as `bool`
+            // on arm64 -- this tree's only target.)
+            let pre_responds: bool =
+                unsafe { objc2::ffi::class_respondsToSelector(view_class, sel.as_ptr()) };
+            // IMP signature: `- (void)displayLayer:(CALayer *)layer` ->
+            // `v@:@` (void return, id self, SEL _cmd, id layer).
+            let imp: unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel, *mut AnyObject) =
+                display_layer_imp;
+            // SAFETY: transmute between the typed extern "C" fn pointer and
+            // the runtime's untyped `Imp` form is sound for the Objective-C
+            // calling convention (same pattern as the setFrameSize hook).
+            let imp_raw: unsafe extern "C" fn() = unsafe { std::mem::transmute(imp) };
+            let types: &'static std::ffi::CStr = std::ffi::CStr::from_bytes_with_nul(b"v@:@\0")
+                .expect("static encoding has no interior NUL");
+            // SAFETY: adding `displayLayer:` to the winit view class. Guard
+            // semantics per the Z-d convention: succeeds only because the
+            // class itself lacks the selector; a false return here (we are
+            // NOT the installer -- checked above) means a future winit
+            // implements it and we must never replace that implementation.
+            let added = unsafe {
+                objc2::ffi::class_addMethod(view_class, sel.as_ptr(), Some(imp_raw), types.as_ptr())
+            };
+            if !added {
+                tracing::debug!(
+                    "displayLayer hook not installed: the view class implements it; \
+                     pull degrades to the 1.12.10 push form"
+                );
+                return;
+            }
+            INSTALLED_BY_THIS_MODULE.store(true, std::sync::atomic::Ordering::Release);
+            tracing::debug!(
+                pre_responds,
+                "displayLayer hook installed on the winit view class"
+            );
+        } else {
+            tracing::debug!(
+                "displayLayer hook already installed by this module; \
+                 re-arming delegate/policy for this window's layer"
+            );
+        }
+        // Defensive pin (E-2, review P1 correction): Apple's documented
+        // default for layerContentsRedrawPolicy IS RedrawDuringViewResize;
+        // this write guards against future changes and documents intent.
+        // SAFETY: typed objc2-app-kit setter on the live view.
+        unsafe {
+            view.setLayerContentsRedrawPolicy(
+                NSViewLayerContentsRedrawPolicy::NSViewLayerContentsRedrawDuringViewResize,
+            );
+        }
+        // layer.delegate = view. Manual `setLayer:` mode does not get this
+        // for free from AppKit (Warp sets it the same way). CALayer.delegate
+        // is unretained (assign): the view owns the layer, so the reference
+        // can never dangle.
+        // SAFETY: `layer` on a live view returns the attached CAMetalLayer
+        // (renderer construction has already attached it); plain getter.
+        let layer: *mut AnyObject = unsafe { msg_send![Retained::as_ptr(&view), layer] };
+        if layer.is_null() {
+            tracing::debug!("displayLayer hook: layer not attached; delegate not set");
+            return;
+        }
+        // SAFETY: plain `setDelegate:` on the live layer; the unretained
+        // delegate (the view) outlives it.
+        unsafe {
+            let _: () = msg_send![layer, setDelegate: Retained::as_ptr(&view)];
+        }
+        tracing::debug!("displayLayer delegate armed: view -> metal layer");
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("displayLayer hook install panicked; pull DISABLED this session");
+    });
+}
+
+/// The injected `displayLayer:` IMP (CALayerDelegate). Warp host_view.m
+/// shape: synchronous content supply when CA asks for it. Five steps (E-2):
+/// reentry guard, watermark dedup, transaction bind, lean present, unbind.
+/// `self` is the winit view; the layer argument is its CAMetalLayer.
+unsafe extern "C" fn display_layer_imp(
+    this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    layer: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+
+    let _ = this; // no super obligation: displayLayer: is not an NSView lifecycle method
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !crate::paint::zoom_render::pull_enabled() || layer.is_null() {
+            return;
+        }
+        // M-1: this check MUST precede any cache access. The cache Mutex is
+        // not reentrant and the in-flight lean encode holds it across ObjC
+        // calls that can pump a nested displayLayer callback -- a nested
+        // `pull_requests_frame` lock would deadlock the main thread.
+        if crate::paint::zoom_render::pull_in_progress() {
+            tracing::debug!("displayLayer pull skipped: a lean present is in flight");
+            return;
+        }
+        // Requested size = the layer's drawableSize (physical px; the
+        // setFrameSize hook keeps it in sync with the bounds).
+        // SAFETY: `drawableSize` on a live CAMetalLayer returns by value.
+        let size: objc2_foundation::NSSize = unsafe { msg_send![layer, drawableSize] };
+        if !size.width.is_finite()
+            || !size.height.is_finite()
+            || size.width <= 0.0
+            || size.height <= 0.0
+        {
+            return;
+        }
+        // Watermark dedup (E-3): a frame at this drawable size is already on
+        // screen -- presenting again would overwrite a fresh frame with the
+        // same content (and during a nested flush would rewind one step).
+        if !crate::paint::zoom_render::pull_requests_frame(size.width, size.height) {
+            tracing::debug!(
+                width = size.width,
+                height = size.height,
+                "displayLayer pull skipped: watermark current"
+            );
+            return;
+        }
+        // Bind the lean present to the CURRENT CA transaction so bounds and
+        // pixels commit atomically (E-2 pull present semantics), present the
+        // cached frame at the requested size, then unbind (IMP-exit reset).
+        crate::paint::zoom_render::bind_pull_transaction();
+        let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
+        crate::paint::zoom_render::unbind_pull_transaction();
+        // E-4 acceptance: callback density is observable at RUST_LOG=debug.
+        tracing::debug!(
+            presented,
+            width = size.width,
+            height = size.height,
+            "displayLayer pull"
+        );
+    }))
+    .unwrap_or_else(|_| {
+        tracing::error!("displayLayer IMP panicked; pull skipped for this callback");
     });
 }

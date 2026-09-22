@@ -68,6 +68,11 @@ impl MetalRenderer {
             // show the desktop through the (alpha-scaled) cell backgrounds.
             set_layer_opaque(&renderer.layer, renderer.opacity >= 1.0);
         }
+        // PLAN_zoom Z-f (Appendix E-2): displayLayer pull wiring runs AFTER
+        // the layer attach -- delegate + redraw policy need the live layer.
+        // (app_runtime's install_zoom_sequence_hook runs pre-attach and only
+        // does the class-level setFrameSize add.)
+        crate::macos_zoom::install_display_layer_hook(window);
         renderer
     }
 
