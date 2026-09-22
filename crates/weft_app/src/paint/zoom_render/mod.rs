@@ -46,6 +46,15 @@ use crate::layout::Rect;
 use crate::paint::metal_backend::PaneInstanceSegment;
 use crate::renderer::MetalRenderer;
 
+// Appendix F-5 split rule ("over budget -> split, no ceiling raise"): the
+// pure zoom decision layer (suppression gate / expiry decision / degrade
+// verdict) lives in policy.rs with its truth tables; this module keeps the
+// watch state and the Metal/cache plumbing.
+mod policy;
+pub(crate) use policy::{
+    pull_can_freshen, pull_degrade_verdict, zoom_flush_action, ZoomFlushAction,
+};
+
 /// `presentsWithTransaction` staleness bound (E-2): the bind state is reset
 /// when the IMP exits; this deadline is the fallback for a bind left over
 /// from a callback that skipped its unbind.
@@ -360,55 +369,63 @@ fn set_layer_transaction(cache: &FrameCache, bound: bool) -> bool {
     result.is_ok()
 }
 
-/// Pull frames actually presented since process start (observability: the
-/// zoom-window degrade warning keys off this counter).
+/// Pull frames presented since process start (the zoom-window verdict keys
+/// off this counter).
 static PULL_PRESENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Zoom-window watch: `(window start, pull count at arm, warned?)`. Armed
-/// from the Resized branch when the zoom jump arms; swept from the
-/// RedrawRequested poll so a SILENTLY degraded pull (hook not dispatched --
-/// the stage-B experiment risk) is visible in the debug log instead of only
-/// showing up as an unexplained stretch.
-static ZOOM_WATCH: Mutex<Option<(Instant, u64, bool)>> = Mutex::new(None);
+/// Zoom-window watch `(start, pull baseline, steps)` (Appendix F-3C):
+/// opened by the first zoom-channel step (`note_zoom_step`), closed by the
+/// deterministic WaitUntil expiry (`zoom_window_finished`) -- the old
+/// per-callback debug poll was invisible at the default `filter=info`
+/// (F-1 leg 4).
+static ZOOM_WATCH: Mutex<Option<(Instant, u64, u32)>> = Mutex::new(None);
 
-fn zoom_watch() -> MutexGuard<'static, Option<(Instant, u64, bool)>> {
+fn zoom_watch() -> MutexGuard<'static, Option<(Instant, u64, u32)>> {
     ZOOM_WATCH
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Arm the degrade watch for one zoom window (300 ms, same constant family
-/// as the zoom-jump arm). No-op if a window is already open.
-pub(crate) fn mark_zoom_window_started() {
+/// Per-step watch update (F-3C, Resized arm): the first zoom-channel step
+/// opens the window (steps = 1, baseline = the pull count before the
+/// animation); later steps extend the CURRENT window -- overlapping windows
+/// join the live one and the baseline keeps its pre-animation value.
+pub(crate) fn note_zoom_step() {
     let mut watch = zoom_watch();
-    if watch.is_none() {
+    if let Some((_, _, steps)) = watch.as_mut() {
+        *steps += 1;
+    } else {
         *watch = Some((
             Instant::now(),
             PULL_PRESENT_COUNT.load(Ordering::Acquire),
-            false,
+            1,
         ));
     }
 }
 
-/// Warn once per zoom window when no pull presented inside it (review flow
-/// item: make the degradation discoverable in `RUST_LOG=debug`).
-pub(crate) fn warn_if_pull_degraded() {
+/// Close the watch and issue the verdict (F-3C, from zoom_wait_policy's
+/// expiry branch): a degraded window warns that displayLayer never
+/// dispatched; otherwise the window settles with `zoom settled` --
+/// M > 0 is the field acceptance signal that the pull actually works.
+/// `steps >= 1` always holds for a live watch (`note_zoom_step` opens at 1),
+/// so no separate guard is needed (review L2).
+pub(crate) fn zoom_window_finished() {
     let mut watch = zoom_watch();
-    let Some((since, baseline, warned)) = *watch else {
+    let Some((_start, baseline, steps)) = *watch else {
         return;
     };
-    if since.elapsed() > TX_BIND_TIMEOUT {
-        // Window lapsed without arming again.
-        *watch = None;
-        return;
-    }
-    if PULL_PRESENT_COUNT.load(Ordering::Acquire) == baseline {
-        if !warned {
-            tracing::debug!(
-                "zoom window active but displayLayer pull count is zero -- \
-                 pull path degraded (check displayLayer hook/delegate install logs)"
-            );
-        }
-        *watch = Some((since, baseline, true));
+    *watch = None;
+    let pull_delta = PULL_PRESENT_COUNT
+        .load(Ordering::Acquire)
+        .saturating_sub(baseline);
+    if pull_degrade_verdict(steps, pull_delta) {
+        tracing::warn!(
+            "zoom window ended degraded: steps={} pull_frames={} -- displayLayer never \
+             dispatched (check displayLayer hook/delegate install logs)",
+            steps,
+            pull_delta
+        );
+    } else {
+        tracing::info!("zoom settled: steps={} pull_frames={}", steps, pull_delta);
     }
 }
 

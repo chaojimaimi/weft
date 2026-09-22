@@ -177,6 +177,19 @@ unsafe extern "C" fn set_frame_size_imp(
             let drawable = objc2_foundation::NSSize::new(size.width * scale, size.height * scale);
             let _: () = msg_send![layer, setDrawableSize: drawable];
         }
+        // PLAN_zoom appendix F-3A (A2, belt-and-braces with A1's
+        // setNeedsDisplayOnBoundsChange pin): explicitly mark the layer dirty
+        // on every drawable sync, so the CA commit still has a display
+        // request to honor even if the bounds-change pin is missed (Warp
+        // window.m:535 setNeedsDisplayAsync, same shape). Either trigger
+        // alone reaches displayLayer:. Registered drag semantics (F-3A): the
+        // mark can commit one pull frame ahead of the asynchronously
+        // dispatched Resized draw -- one 1:1 frame of lag, never a stretch;
+        // Warp is the accepted same-architecture baseline.
+        // SAFETY: plain setter on the live layer fetched above.
+        unsafe {
+            let _: () = msg_send![layer, setNeedsDisplay: true];
+        }
         // PLAN Z-d C-3: callback density + sync timing are observable at
         // `RUST_LOG=debug` for the field acceptance run.
         tracing::debug!(
@@ -307,6 +320,18 @@ pub(crate) fn install_display_layer_hook(window: &winit::window::Window) {
         // delegate (the view) outlives it.
         unsafe {
             let _: () = msg_send![layer, setDelegate: Retained::as_ptr(&view)];
+        }
+        // PLAN_zoom appendix F-3A (A1, the 1.12.11 field-failure ROOT
+        // cause): CALayer's needsDisplayOnBoundsChange defaults to NO -- a
+        // bounds change does NOT mark the layer dirty, so CA never enters a
+        // display cycle and displayLayer: is NEVER dispatched (the stage-B
+        // experiment: install logs all green, zero callbacks). Warp pins the
+        // same flag inside makeBackingLayer (host_view.m:281) rather than
+        // trusting the RedrawDuringViewResize policy alone. A2 (explicit
+        // setNeedsDisplay in the setFrameSize IMP) is the second trigger.
+        // SAFETY: plain setter on the live layer.
+        unsafe {
+            let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: true];
         }
         tracing::debug!("displayLayer delegate armed: view -> metal layer");
     }))

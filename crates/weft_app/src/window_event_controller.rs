@@ -171,10 +171,11 @@ impl App {
                     ) {
                         self.window_runtime.zoom_jump_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-                        // Review flow item: arm the pull-degrade watch so a
-                        // silently dead displayLayer path is discoverable in
-                        // the debug log instead of only as an odd stretch.
-                        crate::paint::zoom_render::mark_zoom_window_started();
+                        // Appendix F-3C: per-step watch update -- the first
+                        // zoom-channel step opens the window, later steps
+                        // extend it; the verdict runs at the deterministic
+                        // WaitUntil expiry (zoom_wait_policy), not here.
+                        crate::paint::zoom_render::note_zoom_step();
                     }
                     let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
                     let live_resize = window
@@ -218,7 +219,6 @@ impl App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let started = std::time::Instant::now();
                 // v1.11.6 (PLAN_v1116 M2 step 3): poll the macOS live-resize
                 // state right before the redraw. While true the renderer
                 // presents through the current Core Animation transaction
@@ -239,17 +239,32 @@ impl App {
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
                 let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
-                if zoom_jump_hot {
-                    // Review flow item: sweep the pull-degrade watch while a
-                    // zoom window is open -- a zero pull count inside the
-                    // window means the displayLayer path never dispatched.
-                    crate::paint::zoom_render::warn_if_pull_degraded();
-                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.set_live_resize(in_live_resize || zoom_jump_hot);
                 }
-                self.handle_redraw_requested();
-                self.performance_probe.record_redraw(started.elapsed());
+                // PLAN_zoom appendix F-3B: `zoom_jump_hot` is only the
+                // NECESSARY half of "the pull should supply this frame"; the
+                // tightened gate adds the cache-side sufficiency (lever
+                // armed, cache populated, stale watermark, no pull in flight
+                // -- see pull_can_freshen). While it holds, the displayLayer
+                // pull is this frame's ONLY supplier: a full draw here would
+                // restamp the watermark with this step's drawable
+                // (apply_stash) and dedupe the pull away -- the 1.12.11
+                // "every step races the pull" defect (F-2). No draw happens,
+                // so the probe records nothing.
+                let pull_supplies_frame = zoom_jump_hot
+                    && self.window.as_ref().is_some_and(|window| {
+                        let inner = window.inner_size();
+                        crate::paint::zoom_render::pull_can_freshen(
+                            inner.width as f32,
+                            inner.height as f32,
+                        )
+                    });
+                if !pull_supplies_frame {
+                    let started = std::time::Instant::now();
+                    self.handle_redraw_requested();
+                    self.performance_probe.record_redraw(started.elapsed());
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): winit 0.30 delivers
@@ -504,6 +519,46 @@ impl App {
         if self.should_exit {
             self.recovery.mark_clean_shutdown();
             event_loop.exit();
+        }
+    }
+
+    /// PLAN_zoom appendix F-3B: deterministic zoom-window expiry handling,
+    /// driven from `about_to_wait`. While the programmatic-zoom window is
+    /// hot, re-arm a short `WaitUntil` wake (expiry + 2ms) so the
+    /// post-expiry flush does not depend on PTY output; at the first tick
+    /// after it lapses, run the one-shot flush: the zoom-window verdict
+    /// (F-3C) plus a redraw request -- by then the suppression gate no
+    /// longer holds (the pull stamped the watermark to the final drawable),
+    /// so the request lands as the normal full draw at the final size. The
+    /// expiry needs no PTY traffic and re-runs after a modal suspension
+    /// (runModal) because about_to_wait always gets a catch-up tick.
+    pub(crate) fn zoom_wait_policy(&mut self, event_loop: &ActiveEventLoop) {
+        let hot = self.window_runtime.zoom_jump_hot();
+        let pending = self.window_runtime.zoom_flush_pending;
+        match crate::paint::zoom_render::zoom_flush_action(hot, pending) {
+            crate::paint::zoom_render::ZoomFlushAction::Arm => {
+                // Hot implies zoom_jump_until is Some (the predicate is
+                // `now < until`); the guard keeps the invariant explicit.
+                if let Some(until) = self.window_runtime.zoom_jump_until {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        until + std::time::Duration::from_millis(2),
+                    ));
+                }
+                self.window_runtime.zoom_flush_pending = true;
+            }
+            crate::paint::zoom_render::ZoomFlushAction::Flush => {
+                // H1 (review round 1): restore the loop's resting flow. The
+                // WaitUntil deadline is past by construction here; leaving
+                // it armed makes the macOS runloop timer fire immediately
+                // on every pass (EventLoopWaker::start_at -> start()), a
+                // permanent post-zoom busy loop. Arm re-covers it on the
+                // next hot window, so resetting here is race-free.
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                self.window_runtime.zoom_flush_pending = false;
+                crate::paint::zoom_render::zoom_window_finished();
+                self.request_redraw();
+            }
+            crate::paint::zoom_render::ZoomFlushAction::None => {}
         }
     }
 }

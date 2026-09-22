@@ -302,6 +302,8 @@ pub struct WindowRuntimeState {
     /// Companion to `zoom_jump_until`: the physical size at the previous
     /// Resized event, for the jump test.
     pub last_resized_physical: Option<(u32, u32)>,
+    /// Appendix F-3B: post-expiry flush flag pairing `zoom_jump_until`.
+    pub zoom_flush_pending: bool,
     pub last_system_appearance_dark: Option<bool>,
     pub last_appearance_check: Instant,
     pub current_logo_variant: weft_core::config::LogoVariant,
@@ -342,6 +344,7 @@ impl WindowRuntimeState {
             last_resize_instant: Instant::now(),
             zoom_jump_until: None,
             last_resized_physical: None,
+            zoom_flush_pending: false,
             last_system_appearance_dark: None,
             last_appearance_check: Instant::now(),
             current_logo_variant: weft_core::config::LogoVariant::Cool,

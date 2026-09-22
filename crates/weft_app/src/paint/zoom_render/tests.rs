@@ -205,3 +205,84 @@ fn stale_transaction_bind_expires_but_fresh_bind_survives() {
         "a bind inside the deadline must survive the sweep"
     );
 }
+
+/// F-3C verdict truth table: degraded = at least two zoom steps and NOT ONE
+/// pull frame (the displayLayer dispatch is dead -- the 1.12.11 signature).
+/// A single step is never a verdict (the accepted single-jump form), and any
+/// pull frame clears it.
+#[test]
+fn pull_degrade_verdict_truth_table() {
+    assert!(!pull_degrade_verdict(1, 0));
+    assert!(pull_degrade_verdict(2, 0));
+    assert!(!pull_degrade_verdict(2, 1));
+    assert!(pull_degrade_verdict(5, 0));
+}
+
+/// F-3B expiry truth table: a hot window re-arms the WaitUntil wake (the
+/// pending flag is irrelevant), a lapsed window with a pending flag flushes
+/// exactly once, otherwise the tick is a no-op.
+#[test]
+fn zoom_flush_action_truth_table() {
+    assert!(matches!(
+        zoom_flush_action(true, false),
+        ZoomFlushAction::Arm
+    ));
+    assert!(matches!(
+        zoom_flush_action(true, true),
+        ZoomFlushAction::Arm
+    ));
+    assert!(matches!(
+        zoom_flush_action(false, true),
+        ZoomFlushAction::Flush
+    ));
+    assert!(matches!(
+        zoom_flush_action(false, false),
+        ZoomFlushAction::None
+    ));
+}
+
+/// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are
+/// process-wide; every other test in this file stays pure-local by design).
+static GLOBAL_ZOOM_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// F-3B suppression-gate combos through the real global cache: an empty
+/// cache never suppresses (start-up draws immediately), a stale watermark
+/// suppresses (the pull is the frame's only supplier), a CAUGHT-UP watermark
+/// releases the gate (the expiry flush draw runs as a NORMAL draw), the
+/// lever off closes it (exact 1.12.10 push-only), and teardown closes it.
+#[test]
+fn pull_can_freshen_gate_combinations() {
+    let _guard = GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Start-up form: empty cache -> not populated -> never suppress.
+    teardown();
+    assert!(!pull_can_freshen(800.0, 600.0));
+
+    // Animation form: populated at 800x600, inner size moved on -> suppress.
+    *lock() = content_cache();
+    assert!(pull_can_freshen(900.0, 700.0));
+
+    // M-1 gate (review M1): a pull present in flight closes the gate
+    // regardless of the stale watermark -- the deadlock-guard line gets its
+    // own pin; dropping the guard reopens it.
+    let in_flight =
+        ReentryGuard::try_enter(&PULL_ACTIVE).expect("guard must be free outside a present");
+    assert!(!pull_can_freshen(900.0, 700.0));
+    drop(in_flight);
+    assert!(pull_can_freshen(900.0, 700.0));
+
+    // Pull caught up: watermark == requested inner size -> release the gate.
+    assert!(!pull_can_freshen(800.0, 600.0));
+
+    // Degradation lever: off closes the gate regardless of the watermark
+    // (E-5's degrade promise); restored afterwards.
+    set_pull_enabled(false);
+    assert!(!pull_can_freshen(900.0, 700.0));
+    set_pull_enabled(true);
+
+    // Teardown: cleared cache closes the gate for good.
+    teardown();
+    assert!(!pull_can_freshen(900.0, 700.0));
+}

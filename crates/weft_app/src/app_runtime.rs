@@ -6,6 +6,7 @@ mod resize_transaction;
 #[cfg(test)]
 mod retention_tests;
 use resize_transaction::commit_pty_resize_result;
+use std::time::Duration;
 
 pub(crate) fn install_runtime_diagnostics() {
     // v1.10.4: write to ~/Library/Logs/Weft/weft.log (macOS standard location)
@@ -785,17 +786,17 @@ impl ApplicationHandler<AppEvent> for App {
     }
 
     /// v1.0 fix: during macOS live-resize, winit may defer `RedrawRequested`
-    /// until the mouse is released. The grid IS reflowed in the `Resized`
+    /// until the mouse is released: the grid IS reflowed in the `Resized`
     /// handler, but without a redraw the old drawable is stretched to fit the
-    /// new window bounds → "content squished together" artifact.
-    ///
-    /// `AboutToWait` fires when the event loop is about to block waiting for
-    /// events. By requesting a redraw here while the resize cascade is active
-    /// (within 100ms of the last `Resized`), we ensure the content is
-    /// re-rendered on every intermediate size during live resize.
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.window_runtime.last_resize_instant.elapsed() < std::time::Duration::from_millis(100)
-        {
+    /// new window bounds ("content squished together"). AboutToWait fires
+    /// when the loop is about to block: a redraw within 100ms of the last
+    /// `Resized` re-renders every intermediate live-resize size. Appendix
+    /// F-3B: hot zoom windows skip the pump (it would only hit the
+    /// suppression gate and self-wake); zoom_wait_policy owns all wakes.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.zoom_wait_policy(event_loop);
+        let rt = &self.window_runtime;
+        if !rt.zoom_jump_hot() && rt.last_resize_instant.elapsed() < Duration::from_millis(100) {
             self.request_redraw();
         }
     }
