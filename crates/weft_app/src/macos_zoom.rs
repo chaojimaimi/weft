@@ -186,9 +186,33 @@ unsafe extern "C" fn set_frame_size_imp(
         // mark can commit one pull frame ahead of the asynchronously
         // dispatched Resized draw -- one 1:1 frame of lag, never a stretch;
         // Warp is the accepted same-architecture baseline.
-        // SAFETY: plain setter on the live layer fetched above.
+        //
+        // FIELD CRASH 1.12.12 (both .ips stacks, `set_frame_size_imp`): the
+        // one-argument `setNeedsDisplay:(BOOL)` is an NSVIEW method (what
+        // Warp's setNeedsDisplayAsync targets on the content view);
+        // CALayer's whole-layer dirty mark is the ZERO-argument
+        // `setNeedsDisplay`. Sending the view form to the CAMetalLayer
+        // raised NSInvalidArgumentException (doesNotRecognizeSelector),
+        // which no catch_unwind can intercept across an extern "C" IMP --
+        // the injected setFrameSize runs only on real resizes after the
+        // hook installs, so the first zoom double-click was the first ever
+        // invocation and killed the process on the spot.
+        // SAFETY: `setNeedsDisplay` is core CALayer API (declared on the
+        // inherited layer class); the responds-check below additionally
+        // converts any future lookup failure into a skipped mark instead
+        // of an exception, per this file's guard convention.
         unsafe {
-            let _: () = msg_send![layer, setNeedsDisplay: true];
+            let sel = objc2::sel!(setNeedsDisplay);
+            // Pure class lookup + selector check, no side effects (same
+            // shape as the install path's `pre_responds` probe); already
+            // inside the enclosing catch_unwind safety domain.
+            let layer_class = objc2::ffi::objc_getClass(b"CALayer\0".as_ptr().cast()) as *mut _;
+            let responds: bool = objc2::ffi::class_respondsToSelector(layer_class, sel.as_ptr());
+            if responds {
+                let _: () = msg_send![layer, setNeedsDisplay];
+            } else {
+                tracing::debug!("setNeedsDisplay missing on the layer class; A2 mark skipped");
+            }
         }
         // PLAN Z-d C-3: callback density + sync timing are observable at
         // `RUST_LOG=debug` for the field acceptance run.
