@@ -172,8 +172,12 @@ unsafe extern "C" fn set_frame_size_imp(
         if layer.is_null() {
             return;
         }
+        // `scale` is hoisted so the inline pull below can convert the
+        // logical `size` into physical pixels for the watermark comparison
+        // (review M-1: `last_presented` is physical; a logical request
+        // would never dedupe on Retina).
+        let scale: f64 = unsafe { msg_send![layer, contentsScale] };
         unsafe {
-            let scale: f64 = msg_send![layer, contentsScale];
             let drawable = objc2_foundation::NSSize::new(size.width * scale, size.height * scale);
             let _: () = msg_send![layer, setDrawableSize: drawable];
         }
@@ -195,8 +199,10 @@ unsafe extern "C" fn set_frame_size_imp(
         // armed as an inert bonus trigger: should CA ever dispatch it, its
         // watermark dedup makes a double present a no-op.
         if crate::paint::zoom_render::zoom_window_active() {
-            let fresh =
-                crate::paint::zoom_render::pull_can_freshen(size.width as f32, size.height as f32);
+            // Physical pixels for the watermark comparison (review M-1):
+            // `last_presented` is stamped from drawable texture sizes.
+            let (pw, ph) = (size.width * scale, size.height * scale);
+            let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
             if fresh {
                 crate::paint::zoom_render::bind_pull_transaction();
                 let presented =
@@ -340,8 +346,10 @@ pub(crate) fn install_display_layer_hook(window: &winit::window::Window) {
         // display cycle and displayLayer: is NEVER dispatched (the stage-B
         // experiment: install logs all green, zero callbacks). Warp pins the
         // same flag inside makeBackingLayer (host_view.m:281) rather than
-        // trusting the RedrawDuringViewResize policy alone. A2 (explicit
-        // setNeedsDisplay in the setFrameSize IMP) is the second trigger.
+        // trusting the RedrawDuringViewResize policy alone. Field appendix G:
+        // CA stayed silent even with every input in place, so the pull now
+        // presents inline from the setFrameSize IMP; this pin remains as the
+        // inert trigger should a future macOS dispatch the delegate.
         // SAFETY: plain setter on the live layer.
         unsafe {
             let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: true];
