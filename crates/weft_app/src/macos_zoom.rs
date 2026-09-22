@@ -188,8 +188,3 @@ unsafe extern "C" fn set_frame_size_imp(
         tracing::error!("setFrameSize IMP panicked; drawable sync skipped for this callback");
     });
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-}
