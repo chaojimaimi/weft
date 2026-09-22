@@ -17,13 +17,14 @@ impl App {
                 // shows up here as a one-shot size jump with inLiveResize
                 // already FALSE (the zoom's internal live-resize window has
                 // closed before winit dispatches Resized) -- while a drag
-                // streams small steps with inLiveResize true. Detect the
-                // jump to arm the zoom channel; a full-screen zoom moves
-                // hundreds of points, drags and divider moves move dozens.
-                let jump = crate::macos_zoom::is_programmatic_resize_jump(
-                    self.window_runtime.last_resized_physical,
-                    (physical_size.width, physical_size.height),
-                );
+                // streams small steps with inLiveResize true. v4 (field run
+                // 2): the zoom ANIMATES -- a stream of small-step Resized
+                // events (~100 ms total) with inLiveResize false throughout,
+                // so no single frame ever exceeds a jump threshold. Arm on
+                // ANY size change; the inLiveResize guard below separates it
+                // from drags.
+                let size_changed = self.window_runtime.last_resized_physical
+                    != Some((physical_size.width, physical_size.height));
                 self.window_runtime.last_resized_physical =
                     Some((physical_size.width, physical_size.height));
                 // Grid/PTY tracks the renderer's visible terminal content
@@ -154,9 +155,15 @@ impl App {
                     // false, so the guard separates the two cleanly. Arm
                     // BEFORE the zoom_jump_hot read: the zoom's own final
                     // Resized then engages the channel same-frame.
+                    // v4: arm on EVERY non-gesture Resized with a size
+                    // change -- the zoom animates in small steps, so the
+                    // per-step re-arm keeps the forced renderer + CA present
+                    // bound for the whole animation. Drags stream with
+                    // inLiveResize true and are excluded by the same guard
+                    // (their sync draw comes from the inLiveResize half).
                     let in_live_resize_now =
                         window.is_some_and(crate::macos_window::window_in_live_resize);
-                    if jump && !in_live_resize_now {
+                    if size_changed && !in_live_resize_now {
                         self.window_runtime.zoom_jump_until =
                             Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
                     }

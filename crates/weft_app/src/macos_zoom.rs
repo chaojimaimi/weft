@@ -29,23 +29,6 @@
 //! (VULN-005 house style): any failure degrades to the pre-fix behaviour
 //! (stretch for a frame), never aborts.
 
-/// PLAN_zoom (field run fix): a PROGRAMMATIC zoom shows up on the Resized
-/// event as a one-shot jump (hundreds of points) with inLiveResize already
-/// false, while a drag streams small steps with inLiveResize true. The first
-/// Resized of a fresh window carries no previous size and never counts.
-pub(crate) fn is_programmatic_resize_jump(prev: Option<(u32, u32)>, next: (u32, u32)) -> bool {
-    /// Threshold in PHYSICAL pixels (a 2x screen arm at 60 pt -- sensitive
-    /// side; arming is benign with the inLiveResize guard).
-    const JUMP_POINTS: i64 = 120;
-    match prev {
-        None => false,
-        Some((w, h)) => {
-            (next.0 as i64 - w as i64).abs() > JUMP_POINTS
-                || (next.1 as i64 - h as i64).abs() > JUMP_POINTS
-        }
-    }
-}
-
 /// Add `setFrameSize:` to the winit view class. Call once from the main
 /// thread after window creation; a repeated call is a no-op by virtue of the
 /// `class_addMethod` return value (see the install log lines).
@@ -195,7 +178,11 @@ unsafe extern "C" fn set_frame_size_imp(
         }
         // PLAN Z-d C-3: callback density + sync timing are observable at
         // `RUST_LOG=debug` for the field acceptance run.
-        tracing::debug!(width = size.width, height = size.height, "setFrameSize callback synced drawable");
+        tracing::debug!(
+            width = size.width,
+            height = size.height,
+            "setFrameSize callback synced drawable"
+        );
     }))
     .unwrap_or_else(|_| {
         tracing::error!("setFrameSize IMP panicked; drawable sync skipped for this callback");
@@ -205,39 +192,4 @@ unsafe extern "C" fn set_frame_size_imp(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn zoom_jump_detection_truth_table() {
-        let big = (1440, 900);
-        let small = (800, 600);
-        assert!(
-            !is_programmatic_resize_jump(None, big),
-            "first resize never counts"
-        );
-        assert!(
-            !is_programmatic_resize_jump(Some(small), small),
-            "no change"
-        );
-        assert!(
-            is_programmatic_resize_jump(Some(small), big),
-            "hundreds of points: programmatic zoom"
-        );
-        assert!(
-            is_programmatic_resize_jump(Some(big), small),
-            "zoom-out jumps too"
-        );
-        // Sub-threshold: drags and divider moves stream steps this small.
-        assert!(!is_programmatic_resize_jump(
-            Some(small),
-            (small.0 + 100, small.1 + 60)
-        ));
-        assert!(
-            !is_programmatic_resize_jump(Some(small), (small.0 + 120, small.1)),
-            "exactly at the threshold is still below (strict >)"
-        );
-        assert!(
-            is_programmatic_resize_jump(Some(small), (small.0 + 121, small.1)),
-            "width past threshold counts"
-        );
-    }
 }
