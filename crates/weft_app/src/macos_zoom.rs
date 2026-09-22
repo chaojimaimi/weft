@@ -191,25 +191,26 @@ unsafe extern "C" fn set_frame_size_imp(
         // every zoom step by construction), so the pull presents from here,
         // bound to the current CA transaction: bounds and pixels commit
         // atomically, no one-beat gap for the compositor to stretch.
-        // Gate = the zoom-window flag AND the same freshen predicate the
-        // draw-suppression uses, so drags (flag false -- armed only outside
-        // a live-resize gesture) never take the extra present, start-up
-        // (cache empty) never presents a phantom, and the lever stays
-        // authoritative. The displayLayer: delegate + A1 bounds pin remain
+        // Gate = the freshen predicate alone (lever / populated cache /
+        // stale watermark). NO zoom-window flag: the field burst (41
+        // setFrameSize callbacks inside one AppKit animation pass, BEFORE
+        // any Resized dispatch -- G-1 timing evidence) would always see the
+        // Resized-armed flag false. Drags take one lean 1:1 present per
+        // tick ahead of the forced draw (the registered F-3A one-frame-lag
+        // semantics; never a stretch), start-up is blocked by the populated
+        // leg, and the lever stays authoritative. The displayLayer:
+        // delegate + A1 bounds pin remain
         // armed as an inert bonus trigger: should CA ever dispatch it, its
         // watermark dedup makes a double present a no-op.
-        if crate::paint::zoom_render::zoom_window_active() {
-            // Physical pixels for the watermark comparison (review M-1):
-            // `last_presented` is stamped from drawable texture sizes.
-            let (pw, ph) = (size.width * scale, size.height * scale);
-            let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
-            if fresh {
-                crate::paint::zoom_render::bind_pull_transaction();
-                let presented =
-                    crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
-                crate::paint::zoom_render::unbind_pull_transaction();
-                tracing::debug!(presented, "setFrameSize inline pull");
-            }
+        // Physical pixels for the watermark comparison (review M-1):
+        // `last_presented` is stamped from drawable texture sizes.
+        let (pw, ph) = (size.width * scale, size.height * scale);
+        let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
+        if fresh {
+            crate::paint::zoom_render::bind_pull_transaction();
+            let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
+            crate::paint::zoom_render::unbind_pull_transaction();
+            tracing::debug!(presented, "setFrameSize inline pull");
         }
         // PLAN Z-d C-3: callback density + sync timing are observable at
         // `RUST_LOG=debug` for the field acceptance run.

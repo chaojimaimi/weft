@@ -53,22 +53,3 @@ pub(crate) fn zoom_flush_action(hot: bool, pending: bool) -> ZoomFlushAction {
 pub(crate) fn pull_degrade_verdict(steps: u32, pull_delta: u64) -> bool {
     steps >= 2 && pull_delta == 0
 }
-
-/// Appendix G: true while a zoom window is open. The injected
-/// `setFrameSize:` IMP reads this to decide whether the inline pull may
-/// present -- the IMP has no access to `WindowRuntime` (zero-App-dependency
-/// rule), so the arm/clear sites (`note_zoom_step` / `zoom_window_finished`
-/// in the parent module) publish the window state here instead.
-static ZOOM_WINDOW_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// True while a zoom window is open (armed by a zoom-channel step, cleared
-/// by the expiry verdict).
-pub(crate) fn zoom_window_active() -> bool {
-    ZOOM_WINDOW_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
-}
-
-/// Arm/clear the zoom-window flag (parent-module lifecycle calls).
-pub(crate) fn set_zoom_window_active(active: bool) {
-    ZOOM_WINDOW_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
-}

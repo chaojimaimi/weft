@@ -286,20 +286,3 @@ fn pull_can_freshen_gate_combinations() {
     teardown();
     assert!(!pull_can_freshen(900.0, 700.0));
 }
-
-/// Appendix G: the inline-pull gate flag mirrors the zoom-window lifecycle
-/// -- opened by a step, closed by the expiry verdict.
-#[test]
-fn zoom_window_active_flag_lifecycle() {
-    let _guard = GLOBAL_ZOOM_STATE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    teardown();
-    assert!(!zoom_window_active());
-    note_zoom_step();
-    assert!(zoom_window_active());
-    note_zoom_step(); // second step keeps it open
-    assert!(zoom_window_active());
-    zoom_window_finished();
-    assert!(!zoom_window_active());
-}
