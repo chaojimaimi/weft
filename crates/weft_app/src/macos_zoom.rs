@@ -212,6 +212,10 @@ unsafe extern "C" fn set_frame_size_imp(
             crate::paint::zoom_render::unbind_pull_transaction();
             tracing::debug!(presented, "setFrameSize inline pull");
         }
+        // Appendix H: ping the app so the reflow tracks the animation live
+        // (the Resized events for this step will not arrive until the burst
+        // ends). The Wake arm dedupes by size comparison.
+        notify_resize_wake();
         // PLAN Z-d C-3: callback density + sync timing are observable at
         // `RUST_LOG=debug` for the field acceptance run.
         tracing::debug!(
@@ -360,6 +364,36 @@ pub(crate) fn install_display_layer_hook(window: &winit::window::Window) {
     .unwrap_or_else(|_| {
         tracing::error!("displayLayer hook install panicked; pull DISABLED this session");
     });
+}
+
+/// Per-step resize wake (appendix H): the zoom animation batch-delivers
+/// winit `Resized` events only after its last setFrameSize callback (field:
+/// 41 events inside one 0.4ms burst), so the reflow pipeline cannot track
+/// the animation from the event path alone. The IMP pings the app once per
+/// callback through the event-loop proxy instead; the Wake arm synthesizes
+/// the resize from the live window size, deduped by size comparison.
+static RESIZE_WAKE_PROXY: std::sync::Mutex<
+    Option<winit::event_loop::EventLoopProxy<crate::AppEvent>>,
+> = std::sync::Mutex::new(None);
+
+/// Stash the app's event-loop proxy (once, from `main` before `run_app`).
+pub(crate) fn stash_resize_wake_proxy(proxy: winit::event_loop::EventLoopProxy<crate::AppEvent>) {
+    *RESIZE_WAKE_PROXY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(proxy);
+}
+
+/// Ping the app that a frame-size change just landed (main thread).
+fn notify_resize_wake() {
+    let proxy = RESIZE_WAKE_PROXY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(proxy) = proxy {
+        // EventLoopClosed after loop teardown is by-design to ignore
+        // (allowlist M-C convention: wakeup send failures are silent).
+        let _ = proxy.send_event(crate::AppEvent::Wake);
+    }
 }
 
 /// The injected `displayLayer:` IMP (CALayerDelegate). Warp host_view.m

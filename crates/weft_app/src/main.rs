@@ -639,6 +639,7 @@ fn main() {
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build().unwrap();
     let proxy = event_loop.create_proxy();
+    crate::macos_zoom::stash_resize_wake_proxy(proxy.clone());
     // v1.11.13 (PLAN_v11113 §M2): install the UN notification delegate
     // BEFORE winit's didFinishLaunching (runs inside run_app) so a
     // cold-start notification click reaches the app (bundle-identity gate

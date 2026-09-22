@@ -532,6 +532,22 @@ impl App {
     /// so the request lands as the normal full draw at the final size. The
     /// expiry needs no PTY traffic and re-runs after a modal suspension
     /// (runModal) because about_to_wait always gets a catch-up tick.
+    /// Appendix H: the zoom animation batches winit `Resized` delivery
+    /// until after its last `setFrameSize` callback (field: 41 events in
+    /// one 0.4ms burst), so the reflow pipeline cannot track the animation
+    /// from the event path alone. The IMP pings an `AppEvent::Wake` per
+    /// callback; this synthesizes the standard resize dispatch whenever the
+    /// live window size has moved past the last applied one. Size-deduped:
+    /// drags and ordinary worker wakes land here as no-ops.
+    pub(crate) fn reflow_if_live_size_moved(&mut self, event_loop: &ActiveEventLoop) {
+        let live_size = self.window.as_ref().map(|window| window.inner_size());
+        if let Some(size) = live_size {
+            if self.window_runtime.last_resized_physical != Some((size.width, size.height)) {
+                self.dispatch_window_event(event_loop, WindowEvent::Resized(size));
+            }
+        }
+    }
+
     pub(crate) fn zoom_wait_policy(&mut self, event_loop: &ActiveEventLoop) {
         let hot = self.window_runtime.zoom_jump_hot();
         let pending = self.window_runtime.zoom_flush_pending;

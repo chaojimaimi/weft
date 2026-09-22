@@ -221,6 +221,8 @@ impl ApplicationHandler<AppEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppEvent) {
         match event {
             AppEvent::Wake => {
+                // Appendix H: see reflow_if_live_size_moved (zoom burst).
+                self.reflow_if_live_size_moved(event_loop);
                 self.performance_probe.record_wake();
                 self.pump_pty();
                 self.process_messages();

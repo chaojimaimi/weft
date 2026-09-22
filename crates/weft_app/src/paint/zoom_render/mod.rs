@@ -372,6 +372,9 @@ fn set_layer_transaction(cache: &FrameCache, bound: bool) -> bool {
 /// Pull frames presented since process start (the zoom-window verdict keys
 /// off this counter).
 static PULL_PRESENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Pull count at the last zoom-window close: the verdict baseline for the
+/// next window (a window-open baseline would swallow the burst's pulls).
+static LAST_CLOSE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Zoom-window watch `(start, pull baseline, steps)` (Appendix F-3C):
 /// opened by the first zoom-channel step (`note_zoom_step`), closed by the
 /// deterministic WaitUntil expiry (`zoom_window_finished`) -- the old
@@ -394,11 +397,11 @@ pub(crate) fn note_zoom_step() {
     if let Some((_, _, steps)) = watch.as_mut() {
         *steps += 1;
     } else {
-        *watch = Some((
-            Instant::now(),
-            PULL_PRESENT_COUNT.load(Ordering::Acquire),
-            1,
-        ));
+        // G-3 baseline: the burst's pulls land before the first Resized, so
+        // the baseline is the previous window's close count, not the count
+        // at open (1.12.14 field bug: 41 pulls, verdict said zero).
+        let baseline = LAST_CLOSE_COUNT.load(Ordering::Acquire);
+        *watch = Some((Instant::now(), baseline, 1));
     }
 }
 
@@ -414,13 +417,13 @@ pub(crate) fn zoom_window_finished() {
         return;
     };
     *watch = None;
-    let pull_delta = PULL_PRESENT_COUNT
-        .load(Ordering::Acquire)
-        .saturating_sub(baseline);
+    let count = PULL_PRESENT_COUNT.load(Ordering::Acquire);
+    let pull_delta = count.saturating_sub(baseline);
+    LAST_CLOSE_COUNT.store(count, Ordering::Release);
     if pull_degrade_verdict(steps, pull_delta) {
         tracing::warn!(
-            "zoom window ended degraded: steps={} pull_frames={} -- displayLayer never \
-             dispatched (check displayLayer hook/delegate install logs)",
+            "zoom window ended degraded: steps={} pull_frames={} -- the inline pull never \
+             presented (check pull gate / frame-cache state)",
             steps,
             pull_delta
         );
