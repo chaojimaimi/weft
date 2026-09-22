@@ -546,9 +546,10 @@ impl MetalRenderer {
     /// PLAN_zoom Z-c: flip the programmatic-zoom present channel. Independent
     /// of `set_live_resize` (which the M2 gate short-circuits) — the flush
     /// gate below ORs this with the live-resize pair. Unlike `set_live_resize`
-    /// there is NO config gate: the zoom channel IS the new mechanism (a
-    /// double-click zoom never enters inLiveResize, so nothing else would
-    /// ever bind its present to the CA transaction).
+    /// there is NO config gate: the zoom channel IS the new mechanism (the
+    /// size-jump detector on the Resided path arms it -- see
+    /// `is_programmatic_resize_jump`), so nothing else would ever bind its
+    /// present to the CA transaction.
     pub(crate) fn set_zoom_sequence(&mut self, active: bool) {
         if self.zoom_sequence_flip == active {
             return;
@@ -574,9 +575,9 @@ impl MetalRenderer {
     /// flush that passes the gate bumps `core_animation_flushes` so tests
     /// can observe the gate end-to-end.
     fn flush_core_animation_if_live_resize(&self) {
-        // PLAN_zoom Z-c: the zoom sequence ORs in as an independent channel —
-        // double-click zoom never enters inLiveResize, so it must bind its
-        // present to the CA transaction without touching the M2 rollback
+        // PLAN_zoom Z-d: the zoom sequence ORs in as an independent channel
+        // (armed by the size-jump detector on the Resized path) -- it binds
+        // the present to the CA transaction without touching the M2 rollback
         // switch's semantics (drag behaviour with the switch on is unchanged:
         // enabled && active still flushes).
         if (!self.live_resize_flip_enabled || !self.live_resize_active) && !self.zoom_sequence_flip

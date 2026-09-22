@@ -430,10 +430,10 @@ impl ApplicationHandler<AppEvent> for App {
         // the NSWindow via the raw-window-handle AppKit handle and sets the
         // style mask + transparency; tab-bar empty space starts native drag.
         configure_titlebar(&window);
-        // PLAN_zoom Z-a/Z-b: add `windowWillResize:toSize:` to the winit
-        // delegate (0.30.13 lacks it) — a double-click zoom sizes the
-        // drawable before AppKit commits the bounds and stamps the
-        // zoom-sequence marker the render gates read.
+        // PLAN_zoom Z-d: add `setFrameSize:` to the winit view class
+        // (0.30.13 lacks it) — the IMP syncs the drawable right after super
+        // applies the new size (Warp host_view.m shape); the zoom-sequence
+        // marker is armed by the size-jump detector on the Resized path.
         macos_zoom::install_zoom_sequence_hook(&window);
         accessibility::install_event_proxy(self.proxy.clone());
         // v1.1: Install the native macOS menu bar (Weft/File/Edit/View/Find/

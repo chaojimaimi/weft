@@ -141,10 +141,10 @@ impl App {
                 // later RedrawRequested arriving (the last drag event can be
                 // a Resized).
                 if let (Some(renderer), window) = (&mut self.renderer, self.window.as_ref()) {
-                    // PLAN_zoom Z-b: a programmatic (double-click) zoom never
-                    // enters inLiveResize — the zoom-sequence marker stamped
-                    // by the injected windowWillResize hook extends the
-                    // same-tick draw to it.
+                    // PLAN_zoom Z-d: the zoom-sequence marker is armed by
+                    // `is_programmatic_resize_jump` outside a live-resize
+                    // gesture (arm block below); when hot it extends the
+                    // same-tick draw to the programmatic zoom.
                     // HIGH-1 (round 3): arm the zoom channel ONLY outside a
                     // live-resize gesture -- a fast drag coalesces Resized
                     // events with >120 physical-px deltas (2x screen: 60 pt),
@@ -163,16 +163,13 @@ impl App {
                     let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
                     let live_resize = window
                         .is_some_and(crate::macos_window::window_in_live_resize)
-                        || crate::macos_zoom::zoom_sequence_active()
                         || zoom_jump_hot;
                     // PLAN_zoom Z-c: set_zoom_sequence runs AFTER
                     // set_live_resize so the release path (both flags false)
                     // lands the async-present restore before the zoom flip
                     // re-binds the transaction.
                     renderer.set_live_resize(live_resize);
-                    renderer.set_zoom_sequence(
-                        crate::macos_zoom::zoom_sequence_active() || zoom_jump_hot,
-                    );
+                    renderer.set_zoom_sequence(zoom_jump_hot);
                     if live_resize {
                         self.handle_redraw_requested_forced();
                     }
@@ -220,8 +217,7 @@ impl App {
                     .window
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
-                let zoom_sequence = crate::macos_zoom::zoom_sequence_active()
-                    || self.window_runtime.zoom_jump_hot();
+                let zoom_sequence = self.window_runtime.zoom_jump_hot();
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.set_live_resize(in_live_resize || zoom_sequence);
                     renderer.set_zoom_sequence(zoom_sequence);
