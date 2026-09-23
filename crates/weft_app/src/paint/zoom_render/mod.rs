@@ -47,13 +47,13 @@ use crate::paint::metal_backend::PaneInstanceSegment;
 use crate::renderer::MetalRenderer;
 
 // Appendix F-5 split rule ("over budget -> split, no ceiling raise"): the
-// pure zoom decision layer (suppression gate / expiry decision / degrade
-// verdict) lives in policy.rs with its truth tables; the zoom-window
-// watch/verdict state lives in verdict.rs (this module: Metal/cache plumbing).
+// pure zoom decision layer (suppression gate / expiry decision) lives in
+// policy.rs with its truth tables; the zoom-window watch/verdict state
+// lives in verdict.rs (this module: Metal/cache plumbing).
 mod policy;
 pub(crate) use policy::{
-    cascade_force_commit, defers_main, pull_can_freshen, pull_degrade_verdict,
-    pull_present_allowed, zoom_diag_anomalous, zoom_flush_action, ZoomFlushAction,
+    cascade_force_commit, pull_can_freshen, pull_present_allowed, zoom_diag_anomalous,
+    zoom_flush_action, ZoomFlushAction,
 };
 mod verdict;
 pub(crate) use verdict::{note_zoom_step, zoom_window_finished};
@@ -422,6 +422,9 @@ pub(crate) fn redraw_cached_frame(width: f64, height: f64) -> bool {
     if !pull_enabled() || !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0
     {
         return false;
+    }
+    if crate::macos_zoom::zoom_anim_active() {
+        return false; // self-zoom: the main path is the sole supplier (Phase C)
     }
     let Some(guard) = ReentryGuard::try_enter(&PULL_ACTIVE) else {
         // Nested CA callback while a present is already in flight: skip.

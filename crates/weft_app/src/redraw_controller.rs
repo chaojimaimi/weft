@@ -193,19 +193,19 @@ impl App {
         // later `CSI A` repaints cannot erase the extra rows. Background tabs
         // remain settle-debounced; both their PTY and Grid retain the old
         // geometry together until the transaction commits.
-        // Appendix I-6 revision: during a self-managed ZOOM-IN animation
-        // the per-step grid reflow is the cheap merge direction -- commit
-        // background panes per step too, or a live background TUI (top)
-        // stays at its old width for the whole animation (field: split +
-        // top intermediate state).
+        // PLAN_zoom_drawable_stall Phase C (revises Appendix I-6): commit
+        // background panes per step in BOTH animation directions. The
+        // zoom-in arm predates it (a live background TUI stayed at its old
+        // width, field: split + top); zoom-out joins it because C3's
+        // main-path un-suppression feeds it per step -- otherwise the right
+        // pane would stay at the old width (the same field symptom).
         // Review MEDIUM-2 wiring anchor: the force bit is the pure truth
         // table (zoom_render::cascade_force_commit); the elapsed-debounce
         // leg stays here at the call site.
         let elapsed_debounce = self.window_runtime.last_resize_instant.elapsed()
             > std::time::Duration::from_millis(100);
-        let force = crate::paint::zoom_render::cascade_force_commit(
-            crate::macos_zoom::zoom_anim_is_zoom_in(),
-        );
+        let force =
+            crate::paint::zoom_render::cascade_force_commit(crate::macos_zoom::zoom_anim_active());
         let cascade_settled = elapsed_debounce || force;
         let pending: Vec<_> = self
             .sessions

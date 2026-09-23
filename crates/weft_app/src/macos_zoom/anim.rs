@@ -116,37 +116,14 @@ pub(crate) fn zoom_anim_peek() -> Option<ZoomAnim> {
     *lock_zoom_anim()
 }
 
-#[cfg(test)]
-pub(crate) fn zoom_anim_slot() -> std::sync::MutexGuard<'static, Option<ZoomAnim>> {
-    lock_zoom_anim()
-}
-
-/// True while a self-managed animation is in flight. The RedrawRequested
-/// suppression gate extends with this: during the animation the main path
-/// (full draw + queued grid drain) is deferred wholesale -- the per-step
-/// grid rewrap of a large document costs 0.4-1 s in the shrink direction
-/// (field: 1.0 s stall at cols~130), which would otherwise freeze the
-/// stepping loop mid-motion. The pull supplies every frame instead; the
-/// coalesced drain runs once after the animation clears.
-/// Direction of the in-flight animation (appendix I-6 revision): zoom-in
-/// grows both dimensions -- its per-step grid reflow is the cheap MERGE
-/// direction (~10-16 ms/step, field-measured), so the main path may keep
-/// tracking live. Zoom-out shrinks -- the rewrap SPLIT path costs 0.4-1 s
-/// at intermediate widths (field: a 1.0 s stall at cols~130), so the main
-/// path must stay deferred. Mixed-dimension targets count as zoom-out
-/// (conservative: defer).
-/// Pure direction predicate (truth-table tested): zoom-in when neither
-/// dimension shrinks ("non-shrinking"); any shrinking dimension counts as
-/// zoom-out (conservative).
-pub(crate) fn zoom_direction_is_in(size_start: (f64, f64), size_target: (f64, f64)) -> bool {
-    size_target.0 >= size_start.0 && size_target.1 >= size_start.1
-}
-
-pub(crate) fn zoom_anim_is_zoom_in() -> bool {
-    zoom_anim_peek().is_some_and(|a| zoom_direction_is_in(a.size_start, a.size_target))
-}
-
 /// Whether an animation segment is running (setFrameSize refresh gate).
+/// Since PLAN_zoom_drawable_stall Phase C this single bit also drives both
+/// controller wirings: the RedrawRequested gate lets the main path draw
+/// live in BOTH directions (the I-6 deferral is retired -- its 0.4-1 s/step
+/// premise was falsified by the G6 bench; the real stall was nextDrawable's
+/// <=1 s block, bounded by Fix A) while the inline pull stands down
+/// (zoom_render::redraw_cached_frame), and the resize-cascade force bit
+/// commits background panes per step.
 pub(crate) fn zoom_anim_active() -> bool {
     lock_zoom_anim().is_some()
 }

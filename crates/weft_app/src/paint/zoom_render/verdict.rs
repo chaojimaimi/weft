@@ -10,10 +10,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-// The degrade verdict comes from the pure decision layer (policy.rs) through
-// the parent's re-export -- the same name path the pre-split module used.
-use super::pull_degrade_verdict;
-
 /// Pull frames presented since process start (the zoom-window verdict keys
 /// off this counter). Incremented only via `record_presented_pull`.
 static PULL_PRESENT_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -58,11 +54,16 @@ pub(crate) fn note_zoom_step() {
 }
 
 /// Close the watch and issue the verdict (F-3C, from zoom_wait_policy's
-/// expiry branch): a degraded window warns that displayLayer never
-/// dispatched; otherwise the window settles with `zoom settled` --
-/// M > 0 is the field acceptance signal that the pull actually works.
-/// `steps >= 1` always holds for a live watch (`note_zoom_step` opens at 1),
-/// so no separate guard is needed (review L2).
+/// expiry branch): always logs the info summary
+/// (`zoom settled: steps=N pull_frames=M`). Since
+/// PLAN_zoom_drawable_stall Phase C, M is expected 0 for self-zoom
+/// windows -- the pull stands down during the animation (the designed
+/// state, so the F-3C degrade warn is retired: it would false-fire on
+/// every zoom). The counter stays meaningful for NON-anim programmatic
+/// zoom windows (single-jump resizes, the hook-failure fallback to the
+/// system zoom), where pulls still present. `steps >= 1` always holds for
+/// a live watch (`note_zoom_step` opens at 1), so no separate guard is
+/// needed (review L2).
 pub(crate) fn zoom_window_finished() {
     let mut watch = zoom_watch();
     let Some((_start, baseline, steps)) = *watch else {
@@ -72,14 +73,5 @@ pub(crate) fn zoom_window_finished() {
     let count = PULL_PRESENT_COUNT.load(Ordering::Acquire);
     let pull_delta = count.saturating_sub(baseline);
     LAST_CLOSE_COUNT.store(count, Ordering::Release);
-    if pull_degrade_verdict(steps, pull_delta) {
-        tracing::warn!(
-            "zoom window ended degraded: steps={} pull_frames={} -- the inline pull never \
-             presented (check pull gate / frame-cache state)",
-            steps,
-            pull_delta
-        );
-    } else {
-        tracing::info!("zoom settled: steps={} pull_frames={}", steps, pull_delta);
-    }
+    tracing::info!("zoom settled: steps={} pull_frames={}", steps, pull_delta);
 }

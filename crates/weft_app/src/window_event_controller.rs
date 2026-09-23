@@ -252,36 +252,30 @@ impl App {
                 // (apply_stash) and dedupe the pull away -- the 1.12.11
                 // "every step races the pull" defect (F-2). No draw happens,
                 // so the probe records nothing.
-                // PLAN_zoom appendix I-6: while the SELF-MANAGED animation is
-                // stepping, the main path (full draw + queued grid drain) is
-                // deferred WHOLESALE -- the shrink-direction grid rewrap of a
-                // large document costs 0.4-1 s at intermediate widths (field:
-                // a 1.0 s mid-animation stall at cols~130), which froze the
-                // stepping loop mid-motion. The pull supplies every frame
-                // instead; the coalesced drain runs once after the animation
-                // clears (the WaitUntil flush pass).
-                // Appendix I-6 revision (direction-aware): the blanket
-                // animation suppression also froze zoom-IN, whose reflow is
-                // the cheap merge direction -- only the shrink direction
-                // (wrap split, 0.4-1 s/step) needs the deferral. Single
-                // peek: active + direction are both derived from one lock
-                // acquisition; the verdict itself is the pure truth table
-                // (review MEDIUM-2 wiring anchor: zoom_render::defers_main).
-                let anim = crate::macos_zoom::zoom_anim_peek();
-                let zoom_in = anim.as_ref().is_some_and(|a| {
-                    crate::macos_zoom::zoom_direction_is_in(a.size_start, a.size_target)
-                });
-                let self_zoom_defers_main =
-                    crate::paint::zoom_render::defers_main(anim.is_some(), zoom_in);
+                // PLAN_zoom_drawable_stall Phase C: the Appendix I-6
+                // main-path deferral is RETIRED. Its premise -- the shrink
+                // direction's reflow costs 0.4-1 s/step (field: a 1.0 s
+                // stall at cols~130) -- was falsified by the G6 bench
+                // (resize_commit_bench G4/G6: 2.0-2.6 ms at 37k lines); the
+                // real mid-animation stall was nextDrawable's <=1 s block
+                // (PLAN section 0), now bounded by Fix A's present-rate
+                // limiter. During a self-zoom the main draw is therefore
+                // UNCONDITIONAL: live tracking in BOTH directions through
+                // the drag-validated pipeline (the pull stands down for the
+                // animation inside redraw_cached_frame). Outside a
+                // self-zoom (drags, single programmatic resizes) the F-3B
+                // `hot && pull_can_freshen` suppression above is preserved
+                // verbatim.
+                let self_zoom_active = crate::macos_zoom::zoom_anim_active();
                 let pull_supplies_frame = zoom_jump_hot
-                    && (self_zoom_defers_main
-                        || self.window.as_ref().is_some_and(|window| {
-                            let inner = window.inner_size();
-                            crate::paint::zoom_render::pull_can_freshen(
-                                inner.width as f32,
-                                inner.height as f32,
-                            )
-                        }));
+                    && !self_zoom_active
+                    && self.window.as_ref().is_some_and(|window| {
+                        let inner = window.inner_size();
+                        crate::paint::zoom_render::pull_can_freshen(
+                            inner.width as f32,
+                            inner.height as f32,
+                        )
+                    });
                 if !pull_supplies_frame {
                     let started = std::time::Instant::now();
                     self.handle_redraw_requested();
