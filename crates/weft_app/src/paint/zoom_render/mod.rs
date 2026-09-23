@@ -52,8 +52,8 @@ use crate::renderer::MetalRenderer;
 // watch/verdict state lives in verdict.rs (this module: Metal/cache plumbing).
 mod policy;
 pub(crate) use policy::{
-    cascade_force_commit, defers_main, pull_can_freshen, pull_degrade_verdict, zoom_diag_anomalous,
-    zoom_flush_action, ZoomFlushAction,
+    cascade_force_commit, defers_main, pull_can_freshen, pull_degrade_verdict,
+    pull_present_allowed, zoom_diag_anomalous, zoom_flush_action, ZoomFlushAction,
 };
 mod verdict;
 pub(crate) use verdict::{note_zoom_step, zoom_window_finished};
@@ -82,6 +82,10 @@ pub(crate) struct FrameCache {
     populated: bool,
     /// Drawable size of the last presented frame (dedup watermark, E-3).
     last_presented: Option<(f32, f32)>,
+    /// Instant of the last PULL present (present-rate limiter,
+    /// PLAN_zoom_drawable_stall A): the pull may acquire a drawable at most
+    /// once per PULL_MIN_INTERVAL. In-memory only; nothing persists it.
+    last_present_at: Option<Instant>,
     // Registered handles (retained; main-thread-exclusive use, see module doc).
     device: Option<metal::Device>,
     queue: Option<metal::CommandQueue>,
@@ -110,6 +114,7 @@ impl FrameCache {
             pane_vertex_ranges: Vec::new(),
             populated: false,
             last_presented: None,
+            last_present_at: None,
             device: None,
             queue: None,
             layer: None,
@@ -442,6 +447,15 @@ fn present_cached_frame() -> bool {
     if !cache.pullable() {
         return false;
     }
+    if !pull_present_allowed(cache.last_present_at, std::time::Instant::now()) {
+        tracing::debug!("inline pull skipped: present-rate throttle");
+        return false;
+    }
+    // Optimistic stamp: the pool debt starts at acquisition, not at encode
+    // completion. If the rare post-stamp nil path hits (pool momentarily
+    // empty), the next pull waits one interval — a skipped beat, not a
+    // regression.
+    cache.last_present_at = Some(std::time::Instant::now());
     let Some(handles) = LeanHandles::borrow(&cache) else {
         return false;
     };

@@ -4,6 +4,8 @@
 
 use super::*;
 
+use super::policy::PULL_MIN_INTERVAL;
+
 fn content_cache() -> FrameCache {
     let mut cache = FrameCache::empty();
     let replaced = cache.apply_stash(
@@ -278,6 +280,28 @@ fn zoom_diag_anomalous_truth_table() {
     // cost (AppKit block).
     assert!(zoom_diag_anomalous(1_003_000, 900));
     assert!(zoom_diag_anomalous(2_000, 1_003_000));
+}
+
+/// Pull present-rate limiter truth table (PLAN_zoom_drawable_stall A): no
+/// previous present is allowed, anything strictly inside the window is
+/// throttled, exactly at (or past) the boundary is allowed.
+#[test]
+fn pull_present_allowed_truth_table() {
+    let now = std::time::Instant::now();
+    // No previous present: allowed.
+    assert!(pull_present_allowed(None, now));
+    // Inside the window: throttled.
+    assert!(!pull_present_allowed(Some(now), now));
+    assert!(!pull_present_allowed(
+        Some(now - PULL_MIN_INTERVAL + std::time::Duration::from_nanos(1)),
+        now
+    ));
+    // Boundary: >= the interval is allowed.
+    assert!(pull_present_allowed(Some(now - PULL_MIN_INTERVAL), now));
+    assert!(pull_present_allowed(
+        Some(now - std::time::Duration::from_secs(1)),
+        now
+    ));
 }
 
 /// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are

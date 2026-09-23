@@ -86,3 +86,26 @@ pub(crate) fn cascade_force_commit(zoom_in: bool) -> bool {
 pub(crate) fn zoom_diag_anomalous(gap_us: u64, call_us: u64) -> bool {
     gap_us > 50_000 || call_us > 20_000
 }
+
+/// Pull present-rate limiter (PLAN_zoom_drawable_stall A): the inline
+/// pull must acquire drawables at most once per PULL_MIN_INTERVAL — the
+/// 60 Hz period, the lowest common refresh. The 3-drawable pool is
+/// returned at display cadence; an unpaced pull (field: one per 2-24 ms
+/// step) outpaces returns and sends nextDrawable into its ≤1 s blocking
+/// cap (13 measured 1.001-1.005 s animation freezes). At 120 Hz this
+/// presents every 2nd refresh — no worse than the field's self-limited
+/// ~20-30 ms-per-present baseline the user accepted.
+pub(crate) const PULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Pure throttle predicate (truth-table tested): a pull may acquire a
+/// drawable when there is no previous present, or when at least
+/// PULL_MIN_INTERVAL has passed since it.
+pub(crate) fn pull_present_allowed(
+    last_present_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    match last_present_at {
+        None => true,
+        Some(at) => now.duration_since(at) >= PULL_MIN_INTERVAL,
+    }
+}
