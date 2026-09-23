@@ -199,6 +199,12 @@ static PULL_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Re-entry guard for the pull path: a CA callback nested inside a present
 /// must not re-encode (E-2 step 1).
 static PULL_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Live-resize bypass for the pull present-rate limiter (Phase D,
+/// PLAN_zoom_drawable_stall): while a drag gesture is active the per-tick
+/// atomic pull present IS the anti-stretch vehicle, so it must not wait for
+/// PULL_MIN_INTERVAL. Fed unconditionally by `set_live_resize` (orthogonal
+/// to the config gate; a cheap store).
+static PULL_BYPASS_LIVE_RESIZE: AtomicBool = AtomicBool::new(false);
 /// Registration is once-per-session; flipping this back on is `teardown`.
 static HANDLES_REGISTERED: AtomicBool = AtomicBool::new(false);
 
@@ -213,6 +219,17 @@ pub(crate) fn set_pull_enabled(enabled: bool) {
 
 pub(crate) fn pull_enabled() -> bool {
     PULL_ENABLED.load(Ordering::Acquire)
+}
+
+/// Phase D drag-anti-stretch lever: true for the whole live-resize drag
+/// gesture (fed from `MetalRenderer::set_live_resize`, BEFORE its config
+/// gate and dedup early-returns).
+pub(crate) fn set_pull_bypass_live_resize(active: bool) {
+    PULL_BYPASS_LIVE_RESIZE.store(active, Ordering::Release);
+}
+
+fn pull_bypass_live_resize() -> bool {
+    PULL_BYPASS_LIVE_RESIZE.load(Ordering::Acquire)
 }
 
 /// RAII re-entry guard (truth-table tested): the second `try_enter` while
@@ -450,7 +467,11 @@ fn present_cached_frame() -> bool {
     if !cache.pullable() {
         return false;
     }
-    if !pull_present_allowed(cache.last_present_at, std::time::Instant::now()) {
+    if !pull_present_allowed(
+        cache.last_present_at,
+        std::time::Instant::now(),
+        pull_bypass_live_resize(),
+    ) {
         tracing::debug!("inline pull skipped: present-rate throttle");
         return false;
     }

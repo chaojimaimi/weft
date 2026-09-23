@@ -158,6 +158,10 @@ impl MetalRenderer {
     /// became the dominant cost — see the FIX_DRAG_RESIZE_STUTTER.md
     /// appendix "为何翻转 presentsWithTransaction".
     pub(crate) fn set_live_resize(&mut self, active: bool) {
+        // PLAN_zoom_drawable_stall Phase D: feed the pull-present bypass
+        // BEFORE the config gate / dedup early-returns below -- either would
+        // silently swallow the forwarding in the default config.
+        crate::paint::zoom_render::set_pull_bypass_live_resize(active);
         if !self.live_resize_flip_enabled {
             // Gate off (default): force the async-present invariant. With
             // construction-time injection `live_resize_active` is already
