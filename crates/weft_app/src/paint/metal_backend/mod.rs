@@ -277,9 +277,17 @@ impl MetalRenderer {
                 let encoder = command_buffer.new_render_command_encoder(pass_desc);
                 encoder.end_encoding();
             }
-            command_buffer.present_drawable(drawable);
             register_gpu_completion_handler(command_buffer);
-            command_buffer.commit();
+            if self.live_resize_active {
+                // Phase E (Warp parity): serialize the gesture present — the
+                // pool drains so next_drawable always vends the NEW size.
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                drawable.present();
+            } else {
+                command_buffer.present_drawable(drawable);
+                command_buffer.commit();
+            }
             // PLAN_zoom Z-f (E-3 nesting rule): hand off BEFORE the flush --
             // a displayLayer nested in this flush must see the new drawable
             // size as the watermark and skip instead of overwriting the
@@ -569,7 +577,6 @@ impl MetalRenderer {
             blit.end_encoding();
         }
 
-        command_buffer.present_drawable(drawable);
         // R3 task 6: ENCODE segment ends here (just before commit). Register a
         // GPU-completion handler so we can correlate the async GPU finish back
         // to this frame's id. The handler captures the submit timestamp and
@@ -577,7 +584,16 @@ impl MetalRenderer {
         // thread next frame. Triple-buffering means this lands 1–2 frames late.
         self.frame_trace.borrow_mut().encode_end();
         register_gpu_completion_handler(command_buffer);
-        command_buffer.commit();
+        if self.live_resize_active {
+            // Phase E (Warp parity): serialize the gesture present — the pool
+            // drains so next_drawable always vends the NEW size.
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            drawable.present();
+        } else {
+            command_buffer.present_drawable(drawable);
+            command_buffer.commit();
+        }
         // PLAN_zoom Z-f (E-3 nesting rule): same handoff point as the idle
         // path above -- streams + watermark move into the frame cache before
         // the flush so a nested displayLayer dedups against the new drawable

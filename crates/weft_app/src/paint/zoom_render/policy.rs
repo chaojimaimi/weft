@@ -80,27 +80,18 @@ pub(crate) fn zoom_diag_anomalous(gap_us: u64, call_us: u64) -> bool {
 /// ~20-30 ms-per-present baseline the user accepted.
 pub(crate) const PULL_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
-/// Pull-present throttle + Phase D live-resize bypass (truth-table tested):
-/// the limiter bounds the (post-C2 historical) self-zoom animation present
-/// storm -- an unpaced pull sends nextDrawable into its blocking cap. A LIVE
-/// drag needs the per-tick atomic pull instead: its present IS the
-/// anti-stretch vehicle (`bind_pull_transaction` commits the new-size texture
-/// with the transaction carrying the new bounds), so `bypass_live_resize`
-/// short-circuits the window. The 2 acquires/tick (pull + forced draw) exceed
-/// the drawable return rate only transiently: the safety mechanism is
-/// blocking backpressure (an empty pool makes nextDrawable short-wait ~one
-/// vsync, auto-pacing presents to the return rate; the 1 s saturation needs a
-/// full second of zero returns -- unreachable mid-drag) plus weeks of pre-A
-/// field health at exactly this profile (F-3A registered semantics: "one
-/// lean 1:1 present per tick ... never a stretch").
+/// Pull-present throttle (truth-table tested; PLAN_zoom_drawable_stall A,
+/// Phase E): the limiter throttles ONE-SHOT / non-gesture pulls to one
+/// drawable acquisition per PULL_MIN_INTERVAL — an unpaced pull sends
+/// nextDrawable into its ≤1 s blocking cap. Live-resize and self-zoom pulls
+/// stand down UPSTREAM instead (`redraw_cached_frame`'s `zoom_anim_active` /
+/// stand-down checks), so no bypass parameter is needed here.
 pub(crate) fn pull_present_allowed(
     last_present_at: Option<std::time::Instant>,
     now: std::time::Instant,
-    bypass_live_resize: bool,
 ) -> bool {
-    bypass_live_resize
-        || match last_present_at {
-            None => true,
-            Some(at) => now.duration_since(at) >= PULL_MIN_INTERVAL,
-        }
+    match last_present_at {
+        None => true,
+        Some(at) => now.duration_since(at) >= PULL_MIN_INTERVAL,
+    }
 }

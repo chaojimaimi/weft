@@ -266,37 +266,28 @@ fn zoom_diag_anomalous_truth_table() {
     assert!(zoom_diag_anomalous(2_000, 1_003_000));
 }
 
-/// Pull present-rate limiter truth table (PLAN_zoom_drawable_stall A, D): no
+/// Pull present-rate limiter truth table (PLAN_zoom_drawable_stall A, E): no
 /// previous present is allowed, anything strictly inside the window is
-/// throttled, exactly at (or past) the boundary is allowed; the Phase D
-/// live-resize bypass leg short-circuits the window entirely.
+/// throttled, exactly at (or past) the boundary is allowed. Live-resize and
+/// self-zoom pulls stand down upstream (redraw_cached_frame), so the
+/// predicate has no bypass leg.
 #[test]
 fn pull_present_allowed_truth_table() {
     let now = std::time::Instant::now();
     // No previous present: allowed.
-    assert!(pull_present_allowed(None, now, false));
+    assert!(pull_present_allowed(None, now));
     // Inside the window: throttled.
-    assert!(!pull_present_allowed(Some(now), now, false));
+    assert!(!pull_present_allowed(Some(now), now));
     assert!(!pull_present_allowed(
         Some(now - PULL_MIN_INTERVAL + std::time::Duration::from_nanos(1)),
-        now,
-        false
+        now
     ));
     // Boundary: >= the interval is allowed.
-    assert!(pull_present_allowed(
-        Some(now - PULL_MIN_INTERVAL),
-        now,
-        false
-    ));
+    assert!(pull_present_allowed(Some(now - PULL_MIN_INTERVAL), now));
     assert!(pull_present_allowed(
         Some(now - std::time::Duration::from_secs(1)),
-        now,
-        false
+        now
     ));
-    // Bypass leg (Phase D): a live-resize drag presents per tick even inside
-    // the throttle window.
-    assert!(pull_present_allowed(Some(now), now, true));
-    assert!(pull_present_allowed(None, now, true));
 }
 
 /// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are

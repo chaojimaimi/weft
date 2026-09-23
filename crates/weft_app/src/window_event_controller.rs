@@ -177,15 +177,14 @@ impl App {
                         // WaitUntil expiry (zoom_wait_policy), not here.
                         crate::paint::zoom_render::note_zoom_step();
                     }
-                    let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
-                    let live_resize = window
-                        .is_some_and(crate::macos_window::window_in_live_resize)
-                        || zoom_jump_hot;
-                    // PLAN_zoom Z-c: set_zoom_sequence runs AFTER
-                    // set_live_resize so the release path (both flags false)
-                    // lands the async-present restore before the zoom flip
-                    // re-binds the transaction.
-                    renderer.set_live_resize(live_resize);
+                    // PLAN_zoom_drawable_stall Phase E: set_live_resize is fed
+                    // the gesture-only `in_live_resize_now` poll. The retired
+                    // `|| zoom_jump_hot` leg (Z-c/Z-d tx-release timing, dead
+                    // since the 1.12.10 binding removal) would arm the
+                    // serialized-present regime on animated programmatic
+                    // resizes (snap/tiling) where nothing presents new-size
+                    // frames until the <=300 ms flush.
+                    renderer.set_live_resize(in_live_resize_now);
                     // PLAN_zoom Z-f (Appendix E-3): the v4 per-step forced
                     // draw is RETIRED for the zoom channel -- a 5-9 ms
                     // synchronous draw per animation step blocked the
@@ -229,18 +228,18 @@ impl App {
                 // winit dispatch point) rather than at the draw call site in
                 // redraw_controller.rs because that file sits at its audited
                 // 866-line ceiling; same frame, same result.
-                // PLAN_zoom Z-d/v4: the zoom channel rides the same poll —
-                // it releases when the 300 ms window lapses even without a
-                // Resized event. Presentation binding (presentsWithTransaction
-                // + flush) was REMOVED after the 1.12.9 field run showed it
-                // whitewashing the window during the system zoom animation.
+                // PLAN_zoom_drawable_stall Phase E: this poll feeds
+                // set_live_resize GESTURE-ONLY — the retired Z-d/v4
+                // `|| zoom_jump_hot` leg armed the present-mode machinery on
+                // animated programmatic resizes (snap/tiling), where nothing
+                // would present new-size frames until the <=300 ms flush.
                 let in_live_resize = self
                     .window
                     .as_ref()
                     .is_some_and(crate::macos_window::window_in_live_resize);
                 let zoom_jump_hot = self.window_runtime.zoom_jump_hot();
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.set_live_resize(in_live_resize || zoom_jump_hot);
+                    renderer.set_live_resize(in_live_resize);
                 }
                 // PLAN_zoom appendix F-3B: `zoom_jump_hot` is only the
                 // NECESSARY half of "the pull should supply this frame"; the

@@ -423,9 +423,10 @@ mod tests {
     use super::*;
 
     /// v1.11.6 (PLAN_v1116 M2 §7): `set_live_resize` flips the renderer flag
-    /// and the layer's `presentsWithTransaction` property in lockstep, and
-    /// early-returns when the value is unchanged (the renderer polls it every
-    /// frame). Uses the M3 headless constructor (same `build_paint_core` as
+    /// and the layer's `presentsWithTransaction` property in lockstep.
+    /// PLAN_zoom_drawable_stall Phase E: the set is unconditional (no dedup
+    /// early-return), so a repeated same-value set is an idempotent no-op.
+    /// Uses the M3 headless constructor (same `build_paint_core` as
     /// production; the layer needs no NSView for the property getter).
     #[test]
     fn live_resize_setter_flips_layer_transaction_mode() {
@@ -449,7 +450,8 @@ mod tests {
             "active live resize must flip the layer property"
         );
 
-        // Same value → early return; neither the flag nor the property flips.
+        // Same value → idempotent (no dedup early-return since Phase E);
+        // neither the flag nor the property changes.
         renderer.set_live_resize(true);
         assert!(renderer.live_resize_active);
         assert!(renderer.layer.presents_with_transaction());
@@ -461,26 +463,31 @@ mod tests {
             "resize end must restore async present"
         );
 
-        // Early-return on the way down too.
+        // Repeat-off stays idempotent on the way down too.
         renderer.set_live_resize(false);
         assert!(!renderer.live_resize_active);
         assert!(!renderer.layer.presents_with_transaction());
     }
 
-    // ── v1.12.2 B2 (PLAN_S2_render): config-gated live-resize present mode ──
+    // ── v1.12.2 B2 (PLAN_S2_render) + Phase E: the config gate now rolls
+    // ── back ONLY the legacy CATransaction flush ──
     //
     // G-B bidirectional switch tests. The headless constructor injects
     // `live_resize_flip_enabled = true` (the v1.11.6 rollback carrier) so the
     // flip test above keeps covering the restored path; the OFF side (the
     // new default) mirrors a config without the key by clearing the field.
+    // PLAN_zoom_drawable_stall Phase E: the gesture present mechanism
+    // (live_resize_active tracking + presentsWithTransaction bind) is
+    // UNCONDITIONAL in both configs; only the flush stays flip-gated.
 
-    /// Config OFF (default): `set_live_resize(true)` must NOT engage present
-    /// mode — the flag stays false, the layer keeps
-    /// `presentsWithTransaction = NO`, and the transaction flush is skipped
-    /// (observable via `core_animation_flushes` staying at zero even when
-    /// the encode paths call the flush hook every frame).
+    /// Config OFF (default, PLAN_zoom_drawable_stall Phase E):
+    /// `set_live_resize(true)` DOES track `live_resize_active` and bind
+    /// `presentsWithTransaction` (the serialized gesture present routes on
+    /// them in the default config), but the legacy transaction flush stays
+    /// gated — `core_animation_flushes` never moves while the flip is off
+    /// (the flush fn self-checks the gate at its metal_backend call site).
     #[test]
-    fn live_resize_config_gate_off_keeps_layer_no_and_never_flushes() {
+    fn live_resize_config_gate_off_still_binds_layer_but_never_flushes() {
         let Some(_device) = Device::system_default() else {
             eprintln!("skipping live-resize gate-off test: no Metal device available");
             return;
@@ -490,16 +497,16 @@ mod tests {
 
         renderer.set_live_resize(true);
         assert!(
-            !renderer.live_resize_active,
-            "gate off: present mode must never engage"
+            renderer.live_resize_active,
+            "gate off: Phase E gesture tracking is unconditional"
         );
         assert!(
-            !renderer.layer.presents_with_transaction(),
-            "gate off: layer must stay in async-present mode"
+            renderer.layer.presents_with_transaction(),
+            "gate off: Phase E gesture-scoped layer bind is unconditional"
         );
 
-        // Simulate the two per-frame flush call sites (metal_backend
-        // mod.rs:187/:452): both must be no-ops under the gate.
+        // Simulate the per-frame flush call sites (metal_backend mod.rs):
+        // all must be no-ops under the gate.
         renderer.flush_core_animation_if_live_resize();
         renderer.flush_core_animation_if_live_resize();
         assert_eq!(
@@ -508,10 +515,18 @@ mod tests {
             "gate off: CATransaction::flush must never run"
         );
 
-        // Unchanged-value early return stays safe with the gate off.
+        // Same-value repeat stays safe with the gate off.
         renderer.set_live_resize(true);
+        assert!(renderer.live_resize_active);
+        assert!(renderer.layer.presents_with_transaction());
+
+        // Gesture end restores async present unconditionally.
+        renderer.set_live_resize(false);
         assert!(!renderer.live_resize_active);
-        assert!(!renderer.layer.presents_with_transaction());
+        assert!(
+            !renderer.layer.presents_with_transaction(),
+            "gate off: gesture end must restore async present"
+        );
     }
 
     /// Drag semantics with the switch ON are unchanged by the zoom channel:

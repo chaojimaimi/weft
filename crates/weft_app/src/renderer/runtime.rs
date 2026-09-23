@@ -145,40 +145,35 @@ impl MetalRenderer {
     /// commit atomically (Warp precedent) — kills the "old frame stretched
     /// to new bounds" artifact. Async present resumes when the resize ends.
     ///
-    /// Early-returns when the state is unchanged (polled every frame); the
-    /// layer property flips only on the transition.
+    /// PLAN_zoom_drawable_stall Phase E (Warp parity): the layer bind and the
+    /// `live_resize_active` tracking are UNCONDITIONAL and gesture-scoped
+    /// (the feed is the gesture-only `in_live_resize` poll) — metal_backend's
+    /// serialized gesture present routes on the flag in the default config
+    /// too. The pull stand-down forwarding also runs unconditionally (before
+    /// any gate); Phase D's bypass is superseded by it.
     ///
-    /// v1.12.2 B2 (PLAN_S2_render): the whole mechanism is now a config-gated
-    /// rollback carrier. With `presents_with_transaction_live_resize` unset
-    /// (the default → `live_resize_flip_enabled == false`) present mode never
-    /// engages: the layer stays NO and `flush_core_animation_if_live_resize`
-    /// never runs. The flip+flush premise (v1.11.6 M2 / v1.11.9 / v1.11.10)
+    /// v1.12.2 B2 (PLAN_S2_render): `presents_with_transaction_live_resize`
+    /// (`live_resize_flip_enabled`) now rolls back ONLY the legacy explicit
+    /// CATransaction flush, which self-checks the gate at its metal_backend
+    /// call site. The flip+flush premise (v1.11.6 M2 / v1.11.9 / v1.11.10)
     /// was a 46-115ms frame budget; after S3/B1/B3 a commit is ~3ms and every
     /// vsync has a frame, so the synchronous flush's 0-33ms WindowServer wait
     /// became the dominant cost — see the FIX_DRAG_RESIZE_STUTTER.md
     /// appendix "为何翻转 presentsWithTransaction".
     pub(crate) fn set_live_resize(&mut self, active: bool) {
-        // PLAN_zoom_drawable_stall Phase D: feed the pull-present bypass
-        // BEFORE the config gate / dedup early-returns below -- either would
-        // silently swallow the forwarding in the default config.
-        crate::paint::zoom_render::set_pull_bypass_live_resize(active);
-        if !self.live_resize_flip_enabled {
-            // Gate off (default): force the async-present invariant. With
-            // construction-time injection `live_resize_active` is already
-            // false here; the force-restore only guards a future live
-            // re-injection path.
-            if self.live_resize_active {
-                self.live_resize_active = false;
-                self.layer.set_presents_with_transaction(false);
-            }
-            return;
-        }
-        if self.live_resize_active == active {
-            return;
-        }
+        // Phase E: tracked unconditionally, first — the serialized gesture
+        // present (metal_backend) and the warm-atlas consumers read the true
+        // gesture state in every config.
         self.live_resize_active = active;
+        // Phase E: the pull STANDS DOWN during the gesture (Warp presents
+        // once per tick) instead of bypassing the present-rate limiter.
+        crate::paint::zoom_render::set_pull_live_resize_stand_down(active);
         self.layer.set_presents_with_transaction(active); // metal-rs typed API
-        tracing::debug!(active, "live resize present mode");
+        if self.live_resize_flip_enabled {
+            // Legacy flip+flush observability only; the flush itself is
+            // gated at the metal_backend call site.
+            tracing::debug!(active, "live resize present mode");
+        }
     }
 
     pub fn resize(&mut self, window: &Window, size: winit::dpi::PhysicalSize<u32>) {
