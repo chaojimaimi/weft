@@ -273,6 +273,7 @@ fn zoom_anim_is_zoom_in_direction() {
         start,
         duration: std::time::Duration::from_millis(220),
         last_applied: (0.0, 0.0, 800.0, 600.0),
+        last_step: start,
         steps: 0,
     });
     assert!(super::zoom_anim_is_zoom_in());

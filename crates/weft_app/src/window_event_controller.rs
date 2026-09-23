@@ -561,7 +561,15 @@ impl App {
         let live_size = self.window.as_ref().map(|window| window.inner_size());
         if let Some(size) = live_size {
             if self.window_runtime.last_resized_physical != Some((size.width, size.height)) {
+                // TEMP-BENCH (appendix I measurement, strip before release):
+                // the synth resize runs the full reflow pipeline inline --
+                // its duration is the per-step layout cost.
+                let t = std::time::Instant::now();
                 self.dispatch_window_event(event_loop, WindowEvent::Resized(size));
+                tracing::debug!(
+                    elapsed_us = t.elapsed().as_micros() as u64,
+                    "STEPZ stage: synth resize dispatch"
+                );
             }
         }
     }
@@ -659,9 +667,24 @@ impl App {
         // position SECOND -- under either anchor interpretation the step
         // lands at exactly (x, y, w, h), and winit's position flip reads the
         // already-updated frame size.
+        // TEMP-BENCH (appendix I measurement, strip before release): stage
+        // timings for the AppKit calls -- the field 1 s stall lives in one
+        // of these or in the subsequent Resized/drain/draw pipeline.
+        let t_setters = std::time::Instant::now();
         let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+        let t_inner = t_setters.elapsed();
         window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
+        let t_pos = t_setters.elapsed();
         crate::macos_zoom::zoom_anim_advance((x, y, w, h));
+        crate::macos_zoom::zoom_anim_mark_stepped();
+        tracing::debug!(
+            step = anim.steps,
+            w,
+            h,
+            ?t_inner,
+            total_us = t_pos.as_micros() as u64,
+            "STEPZ stage: setters"
+        );
         if progress >= 1.0 {
             let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
             tracing::info!(steps, "self-zoom complete");

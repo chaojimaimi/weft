@@ -5293,3 +5293,47 @@ fn same_dims_pty_resize_preserves_ownership_evidence() {
         "identity resize must preserve the scrollback ownership mask"
     );
 }
+
+/// Appendix I optimization baseline (ignored by default; run with
+/// `cargo test -p weft_core --test vt -- --ignored --nocapture bench_shrink`):
+/// reproduces the field zoom-out resize (62x200 -> 33x91) over a
+/// seq-1-18900-shaped document and times both directions.
+#[test]
+#[ignore]
+fn bench_shrink_and_grow_resize_18900_lines() {
+    use std::time::Instant;
+
+    let mut term = crate::vt::Terminal::with_scrollback(62, 200, 100_000);
+    let mut content = String::with_capacity(18900 * 10);
+    for i in 1..=18900 {
+        content.push_str(&i.to_string());
+        content.push_str("\r\n");
+    }
+    let fed = Instant::now();
+    term.process(content.as_bytes());
+    eprintln!("feed 18900 lines: {:?}", fed.elapsed());
+
+    // Field zoom-out direction: maximized (62x200) -> restore (33x91).
+    let t0 = Instant::now();
+    term.resize(33, 91);
+    let shrink = t0.elapsed();
+
+    // Field zoom-in direction: restore -> maximized.
+    let t1 = Instant::now();
+    term.resize(62, 200);
+    let grow = t1.elapsed();
+
+    eprintln!("resize 62x200 -> 33x91 (shrink): {shrink:?}");
+    eprintln!("resize 33x91  -> 62x200 (grow):   {grow:?}");
+
+    // Repeat a few cycles for a stable picture.
+    for cycle in 0..3 {
+        let a = Instant::now();
+        term.resize(33, 91);
+        let s = a.elapsed();
+        let b = Instant::now();
+        term.resize(62, 200);
+        let g = b.elapsed();
+        eprintln!("cycle {cycle}: shrink={s:?} grow={g:?}");
+    }
+}

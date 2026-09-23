@@ -89,3 +89,74 @@ fn bench_widen_resize_dims_at_depth() {
             .join(" ")
     );
 }
+
+/// Appendix I optimization bench (2026-09-23): the field zoom-out shrink —
+/// seq-shaped SHORT lines (no wrap splits) at maximized width, then the
+/// restore shrink. Separates "index rebuild" cost from "wrap split" cost.
+#[test]
+#[ignore = "calibration bench — run explicitly with --release"]
+fn bench_zoom_out_shrink_seq_short_lines() {
+    let rows = 62usize;
+    let cols = 200usize;
+    let mut term = Terminal::with_scrollback(rows, cols, 200_000);
+    // seq 1 18900, twice (field: two runs).
+    let mut buf = String::new();
+    for run in 0..2 {
+        for i in 1..=18900 {
+            buf.push_str(&(run * 18900 + i).to_string());
+            buf.push_str("\r\n");
+        }
+    }
+    term.process(buf.as_bytes());
+    let depth = term.grid().scrollback_len();
+    let mut durs = Vec::new();
+    for i in 0..6 {
+        let target = if i % 2 == 0 {
+            (91usize, 33usize)
+        } else {
+            (cols, rows)
+        };
+        let t = Instant::now();
+        term.resize(target.1, target.0);
+        durs.push(t.elapsed());
+    }
+    println!(
+        "G4 seq-shrink commits depth={depth}: {}",
+        durs.iter()
+            .map(|d| format!("{d:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}
+
+/// Appendix I optimization bench: the WRAP-SPLIT shrink — wide lines that
+/// actually split when the width narrows (200 cols -> 91 splits every line).
+#[test]
+#[ignore = "calibration bench — run explicitly with --release"]
+fn bench_zoom_out_shrink_wrap_split() {
+    let rows = 62usize;
+    let cols = 200usize;
+    let mut term = Terminal::with_scrollback(rows, cols, 400_000);
+    let mut buf = String::new();
+    for i in 1..=18900 {
+        buf.push_str(&format!("row-{i:06}-{}", "x".repeat(cols - 16)));
+        buf.push_str("\r\n");
+    }
+    term.process(buf.as_bytes());
+    let depth = term.grid().scrollback_len();
+    // First shrink materializes the split; alternate to re-split each time.
+    let mut durs = Vec::new();
+    for i in 0..6 {
+        let target = if i % 2 == 0 { 91usize } else { cols };
+        let t = Instant::now();
+        term.resize(rows, target);
+        durs.push(t.elapsed());
+    }
+    println!(
+        "G6 wrap-split shrink commits depth={depth}: {}",
+        durs.iter()
+            .map(|d| format!("{d:?}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}

@@ -80,6 +80,11 @@ pub(crate) struct ZoomAnim {
     pub start: std::time::Instant,
     pub duration: std::time::Duration,
     pub last_applied: ZoomFrame,
+    /// Pacing floor (appendix I measurement): the pipeline costs ~6 ms per
+    /// step while the display refreshes every ~16.7 ms -- steps faster than
+    /// that never reach the screen. `last_step` enforces one applied step
+    /// per display refresh.
+    pub last_step: std::time::Instant,
     pub steps: u32,
 }
 
@@ -146,6 +151,16 @@ pub(crate) fn zoom_anim_active() -> bool {
 
 /// Stamp the applied step and bump the step counter (Appendix I: the step
 /// count lives in the anim -- the controller only logs it at completion).
+/// Stamps the pacing floor after a step lands (appendix I measurement).
+pub(crate) fn zoom_anim_mark_stepped() {
+    let mut anim = ZOOM_ANIM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = anim.as_mut() {
+        a.last_step = std::time::Instant::now();
+    }
+}
+
 pub(crate) fn zoom_anim_advance(last_applied: ZoomFrame) {
     if let Some(anim) = lock_zoom_anim().as_mut() {
         anim.last_applied = last_applied;
@@ -327,6 +342,7 @@ pub(crate) fn start_zoom_anim(start: ZoomFrame, target: ZoomFrame, main_h: f64) 
         start: std::time::Instant::now(),
         duration: ZOOM_ANIM_DURATION,
         last_applied: (start_tl.0, start_tl.1, start.2, start.3),
+        last_step: std::time::Instant::now(),
         steps: 0,
     });
     super::notify_resize_wake();
@@ -561,9 +577,13 @@ pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
     }
     let started = *SELF_ZOOM_TEST_START.get_or_init(std::time::Instant::now);
     let n = SELF_ZOOM_TEST_FIRED.load(std::sync::atomic::Ordering::Acquire);
+    let base = std::env::var_os("WEFT_SELF_ZOOM_TEST_DELAY")
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
     let due = match n {
-        0 => started.elapsed() >= std::time::Duration::from_secs(2),
-        1 => started.elapsed() >= std::time::Duration::from_secs(6),
+        0 => started.elapsed() >= std::time::Duration::from_secs(base),
+        1 => started.elapsed() >= std::time::Duration::from_secs(base + 4),
         _ => false,
     };
     if !due {
