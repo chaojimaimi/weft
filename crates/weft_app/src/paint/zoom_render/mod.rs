@@ -52,8 +52,8 @@ use crate::renderer::MetalRenderer;
 // lives in verdict.rs (this module: Metal/cache plumbing).
 mod policy;
 pub(crate) use policy::{
-    cascade_force_commit, pull_can_freshen, pull_present_allowed, zoom_diag_anomalous,
-    zoom_flush_action, ZoomFlushAction,
+    cascade_force_commit, pull_can_freshen, pull_present_allowed, zoom_flush_action,
+    ZoomFlushAction,
 };
 mod verdict;
 pub(crate) use verdict::{note_zoom_step, zoom_window_finished};

@@ -171,19 +171,10 @@ unsafe fn set_frame_size_sync_drawable(
     let (pw, ph) = (size.width * scale, size.height * scale);
     let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
     if fresh {
-        // Diagnostic build (field forensics 2026-09-23): the pull's CA
-        // commit is the second candidate home for the ~1 s stall (the
-        // stepper's setters are the first). A slow pull speaks at info.
-        let t_pull = std::time::Instant::now();
         crate::paint::zoom_render::bind_pull_transaction();
         let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
         crate::paint::zoom_render::unbind_pull_transaction();
-        let pull_us = t_pull.elapsed().as_micros() as u64;
-        if crate::paint::zoom_render::zoom_diag_anomalous(0, pull_us) {
-            tracing::info!(presented, pull_us, "STEPZ stall: slow inline pull");
-        } else {
-            tracing::debug!(presented, pull_us, "setFrameSize inline pull");
-        }
+        tracing::debug!(presented, "setFrameSize inline pull");
     }
 }
 
