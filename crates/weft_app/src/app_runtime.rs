@@ -50,6 +50,7 @@ pub(crate) fn install_runtime_diagnostics() {
     tracing::info!(
         pid = std::process::id(),
         version = env!("CARGO_PKG_VERSION"),
+        hash = option_env!("WEFT_BUILD_HASH").unwrap_or("dev"),
         "=== Weft session start ==="
     );
     setup_panic_hook(std::panic::take_hook());
@@ -796,6 +797,7 @@ impl ApplicationHandler<AppEvent> for App {
     /// F-3B: hot zoom windows skip the pump (it would only hit the
     /// suppression gate and self-wake); zoom_wait_policy owns all wakes.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.step_self_zoom();
         self.zoom_wait_policy(event_loop);
         let rt = &self.window_runtime;
         if !rt.zoom_jump_hot() && rt.last_resize_instant.elapsed() < Duration::from_millis(100) {

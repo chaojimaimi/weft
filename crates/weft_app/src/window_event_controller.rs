@@ -577,4 +577,78 @@ impl App {
             crate::paint::zoom_render::ZoomFlushAction::None => {}
         }
     }
+
+    /// PLAN_zoom appendix I: advance the self-managed zoom animation by one
+    /// event-loop turn. Called from `about_to_wait` every pass; idle cost is
+    /// the zero-allocation `zoom_anim_peek` (Copy snapshot or None).
+    ///
+    /// Each step applies the eased intermediate frame through the SAME
+    /// winit setters a user drag exercises, so the whole pipeline runs live:
+    /// `request_inner_size` -> injected `setFrameSize:` IMP (drawable sync +
+    /// inline pull) -> Resized dispatched same-pass -> tab/PTY reflow -> full
+    /// draw. That is the drag semantics, which is why the animation tracks
+    /// live instead of freezing like the system zoom does (I-1: AppKit's own
+    /// animation suspends winit dispatch entirely).
+    pub(crate) fn step_self_zoom(&mut self) {
+        // Appendix I acceptance rig: fires one `zoom:` ~2s after startup
+        // when WEFT_SELF_ZOOM_TEST=1 (inert otherwise).
+        if let Some(window) = self.window.as_ref() {
+            crate::macos_zoom::self_zoom_test_tick(window);
+        }
+        let Some(anim) = crate::macos_zoom::zoom_anim_peek() else {
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            crate::macos_zoom::zoom_anim_cancel();
+            return;
+        };
+        // Cancel semantics (review P1-3): a live resize gesture owns the
+        // geometry; the animation must not fight the user's drag.
+        if crate::macos_window::window_in_live_resize(window) {
+            crate::macos_zoom::zoom_anim_cancel();
+            tracing::debug!("self-zoom cancelled: live resize in progress");
+            return;
+        }
+        let progress = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).min(1.0);
+        let eased = crate::macos_zoom::ease_in_out_quad(progress);
+        let x = crate::macos_zoom::lerp(anim.origin_start.0, anim.origin_target.0, eased);
+        let y = crate::macos_zoom::lerp(anim.origin_start.1, anim.origin_target.1, eased);
+        let w = crate::macos_zoom::lerp(anim.size_start.0, anim.size_target.0, eased);
+        let h = crate::macos_zoom::lerp(anim.size_start.1, anim.size_target.1, eased);
+        // Cancel check (review P1-3): actual geometry vs the last applied
+        // step. Window dragging / Mission Control mid-animation must abort
+        // the interpolation; the 1pt tolerance (same epsilon as the zoomed
+        // test) keeps winit's physical read-back rounding from false-tripping.
+        let scale = window.scale_factor();
+        let drifted = match window.outer_position() {
+            Ok(position) => {
+                let position = position.to_logical::<f64>(scale);
+                let size = window.outer_size().to_logical::<f64>(scale);
+                let eps = crate::macos_zoom::ZOOM_EPSILON_PT;
+                (position.x - anim.last_applied.0).abs() > eps
+                    || (position.y - anim.last_applied.1).abs() > eps
+                    || (size.width - anim.last_applied.2).abs() > eps
+                    || (size.height - anim.last_applied.3).abs() > eps
+            }
+            Err(_) => true,
+        };
+        if drifted {
+            crate::macos_zoom::zoom_anim_cancel();
+            tracing::warn!("self-zoom cancelled: window moved externally mid-animation");
+            return;
+        }
+        // Setter order (review P1-2, pinned): inner size FIRST, outer
+        // position SECOND -- under either anchor interpretation the step
+        // lands at exactly (x, y, w, h), and winit's position flip reads the
+        // already-updated frame size.
+        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+        window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
+        crate::macos_zoom::zoom_anim_advance((x, y, w, h));
+        if progress >= 1.0 {
+            let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
+            tracing::info!(steps, "self-zoom complete");
+        } else {
+            self.request_redraw();
+        }
+    }
 }

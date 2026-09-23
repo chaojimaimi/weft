@@ -36,6 +36,12 @@ if [[ "$1" == "--sign" && -n "$2" ]]; then
     shift 2
 fi
 
+# PLAN_zoom appendix I: stamp the build hash into the binary so the
+# session-start log line can distinguish same-version rebuilds (the version
+# number stays frozen at 1.12.15 until the zoom fix is user-confirmed).
+# Exported so the child build-app.sh cargo build picks it up via option_env!.
+export WEFT_BUILD_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo dev)"
+
 # Rebuild only if .app is missing (lets CI package an already-signed .app).
 if [[ ! -d "${APP_DIR}" ]]; then
     echo "==> Building Weft.app"

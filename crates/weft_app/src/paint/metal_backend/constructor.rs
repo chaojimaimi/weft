@@ -73,6 +73,12 @@ impl MetalRenderer {
         // (app_runtime's install_zoom_sequence_hook runs pre-attach and only
         // does the class-level setFrameSize add.)
         crate::macos_zoom::install_display_layer_hook(window);
+        // PLAN_zoom appendix I: `zoom:` on the winit window class is
+        // replaced by the self-managed animation IMP (220ms, event-loop
+        // stepped). Runs here because the NSWindow must exist (same timing
+        // constraint as the displayLayer wiring above); class-level and
+        // idempotent inside macos_zoom.
+        crate::macos_zoom::install_zoom_override_hook(window);
         renderer
     }
 

@@ -212,6 +212,40 @@ unsafe extern "C" fn set_frame_size_imp(
             crate::paint::zoom_render::unbind_pull_transaction();
             tracing::debug!(presented, "setFrameSize inline pull");
         }
+        // Appendix I (review round 2 P1): every REAL resize outside a
+        // self-managed animation refreshes the persisted zoom-restore frame,
+        // so zoom-out follows a window the user dragged/resized meanwhile.
+        // The non-zoomed gate is MANDATORY: a zoom-in's trailing Resized
+        // dispatches on the pass AFTER the anim is cleared with frame ==
+        // visibleFrame -- without the gate the refresh would overwrite the
+        // restore frame with the zoomed-in frame and zoom-out would die. A
+        // restore-direction anim's trailing Resized refreshes to the same
+        // value (harmless -- pinned in the truth table). Checked FIRST so an
+        // active animation skips the whole block (zero msg_sends per step).
+        if !zoom_anim_active() {
+            // SAFETY: `window` on a live view returns its NSWindow
+            // (unretained); frame/screen/visibleFrame are plain NSWindow and
+            // NSScreen getters returning by-value geometry. All guarded by
+            // the catch_unwind above.
+            let window: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, window] };
+            if !window.is_null() {
+                let wframe: objc2_foundation::NSRect = unsafe { msg_send![window, frame] };
+                let screen: *mut objc2::runtime::AnyObject = unsafe { msg_send![window, screen] };
+                if !screen.is_null() {
+                    let vis: objc2_foundation::NSRect = unsafe { msg_send![screen, visibleFrame] };
+                    let f = (
+                        wframe.origin.x,
+                        wframe.origin.y,
+                        wframe.size.width,
+                        wframe.size.height,
+                    );
+                    let v = (vis.origin.x, vis.origin.y, vis.size.width, vis.size.height);
+                    if should_refresh_restore(false, f, v, ZOOM_EPSILON_PT) {
+                        set_zoom_restore_frame(f);
+                    }
+                }
+            }
+        }
         // Appendix H: ping the app so the reflow tracks the animation live
         // (the Resized events for this step will not arrive until the burst
         // ends). The Wake arm dedupes by size comparison.
@@ -460,3 +494,13 @@ unsafe extern "C" fn display_layer_imp(
         tracing::error!("displayLayer IMP panicked; pull skipped for this callback");
     });
 }
+
+mod anim;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use anim::{
+    ease_in_out_quad, install_zoom_override_hook, lerp, self_zoom_test_tick, zoom_anim_advance,
+    zoom_anim_cancel, zoom_anim_finish, zoom_anim_peek, ZOOM_EPSILON_PT,
+};
+use anim::{set_zoom_restore_frame, should_refresh_restore, zoom_anim_active};
