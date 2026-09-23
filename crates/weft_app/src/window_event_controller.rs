@@ -260,9 +260,17 @@ impl App {
                 // stepping loop mid-motion. The pull supplies every frame
                 // instead; the coalesced drain runs once after the animation
                 // clears (the WaitUntil flush pass).
-                let self_zoom_active = crate::macos_zoom::zoom_anim_is_active();
+                // Appendix I-6 revision (direction-aware): the blanket
+                // animation suppression also froze zoom-IN, whose reflow is
+                // the cheap merge direction -- only the shrink direction
+                // (wrap split, 0.4-1 s/step) needs the deferral. Single
+                // peek: active + direction from one lock acquisition.
+                let anim = crate::macos_zoom::zoom_anim_peek();
+                let self_zoom_defers_main = anim.as_ref().is_some_and(|a| {
+                    !crate::macos_zoom::zoom_direction_is_in(a.size_start, a.size_target)
+                });
                 let pull_supplies_frame = zoom_jump_hot
-                    && (self_zoom_active
+                    && (self_zoom_defers_main
                         || self.window.as_ref().is_some_and(|window| {
                             let inner = window.inner_size();
                             crate::paint::zoom_render::pull_can_freshen(

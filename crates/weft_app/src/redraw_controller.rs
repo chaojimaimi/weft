@@ -193,8 +193,14 @@ impl App {
         // later `CSI A` repaints cannot erase the extra rows. Background tabs
         // remain settle-debounced; both their PTY and Grid retain the old
         // geometry together until the transaction commits.
+        // Appendix I-6 revision: during a self-managed ZOOM-IN animation
+        // the per-step grid reflow is the cheap merge direction -- commit
+        // background panes per step too, or a live background TUI (top)
+        // stays at its old width for the whole animation (field: split +
+        // top intermediate state).
         let cascade_settled = self.window_runtime.last_resize_instant.elapsed()
-            > std::time::Duration::from_millis(100);
+            > std::time::Duration::from_millis(100)
+            || crate::macos_zoom::zoom_anim_is_zoom_in();
         let pending: Vec<_> = self
             .sessions
             .tabs()

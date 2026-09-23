@@ -256,3 +256,41 @@ fn to_winit_top_left_matches_winit_flip() {
     let (x, y_top) = to_winit_top_left((37.0, 41.0), (500.0, 400.0), 1000.0);
     assert_eq!((x, y_top), (37.0, 559.0));
 }
+
+/// Appendix I-6 revision: the direction getter -- zoom-in only when BOTH
+/// dimensions grow; mixed/shrinking targets defer (conservative).
+#[test]
+fn zoom_anim_is_zoom_in_direction() {
+    let _guard = ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let start = std::time::Instant::now() - std::time::Duration::from_millis(50);
+    *super::anim::zoom_anim_slot() = Some(super::anim::ZoomAnim {
+        origin_start: (0.0, 0.0),
+        size_start: (800.0, 600.0),
+        origin_target: (0.0, 0.0),
+        size_target: (1728.0, 1084.0),
+        start,
+        duration: std::time::Duration::from_millis(220),
+        last_applied: (0.0, 0.0, 800.0, 600.0),
+        steps: 0,
+    });
+    assert!(super::zoom_anim_is_zoom_in());
+    // shrink: width and height both decrease
+    let a = zoom_anim_peek().unwrap();
+    *super::anim::zoom_anim_slot() = Some(super::anim::ZoomAnim {
+        size_target: (800.0, 600.0),
+        size_start: (1728.0, 1084.0),
+        ..a
+    });
+    assert!(!super::zoom_anim_is_zoom_in());
+    // mixed (width grows, height shrinks): conservative zoom-out
+    let a = zoom_anim_peek().unwrap();
+    *super::anim::zoom_anim_slot() = Some(super::anim::ZoomAnim {
+        size_target: (1728.0, 600.0),
+        ..a
+    });
+    assert!(!super::zoom_anim_is_zoom_in());
+    zoom_anim_finish();
+    assert!(!super::zoom_anim_is_zoom_in());
+}
