@@ -105,6 +105,21 @@ fn should_refresh_restore_truth_table() {
 }
 
 #[test]
+fn zoom_step_due_truth_table() {
+    assert!(!zoom_step_due(std::time::Duration::ZERO));
+    assert!(!zoom_step_due(std::time::Duration::from_millis(11)));
+    assert!(!zoom_step_due(
+        STEP_MIN_INTERVAL - std::time::Duration::from_nanos(1)
+    ));
+    // Boundary: >= — exactly the floor is due.
+    assert!(zoom_step_due(STEP_MIN_INTERVAL));
+    assert!(zoom_step_due(std::time::Duration::from_millis(16)));
+    assert!(zoom_step_due(std::time::Duration::from_secs(1)));
+    // Pin the pacing claim: floor 12 ms bounds a 220 ms animation at 19 steps.
+    assert_eq!(STEP_MIN_INTERVAL, std::time::Duration::from_millis(12));
+}
+
+#[test]
 fn plan_zoom_truth_table() {
     let vis: ZoomFrame = (0.0, 0.0, 1440.0, 855.0);
     let window: ZoomFrame = (100.0, 100.0, 800.0, 600.0);

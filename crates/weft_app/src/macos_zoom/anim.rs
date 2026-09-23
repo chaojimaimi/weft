@@ -82,8 +82,9 @@ pub(crate) struct ZoomAnim {
     pub last_applied: ZoomFrame,
     /// Pacing floor (appendix I measurement): the pipeline costs ~6 ms per
     /// step while the display refreshes every ~16.7 ms -- steps faster than
-    /// that never reach the screen. `last_step` enforces one applied step
-    /// per display refresh.
+    /// that never reach the screen. `last_step` anchors the pacing floor:
+    /// `zoom_step_due` (PLAN_zoom_drawable_stall B) enforces one applied
+    /// step per STEP_MIN_INTERVAL.
     pub last_step: std::time::Instant,
     pub steps: u32,
 }
@@ -160,6 +161,22 @@ pub(crate) fn zoom_anim_mark_stepped() {
     if let Some(a) = anim.as_mut() {
         a.last_step = std::time::Instant::now();
     }
+}
+
+/// Pacing floor (appendix I measurement; NOW wired by
+/// PLAN_zoom_drawable_stall — 95799d2 stamped `last_step` but no check
+/// ever read it). The display refreshes every ~16.7 ms (60 Hz) or ~8.3 ms
+/// (120 Hz); steps applied faster than ~12 ms never reach the screen, so
+/// the floor halves the per-step pipeline + present work. Interpolation
+/// is elapsed-based, so a refused step's interval folds into the next
+/// applied one — the trajectory stays position-exact. Also halves the
+/// pull acquisition rate that Fix A throttles (belt and braces).
+pub(crate) const STEP_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
+
+/// Pure pacing predicate (truth-table tested): a step is due when at
+/// least STEP_MIN_INTERVAL has passed since the previous applied step.
+pub(crate) fn zoom_step_due(elapsed: std::time::Duration) -> bool {
+    elapsed >= STEP_MIN_INTERVAL
 }
 
 pub(crate) fn zoom_anim_advance(last_applied: ZoomFrame) {

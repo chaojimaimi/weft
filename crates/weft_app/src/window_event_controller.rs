@@ -639,6 +639,17 @@ impl App {
             tracing::debug!("self-zoom cancelled: live resize in progress");
             return;
         }
+        // Pacing floor (PLAN_zoom_drawable_stall B): refuse to apply a step
+        // sooner than STEP_MIN_INTERVAL after the previous one. The refusal
+        // MUST keep the sustain chain alive — request_redraw here — or the
+        // loop would sleep until the 300 ms hot-window expiry (the exact
+        // field-freeze shape this plan fixes). Each refused pass costs one
+        // anim peek + one flag check; the due pass then folds the skipped
+        // interval in (time-driven interpolation).
+        if !crate::macos_zoom::zoom_step_due(anim.last_step.elapsed()) {
+            self.request_redraw();
+            return;
+        }
         let progress = (anim.start.elapsed().as_secs_f64() / anim.duration.as_secs_f64()).min(1.0);
         let eased = crate::macos_zoom::ease_in_out_quad(progress);
         let x = crate::macos_zoom::lerp(anim.origin_start.0, anim.origin_target.0, eased);
