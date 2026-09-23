@@ -53,3 +53,23 @@ pub(crate) fn zoom_flush_action(hot: bool, pending: bool) -> ZoomFlushAction {
 pub(crate) fn pull_degrade_verdict(steps: u32, pull_delta: u64) -> bool {
     steps >= 2 && pull_delta == 0
 }
+
+/// RedrawRequested deferral gate (Appendix I-6, review MEDIUM-2 wiring
+/// anchor): while a self-managed zoom animation is ACTIVE, the main path
+/// (full draw + queued grid drain) is deferred ONLY for the shrink direction
+/// -- the wrap-split reflow costs 0.4-1 s/step (field: a 1.0 s stall at
+/// cols~130) and would freeze the stepping loop; a zoom-in's merge-direction
+/// reflow is cheap, so the main path keeps tracking live. The controller
+/// wiring merely derives the two bits from one `zoom_anim_peek`.
+pub(crate) fn defers_main(active: bool, zoom_in: bool) -> bool {
+    active && !zoom_in
+}
+
+/// Resize-cascade force-commit bit (Appendix I-6, review MEDIUM-2 wiring
+/// anchor): during a self-managed ZOOM-IN animation background panes commit
+/// per step too (the cheap merge direction), or a live background TUI stays
+/// at its old width for the whole animation. The elapsed-debounce leg is
+/// composed by the caller; this is only the force bit.
+pub(crate) fn cascade_force_commit(zoom_in: bool) -> bool {
+    zoom_in
+}

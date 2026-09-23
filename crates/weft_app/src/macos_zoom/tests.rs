@@ -285,10 +285,10 @@ fn zoom_anim_is_zoom_in_direction() {
         ..a
     });
     assert!(!super::zoom_anim_is_zoom_in());
-    // mixed (width grows, height shrinks): conservative zoom-out
+    // mixed (width strictly grows, height shrinks): conservative zoom-out
     let a = zoom_anim_peek().unwrap();
     *super::anim::zoom_anim_slot() = Some(super::anim::ZoomAnim {
-        size_target: (1728.0, 600.0),
+        size_target: (1900.0, 600.0),
         ..a
     });
     assert!(!super::zoom_anim_is_zoom_in());

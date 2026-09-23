@@ -134,8 +134,9 @@ pub(crate) fn zoom_anim_slot() -> std::sync::MutexGuard<'static, Option<ZoomAnim
 /// at intermediate widths (field: a 1.0 s stall at cols~130), so the main
 /// path must stay deferred. Mixed-dimension targets count as zoom-out
 /// (conservative: defer).
-/// Pure direction predicate (truth-table tested): zoom-in only when BOTH
-/// dimensions grow; mixed targets count as zoom-out (conservative).
+/// Pure direction predicate (truth-table tested): zoom-in when neither
+/// dimension shrinks ("non-shrinking"); any shrinking dimension counts as
+/// zoom-out (conservative).
 pub(crate) fn zoom_direction_is_in(size_start: (f64, f64), size_target: (f64, f64)) -> bool {
     size_target.0 >= size_start.0 && size_target.1 >= size_start.1
 }
@@ -312,20 +313,22 @@ pub(crate) fn to_winit_top_left(origin: (f64, f64), size: (f64, f64), main_h: f6
 /// inside the IMP's catch_unwind.
 unsafe fn primary_screen_height() -> Option<f64> {
     use objc2::msg_send;
+    use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     let class = objc2::runtime::AnyClass::get("NSScreen")?;
     // SAFETY: `screens` is NSScreen's documented class property.
     let screens: *mut AnyObject = unsafe { msg_send![class, screens] };
-    if screens.is_null() {
-        return None;
-    }
+    // Defensive lifetime scoping (rust-reviewer A3): the getter returns
+    // the floor as a bare pointer; `Retained::retain` scopes a reference so
+    // it is released at scope exit (install_zoom_sequence_hook's view
+    // retain is the house precedent).
+    let screens = unsafe { Retained::retain(screens)? };
     // SAFETY: `firstObject` on a live NSArray.
-    let primary: *mut AnyObject = unsafe { msg_send![screens, firstObject] };
-    if primary.is_null() {
-        return None;
-    }
+    let primary: *mut AnyObject = unsafe { msg_send![Retained::as_ptr(&screens), firstObject] };
+    // Defensive lifetime scoping: same treatment for the element reference.
+    let primary = unsafe { Retained::retain(primary)? };
     // SAFETY: `frame` on a live NSScreen returns a by-value NSRect.
-    let frame: objc2_foundation::NSRect = unsafe { msg_send![primary, frame] };
+    let frame: objc2_foundation::NSRect = unsafe { msg_send![Retained::as_ptr(&primary), frame] };
     Some(frame.origin.y + frame.size.height)
 }
 
@@ -438,118 +441,181 @@ pub(crate) fn install_zoom_override_hook(window: &winit::window::Window) {
 /// is the whole point: AppKit's zoom animation would suspend winit event
 /// dispatch (I-1), the self-managed animation keeps every step inside the
 /// event loop. Each msg_send selector is a real NSWindow/NSScreen API
-/// (frame/visibleFrame/screen/styleMask -- Apple headers), and the whole
-/// body is catch_unwind-guarded (VULN-005 house style): a panic degrades to
-/// "zoom suppressed for this invocation", never an abort.
+/// (frame/visibleFrame/screen/styleMask -- Apple headers). Two guards:
+/// catch_unwind (VULN-005 house style) stops Rust panics, and the inner
+/// `objc2::exception::catch` (review MEDIUM, dock_progress precedent) stops
+/// NSExceptions -- a foreign unwind escaping an extern "C" IMP aborts the
+/// process before catch_unwind could see it. Either failure degrades to a
+/// logged skip / system super forward, never an abort.
 unsafe extern "C" fn zoom_imp(
     this: *mut objc2::runtime::AnyObject,
     _cmd: objc2::runtime::Sel,
     sender: *mut objc2::runtime::AnyObject,
 ) {
-    use objc2::msg_send;
-    use objc2::ClassType;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Appendix I field telemetry: attribute every zoom: invocation (nil
-        // sender = programmatic, e.g. winit set_maximized / the acceptance
-        // rig; a class = a real NSControl like the green button). zoom: is
-        // user-rare, so the string work is free in practice.
-        // SAFETY: object_getClassName on a live object (or nil, allowed).
-        let sender_class = if sender.is_null() {
-            "nil".to_string()
-        } else {
-            let name = objc2::ffi::object_getClassName(sender.cast());
-            if name.is_null() {
-                "unknown".to_string()
-            } else {
-                unsafe { std::ffi::CStr::from_ptr(name) }
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        tracing::debug!(sender_class, "zoom: invoked");
-        // Fullscreen fallback (plan I-2): zoom: inside fullscreen is the
-        // system's own behavior -- forward untouched.
-        // SAFETY: `styleMask` on a live NSWindow returns the mask by value.
-        let style_mask: objc2_app_kit::NSWindowStyleMask = unsafe { msg_send![this, styleMask] };
-        if style_mask.contains(objc2_app_kit::NSWindowStyleMask::FullScreen) {
-            // SAFETY: super lookup starts at NSWindow (WinitWindow's
-            // superclass), forwarding instead of recursing (setFrameSize
-            // pattern).
-            let _: () =
-                unsafe { msg_send![super(this, objc2_app_kit::NSWindow::class()), zoom: sender] };
-            return;
-        }
-        // Geometry (plan I-2 step 2). Screen nil (no active display) ->
-        // system behavior via super forward (review P3 multi-display entry).
-        // SAFETY: plain NSWindow/NSScreen getters, by-value returns.
-        let frame: objc2_foundation::NSRect = unsafe { msg_send![this, frame] };
-        let screen: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, screen] };
-        if screen.is_null() {
-            let _: () =
-                unsafe { msg_send![super(this, objc2_app_kit::NSWindow::class()), zoom: sender] };
-            return;
-        }
-        let vis: objc2_foundation::NSRect = unsafe { msg_send![screen, visibleFrame] };
-        // The winit flip needs the primary display height; without it the
-        // animation could aim at a mirrored Y -- degrade to the system zoom.
-        let Some(main_h) = (unsafe { primary_screen_height() }) else {
-            let _: () =
-                unsafe { msg_send![super(this, objc2_app_kit::NSWindow::class()), zoom: sender] };
-            return;
-        };
-        let frame_t = (
-            frame.origin.x,
-            frame.origin.y,
-            frame.size.width,
-            frame.size.height,
-        );
-        let vis_t = (vis.origin.x, vis.origin.y, vis.size.width, vis.size.height);
-        // Decision (pure, truth-tabled): direction, reentry, restore
-        // bookkeeping all resolved here in one value.
-        let plan = plan_zoom(
-            zoom_anim_active(),
-            zoom_restore_frame(),
-            frame_t,
-            vis_t,
-            ZOOM_EPSILON_PT,
-        );
-        match plan {
-            ZoomPlan::ForwardToSuper => {
-                // Zoomed with no remembered restore frame (e.g. pre-hook
-                // zoom): the system's own zoom is the only sane answer.
-                // SAFETY: super forward as above.
-                let _: () = unsafe {
-                    msg_send![super(this, objc2_app_kit::NSWindow::class()), zoom: sender]
-                };
-            }
-            ZoomPlan::Cancel => {
-                // Reentry with nowhere to go: stay at the current frame.
-                zoom_anim_cancel();
-                tracing::debug!("zoom: reentry without restore frame; animation cancelled");
-            }
-            ZoomPlan::Animate {
-                restore_write,
-                start,
-                target,
-            } => {
-                // Persist the pre-zoom frame exactly once per zoom-in (the
-                // plan's restore_write arm; reentry/restore pass None so the
-                // stored frame never swaps mid-flight).
-                if let Some(restore) = restore_write {
-                    set_zoom_restore_frame(restore);
+        // NSException guard (review MEDIUM): degrade a throw to a super
+        // forward -- the system's own zoom is the sane fallback. F1
+        // (review): exception::catch's closure must not panic (a Rust
+        // unwind through its extern "C" trampoline aborts before this
+        // IMP's catch_unwind could see it) -- the inner catch_unwind
+        // takes panics; the outer only ever sees NSExceptions.
+        let forwarded = std::cell::Cell::new(false);
+        let thrown = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    zoom_imp_objc(this, sender, &forwarded);
+                }));
+                if outcome.is_err() {
+                    tracing::error!("zoom: IMP body panicked; treated as no-op");
                 }
-                start_zoom_anim(start, target, main_h);
-                tracing::debug!(
-                    from = ?start,
-                    to = ?target,
-                    "zoom: self-managed animation armed (220ms, event-loop stepped)"
-                );
+            }))
+        };
+        if let Err(exception) = thrown {
+            tracing::error!(
+                ?exception,
+                "zoom: IMP threw an NSException; forwarding to super (system fallback)"
+            );
+            // F3 (review): skip the fallback when the body already
+            // forwarded -- a double super zoom: would re-enter the system
+            // animation after a half-completed state. The super forward
+            // runs right after an ObjC throw -- the highest
+            // foreign-unwind-risk moment -- so it keeps its own
+            // exception::catch (dock_progress badge-fallback convention).
+            if !forwarded.get() {
+                let fallback = unsafe {
+                    objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                        zoom_imp_forward_super(this, sender);
+                    }))
+                };
+                if fallback.is_err() {
+                    tracing::error!("zoom: super forward also threw; zoom invocation dropped");
+                }
             }
         }
     }))
     .unwrap_or_else(|_| {
         tracing::error!("zoom: IMP panicked; zoom suppressed for this invocation");
     });
+}
+
+/// System fallback: forward `zoom:` to super (NSWindow's implementation --
+/// WinitWindow's superclass), the closest "what the system would have done".
+/// Used by the degenerate paths of `zoom_imp_objc` AND after a caught
+/// NSException in `zoom_imp`.
+unsafe fn zoom_imp_forward_super(
+    this: *mut objc2::runtime::AnyObject,
+    sender: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    use objc2::ClassType;
+    // SAFETY: super lookup starts at NSWindow (WinitWindow's superclass),
+    // forwarding instead of recursing (setFrameSize pattern).
+    let _: () = unsafe { msg_send![super(this, objc2_app_kit::NSWindow::class()), zoom: sender] };
+}
+
+/// The zoom: IMP body: invocation telemetry, geometry reads (styleMask /
+/// frame / screen / visibleFrame / primary-screen height), the pure plan
+/// decision and the anim writes. Every failure mode must stay inside the
+/// guards in `zoom_imp` (Rust panic -> catch_unwind; NSException ->
+/// exception::catch).
+unsafe fn zoom_imp_objc(
+    this: *mut objc2::runtime::AnyObject,
+    sender: *mut objc2::runtime::AnyObject,
+    forwarded: &std::cell::Cell<bool>,
+) {
+    use objc2::msg_send;
+    // Appendix I field telemetry: attribute every zoom: invocation (nil
+    // sender = programmatic, e.g. winit set_maximized / the acceptance
+    // rig; a class = a real NSControl like the green button). zoom: is
+    // user-rare, so the string work is free in practice.
+    // SAFETY: object_getClassName on a live object (or nil, allowed).
+    let sender_class = if sender.is_null() {
+        "nil".to_string()
+    } else {
+        let name = objc2::ffi::object_getClassName(sender.cast());
+        if name.is_null() {
+            "unknown".to_string()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    tracing::debug!(sender_class, "zoom: invoked");
+    // Fullscreen fallback (plan I-2): zoom: inside fullscreen is the
+    // system's own behavior -- forward untouched.
+    // SAFETY: `styleMask` on a live NSWindow returns the mask by value.
+    let style_mask: objc2_app_kit::NSWindowStyleMask = unsafe { msg_send![this, styleMask] };
+    if style_mask.contains(objc2_app_kit::NSWindowStyleMask::FullScreen) {
+        forwarded.set(true);
+        zoom_imp_forward_super(this, sender);
+        return;
+    }
+    // Geometry (plan I-2 step 2). Screen nil (no active display) ->
+    // system behavior via super forward (review P3 multi-display entry).
+    // SAFETY: plain NSWindow/NSScreen getters, by-value returns.
+    let frame: objc2_foundation::NSRect = unsafe { msg_send![this, frame] };
+    let screen: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, screen] };
+    if screen.is_null() {
+        forwarded.set(true);
+        zoom_imp_forward_super(this, sender);
+        return;
+    }
+    let vis: objc2_foundation::NSRect = unsafe { msg_send![screen, visibleFrame] };
+    // The winit flip needs the primary display height; without it the
+    // animation could aim at a mirrored Y -- degrade to the system zoom.
+    let Some(main_h) = (unsafe { primary_screen_height() }) else {
+        forwarded.set(true);
+        zoom_imp_forward_super(this, sender);
+        return;
+    };
+    let frame_t = (
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+    );
+    let vis_t = (vis.origin.x, vis.origin.y, vis.size.width, vis.size.height);
+    // Decision (pure, truth-tabled): direction, reentry, restore
+    // bookkeeping all resolved here in one value.
+    let plan = plan_zoom(
+        zoom_anim_active(),
+        zoom_restore_frame(),
+        frame_t,
+        vis_t,
+        ZOOM_EPSILON_PT,
+    );
+    match plan {
+        ZoomPlan::ForwardToSuper => {
+            // Zoomed with no remembered restore frame (e.g. pre-hook
+            // zoom): the system's own zoom is the only sane answer.
+            forwarded.set(true);
+            zoom_imp_forward_super(this, sender);
+        }
+        ZoomPlan::Cancel => {
+            // Reentry with nowhere to go: stay at the current frame.
+            zoom_anim_cancel();
+            tracing::debug!("zoom: reentry without restore frame; animation cancelled");
+        }
+        ZoomPlan::Animate {
+            restore_write,
+            start,
+            target,
+        } => {
+            // Persist the pre-zoom frame exactly once per zoom-in (the
+            // plan's restore_write arm; reentry/restore pass None so the
+            // stored frame never swaps mid-flight).
+            if let Some(restore) = restore_write {
+                set_zoom_restore_frame(restore);
+            }
+            start_zoom_anim(start, target, main_h);
+            tracing::debug!(
+                from = ?start,
+                to = ?target,
+                "zoom: self-managed animation armed (220ms, event-loop stepped)"
+            );
+        }
+    }
 }
 
 // ============================================================================

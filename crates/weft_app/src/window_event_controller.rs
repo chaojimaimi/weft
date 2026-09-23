@@ -264,11 +264,15 @@ impl App {
                 // animation suppression also froze zoom-IN, whose reflow is
                 // the cheap merge direction -- only the shrink direction
                 // (wrap split, 0.4-1 s/step) needs the deferral. Single
-                // peek: active + direction from one lock acquisition.
+                // peek: active + direction are both derived from one lock
+                // acquisition; the verdict itself is the pure truth table
+                // (review MEDIUM-2 wiring anchor: zoom_render::defers_main).
                 let anim = crate::macos_zoom::zoom_anim_peek();
-                let self_zoom_defers_main = anim.as_ref().is_some_and(|a| {
-                    !crate::macos_zoom::zoom_direction_is_in(a.size_start, a.size_target)
+                let zoom_in = anim.as_ref().is_some_and(|a| {
+                    crate::macos_zoom::zoom_direction_is_in(a.size_start, a.size_target)
                 });
+                let self_zoom_defers_main =
+                    crate::paint::zoom_render::defers_main(anim.is_some(), zoom_in);
                 let pull_supplies_frame = zoom_jump_hot
                     && (self_zoom_defers_main
                         || self.window.as_ref().is_some_and(|window| {

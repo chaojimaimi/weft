@@ -241,6 +241,25 @@ fn zoom_flush_action_truth_table() {
     ));
 }
 
+/// Review MEDIUM-2: the two controller gate wirings are pure functions, so
+/// the wiring gets a truth-table anchor here. Mutation check: deleting the
+/// `!zoom_in` term in `defers_main` turns `defers_main(true, true)` red.
+#[test]
+fn gate_wiring_truth_tables() {
+    // defers_main(active, zoom_in) = active && !zoom_in: only an ACTIVE
+    // shrink-direction animation defers the main path (zoom-in keeps the
+    // main path tracking live; an inactive anim never defers).
+    assert!(!defers_main(false, false));
+    assert!(!defers_main(false, true));
+    assert!(defers_main(true, false));
+    assert!(!defers_main(true, true));
+    // cascade_force_commit(zoom_in) = zoom_in: the force-commit bit mirrors
+    // the animation direction (the elapsed-debounce leg is composed at the
+    // call site, so the pure function pins the force bit only).
+    assert!(cascade_force_commit(true));
+    assert!(!cascade_force_commit(false));
+}
+
 /// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are
 /// process-wide; every other test in this file stays pure-local by design).
 static GLOBAL_ZOOM_STATE_LOCK: Mutex<()> = Mutex::new(());

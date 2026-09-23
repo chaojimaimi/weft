@@ -48,12 +48,15 @@ use crate::renderer::MetalRenderer;
 
 // Appendix F-5 split rule ("over budget -> split, no ceiling raise"): the
 // pure zoom decision layer (suppression gate / expiry decision / degrade
-// verdict) lives in policy.rs with its truth tables; this module keeps the
-// watch state and the Metal/cache plumbing.
+// verdict) lives in policy.rs with its truth tables; the zoom-window
+// watch/verdict state lives in verdict.rs (this module: Metal/cache plumbing).
 mod policy;
 pub(crate) use policy::{
-    pull_can_freshen, pull_degrade_verdict, zoom_flush_action, ZoomFlushAction,
+    cascade_force_commit, defers_main, pull_can_freshen, pull_degrade_verdict, zoom_flush_action,
+    ZoomFlushAction,
 };
+mod verdict;
+pub(crate) use verdict::{note_zoom_step, zoom_window_finished};
 
 /// `presentsWithTransaction` staleness bound (E-2): the bind state is reset
 /// when the IMP exits; this deadline is the fallback for a bind left over
@@ -369,69 +372,6 @@ fn set_layer_transaction(cache: &FrameCache, bound: bool) -> bool {
     result.is_ok()
 }
 
-/// Pull frames presented since process start (the zoom-window verdict keys
-/// off this counter).
-static PULL_PRESENT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Pull count at the last zoom-window close: the verdict baseline for the
-/// next window (a window-open baseline would swallow the burst's pulls).
-static LAST_CLOSE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Zoom-window watch `(start, pull baseline, steps)` (Appendix F-3C):
-/// opened by the first zoom-channel step (`note_zoom_step`), closed by the
-/// deterministic WaitUntil expiry (`zoom_window_finished`) -- the old
-/// per-callback debug poll was invisible at the default `filter=info`
-/// (F-1 leg 4).
-static ZOOM_WATCH: Mutex<Option<(Instant, u64, u32)>> = Mutex::new(None);
-
-fn zoom_watch() -> MutexGuard<'static, Option<(Instant, u64, u32)>> {
-    ZOOM_WATCH
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Per-step watch update (F-3C, Resized arm): the first zoom-channel step
-/// opens the window (steps = 1, baseline = the pull count before the
-/// animation); later steps extend the CURRENT window -- overlapping windows
-/// join the live one and the baseline keeps its pre-animation value.
-pub(crate) fn note_zoom_step() {
-    let mut watch = zoom_watch();
-    if let Some((_, _, steps)) = watch.as_mut() {
-        *steps += 1;
-    } else {
-        // G-3 baseline: the burst's pulls land before the first Resized, so
-        // the baseline is the previous window's close count, not the count
-        // at open (1.12.14 field bug: 41 pulls, verdict said zero).
-        let baseline = LAST_CLOSE_COUNT.load(Ordering::Acquire);
-        *watch = Some((Instant::now(), baseline, 1));
-    }
-}
-
-/// Close the watch and issue the verdict (F-3C, from zoom_wait_policy's
-/// expiry branch): a degraded window warns that displayLayer never
-/// dispatched; otherwise the window settles with `zoom settled` --
-/// M > 0 is the field acceptance signal that the pull actually works.
-/// `steps >= 1` always holds for a live watch (`note_zoom_step` opens at 1),
-/// so no separate guard is needed (review L2).
-pub(crate) fn zoom_window_finished() {
-    let mut watch = zoom_watch();
-    let Some((_start, baseline, steps)) = *watch else {
-        return;
-    };
-    *watch = None;
-    let count = PULL_PRESENT_COUNT.load(Ordering::Acquire);
-    let pull_delta = count.saturating_sub(baseline);
-    LAST_CLOSE_COUNT.store(count, Ordering::Release);
-    if pull_degrade_verdict(steps, pull_delta) {
-        tracing::warn!(
-            "zoom window ended degraded: steps={} pull_frames={} -- the inline pull never \
-             presented (check pull gate / frame-cache state)",
-            steps,
-            pull_delta
-        );
-    } else {
-        tracing::info!("zoom settled: steps={} pull_frames={}", steps, pull_delta);
-    }
-}
-
 /// Hand one encoded frame to the cache (the two `encode_and_present`
 /// present->flush gaps). See `FrameCache::apply_stash` for the idle/full
 /// frame rule. On a full frame the atlas texture handles are refreshed from
@@ -485,7 +425,7 @@ pub(crate) fn redraw_cached_frame(width: f64, height: f64) -> bool {
     let presented = present_cached_frame();
     drop(guard);
     if presented {
-        PULL_PRESENT_COUNT.fetch_add(1, Ordering::Release);
+        verdict::record_presented_pull();
     }
     presented
 }

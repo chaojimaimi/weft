@@ -28,7 +28,11 @@
 //!
 //! Every ObjC interaction is wrapped in `catch_unwind` + `tracing::error!`
 //! (VULN-005 house style): any failure degrades to the pre-fix behaviour
-//! (stretch for a frame), never aborts.
+//! (stretch for a frame), never aborts. The IMP bodies additionally wrap
+//! their ObjC segments in `objc2::exception::catch` (review MEDIUM,
+//! dock_progress precedent): an NSException escaping an extern "C" IMP
+//! aborts the process before Rust unwinding, so it is caught and degraded to
+//! a logged segment skip instead.
 
 /// Add `setFrameSize:` to the winit view class. Call once from the main
 /// thread after window creation; a repeated call is a no-op by virtue of the
@@ -108,11 +112,120 @@ pub(crate) fn install_zoom_sequence_hook(window: &winit::window::Window) {
     });
 }
 
+/// The drawable-sync + inline-pull segment of the setFrameSize IMP: size the
+/// Metal layer's drawable to `size x contentsScale`, then present the cached
+/// frame bound to the current CA transaction when the freshen gate opens.
+/// Runs inside the IMP's catch_unwind AND `objc2::exception::catch` -- a
+/// panic or NSException here degrades to a logged segment skip.
+///
+/// SAFETY: plain CALayer getters/setters on the live view's layer (attached
+/// by `attach_layer_to_nsview`; the typed CAMetalLayer API needs the
+/// `CALayer` feature we do not enable, so these stay raw msg_send).
+unsafe fn set_frame_size_sync_drawable(
+    this: *mut objc2::runtime::AnyObject,
+    size: objc2_foundation::NSSize,
+) {
+    use objc2::msg_send;
+    // The bounds just took effect, so size the drawable to match in the
+    // SAME main-thread callback -- the compositor never sees a mismatched
+    // pair.
+    // SAFETY: the layer was attached by `attach_layer_to_nsview` and
+    // lives as long as the view; both messages are plain
+    // setters/getters.
+    let layer: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, layer] };
+    if layer.is_null() {
+        return;
+    }
+    // `scale` is hoisted so the inline pull below can convert the
+    // logical `size` into physical pixels for the watermark comparison
+    // (review M-1: `last_presented` is physical; a logical request
+    // would never dedupe on Retina).
+    let scale: f64 = unsafe { msg_send![layer, contentsScale] };
+    unsafe {
+        let drawable = objc2_foundation::NSSize::new(size.width * scale, size.height * scale);
+        let _: () = msg_send![layer, setDrawableSize: drawable];
+    }
+    // PLAN_zoom appendix G (field round 3): supply the animation frame
+    // HERE. `displayLayer:` never dispatched in this environment -- the
+    // probe rig proved the chain otherwise complete (makeBackingLayer
+    // adoption, delegate == view, needsDisplay == true across ~150
+    // commits; field: 41-step zoom, zero pulls, both with and without
+    // managed hosting) -- so the trigger cannot be waited on. The
+    // injected `setFrameSize:` IS the per-step callback (it runs on
+    // every zoom step by construction), so the pull presents from here,
+    // bound to the current CA transaction: bounds and pixels commit
+    // atomically, no one-beat gap for the compositor to stretch.
+    // Gate = the freshen predicate alone (lever / populated cache /
+    // stale watermark). NO zoom-window flag: the field burst (41
+    // setFrameSize callbacks inside one AppKit animation pass, BEFORE
+    // any Resized dispatch -- G-1 timing evidence) would always see the
+    // Resized-armed flag false. Drags take one lean 1:1 present per
+    // tick ahead of the forced draw (the registered F-3A one-frame-lag
+    // semantics; never a stretch), start-up is blocked by the populated
+    // leg, and the lever stays authoritative. The displayLayer:
+    // delegate + A1 bounds pin remain
+    // armed as an inert bonus trigger: should CA ever dispatch it, its
+    // watermark dedup makes a double present a no-op.
+    // Physical pixels for the watermark comparison (review M-1):
+    // `last_presented` is stamped from drawable texture sizes.
+    let (pw, ph) = (size.width * scale, size.height * scale);
+    let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
+    if fresh {
+        crate::paint::zoom_render::bind_pull_transaction();
+        let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
+        crate::paint::zoom_render::unbind_pull_transaction();
+        tracing::debug!(presented, "setFrameSize inline pull");
+    }
+}
+
+/// The restore-frame refresh segment of the setFrameSize IMP (Appendix I,
+/// review round 2 P1): every REAL resize outside a self-managed animation
+/// refreshes the persisted zoom-restore frame, so zoom-out follows a window
+/// the user dragged/resized meanwhile. Runs inside the IMP's catch_unwind
+/// AND `objc2::exception::catch` like the drawable sync.
+///
+/// SAFETY: plain NSWindow/NSScreen getters on the live view's window.
+unsafe fn set_frame_size_refresh_restore(this: *mut objc2::runtime::AnyObject) {
+    use objc2::msg_send;
+    // The non-zoomed gate is MANDATORY: a zoom-in's trailing Resized
+    // dispatches on the pass AFTER the anim is cleared with frame ==
+    // visibleFrame -- without the gate the refresh would overwrite the
+    // restore frame with the zoomed-in frame and zoom-out would die. A
+    // restore-direction anim's trailing Resized refreshes to the same
+    // value (harmless -- pinned in the truth table). Checked FIRST so an
+    // active animation skips the whole block (zero msg_sends per step).
+    if !zoom_anim_active() {
+        // SAFETY: `window` on a live view returns its NSWindow
+        // (unretained); frame/screen/visibleFrame are plain NSWindow and
+        // NSScreen getters returning by-value geometry.
+        let window: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, window] };
+        if !window.is_null() {
+            let wframe: objc2_foundation::NSRect = unsafe { msg_send![window, frame] };
+            let screen: *mut objc2::runtime::AnyObject = unsafe { msg_send![window, screen] };
+            if !screen.is_null() {
+                let vis: objc2_foundation::NSRect = unsafe { msg_send![screen, visibleFrame] };
+                let f = (
+                    wframe.origin.x,
+                    wframe.origin.y,
+                    wframe.size.width,
+                    wframe.size.height,
+                );
+                let v = (vis.origin.x, vis.origin.y, vis.size.width, vis.size.height);
+                if should_refresh_restore(false, f, v, ZOOM_EPSILON_PT) {
+                    set_zoom_restore_frame(f);
+                }
+            }
+        }
+    }
+}
+
 /// The injected `setFrameSize:` IMP. Warp host_view.m:133-145 shape:
 /// entry `changed` short-circuit, size validation, super FIRST (applies the
 /// new size AND emits `frameDidChange:` -- the source of winit's Resized
 /// events; skipping it stalls the whole resize pipeline), then the drawable
 /// sync. `self` IS the target view (`setFrameSize:` is an NSView method).
+/// The two ObjC segments after the super forward each get their own
+/// `objc2::exception::catch` inside the catch_unwind (review MEDIUM).
 unsafe extern "C" fn set_frame_size_imp(
     this: *mut objc2::runtime::AnyObject,
     _cmd: objc2::runtime::Sel,
@@ -124,19 +237,33 @@ unsafe extern "C" fn set_frame_size_imp(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Entry `changed` short-circuit (Warp host_view.m:134): the frame is
         // still the OLD size here -- `[super setFrameSize:]` below applies
-        // the new one.
+        // the new one. NSException guard (review F2): the entry reads and
+        // the no-change forward degrade to a logged skip.
         // SAFETY: `frame` on a live view returns a by-value NSRect.
-        let frame: objc2_foundation::NSRect = unsafe { msg_send![this, frame] };
-        if frame.size == size {
-            // SAFETY: forwarding to super is still required on the no-change
-            // path (NSView bookkeeping), it just skips the drawable work.
-            unsafe {
-                let _: () = msg_send![
-                    super(this, objc2_app_kit::NSView::class()),
-                    setFrameSize: size
-                ];
+        let entry = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                let frame: objc2_foundation::NSRect = msg_send![this, frame];
+                if frame.size == size {
+                    // SAFETY: forwarding to super is still required on the
+                    // no-change path (NSView bookkeeping), it just skips the
+                    // drawable work.
+                    let _: () = msg_send![
+                        super(this, objc2_app_kit::NSView::class()),
+                        setFrameSize: size
+                    ];
+                    true
+                } else {
+                    false
+                }
+            }))
+        };
+        match entry {
+            Err(exception) => {
+                tracing::error!(?exception, "setFrameSize entry threw; IMP skipped");
+                return;
             }
-            return;
+            Ok(true) => return,
+            Ok(false) => {}
         }
         // Size validation (Warp host_view.m:138): off-screen windows and
         // degenerate sizes must not reach the drawable.
@@ -150,101 +277,71 @@ unsafe extern "C" fn set_frame_size_imp(
         // Apply the new size via super FIRST: this is the primitive that
         // updates the view/layer geometry AND emits `frameDidChange:` (the
         // source of winit's Resized events). Skipping or deferring it stalls
-        // the whole resize pipeline.
+        // the whole resize pipeline. NSException guard (review F2): a throw
+        // degrades to a logged skip of this pass (resize pipeline stalls one
+        // callback) -- strictly better than the abort a foreign unwind would
+        // cause at the extern "C" IMP boundary.
         // SAFETY: `super(...)` starts the method lookup at NSView (the
         // superclass), so this forwards to the base implementation instead of
         // recursing into the injected method.
-        unsafe {
-            let _: () = msg_send![
-                super(this, objc2_app_kit::NSView::class()),
-                setFrameSize: size
-            ];
+        let forwarded = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                let _: () = msg_send![
+                    super(this, objc2_app_kit::NSView::class()),
+                    setFrameSize: size
+                ];
+            }))
+        };
+        if let Err(exception) = forwarded {
+            tracing::error!(
+                ?exception,
+                "setFrameSize super forward threw; resize pipeline stalled this pass"
+            );
         }
-        // Now the drawable: the bounds just took effect, so size the
-        // drawable to match in the SAME main-thread callback -- the
-        // compositor never sees a mismatched pair.
-        // SAFETY: the layer was attached by `attach_layer_to_nsview` and
-        // lives as long as the view; both messages are plain
-        // setters/getters. The typed CAMetalLayer API needs the `CALayer`
-        // feature we do not enable, so these stay raw msg_send (each
-        // unwind-guarded above; failure degrades to the pre-fix behaviour).
-        let layer: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, layer] };
-        if layer.is_null() {
-            return;
-        }
-        // `scale` is hoisted so the inline pull below can convert the
-        // logical `size` into physical pixels for the watermark comparison
-        // (review M-1: `last_presented` is physical; a logical request
-        // would never dedupe on Retina).
-        let scale: f64 = unsafe { msg_send![layer, contentsScale] };
-        unsafe {
-            let drawable = objc2_foundation::NSSize::new(size.width * scale, size.height * scale);
-            let _: () = msg_send![layer, setDrawableSize: drawable];
-        }
-        // PLAN_zoom appendix G (field round 3): supply the animation frame
-        // HERE. `displayLayer:` never dispatched in this environment -- the
-        // probe rig proved the chain otherwise complete (makeBackingLayer
-        // adoption, delegate == view, needsDisplay == true across ~150
-        // commits; field: 41-step zoom, zero pulls, both with and without
-        // managed hosting) -- so the trigger cannot be waited on. The
-        // injected `setFrameSize:` IS the per-step callback (it runs on
-        // every zoom step by construction), so the pull presents from here,
-        // bound to the current CA transaction: bounds and pixels commit
-        // atomically, no one-beat gap for the compositor to stretch.
-        // Gate = the freshen predicate alone (lever / populated cache /
-        // stale watermark). NO zoom-window flag: the field burst (41
-        // setFrameSize callbacks inside one AppKit animation pass, BEFORE
-        // any Resized dispatch -- G-1 timing evidence) would always see the
-        // Resized-armed flag false. Drags take one lean 1:1 present per
-        // tick ahead of the forced draw (the registered F-3A one-frame-lag
-        // semantics; never a stretch), start-up is blocked by the populated
-        // leg, and the lever stays authoritative. The displayLayer:
-        // delegate + A1 bounds pin remain
-        // armed as an inert bonus trigger: should CA ever dispatch it, its
-        // watermark dedup makes a double present a no-op.
-        // Physical pixels for the watermark comparison (review M-1):
-        // `last_presented` is stamped from drawable texture sizes.
-        let (pw, ph) = (size.width * scale, size.height * scale);
-        let fresh = crate::paint::zoom_render::pull_can_freshen(pw as f32, ph as f32);
-        if fresh {
-            crate::paint::zoom_render::bind_pull_transaction();
-            let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
-            crate::paint::zoom_render::unbind_pull_transaction();
-            tracing::debug!(presented, "setFrameSize inline pull");
-        }
-        // Appendix I (review round 2 P1): every REAL resize outside a
-        // self-managed animation refreshes the persisted zoom-restore frame,
-        // so zoom-out follows a window the user dragged/resized meanwhile.
-        // The non-zoomed gate is MANDATORY: a zoom-in's trailing Resized
-        // dispatches on the pass AFTER the anim is cleared with frame ==
-        // visibleFrame -- without the gate the refresh would overwrite the
-        // restore frame with the zoomed-in frame and zoom-out would die. A
-        // restore-direction anim's trailing Resized refreshes to the same
-        // value (harmless -- pinned in the truth table). Checked FIRST so an
-        // active animation skips the whole block (zero msg_sends per step).
-        if !zoom_anim_active() {
-            // SAFETY: `window` on a live view returns its NSWindow
-            // (unretained); frame/screen/visibleFrame are plain NSWindow and
-            // NSScreen getters returning by-value geometry. All guarded by
-            // the catch_unwind above.
-            let window: *mut objc2::runtime::AnyObject = unsafe { msg_send![this, window] };
-            if !window.is_null() {
-                let wframe: objc2_foundation::NSRect = unsafe { msg_send![window, frame] };
-                let screen: *mut objc2::runtime::AnyObject = unsafe { msg_send![window, screen] };
-                if !screen.is_null() {
-                    let vis: objc2_foundation::NSRect = unsafe { msg_send![screen, visibleFrame] };
-                    let f = (
-                        wframe.origin.x,
-                        wframe.origin.y,
-                        wframe.size.width,
-                        wframe.size.height,
-                    );
-                    let v = (vis.origin.x, vis.origin.y, vis.size.width, vis.size.height);
-                    if should_refresh_restore(false, f, v, ZOOM_EPSILON_PT) {
-                        set_zoom_restore_frame(f);
-                    }
+        // Now the drawable sync + pull and the restore refresh: each is an
+        // ObjC interaction, so each segment gets its own
+        // `objc2::exception::catch` INSIDE the catch_unwind (review MEDIUM:
+        // an NSException escaping an extern "C" IMP aborts before Rust
+        // unwinding -- dock_progress house precedent). A throw degrades to a
+        // logged segment skip; the Wake ping below still runs.
+        // SAFETY: plain NSView/CALayer/NSWindow/NSScreen getters and setters
+        // on live objects (see the segment helpers).
+        let drawable_sync = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                // F1 (review): exception::catch's closure must not panic -- a
+                // Rust unwind through its extern "C" trampoline aborts before
+                // this IMP's catch_unwind could see it. The inner
+                // catch_unwind takes panics; the outer only sees NSExceptions.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    set_frame_size_sync_drawable(this, size);
+                }));
+                if outcome.is_err() {
+                    tracing::error!("setFrameSize drawable sync panicked; segment skipped");
                 }
-            }
+            }))
+        };
+        if let Err(exception) = drawable_sync {
+            tracing::error!(
+                ?exception,
+                "setFrameSize drawable sync threw; segment skipped"
+            );
+        }
+        let restore_refresh = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                // F1: inner catch_unwind, same contract as the drawable sync.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    set_frame_size_refresh_restore(this);
+                }));
+                if outcome.is_err() {
+                    tracing::error!("setFrameSize restore refresh panicked; segment skipped");
+                }
+            }))
+        };
+        if let Err(exception) = restore_refresh {
+            tracing::error!(
+                ?exception,
+                "setFrameSize restore refresh threw; segment skipped"
+            );
         }
         // Appendix H: ping the app so the reflow tracks the animation live
         // (the Resized events for this step will not arrive until the burst
@@ -433,14 +530,14 @@ fn notify_resize_wake() {
 /// The injected `displayLayer:` IMP (CALayerDelegate). Warp host_view.m
 /// shape: synchronous content supply when CA asks for it. Five steps (E-2):
 /// reentry guard, watermark dedup, transaction bind, lean present, unbind.
-/// `self` is the winit view; the layer argument is its CAMetalLayer.
+/// `self` is the winit view; the layer argument is its CAMetalLayer. The
+/// ObjC pull segment gets its own `objc2::exception::catch` inside the
+/// catch_unwind (review MEDIUM).
 unsafe extern "C" fn display_layer_imp(
     this: *mut objc2::runtime::AnyObject,
     _cmd: objc2::runtime::Sel,
     layer: *mut objc2::runtime::AnyObject,
 ) {
-    use objc2::msg_send;
-
     let _ = this; // no super obligation: displayLayer: is not an NSView lifecycle method
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !crate::paint::zoom_render::pull_enabled() || layer.is_null() {
@@ -454,45 +551,70 @@ unsafe extern "C" fn display_layer_imp(
             tracing::debug!("displayLayer pull skipped: a lean present is in flight");
             return;
         }
-        // Requested size = the layer's drawableSize (physical px; the
-        // setFrameSize hook keeps it in sync with the bounds).
-        // SAFETY: `drawableSize` on a live CAMetalLayer returns by value.
-        let size: objc2_foundation::NSSize = unsafe { msg_send![layer, drawableSize] };
-        if !size.width.is_finite()
-            || !size.height.is_finite()
-            || size.width <= 0.0
-            || size.height <= 0.0
-        {
-            return;
+        // NSException guard (review MEDIUM): the drawableSize read + the
+        // transaction-bound present degrade to a logged skip, never an
+        // abort.
+        let pulled = unsafe {
+            objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                // F1: inner catch_unwind, same contract as the drawable sync.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    display_layer_pull(layer);
+                }));
+                if outcome.is_err() {
+                    tracing::error!("displayLayer pull panicked; segment skipped");
+                }
+            }))
+        };
+        if let Err(exception) = pulled {
+            tracing::error!(?exception, "displayLayer pull threw; segment skipped");
         }
-        // Watermark dedup (E-3): a frame at this drawable size is already on
-        // screen -- presenting again would overwrite a fresh frame with the
-        // same content (and during a nested flush would rewind one step).
-        if !crate::paint::zoom_render::pull_requests_frame(size.width, size.height) {
-            tracing::debug!(
-                width = size.width,
-                height = size.height,
-                "displayLayer pull skipped: watermark current"
-            );
-            return;
-        }
-        // Bind the lean present to the CURRENT CA transaction so bounds and
-        // pixels commit atomically (E-2 pull present semantics), present the
-        // cached frame at the requested size, then unbind (IMP-exit reset).
-        crate::paint::zoom_render::bind_pull_transaction();
-        let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
-        crate::paint::zoom_render::unbind_pull_transaction();
-        // E-4 acceptance: callback density is observable at RUST_LOG=debug.
-        tracing::debug!(
-            presented,
-            width = size.width,
-            height = size.height,
-            "displayLayer pull"
-        );
     }))
     .unwrap_or_else(|_| {
         tracing::error!("displayLayer IMP panicked; pull skipped for this callback");
     });
+}
+
+/// The pull-supply segment of the displayLayer IMP: drawableSize read,
+/// watermark dedup, then the transaction-bound lean present (E-2 steps 2-5).
+///
+/// SAFETY: `drawableSize` on a live CAMetalLayer returns by value; the
+/// caller validated the layer pointer.
+unsafe fn display_layer_pull(layer: *mut objc2::runtime::AnyObject) {
+    use objc2::msg_send;
+    // Requested size = the layer's drawableSize (physical px; the
+    // setFrameSize hook keeps it in sync with the bounds).
+    let size: objc2_foundation::NSSize = unsafe { msg_send![layer, drawableSize] };
+    if !size.width.is_finite()
+        || !size.height.is_finite()
+        || size.width <= 0.0
+        || size.height <= 0.0
+    {
+        return;
+    }
+    // Watermark dedup (E-3): a frame at this drawable size is already on
+    // screen -- presenting again would overwrite a fresh frame with the
+    // same content (and during a nested flush would rewind one step).
+    if !crate::paint::zoom_render::pull_requests_frame(size.width, size.height) {
+        tracing::debug!(
+            width = size.width,
+            height = size.height,
+            "displayLayer pull skipped: watermark current"
+        );
+        return;
+    }
+    // Bind the lean present to the CURRENT CA transaction so bounds and
+    // pixels commit atomically (E-2 pull present semantics), present the
+    // cached frame at the requested size, then unbind (IMP-exit reset).
+    crate::paint::zoom_render::bind_pull_transaction();
+    let presented = crate::paint::zoom_render::redraw_cached_frame(size.width, size.height);
+    crate::paint::zoom_render::unbind_pull_transaction();
+    // E-4 acceptance: callback density is observable at RUST_LOG=debug.
+    tracing::debug!(
+        presented,
+        width = size.width,
+        height = size.height,
+        "displayLayer pull"
+    );
 }
 
 mod anim;

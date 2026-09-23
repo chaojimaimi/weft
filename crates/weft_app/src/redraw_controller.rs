@@ -198,9 +198,15 @@ impl App {
         // background panes per step too, or a live background TUI (top)
         // stays at its old width for the whole animation (field: split +
         // top intermediate state).
-        let cascade_settled = self.window_runtime.last_resize_instant.elapsed()
-            > std::time::Duration::from_millis(100)
-            || crate::macos_zoom::zoom_anim_is_zoom_in();
+        // Review MEDIUM-2 wiring anchor: the force bit is the pure truth
+        // table (zoom_render::cascade_force_commit); the elapsed-debounce
+        // leg stays here at the call site.
+        let elapsed_debounce = self.window_runtime.last_resize_instant.elapsed()
+            > std::time::Duration::from_millis(100);
+        let force = crate::paint::zoom_render::cascade_force_commit(
+            crate::macos_zoom::zoom_anim_is_zoom_in(),
+        );
+        let cascade_settled = elapsed_debounce || force;
         let pending: Vec<_> = self
             .sessions
             .tabs()
