@@ -252,14 +252,24 @@ impl App {
                 // (apply_stash) and dedupe the pull away -- the 1.12.11
                 // "every step races the pull" defect (F-2). No draw happens,
                 // so the probe records nothing.
+                // PLAN_zoom appendix I-6: while the SELF-MANAGED animation is
+                // stepping, the main path (full draw + queued grid drain) is
+                // deferred WHOLESALE -- the shrink-direction grid rewrap of a
+                // large document costs 0.4-1 s at intermediate widths (field:
+                // a 1.0 s mid-animation stall at cols~130), which froze the
+                // stepping loop mid-motion. The pull supplies every frame
+                // instead; the coalesced drain runs once after the animation
+                // clears (the WaitUntil flush pass).
+                let self_zoom_active = crate::macos_zoom::zoom_anim_is_active();
                 let pull_supplies_frame = zoom_jump_hot
-                    && self.window.as_ref().is_some_and(|window| {
-                        let inner = window.inner_size();
-                        crate::paint::zoom_render::pull_can_freshen(
-                            inner.width as f32,
-                            inner.height as f32,
-                        )
-                    });
+                    && (self_zoom_active
+                        || self.window.as_ref().is_some_and(|window| {
+                            let inner = window.inner_size();
+                            crate::paint::zoom_render::pull_can_freshen(
+                                inner.width as f32,
+                                inner.height as f32,
+                            )
+                        }));
                 if !pull_supplies_frame {
                     let started = std::time::Instant::now();
                     self.handle_redraw_requested();

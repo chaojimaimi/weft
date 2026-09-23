@@ -110,6 +110,20 @@ pub(crate) fn zoom_anim_peek() -> Option<ZoomAnim> {
     *lock_zoom_anim()
 }
 
+/// True while a self-managed animation is in flight. The RedrawRequested
+/// suppression gate extends with this: during the animation the main path
+/// (full draw + queued grid drain) is deferred wholesale -- the per-step
+/// grid rewrap of a large document costs 0.4-1 s in the shrink direction
+/// (field: 1.0 s stall at cols~130), which would otherwise freeze the
+/// stepping loop mid-motion. The pull supplies every frame instead; the
+/// coalesced drain runs once after the animation clears.
+pub(crate) fn zoom_anim_is_active() -> bool {
+    ZOOM_ANIM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
 /// Whether an animation segment is running (setFrameSize refresh gate).
 pub(crate) fn zoom_anim_active() -> bool {
     lock_zoom_anim().is_some()
@@ -517,11 +531,11 @@ unsafe extern "C" fn zoom_imp(
 // ============================================================================
 static SELF_ZOOM_TEST_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
-static SELF_ZOOM_TEST_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SELF_ZOOM_TEST_FIRED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// One no-op tick unless the rig is armed; fires exactly once, 2s after the
-/// first pass. Called from step_self_zoom (window_event_controller).
+/// One no-op tick unless the rig is armed; fires `zoom:` twice (2s zoom-in,
+/// 6s zoom-out -- the restore direction) when the rig is armed. Called from
+/// step_self_zoom (window_event_controller).
 pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -531,12 +545,16 @@ pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
         return;
     }
     let started = *SELF_ZOOM_TEST_START.get_or_init(std::time::Instant::now);
-    if started.elapsed() < std::time::Duration::from_secs(2) {
+    let n = SELF_ZOOM_TEST_FIRED.load(std::sync::atomic::Ordering::Acquire);
+    let due = match n {
+        0 => started.elapsed() >= std::time::Duration::from_secs(2),
+        1 => started.elapsed() >= std::time::Duration::from_secs(6),
+        _ => false,
+    };
+    if !due {
         return;
     }
-    if SELF_ZOOM_TEST_FIRED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return;
-    }
+    SELF_ZOOM_TEST_FIRED.store(n + 1, std::sync::atomic::Ordering::Release);
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -563,6 +581,6 @@ pub(crate) fn self_zoom_test_tick(window: &winit::window::Window) {
     }))
     .unwrap_or_else(|_| {
         tracing::error!("self-zoom test rig panicked");
-        SELF_ZOOM_TEST_FIRED.store(false, std::sync::atomic::Ordering::Release);
+        SELF_ZOOM_TEST_FIRED.store(n, std::sync::atomic::Ordering::Release);
     });
 }
