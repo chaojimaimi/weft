@@ -160,3 +160,60 @@ fn bench_zoom_out_shrink_wrap_split() {
             .join(" ")
     );
 }
+
+/// Appendix K analysis (2026-09-23): right-aligned progress lines (brew
+/// style -- name + padding spaces + progress at the print-time right edge)
+/// through a shrink/grow cycle. Pins the STANDARD terminal semantics:
+/// content preserved, wrap split lands inside the padding, no
+/// re-alignment of historical lines. Run: cargo test -p weft_core --test
+/// resize_commit_bench -- --ignored --nocapture verify_padded_rewrap
+#[test]
+#[ignore = "semantic verification — run explicitly"]
+fn verify_padded_rewrap_semantics() {
+    let mut term = Terminal::with_scrollback(62, 200, 200_000);
+    let name = "Cask cockpit-tools (1.3.59)";
+    let prog = "Downloaded  107.2MB/107.2MB";
+    let pad = " ".repeat(200 - name.len() - prog.len() - 2);
+    let printed = format!("{name}  {pad}{prog}");
+    assert_eq!(printed.chars().count(), 200);
+    term.process(printed.as_bytes());
+    term.process(b"\r\n");
+
+    fn doc_tail_rows(term: &Terminal, n: usize) -> Vec<String> {
+        // The visible viewport holds the document tail after the resize
+        // (rows=62 tall, content shorter than that at these sizes).
+        let grid = term.grid();
+        let mut out = Vec::new();
+        for r in (0..grid.num_rows).rev() {
+            let text = grid.row_text(r);
+            if !text.trim().is_empty() {
+                out.push(text.trim_end().to_string());
+            }
+            if out.len() == n {
+                break;
+            }
+        }
+        out.reverse();
+        out
+    }
+
+    term.resize(62, 91);
+    let shrunk = doc_tail_rows(&term, 3);
+    println!("after shrink to 91 cols:");
+    for (i, r) in shrunk.iter().enumerate() {
+        println!("  row{i}: {r:?}");
+    }
+    let joined: String = shrunk.concat();
+    assert!(joined.contains(name), "name preserved through shrink");
+    assert!(joined.contains(prog), "progress preserved through shrink");
+
+    term.resize(62, 200);
+    let grown = doc_tail_rows(&term, 3);
+    println!("after grow back to 200 cols:");
+    for (i, r) in grown.iter().enumerate() {
+        println!("  row{i}: {r:?}");
+    }
+    let joined2: String = grown.concat();
+    assert!(joined2.contains(name), "name preserved through grow");
+    assert!(joined2.contains(prog), "progress preserved through grow");
+}
