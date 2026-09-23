@@ -260,6 +260,26 @@ fn gate_wiring_truth_tables() {
     assert!(!cascade_force_commit(false));
 }
 
+/// Diagnostic-build stall predicate truth table: quiet legs (gap <= 50 ms,
+/// call <= 20 ms) stay at debug; either leg over its floor speaks at info.
+/// Mutation check: flipping a floor's comparison direction turns the
+/// boundary rows red. The pull call site passes gap 0 (not measured there).
+#[test]
+fn zoom_diag_anomalous_truth_table() {
+    assert!(!zoom_diag_anomalous(0, 0));
+    assert!(!zoom_diag_anomalous(24_000, 3_000));
+    assert!(!zoom_diag_anomalous(49_999, 19_999));
+    // Boundary: strictly-greater -- the floors themselves stay quiet.
+    assert!(!zoom_diag_anomalous(50_000, 20_000));
+    // Either leg over -> anomalous.
+    assert!(zoom_diag_anomalous(50_001, 0));
+    assert!(zoom_diag_anomalous(0, 20_001));
+    // The field signature: a ~1 s gap (loop starvation) or a ~1 s setter
+    // cost (AppKit block).
+    assert!(zoom_diag_anomalous(1_003_000, 900));
+    assert!(zoom_diag_anomalous(2_000, 1_003_000));
+}
+
 /// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are
 /// process-wide; every other test in this file stays pure-local by design).
 static GLOBAL_ZOOM_STATE_LOCK: Mutex<()> = Mutex::new(());

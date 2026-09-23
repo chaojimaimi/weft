@@ -674,21 +674,43 @@ impl App {
         // TEMP-BENCH (appendix I measurement, strip before release): stage
         // timings for the AppKit calls -- the field 1 s stall lives in one
         // of these or in the subsequent Resized/drain/draw pipeline.
+        // Diagnostic build (field forensics 2026-09-23): the stall shows up
+        // here as either a huge GAP (the loop failed to wake between passes)
+        // or a huge SETTER cost (request_inner_size / set_outer_position
+        // blocked in AppKit). `anim.last_step` is the previous step's stamp,
+        // so the gap is free. Anomalous steps speak at info; see
+        // zoom_diag_anomalous for the floors.
+        let gap_us = anim.last_step.elapsed().as_micros() as u64;
         let t_setters = std::time::Instant::now();
         let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
         let t_inner = t_setters.elapsed();
         window.set_outer_position(winit::dpi::LogicalPosition::new(x, y));
         let t_pos = t_setters.elapsed();
+        let inner_us = t_inner.as_micros() as u64;
+        let total_us = t_pos.as_micros() as u64;
         crate::macos_zoom::zoom_anim_advance((x, y, w, h));
         crate::macos_zoom::zoom_anim_mark_stepped();
-        tracing::debug!(
-            step = anim.steps,
-            w,
-            h,
-            ?t_inner,
-            total_us = t_pos.as_micros() as u64,
-            "STEPZ stage: setters"
-        );
+        if crate::paint::zoom_render::zoom_diag_anomalous(gap_us, total_us) {
+            tracing::info!(
+                step = anim.steps,
+                w,
+                h,
+                gap_us,
+                inner_us,
+                total_us,
+                "STEPZ stall: zoom step gap or setter overrun"
+            );
+        } else {
+            tracing::debug!(
+                step = anim.steps,
+                w,
+                h,
+                gap_us,
+                inner_us,
+                total_us,
+                "STEPZ stage: setters"
+            );
+        }
         if progress >= 1.0 {
             let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
             tracing::info!(steps, "self-zoom complete");

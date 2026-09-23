@@ -73,3 +73,16 @@ pub(crate) fn defers_main(active: bool, zoom_in: bool) -> bool {
 pub(crate) fn cascade_force_commit(zoom_in: bool) -> bool {
     zoom_in
 }
+
+/// Diagnostic-build threshold predicate (field forensics 2026-09-23): the
+/// occasional ~1 s mid-animation stall must name its home -- a step GAP over
+/// the floor means the loop failed to wake between passes; a per-step cost
+/// over the floor means the AppKit setter section (the stepper passes the
+/// combined request_inner_size + set_outer_position elapsed; `inner_us` in
+/// the same log decomposes it) or the inline-pull CA commit (a single call
+/// at the IMP site) blocked. Floors: gap 50 ms (field-normal gaps are
+/// 2-24 ms), cost 20 ms (setters and the pull normally cost microseconds to
+/// low single-digit ms). Strictly-greater so the boundary values stay quiet.
+pub(crate) fn zoom_diag_anomalous(gap_us: u64, call_us: u64) -> bool {
+    gap_us > 50_000 || call_us > 20_000
+}
