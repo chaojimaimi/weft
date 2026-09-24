@@ -78,6 +78,11 @@ impl BlockTracker {
         // (empty on every real path — finalize always drained it); the local
         // drops at function end, so no explicit clear is needed.
         std::mem::swap(&mut self.output, &mut staged);
+        // PLAN_v11217 §3.5 (T4, review P2c): the swapped-in capture came from
+        // `take_orphan_staging` (built under `OutputCapture::default`) — align
+        // its cap metadata with the tracker's configured field so the
+        // finalize truncation marker reports the real cap, never the default.
+        self.output.set_cap_bytes(self.output_cap);
         self.finalize(Some(exit_code));
     }
 
@@ -391,6 +396,35 @@ mod tests {
                 .and_then(|styled| styled.line(0))
                 .and_then(|line| line.foreground_at(1)),
             Some(CellColor::Palette(2))
+        );
+    }
+
+    /// PLAN_v11217 §3.5 (T4): orphan display consistency — with cap=2 MiB the
+    /// synthesized orphan block's truncation marker reports "2 MiB" and the
+    /// scrollback clarification (the staged capture swapped in by
+    /// `on_orphan_command_end` carries the tracker's configured cap metadata,
+    /// not the `Default` fallback).
+    #[test]
+    fn orphan_block_marker_reports_the_configured_cap() {
+        let mib = 1024 * 1024;
+        let mut tracker = BlockTracker::new();
+        tracker.set_output_cap(2 * mib);
+        // Simulate `take_orphan_staging`'s product: a Default-built capture
+        // that absorbed >2 MiB of staged error output.
+        let mut staged = OutputCapture::default();
+        for _ in 0..(2 * mib + 64) {
+            staged.print('e', CapturedStyle::default(), 2 * mib);
+        }
+        tracker.on_orphan_command_end(1, "print(x)".to_string(), staged);
+
+        assert_eq!(tracker.blocks().len(), 1);
+        let block = tracker.blocks().last().unwrap();
+        assert!(
+            block
+                .output
+                .contains("block excerpt truncated at 2 MiB — full output remains in scrollback"),
+            "orphan marker must report the configured cap, got tail: …{}",
+            &block.output[block.output.len().saturating_sub(90)..]
         );
     }
 

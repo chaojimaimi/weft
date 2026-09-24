@@ -3,7 +3,7 @@ mod snapshot_row; // v1.11.3: gate budget
 
 use self::snapshot_row::{mark_snapshot_truncated, push_snapshot_text, styled_row};
 use super::{Grid, Row};
-use crate::blocks::{StyledLine, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{StyledLine, StyledOutput};
 use std::sync::Arc;
 
 const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
@@ -12,8 +12,15 @@ const MAX_SNAPSHOT_COLOR_SPANS: usize = 4096;
 /// typical line has 0-2 links.
 pub(crate) const MAX_SNAPSHOT_LINK_SPANS: usize = 256;
 
-/// v1.10.20: snapshot text budget — shared with `grid/snapshot_line_map.rs` (single bound for both walks).
-pub(crate) const SNAPSHOT_TEXT_BUDGET: usize = MAX_OUTPUT_BYTES + 4;
+/// v1.10.20: snapshot text budget, derived from the configured block output
+/// cap (PLAN_v11217 §3.5, T4 C-class). The former `SNAPSHOT_TEXT_BUDGET`
+/// global constant is gone: the cap argument is passed in per call (single
+/// source: `BlockTracker::output_cap`), and the +4 slack is the historical
+/// headroom the walk abort logic keeps for the truncation marker byte.
+/// Shared with `grid/snapshot_line_map.rs` (single bound for both walks).
+pub(crate) const fn snapshot_text_budget(text_cap: usize) -> usize {
+    text_cap.saturating_add(4)
+}
 
 /// v1.6.1: Convert a resolved URL `Arc<str>` to the `String` that `LinkSpan`
 /// stores. Centralized so the conversion is consistent across all call sites.
@@ -72,22 +79,31 @@ impl Grid {
     /// live viewport. Primary-screen TUIs use this as their detached command
     /// transcript because their coordinate repaint stream is not linear text.
     #[doc(hidden)]
-    pub fn document_text_from(&self, scrollback_start: u64) -> String {
-        self.document_snapshot_from(scrollback_start).0
+    pub fn document_text_from(&self, scrollback_start: u64, text_cap: usize) -> String {
+        self.document_snapshot_from(scrollback_start, text_cap).0
     }
 
     #[doc(hidden)]
-    pub fn document_snapshot_from(&self, scrollback_start: u64) -> (String, StyledOutput) {
+    pub fn document_snapshot_from(
+        &self,
+        scrollback_start: u64,
+        text_cap: usize,
+    ) -> (String, StyledOutput) {
         self.document_snapshot_from_indices(
             self.scrollback.index_since(scrollback_start),
             0,
             None,
             None,
+            text_cap,
         )
     }
 
     #[doc(hidden)]
-    pub fn document_snapshot_from_position(&self, document_start: u64) -> (String, StyledOutput) {
+    pub fn document_snapshot_from_position(
+        &self,
+        document_start: u64,
+        text_cap: usize,
+    ) -> (String, StyledOutput) {
         let viewport_origin = self.scrollback.position();
         let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
             (self.scrollback.index_since(document_start), 0)
@@ -97,7 +113,7 @@ impl Grid {
                 document_start.saturating_sub(viewport_origin) as usize,
             )
         };
-        self.document_snapshot_from_indices(scrollback_start, viewport_start, None, None)
+        self.document_snapshot_from_indices(scrollback_start, viewport_start, None, None, text_cap)
     }
 
     /// v1.6.1: Same as [`document_snapshot_from_position`](Self::document_snapshot_from_position)
@@ -107,6 +123,7 @@ impl Grid {
         &self,
         document_start: u64,
         url_resolver: F,
+        text_cap: usize,
     ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
@@ -126,6 +143,7 @@ impl Grid {
             None,
             None,
             url_resolver,
+            text_cap,
         )
     }
 
@@ -139,6 +157,7 @@ impl Grid {
         document_start: u64,
         scrollback_owned: &[bool],
         viewport_owned: &[bool],
+        text_cap: usize,
     ) -> (String, StyledOutput) {
         let viewport_origin = self.scrollback.position();
         let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
@@ -154,6 +173,7 @@ impl Grid {
             viewport_start,
             Some(scrollback_owned),
             Some(viewport_owned),
+            text_cap,
         )
     }
 
@@ -165,6 +185,7 @@ impl Grid {
         scrollback_owned: &[bool],
         viewport_owned: &[bool],
         url_resolver: F,
+        text_cap: usize,
     ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
@@ -184,6 +205,7 @@ impl Grid {
             Some(scrollback_owned),
             Some(viewport_owned),
             url_resolver,
+            text_cap,
         )
     }
 
@@ -193,6 +215,7 @@ impl Grid {
         viewport_start: usize,
         scrollback_owned: Option<&[bool]>,
         viewport_owned: Option<&[bool]>,
+        text_cap: usize,
     ) -> (String, StyledOutput) {
         // v1.6.1: resolve hyperlink ids to URLs via the terminal's registry.
         // The closure captures `&self` (immutable) so it can be called per row.
@@ -209,6 +232,7 @@ impl Grid {
             scrollback_owned,
             viewport_owned,
             url_resolver,
+            text_cap,
         );
         (text, styled)
     }
@@ -225,10 +249,14 @@ impl Grid {
         scrollback_owned: Option<&[bool]>,
         viewport_owned: Option<&[bool]>,
         url_resolver: F,
+        text_cap: usize,
     ) -> (String, StyledOutput, Option<usize>)
     where
         F: Fn(u32) -> Option<Arc<str>>,
     {
+        // PLAN_v11217 §3.5 (T4): the walk budget derives from the configured
+        // cap — no global constant. The +4 slack is historical headroom.
+        let text_budget = snapshot_text_budget(text_cap);
         let cursor_row = self.cursor.row;
         let scrollback = (scrollback_start..self.scrollback.len()).filter_map(|index| {
             scrollback_owned
@@ -283,13 +311,13 @@ impl Grid {
             let row = styled_row(
                 &row,
                 self.num_cols,
-                SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len()),
+                text_budget.saturating_sub(text.len()),
                 style_budget,
                 &url_resolver,
             );
             if row.text.is_empty() {
                 if row.text_overflow {
-                    mark_snapshot_truncated(&mut text);
+                    mark_snapshot_truncated(&mut text, text_cap);
                     lines.clear();
                     return (text, StyledOutput { lines }, cursor_snapshot_line);
                 }
@@ -304,7 +332,7 @@ impl Grid {
             if started {
                 line_index = line_index.saturating_add(1 + pending_empty);
                 for _ in 0..=pending_empty {
-                    if !push_snapshot_text(&mut text, "\n") {
+                    if !push_snapshot_text(&mut text, "\n", text_budget) {
                         lines.clear();
                         return (text, StyledOutput { lines }, cursor_snapshot_line);
                     }
@@ -320,12 +348,12 @@ impl Grid {
                 cursor_snapshot_line = Some(line_index);
             }
             pending_empty = 0;
-            if !push_snapshot_text(&mut text, &row.text) {
+            if !push_snapshot_text(&mut text, &row.text, text_budget) {
                 lines.clear();
                 return (text, StyledOutput { lines }, cursor_snapshot_line);
             }
             if row.text_overflow {
-                mark_snapshot_truncated(&mut text);
+                mark_snapshot_truncated(&mut text, text_cap);
                 lines.clear();
                 return (text, StyledOutput { lines }, cursor_snapshot_line);
             }
@@ -366,6 +394,7 @@ impl Grid {
         &self,
         start: usize,
         url_resolver: F,
+        text_cap: usize,
     ) -> Vec<(String, Option<StyledLine>)>
     where
         F: Fn(u32) -> Option<Arc<str>>,
@@ -373,10 +402,12 @@ impl Grid {
         (start..self.scrollback.len())
             .filter_map(|index| {
                 let row = self.scrollback.get(index)?;
+                // PLAN_v11217 §3.5 (T4): the per-row budget derives from the
+                // configured cap (single source: the caller's tracker field).
                 let snap = styled_row(
                     &row,
                     self.num_cols,
-                    MAX_OUTPUT_BYTES,
+                    snapshot_text_budget(text_cap),
                     Some(MAX_SNAPSHOT_COLOR_SPANS),
                     &url_resolver,
                 );
@@ -407,6 +438,7 @@ impl Grid {
 mod tests {
     use super::super::CellFlags;
     use super::*;
+    use crate::blocks::{DEFAULT_OUTPUT_CAP, OUTPUT_CAP_MAX_MIB};
 
     fn row(text: &str, cols: usize) -> Row {
         let mut row = Row::new(cols);
@@ -427,7 +459,7 @@ mod tests {
         grid.viewport[3] = row("claude --resume session-id", 40);
 
         assert_eq!(
-            grid.document_text_from(command_start),
+            grid.document_text_from(command_start, DEFAULT_OUTPUT_CAP),
             "complete answer line 1\ncomplete answer line 2\n\nPress Ctrl-C again to exit\nclaude --resume session-id"
         );
     }
@@ -457,8 +489,11 @@ mod tests {
         grid.cursor.row = 2;
         grid.cursor.col = 14;
 
-        let (text, _styled, cursor_line) =
-            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        let (text, _styled, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+            document_start,
+            |_| None,
+            DEFAULT_OUTPUT_CAP,
+        );
         assert_eq!(
             text,
             "banner of the app\napp header line\napp content line\ninput prompt:",
@@ -481,8 +516,11 @@ mod tests {
         grid.cursor.row = 2;
         let document_start = grid.scrollback.position();
 
-        let (text, _styled, cursor_line) =
-            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        let (text, _styled, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+            document_start,
+            |_| None,
+            DEFAULT_OUTPUT_CAP,
+        );
         assert_eq!(text, "first document row\n\ninput row here");
         assert_eq!(cursor_line, Some(2));
     }
@@ -491,7 +529,10 @@ mod tests {
     fn document_clamps_a_cleared_scrollback_baseline() {
         let mut grid = Grid::with_scrollback(2, 20, 20);
         grid.viewport[0] = row("final screen", 20);
-        assert_eq!(grid.document_text_from(99), "final screen");
+        assert_eq!(
+            grid.document_text_from(99, DEFAULT_OUTPUT_CAP),
+            "final screen"
+        );
     }
 
     #[test]
@@ -505,7 +546,7 @@ mod tests {
         grid.viewport[0] = row("resume tail", 24);
 
         assert_eq!(
-            grid.document_text_from(command_start),
+            grid.document_text_from(command_start, DEFAULT_OUTPUT_CAP),
             "new answer 1\nnew answer 2\nresume tail"
         );
     }
@@ -524,7 +565,7 @@ mod tests {
         grid.viewport[0] = row("resume", 24);
 
         assert_eq!(
-            grid.document_text_from(command_start),
+            grid.document_text_from(command_start, DEFAULT_OUTPUT_CAP),
             "new 0\nnew 1\nnew 2\nnew 3\nnew 4\nnew 5\nnew 6\nresume"
         );
     }
@@ -540,19 +581,22 @@ mod tests {
 
         grid.scroll_up(3);
         assert_eq!(
-            grid.document_snapshot_from_position(document_start).0,
+            grid.document_snapshot_from_position(document_start, DEFAULT_OUTPUT_CAP)
+                .0,
             "answer one\nanswer two"
         );
         grid.clear_scrollback();
         assert_eq!(
-            grid.document_snapshot_from_position(document_start).0,
+            grid.document_snapshot_from_position(document_start, DEFAULT_OUTPUT_CAP)
+                .0,
             "answer two"
         );
         for index in 0..4 {
             grid.scrollback.push(row(&format!("new {index}"), 24));
         }
         assert_eq!(
-            grid.document_snapshot_from_position(document_start).0,
+            grid.document_snapshot_from_position(document_start, DEFAULT_OUTPUT_CAP)
+                .0,
             "new 2\nnew 3\nanswer two"
         );
     }
@@ -568,7 +612,12 @@ mod tests {
         let owned = [true, false, true, false, true];
 
         let snapshot = grid
-            .document_snapshot_from_position_with_ownership_masks(0, &[], &owned)
+            .document_snapshot_from_position_with_ownership_masks(
+                0,
+                &[],
+                &owned,
+                DEFAULT_OUTPUT_CAP,
+            )
             .0;
 
         assert_eq!(snapshot, "Claude banner\nrestored answer\nprompt");
@@ -590,6 +639,7 @@ mod tests {
                 0,
                 &[false, true],
                 &[true, false, true],
+                DEFAULT_OUTPUT_CAP,
             )
             .0;
 
@@ -611,7 +661,9 @@ mod tests {
         let document_start = grid.scrollback.position() + 3;
 
         let (mapped, _map) = grid.resize_preserving_document_position(document_start, 6, 6);
-        let snapshot = grid.document_snapshot_from_position(mapped).0;
+        let snapshot = grid
+            .document_snapshot_from_position(mapped, DEFAULT_OUTPUT_CAP)
+            .0;
 
         assert!(!snapshot.contains("old shell"));
         assert!(!snapshot.contains("history"));
@@ -634,7 +686,7 @@ mod tests {
         styled.cells[3].fg = crate::grid::CellColor::Palette(5);
         grid.viewport[0] = styled;
 
-        let (text, snapshot) = grid.document_snapshot_from(0);
+        let (text, snapshot) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
         assert_eq!(text, "A中B");
         let line = snapshot.line(0).expect("colored line");
         assert_eq!(
@@ -668,10 +720,44 @@ mod tests {
             grid.scrollback.push(row(&full, cols));
         }
 
-        let (text, styled) = grid.document_snapshot_from(0);
-        assert!(text.len() > MAX_OUTPUT_BYTES);
-        assert!(text.len() <= MAX_OUTPUT_BYTES + 4);
+        let (text, styled) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
+        assert!(text.len() > DEFAULT_OUTPUT_CAP);
+        assert!(text.len() <= DEFAULT_OUTPUT_CAP + 4);
         assert!(styled.lines.is_empty(), "truncated text cannot keep styles");
+    }
+
+    /// PLAN_v11217 §3.5 (T4): the walk budget is DYNAMIC — with cap=64 MiB
+    /// the same grid content that truncated at the 1 MiB default now survives
+    /// the walk intact (budget = cap + 4, single source: the passed cap).
+    #[test]
+    fn snapshot_text_budget_follows_the_configured_cap() {
+        // §3.5 acceptance letter: cap=2 MiB → budget = 2 MiB + 4.
+        assert_eq!(snapshot_text_budget(2 * 1024 * 1024), 2 * 1024 * 1024 + 4);
+        let cols = 1_100;
+        let mut grid = Grid::with_scrollback(1, cols, 1_100);
+        let full = "x".repeat(cols);
+        for _ in 0..1_100 {
+            grid.scrollback.push(row(&full, cols));
+        }
+
+        // Raised cap: the >1MiB content is retained (budget 64 MiB + 4).
+        let raised = grid.document_snapshot_from(0, OUTPUT_CAP_MAX_MIB * 1024 * 1024);
+        assert!(
+            raised.0.len() > DEFAULT_OUTPUT_CAP + 4,
+            "raised cap must lift the walk budget past the old constant, got {}",
+            raised.0.len()
+        );
+        // 1,100 rows × 1,100 B + the 1,099 '\n' separators between them.
+        assert_eq!(
+            raised.0.len(),
+            cols * 1_100 + (1_100 - 1),
+            "nothing truncated under the raised budget"
+        );
+
+        // Default cap: the same content still truncates (legacy twin).
+        let default = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
+        assert!(default.0.len() > DEFAULT_OUTPUT_CAP);
+        assert!(default.0.len() <= DEFAULT_OUTPUT_CAP + 4);
     }
 
     #[test]
@@ -685,7 +771,7 @@ mod tests {
         }
         grid.viewport[0] = styled;
 
-        let (text, styled) = grid.document_snapshot_from(0);
+        let (text, styled) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
         assert_eq!(text.len(), cols);
         assert!(styled.lines.is_empty());
     }
@@ -701,7 +787,7 @@ mod tests {
         grid.scrollback.set_max_lines(3, 24);
 
         assert_eq!(
-            grid.document_text_from(command_start),
+            grid.document_text_from(command_start, DEFAULT_OUTPUT_CAP),
             "answer 2\nanswer 3\nanswer 4"
         );
     }

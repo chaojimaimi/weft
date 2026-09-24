@@ -747,7 +747,7 @@ fn resize_dims_keeps_scrollback_rows_at_renderable_width() {
     );
     assert_eq!(grid.cell(0, 4).character, ' ');
     assert_eq!(
-        grid.document_text_from(0),
+        grid.document_text_from(0, crate::blocks::DEFAULT_OUTPUT_CAP),
         "ABCD",
         "the snapshot contains the complete history row"
     );
@@ -778,7 +778,7 @@ fn narrowing_resize_keeps_scrollback_rows_at_original_width() {
     let text: String = row.cells.iter().map(|c| c.character).collect();
     assert_eq!(text, "ABCDEFGH", "the right half survives the narrowing");
     assert_eq!(
-        grid.document_text_from(0),
+        grid.document_text_from(0, crate::blocks::DEFAULT_OUTPUT_CAP),
         "ABCDEFGH",
         "the snapshot contains the complete history row"
     );

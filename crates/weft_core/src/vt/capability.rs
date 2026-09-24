@@ -33,8 +33,9 @@ use super::screen_exit::{
 /// deletes every streamed paragraph that scrolled out of the viewport; the
 /// superseded frame is snapshotted into this history BEFORE the clear and
 /// prepended to every subsequent screen snapshot, so history review stays
-/// complete. Bounded at `MAX_OUTPUT_BYTES` (head-keeping, matching the
-/// snapshot truncation semantics). Cleared at each real command start.
+/// complete. Bounded at the tracker's configured output cap (default
+/// `DEFAULT_OUTPUT_CAP`; head-keeping, matching the snapshot truncation
+/// semantics). Cleared at each real command start.
 #[derive(Default)]
 pub(in crate::vt) struct ScreenHistory {
     pub(in crate::vt) text: String,

@@ -2,7 +2,7 @@
 //! its tail capture primitives.
 
 use super::Terminal;
-use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase, StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase, StyledOutput};
 
 pub(in crate::vt) struct PrimaryScreenInterruptCapture {
     pub(in crate::vt) frozen_text: String,
@@ -22,10 +22,15 @@ impl Terminal {
             return;
         };
         let (frozen_text, frozen_styled, _) = self.primary_screen_document_snapshot(document_start);
+        let mut tail = OutputCapture::default();
+        // T4 review P2: the Default cap metadata would make take_styled's
+        // marker report "1 MiB" on a raised-cap session — align it with the
+        // tracker field the tail's truncation actually follows.
+        tail.set_cap_bytes(self.block_tracker.output_cap());
         self.capabilities.primary_screen_interrupt_capture = Some(PrimaryScreenInterruptCapture {
             frozen_text,
             frozen_styled,
-            tail: OutputCapture::default(),
+            tail,
             origin_row: None,
         });
         tracing::info!("froze primary-screen transcript before interrupt");
@@ -57,13 +62,18 @@ impl Terminal {
             && self.capabilities.primary_screen_exit.is_none()
     }
 
+    // PLAN_v11217 §3.5 (T4): every tail sink below is A-class — the
+    // interrupt tail is retained text (it merges into the block on
+    // exit) — so its cap reads the tracker's configured field.
     pub(in crate::vt) fn capture_primary_screen_interrupt_print(
         &mut self,
         c: char,
         style: CapturedStyle,
     ) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
-            capture.tail.print(c, style, MAX_OUTPUT_BYTES);
+            capture
+                .tail
+                .print(c, style, self.block_tracker.output_cap());
         }
     }
 
@@ -73,13 +83,15 @@ impl Terminal {
         style: CapturedStyle,
     ) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
-            capture.tail.print_ascii(bytes, style, MAX_OUTPUT_BYTES);
+            capture
+                .tail
+                .print_ascii(bytes, style, self.block_tracker.output_cap());
         }
     }
 
     pub(in crate::vt) fn capture_primary_screen_interrupt_newline(&mut self) {
         if let Some(capture) = &mut self.capabilities.primary_screen_interrupt_capture {
-            capture.tail.newline(MAX_OUTPUT_BYTES);
+            capture.tail.newline(self.block_tracker.output_cap());
         }
     }
 
@@ -109,10 +121,10 @@ impl Terminal {
             let origin_row = *capture.origin_row.get_or_insert(self.grid.cursor.row);
             let row = self.grid.cursor.row.saturating_sub(origin_row);
             let col = self.grid.cursor.col;
-            capture.tail.goto(row, col, MAX_OUTPUT_BYTES);
+            capture.tail.goto(row, col, self.block_tracker.output_cap());
             if clear_line && col == 0 {
                 capture.tail.erase_line(2);
-                capture.tail.goto(row, col, MAX_OUTPUT_BYTES);
+                capture.tail.goto(row, col, self.block_tracker.output_cap());
             }
         }
     }

@@ -63,14 +63,21 @@ impl Terminal {
         let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
             self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
         };
+        // PLAN_v11217 §3.5 (T4): the snapshot walk's text budget derives from
+        // the tracker's configured cap (single source: `tracker.output_cap`;
+        // the Grid receives it as the `text_cap` argument).
+        let text_cap = self.block_tracker.output_cap();
         self.capabilities
             .primary_screen_ownership
             .viewport
             .as_ref()
             .map_or_else(
                 || {
-                    self.grid
-                        .document_snapshot_from_position_with_resolver(document_start, url_resolver)
+                    self.grid.document_snapshot_from_position_with_resolver(
+                        document_start,
+                        url_resolver,
+                        text_cap,
+                    )
                 },
                 |owned| {
                     self.grid
@@ -79,6 +86,7 @@ impl Terminal {
                             &self.capabilities.primary_screen_ownership.scrollback,
                             owned,
                             url_resolver,
+                            text_cap,
                         )
                 },
             )

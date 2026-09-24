@@ -159,6 +159,8 @@ impl Config {
                 // v1.11.2 X3: same scrollback clamp as the v1.5 load path so
                 // both entry points produce in-range values.
                 io::normalize_scrollback(&mut cfg);
+                // PLAN_v11217 §3.5 (T4): same clamp for output_cap_mib.
+                io::normalize_blocks(&mut cfg);
                 cfg
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),

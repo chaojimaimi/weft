@@ -160,7 +160,7 @@ pub(super) fn space_primary_screen_exit_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::{CapturedStyle, StyledLine, MAX_OUTPUT_BYTES};
+    use crate::blocks::{CapturedStyle, StyledLine, DEFAULT_OUTPUT_CAP};
     use crate::grid::{CellColor, CellFlags, UnderlineStyle};
 
     fn empty_styled_line(line: u32) -> StyledLine {
@@ -248,13 +248,13 @@ mod tests {
             UnderlineStyle::Single,
             None,
         );
-        tail.print_ascii(b"repainted footer", plain, MAX_OUTPUT_BYTES);
+        tail.print_ascii(b"repainted footer", plain, DEFAULT_OUTPUT_CAP);
         for _ in 0..3 {
-            tail.newline(MAX_OUTPUT_BYTES);
+            tail.newline(DEFAULT_OUTPUT_CAP);
         }
         let label = "To resume this session:";
-        tail.print_ascii(label.as_bytes(), dim, MAX_OUTPUT_BYTES);
-        tail.print_ascii(b" agent --session session-id\n", plain, MAX_OUTPUT_BYTES);
+        tail.print_ascii(label.as_bytes(), dim, DEFAULT_OUTPUT_CAP);
+        tail.print_ascii(b" agent --session session-id\n", plain, DEFAULT_OUTPUT_CAP);
 
         let (text, styled) =
             merge_primary_screen_interrupt_tail("answer".into(), StyledOutput::default(), &tail);
@@ -281,11 +281,11 @@ mod tests {
             UnderlineStyle::Single,
             None,
         );
-        tail.print_ascii(b"To resume this session:", dim, MAX_OUTPUT_BYTES);
+        tail.print_ascii(b"To resume this session:", dim, DEFAULT_OUTPUT_CAP);
         tail.print_ascii(
             b" agent --session id",
             CapturedStyle::default(),
-            MAX_OUTPUT_BYTES,
+            DEFAULT_OUTPUT_CAP,
         );
 
         let (text, styled) =

@@ -51,6 +51,28 @@ pub fn normalize_scrollback(config: &mut Config) {
     config.scrollback.lines = raw.clamp(SCROLLBACK_MIN_LINES, SCROLLBACK_MAX_LINES);
 }
 
+/// PLAN_v11217 §3.5 (T4): clamp `config.blocks.output_cap_mib` into
+/// `[OUTPUT_CAP_MIN_MIB, OUTPUT_CAP_MAX_MIB]`, warning when the on-disk value
+/// was out of range. Canonical clamp point: called on the parsed `source` and
+/// again on the profile-resolved `effective` config (same shape as
+/// [`normalize_scrollback`]) — a profile override can reintroduce an
+/// out-of-range value after the source was normalized.
+pub fn normalize_blocks(config: &mut Config) {
+    let raw = config.blocks.output_cap_mib;
+    let clamped = raw.clamp(
+        crate::blocks::OUTPUT_CAP_MIN_MIB,
+        crate::blocks::OUTPUT_CAP_MAX_MIB,
+    );
+    if clamped != raw {
+        tracing::warn!(
+            raw,
+            clamped,
+            "[blocks] output_cap_mib out of range; clamping"
+        );
+    }
+    config.blocks.output_cap_mib = clamped;
+}
+
 // ── LoadedConfig ───────────────────────────────────────────────────────
 
 /// The result of loading and resolving a config document.
@@ -180,10 +202,13 @@ pub fn load_resolved_from_path(path: &Path) -> Result<LoadedConfig, ConfigLoadEr
     // v1.11.2 X3: normalize before the profile overlay so the stored source
     // view is always in range.
     normalize_scrollback(&mut source);
+    // PLAN_v11217 §3.5 (T4): same canonical clamp point for output_cap_mib.
+    normalize_blocks(&mut source);
     let (mut effective, diagnostics) = source.resolve_active_profile()?;
     // A profile's [scrollback] override is applied inside
     // resolve_active_profile and can reintroduce an out-of-range value.
     normalize_scrollback(&mut effective);
+    normalize_blocks(&mut effective);
     Ok(LoadedConfig {
         source,
         effective,
@@ -419,6 +444,89 @@ retained_limit = 42
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&path2);
         let _ = std::fs::remove_file(&path3);
+    }
+
+    // ── PLAN_v11217 §3.5 (T4): [blocks] output_cap_mib round-trip + clamp ──
+
+    #[test]
+    fn blocks_output_cap_mib_round_trips_through_save_and_profile() {
+        let path = tmp("cap-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        let toml = r#"
+[blocks]
+output_cap_mib = 8
+
+[profiles.big.blocks]
+output_cap_mib = 32
+"#;
+        std::fs::write(&path, toml).unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        assert_eq!(loaded.source.blocks.output_cap_mib, 8);
+
+        // Save the source back out and reload — the key must survive.
+        let path2 = tmp("cap-roundtrip-2");
+        let _ = std::fs::remove_file(&path2);
+        loaded.source.save_to_path(&path2).unwrap();
+        let reloaded = load_resolved_from_path(&path2).unwrap();
+        assert_eq!(reloaded.source.blocks.output_cap_mib, 8);
+
+        // Profile override applies to effective.
+        let with_active = r#"
+active_profile = "big"
+
+[profiles.big.blocks]
+output_cap_mib = 32
+"#;
+        let path3 = tmp("cap-roundtrip-3");
+        let _ = std::fs::remove_file(&path3);
+        std::fs::write(&path3, with_active).unwrap();
+        let active = load_resolved_from_path(&path3).unwrap();
+        assert_eq!(active.effective.blocks.output_cap_mib, 32);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_file(&path3);
+    }
+
+    /// The load-layer clamp truth table (§3.5 acceptance): 0→1, 1→1, 64→64,
+    /// 65→64 — verified on the profile-resolved effective config, so the
+    /// profile-overlay reintroduction path is covered too.
+    #[test]
+    fn blocks_output_cap_mib_clamps_on_load() {
+        let case = |raw: usize| {
+            let path = tmp("cap-clamp");
+            let _ = std::fs::remove_file(&path);
+            let toml =
+                format!("active_profile = \"p\"\n\n[profiles.p.blocks]\noutput_cap_mib = {raw}\n");
+            std::fs::write(&path, toml).unwrap();
+            let loaded = load_resolved_from_path(&path).unwrap();
+            let effective = loaded.effective.blocks.output_cap_mib;
+            let _ = std::fs::remove_file(&path);
+            effective
+        };
+        assert_eq!(case(0), crate::blocks::OUTPUT_CAP_MIN_MIB, "0 → 1 (floor)");
+        assert_eq!(case(1), 1, "1 → 1 (in range untouched)");
+        assert_eq!(case(64), 64, "64 → 64 (ceiling kept)");
+        assert_eq!(
+            case(65),
+            crate::blocks::OUTPUT_CAP_MAX_MIB,
+            "65 → 64 (ceiling)"
+        );
+    }
+
+    /// An all-default [blocks] section must not gain an output_cap_mib key on
+    /// save (mirrors the retained_limit non-default-only write contract).
+    #[test]
+    fn blocks_output_cap_mib_default_is_not_persisted() {
+        let path = tmp("cap-default-save");
+        let _ = std::fs::remove_file(&path);
+        let cfg = crate::config::Config::default();
+        cfg.save_to_path(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("output_cap_mib"),
+            "default cap must stay out of the saved file: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     // ── v1.11.2 X3: [scrollback] lines clamp (PLAN_v1112 §5) ───────────

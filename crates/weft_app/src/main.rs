@@ -48,6 +48,7 @@ mod layout;
 mod lifecycle_controller;
 mod macos_alert;
 mod macos_file_dialog;
+mod recovery_restore;
 // v1.11.12 (PLAN_v11112 M-D): pointer-parameterized pure decision core for
 // the system-appearance query (macos_system.rs sits at the 800-line ceiling).
 mod macos_appearance;
@@ -483,6 +484,11 @@ impl App {
         crate::config_controller::apply_blocks_retained_limit(
             &mut tab,
             self.config_state.config.blocks.retained_limit,
+        );
+        // PLAN_v11217 §3.5 (T4): propagate the configured output cap too.
+        crate::config_controller::apply_blocks_output_cap(
+            &mut tab,
+            self.config_state.config.blocks.output_cap_mib,
         );
         // v1.11.7 (P2-3): inject the user's TUI render tier — the core default
         // is Classic; the factory default here is `noninteractive`.

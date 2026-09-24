@@ -319,12 +319,17 @@ pub const PASTE_SIZE_TIERS_KIB: [u32; 6] = [8, 16, 32, 64, 128, 256];
 #[serde(default)]
 pub struct BlocksConfig {
     pub retained_limit: usize,
+    /// PLAN_v11217 §3.5 (T4): per-tab retained-output cap (MiB), clamped
+    /// 1..=64 at load normalization AND `BlockTracker::set_output_cap`
+    /// (review P2a double clamp). No Settings UI row (config-first cut).
+    pub output_cap_mib: usize,
 }
 
 impl Default for BlocksConfig {
     fn default() -> Self {
         Self {
             retained_limit: crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
+            output_cap_mib: crate::blocks::OUTPUT_CAP_DEFAULT_MIB,
         }
     }
 }
@@ -507,8 +512,7 @@ mod paste_config_tests {
 mod blocks_config_tests {
     use super::BlocksConfig;
 
-    /// v1.11.2 X4 (PLAN_v1112 §1.2): default matches the tracker default and
-    /// the section is optional in TOML.
+    /// v1.11.2 X4: default matches the tracker default; section optional.
     #[test]
     fn defaults_to_tracker_retention_cap() {
         assert_eq!(
@@ -526,6 +530,21 @@ mod blocks_config_tests {
         assert_eq!(cfg.retained_limit, 500);
         let cfg: BlocksConfig = toml::from_str("retained_limit = 0").unwrap();
         assert_eq!(cfg.retained_limit, 0, "0 = retention disabled");
+    }
+
+    /// PLAN_v11217 §3.5 (T4): defaults to 1, parses from TOML; parse does
+    /// NOT clamp (that lives in `normalize_blocks` / `set_output_cap`).
+    #[test]
+    fn output_cap_mib_defaults_and_parses() {
+        let default = BlocksConfig::default();
+        assert_eq!(
+            default.output_cap_mib,
+            crate::blocks::OUTPUT_CAP_DEFAULT_MIB
+        );
+        let cfg: BlocksConfig = toml::from_str("output_cap_mib = 8").unwrap();
+        assert_eq!(cfg.output_cap_mib, 8);
+        let cfg: BlocksConfig = toml::from_str("[blocks]").unwrap();
+        assert_eq!(cfg, default, "section is optional");
     }
 }
 

@@ -4,7 +4,7 @@
 use super::Terminal;
 use crate::blocks::{
     extract_owned_pushed_rows, line_boundary_at_or_before, styled_lines_from, styled_lines_in,
-    StyledOutput, MAX_OUTPUT_BYTES,
+    StyledOutput, DEFAULT_OUTPUT_CAP,
 };
 
 /// v1.10.23 (FIX_OMP_CONTENT_LOSS): minimum preserved-frame size (snapshot
@@ -67,6 +67,7 @@ impl Terminal {
             // preservation needs the EMPTY viewport mask (the fresh frame must
             // stay out), a form `primary_screen_document_snapshot` cannot
             // express; Phase 1 migrates this path to the index mapping.
+            let text_cap = self.block_tracker.output_cap();
             let (text, styled, _) = self
                 .grid
                 .document_snapshot_from_position_with_ownership_masks_and_resolver(
@@ -74,6 +75,7 @@ impl Terminal {
                     &self.capabilities.primary_screen_ownership.scrollback,
                     &[],
                     |id| self.hyperlinks.url(id).map(std::sync::Arc::<str>::from),
+                    text_cap,
                 );
             (text, styled)
         };
@@ -87,9 +89,9 @@ impl Terminal {
 
     /// v1.10.23 (FIX_OMP_CONTENT_LOSS): append one superseded document frame
     /// to the preservation history that [`Self::compose_screen_history`]
-    /// prepends to every screen snapshot. Bounded at `MAX_OUTPUT_BYTES` —
-    /// frames beyond the cap are dropped (head-keeping, matching the snapshot
-    /// truncation semantics).
+    /// prepends to every screen snapshot. Bounded at the tracker's configured
+    /// output cap (default `DEFAULT_OUTPUT_CAP`) — frames beyond the cap are
+    /// dropped (head-keeping, matching the snapshot truncation semantics).
     // v1.11.12 (PLAN_v11112 M-A): `pub(super)` so the ledger invariant
     // tests can drive the append path directly.
     pub(super) fn append_screen_history_frame(&mut self, text: &str, styled: StyledOutput) {
@@ -98,13 +100,20 @@ impl Terminal {
         if text.is_empty() {
             return;
         }
-        if history.text.len() >= crate::blocks::MAX_OUTPUT_BYTES {
+        // PLAN_v11217 §3.5 (T4, round-7 upgrade): the dropped frame is
+        // user-visible retained content lost forever — "丢帧即限界" — so the
+        // bound reads the tracker's configured field, not a global constant.
+        let cap = self.block_tracker.output_cap();
+        if history.text.len() >= cap {
             // Capacity drop must be observable — the frame is preserved
-            // nowhere else after the scrollback clear below.
+            // nowhere else after the scrollback clear below. The cap MiB in
+            // the message must follow the configured field (it names the
+            // budget the user actually has).
             tracing::warn!(
                 bytes = history.text.len(),
                 dropped = text.len(),
-                "screen history at 1MiB cap; dropping superseded frame"
+                "screen history at {} MiB cap; dropping superseded frame",
+                cap / (1024 * 1024)
             );
             return;
         }
@@ -295,9 +304,12 @@ impl Terminal {
         let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
             self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
         };
-        let rows = self
-            .grid
-            .snapshot_rows_from_scrollback(scrollback_from, url_resolver);
+        // Per-row extraction budget = the tracker's configured cap (T4 C-class).
+        let rows = self.grid.snapshot_rows_from_scrollback(
+            scrollback_from,
+            url_resolver,
+            self.block_tracker.output_cap(),
+        );
         let (text, styled) = extract_owned_pushed_rows(&rows, &owned);
         if !text.is_empty() {
             self.block_tracker.append_screen_prefix(&text, styled);
@@ -346,9 +358,12 @@ impl Terminal {
         let url_resolver = |id: u32| -> Option<std::sync::Arc<str>> {
             self.hyperlinks.url(id).map(std::sync::Arc::<str>::from)
         };
-        let rows = self
-            .grid
-            .snapshot_rows_from_scrollback(scrollback_from, url_resolver);
+        // Per-row extraction budget = the tracker's configured cap (T4 C-class).
+        let rows = self.grid.snapshot_rows_from_scrollback(
+            scrollback_from,
+            url_resolver,
+            self.block_tracker.output_cap(),
+        );
         let (text, styled) = extract_owned_pushed_rows(&rows, &owned);
         if !text.is_empty() {
             self.block_tracker.append_screen_prefix(&text, styled);
@@ -368,7 +383,7 @@ impl Terminal {
     }
 
     /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): 1MiB chunking for screen-owned
-    /// TUI history. The composed text exceeded `MAX_OUTPUT_BYTES`: settle the
+    /// TUI history. The composed text exceeded `DEFAULT_OUTPUT_CAP`: settle the
     /// head chunk(s) as finished blocks (contiguous ids, byte-seamless text)
     /// and continue the tail in the in-flight block, so long sessions no
     /// longer truncate at the snapshot budget. The boundary never cuts inside
@@ -376,12 +391,18 @@ impl Terminal {
     /// the snapshot is re-captured wholesale on the next refresh, so a
     /// partial segment in a finished block would duplicate the surviving
     /// rows. Degradation branch: when the viewport segment ALONE exceeds
-    /// `MAX_OUTPUT_BYTES` (no chunkable history/prefix remains before it),
+    /// `DEFAULT_OUTPUT_CAP` (no chunkable history/prefix remains before it),
     /// splitting would have to cut the segment — the split falls back to the
-    /// old snapshot truncation (head-keeping, tail styles dropped, see
-    /// [`Self::trim_screen_history`]) and warns. Ordinary command-output
-    /// capture (the print path) is untouched — its truncation semantics are
-    /// unchanged.
+    /// old snapshot truncation (head-keeping at the CONFIGURED cap, tail
+    /// styles dropped, see [`Self::trim_screen_history`]) and warns. Ordinary
+    /// command-output capture (the print path) is untouched — its truncation
+    /// semantics are unchanged.
+    ///
+    /// PLAN_v11217 §3.5 (T4): the chunk threshold below stays the
+    /// `DEFAULT_OUTPUT_CAP` CONSTANT (B-class: "chunk granularity, not
+    /// retention" — settling heads preserves every byte, so nothing is
+    /// bounded or lost by chunking at 1MiB regardless of the configured
+    /// cap). Only the fallback truncation reads the configured field.
     pub(super) fn split_screen_history(
         &mut self,
         composed: String,
@@ -397,8 +418,14 @@ impl Terminal {
         let mut heads: Vec<(String, Option<StyledOutput>)> = Vec::new();
         let mut rest = composed;
         let mut line_at = 0usize;
-        while rest.len() > MAX_OUTPUT_BYTES {
-            let natural = line_boundary_at_or_before(&rest, MAX_OUTPUT_BYTES);
+        // B-class (chunk granularity, not retention). INVARIANT CHAIN: the
+        // non-degraded tail handed to `BlockTracker::split_screen_history` is
+        // ≤ 1MiB BY this loop alone; the fallback branch below can hand a
+        // tail of up to the configured cap, which is why that callee's
+        // `output.replace` must read `output_cap` and not this constant
+        // (screen_capture.rs:164 — round-7 linkage note).
+        while rest.len() > DEFAULT_OUTPUT_CAP {
+            let natural = line_boundary_at_or_before(&rest, DEFAULT_OUTPUT_CAP);
             let clamp = rest.len().saturating_sub(segment_len);
             if clamp == 0 {
                 // The entire remaining text is the live viewport segment
@@ -406,10 +433,17 @@ impl Terminal {
                 // duplicate the settled rows on the next refresh (the
                 // segment is re-captured wholesale) — unbounded growth.
                 // Fall back to the pre-split snapshot truncation: settle the
-                // heads split so far, truncate the segment at the 1MiB
-                // budget in the in-flight block, drop tail styles (matching
+                // heads split so far, truncate the segment at the budget in
+                // the in-flight block, drop tail styles (matching
                 // `replace_screen_snapshot`'s truncation semantics).
-                let mut end = MAX_OUTPUT_BYTES.min(rest.len());
+                // A-class (PLAN_v11217 §3.5, round-7 upgrade): this truncates
+                // the RETAINED in-flight block — the bound reads the tracker's
+                // configured field. The tail produced here (up to the cap)
+                // flows into `BlockTracker::split_screen_history`, whose
+                // `output.replace` must therefore also read `output_cap` —
+                // see the invariant-chain note at the loop above.
+                let cap = self.block_tracker.output_cap();
+                let mut end = cap.min(rest.len());
                 while end > 0 && !rest.is_char_boundary(end) {
                     end -= 1;
                 }

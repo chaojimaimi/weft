@@ -609,7 +609,7 @@ fn history_append_ledger_matches_recompute() {
 #[test]
 fn history_append_at_cap_leaves_ledger_untouched() {
     let mut t = Terminal::new(6, 40);
-    let filler = "x".repeat(crate::blocks::MAX_OUTPUT_BYTES);
+    let filler = "x".repeat(crate::blocks::DEFAULT_OUTPUT_CAP);
     t.append_screen_history_frame(&filler, StyledOutput::default());
     let before = t.screen_history_lines();
     let bytes_before = t.capabilities.screen_history.text.len();
@@ -719,7 +719,7 @@ fn prefix_append_ledger_matches_recompute() {
     assert_eq!(capture.screen_prefix_line_count(), 4);
 
     // `replace` swaps the live segment only — prefix (and ledger) survive.
-    capture.replace("viewport", crate::blocks::MAX_OUTPUT_BYTES);
+    capture.replace("viewport", crate::blocks::DEFAULT_OUTPUT_CAP);
     assert_eq!(capture.screen_prefix_line_count(), 4);
 }
 

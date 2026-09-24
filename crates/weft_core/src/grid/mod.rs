@@ -7,7 +7,6 @@ pub mod flat;
 mod reflow;
 mod row;
 mod row_extras;
-mod snapshot;
 mod snapshot_line_map;
 pub use cell::{
     terminal_char_width, terminal_grapheme_glyph, terminal_text_width, Cell, CellColor, CellFlags,
@@ -17,6 +16,7 @@ pub use cursor::{Cursor, CursorStyle};
 pub use row::Row;
 pub use row_extras::{CellExtra, RowExtras};
 
+pub(crate) mod snapshot; // PLAN_v11217 §3.5: budget helper reachable crate-wide
 use flat::FlatStorage;
 use std::sync::Arc;
 

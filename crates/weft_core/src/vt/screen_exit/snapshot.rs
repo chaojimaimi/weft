@@ -4,7 +4,7 @@
 use super::tail::{merge_primary_screen_interrupt_tail, space_primary_screen_exit_tail};
 use super::Terminal;
 use super::PRIMARY_HISTORY_SNAPSHOT_INTERVAL;
-use crate::blocks::{StyledOutput, MAX_OUTPUT_BYTES};
+use crate::blocks::{StyledOutput, DEFAULT_OUTPUT_CAP};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -76,6 +76,9 @@ impl Terminal {
                 document_start.saturating_sub(viewport_origin) as usize,
             )
         };
+        // PLAN_v11217 §3.5 (T4): the replayed walk must use the SAME derived
+        // text budget as the snapshot builder — the tracker's configured cap.
+        let text_cap = self.block_tracker.output_cap();
         let line = match self
             .capabilities
             .primary_screen_ownership
@@ -88,6 +91,7 @@ impl Terminal {
                 viewport_start,
                 Some(&self.capabilities.primary_screen_ownership.scrollback),
                 Some(owned),
+                text_cap,
             ),
             None => self.grid.snapshot_line_index_for_viewport_row(
                 viewport_row,
@@ -95,6 +99,7 @@ impl Terminal {
                 viewport_start,
                 None,
                 None,
+                text_cap,
             ),
         };
         // v1.10.23: the rendered block prepends the preserved-frame history,
@@ -321,10 +326,16 @@ impl Terminal {
     /// v1.10.25 (FIX_TUI_HISTORY_INCREMENTAL): publish a composed screen
     /// snapshot to the in-flight block — or split it into 1MiB finished
     /// blocks plus an in-flight tail when the session history crossed
-    /// `MAX_OUTPUT_BYTES` (long TUI sessions no longer truncate at the
+    /// `DEFAULT_OUTPUT_CAP` (long TUI sessions no longer truncate at the
     /// snapshot budget).
     fn publish_screen_snapshot(&mut self, text: String, styled: StyledOutput, segment_len: usize) {
-        if text.len() > MAX_OUTPUT_BYTES {
+        // B-class (PLAN_v11217 §3.5): "chunk granularity, not retention" —
+        // this gate only selects between an equal-sized replace and the
+        // split machinery; both arms preserve the bytes (the split settles
+        // byte-seamless heads). The threshold stays the DEFAULT constant
+        // even when `[blocks] output_cap_mib` is raised: the split boundary
+        // is arithmetic granularity, not a retention bound.
+        if text.len() > DEFAULT_OUTPUT_CAP {
             self.split_screen_history(text, styled, segment_len);
         } else {
             self.block_tracker.replace_screen_snapshot(&text, styled);

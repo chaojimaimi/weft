@@ -216,7 +216,7 @@ pub fn block_cwd_header_active(editor_mode: bool, cwd_present: bool) -> bool {
 
 /// v1.10.26 Batch D (D-3): structural chrome rows a <b>settled split head</b>
 /// adds to the block view above the live tail. When a long primary-screen
-/// TUI snapshot crosses `MAX_OUTPUT_BYTES`, `split_screen_history`
+/// TUI snapshot crosses `DEFAULT_OUTPUT_CAP`, `split_screen_history`
 /// (vt/screen_exit/freeze.rs) settles 1MiB chunks as finished blocks; each
 /// new block renders a Command row + Header band + Separator (see
 /// `paint/block_view/layout_pass.rs`), i.e. this many rows inserted between

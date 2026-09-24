@@ -119,7 +119,7 @@ fn run_stream_bench(name: &str, bytes: &[u8], lines: usize) {
 }
 
 /// 16MB 长行流（捕获开）：模拟 `cat` 大文件。单命令块输出超 1MiB 时
-/// Block 捕获缓冲按 MAX_OUTPUT_BYTES 截断——这是生产行为（网格始终持有
+/// Block 捕获缓冲按 DEFAULT_OUTPUT_CAP 截断——这是生产行为（网格始终持有
 /// 完整显示输出，截断只影响块摘录），本基准刻意保留该路径参与测量。
 #[test]
 #[ignore]

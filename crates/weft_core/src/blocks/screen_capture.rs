@@ -8,12 +8,12 @@
 //! snapshot. The prefix is append-only — rows pushed out of the viewport are
 //! captured into the in-flight block BEFORE the scrollback ring can evict
 //! them, so ring eviction is decoupled from TUI history. Past
-//! `MAX_OUTPUT_BYTES` the head is settled as a finished block and the tail
+//! `DEFAULT_OUTPUT_CAP` the head is settled as a finished block and the tail
 //! continues in a new in-flight block (contiguous ids, byte-seamless text);
 //! ordinary command-output capture keeps truncating.
 
 use super::style::StyledLine;
-use super::{Block, BlockId, BlockTracker, StyledOutput, MAX_OUTPUT_BYTES};
+use super::{Block, BlockId, BlockTracker, StyledOutput};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -161,7 +161,16 @@ impl BlockTracker {
             self.blocks.push(block.clone());
             self.unpersisted.push(block);
         }
-        self.output.replace(&tail, MAX_OUTPUT_BYTES);
+        // PLAN_v11217 §3.5: originally classified B ("chunk granularity,
+        // not retention" — the 1MiB chunking loop upstream keeps tail ≤ 1MiB,
+        // so this bound never binds), but the round-7 upgrade of the
+        // freeze.rs fallback (:412) to cap-aware means the tail handed here
+        // can be up to the CONFIGURED cap (fallback truncates at the cap).
+        // With the old constant this site would then re-truncate that legit
+        // tail back to 1 MiB — the same P0 shape as the style.rs replace
+        // paths. Reads the configured field per the review's own linkage
+        // note ("freeze 若升 A 此处须联动重审").
+        self.output.replace(&tail, self.output_cap);
         self.output.drain_screen_prefix(consumed_prefix);
         self.styled_output = tail_styled.map(Arc::new);
         self.live_output_version = self.live_output_version.wrapping_add(1);
@@ -171,7 +180,7 @@ impl BlockTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::CapturedStyle;
+    use crate::blocks::{CapturedStyle, DEFAULT_OUTPUT_CAP};
     use crate::grid::CellColor;
 
     fn styled_line(line: u32, color: CellColor) -> StyledLine {
@@ -326,7 +335,9 @@ mod tests {
         let mut tracker = tracker_with_session("omp");
         tracker.append_screen_prefix("line one", None);
         tracker.append_screen_prefix("line two", None);
-        tracker.output.replace("viewport", MAX_OUTPUT_BYTES);
+        tracker
+            .output
+            .replace("viewport", crate::blocks::DEFAULT_OUTPUT_CAP);
 
         tracker.split_screen_history(
             vec![("line one\n".to_string(), None)],
@@ -373,17 +384,21 @@ mod tests {
     #[test]
     fn split_does_not_affect_ordinary_capture_truncation() {
         // The print-path truncation semantics are untouched: a non-screen
-        // capture still truncates at MAX_OUTPUT_BYTES with the marker.
+        // capture still truncates at DEFAULT_OUTPUT_CAP with the marker.
         let mut tracker = BlockTracker::new();
         tracker.on_prompt_start();
         tracker.on_command_start("cat huge".to_string());
-        for _ in 0..(MAX_OUTPUT_BYTES + 1024) {
+        for _ in 0..(DEFAULT_OUTPUT_CAP + 1024) {
             tracker.on_print('a', CapturedStyle::default());
         }
         tracker.on_command_end(0);
         let block = tracker.blocks().last().unwrap();
-        assert!(block.output.contains("output truncated"));
-        assert!(block.output.len() <= MAX_OUTPUT_BYTES + 64);
+        assert!(block.output.contains("block excerpt truncated at 1 MiB"));
+        assert!(
+            block.output.contains("full output remains in scrollback"),
+            "marker must clarify the data is not lost"
+        );
+        assert!(block.output.len() <= DEFAULT_OUTPUT_CAP + 96);
     }
 
     #[test]
@@ -404,7 +419,7 @@ mod tests {
     }
 
     /// The full chunking loop (as driven by the Terminal's split path):
-    /// composed text past MAX_OUTPUT_BYTES peels 1MiB heads at line
+    /// composed text past DEFAULT_OUTPUT_CAP peels 1MiB heads at line
     /// boundaries; head + tail concatenates back to the original (seamless).
     #[test]
     fn chunking_is_byte_seamless_and_bounded() {
@@ -415,17 +430,17 @@ mod tests {
             }
             composed.push_str(&format!("line {index:05} {}", "x".repeat(180)));
         }
-        assert!(composed.len() > MAX_OUTPUT_BYTES * 3);
+        assert!(composed.len() > DEFAULT_OUTPUT_CAP * 3);
 
         let mut heads = Vec::new();
         let mut rest = composed.clone();
-        while rest.len() > MAX_OUTPUT_BYTES {
-            let boundary = line_boundary_at_or_before(&rest, MAX_OUTPUT_BYTES);
+        while rest.len() > DEFAULT_OUTPUT_CAP {
+            let boundary = line_boundary_at_or_before(&rest, DEFAULT_OUTPUT_CAP);
             assert!(boundary > 0, "chunking must always make progress");
             heads.push(rest[..boundary].to_string());
             rest = rest[boundary..].to_string();
         }
-        assert!(rest.len() <= MAX_OUTPUT_BYTES);
+        assert!(rest.len() <= DEFAULT_OUTPUT_CAP);
         let reassembled = heads
             .iter()
             .map(String::as_str)
@@ -433,6 +448,6 @@ mod tests {
             .join("")
             + &rest;
         assert_eq!(reassembled, composed, "chunking must be byte-seamless");
-        assert!(heads.iter().all(|head| head.len() <= MAX_OUTPUT_BYTES));
+        assert!(heads.iter().all(|head| head.len() <= DEFAULT_OUTPUT_CAP));
     }
 }

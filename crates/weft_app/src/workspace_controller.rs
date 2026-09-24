@@ -320,8 +320,13 @@ impl App {
             self.sessions
                 .open_tab(rows, cols, scrollback, &self.proxy, root_cwd.as_deref());
         // v1.11.2 X4: propagate the block retention cap to the restored tab.
+        // PLAN_v11217 §3.5 (T4): the configured output cap rides the same walk.
         if let Some(tab) = self.sessions.tab_mut(tab_idx) {
             crate::config_controller::apply_blocks_retained_limit(tab, blocks_limit);
+            crate::config_controller::apply_blocks_output_cap(
+                tab,
+                self.config_state.config.blocks.output_cap_mib,
+            );
             // v1.11.7 (P2-3): inject the user's TUI render tier.
             crate::config_controller::apply_tui_render_mode(
                 tab,
@@ -390,6 +395,9 @@ impl App {
                     let mut new_pane = Pane::spawn(rows, cols, scrollback, &proxy, Some(cwd));
                     // v1.11.2 X4: retention cap on workspace-restored splits.
                     new_pane.set_blocks_retained_limit(blocks_limit);
+                    new_pane.set_blocks_output_cap(crate::config_controller::output_cap_bytes(
+                        self.config_state.config.blocks.output_cap_mib,
+                    ));
                     // v1.11.7 (P2-3): TUI render tier on restored splits.
                     new_pane
                         .set_tui_render_mode(self.config_state.config.experimental.tui_render_mode);

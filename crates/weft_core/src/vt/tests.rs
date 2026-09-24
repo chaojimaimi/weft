@@ -1,5 +1,5 @@
 use super::*;
-use crate::blocks::ShellPhase;
+use crate::blocks::{ShellPhase, DEFAULT_OUTPUT_CAP};
 use crate::grid::{CellColor, UnderlineStyle};
 use std::time::{Duration, Instant};
 
@@ -716,6 +716,7 @@ fn primary_screen_ownership_follows_rows_into_scrollback() {
                 .viewport
                 .as_deref()
                 .unwrap(),
+            DEFAULT_OUTPUT_CAP,
         )
         .0;
     assert!(!snapshot.contains("old shell"));
@@ -3448,7 +3449,7 @@ fn osc8_link_at_block_capture_resolves_url() {
     };
     let (_text, styled, _): (String, StyledOutput, Option<usize>) = t
         .grid()
-        .document_snapshot_from_position_with_resolver(0, url_resolver);
+        .document_snapshot_from_position_with_resolver(0, url_resolver, DEFAULT_OUTPUT_CAP);
     // The first line should have a LinkSpan covering "link" (chars 0-4).
     let line0 = styled.line(0);
     assert!(line0.is_some(), "line 0 should exist in snapshot");
@@ -4455,7 +4456,7 @@ fn snapshot_roundtrip_preserves_wavy_style_and_underline_color() {
     t.process(b"\x1b[4:3m\x1b[58:2:200:100:50mwave");
     let (_text, styled, _): (String, StyledOutput, Option<usize>) = t
         .grid()
-        .document_snapshot_from_position_with_resolver(0, |_| None);
+        .document_snapshot_from_position_with_resolver(0, |_| None, DEFAULT_OUTPUT_CAP);
     let line = styled.line(0).expect("line 0 in snapshot");
     assert_eq!(line.underline_style_at(0), UnderlineStyle::Wavy);
     assert_eq!(line.underline_style_at(3), UnderlineStyle::Wavy);

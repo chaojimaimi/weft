@@ -292,16 +292,15 @@ pub(super) fn write_paste_section(
     write_paste_keys(doc, paste, &default, skipped);
 }
 
-/// v1.11.2 X4 (PLAN_v1112 §1.2): write the `[blocks]` section (retention
-/// cap). Mirrors [`write_paste_section`]: only non-default values are
-/// persisted; an all-default config leaves the file untouched.
+/// v1.11.2 X4 (PLAN_v1112 §1.2): write the `[blocks]` section (retention cap;
+/// PLAN_v11217 §3.5 adds output_cap_mib). Only non-default values persist.
 pub(super) fn write_blocks_section(
     doc: &mut toml_edit::DocumentMut,
     blocks: &super::BlocksConfig,
     skipped: &mut Vec<&'static str>,
 ) {
     let default = super::BlocksConfig::default();
-    let dirty = blocks.retained_limit != default.retained_limit;
+    let dirty = blocks != &default;
     if !dirty && !doc.contains_key("blocks") {
         return;
     }
@@ -317,11 +316,17 @@ pub(super) fn write_blocks_section(
         skipped.push("blocks");
         return;
     };
-    if blocks.retained_limit != default.retained_limit {
-        blocks_entry["retained_limit"] =
-            toml_edit::value(i64::try_from(blocks.retained_limit).unwrap_or(0));
-    } else if blocks_entry.contains_key("retained_limit") {
-        blocks_entry.remove("retained_limit");
+    // PLAN_v11217 §3.5 (T4): output_cap_mib joins the non-default-only write.
+    let (b, d) = (blocks, &default);
+    for (key, value, default_value) in [
+        ("retained_limit", b.retained_limit, d.retained_limit),
+        ("output_cap_mib", b.output_cap_mib, d.output_cap_mib),
+    ] {
+        if value != default_value {
+            blocks_entry[key] = toml_edit::value(i64::try_from(value).unwrap_or(0));
+        } else if blocks_entry.contains_key(key) {
+            blocks_entry.remove(key);
+        }
     }
 }
 

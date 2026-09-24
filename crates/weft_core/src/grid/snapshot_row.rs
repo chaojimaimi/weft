@@ -3,10 +3,9 @@
 //! budget — `styled_row` is a pure Row → (text + spans) transform.
 
 use super::url_to_string;
-use super::{MAX_SNAPSHOT_LINK_SPANS, SNAPSHOT_TEXT_BUDGET};
+use super::MAX_SNAPSHOT_LINK_SPANS;
 use crate::blocks::{
-    encode_underline_style, AttributeSpan, ColorSpan, ForegroundSpan, LinkSpan,
-    ANSI_ATTRIBUTE_MASK, MAX_OUTPUT_BYTES,
+    encode_underline_style, AttributeSpan, ColorSpan, ForegroundSpan, LinkSpan, ANSI_ATTRIBUTE_MASK,
 };
 use crate::grid::snapshot_line_map::snapshot_row_extent;
 use crate::grid::{CellFlags, Row};
@@ -27,8 +26,11 @@ pub(crate) struct SnapshotRow {
     pub(crate) style_overflow: bool,
 }
 
-pub(crate) fn push_snapshot_text(text: &mut String, source: &str) -> bool {
-    let remaining = SNAPSHOT_TEXT_BUDGET.saturating_sub(text.len());
+/// PLAN_v11217 §3.5 (T4): the budget is a per-call argument derived from the
+/// tracker's configured cap (`snapshot_text_budget(cap)`) — the former global
+/// `SNAPSHOT_TEXT_BUDGET` constant is gone (C-class derived quantity).
+pub(crate) fn push_snapshot_text(text: &mut String, source: &str, budget: usize) -> bool {
+    let remaining = budget.saturating_sub(text.len());
     if source.len() <= remaining {
         text.push_str(source);
         return true;
@@ -41,8 +43,10 @@ pub(crate) fn push_snapshot_text(text: &mut String, source: &str) -> bool {
     false
 }
 
-pub(crate) fn mark_snapshot_truncated(text: &mut String) {
-    if text.len() <= MAX_OUTPUT_BYTES {
+/// PLAN_v11217 §3.5 (T4, round-7 reclassification B→C): the marker threshold
+/// derives from the configured cap passed per call, not a global constant.
+pub(crate) fn mark_snapshot_truncated(text: &mut String, text_cap: usize) {
+    if text.len() <= text_cap {
         text.push(' ');
     }
 }

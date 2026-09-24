@@ -45,7 +45,7 @@
 //! | D4 | wide-char cell layout: grid +2 cols, capture +1 char; grid wraps whole glyphs at line end, capture never wraps | 预期等价 after canonical form | none needed if equal | EQUAL (s08) |
 //! | D5 | orphan combining scalar: grid drops (no base cell), capture keeps | 设计内 (directional) | capture keeps the mark the grid drops | EXPECTED DIFFERENCE (s09) |
 //! | D6 | hyperlink / SGR styles | no text channel on capture | pure-text comparison rules them out | (no text scenario — styles never change text) |
-//! | D7 | 1 MiB budget: capture appends `\n…(output truncated, >1 MiB)`, snapshot appends a single space + drops styles | 设计内 | budget overflow is catalog-specific | EXPECTED DIFFERENCE (s10) |
+//! | D7 | 1 MiB budget: capture appends `\n…(block excerpt truncated at 1 MiB — full output remains in scrollback)`, snapshot appends a single space + drops styles | 设计内 | budget overflow is catalog-specific | EXPECTED DIFFERENCE (s10) |
 //! | D8 | absolute addressing / edit ops (CUP `H`/`f`, ICH/DCH/IL/DL/SU/SD `@ P L M S T`) have no capture mirror | 设计内 | screen-owned channel exists for exactly this | EXPECTED DIFFERENCE (s12) |
 //! | D9 | vertical moves (CUU/CUD) mirror onto the capture WITHOUT writing the rows they cross, so the capture folds physical blank rows the snapshot keeps | 设计内/待裁 (Phase 1: either the capture materializes folded rows, or the snapshot walk folds empty rows for plain commands) | the D2 canonical normalization does NOT absorb internal empties | EXPECTED DIFFERENCE (s14) |
 //! | D4b | wide-glyph overwrite: a glyph landing on a pair's lead blanks the orphaned spacer in the grid while the capture keeps the overwritten char | 设计内 (D4 cell-model subclass) | no capture channel for pair cleanup | fuzz-verified (fuzz_lite predicate ⑧, seed 11916113683178599450) |
@@ -59,15 +59,19 @@
 use weft_core::grid::{CellFlags, Row};
 use weft_core::vt::Terminal;
 
-/// Capture-side truncation marker appended by `OutputCapture::take_styled`.
-const TRUNCATION_MARKER: &str = "\n…(output truncated, >1 MiB)";
+/// Capture-side truncation marker appended by `OutputCapture::take_styled`
+/// (PLAN_v11217 §3.5 T4 copy: names the configured cap and clarifies the full
+/// output remains in scrollback — this constant pins the DEFAULT-cap form).
+const TRUNCATION_MARKER: &str =
+    "\n…(block excerpt truncated at 1 MiB — full output remains in scrollback)";
 
-/// 1 MiB capture budget — mirrors `blocks::MAX_OUTPUT_BYTES` (pub(crate),
+/// 1 MiB capture budget — mirrors `blocks::DEFAULT_OUTPUT_CAP` (pub(crate),
 /// hence the local copy). MUST stay equal to `CAPTURE_BUDGET` in
 /// `tests/fuzz_lite.rs`; the s10 scenario below pins the truncated capture
 /// to EXACTLY `CAPTURE_BUDGET + TRUNCATION_MARKER.len()` bytes, so drift
-/// breaks that assertion loudly.
-const CAPTURE_BUDGET: usize = 1024 * 1024;
+/// breaks that assertion loudly. Aliased to the production constant (T4
+/// review P3: a hardcoded mirror could drift from a raised configured cap).
+use weft_core::blocks::DEFAULT_OUTPUT_CAP as CAPTURE_BUDGET;
 
 // ── Normalization (line-domain canonical form) ─────────────────────────
 
@@ -329,7 +333,7 @@ fn scenarios() -> Vec<Scenario> {
             rows: 24,
             cols: 80,
             scrollback: 200,
-            // > 1 MiB of printable bytes: the capture stops at MAX_OUTPUT_BYTES
+            // > 1 MiB of printable bytes: the capture stops at DEFAULT_OUTPUT_CAP
             // and appends the marker; the snapshot walks the retained grid
             // tail. Only the marker's presence is pinned (plan: 缩小验证点).
             output: "x".repeat(1_100_000),
@@ -471,7 +475,7 @@ fn run_scenario(scenario: &Scenario) {
                 "{label}: capture must carry the truncation marker"
             );
             // P2-2 anti-drift pin: the capture stops at exactly
-            // MAX_OUTPUT_BYTES of content and appends exactly the marker.
+            // DEFAULT_OUTPUT_CAP of content and appends exactly the marker.
             assert_eq!(
                 capture_text.len(),
                 CAPTURE_BUDGET + TRUNCATION_MARKER.len(),
@@ -580,7 +584,7 @@ fn line_domain_walk_matches_facade_text_on_a_wrapped_document() {
 
     let (facade_text, _, _) = terminal
         .grid()
-        .document_snapshot_from_position_with_resolver(anchor, |_| None);
+        .document_snapshot_from_position_with_resolver(anchor, |_| None, CAPTURE_BUDGET);
     let facade_physical = normalize(facade_text.split('\n').map(str::to_string).collect());
     let walked = snapshot_logical_lines(&terminal, anchor);
     assert!(

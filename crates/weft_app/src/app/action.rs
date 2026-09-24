@@ -192,6 +192,10 @@ impl crate::App {
                             pane.set_blocks_retained_limit(
                                 self.config_state.config.blocks.retained_limit,
                             );
+                            // PLAN_v11217 §3.5 (T4): output cap on split panes.
+                            pane.set_blocks_output_cap(crate::config_controller::output_cap_bytes(
+                                self.config_state.config.blocks.output_cap_mib,
+                            ));
                             // v1.11.7 (P2-3): TUI render tier on split panes.
                             pane.set_tui_render_mode(
                                 self.config_state.config.experimental.tui_render_mode,

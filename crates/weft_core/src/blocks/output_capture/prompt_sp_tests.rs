@@ -142,5 +142,10 @@ fn truncation_marker_appended_after_strip() {
     // remainder trips `truncated` — the PROMPT_SP shape at the cap.
     output.print_ascii(&[b' '; 99], CapturedStyle::default(), 10);
     let (text, _styled) = output.take_styled();
-    assert_eq!(text, "data\n…(output truncated, >1 MiB)");
+    // PLAN_v11217 §3.5 (T4): the marker reports the recorded cap metadata and
+    // clarifies the full output remains in scrollback.
+    assert_eq!(
+        text,
+        "data\n…(block excerpt truncated at 1 MiB — full output remains in scrollback)"
+    );
 }

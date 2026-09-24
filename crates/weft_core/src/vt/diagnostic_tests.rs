@@ -23,11 +23,12 @@
 //! continuation chunk.
 
 use super::*;
-use crate::blocks::MAX_OUTPUT_BYTES;
+use crate::blocks::DEFAULT_OUTPUT_CAP;
 use crate::grid::terminal_text_width;
 
-/// Grid snapshot text budget (`grid::snapshot::SNAPSHOT_TEXT_BUDGET`).
-const SNAPSHOT_BUDGET: usize = MAX_OUTPUT_BYTES + 4;
+/// Grid snapshot text budget — PLAN_v11217 §3.5 (T4): derived from the
+/// configured cap via `snapshot_text_budget` (the global constant is gone).
+const SNAPSHOT_BUDGET: usize = crate::grid::snapshot::snapshot_text_budget(DEFAULT_OUTPUT_CAP);
 
 fn line_a(n: usize) -> String {
     format!("line {n:05} the quick brown fox")
@@ -75,7 +76,11 @@ fn observe(terminal: &Terminal, tag: &str, printed: usize) {
         .position()
         .saturating_sub(scrollback.len() as u64);
     let clamped_start = doc_start.map_or(0, |d| scrollback.index_since(d));
-    let raw = doc_start.map_or_else(String::new, |d| terminal.grid().document_text_from(d));
+    let raw = doc_start.map_or_else(String::new, |d| {
+        terminal
+            .grid()
+            .document_text_from(d, crate::blocks::DEFAULT_OUTPUT_CAP)
+    });
     let first_line = raw.lines().next().unwrap_or("").to_string();
     let last_line = raw.lines().last().unwrap_or("").to_string();
     let in_flight = terminal.block_tracker().in_flight();
@@ -272,7 +277,7 @@ fn split_then_second_refresh_keeps_cross_block_concatenation_byte_exact() {
     activate_primary_screen_tui(&mut terminal);
     // 5,300 lines x 200 B: 5,276 rows pushed out of the 24-row viewport into
     // the scroll-out prefix (~1,060,475 B) — the prefix ALONE exceeds
-    // MAX_OUTPUT_BYTES, so the first refresh must split it (history empty,
+    // DEFAULT_OUTPUT_CAP, so the first refresh must split it (history empty,
     // prefix non-empty).
     stream_lines(&mut terminal, 1, 5_300, line_b);
     assert!(terminal.refresh_primary_history_snapshot_now());
@@ -357,7 +362,7 @@ fn split_tail_styled_line_count_matches_text_line_count() {
 fn giant_viewport_segment_truncates_instead_of_growing_across_refreshes() {
     // 3,000 rows x 360 cols: the viewport holds the whole session, so no
     // scroll-out prefix exists — the composed text IS the segment, and it
-    // exceeds MAX_OUTPUT_BYTES (~1.08 MB).
+    // exceeds DEFAULT_OUTPUT_CAP (~1.08 MB).
     let mut terminal = Terminal::new(3_000, 360);
     activate_primary_screen_tui(&mut terminal);
     let mut buf = String::with_capacity(3_000 * 370);
@@ -379,12 +384,12 @@ fn giant_viewport_segment_truncates_instead_of_growing_across_refreshes() {
         .in_flight()
         .expect("in-flight tail");
     assert!(
-        tail.output.len() <= MAX_OUTPUT_BYTES,
+        tail.output.len() <= DEFAULT_OUTPUT_CAP,
         "giant segment must be truncated at the 1MiB budget in the in-flight tail, got {} bytes",
         tail.output.len()
     );
     assert!(
-        first.len() <= MAX_OUTPUT_BYTES + 4096,
+        first.len() <= DEFAULT_OUTPUT_CAP + 4096,
         "concatenation must stay near the 1MiB budget (chunkable prefix parts only), got {} bytes",
         first.len()
     );

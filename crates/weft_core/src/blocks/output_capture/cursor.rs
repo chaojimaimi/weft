@@ -123,16 +123,16 @@ impl OutputCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::MAX_OUTPUT_BYTES;
+    use crate::blocks::DEFAULT_OUTPUT_CAP;
 
     /// `set_cursor_column` past the end of the line pads with spaces so a
     /// subsequent print lands at the requested column.
     #[test]
     fn set_cursor_column_pads_to_column_with_spaces() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.set_cursor_column(6, MAX_OUTPUT_BYTES);
-        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"abc", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.set_cursor_column(6, DEFAULT_OUTPUT_CAP);
+        output.print('X', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "abc   X");
     }
 
@@ -142,9 +142,9 @@ mod tests {
     #[test]
     fn set_cursor_column_into_wide_char_emits_space_and_overwrites() {
         let mut output = OutputCapture::default();
-        output.print('你', CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.set_cursor_column(1, MAX_OUTPUT_BYTES);
-        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print('你', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.set_cursor_column(1, DEFAULT_OUTPUT_CAP);
+        output.print('X', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), " X");
     }
 
@@ -153,15 +153,15 @@ mod tests {
     #[test]
     fn backspace_stops_at_line_start() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"def", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"abc", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"def", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         // Three backspaces reach line start (column 0 of "def"); a fourth
         // is a no-op.
         for _ in 0..4 {
             output.backspace();
         }
-        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print('X', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "abc\nXef");
     }
 
@@ -170,10 +170,10 @@ mod tests {
     #[test]
     fn backspace_across_multibyte_char() {
         let mut output = OutputCapture::default();
-        output.print('你', CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.print('好', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print('你', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.print('好', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.backspace();
-        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print('X', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "你X");
     }
 
@@ -182,9 +182,9 @@ mod tests {
     #[test]
     fn move_cursor_columns_negative_saturates_to_zero() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"abc", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.move_cursor_columns(-100, MAX_OUTPUT_BYTES);
-        output.print('X', CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"abc", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.move_cursor_columns(-100, DEFAULT_OUTPUT_CAP);
+        output.print('X', CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "Xbc");
     }
 
@@ -193,15 +193,15 @@ mod tests {
     #[test]
     fn move_cursor_rows_up_overwrites_target_row() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line3", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line3", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         // cursor at end of "line3". Move up 2 rows → "line1" row start.
         output.move_cursor_rows(-2);
         output.carriage_return();
-        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"LINE1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "LINE1\nline2\nline3");
     }
 
@@ -210,13 +210,13 @@ mod tests {
     #[test]
     fn move_cursor_rows_down_returns_to_original_row() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.move_cursor_rows(-1);
         output.move_cursor_rows(1);
         output.carriage_return();
-        output.print_ascii(b"LINE2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"LINE2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "line1\nLINE2");
     }
 
@@ -225,12 +225,12 @@ mod tests {
     #[test]
     fn move_cursor_rows_up_saturates_at_first_row() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.move_cursor_rows(-100);
         output.carriage_return();
-        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"LINE1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "LINE1\nline2");
     }
 
@@ -239,11 +239,11 @@ mod tests {
     #[test]
     fn move_cursor_rows_down_saturates_at_last_row() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.move_cursor_rows(100);
-        output.print_ascii(b" appended", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b" appended", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "line1\nline2 appended");
     }
 
@@ -255,28 +255,28 @@ mod tests {
     fn move_cursor_rows_multiline_progress_repaint() {
         let mut output = OutputCapture::default();
         // Initial paint: 3 rows, each followed by \n.
-        output.print_ascii(b"a:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"b:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"c:   0%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
+        output.print_ascii(b"a:   0%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"b:   0%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"c:   0%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
         // 3 newlines leave cursor on an empty row 4. Move up 3 rows to
         // land on row 1 ("a:   0%").
         output.move_cursor_rows(-3);
         // Repaint row 1 (new content shorter → erase_line clears tail)
         output.carriage_return();
-        output.print_ascii(b"a: 50%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"a: 50%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.erase_line(0);
-        output.newline(MAX_OUTPUT_BYTES);
+        output.newline(DEFAULT_OUTPUT_CAP);
         // Repaint row 2
         output.carriage_return();
-        output.print_ascii(b"b: 30%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"b: 30%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.erase_line(0);
-        output.newline(MAX_OUTPUT_BYTES);
+        output.newline(DEFAULT_OUTPUT_CAP);
         // Repaint row 3
         output.carriage_return();
-        output.print_ascii(b"c: 10%", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"c: 10%", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.erase_line(0);
 
         assert_eq!(
@@ -302,16 +302,16 @@ mod tests {
     #[test]
     fn move_cursor_rows_from_mid_row_uses_line_start() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"line1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
-        output.newline(MAX_OUTPUT_BYTES);
-        output.print_ascii(b"line2", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"line1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
+        output.newline(DEFAULT_OUTPUT_CAP);
+        output.print_ascii(b"line2", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         // cursor in the middle of "line2" (byte 7, after "li")
         output.cursor = 8;
         output.char_cursor = 9;
         // move up 1 row → "line1" row start (byte 0)
         output.move_cursor_rows(-1);
         output.carriage_return();
-        output.print_ascii(b"LINE1", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"LINE1", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         assert_eq!(output.as_str(), "LINE1\nline2");
     }
 
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn watermark_backspace_and_row_moves_follow_the_cursor() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"one\ntwo", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"one\ntwo", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.take_min_write_offset();
         // Tail line "two" starts at byte 4; cursor 7.
         output.backspace();
@@ -347,10 +347,10 @@ mod tests {
     #[test]
     fn watermark_horizontal_moves_never_record() {
         let mut output = OutputCapture::default();
-        output.print_ascii(b"one\ntwo", CapturedStyle::default(), MAX_OUTPUT_BYTES);
+        output.print_ascii(b"one\ntwo", CapturedStyle::default(), DEFAULT_OUTPUT_CAP);
         output.take_min_write_offset();
-        output.set_cursor_column(1, MAX_OUTPUT_BYTES);
-        output.move_cursor_columns(-2, MAX_OUTPUT_BYTES);
+        output.set_cursor_column(1, DEFAULT_OUTPUT_CAP);
+        output.move_cursor_columns(-2, DEFAULT_OUTPUT_CAP);
         assert_eq!(
             output.min_write_offset_value(),
             usize::MAX,

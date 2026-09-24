@@ -999,7 +999,7 @@ fn scan_window_mechanisms(bytes: &[u8]) -> WindowMechanisms {
 /// OSC 133 marker introducer.
 const MARKER_HEAD: &[u8] = b"\x1b]133;";
 
-/// 1 MiB capture budget — mirrors `blocks::MAX_OUTPUT_BYTES` (pub(crate),
+/// 1 MiB capture budget — mirrors `blocks::DEFAULT_OUTPUT_CAP` (pub(crate),
 /// hence the local copy). MUST stay equal to `CAPTURE_BUDGET` in
 /// `tests/capture_snapshot_equivalence.rs`; the s10 scenario there pins the
 /// exact truncated length against it, so drift breaks that test loudly.

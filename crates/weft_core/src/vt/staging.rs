@@ -28,9 +28,18 @@
 //! are untouched by this module — staging mirrors bytes, never intercepts.
 
 use super::Terminal;
-use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase, MAX_OUTPUT_BYTES};
+use crate::blocks::{CapturedStyle, OutputCapture, ShellPhase};
 
 impl Terminal {
+    /// PLAN_v11217 §3.5 (T4): configure this terminal's retained-output cap
+    /// (`[blocks] output_cap_mib`). Lives beside the staging capture sinks
+    /// (this module's impl block) to keep vt/mod.rs at its architecture
+    /// ceiling; `cap_bytes` is in BYTES, clamped 1..=64 MiB inside the
+    /// tracker (review P2a double clamp).
+    pub fn set_block_output_cap(&mut self, cap_bytes: usize) {
+        self.block_tracker_mut().set_output_cap(cap_bytes);
+    }
+
     /// Whether pre-`133;B` bytes should divert into the staging buffer:
     /// an editor-submitted command still awaiting preexec, integrated phase
     /// AtPrompt, primary screen.
@@ -53,19 +62,24 @@ impl Terminal {
 
     /// Sink for `Perform::print`: in-flight block capture while the phase
     /// predicate of the original call site holds, staging otherwise.
+    /// PLAN_v11217 §3.5 (T4, review P2b): the staging buffer bounds RETAINED
+    /// text — the orphan `133;D` path swaps it in as a finished block's
+    /// output — so its cap reads the tracker's configured field.
     pub(super) fn capture_print(&mut self, c: char, style: CapturedStyle) {
         let capturing = !self.capabilities.alt_active
             && self.block_tracker.phase() == ShellPhase::CommandExecuting;
         if capturing {
             self.block_tracker.on_print(c, style);
         } else if self.staging_active() {
-            self.preexec_staging.print(c, style, MAX_OUTPUT_BYTES);
+            self.preexec_staging
+                .print(c, style, self.block_tracker.output_cap());
         }
     }
 
     /// Sink for the printable-ASCII fast path in `Terminal::process`.
     /// Mirrors that site's phase-only predicate (screen-owned sessions no-op
-    /// inside the tracker exactly as before).
+    /// inside the tracker exactly as before). Cap reads the tracker field
+    /// (same retention semantics as `capture_print`).
     pub(super) fn capture_print_ascii_run(&mut self, bytes: &[u8], style: CapturedStyle) {
         let capturing = !self.capabilities.alt_active
             && self.block_tracker.phase() == ShellPhase::CommandExecuting;
@@ -73,7 +87,7 @@ impl Terminal {
             self.block_tracker.on_print_ascii_run(bytes, style);
         } else if self.staging_active() {
             self.preexec_staging
-                .print_ascii(bytes, style, MAX_OUTPUT_BYTES);
+                .print_ascii(bytes, style, self.block_tracker.output_cap());
         }
     }
 
@@ -82,7 +96,8 @@ impl Terminal {
         if !self.capabilities.alt_active && self.block_tracker.is_capturing() {
             self.block_tracker.on_newline();
         } else if self.staging_active() {
-            self.preexec_staging.newline(MAX_OUTPUT_BYTES);
+            self.preexec_staging
+                .newline(self.block_tracker.output_cap());
         }
     }
 

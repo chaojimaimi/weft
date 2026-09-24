@@ -11,14 +11,17 @@
 //! drifts on every blank row.
 //!
 //! The rules stay single-sourced with the builder, not copied:
-//! - [`super::snapshot::SNAPSHOT_TEXT_BUDGET`] — the text-budget abort bound
+//! - `super::snapshot::snapshot_text_budget(cap)` — the text-budget abort
+//!   bound, derived from the caller's configured block-output cap
+//!   (PLAN_v11217 §3.5, T4 C-class: the cap argument flows from
+//!   `BlockTracker::output_cap` at every call site)
 //! - [`snapshot_row_extent`] — which cells count as text (the builder's
 //!   `styled_row` imports this helper, so both walks share the rule)
 //! - the regression tests below cross-check the mapping against the real
 //!   builder output (`document_snapshot_from_position_with_resolver` /
 //!   `_with_ownership_masks`), so any drift between the two walks fails.
 
-use super::snapshot::SNAPSHOT_TEXT_BUDGET;
+use super::snapshot::snapshot_text_budget;
 use super::{CellFlags, Grid, Row};
 
 /// Shared cell-extent rule: last non-blank cell of a row's snapshot text
@@ -62,6 +65,7 @@ impl Grid {
         viewport_start: usize,
         scrollback_owned: Option<&[bool]>,
         viewport_owned: Option<&[bool]>,
+        text_cap: usize,
     ) -> Option<usize> {
         if viewport_row >= self.num_rows {
             return None;
@@ -71,6 +75,8 @@ impl Grid {
         }) {
             return None;
         }
+        // PLAN_v11217 §3.5 (T4): same derived budget as the snapshot builder.
+        let text_budget = snapshot_text_budget(text_cap);
         let mut state = SnapshotWalkState::default();
         // Scrollback rows precede the viewport in document order.
         // T3 (D5-2): rows contribute their snapshot text length straight from
@@ -85,9 +91,7 @@ impl Grid {
             };
             // A non-empty row that overflows the text budget aborts the
             // snapshot; nothing after it exists in the document.
-            if walk_snapshot_len(&mut state, row_len).is_some()
-                && state.text_len > SNAPSHOT_TEXT_BUDGET
-            {
+            if walk_snapshot_len(&mut state, row_len).is_some() && state.text_len > text_budget {
                 return None;
             }
         }
@@ -105,7 +109,7 @@ impl Grid {
                 // its (truncated) line still exists in the snapshot text.
                 return line;
             }
-            if state.text_len > SNAPSHOT_TEXT_BUDGET {
+            if state.text_len > text_budget {
                 return None;
             }
         }
@@ -183,7 +187,7 @@ fn snapshot_row_text_len(row: &Row, num_cols: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blocks::MAX_OUTPUT_BYTES;
+    use crate::blocks::DEFAULT_OUTPUT_CAP;
 
     fn row(text: &str, cols: usize) -> Row {
         let mut row = Row::new(cols);
@@ -207,8 +211,11 @@ mod tests {
         grid.viewport[3] = row("gamma", 40);
         let document_start = grid.scrollback.position();
 
-        let (text, _, _) =
-            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        let (text, _, _) = grid.document_snapshot_from_position_with_resolver(
+            document_start,
+            |_| None,
+            DEFAULT_OUTPUT_CAP,
+        );
         assert_eq!(text, "alpha\n\nbeta\ngamma");
 
         let map = |viewport_row| {
@@ -218,6 +225,7 @@ mod tests {
                 0,
                 None,
                 None,
+                DEFAULT_OUTPUT_CAP,
             )
         };
         assert_eq!(map(0), Some(0));
@@ -237,25 +245,25 @@ mod tests {
         grid.viewport[2] = row("only", 40);
 
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(1, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(1, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(2, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(2, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             Some(0),
             "leading empties never shift the first line"
         );
         // viewport_start=2: rows 0-1 are outside the document walk.
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(1, 0, 2, None, None),
+            grid.snapshot_line_index_for_viewport_row(1, 0, 2, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(2, 0, 2, None, None),
+            grid.snapshot_line_index_for_viewport_row(2, 0, 2, None, None, DEFAULT_OUTPUT_CAP),
             Some(0)
         );
     }
@@ -276,6 +284,7 @@ mod tests {
                 0,
                 &[false, true],
                 &[true, false, true],
+                DEFAULT_OUTPUT_CAP,
             )
             .0;
         assert_eq!(snapshot, "owned page\nowned tail\nowned prompt");
@@ -289,6 +298,7 @@ mod tests {
                 0,
                 Some(&scrollback_owned),
                 Some(&viewport_owned),
+                DEFAULT_OUTPUT_CAP,
             )
         };
         assert_eq!(
@@ -301,7 +311,7 @@ mod tests {
         // Without the masks, the same row maps to its plain walk position
         // (both scrollback rows are counted).
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             Some(2)
         );
     }
@@ -318,8 +328,11 @@ mod tests {
         grid.viewport[2] = row("content", 40);
         let document_start = grid.scrollback.position() - 1; // start at "banner"
 
-        let (text, _, _) =
-            grid.document_snapshot_from_position_with_resolver(document_start, |_| None);
+        let (text, _, _) = grid.document_snapshot_from_position_with_resolver(
+            document_start,
+            |_| None,
+            DEFAULT_OUTPUT_CAP,
+        );
         assert_eq!(text, "banner\nheader\n\ncontent");
 
         let map = |row| {
@@ -329,6 +342,7 @@ mod tests {
                 0,
                 None,
                 None,
+                DEFAULT_OUTPUT_CAP,
             )
         };
         assert_eq!(map(0), Some(1), "banner occupies line 0");
@@ -343,11 +357,11 @@ mod tests {
         grid.viewport[0] = row("a", 24);
         grid.viewport[1] = row("b", 24);
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(4, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(4, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(9, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(9, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
 
@@ -361,18 +375,18 @@ mod tests {
         }
         grid.viewport[0] = row("tail", 1_100);
         grid.viewport[1] = row("more", 1_100);
-        let (text, _) = grid.document_snapshot_from(0);
+        let (text, _) = grid.document_snapshot_from(0, DEFAULT_OUTPUT_CAP);
         assert!(
-            text.len() > MAX_OUTPUT_BYTES,
+            text.len() > DEFAULT_OUTPUT_CAP,
             "budget is actually exhausted"
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(0, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None,
             "viewport rows after the abort don't exist in the snapshot"
         );
         assert_eq!(
-            grid.snapshot_line_index_for_viewport_row(1, 0, 0, None, None),
+            grid.snapshot_line_index_for_viewport_row(1, 0, 0, None, None, DEFAULT_OUTPUT_CAP),
             None
         );
     }

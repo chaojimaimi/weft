@@ -299,6 +299,16 @@ impl Pane {
         }
     }
 
+    /// PLAN_v11217 §3.5 (T4): apply the `[blocks] output_cap_mib` config to
+    /// this pane's terminal. Mirror of `set_blocks_retained_limit` — same
+    /// creation-site chokepoints. `cap_bytes` arrives pre-converted (and
+    /// clamped) from the config_controller helper.
+    pub(crate) fn set_blocks_output_cap(&mut self, cap_bytes: usize) {
+        if let Some(t) = self.terminal.as_mut() {
+            t.set_block_output_cap(cap_bytes);
+        }
+    }
+
     /// v1.11.7 (PLAN_v1117 §三 M1.2, P2-3): inject the user's
     /// `[experimental] tui_render_mode` into this pane's terminal (the
     /// factory default is `noninteractive`; `Terminal::new` itself stays

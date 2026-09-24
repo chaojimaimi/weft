@@ -1,4 +1,5 @@
 use super::*;
+use crate::blocks::DEFAULT_OUTPUT_CAP;
 
 fn row(text: &str, cols: usize) -> Row {
     let mut row = Row::new(cols);
@@ -20,8 +21,11 @@ fn cursor_snapshot_line_tracks_empty_row_between_content() {
     grid.viewport[3] = row("----------------------------------------", 40);
     grid.cursor.row = 2;
 
-    let (text, _styled, cursor_line) =
-        grid.document_snapshot_from_position_with_resolver(grid.scrollback.position(), |_| None);
+    let (text, _styled, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+        grid.scrollback.position(),
+        |_| None,
+        DEFAULT_OUTPUT_CAP,
+    );
     assert_eq!(
         text,
         "startup help\n----------------------------------------\n\n----------------------------------------"
@@ -37,8 +41,11 @@ fn cursor_snapshot_line_tracks_second_of_multiple_middle_empty_rows() {
     grid.viewport[3] = row("lower", 20);
     grid.cursor.row = 2;
 
-    let (text, _, cursor_line) =
-        grid.document_snapshot_from_position_with_resolver(grid.scrollback.position(), |_| None);
+    let (text, _, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+        grid.scrollback.position(),
+        |_| None,
+        DEFAULT_OUTPUT_CAP,
+    );
     assert_eq!(text, "upper\n\n\nlower");
     assert_eq!(cursor_line, Some(2));
 }
@@ -50,8 +57,11 @@ fn cursor_snapshot_line_does_not_point_past_trailing_empty_rows() {
         grid.viewport[0] = row("content", 20);
         grid.cursor.row = cursor_row;
 
-        let (text, _, cursor_line) = grid
-            .document_snapshot_from_position_with_resolver(grid.scrollback.position(), |_| None);
+        let (text, _, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+            grid.scrollback.position(),
+            |_| None,
+            DEFAULT_OUTPUT_CAP,
+        );
         assert_eq!(text, "content");
         assert_eq!(cursor_line, None);
     }
@@ -63,8 +73,11 @@ fn cursor_snapshot_line_does_not_claim_skipped_leading_empty_row() {
     grid.viewport[1] = row("later content", 20);
     grid.cursor.row = 0;
 
-    let (text, _, cursor_line) =
-        grid.document_snapshot_from_position_with_resolver(grid.scrollback.position(), |_| None);
+    let (text, _, cursor_line) = grid.document_snapshot_from_position_with_resolver(
+        grid.scrollback.position(),
+        |_| None,
+        DEFAULT_OUTPUT_CAP,
+    );
     assert_eq!(text, "later content");
     assert_eq!(cursor_line, None);
 }
@@ -83,6 +96,7 @@ fn cursor_snapshot_line_stays_none_when_cursor_or_flush_row_is_unowned() {
             &[],
             &[true, false, true],
             |_| None,
+            DEFAULT_OUTPUT_CAP,
         );
     assert_eq!(cursor_excluded, None);
 
@@ -92,6 +106,7 @@ fn cursor_snapshot_line_stays_none_when_cursor_or_flush_row_is_unowned() {
             &[],
             &[true, true, false],
             |_| None,
+            DEFAULT_OUTPUT_CAP,
         );
     assert_eq!(text, "upper");
     assert_eq!(flush_excluded, None);
