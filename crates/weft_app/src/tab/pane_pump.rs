@@ -22,13 +22,13 @@ use super::Tab;
 use crate::AppMsg;
 use weft_core::pane_layout::PaneId;
 
-/// Split threshold for a single oversized PTY message (matches the PTY read
-/// buffer size). Messages larger than this are split: the head is processed
-/// now, the tail is re-queued ON THE PANE for the next frame — kept ahead of
-/// every later AppMsg (especially PtyExit) so the original PTY byte order
-/// never inverts. T1 hard invariant (§3.2 改动点 4 / R2): FROZEN — the
-/// flood-aware budget must never touch it.
-const MAX_BYTES_PER_MESSAGE: usize = 256 * 1024;
+/// Split threshold for a single oversized PTY message. T8 (PLAN_v11217 §3.4):
+/// single source of truth `weft_core::pty::EVENT_CAP` (the hard cap read_batch
+/// enforces; value unchanged) — a production message can never exceed this,
+/// so the split path stays test-injection-only. Oversize split: the head is
+/// processed now, the tail is re-queued ON THE PANE ahead of every later
+/// AppMsg (esp. PtyExit) — PTY byte order never inverts. T1 (R2): FROZEN.
+const MAX_BYTES_PER_MESSAGE: usize = weft_core::pty::EVENT_CAP;
 /// Time-check granularity: the clock is consulted at most once per this
 /// many bytes so clock reads cannot dominate tiny messages. T1: unchanged.
 const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;

@@ -3,6 +3,7 @@
 //! -> `tab/tests.rs`, `vt/mod.rs` -> `vt/tests.rs`). Declared in
 //! `pty.rs` via `#[cfg(test)] #[path = "pty/tests.rs"] mod tests;`.
 
+use super::read_loop::{read_batch, BatchStop, EVENT_CAP, READ_BATCH_TARGET};
 use super::*;
 
 #[test]
@@ -291,29 +292,6 @@ async fn spawn_unknown_command_child_exits() {
         got_exit,
         "should receive an Exit event for an unknown command"
     );
-}
-
-// ── v1.11.2 X2 (PLAN_v1112 §2): wake-throttle decision table ──────
-
-#[test]
-fn pty_wake_due_throttles_floods_to_sixty_hz() {
-    // Inside the 16 ms window with a non-empty queue: no wake.
-    assert!(!pty_wake_due(false, false, 1_000, 1_008));
-    // At/after the window boundary: wake.
-    assert!(pty_wake_due(false, false, 1_000, 1_016));
-    assert!(pty_wake_due(false, false, 1_000, 2_000));
-}
-
-#[test]
-fn pty_wake_due_wakes_a_caught_up_consumer_immediately() {
-    // An empty queue means the consumer is idle — fresh output must be
-    // pumped without waiting out the 16 ms window.
-    assert!(pty_wake_due(false, true, 1_000, 1_001));
-}
-
-#[test]
-fn pty_wake_due_exit_bypasses_the_throttle() {
-    assert!(pty_wake_due(true, false, 1_000, 1_001));
 }
 
 // Restored verbatim from HEAD (rust-reviewer v1.11.2 Major-1): the
@@ -811,3 +789,9 @@ async fn receiver_drop_sets_mouse_suppressed() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+// T8 tests (read_batch stop conditions, wake table, flood integrity)
+// live in a child module file to stay under the 800-line gate cap;
+// `super::*` from the child reaches everything imported above.
+#[path = "wake_and_batch_tests.rs"]
+mod wake_and_batch_tests;

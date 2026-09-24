@@ -15,7 +15,7 @@ use nix::unistd::{self, Pid};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::input::{new_flag, MouseDisableScanner, MouseSuppressFlag};
+use crate::input::{new_flag, MouseSuppressFlag};
 
 /// PTY-specific errors.
 #[derive(Debug, Error)]
@@ -204,7 +204,7 @@ impl Pty {
                 let read_child_pid = child;
 
                 tokio::spawn(async move {
-                    read_loop(duped, read_child_pid, tx, mouse_suppress, wake).await;
+                    read_loop::read_loop(duped, read_child_pid, tx, mouse_suppress, wake).await;
                 });
 
                 Ok(Self {
@@ -619,226 +619,40 @@ impl WakeThrottle {
     }
 }
 
-/// Pure wake decision (v1.11.2 X2, PLAN_v1112 §2): during an output flood
-/// the UI is nudged at most once per 16 ms (~60 Hz, Warp-precedent), but a
-/// caught-up consumer (empty queue) always wakes immediately so fresh
-/// output is pumped without latency, and Exit always bypasses the throttle
-/// so the UI learns of a dead child instantly.
+/// Backlog-state wake interval (T8, PLAN_v11217 §3.4): 2 ms. The previous
+/// 16 ms (~60 Hz, Warp-precedent) capped cat throughput at 60 Hz × ≤32
+/// channel events × kernel read granularity ≈ 5.8 MB/s — exactly the
+/// measured T0 baseline. A caught-up consumer (empty queue) wakes
+/// immediately regardless (unchanged), and Exit always bypasses the
+/// throttle.
+const FLOOD_WAKE_INTERVAL_MS: u64 = 2;
+
+/// Pure wake decision (v1.11.2 X2, PLAN_v1112 §2; revised by T8
+/// PLAN_v11217 §3.4): during an output backlog the UI is nudged at most
+/// once per `FLOOD_WAKE_INTERVAL_MS`, but a caught-up consumer (empty
+/// queue) always wakes immediately so fresh output is pumped without
+/// latency, and Exit always bypasses the throttle so the UI learns of a
+/// dead child instantly.
+///
+/// Safety of ~500 wakes/s (fourth-round review P3): the guarantee is
+/// SELF-LIMITATION, not "each wake is cheap" — wake generation rate ≤
+/// batch flush rate ≤ kernel data-availability rate, and a full channel
+/// suspends the reader in `send().await` before it can produce another
+/// wake, so there is no feedback amplification.
 fn pty_wake_due(is_exit: bool, consumer_caught_up: bool, last_ms: u64, now_ms: u64) -> bool {
     if is_exit {
         return true;
     }
-    consumer_caught_up || now_ms.saturating_sub(last_ms) >= 16
+    consumer_caught_up || now_ms.saturating_sub(last_ms) >= FLOOD_WAKE_INTERVAL_MS
 }
 
-/// Async read loop: reads from the PTY master fd and sends output events.
-/// Detects child exit via EIO error and sends an Exit event.
-///
-/// v1.11.2 X2 (PLAN_v1112 §2): `tx` is bounded; a full channel suspends this
-/// task on `send().await`, which backpressures into the kernel PTY buffer and
-/// ultimately blocks the child's writes — bytes are never dropped. UI wakes
-/// are throttled to ~60 Hz during floods (`WakeThrottle`); Exit always wakes.
-///
-/// v1.11.15 (FIX A, PLAN_v11115_EXIT_RACE_MOUSE_LEAK §1): every chunk is fed
-/// through a persistent [`MouseDisableScanner`] BEFORE it is queued; the
-/// first mouse-disable DECRST flips `suppress` right here on the reader
-/// thread, closing the parse-latency window in which the UI used to keep
-/// writing hover bytes into a shell that had already left the TUI. The exit
-/// paths (EOF / EIO / EBADF / read error) force-set the flag too, covering a
-/// TUI killed before it could emit its disable sequences.
-async fn read_loop<W: Fn() + Send + 'static>(
-    fd: OwnedFd,
-    child_pid: Pid,
-    tx: mpsc::Sender<PtyEvent>,
-    suppress: MouseSuppressFlag,
-    wake: W,
-) {
-    // Buffer size: 256KB as per architecture doc.
-    const BUF_SIZE: usize = 256 * 1024;
-
-    let mut throttle = WakeThrottle::default();
-    // Persistent across chunks: a sequence split across reads stays inside
-    // the FSM (no carry buffer needed).
-    let mut mouse_scanner = MouseDisableScanner::new();
-
-    let async_fd = match tokio::io::unix::AsyncFd::new(fd) {
-        Ok(fd) => fd,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create async fd for PTY read");
-            let _ = tx
-                .send(PtyEvent::Exit(Err(format!(
-                    "async fd creation failed: {e}"
-                ))))
-                .await;
-            return;
-        }
-    };
-
-    let mut buf = vec![0u8; BUF_SIZE];
-
-    loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(error = %e, "PTY read fd became unreadable");
-                break;
-            }
-        };
-
-        match guard
-            .try_io(|fd| nix::unistd::read(fd.as_raw_fd(), &mut buf).map_err(io::Error::from))
-        {
-            Ok(Ok(0)) => {
-                // EOF — child closed the PTY.
-                tracing::debug!("PTY read returned 0 (EOF)");
-                break;
-            }
-            Ok(Ok(n)) => {
-                let data = buf[..n].to_vec();
-                // v1.11.15 (FIX A): scan before queueing so the flag flips as
-                // early as the bytes exist. A hit here is always followed by
-                // the main-thread parser clearing it (h and l arms alike).
-                if mouse_scanner.feed(&data) {
-                    crate::input::set_suppressed(&suppress);
-                }
-                // R1-4: env-gated capture tee for recording real PTY byte
-                // streams. Disabled by default (one env::var lookup per read);
-                // set WEFT_PTY_CAPTURE=/path/to/capture.bin to record. Fixtures
-                // committed to the repo use inline byte literals (see
-                // tests/replay_fixtures.rs), but this tee is the tool for
-                // discovering the exact byte shapes of new TUI apps.
-                if let Ok(path) = std::env::var("WEFT_PTY_CAPTURE") {
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&path)
-                    {
-                        let _ = std::io::Write::write_all(&mut f, &data);
-                    }
-                }
-                // v1.11.2 X2: sample emptiness BEFORE the send — an empty
-                // queue means the consumer is caught up and must be woken so
-                // fresh output is pumped promptly. Suspending here on a full
-                // channel is the intended backpressure path.
-                // (tokio 1.53's Sender has no len(); full remaining capacity
-                // is exactly "queue is empty" for this single-producer task.)
-                let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
-                if tx.send(PtyEvent::Output(data)).await.is_err() {
-                    // v1.11.16 (Fix B1): receiver dropped ⟹ Pty dropped (no take/move
-                    // path for event_rx — verified). Drop::drop runs before field drops,
-                    // so SIGHUP is already sent; re-kill is a harmless ESRCH no-op.
-                    // Break into the shared exit tail (set_suppressed + waitpid_safe).
-                    let _ = signal::kill(child_pid, Signal::SIGHUP);
-                    break;
-                }
-                // Nudge the UI event loop so fresh output is pumped promptly,
-                // instead of idling until the next keyboard/mouse event — but
-                // at most ~once per 16 ms during a flood (v1.11.2 X2).
-                let now_ms = monotonic_millis();
-                if pty_wake_due(false, consumer_caught_up, throttle.last(), now_ms) {
-                    wake();
-                    throttle.stamp(now_ms);
-                }
-            }
-            Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Spurious wakeup, retry.
-                continue;
-            }
-            Ok(Err(ref e))
-                if e.raw_os_error() == Some(nix::libc::EIO)
-                    || e.raw_os_error() == Some(nix::libc::EBADF) =>
-            {
-                // EIO on master fd means child exited (macOS).
-                tracing::debug!("PTY read EIO/EBADF — child likely exited");
-                break;
-            }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "PTY read error");
-                break;
-            }
-            Err(_would_block) => {
-                // Spurious, retry.
-                continue;
-            }
-        }
-    }
-
-    // v1.11.15 (FIX A): every exit path lands here (EOF, EIO/EBADF, read
-    // error, unreadable fd). Force-set the flag so a TUI killed before it
-    // could emit its mouse-disable sequences cannot leave the UI writing
-    // hover bytes into a dead or legacy-mode PTY. The pending tab teardown (or
-    // the parser's next mouse-mode DECSET, for a surviving shell) is the
-    // authoritative follow-up.
-    crate::input::set_suppressed(&suppress);
-    // Wait for child and report exit status.
-    let exit_status = match waitpid_safe(child_pid) {
-        Ok(status) => {
-            if let Some(code) = status.exit_code() {
-                std::result::Result::Ok(code)
-            } else if let Some(sig) = status.signal() {
-                Err(format!("killed by signal {sig}"))
-            } else {
-                Err("unknown exit status".into())
-            }
-        }
-        Err(e) => Err(format!("waitpid failed: {e}")),
-    };
-    // v1.11.2 X2: Exit bypasses the throttle entirely (pty_wake_due's
-    // is_exit arm) — the UI must learn of the dead child immediately.
-    if tx.send(PtyEvent::Exit(exit_status)).await.is_ok() {
-        wake();
-    }
-}
-
-/// Safely wait for a child process, handling ECHILD (already reaped).
-fn waitpid_safe(pid: Pid) -> std::result::Result<ChildStatus, String> {
-    match nix::sys::wait::waitpid(pid, None) {
-        Ok(status) => Ok(ChildStatus::from(status)),
-        Err(nix::errno::Errno::ECHILD) => {
-            // Already reaped (e.g. by a signal handler).
-            Ok(ChildStatus {
-                exit_code: Some(0),
-                signal: None,
-            })
-        }
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-/// Simplified child exit status.
-struct ChildStatus {
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-}
-
-impl ChildStatus {
-    fn exit_code(&self) -> Option<i32> {
-        self.exit_code
-    }
-    fn signal(&self) -> Option<i32> {
-        self.signal
-    }
-}
-
-impl From<nix::sys::wait::WaitStatus> for ChildStatus {
-    fn from(status: nix::sys::wait::WaitStatus) -> Self {
-        use nix::sys::wait::WaitStatus;
-        match status {
-            WaitStatus::Exited(_, code) => Self {
-                exit_code: Some(code),
-                signal: None,
-            },
-            WaitStatus::Signaled(_, sig, _) => Self {
-                exit_code: None,
-                signal: Some(sig as i32),
-            },
-            _ => Self {
-                exit_code: None,
-                signal: None,
-            },
-        }
-    }
-}
+// Reader task moved to `pty/read_loop.rs` (T8, PLAN_v11217 §3.4; standard
+// `pty.rs` + `pty/` directory layout) so this file stays within its
+// architecture budget. EVENT_CAP is the single source of truth for the
+// per-message size ceiling — the app crate's oversize-split threshold
+// re-exports it.
+mod read_loop;
+pub use read_loop::EVENT_CAP;
 
 // Tests extracted to `pty/tests.rs` (repo convention) to keep the
 // production file within the architecture gate.
