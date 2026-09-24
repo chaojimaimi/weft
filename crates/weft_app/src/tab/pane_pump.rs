@@ -7,7 +7,8 @@
 //! (`self.msg_rx` through `Deref`). A background pane's output stalled in
 //! its own bounded channel with zero consumers, so its picture froze until
 //! it gained focus. Both halves now walk EVERY pane; the tab-level frame
-//! budget (shared 8ms clock + per-frame total byte cap) bounds the worst
+//! budget (flood-aware clock/byte cap — base 8ms/256KB, flood 16ms/1MiB
+//! when the consumer falls behind, `frame_budget` below) bounds the worst
 //! case so N panes cannot eat N× the old frame cost (spec §2.1–§2.3).
 //!
 //! The per-pane dispatch lives here so `tab.rs` stays at its architecture
@@ -15,6 +16,7 @@
 //! per-pane PtyExit semantics (§2.2), and the shared frame budget (§2.3).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use super::Tab;
 use crate::AppMsg;
@@ -24,23 +26,64 @@ use weft_core::pane_layout::PaneId;
 /// buffer size). Messages larger than this are split: the head is processed
 /// now, the tail is re-queued ON THE PANE for the next frame — kept ahead of
 /// every later AppMsg (especially PtyExit) so the original PTY byte order
-/// never inverts.
+/// never inverts. T1 hard invariant (§3.2 改动点 4 / R2): FROZEN — the
+/// flood-aware budget must never touch it.
 const MAX_BYTES_PER_MESSAGE: usize = 256 * 1024;
-/// 8ms leaves ~8ms for rendering at 60fps. The clock is checked at most
-/// every `MIN_BYTES_FOR_TIME_CHECK` bytes to keep `Instant::now()` overhead
-/// from dominating for tiny messages.
-///
-/// FIX_background_pane_pump §2.3: the budget clock is TAB-level — N panes
-/// share ONE 8ms window per frame (the first pane processed starts it).
-/// Once it lapses, the remaining panes resume next frame; the channels are
-/// bounded, so nothing is lost, only deferred.
-const FRAME_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+/// Time-check granularity: the clock is consulted at most once per this
+/// many bytes so clock reads cannot dominate tiny messages. T1: unchanged.
 const MIN_BYTES_FOR_TIME_CHECK: usize = 32 * 1024;
-/// FIX_background_pane_pump §2.3: tab-level per-frame TOTAL byte cap across
-/// all panes (same size as the per-message split threshold). Bytes counted
-/// include oversized heads, so a pane that spends the whole cap defers its
-/// siblings to the next frame deterministically.
-const TAB_MAX_BYTES_PER_FRAME: usize = 256 * 1024;
+/// T1 (PLAN_v11217 §3.2): the tab-level frame budget is FLOOD-AWARE —
+/// chosen ONCE per frame by [`frame_budget`] from a backlog snapshot.
+/// Base = 8ms/256KB (the exact v1.0 + FIX_background_pane_pump budget;
+/// clock stays TAB-level — N panes share ONE window per frame, R3; bytes
+/// counted include oversized heads). Flood = 16ms/1MiB while the consumer
+/// is visibly behind, raising pump duty cycle from ~48% toward ~100%;
+/// deferred panes resume next frame (bounded channel, round-robin rotation).
+const FLOOD_BACKLOG_MSGS: usize = 16;
+const BASE_TIME_BUDGET: Duration = Duration::from_millis(8);
+const FLOOD_TIME_BUDGET: Duration = Duration::from_millis(16);
+const BASE_BYTES_PER_FRAME: usize = 256 * 1024;
+const FLOOD_BYTES_PER_FRAME: usize = 1024 * 1024;
+
+/// One frame's drain limits, picked by [`frame_budget`].
+struct FrameBudget {
+    time: Duration,
+    bytes: usize,
+}
+
+/// 洪水判定：tab 内所有窗格 msg 通道积压之和 + 超长消息尾存在性。
+/// crossbeam bounded(1024)；pump 高水位 768，洪水期积压可达数百，
+/// 阈值 16 只在"消费端明显落后"时触发。
+///
+/// [评审修订 P2] 生产事实：PTY 读缓冲 256KB（pty.rs BUF_SIZE）恰好等于
+/// MAX_BYTES_PER_MESSAGE，生产单条 PtyOutput 永不超限、永不切分——
+/// `has_pending_tail` 在生产中恒 false，是防御/测试注入路径的信号；
+/// 生产唯一真实洪水信号是 Σ msg_rx.len() >= 16。保留 tail 信号无害
+/// （对注入式测试有用），但维护者不得按"尾=洪水"推理生产行为。
+///
+/// [误触发无害性 · 天花板不是地板] 预算/字节上限只在被绑定时才生效：
+/// TUI 全屏重绘（vim 刷新等）瞬间产生 ≥16 条小消息误入洪水模式时，
+/// 若实际工作量在 8ms/256KB 内即消化完毕，行为与基础模式逐位一致；
+/// 上限放宽不改变任何排水前的处理顺序或内容。
+///
+/// [洪水期最坏交互代价] 非洪水场景行为逐位不变；洪水期键入回显上界
+/// ≈ FLOOD_TIME_BUDGET(16ms) + 唤醒间隔(≤16ms) + vsync(≤16.6ms) ≈ 48ms
+/// （评审 P3 修正：原 32ms 低估了上屏 vsync 项），实测 Warp 同场景零
+/// 退化，可接受。
+fn frame_budget(total_backlog_msgs: usize, has_pending_tail: bool) -> FrameBudget {
+    let flood = total_backlog_msgs >= FLOOD_BACKLOG_MSGS || has_pending_tail;
+    if flood {
+        FrameBudget {
+            time: FLOOD_TIME_BUDGET,
+            bytes: FLOOD_BYTES_PER_FRAME,
+        }
+    } else {
+        FrameBudget {
+            time: BASE_TIME_BUDGET,
+            bytes: BASE_BYTES_PER_FRAME,
+        }
+    }
+}
 
 impl Tab {
     /// Process queued messages into the terminals and drain finished blocks.
@@ -86,6 +129,26 @@ impl Tab {
         bool,
         Vec<(PaneId, weft_core::vt::UiEvent)>,
     ) {
+        self.process_messages_with_clock(std::time::Instant::now)
+    }
+
+    /// Testable seam for [`Self::process_messages`] (T1, PLAN_v11217 §3.2
+    /// 改动点 2): `now` is the frame clock; the production entry passes
+    /// `Instant::now` (path bit-identical to pre-T1). HARD RULE: budget
+    /// checks read the clock ONLY via this closure — `frame_start.elapsed()`
+    /// implicitly consults the real clock and bypasses the seam. Real-clock
+    /// touch points per frame: EXACTLY three — frame-start init, the
+    /// between-panes check, the per-message check; the post-drain
+    /// `Instant::now()` (settle/idle) stays on the REAL clock, not in the seam.
+    fn process_messages_with_clock(
+        &mut self,
+        now: impl Fn() -> std::time::Instant,
+    ) -> (
+        bool,
+        Vec<weft_core::blocks::Block>,
+        bool,
+        Vec<(PaneId, weft_core::vt::UiEvent)>,
+    ) {
         let mut need_redraw = false;
         let mut alive = true;
         let mut processed_panes: HashSet<PaneId> = HashSet::new();
@@ -93,9 +156,18 @@ impl Tab {
         let mut drained: Vec<weft_core::blocks::Block> = Vec::new();
         let mut ui_events: Vec<(PaneId, weft_core::vt::UiEvent)> = Vec::new();
         // §2.3: ONE shared clock per frame — the first pane processed starts
-        // it; `frame_bytes` accumulates across all panes.
-        let frame_start = std::time::Instant::now();
+        // it; `frame_bytes` accumulates across all panes. Seam touch 1/3.
+        let frame_start = now();
         let mut frame_bytes = 0usize;
+        // T1 (§3.2 改动点 2): ONE backlog snapshot per frame — the sum spans
+        // EVERY pane's channel (the FIX_background_pane_pump active-only bug
+        // must not resurrect in the flood signal); entries are serial per thread.
+        let total_backlog_msgs: usize = self.panes.values().map(|pane| pane.msg_rx.len()).sum();
+        let has_pending_tail = self
+            .panes
+            .values()
+            .any(|pane| pane.pending_pty_output.is_some());
+        let budget = frame_budget(total_backlog_msgs, has_pending_tail);
 
         // Deterministic order (HashMap keys() is process-randomly shuffled,
         // which both flaked the byte-cap test and pinned the deferral on one
@@ -113,15 +185,15 @@ impl Tab {
         }
         let mut rotation_tail: Option<PaneId> = None;
         for pane_id in pane_ids {
-            // Shared frame budget: once the tab's 8ms window has lapsed (and
+            // Shared frame budget: once the tab's window has lapsed (and
             // enough bytes have flowed to make the check meaningful) or the
             // total byte cap is spent, leave every remaining pane for the
             // next frame — bounded channel, no loss; the rotation above
             // makes the deferral round-robin across frames, not a fixed
-            // priority.
-            if frame_bytes >= TAB_MAX_BYTES_PER_FRAME
+            // priority. T1: dynamic budget; seam touch 2/3 via `now()`.
+            if frame_bytes >= budget.bytes
                 || (frame_bytes >= MIN_BYTES_FOR_TIME_CHECK
-                    && frame_start.elapsed() >= FRAME_TIME_BUDGET)
+                    && now().saturating_duration_since(frame_start) >= budget.time)
             {
                 // Remember the FIRST deferred pane so the NEXT frame starts
                 // with it (see the rotation rationale above).
@@ -132,6 +204,8 @@ impl Tab {
                 pane_id,
                 &mut frame_bytes,
                 frame_start,
+                &budget,
+                &now,
                 &mut need_redraw,
                 &mut processed_panes,
             );
@@ -162,6 +236,8 @@ impl Tab {
         // sequence matches the original single-pane post-loop exactly:
         // keypress-bypass refresh → settle → block drain → ui events →
         // split-head anchor compensation → block-completion snap.
+        // T1 seam rule: REAL clock, NOT the injected frame clock — settle/
+        // idle timing must keep ticking under a frozen test clock (不入缝).
         let now = std::time::Instant::now();
         // Sorted to match the consume pass above — drained blocks / ui
         // events then append in a stable pane order (no correctness impact,
@@ -244,14 +320,21 @@ impl Tab {
     /// message the pump ever enqueues for a session).
     ///
     /// Budget accounting is tab-level (`frame_bytes` accumulates across
-    /// panes; `frame_start` is the shared frame clock). When a budget trips,
-    /// THIS pane's drain ends; the caller's top-of-loop check defers the
+    /// panes; `frame_start` + injected `now` form the shared frame clock —
+    /// seam touch point 3/3; `budget` is this frame's base-or-flood
+    /// FrameBudget, chosen once at frame start). When a budget trips, THIS
+    /// pane's drain ends; the caller's top-of-loop check defers the
     /// remaining panes to the next frame.
+    // T1: budget + injected clock must reach the per-message check —
+    // explicit params, mirroring paint/'s why-commented allowances.
+    #[allow(clippy::too_many_arguments)]
     fn drain_pane_channel(
         &mut self,
         pane_id: PaneId,
         frame_bytes: &mut usize,
         frame_start: std::time::Instant,
+        budget: &FrameBudget,
+        now: &impl Fn() -> std::time::Instant,
         need_redraw: &mut bool,
         processed_panes: &mut HashSet<PaneId>,
     ) -> bool {
@@ -293,12 +376,13 @@ impl Tab {
                     *need_redraw |= self.process_pty_output_for_pane(pane_id, &data);
                     processed_panes.insert(pane_id);
                     // Cooperative yield (§2.3): over the shared budget, stop.
+                    // Seam touch 3/3 — the delta goes through `now()`.
                     if *frame_bytes >= MIN_BYTES_FOR_TIME_CHECK
-                        && frame_start.elapsed() >= FRAME_TIME_BUDGET
+                        && now().saturating_duration_since(frame_start) >= budget.time
                     {
                         return false;
                     }
-                    if *frame_bytes >= TAB_MAX_BYTES_PER_FRAME {
+                    if *frame_bytes >= budget.bytes {
                         return false;
                     }
                 }
@@ -705,3 +789,12 @@ mod tests {
         );
     }
 }
+
+/// T1 flood-aware frame budget tests (PLAN_v11217 §3.2). A CHILD module (via
+/// `#[path]`, file `src/tab/pane_pump_budget_tests.rs`) so the strategy fn
+/// [`frame_budget`], its constants, and the [`Tab::process_messages_with_clock`]
+/// seam stay private while being pinned end to end. Split out of `mod tests`
+/// to keep this file under the commit-gate 800-line ceiling.
+#[cfg(test)]
+#[path = "pane_pump_budget_tests.rs"]
+mod budget_tests;
