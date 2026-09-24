@@ -70,6 +70,9 @@ pub(crate) fn zoom_window_finished() {
         return;
     };
     *watch = None;
+    // Phase F (PLAN_zoom_drawable_stall): the flush is the window's
+    // legitimate clear — stand the drawing-protection flag down here.
+    super::set_self_zoom_window(false);
     let count = PULL_PRESENT_COUNT.load(Ordering::Acquire);
     let pull_delta = count.saturating_sub(baseline);
     LAST_CLOSE_COUNT.store(count, Ordering::Release);

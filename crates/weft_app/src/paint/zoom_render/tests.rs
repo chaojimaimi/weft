@@ -270,18 +270,18 @@ fn pull_present_allowed_truth_table() {
     ));
 }
 
-/// Serializes the global-state test below (FRAME_CACHE / PULL_ENABLED are
-/// process-wide; every other test in this file stays pure-local by design).
-static GLOBAL_ZOOM_STATE_LOCK: Mutex<()> = Mutex::new(());
-
 /// F-3B suppression-gate combos through the real global cache: an empty
 /// cache never suppresses (start-up draws immediately), a stale watermark
 /// suppresses (the pull is the frame's only supplier), a CAUGHT-UP watermark
 /// releases the gate (the expiry flush draw runs as a NORMAL draw), the
 /// lever off closes it (exact 1.12.10 push-only), and teardown closes it.
+///
+/// The lock lives on the parent module (`super::GLOBAL_ZOOM_STATE_LOCK`) so
+/// macos_zoom's anim-state tests share it — both domains touch the
+/// process-global SELF_ZOOM_WINDOW and must not interleave.
 #[test]
 fn pull_can_freshen_gate_combinations() {
-    let _guard = GLOBAL_ZOOM_STATE_LOCK
+    let _guard = super::GLOBAL_ZOOM_STATE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -314,4 +314,23 @@ fn pull_can_freshen_gate_combinations() {
     // Teardown: cleared cache closes the gate for good.
     teardown();
     assert!(!pull_can_freshen(900.0, 700.0));
+}
+
+/// Phase F lifecycle (PLAN_zoom_drawable_stall): the self-zoom window flag
+/// is a plain set/close pair around the animation + ≤300 ms flush tail —
+/// opened by `start_zoom_anim`, closed by `zoom_anim_cancel` and by the
+/// flush verdict (`zoom_window_finished`). Holding the SHARED
+/// GLOBAL_ZOOM_STATE_LOCK is MANDATORY: the flag is process-global and the
+/// macos_zoom anim tests (same flag, same lock) flip it concurrently.
+#[test]
+fn self_zoom_window_flag_lifecycle() {
+    let _guard = super::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    assert!(!self_zoom_window(), "the window starts closed");
+    set_self_zoom_window(true);
+    assert!(self_zoom_window(), "arming opens the window");
+    set_self_zoom_window(false);
+    assert!(!self_zoom_window(), "cancel/flush closes the window");
 }

@@ -176,6 +176,11 @@ impl App {
                         // extend it; the verdict runs at the deterministic
                         // WaitUntil expiry (zoom_wait_policy), not here.
                         crate::paint::zoom_render::note_zoom_step();
+                        // Phase F self-healing: re-assert the window beside
+                        // the watch -- closes the razor-thin re-zoom window
+                        // where a pending flush could clear the flag under a
+                        // live second animation.
+                        crate::paint::zoom_render::set_self_zoom_window(true);
                     }
                     // PLAN_zoom_drawable_stall Phase E: set_live_resize is fed
                     // the gesture-only `in_live_resize_now` poll. The retired
@@ -262,12 +267,19 @@ impl App {
                 // UNCONDITIONAL: live tracking in BOTH directions through
                 // the drag-validated pipeline (the pull stands down for the
                 // animation inside redraw_cached_frame). Outside a
-                // self-zoom (drags, single programmatic resizes) the F-3B
-                // `hot && pull_can_freshen` suppression above is preserved
-                // verbatim.
-                let self_zoom_active = crate::macos_zoom::zoom_anim_active();
+                // self-zoom (drags) the F-3B `hot && pull_can_freshen`
+                // suppression above is preserved verbatim. Single-jump
+                // resizes open the Phase F window flag for ≤300 ms (the
+                // hardening re-arms it beside note_zoom_step), so their tail
+                // runs main-draw-supplied instead of pull-supplied — the
+                // plan's documented fail-safe direction. Phase F: the gate
+                // reads the self-zoom WINDOW flag, which spans arm→flush
+                // (animation + the ≤300 ms hot tail) — at the last step the
+                // anim is already cleared when this gate re-runs for the
+                // final geometry, so zoom_anim_active() was too weak.
+                let self_zoom_window = crate::paint::zoom_render::self_zoom_window();
                 let pull_supplies_frame = zoom_jump_hot
-                    && !self_zoom_active
+                    && !self_zoom_window
                     && self.window.as_ref().is_some_and(|window| {
                         let inner = window.inner_size();
                         crate::paint::zoom_render::pull_can_freshen(
@@ -674,6 +686,12 @@ impl App {
         if progress >= 1.0 {
             let steps = crate::macos_zoom::zoom_anim_finish().map_or(0, |finished| finished.steps);
             tracing::info!(steps, "self-zoom complete");
+            // Phase F (PLAN_zoom_drawable_stall): the final frame must draw
+            // NOW. The final synth Resized lands only after `about_to_wait`
+            // returns — i.e. after the anim was cleared here — so without
+            // this request the final-geometry frame waits for the ≤300 ms
+            // flush (the F.0 final-adjustment defect).
+            self.request_redraw();
         } else {
             self.request_redraw();
         }

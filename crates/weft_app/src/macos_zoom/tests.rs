@@ -168,6 +168,13 @@ fn reentry_semantics_through_global_state() {
     let _guard = ZOOM_STATE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // This test is the longest SELF_ZOOM_WINDOW writer (start_zoom_anim x3,
+    // finish leaves the flag set until the final cancel) — it must hold the
+    // SHARED zoom_render lock too, or the zoom_render global-state tests
+    // interleave with it (rust-reviewer round 7: 2/12 stress failures).
+    let _shared_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Clean slate.
     zoom_anim_cancel();
@@ -270,4 +277,42 @@ fn to_winit_top_left_matches_winit_flip() {
     // Round trip through the winit formula (y_top = main_h - h - y_ns).
     let (x, y_top) = to_winit_top_left((37.0, 41.0), (500.0, 400.0), 1000.0);
     assert_eq!((x, y_top), (37.0, 559.0));
+}
+
+/// Phase F (PLAN_zoom_drawable_stall): arming the animation OPENS the
+/// self-zoom window (drawing protection spans arm→flush) and cancelling it
+/// CLOSES the window again (a cancelled animation has nothing to protect).
+/// Same serialization as `reentry_semantics_through_global_state` (the
+/// anim state and the window flag are process-global) PLUS the shared
+/// zoom_render lock: the window flag is also read/written by zoom_render's
+/// own global-state tests, so both locks must be held together
+/// (rust-reviewer round 7 reproduced the interleave with only one).
+#[test]
+fn zoom_anim_arm_and_cancel_drive_self_zoom_window() {
+    let _guard = ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _shared_guard = crate::paint::zoom_render::GLOBAL_ZOOM_STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Clean slate (mirrors the existing global-state test's setup).
+    zoom_anim_cancel();
+    assert!(!zoom_anim_active());
+    assert!(!crate::paint::zoom_render::self_zoom_window());
+
+    let frame: ZoomFrame = (0.0, 0.0, 800.0, 600.0);
+    start_zoom_anim(frame, frame, 900.0);
+    assert!(zoom_anim_active());
+    assert!(
+        crate::paint::zoom_render::self_zoom_window(),
+        "arming the animation must open the self-zoom window"
+    );
+
+    zoom_anim_cancel();
+    assert!(!zoom_anim_active());
+    assert!(
+        !crate::paint::zoom_render::self_zoom_window(),
+        "cancelling the animation must close the self-zoom window"
+    );
 }

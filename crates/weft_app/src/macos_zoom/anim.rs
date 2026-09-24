@@ -173,6 +173,9 @@ pub(crate) fn zoom_anim_finish() -> Option<ZoomAnim> {
 /// the restore frame is intentionally left alone (review P1-1).
 pub(crate) fn zoom_anim_cancel() {
     *lock_zoom_anim() = None;
+    // Phase F (PLAN_zoom_drawable_stall): a cancelled animation has nothing
+    // left to protect — close the drawing-protection window.
+    crate::paint::zoom_render::set_self_zoom_window(false);
 }
 
 /// Read the persisted restore frame (AppKit logical coordinates).
@@ -342,6 +345,9 @@ pub(crate) fn start_zoom_anim(start: ZoomFrame, target: ZoomFrame, main_h: f64) 
         last_step: std::time::Instant::now(),
         steps: 0,
     });
+    // Phase F (PLAN_zoom_drawable_stall): open the drawing-protection window
+    // at ARM — it stays open through the ≤300 ms flush tail (verdict close).
+    crate::paint::zoom_render::set_self_zoom_window(true);
     super::notify_resize_wake();
 }
 
