@@ -36,6 +36,14 @@ mod testing;
 #[cfg(test)]
 mod tests;
 
+/// T2 extras-gate equivalence tests (PLAN_v11217 §3.3). A CHILD module (via
+/// `#[path]`, file `src/grid/flat/encode_fast_path_tests.rs`) so the tests
+/// can reach the private flat structures directly while keeping this file
+/// under the commit-gate 800-line ceiling.
+#[cfg(test)]
+#[path = "encode_fast_path_tests.rs"]
+mod encode_fast_path_tests;
+
 use std::sync::Arc;
 
 use super::cell::{CellColor, CellFlags, CellWidth};
@@ -513,6 +521,20 @@ impl FlatStorage {
         // pre-first-cell backfill range works out).
         let mut last_cell: isize = -1;
 
+        // T2 (PLAN_v11217 §3.3): hoist the `RowExtras` fast-path predicate so
+        // the per-cell lookups below are skipped entirely for plain rows (seq
+        // short-line streams do 2 BTreeMap probes per blank cell otherwise).
+        //
+        // Correctness: `RowExtras.cells` empty ⟺ both lookups return `None`
+        // for EVERY column — `grapheme_at` / `hyperlink_id_at` are exactly
+        // `self.cells.get(&col).and_then(..)` (row_extras.rs:121-144), and
+        // `is_empty` is `cells.is_empty()` (row_extras.rs:116). So when
+        // `extras_empty` holds, substituting `None` for each lookup is
+        // bit-for-bit equivalent to probing the map; when it does not hold,
+        // the original unconditional lookups run unchanged. Non-empty-extras
+        // rows take the identical code path as before this gate.
+        let extras_empty = row.extras.is_empty();
+
         for (idx, cell) in row.cells.iter().enumerate() {
             let idx = idx as isize;
 
@@ -523,7 +545,11 @@ impl FlatStorage {
                 continue;
             }
 
-            let cluster = row.extras.grapheme_at(idx as usize);
+            let cluster = if extras_empty {
+                None
+            } else {
+                row.extras.grapheme_at(idx as usize)
+            };
             // A default cell is a NEVER-written blank. A written blank keeps
             // its DIRTY flag — the same discriminator reflow's
             // `row_content_end` uses — so an exactly-full wrapped row keeps
@@ -545,7 +571,11 @@ impl FlatStorage {
                 self.bg_and_style_map.push_attribute_change(offset.., style);
             }
 
-            let hl = row.extras.hyperlink_id_at(idx as usize);
+            let hl = if extras_empty {
+                None
+            } else {
+                row.extras.hyperlink_id_at(idx as usize)
+            };
             if hl != hyperlink_id {
                 needs_processing = true;
                 hyperlink_id = hl;
