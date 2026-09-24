@@ -294,6 +294,25 @@ impl App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // KB_DIAG (PLAN_v11217 §3.6, T6): winit entry-layer evidence
+                // for the synthetic fast-typing space/underscore loss (T9
+                // groundwork). The three-layer counting experiment pairs this
+                // log's per-key count against the script-sent char count and
+                // the "key → pty" count (app/keyboard.rs). `logical_key` is
+                // the new value here: it exposes winit's NamedKey/Character
+                // decision directly, so a space deformed at this layer
+                // (Named vs Character) is visible. Released events are
+                // included by design — hence the neutral message name.
+                // Debug-gated (RUST_LOG=weft_app=debug); zero cost by
+                // default in release (tracing macro semantics).
+                tracing::debug!(
+                    physical = ?event.physical_key,
+                    logical = ?event.logical_key,
+                    text = ?event.text,
+                    repeat = event.repeat,
+                    state = ?event.state,
+                    "KB_DIAG key"
+                );
                 // v1.11.4 (PLAN_v1114 §2.2, L2 pipe): winit 0.30 delivers
                 // Pressed (first), Pressed+repeat (macOS hold-to-repeat) and
                 // Released. The kind flows to the InputHandler so a kitty
