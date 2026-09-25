@@ -511,12 +511,12 @@ mod tests {
             CELL_H,
             0,
         );
-        // Row 3 (Keybindings) starts at sidebar_top + 3*20 = 140 + 60 = 200
+        // Row 4 (Keybindings; v1.12.19 inserted Blocks) = 140 + 80 = 220.
         assert_eq!(
-            settings_target_at(&scene, 300.0, 205.0),
+            settings_target_at(&scene, 300.0, 225.0),
             Some(SettingsTarget::SidebarCategory(SettingsTab::Keybindings)),
         );
-        assert_eq!(scene.semantics[4].state, "selected");
+        assert_eq!(scene.semantics[5].state, "selected");
     }
 
     #[test]

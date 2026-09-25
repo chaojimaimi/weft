@@ -109,6 +109,40 @@ fn per_tab_output_cap_apply_matches_the_all_tab_walk() {
     );
 }
 
+/// v1.12.19 (PLAN_v11217 §3.8 T13b): the retained-limit walk must reach
+/// EVERY pane in EVERY tab — the Settings Blocks row takes effect on
+/// already-open tabs without a restart (same contract as the output-cap
+/// walk, and same tab/pane construction precedent).
+#[test]
+fn retained_limit_walk_touches_every_pane_of_every_tab() {
+    let mut tabs = vec![tab_with_terminal(100), tab_with_terminal(100)];
+    apply_blocks_retained_limit_to_all_panes(&mut tabs, 750);
+    for tab in &tabs {
+        assert_eq!(
+            tab.terminal
+                .as_ref()
+                .unwrap()
+                .block_tracker()
+                .retained_limit(),
+            750,
+            "configured retained limit reaches the tracker"
+        );
+    }
+    // 0 must pass through: it means "retention disabled", not a floor.
+    let mut tabs = vec![tab_with_terminal(100)];
+    apply_blocks_retained_limit_to_all_panes(&mut tabs, 0);
+    assert_eq!(
+        tabs[0]
+            .terminal
+            .as_ref()
+            .unwrap()
+            .block_tracker()
+            .retained_limit(),
+        0,
+        "0 disables retention (v1.11.2 semantics preserved)"
+    );
+}
+
 // ── decide_reload ────────────────────────────────────────────────
 
 #[test]

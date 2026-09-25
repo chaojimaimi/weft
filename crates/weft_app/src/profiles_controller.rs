@@ -198,6 +198,14 @@ pub(super) fn merge_settings_draft(
         if dirty.contains(weft_core::config::ConfigSectionMask::NOTIFICATIONS) {
             profile.notifications = Some(draft.notifications); // Copy
         }
+        // v1.12.19 (PLAN_v11217 §3.8 T13a.1/T13b): [blocks] Settings rows
+        // (Retained limit / Output cap) are profile-overridable — the
+        // CLIPBOARD/NOTIFICATIONS precedent. Missing this arm in BOTH the
+        // profile and base branches silently drops the user's edit (review
+        // P0); guarded by the draft→persist BLOCKS round-trip test below.
+        if dirty.contains(weft_core::config::ConfigSectionMask::BLOCKS) {
+            profile.blocks = Some(draft.blocks.clone());
+        }
     } else {
         if dirty.contains(weft_core::config::ConfigSectionMask::FONT) {
             candidate.font = draft.font.clone();
@@ -231,6 +239,11 @@ pub(super) fn merge_settings_draft(
         if dirty.contains(weft_core::config::ConfigSectionMask::NOTIFICATIONS) {
             candidate.notifications = draft.notifications; // Copy
         }
+        // v1.12.19 (PLAN_v11217 §3.8 T13b): [blocks] base edits (the
+        // profile branch carries the twin arm above).
+        if dirty.contains(weft_core::config::ConfigSectionMask::BLOCKS) {
+            candidate.blocks = draft.blocks.clone();
+        }
     }
 
     // v1.8.3: AI config is global only — never written into a profile.
@@ -238,6 +251,15 @@ pub(super) fn merge_settings_draft(
     // config on `candidate` regardless of whether a profile is active.
     if dirty.contains(weft_core::config::ConfigSectionMask::AI) {
         candidate.ai = draft.ai.clone();
+    }
+
+    // v1.12.19 (PLAN_v11217 §3.8 T13a.1): [session] recovery is global
+    // only too — `ProfileConfig` has no `session` field (a `session`
+    // section inside a profile is a schema error), so the Terminal tab's
+    // Session recovery row always writes the base config (AI-mask
+    // precedent).
+    if dirty.contains(weft_core::config::ConfigSectionMask::SESSION) {
+        candidate.session = draft.session;
     }
 
     candidate
@@ -470,323 +492,5 @@ impl App {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use weft_core::config::{validate_profile_name, ProfileConfig};
-
-    fn loaded_from(source: Config) -> weft_core::config::LoadedConfig {
-        let (effective, diagnostics) = source.resolve_active_profile().unwrap();
-        weft_core::config::LoadedConfig {
-            source,
-            effective,
-            fingerprint: 42,
-            diagnostics,
-        }
-    }
-
-    #[test]
-    fn profile_transactions_create_switch_and_delete_successfully() {
-        let base = Config::default();
-        let created = run_profile_transaction(&base, ProfileChange::Create("work"), |candidate| {
-            Ok(loaded_from(candidate.clone()))
-        })
-        .unwrap();
-        assert_eq!(created.source.active_profile.as_deref(), Some("work"));
-        assert!(created.source.profiles.contains_key("work"));
-
-        let switched =
-            run_profile_transaction(&created.source, ProfileChange::Switch(None), |candidate| {
-                Ok(loaded_from(candidate.clone()))
-            })
-            .unwrap();
-        assert_eq!(switched.source.active_profile, None);
-        assert!(switched.source.profiles.contains_key("work"));
-
-        let deleted = run_profile_transaction(
-            &created.source,
-            ProfileChange::Delete("work"),
-            |candidate| Ok(loaded_from(candidate.clone())),
-        )
-        .unwrap();
-        assert_eq!(deleted.source.active_profile, None);
-        assert!(!deleted.source.profiles.contains_key("work"));
-    }
-
-    #[test]
-    fn switch_missing_profile_is_rejected_before_persist() {
-        let source = Config::default();
-        let persist_called = std::cell::Cell::new(false);
-        let result =
-            run_profile_transaction(&source, ProfileChange::Switch(Some("missing")), |_| {
-                persist_called.set(true);
-                unreachable!("missing profile must fail before persistence")
-            });
-
-        assert!(
-            matches!(result, Err(ProfileTransactionError::NotFound(name)) if name == "missing")
-        );
-        assert!(!persist_called.get());
-        assert_eq!(source.active_profile, None);
-    }
-
-    #[test]
-    fn persistence_failures_do_not_commit_source() {
-        let source = Config::default();
-        let save_result = run_profile_transaction(&source, ProfileChange::Create("work"), |_| {
-            Err(ProfileTransactionError::Save(
-                weft_core::config::ConfigSaveError::NoConfigPath,
-            ))
-        });
-        assert!(matches!(save_result, Err(ProfileTransactionError::Save(_))));
-
-        let disk_candidate = std::cell::RefCell::new(None);
-        let reload_result =
-            run_profile_transaction(&source, ProfileChange::Create("work"), |candidate| {
-                *disk_candidate.borrow_mut() = Some(candidate.clone());
-                Err(ProfileTransactionError::Reload(
-                    weft_core::config::ConfigLoadError::NoPath,
-                ))
-            });
-        assert!(matches!(
-            reload_result,
-            Err(ProfileTransactionError::Reload(_))
-        ));
-        assert_eq!(
-            disk_candidate
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .active_profile
-                .as_deref(),
-            Some("work"),
-            "save succeeded before the injected reload failure"
-        );
-        assert_eq!(
-            source.active_profile, None,
-            "runtime source was not committed"
-        );
-        assert!(
-            source.profiles.is_empty(),
-            "runtime profiles were not committed"
-        );
-    }
-
-    #[test]
-    fn active_profile_settings_write_only_dirty_sections() {
-        let mut source = Config::default();
-        source.font.size = 13.0;
-        source.window.padding_x = 2;
-        source.profiles.insert(
-            "work".into(),
-            ProfileConfig {
-                font: Some(weft_core::config::FontConfig {
-                    size: 18.0,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-        source.active_profile = Some("work".into());
-        let (mut draft, _) = source.resolve_active_profile().unwrap();
-        draft.window.padding_x = 9;
-
-        let merged = merge_settings_draft(
-            &source,
-            &draft,
-            weft_core::config::ConfigSectionMask::WINDOW,
-        )
-        .unwrap();
-        assert_eq!(merged.font.size, 13.0, "base font must stay raw");
-        assert_eq!(merged.window.padding_x, 2, "base window must stay raw");
-        let profile = merged.profiles.get("work").unwrap();
-        assert_eq!(profile.font.as_ref().unwrap().size, 18.0);
-        assert_eq!(profile.window.as_ref().unwrap().padding_x, 9);
-        assert!(profile.theme.is_none());
-    }
-
-    #[test]
-    fn base_settings_do_not_modify_profiles() {
-        let mut source = Config::default();
-        source.profiles.insert(
-            "work".into(),
-            ProfileConfig {
-                font: Some(weft_core::config::FontConfig {
-                    size: 18.0,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-        let mut draft = source.clone();
-        draft.font.size = 15.0;
-
-        let merged =
-            merge_settings_draft(&source, &draft, weft_core::config::ConfigSectionMask::FONT)
-                .unwrap();
-        assert_eq!(merged.font.size, 15.0);
-        assert_eq!(
-            merged
-                .profiles
-                .get("work")
-                .unwrap()
-                .font
-                .as_ref()
-                .unwrap()
-                .size,
-            18.0
-        );
-    }
-
-    #[test]
-    fn settings_reload_failure_keeps_runtime_source_uncommitted() {
-        let mut source = Config::default();
-        source
-            .profiles
-            .insert("work".into(), ProfileConfig::default());
-        source.active_profile = Some("work".into());
-        let (mut draft, _) = source.resolve_active_profile().unwrap();
-        draft.window.padding_x = 7;
-        let disk_candidate = std::cell::RefCell::new(None);
-
-        let result = run_settings_draft_transaction(
-            &source,
-            &draft,
-            weft_core::config::ConfigSectionMask::WINDOW,
-            |candidate| {
-                *disk_candidate.borrow_mut() = Some(candidate.clone());
-                Err(ProfileTransactionError::Reload(
-                    weft_core::config::ConfigLoadError::NoPath,
-                ))
-            },
-        );
-
-        assert!(matches!(result, Err(ProfileTransactionError::Reload(_))));
-        assert!(source.profiles.get("work").unwrap().window.is_none());
-        assert_eq!(source.window.padding_x, 0);
-        assert_eq!(
-            disk_candidate
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .profiles
-                .get("work")
-                .unwrap()
-                .window
-                .as_ref()
-                .unwrap()
-                .padding_x,
-            7
-        );
-    }
-
-    /// Validate-profile-name is the first gate of `create_profile`.
-    /// The transaction can't even start if the name is bad, so we test
-    /// the pure validation function here rather than spinning up a full
-    /// App (which requires a Metal device).
-    #[test]
-    fn create_profile_rejects_invalid_names() {
-        // The validation function is the gate; create_profile wraps it.
-        assert!(validate_profile_name("").is_err());
-        assert!(validate_profile_name(" ").is_err());
-        assert!(validate_profile_name("base").is_err());
-        assert!(validate_profile_name("BASE").is_err());
-        assert!(validate_profile_name("_bad").is_err()); // must start alphanumeric
-        assert!(validate_profile_name("has space").is_err());
-        assert!(validate_profile_name("has/slash").is_err());
-        // 33 chars
-        assert!(validate_profile_name(&"a".repeat(33)).is_err());
-    }
-
-    #[test]
-    fn create_profile_accepts_valid_names() {
-        assert!(validate_profile_name("work").is_ok());
-        assert!(validate_profile_name("dev-1").is_ok());
-        assert!(validate_profile_name("a.b.c").is_ok());
-        assert!(validate_profile_name("A_1-2.3").is_ok());
-        assert!(validate_profile_name(&"a".repeat(32)).is_ok());
-    }
-
-    /// `profile_names_sorted` returns BTreeMap order (alphabetical), so
-    /// the Settings + Palette views see a stable index↔name mapping
-    /// within a frame. We can't test the full App method without a
-    /// renderer, but we can verify the BTreeMap ordering invariant on
-    /// a raw Config.
-    #[test]
-    fn profile_names_are_alphabetical() {
-        let mut cfg = Config::default();
-        cfg.profiles
-            .insert("zebra".into(), ProfileConfig::default());
-        cfg.profiles
-            .insert("alpha".into(), ProfileConfig::default());
-        cfg.profiles
-            .insert("mango".into(), ProfileConfig::default());
-        let names: Vec<String> = cfg.profiles.keys().cloned().collect();
-        assert_eq!(names, vec!["alpha", "mango", "zebra"]);
-    }
-
-    /// `active_profile_name` normalizes empty strings to `None`, matching
-    /// `resolve_active_profile`'s behavior. This prevents the Settings
-    /// selector from showing a stale "active" state when the TOML has
-    /// `active_profile = ""`.
-    #[test]
-    fn empty_active_profile_normalizes_to_none() {
-        let cfg = Config {
-            active_profile: Some(String::new()),
-            ..Default::default()
-        };
-        // The normalization logic: trim + filter empty.
-        let normalized = cfg
-            .active_profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        assert_eq!(normalized, None);
-    }
-
-    /// Deleting the active profile must clear `active_profile` so we
-    /// don't leave a dangling reference. This test verifies the
-    /// invariant on a raw Config (the App method wraps this logic).
-    #[test]
-    fn delete_active_profile_clears_active_ref() {
-        let mut cfg = Config {
-            active_profile: Some("work".into()),
-            ..Default::default()
-        };
-        cfg.profiles.insert("work".into(), ProfileConfig::default());
-
-        // Simulate delete.
-        let was_active = cfg.active_profile.as_deref() == Some("work");
-        assert!(was_active);
-        if was_active {
-            cfg.active_profile = None;
-        }
-        cfg.profiles.remove("work");
-
-        assert_eq!(cfg.active_profile, None);
-        assert!(!cfg.profiles.contains_key("work"));
-    }
-
-    /// Creating a profile that already exists must fail before touching
-    /// the source. This test verifies the duplicate check on a raw Config.
-    #[test]
-    fn create_duplicate_profile_fails() {
-        let mut cfg = Config::default();
-        cfg.profiles.insert("work".into(), ProfileConfig::default());
-        // The duplicate check.
-        assert!(cfg.profiles.contains_key("work"));
-    }
-
-    /// The 32-profile cap is enforced before insertion. This test
-    /// verifies the cap on a raw Config.
-    #[test]
-    fn profile_cap_enforced() {
-        let mut cfg = Config::default();
-        for i in 0..32 {
-            cfg.profiles
-                .insert(format!("p{i:02}"), ProfileConfig::default());
-        }
-        assert_eq!(cfg.profiles.len(), 32);
-        // The cap check: `cfg.profiles.len() >= MAX_PROFILES` should be true.
-        assert!(cfg.profiles.len() >= weft_core::config::MAX_PROFILES);
-    }
-}
+#[path = "profiles_controller/tests.rs"]
+mod tests;

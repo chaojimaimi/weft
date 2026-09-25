@@ -457,40 +457,39 @@ impl App {
                     _ => {}
                 }
             }
-            SettingsTab::Terminal => match self.settings.selection {
-                0 => {
-                    // Scrollback: ±1000 lines, clamped to [1000, 100000].
-                    self.settings.draft.scrollback.lines =
-                        ((self.settings.draft.scrollback.lines as i32 + delta * 1000).max(1000)
-                            as usize)
-                            .min(100000);
-                    self.settings
-                        .mark_dirty(weft_core::config::ConfigSectionMask::SCROLLBACK);
+            SettingsTab::Terminal => {
+                // v1.12.19 (T13a/T13c): the row→field mapping lives in
+                // `settings_validation::adjust_terminal_row` (Input tab
+                // precedent) so all five rows — including the new Session
+                // recovery cycle and the io-clamped scrollback range — stay
+                // headless-tested.
+                let draft = &mut self.settings.draft;
+                let mask = crate::settings_validation::adjust_terminal_row(
+                    &mut draft.scrollback.lines,
+                    &mut draft.window.padding_x,
+                    &mut draft.window.padding_y,
+                    &mut draft.theme.minimum_contrast,
+                    &mut draft.session.recovery,
+                    self.settings.selection,
+                    delta,
+                );
+                if let Some(mask) = mask {
+                    self.settings.mark_dirty(mask);
                 }
-                1 => {
-                    // Padding X: ±1 cell, clamped to [0, 20].
-                    self.settings.draft.window.padding_x =
-                        ((self.settings.draft.window.padding_x as i32 + delta).max(0) as u32)
-                            .min(20);
-                    self.settings
-                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
+            }
+            // v1.12.19 (T13b): Blocks tab — the row→field mapping lives in
+            // `settings_validation::adjust_blocks_row` so both rows stay
+            // headless-tested (Input tab precedent).
+            SettingsTab::Blocks => {
+                if let Some(mask) = crate::settings_validation::adjust_blocks_row(
+                    &mut self.settings.draft.blocks.retained_limit,
+                    &mut self.settings.draft.blocks.output_cap_mib,
+                    self.settings.selection,
+                    delta,
+                ) {
+                    self.settings.mark_dirty(mask);
                 }
-                2 => {
-                    // Padding Y: ±1 cell, clamped to [0, 20].
-                    self.settings.draft.window.padding_y =
-                        ((self.settings.draft.window.padding_y as i32 + delta).max(0) as u32)
-                            .min(20);
-                    self.settings
-                        .mark_dirty(weft_core::config::ConfigSectionMask::WINDOW);
-                }
-                3 => {
-                    let value = &mut self.settings.draft.theme.minimum_contrast;
-                    *value = adjust_finite_value(*value, delta, 0.5, 1.0, 12.0, 7.0);
-                    self.settings
-                        .mark_dirty(weft_core::config::ConfigSectionMask::THEME);
-                }
-                _ => {}
-            },
+            }
             SettingsTab::Input => {
                 // v1.11.1 (PLAN_v1111 §4.6): the row→field mapping lives in
                 // `settings_validation::adjust_input_row` so all five rows
@@ -784,7 +783,12 @@ impl App {
                 self.settings_appearance_theme_count()
                     + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS
             }
-            SettingsTab::Terminal => 4, // Scrollback + padding + minimum contrast.
+            // v1.12.19 (T13a): 4 legacy rows + the Session recovery row.
+            // This literal is the row-count's only silent site — a missed
+            // bump leaves row 4 key-selectable yet unclickable/unpaintable.
+            SettingsTab::Terminal => 5, // Scrollback + padding + contrast + session recovery.
+            // v1.12.19 (T13b): Retained limit + Output cap.
+            SettingsTab::Blocks => 2,
             // v1.11.1 (PLAN_v1111 §4.6): 2 editor rows + 3 paste rows.
             SettingsTab::Input => 5,
             SettingsTab::Keybindings => self.settings_keybinding_views().len(),
@@ -842,6 +846,7 @@ impl App {
                 // Non-theme rows: Enter is a no-op (←/→ handles adjustments).
             }
             SettingsTab::Terminal
+            | SettingsTab::Blocks
             | SettingsTab::Input
             | SettingsTab::Keybindings
             | SettingsTab::Window

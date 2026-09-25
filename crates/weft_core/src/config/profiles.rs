@@ -113,6 +113,15 @@ bitflags! {
         /// v1.11.5 (PLAN_v1115 §M8): `[notifications]` (Settings Advanced
         /// rows: Notify Enabled / Threshold / Sound).
         const NOTIFICATIONS = 1 << 11;
+        /// v1.12.19 (PLAN_v11217 §3.8 T13b): `[blocks]` Settings tab rows
+        /// (Retained limit / Output cap). Profile-overridable like
+        /// `[scrollback]` (`ProfileConfig.blocks` already exists).
+        const BLOCKS = 1 << 12;
+        /// v1.12.19 (PLAN_v11217 §3.8 T13a): `[session]` settings row
+        /// (Terminal tab: Session recovery). Global only — `ProfileConfig`
+        /// has no `session` field, so the merge writes it to the base config
+        /// regardless of the active profile (the AI-mask precedent).
+        const SESSION = 1 << 13;
     }
 }
 

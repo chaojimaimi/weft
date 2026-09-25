@@ -167,6 +167,17 @@ pub(super) fn apply_blocks_retained_limit(tab: &mut Tab, limit: usize) {
     }
 }
 
+/// v1.12.19 (PLAN_v11217 §3.8 T13b): apply the `[blocks] retained_limit`
+/// config to every pane of every tab. Closes the historical gap where
+/// retained_limit was creation-time-only (`apply_blocks_retained_limit` at
+/// the spawn/restore chokepoints): the Settings Blocks row must take effect
+/// immediately on already-open tabs, same as the output-cap walk above.
+pub(super) fn apply_blocks_retained_limit_to_all_panes(tabs: &mut [Tab], limit: usize) {
+    for tab in tabs.iter_mut() {
+        apply_blocks_retained_limit(tab, limit);
+    }
+}
+
 /// PLAN_v11217 §3.5 (T4): apply the `[blocks] output_cap_mib` config to every
 /// pane's terminal of one tab. Per-tab twin of
 /// [`apply_blocks_output_cap_to_all_panes`]; called by the tab/pane creation
@@ -438,6 +449,14 @@ impl App {
         apply_blocks_output_cap_to_all_panes(
             self.sessions.tabs_mut(),
             config.blocks.output_cap_mib,
+        );
+
+        // v1.12.19 (T13b): retained_limit joins the all-tab walk — the
+        // Settings Blocks row must take effect on already-open tabs without
+        // a restart (closes the creation-time-only gap noted above).
+        apply_blocks_retained_limit_to_all_panes(
+            self.sessions.tabs_mut(),
+            config.blocks.retained_limit,
         );
 
         // v1.0 Logo: sync Dock icon if variant changed.

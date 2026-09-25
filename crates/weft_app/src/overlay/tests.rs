@@ -209,19 +209,22 @@ fn settings_tab_labels_are_distinct() {
 }
 
 #[test]
-fn settings_tab_all_has_six_visible_categories() {
+fn settings_tab_all_has_seven_visible_categories() {
     // F5: Logo merged into Appearance; Font merged into Appearance.
     // v1.8.3: LocalAi added as the 7th category (between Window and Advanced).
     // v1.11.0: Advanced removed from the visible list — placeholder rows have
     // no real config backing (PLAN_v111 item 1); the enum variant is kept.
-    // Visible: Appearance, Terminal, Input, Keybindings, Window, LocalAi.
-    assert_eq!(SettingsTab::ALL.len(), 6);
+    // v1.12.19 (PLAN_v11217 §3.8 T13b): Blocks joins right after Terminal.
+    // Visible: Appearance, Terminal, Blocks, Input, Keybindings, Window,
+    // LocalAi.
+    assert_eq!(SettingsTab::ALL.len(), 7);
     assert_eq!(SettingsTab::ALL[0], SettingsTab::Appearance);
     assert_eq!(SettingsTab::ALL[1], SettingsTab::Terminal);
-    assert_eq!(SettingsTab::ALL[2], SettingsTab::Input);
-    assert_eq!(SettingsTab::ALL[3], SettingsTab::Keybindings);
-    assert_eq!(SettingsTab::ALL[4], SettingsTab::Window);
-    assert_eq!(SettingsTab::ALL[5], SettingsTab::LocalAi);
+    assert_eq!(SettingsTab::ALL[2], SettingsTab::Blocks);
+    assert_eq!(SettingsTab::ALL[3], SettingsTab::Input);
+    assert_eq!(SettingsTab::ALL[4], SettingsTab::Keybindings);
+    assert_eq!(SettingsTab::ALL[5], SettingsTab::Window);
+    assert_eq!(SettingsTab::ALL[6], SettingsTab::LocalAi);
 }
 
 #[test]
@@ -289,6 +292,9 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         notify_threshold_secs: 30,
         notify_sound: false,
         osc52_mode: weft_core::config::Osc52Mode::Default,
+        recovery_mode: weft_core::config::RecoveryMode::Ask,
+        blocks_retained_limit: 2000,
+        blocks_output_cap_mib: 1,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -352,6 +358,9 @@ fn settings_overlay_is_modal_and_highest_z() {
                     notify_threshold_secs: 30,
                     notify_sound: false,
                     osc52_mode: weft_core::config::Osc52Mode::Default,
+                    recovery_mode: weft_core::config::RecoveryMode::Ask,
+                    blocks_retained_limit: 2000,
+                    blocks_output_cap_mib: 1,
                 }),
             },
         ],

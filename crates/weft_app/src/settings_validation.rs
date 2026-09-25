@@ -6,8 +6,9 @@ use font_kit::family_name::FamilyName;
 use font_kit::properties::Properties;
 use font_kit::source::SystemSource;
 use weft_core::config::{
-    Action, Config, ConfigSectionMask, EditorConfig, FontConfig, PasteConfig, PASTE_SIZE_TIERS_KIB,
-    SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    Action, Config, ConfigSectionMask, EditorConfig, FontConfig, PasteConfig, RecoveryMode,
+    PASTE_SIZE_TIERS_KIB, SCROLLBACK_MAX_LINES, SCROLLBACK_MIN_LINES, SIDEBAR_MAX_WIDTH,
+    SIDEBAR_MIN_WIDTH,
 };
 use weft_core::input::{KeyCode, Modifiers};
 
@@ -258,6 +259,149 @@ pub(crate) fn adjust_input_row(
     }
 }
 
+/// v1.12.19 (PLAN_v11217 §3.8 T13a/T13c): adjust the Settings Terminal-page
+/// row `row` by `delta` — the write-model twin of the page's painted rows,
+/// mirroring [`adjust_input_row`] so the mapping stays headless-tested.
+/// Rows 0-3 are the legacy scrollback / padding X / padding Y / contrast
+/// rows (row 0's clamp now uses the io-layer constants — T13c); row 4 is
+/// the Session recovery cycle. Returns the config section to mark dirty,
+/// or `None` for an unknown row.
+pub(crate) fn adjust_terminal_row(
+    scrollback_lines: &mut usize,
+    padding_x: &mut u32,
+    padding_y: &mut u32,
+    minimum_contrast: &mut f32,
+    recovery: &mut RecoveryMode,
+    row: usize,
+    delta: i32,
+) -> Option<ConfigSectionMask> {
+    match row {
+        0 => {
+            // Scrollback: ±1000 lines, clamped to the io-layer range
+            // (T13c: the old [1_000, 100_000] range fought the 100..=1M
+            // load clamp and tripped the validator above 100k).
+            *scrollback_lines = ((*scrollback_lines as i64).saturating_add(delta as i64 * 1000))
+                .clamp(SCROLLBACK_MIN_LINES as i64, SCROLLBACK_MAX_LINES as i64)
+                as usize;
+            Some(ConfigSectionMask::SCROLLBACK)
+        }
+        1 => {
+            // Padding X: ±1 cell, clamped to [0, 20].
+            *padding_x = ((*padding_x as i32 + delta).max(0) as u32).min(20);
+            Some(ConfigSectionMask::WINDOW)
+        }
+        2 => {
+            // Padding Y: ±1 cell, clamped to [0, 20].
+            *padding_y = ((*padding_y as i32 + delta).max(0) as u32).min(20);
+            Some(ConfigSectionMask::WINDOW)
+        }
+        3 => {
+            *minimum_contrast = adjust_finite_value(*minimum_contrast, delta, 0.5, 1.0, 12.0, 7.0);
+            Some(ConfigSectionMask::THEME)
+        }
+        4 => {
+            *recovery = cycled_recovery_mode(*recovery, delta);
+            Some(ConfigSectionMask::SESSION)
+        }
+        _ => None,
+    }
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): what the startup recovery path does
+/// when an unclean-shutdown snapshot exists. Pure decision core for
+/// `recovery_controller::run_startup_recovery` — headless-tested below; the
+/// controller only performs the parked-snapshot state machine the gate
+/// prescribes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryGate {
+    /// Show the deferred recovery prompt (factory behavior).
+    Prompt,
+    /// Skip the prompt; apply `RecoveryChoice::Restore` synchronously.
+    AutoRestore,
+    /// Skip the prompt; apply `RecoveryChoice::Ignore` synchronously (the
+    /// snapshot is superseded by the current session's auto-snapshot, never
+    /// deleted — permanent deletion stays a manual action).
+    NeverIgnore,
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): map the user's `[session].recovery`
+/// setting onto the startup-recovery action.
+pub(crate) fn recovery_gate(mode: RecoveryMode) -> RecoveryGate {
+    match mode {
+        RecoveryMode::Ask => RecoveryGate::Prompt,
+        RecoveryMode::Auto => RecoveryGate::AutoRestore,
+        RecoveryMode::Never => RecoveryGate::NeverIgnore,
+    }
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): Terminal-tab value labels for the
+/// Session recovery cycle row. Wording note: `never` still performs the
+/// NORMAL session-tab restore on launch — it only skips the crash-recovery
+/// prompt — so the label must not suggest "fresh start".
+pub(crate) fn recovery_mode_label(mode: RecoveryMode) -> &'static str {
+    match mode {
+        RecoveryMode::Ask => "Ask after unexpected quit",
+        RecoveryMode::Auto => "Auto-restore without prompting",
+        RecoveryMode::Never => "Skip crash-recovery prompt",
+    }
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): next recovery mode after cycling
+/// `delta` steps through ask → auto → never (wraps both ways; out-of-list
+/// stored values cannot occur — `RecoveryMode::parse` is never-fail).
+pub(crate) fn cycled_recovery_mode(current: RecoveryMode, delta: i32) -> RecoveryMode {
+    const MODES: [RecoveryMode; 3] = [RecoveryMode::Ask, RecoveryMode::Auto, RecoveryMode::Never];
+    let idx = MODES.iter().position(|m| *m == current).unwrap_or(0);
+    let next = (idx as i32 + delta).rem_euclid(MODES.len() as i32) as usize;
+    MODES[next]
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13b): upper bound for the Settings
+/// "Retained limit" row. NEW bound owned by this plan (there is no existing
+/// constant — the load path deliberately does not clamp `retained_limit`,
+/// the v1.11.2 power-user semantics); 20 000 blocks ≈ 10x the default cap.
+pub(crate) const BLOCKS_RETAINED_LIMIT_MAX: usize = 20_000;
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13b): adjust the Settings Blocks-page row
+/// `row` by `delta`. Row 0 is the per-tab in-memory retention cap
+/// (±50, clamped 0..=[`BLOCKS_RETAINED_LIMIT_MAX`]; 0 disables retention);
+/// row 1 is the retained-output cap in MiB (±1, clamped to the io-layer
+/// `OUTPUT_CAP_MIN/MAX_MIB` range). Returns the config section to mark
+/// dirty, or `None` for an unknown row / an unchanged value.
+pub(crate) fn adjust_blocks_row(
+    retained_limit: &mut usize,
+    output_cap_mib: &mut usize,
+    row: usize,
+    delta: i32,
+) -> Option<ConfigSectionMask> {
+    let mask = ConfigSectionMask::BLOCKS;
+    match row {
+        0 => {
+            let next = ((*retained_limit as i64) + delta as i64 * 50)
+                .clamp(0, BLOCKS_RETAINED_LIMIT_MAX as i64) as usize;
+            if next == *retained_limit {
+                None
+            } else {
+                *retained_limit = next;
+                Some(mask)
+            }
+        }
+        1 => {
+            let next = ((*output_cap_mib as i64) + delta as i64).clamp(
+                weft_core::blocks::OUTPUT_CAP_MIN_MIB as i64,
+                weft_core::blocks::OUTPUT_CAP_MAX_MIB as i64,
+            ) as usize;
+            if next == *output_cap_mib {
+                None
+            } else {
+                *output_cap_mib = next;
+                Some(mask)
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn adjust_finite_value(
     current: f32,
     delta: i32,
@@ -354,8 +498,15 @@ pub(crate) fn validate_settings(config: &Config) -> Vec<FieldError> {
         1.0,
         12.0,
     );
-    if !(1_000..=100_000).contains(&config.scrollback.lines) {
-        errors.push(("Scrollback".into(), "Must be 1000–100000 lines".into()));
+    // v1.12.19 (PLAN_v11217 §3.8 T13c): align the hard validation with the
+    // io-layer clamp constants (100 / 1_000_000) — previously a legal
+    // file-side value >100 000 opened the panel already in error, and the
+    // ←/→ stepper stopped at the narrower 1_000..=100_000 range.
+    if !(SCROLLBACK_MIN_LINES..=SCROLLBACK_MAX_LINES).contains(&config.scrollback.lines) {
+        errors.push((
+            "Scrollback".into(),
+            format!("Must be {SCROLLBACK_MIN_LINES}–{SCROLLBACK_MAX_LINES} lines"),
+        ));
     }
     if config.window.padding_x > 20 {
         errors.push(("Padding X".into(), "Must be at most 20 cells".into()));
@@ -383,374 +534,5 @@ pub(crate) fn validate_settings(config: &Config) -> Vec<FieldError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::overlay::SettingsKeybindingView;
-
-    fn kb(action: &str, binding: &str) -> SettingsKeybindingView {
-        SettingsKeybindingView {
-            action: action.into(),
-            binding: binding.into(),
-            conflict: false,
-        }
-    }
-
-    #[test]
-    fn programming_font_catalog_filters_missing_and_preserves_custom_current() {
-        let installed = ["Hack", "Fira Code"];
-        let families = filtered_programming_fonts("My Mono", |family| installed.contains(&family));
-        assert_eq!(families[0], "Menlo");
-        assert!(families.iter().any(|family| family == "Hack"));
-        assert!(families.iter().any(|family| family == "Fira Code"));
-        assert!(families.iter().any(|family| family == "My Mono"));
-        assert!(!families.iter().any(|family| family == "JetBrains Mono"));
-    }
-
-    #[test]
-    fn directional_booleans_use_left_for_off_and_right_for_on() {
-        assert!(!directional_bool(true, -1));
-        assert!(!directional_bool(false, -1));
-        assert!(directional_bool(false, 1));
-        assert!(directional_bool(true, 1));
-        assert!(directional_bool(true, 0));
-        assert!(!directional_bool(false, 0));
-    }
-
-    #[test]
-    fn programming_font_catalog_keeps_unavailable_selected_candidate() {
-        let families = filtered_programming_fonts("JetBrains Mono", |_| false);
-        assert_eq!(families, ["Menlo", "JetBrains Mono"]);
-    }
-
-    #[test]
-    fn display_conflicts_require_different_actions_on_the_same_label() {
-        let views = [kb("Copy", "cmd+x"), kb("Paste", "cmd+x")];
-        assert!(detect_keybinding_conflicts(&views).contains("cmd+x"));
-        let aliases = [kb("Paste", "cmd+v"), kb("Paste", "cmd+shift+v")];
-        assert!(detect_keybinding_conflicts(&aliases).is_empty());
-    }
-
-    #[test]
-    fn default_config_is_valid() {
-        assert!(validate_settings(&Config::default()).is_empty());
-    }
-
-    #[test]
-    fn invalid_runtime_geometry_uses_safe_values_without_mutating_source() {
-        let font = FontConfig {
-            size: f32::NAN,
-            line_height: f32::INFINITY,
-            ..FontConfig::default()
-        };
-        let safe = runtime_font_config(&font);
-        assert_eq!(safe.size, FontConfig::default().size);
-        assert_eq!(safe.line_height, FontConfig::default().line_height);
-        assert!(font.size.is_nan());
-        assert!(font.line_height.is_infinite());
-        assert_eq!(runtime_opacity(f32::NAN), 1.0);
-        assert_ne!(runtime_opacity(f32::NAN), runtime_opacity(0.95));
-        assert_eq!(runtime_minimum_contrast(f32::NAN), 7.0);
-        assert_eq!(runtime_sidebar_width(Some(f32::NAN)), None);
-    }
-
-    #[test]
-    fn valid_runtime_geometry_is_preserved() {
-        let font = FontConfig {
-            size: 18.0,
-            line_height: 1.4,
-            ..FontConfig::default()
-        };
-        assert_eq!(runtime_font_config(&font).size, 18.0);
-        assert_eq!(runtime_font_config(&font).line_height, 1.4);
-        assert_eq!(runtime_opacity(0.75), 0.75);
-        assert_eq!(runtime_minimum_contrast(5.5), 5.5);
-        assert_eq!(runtime_sidebar_width(Some(300.0)), Some(300.0));
-    }
-
-    #[test]
-    fn runtime_zoom_is_applied_after_base_font_validation() {
-        let font = FontConfig::default();
-        assert_eq!(runtime_scaled_font_config(&font, 0.5).size, 7.0);
-        assert_eq!(runtime_scaled_font_config(&font, 3.0).size, 42.0);
-
-        let invalid = FontConfig {
-            size: f32::NAN,
-            ..FontConfig::default()
-        };
-        assert_eq!(runtime_scaled_font_config(&invalid, 2.0).size, 28.0);
-        assert_eq!(runtime_atlas_font_config(&font).size, font.size);
-    }
-
-    #[test]
-    fn non_finite_and_every_numeric_boundary_are_rejected() {
-        let mut config = Config::default();
-        config.font.size = f32::NAN;
-        config.font.line_height = f32::INFINITY;
-        config.window.opacity = f32::NEG_INFINITY;
-        config.theme.minimum_contrast = f32::NAN;
-        config.scrollback.lines = 100;
-        config.window.padding_x = 21;
-        config.window.padding_y = 21;
-        config.window.width = 4_001;
-        config.window.height = 299;
-        config.window.sidebar_width = Some(f32::NAN);
-        let labels: Vec<_> = validate_settings(&config)
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
-        for expected in [
-            "Font Size",
-            "Line Height",
-            "Window Opacity",
-            "Minimum Contrast",
-            "Scrollback",
-            "Padding X",
-            "Padding Y",
-            "Window Width",
-            "Window Height",
-            "Sidebar Width",
-        ] {
-            assert!(labels.iter().any(|label| label == expected), "{expected}");
-        }
-    }
-
-    #[test]
-    fn numeric_minimum_and_maximum_boundaries_are_inclusive() {
-        let mut config = Config::default();
-        config.font.size = 8.0;
-        config.font.line_height = 1.0;
-        config.window.opacity = 0.5;
-        config.theme.minimum_contrast = 1.0;
-        config.scrollback.lines = 1_000;
-        config.window.padding_x = 20;
-        config.window.padding_y = 20;
-        config.window.width = 400;
-        config.window.height = 300;
-        config.window.sidebar_width = Some(SIDEBAR_MIN_WIDTH);
-        assert!(validate_settings(&config).is_empty());
-
-        config.font.size = 24.0;
-        config.font.line_height = 1.5;
-        config.theme.minimum_contrast = 12.0;
-        config.window.opacity = 1.0;
-        config.scrollback.lines = 100_000;
-        config.window.width = 4_000;
-        config.window.height = 4_000;
-        config.window.sidebar_width = Some(SIDEBAR_MAX_WIDTH);
-        assert!(validate_settings(&config).is_empty());
-    }
-
-    #[test]
-    fn invalid_and_canonical_alias_conflicts_block_save_validation() {
-        let mut config = Config::default();
-        config
-            .keybindings
-            .insert("not-a-chord".into(), Action::Copy);
-        config
-            .keybindings
-            .insert("cmd+return".into(), Action::NewTab);
-        config
-            .keybindings
-            .insert("super+enter".into(), Action::CloseTab);
-        let errors = validate_settings(&config);
-        assert!(errors
-            .iter()
-            .any(|(label, message)| label == "Keybindings" && message.contains("Invalid")));
-        assert!(errors
-            .iter()
-            .any(|(label, message)| label == "Keybindings" && message.contains("conflicts")));
-    }
-
-    #[test]
-    fn canonical_aliases_for_the_same_action_are_allowed() {
-        let mut config = Config::default();
-        config
-            .keybindings
-            .insert("cmd+return".into(), Action::NewTab);
-        config
-            .keybindings
-            .insert("super+enter".into(), Action::NewTab);
-        assert!(validate_settings(&config).is_empty());
-    }
-
-    #[test]
-    fn non_finite_draft_value_recovers_from_fallback_before_adjustment() {
-        assert_eq!(adjust_finite_value(f32::NAN, 1, 0.5, 8.0, 24.0, 14.0), 14.5);
-        assert_eq!(
-            adjust_finite_value(f32::INFINITY, -1, 0.05, 0.5, 1.0, 1.0),
-            0.95
-        );
-        assert_eq!(adjust_finite_value(24.0, 1, 0.5, 8.0, 24.0, 14.0), 24.0);
-    }
-
-    // ── v1.11.1 runtime_paste_config (PLAN_v1111 §4.2) ─────────────────
-
-    #[test]
-    fn paste_config_every_legal_tier_is_preserved() {
-        for kib in PASTE_SIZE_TIERS_KIB {
-            let cfg = runtime_paste_config(&PasteConfig {
-                size_threshold_kib: kib,
-                ..PasteConfig::default()
-            });
-            assert_eq!(cfg.size_threshold_kib, kib, "tier {kib} must pass through");
-        }
-    }
-
-    #[test]
-    fn paste_config_out_of_tier_thresholds_fall_back_to_16kib_without_mutating_source() {
-        for bad in [0u32, 7, 12, 17, 300, u32::MAX] {
-            let source = PasteConfig {
-                size_threshold_kib: bad,
-                confirm_large: false,
-                confirm_control_chars: true,
-            };
-            let safe = runtime_paste_config(&source);
-            assert_eq!(safe.size_threshold_kib, 16, "{bad} KiB is not a legal tier");
-            assert!(!safe.confirm_large);
-            assert!(safe.confirm_control_chars);
-            assert_eq!(
-                source.size_threshold_kib, bad,
-                "the stored config value must not be mutated"
-            );
-        }
-    }
-
-    #[test]
-    fn cycled_paste_threshold_walks_all_tiers_and_wraps_both_ways() {
-        // Forward from the default walks the documented order.
-        assert_eq!(cycled_paste_threshold(16, 1), 32);
-        assert_eq!(cycled_paste_threshold(256, 1), 8, "wraps at the top");
-        // Backward wraps at the bottom.
-        assert_eq!(cycled_paste_threshold(8, -1), 256);
-        assert_eq!(cycled_paste_threshold(64, -1), 32);
-        // An out-of-tier stored value re-anchors at the default step.
-        assert_eq!(cycled_paste_threshold(12, 1), 32);
-        assert_eq!(cycled_paste_threshold(12, -1), 8);
-    }
-
-    #[test]
-    fn adjust_input_rows_map_to_their_config_sections() {
-        let mut editor = EditorConfig::default();
-        let mut paste = PasteConfig {
-            confirm_large: false,
-            ..PasteConfig::default()
-        };
-
-        // Rows 0-1 are the [editor] toggles.
-        assert_eq!(
-            adjust_input_row(&mut editor, &mut paste, 0, 1),
-            Some(ConfigSectionMask::EDITOR)
-        );
-        assert!(editor.submit_on_ctrl_enter);
-        // Smart Select defaults On, so ← flips it off while → would be a
-        // no-op (covered by the noop test below).
-        assert_eq!(
-            adjust_input_row(&mut editor, &mut paste, 1, -1),
-            Some(ConfigSectionMask::EDITOR)
-        );
-        assert!(!editor.smart_select);
-
-        // Rows 2-3 are the [paste] toggles; row 2 flips its off default on,
-        // row 3 flips its On default off.
-        assert_eq!(
-            adjust_input_row(&mut editor, &mut paste, 2, 1),
-            Some(ConfigSectionMask::PASTE)
-        );
-        assert!(paste.confirm_large);
-        assert_eq!(
-            adjust_input_row(&mut editor, &mut paste, 3, -1),
-            Some(ConfigSectionMask::PASTE)
-        );
-        assert!(!paste.confirm_control_chars);
-
-        // Row 4 cycles the threshold.
-        assert_eq!(
-            adjust_input_row(&mut editor, &mut paste, 4, 1),
-            Some(ConfigSectionMask::PASTE)
-        );
-        assert_eq!(paste.size_threshold_kib, 32);
-    }
-
-    #[test]
-    fn adjust_input_row_is_a_noop_when_the_value_already_matches() {
-        let mut editor = EditorConfig::default();
-        let mut paste = PasteConfig::default();
-        // Smart Select defaults On; → on an already-On row changes nothing.
-        assert_eq!(adjust_input_row(&mut editor, &mut paste, 1, 1), None);
-        assert!(editor.smart_select);
-        // Unknown rows never dirty anything.
-        assert_eq!(adjust_input_row(&mut editor, &mut paste, 5, 1), None);
-        assert_eq!(adjust_input_row(&mut editor, &mut paste, 99, -1), None);
-        assert_eq!(paste, PasteConfig::default());
-        assert!(!editor.submit_on_ctrl_enter);
-        assert!(editor.smart_select);
-    }
-
-    #[test]
-    fn input_page_read_model_and_write_model_stay_aligned() {
-        // The painted labels and the ←/→ write mapping must cover the same
-        // five rows in the same order (paint/settings renders row i from
-        // input_page_row_values()[i]; adjust_input_row writes row i).
-        let paste = PasteRowsView {
-            confirm_large: false,
-            confirm_control_chars: true,
-            size_threshold_kib: 16,
-        };
-        let rows = input_page_row_values(false, true, paste);
-        assert_eq!(rows.len(), 5);
-        assert_eq!(rows[4], ("Paste size threshold:", "16 KiB".to_string()));
-        for (row, (label, value)) in rows.iter().take(4).enumerate() {
-            assert!(
-                value == "On" || value == "Off",
-                "row {row} ({label}) must render an On/Off value"
-            );
-            // Each toggle row is adjustable in at least one direction.
-            let mut editor = EditorConfig::default();
-            let mut paste_cfg = PasteConfig {
-                confirm_large: false,
-                ..PasteConfig::default()
-            };
-            let changed = adjust_input_row(&mut editor, &mut paste_cfg, row, -1).is_some()
-                || adjust_input_row(&mut editor, &mut paste_cfg, row, 1).is_some();
-            assert!(changed, "toggle row {row} ({label}) must be adjustable");
-        }
-    }
-
-    // ── v1.11.5 (PLAN_v1115 §M8): Advanced-page cycles ────────────────
-
-    #[test]
-    fn notify_threshold_cycles_through_four_tiers() {
-        // 30 → 60 (right) / 30 → 10 (left), wrapping both ends.
-        assert_eq!(cycled_notify_threshold(30, 1), 60);
-        assert_eq!(cycled_notify_threshold(30, -1), 10);
-        assert_eq!(cycled_notify_threshold(120, 1), 10, "wrap around top");
-        assert_eq!(cycled_notify_threshold(10, -1), 120, "wrap around bottom");
-        assert_eq!(cycled_notify_threshold(30, 0), 30, "no-op");
-        // Hand-edited out-of-tier value re-anchors at the default (30).
-        assert_eq!(cycled_notify_threshold(45, 1), 60);
-        assert_eq!(cycled_notify_threshold(0, 1), 60);
-        // The exact tiers the Settings UI promises.
-        assert_eq!(NOTIFY_THRESHOLD_TIERS_SECS, [10, 30, 60, 120]);
-    }
-
-    #[test]
-    fn osc52_mode_cycles_through_three_states() {
-        use weft_core::config::Osc52Mode;
-        assert_eq!(cycled_osc52_mode(Osc52Mode::Default, 1), Osc52Mode::Off);
-        assert_eq!(
-            cycled_osc52_mode(Osc52Mode::Off, 1),
-            Osc52Mode::Unrestricted
-        );
-        assert_eq!(
-            cycled_osc52_mode(Osc52Mode::Unrestricted, 1),
-            Osc52Mode::Default,
-            "wrap around"
-        );
-        assert_eq!(
-            cycled_osc52_mode(Osc52Mode::Default, -1),
-            Osc52Mode::Unrestricted,
-            "wrap around backwards"
-        );
-        assert_eq!(cycled_osc52_mode(Osc52Mode::Off, 0), Osc52Mode::Off);
-    }
-}
+#[path = "settings_validation/tests.rs"]
+mod tests;

@@ -377,6 +377,14 @@ impl BlockTracker {
         self.current_cwd = cwd;
     }
 
+    /// v1.12.19 (PLAN_v11217 §3.8 T13b): the configured in-memory retention
+    /// cap (0 = retention disabled). Read-side twin of
+    /// `set_retained_limit` — the all-tab walk test asserts the config
+    /// value reached every pane's tracker.
+    pub fn retained_limit(&self) -> usize {
+        self.retained_limit
+    }
+
     /// PLAN_v11217 §3.5 (T4): the configured retained-output cap in bytes.
     /// Every bounding site of user-visible retained text reads this — never a
     /// global constant — so `[blocks] output_cap_mib` takes effect per tab.

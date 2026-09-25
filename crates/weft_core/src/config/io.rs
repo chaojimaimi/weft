@@ -529,6 +529,64 @@ output_cap_mib = 32
         let _ = std::fs::remove_file(&path);
     }
 
+    // ── v1.12.19 (PLAN_v11217 §3.8 T13a): [session] recovery round-trip ──
+
+    /// `recovery = "auto"` must survive a save → reload cycle, and an
+    /// all-default `[session]` must not gain a `recovery` key on save
+    /// (non-default-only write contract, blocks/clipboard precedent).
+    #[test]
+    fn session_recovery_round_trips_through_save_and_profile() {
+        let path = tmp("session-roundtrip");
+        let _ = std::fs::remove_file(&path);
+        // A `[profiles.x.session]` section is a schema error (ProfileConfig
+        // has no session field — global-only like [ai]), so the profile leg
+        // of this test only asserts the parse rejection below.
+        let cfg_only = "[session]\nrecovery = \"auto\"\n";
+        std::fs::write(&path, cfg_only).unwrap();
+        let loaded = load_resolved_from_path(&path).unwrap();
+        assert_eq!(
+            loaded.source.session.recovery,
+            crate::config::RecoveryMode::Auto
+        );
+
+        // Save the source back out and reload — the key must survive.
+        let path2 = tmp("session-roundtrip-2");
+        let _ = std::fs::remove_file(&path2);
+        loaded.source.save_to_path(&path2).unwrap();
+        let text = std::fs::read_to_string(&path2).unwrap();
+        assert!(
+            text.contains("recovery = \"auto\""),
+            "non-default recovery must persist: {text}"
+        );
+        let reloaded = load_resolved_from_path(&path2).unwrap();
+        assert_eq!(
+            reloaded.source.session.recovery,
+            crate::config::RecoveryMode::Auto
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+
+        // All-default session: no `recovery` key in the saved file.
+        let path3 = tmp("session-default-save");
+        let _ = std::fs::remove_file(&path3);
+        crate::config::Config::default()
+            .save_to_path(&path3)
+            .unwrap();
+        let text = std::fs::read_to_string(&path3).unwrap();
+        assert!(
+            !text.contains("recovery"),
+            "default recovery must stay out of the saved file: {text}"
+        );
+        let _ = std::fs::remove_file(&path3);
+
+        // `[profiles.x.session]` is rejected by deny_unknown_fields.
+        let path4 = tmp("session-profile-reject");
+        let _ = std::fs::remove_file(&path4);
+        std::fs::write(&path4, "[profiles.work.session]\nrecovery = \"auto\"\n").unwrap();
+        assert!(load_resolved_from_path(&path4).is_err());
+        let _ = std::fs::remove_file(&path4);
+    }
+
     // ── v1.11.2 X3: [scrollback] lines clamp (PLAN_v1112 §5) ───────────
     #[test]
     fn normalize_scrollback_clamps_default_into_range() {

@@ -459,6 +459,75 @@ impl Default for NotificationsConfig {
     }
 }
 
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): crash-recovery prompt behavior for an
+/// unclean shutdown.
+///
+/// - `Ask` — show the recovery prompt on the next launch (pre-T13 behavior,
+///   the factory default).
+/// - `Auto` — skip the prompt and restore the snapshot automatically.
+/// - `Never` — skip the prompt and start fresh; the snapshot is superseded
+///   by the current session's auto-snapshot (NOT deleted — permanent
+///   deletion stays a manual action).
+///
+/// Unknown/illegal TOML values fall back to `Ask` — a typo must never fail
+/// the whole config parse (same never-fail philosophy as `Osc52Mode`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryMode {
+    #[default]
+    Ask,
+    Auto,
+    Never,
+}
+
+impl RecoveryMode {
+    /// Canonical TOML spelling (lowercase).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Never => "never",
+        }
+    }
+
+    /// Parse a TOML value; anything unrecognized → `Ask` (never fails).
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "auto" => Self::Auto,
+            "never" => Self::Never,
+            _ => Self::Ask,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RecoveryMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::parse(&raw))
+    }
+}
+
+/// v1.12.19 (PLAN_v11217 §3.8 T13a): `[session]` section — session
+/// lifecycle switches. Global only (`ProfileConfig` has no `session`
+/// field; a `session` section inside a profile is a schema error by
+/// `deny_unknown_fields`, mirroring `[ai]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// What to do with a crash-recovery snapshot on the next launch.
+    pub recovery: RecoveryMode,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            recovery: RecoveryMode::Ask,
+        }
+    }
+}
+
 /// v1.11.7 (PLAN_v1117_SHADOW_BLOCK_VIEW §三 M1.2, D-d): `[experimental]`
 /// section — experimental switches that are not yet stable enough for
 /// Settings UI rows (config-file keys, like `[blocks]`/`[compat]`).
@@ -479,72 +548,6 @@ impl Default for ExperimentalConfig {
         Self {
             tui_render_mode: TuiRenderMode::Noninteractive,
         }
-    }
-}
-
-#[cfg(test)]
-mod paste_config_tests {
-    use super::{PasteConfig, PASTE_SIZE_TIERS_KIB};
-    #[test]
-    fn defaults_confirm_both_risks_at_16kib() {
-        let cfg = PasteConfig::default();
-        assert!(cfg.confirm_large);
-        assert!(cfg.confirm_control_chars);
-        assert_eq!(cfg.size_threshold_kib, 16);
-    }
-
-    #[test]
-    fn missing_section_deserializes_to_defaults() {
-        let cfg: PasteConfig = toml::from_str("[paste]").unwrap();
-        assert_eq!(cfg, PasteConfig::default());
-    }
-
-    #[test]
-    fn threshold_tier_list_is_the_six_documented_steps() {
-        assert_eq!(PASTE_SIZE_TIERS_KIB, [8, 16, 32, 64, 128, 256]);
-        // The default must be one of the cycle steps so the Settings row can
-        // round-trip its position.
-        assert!(PASTE_SIZE_TIERS_KIB.contains(&PasteConfig::default().size_threshold_kib));
-    }
-}
-
-#[cfg(test)]
-mod blocks_config_tests {
-    use super::BlocksConfig;
-
-    /// v1.11.2 X4: default matches the tracker default; section optional.
-    #[test]
-    fn defaults_to_tracker_retention_cap() {
-        assert_eq!(
-            BlocksConfig::default().retained_limit,
-            crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT
-        );
-        let cfg: BlocksConfig = toml::from_str("[blocks]").unwrap();
-        assert_eq!(cfg, BlocksConfig::default());
-    }
-
-    #[test]
-    fn parses_hand_written_value_including_zero_disable() {
-        // Deserialize from the section's own table body.
-        let cfg: BlocksConfig = toml::from_str("retained_limit = 500").unwrap();
-        assert_eq!(cfg.retained_limit, 500);
-        let cfg: BlocksConfig = toml::from_str("retained_limit = 0").unwrap();
-        assert_eq!(cfg.retained_limit, 0, "0 = retention disabled");
-    }
-
-    /// PLAN_v11217 §3.5 (T4): defaults to 1, parses from TOML; parse does
-    /// NOT clamp (that lives in `normalize_blocks` / `set_output_cap`).
-    #[test]
-    fn output_cap_mib_defaults_and_parses() {
-        let default = BlocksConfig::default();
-        assert_eq!(
-            default.output_cap_mib,
-            crate::blocks::OUTPUT_CAP_DEFAULT_MIB
-        );
-        let cfg: BlocksConfig = toml::from_str("output_cap_mib = 8").unwrap();
-        assert_eq!(cfg.output_cap_mib, 8);
-        let cfg: BlocksConfig = toml::from_str("[blocks]").unwrap();
-        assert_eq!(cfg, default, "section is optional");
     }
 }
 
@@ -724,77 +727,5 @@ impl AiConfig {
 }
 
 #[cfg(test)]
-mod ai_config_tests {
-    use super::*;
-
-    #[test]
-    fn unconfigured_when_no_provider() {
-        let cfg = AiConfig::default();
-        assert!(!cfg.is_configured());
-        assert_eq!(cfg.provider_kind(), None);
-        assert_eq!(cfg.effective_timeout_secs(), 30);
-        assert_eq!(cfg.effective_max_tokens(), 4096);
-    }
-
-    #[test]
-    fn ollama_configured_without_api_key() {
-        let cfg = AiConfig {
-            provider: Some("ollama".into()),
-            ..Default::default()
-        };
-        assert!(cfg.is_configured());
-        assert_eq!(cfg.provider_kind(), Some("ollama"));
-    }
-
-    #[test]
-    fn openai_no_longer_configured_in_v18() {
-        // v1.8: only "ollama" is accepted. Old configs with "openai" /
-        // "anthropic" / "custom" should be treated as unconfigured so the
-        // user sees a hint to switch rather than a silent breakage.
-        let cfg = AiConfig {
-            provider: Some("openai".into()),
-            api_key: Some("sk-test".into()),
-            ..Default::default()
-        };
-        assert!(!cfg.is_configured());
-    }
-
-    #[test]
-    fn anthropic_no_longer_configured_in_v18() {
-        let cfg = AiConfig {
-            provider: Some("anthropic".into()),
-            api_key: Some("sk-ant-test".into()),
-            ..Default::default()
-        };
-        assert!(!cfg.is_configured());
-    }
-
-    #[test]
-    fn custom_no_longer_configured_in_v18() {
-        let cfg = AiConfig {
-            provider: Some("custom".into()),
-            base_url: Some("https://internal.example.com/v1".into()),
-            ..Default::default()
-        };
-        assert!(!cfg.is_configured());
-    }
-
-    #[test]
-    fn empty_api_key_treated_as_unset() {
-        // v1.8: api_key is ignored entirely, but the field is kept for
-        // backwards-compat deserialization. Any value is "unset".
-        let cfg = AiConfig {
-            provider: Some("anthropic".into()),
-            api_key: Some("   ".into()),
-            ..Default::default()
-        };
-        assert!(!cfg.is_configured());
-    }
-
-    #[test]
-    fn defaults_command_generation_on_diagnosis_off() {
-        let cfg = AiConfig::default();
-        assert!(cfg.enable_command_generation);
-        assert!(!cfg.enable_error_diagnosis);
-    }
-}
+#[path = "sections/tests.rs"]
+mod tests;

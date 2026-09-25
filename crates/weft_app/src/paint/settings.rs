@@ -12,6 +12,8 @@
 //! errors render inline next to the offending field. Keybinding conflicts
 //! get a summary badge. Advanced rows carry restart-required badges.
 
+mod pages;
+
 use crate::paint::primitives::{color_to_normalized, push_filled_triangle, push_line, push_quad};
 use crate::renderer::MetalRenderer;
 use crate::settings_component::settings_value_x;
@@ -276,51 +278,47 @@ impl MetalRenderer {
                     );
                 }
                 SettingsTab::Terminal => {
-                    let rows: [(&str, String, &str); 4] = [
-                        (
-                            "Scrollback:",
-                            format!("{} lines", s.scrollback_lines),
-                            "Scrollback",
-                        ),
-                        (
-                            "Padding X:",
-                            format!("{} cells", s.window_padding_x),
-                            "Padding X",
-                        ),
-                        (
-                            "Padding Y:",
-                            format!("{} cells", s.window_padding_y),
-                            "Padding Y",
-                        ),
-                        (
-                            "Contrast:",
-                            format!("{:.1}:1", s.minimum_contrast),
-                            "Minimum Contrast",
-                        ),
-                    ];
-                    for (i, (label, value, err_label)) in rows.iter().enumerate() {
-                        let row_y = content_top + i as f32 * ch;
-                        let is_sel = i == s.selection;
-                        self.push_settings_row(
-                            &mut verts,
-                            row_y,
-                            label,
-                            value,
-                            is_sel,
-                            content_x0,
-                            content_x1,
-                            value_x,
-                            cw,
-                            ch,
-                            content_cols,
-                            bg_uv,
-                            selection_bg,
-                            fg,
-                            label_c,
-                            accent,
-                            find_field_error(s.field_errors, err_label),
-                        );
-                    }
+                    // v1.12.19 (PLAN_v11217 §3.8 T13a): row 4 is the Session
+                    // recovery three-state cycle — body in settings/pages.rs
+                    // (line-budget split, child-module privacy).
+                    self.render_terminal_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        value_x,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        fg,
+                        label_c,
+                        accent,
+                    );
+                }
+                SettingsTab::Blocks => {
+                    // v1.12.19 (PLAN_v11217 §3.8 T13b): the [blocks] rows
+                    // leave config-only territory — body in
+                    // settings/pages.rs (line-budget split).
+                    self.render_blocks_content(
+                        &mut verts,
+                        s,
+                        content_top,
+                        content_x0,
+                        content_x1,
+                        value_x,
+                        cw,
+                        ch,
+                        content_cols,
+                        bg_uv,
+                        selection_bg,
+                        fg,
+                        label_c,
+                        accent,
+                        warning_c,
+                    );
                 }
                 SettingsTab::Input => {
                     // v1.11.1 (PLAN_v1111 §4.6): row model shared with the

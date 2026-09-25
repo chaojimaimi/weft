@@ -106,6 +106,13 @@ pub struct SettingsViewParams<'a> {
     pub settings_notify_threshold_secs: u64,
     pub settings_notify_sound: bool,
     pub settings_osc52_mode: weft_core::config::Osc52Mode,
+    /// v1.12.19 (PLAN_v11217 §3.8 T13a): Terminal row 5 draft value.
+    pub settings_recovery_mode: weft_core::config::RecoveryMode,
+    /// v1.12.19 (PLAN_v11217 §3.8 T13b): Blocks tab draft values. Draft
+    /// projections like `settings_scrollback_lines` (:163 precedent) — NOT
+    /// snapshot fields, or ←/→ steps would not repaint the value.
+    pub settings_blocks_retained_limit: usize,
+    pub settings_blocks_output_cap_mib: usize,
 }
 
 /// v1.11 audit (PLAN_audit_fix_batch3 C4): settings-domain *owned* computed
@@ -186,6 +193,9 @@ impl crate::app_state::SettingsState {
             settings_notify_threshold_secs: self.draft.notifications.threshold_secs,
             settings_notify_sound: self.draft.notifications.sound,
             settings_osc52_mode: self.draft.clipboard.osc52,
+            settings_recovery_mode: self.draft.session.recovery,
+            settings_blocks_retained_limit: self.draft.blocks.retained_limit,
+            settings_blocks_output_cap_mib: self.draft.blocks.output_cap_mib,
         }
     }
 }

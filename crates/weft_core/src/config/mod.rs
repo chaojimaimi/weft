@@ -74,8 +74,8 @@ pub use save::ConfigSaveError;
 pub use sections::{
     AiConfig, BlocksConfig, ClipboardConfig, CompatConfig, EditorConfig, ExperimentalConfig,
     FontConfig, LogoConfig, LogoVariant, NotificationsConfig, Osc52Mode, OutputSemanticConfig,
-    PasteConfig, ScrollbackConfig, SyntaxConfig, ThemeConfig, UiConfig, WindowConfig,
-    PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
+    PasteConfig, RecoveryMode, ScrollbackConfig, SessionConfig, SyntaxConfig, ThemeConfig,
+    UiConfig, WindowConfig, PASTE_SIZE_TIERS_KIB, SIDEBAR_MAX_WIDTH, SIDEBAR_MIN_WIDTH,
 };
 pub use theme::{OutputSemanticColors, SyntaxColors, Theme, ThemeUi};
 pub use theme_import::{
@@ -119,6 +119,10 @@ pub struct Config {
     /// `noninteractive`) is the primary-screen TUI render tier injected into
     /// every constructed Terminal (P2-3).
     pub experimental: ExperimentalConfig,
+    /// v1.12.19 (PLAN_v11217 §3.8 T13a): session lifecycle switches
+    /// (`[session].recovery` — crash-recovery prompt behavior). Global only
+    /// (`ProfileConfig` has no `session` field, like `[ai]`).
+    pub session: SessionConfig,
     pub logo: LogoConfig,
     /// v1.6 AI integration. Disabled by default (`provider = None`).
     /// Config schema is parsed/serialized today so existing config files keep
@@ -634,6 +638,30 @@ impl Config {
                 if t.iter().count() == 0 {
                     doc.remove("experimental");
                 }
+            }
+        }
+
+        // [session] section — v1.12.19 (PLAN_v11217 §3.8 T13a): only write
+        // `recovery` when it differs from the default (ask); remove the
+        // key/table otherwise so a stale file never pins a changed default
+        // (same minimal-write contract as [clipboard] above).
+        if self.session.recovery != SessionConfig::default().recovery {
+            let session_entry = doc.entry("session").or_insert_with(toml_edit::table);
+            if session_entry.is_none() {
+                *session_entry = toml_edit::table();
+            }
+            match session_entry.as_table_mut() {
+                Some(t) => {
+                    t["recovery"] = toml_edit::value(self.session.recovery.as_str());
+                }
+                None => {
+                    tracing::warn!("[session] section is not a table; skipping write");
+                }
+            }
+        } else if let Some(t) = doc.get_mut("session").and_then(|i| i.as_table_mut()) {
+            t.remove("recovery");
+            if t.iter().count() == 0 {
+                doc.remove("session");
             }
         }
 

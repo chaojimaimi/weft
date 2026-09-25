@@ -100,8 +100,11 @@ pub enum OverlayContent<'a> {
 pub enum SettingsTab {
     /// Theme list, logo variant, font family/size/line-height, window opacity.
     Appearance,
-    /// Scrollback, padding X/Y, alt-screen behavior.
+    /// Scrollback, padding X/Y, contrast, session recovery.
     Terminal,
+    /// v1.12.19 (PLAN_v11217 §3.8 T13b): block retention (Retained limit,
+    /// Output cap) — `[blocks]` rows promoted out of config-only territory.
+    Blocks,
     /// Editor mode (submit_on_ctrl_enter), IME / mouse settings.
     Input,
     /// Keybinding list + conflict detection + restore defaults.
@@ -124,10 +127,12 @@ impl SettingsTab {
     /// v1.11.0: `Advanced` 从可见列表移除（空壳 placeholder 无配置支撑，
     /// 见 AUDIT_v1.10.39 P2-M7 / PLAN_v111 第 1 项）。变体仍存在以满足
     /// 各 match 的穷尽性；键盘导航（Tab/↑/↓）与绘制/命中区全部由本列表
-    /// 驱动，故移除即全局隐藏。
-    pub const ALL: [SettingsTab; 6] = [
+    /// 驱动，故移除即全局隐藏。v1.12.19 (T13b): `Blocks` joins right
+    /// after `Terminal` (7 categories).
+    pub const ALL: [SettingsTab; 7] = [
         SettingsTab::Appearance,
         SettingsTab::Terminal,
+        SettingsTab::Blocks,
         SettingsTab::Input,
         SettingsTab::Keybindings,
         SettingsTab::Window,
@@ -139,6 +144,7 @@ impl SettingsTab {
         match self {
             SettingsTab::Appearance => "Appearance",
             SettingsTab::Terminal => "Terminal",
+            SettingsTab::Blocks => "Blocks",
             SettingsTab::Input => "Input",
             SettingsTab::Keybindings => "Keybindings",
             SettingsTab::Window => "Window",
@@ -300,6 +306,12 @@ pub struct SettingsDrawParams<'a> {
     pub notify_threshold_secs: u64,
     pub notify_sound: bool,
     pub osc52_mode: weft_core::config::Osc52Mode,
+    /// v1.12.19 (PLAN_v11217 §3.8 T13a/T13b): Terminal row 5 + Blocks tab
+    /// draft values (review P1a: draft projections, not snapshot, so ←/→
+    /// steps repaint immediately).
+    pub recovery_mode: weft_core::config::RecoveryMode,
+    pub blocks_retained_limit: usize,
+    pub blocks_output_cap_mib: usize,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -453,11 +465,12 @@ impl OverlayWarmup for OverlayContent<'_> {
                 // F5: sidebar category labels + status text + theme names + keybinding strings.
                 // v1.11.0: "Advanced" removed from the warmup — the tab is
                 // hidden from the sidebar (see SettingsTab::ALL).
+                // v1.12.19: Blocks tab + Terminal's Session recovery row.
                 missing.extend(
-                    "Settings Appearance Terminal Input Keybindings Window Local AI".chars(),
+                    "Settings Appearance Terminal Blocks Input Keybindings Window Local AI".chars(),
                 );
                 missing.extend(
-                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing"
+                    "Theme: Font: Size: Line: Opacity Padding Scrollback Lines Variant: Width Height Sidebar Submit Debug Experimental Conflict restart Semantic: On Off Enabled: Model: URL: Tokens: Timeout: Cmd Generation: Error Diagnosis: Test Connection Connected models Failed Not tested Testing Session recovery: Retained limit: Output cap: Unlimited MiB applies on next launch Ask after unexpected quit Auto-restore without prompting Skip crash-recovery prompt 0 keeps every block in memory — raise only with care"
                         .chars(),
                 );
                 // v1.0 fix: warm up the actual footer glyphs. The footer
@@ -761,6 +774,9 @@ pub fn build_overlay_stack<'a>(
                 notify_threshold_secs: settings.settings_notify_threshold_secs,
                 notify_sound: settings.settings_notify_sound,
                 osc52_mode: settings.settings_osc52_mode,
+                recovery_mode: settings.settings_recovery_mode,
+                blocks_retained_limit: settings.settings_blocks_retained_limit,
+                blocks_output_cap_mib: settings.settings_blocks_output_cap_mib,
             }),
         });
     }

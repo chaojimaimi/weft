@@ -935,7 +935,7 @@
       "footer_y": 596.0,
       "max_rows": 25,
       "scene": {
-        "hit_count": 7,
+        "hit_count": 8,
         "hits": [
           {
             "bounds": [
@@ -962,7 +962,7 @@
               430.0,
               176.0
             ],
-            "target": "SidebarCategory(Input)"
+            "target": "SidebarCategory(Blocks)"
           },
           {
             "bounds": [
@@ -971,7 +971,7 @@
               430.0,
               194.0
             ],
-            "target": "SidebarCategory(Keybindings)"
+            "target": "SidebarCategory(Input)"
           },
           {
             "bounds": [
@@ -980,7 +980,7 @@
               430.0,
               212.0
             ],
-            "target": "SidebarCategory(Window)"
+            "target": "SidebarCategory(Keybindings)"
           },
           {
             "bounds": [
@@ -988,6 +988,15 @@
               212.0,
               430.0,
               230.0
+            ],
+            "target": "SidebarCategory(Window)"
+          },
+          {
+            "bounds": [
+              70.0,
+              230.0,
+              430.0,
+              248.0
             ],
             "target": "SidebarCategory(LocalAi)"
           },
@@ -1001,7 +1010,7 @@
             "target": "ApplyButton"
           }
         ],
-        "semantic_count": 8,
+        "semantic_count": 9,
         "semantics": [
           {
             "bounds": [
@@ -1047,7 +1056,7 @@
               176.0
             ],
             "focus": "Settings",
-            "label": "Input",
+            "label": "Blocks",
             "role": "Tab",
             "state": ""
           },
@@ -1059,7 +1068,7 @@
               194.0
             ],
             "focus": "Settings",
-            "label": "Keybindings",
+            "label": "Input",
             "role": "Tab",
             "state": ""
           },
@@ -1071,7 +1080,7 @@
               212.0
             ],
             "focus": "Settings",
-            "label": "Window",
+            "label": "Keybindings",
             "role": "Tab",
             "state": ""
           },
@@ -1081,6 +1090,18 @@
               212.0,
               430.0,
               230.0
+            ],
+            "focus": "Settings",
+            "label": "Window",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              70.0,
+              230.0,
+              430.0,
+              248.0
             ],
             "focus": "Settings",
             "label": "Local AI",
@@ -1125,7 +1146,7 @@
       "footer_y": 774.0,
       "max_rows": 33,
       "scene": {
-        "hit_count": 28,
+        "hit_count": 29,
         "hits": [
           {
             "bounds": [
@@ -1152,7 +1173,7 @@
               491.904,
               198.0
             ],
-            "target": "SidebarCategory(Input)"
+            "target": "SidebarCategory(Blocks)"
           },
           {
             "bounds": [
@@ -1161,7 +1182,7 @@
               491.904,
               216.0
             ],
-            "target": "SidebarCategory(Keybindings)"
+            "target": "SidebarCategory(Input)"
           },
           {
             "bounds": [
@@ -1170,7 +1191,7 @@
               491.904,
               234.0
             ],
-            "target": "SidebarCategory(Window)"
+            "target": "SidebarCategory(Keybindings)"
           },
           {
             "bounds": [
@@ -1178,6 +1199,15 @@
               234.0,
               491.904,
               252.0
+            ],
+            "target": "SidebarCategory(Window)"
+          },
+          {
+            "bounds": [
+              201.6,
+              252.0,
+              491.904,
+              270.0
             ],
             "target": "SidebarCategory(LocalAi)"
           },
@@ -1380,7 +1410,7 @@
             "target": "SaveButton"
           }
         ],
-        "semantic_count": 28,
+        "semantic_count": 29,
         "semantics": [
           {
             "bounds": [
@@ -1426,7 +1456,7 @@
               198.0
             ],
             "focus": "Settings",
-            "label": "Input",
+            "label": "Blocks",
             "role": "Tab",
             "state": ""
           },
@@ -1438,7 +1468,7 @@
               216.0
             ],
             "focus": "Settings",
-            "label": "Keybindings",
+            "label": "Input",
             "role": "Tab",
             "state": ""
           },
@@ -1450,7 +1480,7 @@
               234.0
             ],
             "focus": "Settings",
-            "label": "Window",
+            "label": "Keybindings",
             "role": "Tab",
             "state": ""
           },
@@ -1460,6 +1490,18 @@
               234.0,
               491.904,
               252.0
+            ],
+            "focus": "Settings",
+            "label": "Window",
+            "role": "Tab",
+            "state": ""
+          },
+          {
+            "bounds": [
+              201.6,
+              252.0,
+              491.904,
+              270.0
             ],
             "focus": "Settings",
             "label": "Local AI",
