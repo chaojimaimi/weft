@@ -20,7 +20,6 @@
 //! `BlockTracker` from its `osc_dispatch` / `print` paths.
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -551,7 +550,11 @@ impl BlockTracker {
     }
 
     /// Share persisted IDs across tabs; isolated trackers remain local.
-    pub fn use_shared_id_allocator(&mut self, next_id: Arc<AtomicU64>) {
+    ///
+    /// T14 (PLAN_v11217 §3.9): the shared allocator is now a hi/lo
+    /// [`BlockIdPool`](crate::block_id_sequence::BlockIdPool) backed by the
+    /// persistent `meta.next_id` counter, so pruned ids are never reused.
+    pub fn use_shared_id_allocator(&mut self, next_id: Arc<crate::block_id_sequence::BlockIdPool>) {
         self.ids.share(next_id);
     }
 

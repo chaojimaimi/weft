@@ -362,15 +362,62 @@ pub(crate) fn cycled_recovery_mode(current: RecoveryMode, delta: i32) -> Recover
 /// the v1.11.2 power-user semantics); 20 000 blocks ≈ 10x the default cap.
 pub(crate) const BLOCKS_RETAINED_LIMIT_MAX: usize = 20_000;
 
+/// T14 (PLAN_v11217 §3.9): UI-step ceiling for the "History max age" row —
+/// 10 years of days. Hand-edited TOML may exceed it (the prune math is
+/// saturating), but ←/→ stops here.
+pub(crate) const BLOCKS_HISTORY_MAX_AGE_DAYS_MAX: u32 = 3_650;
+
+/// T14 (PLAN_v11217 §3.9): UI-step ceiling for the "History max size" row —
+/// 64 GiB in MiB. Hand-edited TOML may exceed it; ←/→ stops here.
+pub(crate) const BLOCKS_HISTORY_MAX_DB_MB_MAX: u32 = 65_536;
+
+/// T14 (PLAN_v11217 §3.9): selectable-row count per Settings tab, extracted
+/// from `App::settings_tab_row_count` so the Blocks-tab bump is
+/// headless-tested (a missed bump leaves row 3 key-selectable yet
+/// unclickable/unpaintable — the T13a silent-site lesson). The two
+/// caller-computed dynamic counts (Appearance theme list, Keybindings
+/// views) arrive as parameters.
+pub(crate) fn settings_tab_row_count(
+    tab: crate::overlay::SettingsTab,
+    appearance_rows: usize,
+    keybinding_rows: usize,
+) -> usize {
+    use crate::overlay::SettingsTab;
+    match tab {
+        // Theme list + Variant + Font + Size + Line + Opacity + Semantic toggle.
+        SettingsTab::Appearance => appearance_rows,
+        // v1.12.19 (T13a): 4 legacy rows + the Session recovery row.
+        SettingsTab::Terminal => 5,
+        // v1.12.19 (T13b): Retained limit + Output cap; T14 (§3.9): History
+        // max age + History max size.
+        SettingsTab::Blocks => 4,
+        // v1.11.1 (PLAN_v1111 §4.6): 2 editor rows + 3 paste rows.
+        SettingsTab::Input => 5,
+        SettingsTab::Keybindings => keybinding_rows,
+        SettingsTab::Window => 3, // Width + Height + Sidebar Width.
+        // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
+        // Cmd Generation + Error Diagnosis + Test Connection.
+        SettingsTab::LocalAi => 8,
+        // v1.11.5 (PLAN_v1115 §M8): 4 rows added (Notify Enabled /
+        // Threshold / Notify Sound / OSC52 Clipboard); Import/Export
+        // stay at rows 2/3 so the v1.5.2 Enter mapping never moves.
+        SettingsTab::Advanced => ADVANCED_ROW_COUNT,
+    }
+}
+
 /// v1.12.19 (PLAN_v11217 §3.8 T13b): adjust the Settings Blocks-page row
 /// `row` by `delta`. Row 0 is the per-tab in-memory retention cap
 /// (±50, clamped 0..=[`BLOCKS_RETAINED_LIMIT_MAX`]; 0 disables retention);
 /// row 1 is the retained-output cap in MiB (±1, clamped to the io-layer
-/// `OUTPUT_CAP_MIN/MAX_MIB` range). Returns the config section to mark
-/// dirty, or `None` for an unknown row / an unchanged value.
+/// `OUTPUT_CAP_MIN/MAX_MIB` range); T14 rows 2-3 are the SQLite history
+/// prune gates (row 2 age ±30 days, row 3 budget ±128 MiB, both clamped at
+/// 0 = Off on the floor and the T14 UI ceilings above). Returns the config
+/// section to mark dirty, or `None` for an unknown row / an unchanged value.
 pub(crate) fn adjust_blocks_row(
     retained_limit: &mut usize,
     output_cap_mib: &mut usize,
+    history_max_age_days: &mut u32,
+    history_max_db_mb: &mut u32,
     row: usize,
     delta: i32,
 ) -> Option<ConfigSectionMask> {
@@ -395,6 +442,28 @@ pub(crate) fn adjust_blocks_row(
                 None
             } else {
                 *output_cap_mib = next;
+                Some(mask)
+            }
+        }
+        2 => {
+            // Age gate: ±30 days, floor 0 (Off).
+            let next = ((*history_max_age_days as i64) + delta as i64 * 30)
+                .clamp(0, BLOCKS_HISTORY_MAX_AGE_DAYS_MAX as i64) as u32;
+            if next == *history_max_age_days {
+                None
+            } else {
+                *history_max_age_days = next;
+                Some(mask)
+            }
+        }
+        3 => {
+            // Size gate: ±128 MiB, floor 0 (Off).
+            let next = ((*history_max_db_mb as i64) + delta as i64 * 128)
+                .clamp(0, BLOCKS_HISTORY_MAX_DB_MB_MAX as i64) as u32;
+            if next == *history_max_db_mb {
+                None
+            } else {
+                *history_max_db_mb = next;
                 Some(mask)
             }
         }

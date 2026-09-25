@@ -3,11 +3,11 @@
 //! See [`crate::persistence`] for the module-level overview.
 
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use crate::block_id_sequence::{BlockIdPool, ID_RESERVE};
 use crate::blocks::{Block, BlockId};
 use crate::persistence::migrations::{ensure_column, ensure_tabs_active_column};
 use crate::persistence::{millis_to_system_time, system_time_to_millis, PersistenceError};
@@ -19,11 +19,20 @@ pub(crate) const MAX_STYLED_OUTPUT_JSON_BYTES: usize = 256 * 1024;
 
 /// SQLite-backed store of finished command blocks.
 ///
-/// Wraps a single [`rusqlite::Connection`]; safe to share via `&self` because
-/// `rusqlite::Connection` is `Sync` for `&` access.
+/// Wraps a single [`rusqlite::Connection`]. rusqlite 0.31 implements
+/// `Connection: Send` (moving the whole store across threads is fine) but
+/// **not** `Sync` — `&BlockStore` must never be shared between threads.
+/// Every background consumer (prune routine, palette search worker) opens
+/// its own connection to the same file; that design is required by
+/// rusqlite's thread-safety model, not an optimization.
 pub struct BlockStore {
     pub(crate) conn: Connection,
-    pub(crate) block_id_allocator: Arc<AtomicU64>,
+    pub(crate) block_id_allocator: Arc<BlockIdPool>,
+    /// T14 (PLAN_v11217 §3.9): the file was opened in `auto_vacuum=NONE`
+    /// mode. The pragma value itself is the persistent truth — the prune
+    /// routine converts to INCREMENTAL with a one-time VACUUM and clears
+    /// this flag; a later `open` re-reads the pragma (naturally idempotent).
+    pub(crate) needs_vacuum_migration: bool,
 }
 
 const SCHEMA: &str = "\
@@ -49,16 +58,48 @@ CREATE TABLE IF NOT EXISTS tabs (\
     shell_phase         TEXT,\
     block_ids           TEXT\
 );\
-CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);";
+CREATE INDEX IF NOT EXISTS idx_tabs_position ON tabs(position);\
+CREATE TABLE IF NOT EXISTS meta (\
+    key TEXT PRIMARY KEY,\
+    v   INTEGER NOT NULL\
+);";
 
 impl BlockStore {
     /// Open (creating if needed) the block DB at `path`, ensuring its parent
     /// directory exists and the schema is in place.
+    ///
+    /// Ordering invariant (PLAN_v11217 §3.9 2b): this must stay the FIRST
+    /// open of `blocks.db` in the startup sequence (before
+    /// `AnnotationStore` / `SearchIndex` / the palette worker) — the
+    /// one-time DELETE→WAL journal switch requires no other active
+    /// connections; later opens see the persisted WAL mode and their
+    /// repeated SET is a no-op.
     pub fn open(path: &Path) -> Result<Self, PersistenceError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        // T14: a freshly-created file gets incremental auto_vacuum BEFORE any
+        // table exists, so the pragma is persisted without a migration
+        // VACUUM (review P3a). Existing NONE-mode DBs are recorded below and
+        // migrated inside the prune routine — off the startup path.
+        let file_existed = path.exists();
+        let mut conn = Connection::open(path)?;
+        if !file_existed {
+            // NOTE: the auto_vacuum SET form returns NO row on an empty DB,
+            // so this must run via execute_batch, not query_row.
+            conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL;")?;
+        }
+        // T14 (§3.9 2b): switch the journal to WAL once, here. Readers stop
+        // blocking writers, so the background prune / palette connections
+        // never stall the main thread's inserts. Best-effort: a busy failure
+        // (e.g. a second Weft instance mid-open) logs and keeps the previous
+        // journal mode rather than disabling persistence entirely; the main
+        // thread's insert-drop window argument in prune.rs covers this mode.
+        if let Err(e) =
+            conn.query_row::<String, _, _>("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        {
+            tracing::warn!(error = %e, "journal_mode=WAL failed; keeping current journal mode");
+        }
         conn.execute_batch(SCHEMA)?;
         // CREATE TABLE IF NOT EXISTS does not evolve databases created by an
         // older Weft version, so migrate the D5 active-tab field explicitly.
@@ -72,19 +113,87 @@ impl BlockStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&conn, "tabs", "block_ids", "TEXT")?;
-        let next_block_id =
-            conn.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM blocks", [], |row| {
-                row.get::<_, u64>(0)
+        let needs_vacuum_migration = if file_existed {
+            let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
+            mode == 0 // 0=NONE, 1=FULL, 2=INCREMENTAL
+        } else {
+            false
+        };
+        // T14 (§3.9 2): persistent monotonic id counter — seed `next_id` to
+        // MAX(id)+1 exactly once (the NOT EXISTS guard closes the seed race
+        // in one statement), then atomically grab a reservation segment
+        // [hi-RESERVE, hi) in the SAME transaction. Concurrent openers
+        // serialize on the write lock and never overlap segments; a crash
+        // discards the unused reservation (an id hole — harmless) and never
+        // rolls the counter back, so pruned ids are never reused and the
+        // old multi-instance INSERT-OR-REPLACE collision is closed.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO meta(key, v) \
+             SELECT 'next_id', COALESCE((SELECT MAX(id) FROM blocks), 0) + 1 \
+             WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key = 'next_id')",
+            [],
+        )?;
+        tx.execute(
+            "UPDATE meta SET v = v + ?1 WHERE key = 'next_id'",
+            [ID_RESERVE as i64],
+        )?;
+        let reserved_hi: i64 =
+            tx.query_row("SELECT v FROM meta WHERE key = 'next_id'", [], |row| {
+                row.get(0)
             })?;
+        tx.commit()?;
+        let reserved_hi = reserved_hi.max(ID_RESERVE as i64) as u64;
+        let reserved_lo = reserved_hi - ID_RESERVE;
+        let allocator = Arc::new(BlockIdPool::new(reserved_lo, reserved_hi));
+        // Reservation re-grab runs on a short-lived dedicated connection: the
+        // pool must not hold shared access to `self.conn` (Connection is Send
+        // but not Sync, see the struct docs). Fires once per ID_RESERVE
+        // allocations; a busy grab fails and the pool overshoots (ids stay
+        // monotonic — the hole is harmless), retrying on a later allocation.
+        let refill_path = path.to_path_buf();
+        // Reviewer MEDIUM-2: every refill failure mode must be visible — a
+        // persistently busy refill hides a cross-process id collision window
+        // behind nothing but an (harmless) id hole.
+        allocator.install_refill(Box::new(move || {
+            let grab = || -> Result<u64, PersistenceError> {
+                let mut conn = Connection::open(&refill_path)?;
+                let _ = conn.busy_timeout(std::time::Duration::from_millis(2000));
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE meta SET v = v + ?1 WHERE key = 'next_id'",
+                    [ID_RESERVE as i64],
+                )?;
+                let v: i64 =
+                    tx.query_row("SELECT v FROM meta WHERE key = 'next_id'", [], |row| {
+                        row.get(0)
+                    })?;
+                tx.commit()?;
+                Ok(v as u64)
+            };
+            match grab() {
+                Ok(hi) => Some(hi),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "id-pool refill failed: pool overshoots (ids stay monotonic)"
+                    );
+                    None
+                }
+            }
+        }));
         Ok(Self {
             conn,
-            block_id_allocator: Arc::new(AtomicU64::new(next_block_id.max(1))),
+            block_id_allocator: allocator,
+            needs_vacuum_migration,
         })
     }
 
     /// Shared allocator used by every tab writing to this store, preventing
     /// per-terminal BlockId sequences from replacing each other in SQLite.
-    pub fn block_id_allocator(&self) -> Arc<AtomicU64> {
+    /// T14: a hi/lo [`BlockIdPool`] over the persistent `meta.next_id`
+    /// counter — see [`crate::block_id_sequence`] for the protocol.
+    pub fn block_id_allocator(&self) -> Arc<BlockIdPool> {
         self.block_id_allocator.clone()
     }
 
@@ -555,10 +664,13 @@ mod tests {
         assert_eq!(loaded[0].command, "new");
     }
 
+    /// T14 (PLAN_v11217 §3.9 2): the seeding source is now the persistent
+    /// `meta.next_id` counter. A reopen seeds the allocation cursor to
+    /// MAX(id)+1 (legacy DBs) or the previous counter value (already-seeded
+    /// DBs) and grabs a reservation segment — the cursor must never trail
+    /// any persisted id.
     #[test]
     fn reopened_store_seeds_shared_block_ids_after_persisted_maximum() {
-        use std::sync::atomic::Ordering;
-
         let path = std::env::temp_dir().join(format!(
             "weft-block-id-reopen-{}-{}.db",
             std::process::id(),
@@ -570,7 +682,86 @@ mod tests {
             store.insert(&block(7, "persisted", "", Some(0))).unwrap();
         }
         let store = BlockStore::open(&path).unwrap();
-        assert_eq!(store.block_id_allocator().load(Ordering::Relaxed), 8);
+        let allocator = store.block_id_allocator();
+        assert!(
+            allocator.next() > 7,
+            "cursor seeds strictly above the persisted maximum (got {})",
+            allocator.next()
+        );
+        assert!(
+            allocator.hi() >= allocator.next() + crate::block_id_sequence::ID_RESERVE,
+            "open() grabs a reservation segment of ID_RESERVE ids"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// T14 acceptance (§3.9 2): grab a reservation → allocate ids → drop the
+    /// store WITHOUT writing anything back → reopen. The new ids must be
+    /// strictly greater than the maximum persisted id: an unflushed
+    /// reservation is discarded (id hole), never rolled back, so pruned or
+    /// crashed-away ids can never be reused.
+    #[test]
+    fn reopened_store_never_reuses_ids_below_the_persistent_counter() {
+        let path = std::env::temp_dir().join(format!(
+            "weft-block-id-no-reuse-{}-{}.db",
+            std::process::id(),
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut allocated_max = 0u64;
+        {
+            let store = BlockStore::open(&path).unwrap();
+            store.insert(&block(3, "persisted", "", Some(0))).unwrap();
+            // Allocate ids from the shared pool but never persist them.
+            let mut seq = crate::block_id_sequence::BlockIdSequence::new();
+            seq.share(store.block_id_allocator());
+            for _ in 0..10 {
+                allocated_max = allocated_max.max(seq.allocate());
+            }
+        } // dropped without any write-back of the allocated ids
+        let store = BlockStore::open(&path).unwrap();
+        let next = store.block_id_allocator().next();
+        assert!(
+            next > allocated_max,
+            "reopen must allocate above the discarded reservation (next={next}, allocated_max={allocated_max})"
+        );
+        assert!(
+            next > 3,
+            "reopen must allocate above the persisted maximum id"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// T14 acceptance (§3.9 2): an allocator whose cursor was pushed beyond
+    /// the reservation (e.g. hydration of a huge history) re-grabs until the
+    /// bound covers it — subsequent allocations stay inside an exclusively
+    /// owned segment and never collide with a second open of the same DB.
+    #[test]
+    fn observe_beyond_reservation_regrabs_without_colliding() {
+        use crate::block_id_sequence::BlockIdSequence;
+
+        let path = std::env::temp_dir().join(format!(
+            "weft-block-id-observe-{}-{}.db",
+            std::process::id(),
+            SystemTime::UNIX_EPOCH.elapsed().unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = BlockStore::open(&path).unwrap();
+        let pool = store.block_id_allocator();
+        let mut seq = BlockIdSequence::new();
+        seq.share(pool.clone());
+        let far = pool.hi() + 9_000; // beyond two reservations
+        seq.observe(far);
+        let id = seq.allocate();
+        assert_eq!(id, far + 1);
+        assert!(id < pool.hi(), "bound must cover allocations after observe");
+        // A second open of the same DB grabs a non-overlapping segment.
+        let second = BlockStore::open(&path).unwrap();
+        let other = second.block_id_allocator();
+        assert!(
+            other.next() >= pool.hi(),
+            "reservation segments must never overlap across openers"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

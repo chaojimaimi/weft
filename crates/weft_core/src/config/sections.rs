@@ -323,6 +323,15 @@ pub struct BlocksConfig {
     /// 1..=64 at load normalization AND `BlockTracker::set_output_cap`
     /// (review P2a double clamp). No Settings UI row (config-first cut).
     pub output_cap_mib: usize,
+    /// T14 (PLAN_v11217 §3.9): auto-prune blocks whose `started_ms` is
+    /// older than this many days. `0` = age gate off. Default 90 — NOTE:
+    /// this is a data-deleting default (see the release notes); set `0` to
+    /// keep history forever.
+    pub history_max_age_days: u32,
+    /// T14 (PLAN_v11217 §3.9): auto-prune oldest blocks while the
+    /// `blocks.db` file exceeds this budget (MiB). The gate is absolute —
+    /// no age-window exemption. `0` = size gate off. Default 512.
+    pub history_max_db_mb: u32,
 }
 
 impl Default for BlocksConfig {
@@ -330,6 +339,8 @@ impl Default for BlocksConfig {
         Self {
             retained_limit: crate::blocks::retention::DEFAULT_BLOCKS_RETAINED_LIMIT,
             output_cap_mib: crate::blocks::OUTPUT_CAP_DEFAULT_MIB,
+            history_max_age_days: 90,
+            history_max_db_mb: 512,
         }
     }
 }

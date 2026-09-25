@@ -295,6 +295,8 @@ fn overlay_warmup_settings_collects_label_and_theme_chars() {
         recovery_mode: weft_core::config::RecoveryMode::Ask,
         blocks_retained_limit: 2000,
         blocks_output_cap_mib: 1,
+        blocks_history_max_age_days: 90,
+        blocks_history_max_db_mb: 512,
     };
     let mut missing = HashSet::new();
     OverlayContent::Settings(s).warm_chars(&mut missing);
@@ -361,6 +363,8 @@ fn settings_overlay_is_modal_and_highest_z() {
                     recovery_mode: weft_core::config::RecoveryMode::Ask,
                     blocks_retained_limit: 2000,
                     blocks_output_cap_mib: 1,
+                    blocks_history_max_age_days: 90,
+                    blocks_history_max_db_mb: 512,
                 }),
             },
         ],

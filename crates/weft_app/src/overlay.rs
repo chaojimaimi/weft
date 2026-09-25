@@ -111,13 +111,10 @@ pub enum SettingsTab {
     Keybindings,
     /// Window size, sidebar width, tab bar.
     Window,
-    /// v1.8.3: Local Ollama AI integration (enable, model, test connection,
-    /// data-range toggles, max_tokens, timeout). AI config is global only.
+    /// v1.8.3: Local Ollama AI (enable/model/test/toggles/max_tokens/timeout).
     LocalAi,
-    /// v1.11.0 隐藏入口：Debug logging / experimental / Import-Export 行均为
-    /// 无真实配置支撑的 placeholder（无配置支撑，补实后恢复，见
-    /// docs/PLAN_v111.md 第 1 项）。枚举变体与全部 match 臂**保留**，仅从
-    /// `ALL` 可见列表移除，避免大面积 match 改动；如未来补实配置即加回。
+    /// v1.11.0 隐藏入口（placeholder 无配置支撑，见 docs/PLAN_v111.md 第 1 项）。
+    /// 变体与 match 臂保留，仅从 `ALL` 移除；补实配置即加回。
     Advanced,
 }
 
@@ -312,6 +309,10 @@ pub struct SettingsDrawParams<'a> {
     pub recovery_mode: weft_core::config::RecoveryMode,
     pub blocks_retained_limit: usize,
     pub blocks_output_cap_mib: usize,
+    /// T14 (PLAN_v11217 §3.9): Blocks tab history-prune gate draft values
+    /// (draft projections like the T13 fields above — never snapshot).
+    pub blocks_history_max_age_days: u32,
+    pub blocks_history_max_db_mb: u32,
 }
 
 /// Command Palette rendering parameters (v0.7).
@@ -777,6 +778,8 @@ pub fn build_overlay_stack<'a>(
                 recovery_mode: settings.settings_recovery_mode,
                 blocks_retained_limit: settings.settings_blocks_retained_limit,
                 blocks_output_cap_mib: settings.settings_blocks_output_cap_mib,
+                blocks_history_max_age_days: settings.settings_blocks_history_max_age_days,
+                blocks_history_max_db_mb: settings.settings_blocks_history_max_db_mb,
             }),
         });
     }

@@ -326,12 +326,24 @@ struct App {
     /// the LocalAi tab's model dropdown.
     ai_models: Vec<ai::client::TagModel>,
     /// v1.8.3: Connection status for the Settings LocalAi tab. Updated by
-    /// `poll_ai_results` when a `ModelsRefreshed` event arrives.
+    /// `poll_ai_results` when an `AiResultEvent::ModelsRefreshed` event arrives.
     ai_connection_status: crate::app_state::AiConnectionStatus,
     /// v1.8.3: In-flight `/api/tags` request id, if any. Used to correlate
     /// `AiResultEvent::ModelsRefreshed` with the Settings "Test Connection"
     /// button. `None` when no refresh is pending.
     ai_models_request_id: Option<u64>,
+    /// T14 (PLAN_v11217 §3.9): when the first block-prune may run — the App
+    /// construction instant; the gate requires 10s of elapsed time to stay
+    /// out of the cold-start measurement window.
+    block_prune_arm: std::time::Instant,
+    /// T14: last prune trigger time (set at spawn time on the main thread);
+    /// `None` until the first prune — the 24h gate in
+    /// `run_tabs_autosave_tick` re-arms from it.
+    last_block_prune: Option<std::time::Instant>,
+    /// T14: re-entrancy guard for the background prune thread — swap
+    /// false→true on the main thread before spawning, cleared by the thread
+    /// when the pass finishes (success, failure, or busy skip).
+    block_prune_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
@@ -469,6 +481,9 @@ impl App {
             ai_models: Vec::new(),
             ai_connection_status: crate::app_state::AiConnectionStatus::Idle,
             ai_models_request_id: None,
+            block_prune_arm: std::time::Instant::now(),
+            last_block_prune: None,
+            block_prune_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

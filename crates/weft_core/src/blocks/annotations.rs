@@ -47,8 +47,10 @@ pub struct BlockAnnotation {
 }
 
 /// SQLite-backed store of [`BlockAnnotation`]s. Opens its own connection to
-/// the same `blocks.db` file; safe to share via `&self` (rusqlite `&Connection`
-/// is `Sync`).
+/// the same `blocks.db` file. rusqlite 0.31 `Connection` is `Send` but not
+/// `Sync` — `&self` access stays on the owning thread; background consumers
+/// (e.g. the prune routine) must open their own connection, which is a
+/// thread-safety requirement, not an optimization.
 pub struct AnnotationStore {
     conn: Connection,
 }

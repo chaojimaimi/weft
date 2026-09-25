@@ -120,9 +120,23 @@ impl MetalRenderer {
         } else {
             format!("{} blocks", s.blocks_retained_limit)
         };
-        let rows: [(&str, String); 2] = [
+        // T14 (PLAN_v11217 §3.9): 0 = Off on both history-prune gates
+        // (both Off → the prune never runs, behavior identical to pre-T14).
+        let age_label = if s.blocks_history_max_age_days == 0 {
+            "Off".to_string()
+        } else {
+            format!("{} days", s.blocks_history_max_age_days)
+        };
+        let size_label = if s.blocks_history_max_db_mb == 0 {
+            "Off".to_string()
+        } else {
+            format!("{} MiB", s.blocks_history_max_db_mb)
+        };
+        let rows: [(&str, String); 4] = [
             ("Retained limit:", retained_label),
             ("Output cap:", format!("{} MiB", s.blocks_output_cap_mib)),
+            ("History max age:", age_label),
+            ("History max size:", size_label),
         ];
         for (i, (label, value)) in rows.iter().enumerate() {
             let value = value.as_str();
@@ -156,6 +170,22 @@ impl MetalRenderer {
                     label,
                     value,
                     "0 keeps every block in memory — raise only with care",
+                    warning_c,
+                    value_x,
+                    content_x0,
+                    cw,
+                    content_cols,
+                );
+            }
+            // T14 orphan semantics (§3.9 4): pruned blocks also disappear
+            // from the restored history of saved sessions.
+            if i == 2 && s.blocks_history_max_age_days != 0 {
+                self.push_settings_side_note(
+                    verts,
+                    row_y,
+                    label,
+                    value,
+                    "pruned blocks vanish from restored sessions' history",
                     warning_c,
                     value_x,
                     content_x0,

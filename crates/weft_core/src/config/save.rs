@@ -317,13 +317,34 @@ pub(super) fn write_blocks_section(
         return;
     };
     // PLAN_v11217 §3.5 (T4): output_cap_mib joins the non-default-only write.
+    // T14 (§3.9): history_max_age_days / history_max_db_mb are written here
+    // EXPLICITLY — the per-key loop never picks up new fields on its own
+    // (a missed key = settings save succeeds but the file never changes).
     let (b, d) = (blocks, &default);
     for (key, value, default_value) in [
-        ("retained_limit", b.retained_limit, d.retained_limit),
-        ("output_cap_mib", b.output_cap_mib, d.output_cap_mib),
+        (
+            "retained_limit",
+            i64::try_from(b.retained_limit).unwrap_or(0),
+            i64::try_from(d.retained_limit).unwrap_or(0),
+        ),
+        (
+            "output_cap_mib",
+            i64::try_from(b.output_cap_mib).unwrap_or(0),
+            i64::try_from(d.output_cap_mib).unwrap_or(0),
+        ),
+        (
+            "history_max_age_days",
+            i64::from(b.history_max_age_days),
+            i64::from(d.history_max_age_days),
+        ),
+        (
+            "history_max_db_mb",
+            i64::from(b.history_max_db_mb),
+            i64::from(d.history_max_db_mb),
+        ),
     ] {
         if value != default_value {
-            blocks_entry[key] = toml_edit::value(i64::try_from(value).unwrap_or(0));
+            blocks_entry[key] = toml_edit::value(value);
         } else if blocks_entry.contains_key(key) {
             blocks_entry.remove(key);
         }

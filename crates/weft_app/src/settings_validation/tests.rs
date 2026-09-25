@@ -256,38 +256,41 @@ fn recovery_mode_labels_use_the_specified_wording() {
 /// rows are a no-op.
 #[test]
 fn adjust_blocks_row_truth_table() {
+    // T14 rows 2-3 are exercised separately below; these locals only feed
+    // the widened signature (never mutated by rows 0-1).
+    let (mut age, mut mb) = (90u32, 512u32);
     // Row 0 — retained limit.
     let (mut retained, mut cap) = (2_000usize, 1usize);
     assert_eq!(
-        adjust_blocks_row(&mut retained, &mut cap, 0, 1),
+        adjust_blocks_row(&mut retained, &mut cap, &mut age, &mut mb, 0, 1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(retained, 2_050);
     assert_eq!(
-        adjust_blocks_row(&mut retained, &mut cap, 0, -1),
+        adjust_blocks_row(&mut retained, &mut cap, &mut age, &mut mb, 0, -1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(retained, 2_000);
     // Boundaries: 0 (Unlimited) and 20 000.
     let (mut r0, mut c) = (20usize, 1usize);
     assert_eq!(
-        adjust_blocks_row(&mut r0, &mut c, 0, -1),
+        adjust_blocks_row(&mut r0, &mut c, &mut age, &mut mb, 0, -1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(r0, 0, "floor clamps at 0 (Unlimited)");
     assert_eq!(
-        adjust_blocks_row(&mut r0, &mut c, 0, -1),
+        adjust_blocks_row(&mut r0, &mut c, &mut age, &mut mb, 0, -1),
         None,
         "stays at floor"
     );
     let (mut rmax, _) = (19_975usize, 1usize);
     assert_eq!(
-        adjust_blocks_row(&mut rmax, &mut c, 0, 1),
+        adjust_blocks_row(&mut rmax, &mut c, &mut age, &mut mb, 0, 1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(rmax, BLOCKS_RETAINED_LIMIT_MAX, "ceiling is 20 000");
     assert_eq!(
-        adjust_blocks_row(&mut rmax, &mut c, 0, 1),
+        adjust_blocks_row(&mut rmax, &mut c, &mut age, &mut mb, 0, 1),
         None,
         "stays at ceiling"
     );
@@ -295,18 +298,18 @@ fn adjust_blocks_row_truth_table() {
     // Row 1 — output cap, ±1, clamped 1..=64.
     let (mut retained2, mut cap1) = (100usize, 8usize);
     assert_eq!(
-        adjust_blocks_row(&mut retained2, &mut cap1, 1, 1),
+        adjust_blocks_row(&mut retained2, &mut cap1, &mut age, &mut mb, 1, 1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(cap1, 9);
     assert_eq!(
-        adjust_blocks_row(&mut retained2, &mut cap1, 1, -1),
+        adjust_blocks_row(&mut retained2, &mut cap1, &mut age, &mut mb, 1, -1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(cap1, 8);
     let (mut r, mut cmin) = (100usize, 2usize);
     assert_eq!(
-        adjust_blocks_row(&mut r, &mut cmin, 1, -1),
+        adjust_blocks_row(&mut r, &mut cmin, &mut age, &mut mb, 1, -1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(
@@ -315,13 +318,13 @@ fn adjust_blocks_row_truth_table() {
         "floor is 1 MiB"
     );
     assert_eq!(
-        adjust_blocks_row(&mut r, &mut cmin, 1, -1),
+        adjust_blocks_row(&mut r, &mut cmin, &mut age, &mut mb, 1, -1),
         None,
         "already at floor → no-op"
     );
     let (mut r2, mut cmax) = (100usize, 63usize);
     assert_eq!(
-        adjust_blocks_row(&mut r2, &mut cmax, 1, 1),
+        adjust_blocks_row(&mut r2, &mut cmax, &mut age, &mut mb, 1, 1),
         Some(ConfigSectionMask::BLOCKS)
     );
     assert_eq!(
@@ -330,16 +333,113 @@ fn adjust_blocks_row_truth_table() {
         "ceiling is 64 MiB"
     );
     assert_eq!(
-        adjust_blocks_row(&mut r2, &mut cmax, 1, 1),
+        adjust_blocks_row(&mut r2, &mut cmax, &mut age, &mut mb, 1, 1),
         None,
         "already at ceiling → no-op"
     );
 
     // Unknown rows never dirty anything.
     let (mut r3, mut c3) = (100usize, 1usize);
-    assert_eq!(adjust_blocks_row(&mut r3, &mut c3, 2, 1), None);
-    assert_eq!(adjust_blocks_row(&mut r3, &mut c3, 99, -1), None);
-    assert_eq!((r3, c3), (100, 1));
+    let (mut a3, mut m3) = (90u32, 512u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r3, &mut c3, &mut a3, &mut m3, 4, 1),
+        None
+    );
+    assert_eq!(
+        adjust_blocks_row(&mut r3, &mut c3, &mut a3, &mut m3, 99, -1),
+        None
+    );
+    assert_eq!((r3, c3, a3, m3), (100, 1, 90, 512));
+}
+
+/// T14 (PLAN_v11217 §3.9): Blocks rows 2-3 — history prune gates. Row 2
+/// age ±30 days, row 3 budget ±128 MiB, both floor-clamped at 0 (Off) and
+/// UI-ceiling-clamped, both mark BLOCKS dirty.
+#[test]
+fn adjust_blocks_history_gates_truth_table() {
+    // Row 2 — age gate ±30 days.
+    let (mut r, mut c, mut age, mut mb) = (100usize, 8usize, 90u32, 512u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mb, 2, 1),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(age, 120);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mb, 2, -3),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(age, 30);
+    // Floor: 0 = Off (stays there, no dirty).
+    let (mut r, mut c, mut age0, mut mb) = (100usize, 8usize, 20u32, 512u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age0, &mut mb, 2, -1),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(age0, 0, "floor clamps at 0 (Off)");
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age0, &mut mb, 2, -1),
+        None,
+        "stays at floor"
+    );
+    // Ceiling: 3650 days.
+    let (mut r, mut c, mut agemax, mut mb) = (100usize, 8usize, 3_640u32, 512u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut agemax, &mut mb, 2, 1),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(agemax, BLOCKS_HISTORY_MAX_AGE_DAYS_MAX, "ceiling is 3650");
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut agemax, &mut mb, 2, 1),
+        None,
+        "stays at ceiling"
+    );
+
+    // Row 3 — size gate ±128 MiB.
+    let (mut r, mut c, mut age, mut mb) = (100usize, 8usize, 90u32, 512u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mb, 3, 1),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(mb, 640);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mb, 3, -5),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(mb, 0, "-5 x 128 reaches the Off floor");
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mb, 3, -1),
+        None,
+        "stays at Off"
+    );
+    // Ceiling: 65 536 MiB.
+    let (mut r, mut c, mut age, mut mbmax) = (100usize, 8usize, 90u32, 65_500u32);
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mbmax, 3, 1),
+        Some(ConfigSectionMask::BLOCKS)
+    );
+    assert_eq!(mbmax, BLOCKS_HISTORY_MAX_DB_MB_MAX, "ceiling is 65536");
+    assert_eq!(
+        adjust_blocks_row(&mut r, &mut c, &mut age, &mut mbmax, 3, 1),
+        None,
+        "stays at ceiling"
+    );
+}
+
+/// T14 (PLAN_v11217 §3.9): the Blocks Settings page exposes 4 selectable
+/// rows (T13's two + the two history-prune gates). The tab→count mapping
+/// is extracted so a missed bump cannot silently unclick row 3.
+#[test]
+fn settings_blocks_tab_row_count_is_four() {
+    use crate::overlay::SettingsTab;
+    assert_eq!(
+        settings_tab_row_count(SettingsTab::Blocks, 7, 12),
+        4,
+        "Retained limit + Output cap + History max age + History max size"
+    );
+    // The dynamic arms pass through unchanged.
+    assert_eq!(settings_tab_row_count(SettingsTab::Appearance, 7, 12), 7);
+    assert_eq!(settings_tab_row_count(SettingsTab::Keybindings, 7, 12), 12);
+    assert_eq!(settings_tab_row_count(SettingsTab::Terminal, 7, 12), 5);
 }
 
 #[test]

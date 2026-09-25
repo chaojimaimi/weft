@@ -478,12 +478,15 @@ impl App {
                 }
             }
             // v1.12.19 (T13b): Blocks tab — the row→field mapping lives in
-            // `settings_validation::adjust_blocks_row` so both rows stay
+            // `settings_validation::adjust_blocks_row` so all four rows
+            // (T13: retention/output cap; T14: history age/size gates) stay
             // headless-tested (Input tab precedent).
             SettingsTab::Blocks => {
                 if let Some(mask) = crate::settings_validation::adjust_blocks_row(
                     &mut self.settings.draft.blocks.retained_limit,
                     &mut self.settings.draft.blocks.output_cap_mib,
+                    &mut self.settings.draft.blocks.history_max_age_days,
+                    &mut self.settings.draft.blocks.history_max_db_mb,
                     self.settings.selection,
                     delta,
                 ) {
@@ -775,32 +778,16 @@ impl App {
     }
 
     /// F5: Number of selectable rows in the active Settings category.
+    /// The tab→count mapping lives in
+    /// `settings_validation::settings_tab_row_count` (headless-tested; the
+    /// two dynamic counts arrive as parameters).
     pub(super) fn settings_tab_row_count(&self) -> usize {
-        use crate::overlay::SettingsTab;
-        match self.settings.tab {
-            SettingsTab::Appearance => {
-                // Theme list + Variant + Font + Size + Line + Opacity + Semantic toggle.
-                self.settings_appearance_theme_count()
-                    + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS
-            }
-            // v1.12.19 (T13a): 4 legacy rows + the Session recovery row.
-            // This literal is the row-count's only silent site — a missed
-            // bump leaves row 4 key-selectable yet unclickable/unpaintable.
-            SettingsTab::Terminal => 5, // Scrollback + padding + contrast + session recovery.
-            // v1.12.19 (T13b): Retained limit + Output cap.
-            SettingsTab::Blocks => 2,
-            // v1.11.1 (PLAN_v1111 §4.6): 2 editor rows + 3 paste rows.
-            SettingsTab::Input => 5,
-            SettingsTab::Keybindings => self.settings_keybinding_views().len(),
-            SettingsTab::Window => 3, // Width + Height + Sidebar Width.
-            // v1.8.3: Enabled + Model + URL + Max Tokens + Timeout +
-            // Cmd Generation + Error Diagnosis + Test Connection.
-            SettingsTab::LocalAi => 8,
-            // v1.11.5 (PLAN_v1115 §M8): 4 rows added (Notify Enabled /
-            // Threshold / Notify Sound / OSC52 Clipboard); Import/Export
-            // stay at rows 2/3 so the v1.5.2 Enter mapping never moves.
-            SettingsTab::Advanced => crate::settings_validation::ADVANCED_ROW_COUNT,
-        }
+        crate::settings_validation::settings_tab_row_count(
+            self.settings.tab,
+            self.settings_appearance_theme_count()
+                + crate::settings_component::APPEARANCE_ADJUSTMENT_ROWS,
+            self.settings_keybinding_views().len(),
+        )
     }
 
     fn settings_appearance_theme_count(&self) -> usize {

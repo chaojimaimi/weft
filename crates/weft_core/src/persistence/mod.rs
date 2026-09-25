@@ -7,6 +7,9 @@
 //!
 //! - [`blocks`]: `BlockStore` + block table CRUD.
 //! - [`tabs`]: `TabSnapshot` + tab table CRUD (methods on `BlockStore`).
+//! - [`prune`]: T14 dual-gate auto-cleanup (age + size) with three-table
+//!   cascade deletes, hi/lo id-counter seeding context, and incremental
+//!   space reclamation.
 //! - [`migrations`]: schema evolution helpers used by `BlockStore::open`.
 //!
 //! [`BlockStore`] wraps a single [`rusqlite::Connection`] and stores finished
@@ -24,9 +27,11 @@
 
 pub mod blocks;
 pub mod migrations;
+pub mod prune;
 pub mod tabs;
 
 pub use blocks::BlockStore;
+pub use prune::{run_block_prune, PrunePlan, PruneReport, PruneTerminal};
 pub use tabs::TabSnapshot;
 
 use std::time::{Duration, SystemTime};

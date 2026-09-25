@@ -4,6 +4,7 @@
 //! prompt/command parsing, workflow seeding, chord label formatting, cache
 //! dir resolution, first-run onboarding, and shell-integration env setup.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 use weft_core::shell::Integration;
 
@@ -661,5 +662,15 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+/// Reviewer MEDIUM-3 (T14): releases the prune re-entry guard even if the
+/// prune thread panics mid-pass; without it a panic would wedge `weft-prune`
+/// for the rest of the session (the flag is only cleared on the happy path).
+pub(crate) struct PruneGuard<'a>(pub(crate) &'a AtomicBool);
+impl Drop for PruneGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }

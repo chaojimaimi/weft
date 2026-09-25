@@ -179,7 +179,7 @@ fn hydrate_persisted_history(
     terminal: &mut Terminal,
     global_newest_first: &[weft_core::blocks::Block],
     tab_block_ids: &[u64],
-    block_id_allocator: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    block_id_allocator: std::sync::Arc<weft_core::block_id_sequence::BlockIdPool>,
 ) {
     // Editor ↑-key recall: per-tab (this tab's own blocks), consistent with
     // the block tracker / Cmd+Shift+B panel below and Warp's session-scoped
@@ -1043,7 +1043,8 @@ mod tests {
         // block tracker and Warp semantics), not global.
         let mut newest_first = vec![block(2, "❯ echo newest"), block(1, "❯ echo oldest")];
         newest_first[0].output = "large persisted output".repeat(1024).into();
-        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let allocator =
+            std::sync::Arc::new(weft_core::block_id_sequence::BlockIdPool::new(3, 3 + 4096));
         let mut terminal_a = Terminal::new(24, 80);
         let mut terminal_b = Terminal::new(24, 80);
 
@@ -1089,7 +1090,8 @@ mod tests {
         // FIX ② (2026-08-19): legacy snapshots (no block_ids) → both block tracker
         // and editor history stay empty (per-tab isolation).
         let newest_first = vec![block(1, "❯ ls"), block(2, "❯ echo hi")];
-        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(3));
+        let allocator =
+            std::sync::Arc::new(weft_core::block_id_sequence::BlockIdPool::new(3, 3 + 4096));
         let mut terminal = Terminal::new(24, 80);
         hydrate_persisted_history(&mut terminal, &newest_first, &[], allocator);
         assert!(terminal.block_tracker().blocks().is_empty());
@@ -1108,7 +1110,10 @@ mod tests {
     #[test]
     fn hydrate_with_recovered_block_ids_populates_tracker() {
         let newest_first = vec![block(10, "❯ git status"), block(20, "❯ make test")];
-        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30));
+        let allocator = std::sync::Arc::new(weft_core::block_id_sequence::BlockIdPool::new(
+            30,
+            30 + 4096,
+        ));
 
         // Simulate the post-fix recovery path: restored_snapshot was attached
         // with this tab's block_ids = [10, 20].
@@ -1186,7 +1191,10 @@ mod tests {
         );
 
         let newest_first = vec![block(10, "❯ git status"), block(20, "❯ make test")];
-        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(30));
+        let allocator = std::sync::Arc::new(weft_core::block_id_sequence::BlockIdPool::new(
+            30,
+            30 + 4096,
+        ));
         hydrate_persisted_history(
             tab.terminal.as_mut().unwrap(),
             &newest_first,
@@ -1216,7 +1224,10 @@ mod tests {
             newest_first.push(block(i, &format!("❯ cmd{}", i)));
         }
 
-        let allocator = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(11));
+        let allocator = std::sync::Arc::new(weft_core::block_id_sequence::BlockIdPool::new(
+            11,
+            11 + 4096,
+        ));
         let mut terminal = Terminal::new(24, 80);
 
         // Tab only produced blocks [2, 5, 10] (non-contiguous, not the newest globally)

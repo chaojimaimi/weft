@@ -15,6 +15,7 @@
 
 use crate::effect::Effect;
 use crate::{clipboard_copy, clipboard_paste, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info};
 use weft_core::input::{
     classify_paste, contains_dangerous_control_chars, encode_paste, format_byte_count,
@@ -587,6 +588,86 @@ impl crate::App {
         }
         // v1.11.1: paste-toast expiry rides this tick.
         self.expire_paste_toast_tick();
+        // T14 (PLAN_v11217 §3.9): the block-prune 24h gate rides this 1 Hz
+        // tick too — O(1) checks (two Instant compares + one AtomicBool swap)
+        // and the actual prune runs on its own background thread/connection.
+        self.maybe_run_block_prune_tick();
+    }
+
+    /// T14 (PLAN_v11217 §3.9 3): block-library auto-cleanup scheduling.
+    /// First pass 10s after startup (the arm anchor — keeps the prune and
+    /// its WAL/pragma work out of the cold-start measurement window; this
+    /// 1 Hz tick then drives the check), later passes at a 24h cadence via
+    /// `last_block_prune`. Both gates 0=Off → the prune never runs
+    /// (bit-identical to pre-T14). Re-entrancy via an AtomicBool swap on
+    /// the main thread; the spawned thread owns a DEDICATED BlockStore
+    /// connection (rusqlite Connection is Send, not Sync) and clears the
+    /// flag when done.
+    fn maybe_run_block_prune_tick(&mut self) {
+        const PRUNE_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+        const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        if self.block_prune_arm.elapsed() < PRUNE_STARTUP_DELAY {
+            return;
+        }
+        if self
+            .last_block_prune
+            .is_some_and(|last| last.elapsed() < PRUNE_INTERVAL)
+        {
+            return;
+        }
+        let gates = &self.config_state.config.blocks;
+        if gates.history_max_age_days == 0 && gates.history_max_db_mb == 0 {
+            return; // both gates Off — never spawn
+        }
+        if self.block_prune_in_flight.swap(true, Ordering::SeqCst) {
+            return; // a pass is already running
+        }
+        self.last_block_prune = Some(std::time::Instant::now());
+        let Some(path) = crate::app::helpers::weft_cache_dir().map(|c| c.join("blocks.db")) else {
+            self.block_prune_in_flight.store(false, Ordering::SeqCst);
+            return;
+        };
+        let age_days = gates.history_max_age_days;
+        let max_db_mb = gates.history_max_db_mb;
+        let in_flight = self.block_prune_in_flight.clone();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("weft-prune"))
+            .spawn(move || {
+                // Reviewer MEDIUM-3: a panic inside the prune pass must not
+                // wedge the re-entry guard for the rest of the session — the
+                // guard releases on scope exit however the closure ends.
+                let _guard = crate::app::helpers::PruneGuard(&in_flight);
+                let started = std::time::Instant::now();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                match weft_core::persistence::run_block_prune(&path, age_days, max_db_mb, now_ms) {
+                    Ok(Some(report)) => {
+                        tracing::info!(
+                            age_deleted = report.age_deleted,
+                            size_deleted = report.size_deleted,
+                            bytes_before = report.bytes_before,
+                            bytes_after = report.bytes_after,
+                            terminal = ?report.terminal,
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "block prune finished"
+                        );
+                    }
+                    Ok(None) => {} // both gates Off (config raced to Off)
+                    Err(e) => {
+                        // Batch-busy aborts land here as partial passes —
+                        // the 24h window retries naturally, no retry loop.
+                        tracing::warn!(error = %e, "block prune failed; will retry next window");
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // Thread spawn failed: release the guard; the next window
+            // retries (no busy loop — last_block_prune stays armed).
+            tracing::warn!("failed to spawn prune thread; will retry next window");
+            self.block_prune_in_flight.store(false, Ordering::SeqCst);
+        }
     }
 
     /// v1.11.1: apply an already-approved paste and surface the post-paste

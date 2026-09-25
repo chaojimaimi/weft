@@ -113,6 +113,10 @@ pub struct SettingsViewParams<'a> {
     /// snapshot fields, or ←/→ steps would not repaint the value.
     pub settings_blocks_retained_limit: usize,
     pub settings_blocks_output_cap_mib: usize,
+    /// T14 (PLAN_v11217 §3.9): history-prune gate draft values, same
+    /// draft-projection discipline as the T13 fields above.
+    pub settings_blocks_history_max_age_days: u32,
+    pub settings_blocks_history_max_db_mb: u32,
 }
 
 /// v1.11 audit (PLAN_audit_fix_batch3 C4): settings-domain *owned* computed
@@ -196,6 +200,8 @@ impl crate::app_state::SettingsState {
             settings_recovery_mode: self.draft.session.recovery,
             settings_blocks_retained_limit: self.draft.blocks.retained_limit,
             settings_blocks_output_cap_mib: self.draft.blocks.output_cap_mib,
+            settings_blocks_history_max_age_days: self.draft.blocks.history_max_age_days,
+            settings_blocks_history_max_db_mb: self.draft.blocks.history_max_db_mb,
         }
     }
 }

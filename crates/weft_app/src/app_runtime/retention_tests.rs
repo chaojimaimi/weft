@@ -13,7 +13,6 @@ use super::*;
 /// regresses, this test fails with blocks silently dropped from restore.
 #[test]
 fn retention_evicted_blocks_still_hydrate_to_their_tab() {
-    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
 
     // ── Session 1: produce 4 blocks, retention keeps only 2 in memory.
@@ -72,7 +71,10 @@ fn retention_evicted_blocks_still_hydrate_to_their_tab() {
         &mut restarted,
         &persisted,
         &snap_block_ids,
-        Arc::new(AtomicU64::new(100)),
+        Arc::new(weft_core::block_id_sequence::BlockIdPool::new(
+            100,
+            100 + 4096,
+        )),
     );
     let hydrated = restarted.block_tracker().blocks();
     assert_eq!(
