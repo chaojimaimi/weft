@@ -15,7 +15,7 @@
 
 use crate::effect::Effect;
 use crate::{clipboard_copy, clipboard_paste, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use tracing::{debug, info};
 use weft_core::input::{
     classify_paste, contains_dangerous_control_chars, encode_paste, format_byte_count,

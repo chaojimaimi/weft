@@ -351,6 +351,16 @@ pub(crate) fn shell_integration_env(shell: &str) -> Vec<(String, String)> {
     env
 }
 
+/// Reviewer MEDIUM-3 (T14): releases the prune re-entry guard even if the
+/// prune thread panics mid-pass; without it a panic would wedge `weft-prune`
+/// for the rest of the session (the flag is only cleared on the happy path).
+pub(crate) struct PruneGuard<'a>(pub(crate) &'a AtomicBool);
+impl Drop for PruneGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,12 +675,4 @@ mod tests {
     }
 }
 
-/// Reviewer MEDIUM-3 (T14): releases the prune re-entry guard even if the
-/// prune thread panics mid-pass; without it a panic would wedge `weft-prune`
-/// for the rest of the session (the flag is only cleared on the happy path).
-pub(crate) struct PruneGuard<'a>(pub(crate) &'a AtomicBool);
-impl Drop for PruneGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
+

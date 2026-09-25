@@ -3,7 +3,6 @@
 
 use super::*;
 
-use super::*;
 use crate::config::profiles::ProfileError;
 use std::io::Write;
 
