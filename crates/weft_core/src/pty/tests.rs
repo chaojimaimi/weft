@@ -3,7 +3,9 @@
 //! -> `tab/tests.rs`, `vt/mod.rs` -> `vt/tests.rs`). Declared in
 //! `pty.rs` via `#[cfg(test)] #[path = "pty/tests.rs"] mod tests;`.
 
-use super::read_loop::{read_batch, BatchStop, EVENT_CAP, READ_BATCH_TARGET};
+use super::read_loop::{
+    hold_expired, read_batch, stream_active, BatchStop, EVENT_CAP, READ_BATCH_TARGET,
+};
 use super::*;
 
 #[test]

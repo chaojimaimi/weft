@@ -1,20 +1,27 @@
 //! The PTY reader task: the async read loop plus the pure flood-phase read
-//! aggregation it drives (T8, PLAN_v11217_PERF_TRAIN §3.4).
+//! aggregation it drives (T8, PLAN_v11217_PERF_TRAIN §3.4) and the
+//! flood-phase batch hold the loop layers on top of it (T5', §3.7).
 //!
 //! Moved out of `pty.rs` via the standard `pty.rs` + `pty/` directory layout
 //! while rewiring (same file split as `pty/tests.rs`), so the production
-//! file stays under its architecture budget. T8's two changes live here:
+//! file stays under its architecture budget. Changes living here:
 //!
 //! - Backlog-state UI wake interval tightened 16 ms → 2 ms (the decision
-//!   itself stays in the parent as `pty_wake_due`);
+//!   itself stays in the parent as `pty_wake_due`, T8);
 //! - Consecutive non-blocking reads are aggregated into one
 //!   `PtyEvent::Output` batch by the pure [`read_batch`] until the soft
 //!   target, a WouldBlock, the hard [`EVENT_CAP`], or EOF ends the batch —
-//!   no timers, no data hold: a dry read flushes what was accumulated
-//!   immediately, so interactive echo latency is unchanged.
+//!   `read_batch` itself stays timer-free and hold-free (T8);
+//! - T5' (§3.7) seq short-line fix: on an ACTIVE stream a
+//!   WouldBlock-truncated batch is CARRIED OVER in `pending` across the
+//!   WouldBlock boundary (with a [`HOLD_MAX_MS`] timer racing readiness in
+//!   a select-armed loop top, so a trickle can never strand the bytes), and
+//!   the batch count collapses from ~50k/s to hundreds/s. An idle stream's
+//!   first batch is never held — interactive echo is unchanged.
 
 use std::io;
 use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::time::Duration;
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
@@ -39,6 +46,36 @@ pub const EVENT_CAP: usize = 256 * 1024;
 /// many bytes. Soft — [`EVENT_CAP`] remains the hard bound, and WouldBlock /
 /// EOF flush whatever was accumulated regardless of this target.
 pub(crate) const READ_BATCH_TARGET: usize = 64 * 1024;
+
+/// T5' (PLAN_v11217 §3.7): data seen within this window means the producing
+/// stream is ACTIVE and a WouldBlock-truncated batch is worth carrying over
+/// into [`HOLD_MAX_MS`]-bounded hold state instead of paying one
+/// send+wake round-trip per few-line batch.
+pub(crate) const STREAM_ACTIVE_WINDOW_MS: u64 = 50;
+
+/// T5': how long a carried batch may wait for the next trickle before the
+/// hold timer flushes it — the echo-latency ceiling for an active stream
+/// (≤4 ms is invisible under an 8 ms vsync; an idle stream's first batch is
+/// never held at all).
+pub(crate) const HOLD_MAX_MS: u64 = 4;
+
+/// T5' pure hold decision (truth-tabled in `wake_and_batch_tests.rs`):
+/// `None` — no data has EVER arrived in this session — is deliberately NOT
+/// active (review P3a): a naive `0` default would misjudge the session's
+/// first 50 ms as active and hold the very first prompt for 4 ms.
+pub(crate) fn stream_active(last_data_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_data_ms {
+        None => false,
+        Some(last) => now_ms.saturating_sub(last) < STREAM_ACTIVE_WINDOW_MS,
+    }
+}
+
+/// T5' pure hold decision: true once [`HOLD_MAX_MS`] have elapsed since the
+/// held batch's FIRST byte arrived — the batch must flush regardless of
+/// stream activity (the hold ceiling is absolute, not per-append).
+pub(crate) fn hold_expired(first_byte_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(first_byte_ms) >= HOLD_MAX_MS
+}
 
 /// Why an aggregated read batch ended. `Eof` / `Error` are terminal: the
 /// caller must flush the returned batch (if non-empty) into the channel
@@ -128,12 +165,24 @@ where
 /// boundaries unchanged (pty.rs note: sequences persist across reads with no
 /// carry buffer; a batch edge is just another arbitrary split point, no
 /// different from today's kernel read edges).
+///
+/// T5' (PLAN_v11217 §3.7): while a stream is active, a WouldBlock-truncated
+/// batch is carried in `pending` across the WouldBlock boundary and only
+/// flushed on soft-target close, hold expiry (a `HOLD_MAX_MS` timer racing
+/// readability in a select-armed loop top), a terminal stop, or the EVENT_CAP
+/// pre-append check. Invariants untouched: the scanner/`WEFT_PTY_CAPTURE`
+/// tee stay per-read (so the suppression flag still flips the moment the
+/// bytes EXIST — on an active stream their forwarding to the UI may now lag
+/// by ≤4 ms, which is the declared echo-latency ceiling), caught-up is
+/// sampled before every send (inside [`flush_output`]), Exit always wakes,
+/// and the wake throttle is unchanged. An idle stream's first batch is never
+/// held: the activity decision uses the pre-batch stamp.
 pub(super) async fn read_loop<W: Fn() + Send + 'static>(
     fd: OwnedFd,
     child_pid: Pid,
     tx: mpsc::Sender<PtyEvent>,
     suppress: MouseSuppressFlag,
-    wake: W,
+    mut wake: W,
 ) {
     // Buffer size: 256KB as per architecture doc (== EVENT_CAP; read_batch
     // additionally caps every request to the batch's remaining room).
@@ -159,12 +208,68 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
 
     let mut buf = vec![0u8; BUF_SIZE];
 
+    // T5' (§3.7) hold state: a WouldBlock-truncated batch on an active
+    // stream is carried here across the WouldBlock boundary — bytes plus
+    // the arrival timestamp of the batch's FIRST byte (the hold anchor);
+    // `last_data_ms` feeds the stream-activity window. Any path that sends
+    // or exits flushes `pending` first, so no byte can strand.
+    let mut pending: Option<(Vec<u8>, u64)> = None;
+    let mut last_data_ms: Option<u64> = None;
+
     loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::debug!(error = %e, "PTY read fd became unreadable");
-                break;
+        // T5' change point 3: while a batch is held, race readiness against
+        // a `HOLD_MAX_MS` timer anchored at the held batch's FIRST byte, so
+        // a trickle (seq's line-by-line writes) can never strand bytes past
+        // the hold ceiling. `biased` prefers the readable arm when both are
+        // ready — continuous data flushes via the soft target / cap anyway;
+        // the timer only wins when the stream actually pauses.
+        //
+        // Epoch conversion (review P2a): the state timestamps come from
+        // `monotonic_millis()` (std Instant, process start) while tokio's
+        // clock starts at runtime start — the two are NEVER mixed raw. The
+        // deadline is rebuilt each iteration from the SAME first-byte
+        // anchor: `first_byte_ms` only changes when the pending batch is
+        // replaced, so as `now` advances the remaining time shrinks and the
+        // absolute deadline stays put — a trickle append does NOT reset the
+        // timer.
+        let mut guard = if let Some((_, first_byte_ms)) = &pending {
+            let held_for = monotonic_millis()
+                .saturating_sub(*first_byte_ms)
+                .min(HOLD_MAX_MS);
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_millis(HOLD_MAX_MS - held_for);
+            tokio::select! {
+                biased;
+                readable = async_fd.readable() => match readable {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "PTY read fd became unreadable");
+                        // Same rule as the terminal stops: bytes already
+                        // read are flushed before the exit tail.
+                        if let Some((held, _)) = pending.take() {
+                            let _ = flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await;
+                        }
+                        break;
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    // Hold expired: flush the held batch (send + wake) and
+                    // drop back to the plain loop top — held bytes never
+                    // wait on data that may never come.
+                    let (held, _) = pending.take().expect("pending held across the timer arm");
+                    if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            match async_fd.readable().await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::debug!(error = %e, "PTY read fd became unreadable");
+                    break;
+                }
             }
         };
 
@@ -233,39 +338,84 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
         };
 
         if data.is_empty() {
-            // Spurious wakeup with no bytes (would-block on the first read):
-            // nothing to pump, nothing to flush — retry, exactly as the
-            // pre-T8 loop's WouldBlock arms did.
             if terminal.is_some() {
+                // T5' combination table — terminal + empty batch + held
+                // bytes (review P1b): a command's tail can sit in `pending`
+                // (child exited right after its last writes reached the
+                // hold) — flush it before the exit tail (R2: no byte loss
+                // on child exit). Receiver gone or not, the tail runs
+                // either way; the helper already SIGHUP'd on Err.
+                if let Some((held, _)) = pending.take() {
+                    let _ = flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await;
+                }
                 break;
             }
+            // Spurious wakeup with no bytes (would-block on the first
+            // read): nothing to pump. With a held batch this `continue`
+            // lands on the SELECT-ARMED loop top above (combination table
+            // row 3, review P1b) — a plain `readable().await` top would
+            // leave pending stranded without its hold timer.
             continue;
         }
 
-        // v1.11.2 X2: sample emptiness BEFORE the send — an empty
-        // queue means the consumer is caught up and must be woken so
-        // fresh output is pumped promptly. Suspending here on a full
-        // channel is the intended backpressure path.
-        // (tokio 1.53's Sender has no len(); full remaining capacity
-        // is exactly "queue is empty" for this single-producer task.)
-        // T8: the sampled unit is the whole batch.
-        let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
-        if tx.send(PtyEvent::Output(data)).await.is_err() {
-            // v1.11.16 (Fix B1): receiver dropped ⟹ Pty dropped (no take/move
-            // path for event_rx — verified). Drop::drop runs before field drops,
-            // so SIGHUP is already sent; re-kill is a harmless ESRCH no-op.
-            // Break into the shared exit tail (set_suppressed + waitpid_safe).
-            let _ = signal::kill(child_pid, Signal::SIGHUP);
-            break;
-        }
-        // Nudge the UI event loop so fresh output is pumped promptly,
-        // instead of idling until the next keyboard/mouse event — but at
-        // most once per `FLOOD_WAKE_INTERVAL_MS` while backlogged (T8
-        // tightened the v1.11.2 X2 interval from 16 ms ~60 Hz).
+        // T5' change point 2: every read that returned data marks the
+        // stream active. The activity DECISION below uses the pre-batch
+        // value on purpose — the first small batch after an idle period
+        // must flush immediately ("an idle stream's first batch is never
+        // held"), so `was_active` is sampled before this batch refreshes
+        // the stamp.
         let now_ms = monotonic_millis();
-        if pty_wake_due(false, consumer_caught_up, throttle.last(), now_ms) {
-            wake();
-            throttle.stamp(now_ms);
+        let was_active = stream_active(last_data_ms, now_ms);
+        last_data_ms = Some(now_ms);
+
+        // Hold gate: ONLY a WouldBlock-truncated batch on an active stream
+        // with the hold window unexpired is carried over. A SoftTarget stop
+        // closes the batch; a terminal stop or an expired hold flushes.
+        let hold_first_ms = pending.as_ref().map_or(now_ms, |(_, first)| *first);
+        let carry_over = matches!(stop, BatchStop::WouldBlock)
+            && was_active
+            && !hold_expired(hold_first_ms, now_ms);
+
+        if carry_over {
+            // Review P1a: keep "any Output ≤ EVENT_CAP" a STRUCTURAL
+            // guarantee — if the append would reach the cap, flush the
+            // held batch FIRST (byte order preserved) and start a fresh
+            // pending from this batch; the oversize-split path stays
+            // test-injection-only.
+            let cap_hit = pending
+                .as_ref()
+                .is_some_and(|(held, _)| held.len() + data.len() >= EVENT_CAP);
+            if cap_hit {
+                let (held, _) = pending.take().expect("cap_hit implies pending");
+                if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+                    break;
+                }
+            }
+            match &mut pending {
+                // min: the combined batch's anchor is its EARLIEST byte — a
+                // trickle append must not extend the hold deadline.
+                Some((held, first)) => {
+                    *first = (*first).min(now_ms);
+                    held.extend_from_slice(&data);
+                }
+                None => pending = Some((data, now_ms)),
+            }
+            // No send, no wake — deferring both is the entire point.
+            continue;
+        }
+
+        // Immediate flush: soft-target close, idle-stream batch, or expired
+        // hold. Pending and the fresh batch are NEVER merged (T5' change
+        // point 4) — pending goes first so byte order holds and no single
+        // Output can exceed EVENT_CAP; a failed first send short-circuits
+        // the second (helper returns false → break).
+        if let Some((held, _)) = pending.take() {
+            if !flush_output(&tx, child_pid, &mut throttle, &mut wake, held).await {
+                break;
+            }
+        }
+        if !flush_output(&tx, child_pid, &mut throttle, &mut wake, data).await {
+            break;
         }
         if terminal.is_some() {
             break;
@@ -297,6 +447,50 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
     if tx.send(PtyEvent::Exit(exit_status)).await.is_ok() {
         wake();
     }
+}
+
+/// Shared Output flush (T5' second-round review P2): every send point in
+/// [`read_loop`] funnels through here, so the send-error semantics exist in
+/// exactly one place — sample `caught-up` BEFORE the send (v1.11.2 X2: an
+/// empty queue means the consumer must be woken so fresh output is pumped
+/// promptly; a full channel suspends here, the intended backpressure path),
+/// then send, then the wake check.
+///
+/// On `Err` (receiver dropped ⟹ Pty dropped — v1.11.16 Fix B1 semantics,
+/// explicitly preserved) the child is SIGHUP'd and `false` tells the caller
+/// to break into the shared exit tail; for a pending+data pair a failed
+/// first send short-circuits the second. `PtyEvent::Exit` does NOT go
+/// through here (it has its own always-wake arm).
+///
+/// (tokio 1.53's Sender has no len(); full remaining capacity is exactly
+/// "queue is empty" for this single-producer task.)
+/// (`W` reaches the helper as `&mut W`: a mutable reference is `Send`
+/// whenever `W: Send`, so the spawned `read_loop` future stays `Send`
+/// without widening `Pty::spawn`'s public `W` bound to `Sync`.)
+async fn flush_output<W: Fn()>(
+    tx: &mpsc::Sender<PtyEvent>,
+    child_pid: Pid,
+    throttle: &mut WakeThrottle,
+    wake: &mut W,
+    data: Vec<u8>,
+) -> bool {
+    let consumer_caught_up = tx.capacity() >= PTY_CHANNEL_CAP;
+    if tx.send(PtyEvent::Output(data)).await.is_err() {
+        // Drop::drop runs before field drops, so SIGHUP is already sent on
+        // the Pty drop path; re-kill is a harmless ESRCH no-op.
+        let _ = signal::kill(child_pid, Signal::SIGHUP);
+        return false;
+    }
+    // Nudge the UI event loop so fresh output is pumped promptly, instead
+    // of idling until the next keyboard/mouse event — but at most once per
+    // `FLOOD_WAKE_INTERVAL_MS` while backlogged (T8 tightened the v1.11.2
+    // X2 interval from 16 ms ~60 Hz).
+    let now_ms = monotonic_millis();
+    if pty_wake_due(false, consumer_caught_up, throttle.last(), now_ms) {
+        wake();
+        throttle.stamp(now_ms);
+    }
+    true
 }
 
 /// Safely wait for a child process, handling ECHILD (already reaped).

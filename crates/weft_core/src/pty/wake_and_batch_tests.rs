@@ -165,6 +165,40 @@ fn read_batch_returns_batch_with_terminal_error() {
     }
 }
 
+// ── T5' (PLAN_v11217 §3.7): hold-decision truth tables ────────────
+// Literal millisecond values on purpose: the tables pin the BEHAVIOR, so
+// drifting a constant silently re-lights these tests.
+
+/// `stream_active` truth table. `None` (no data has EVER arrived) is never
+/// active — review P3a: a naive `0` default would misjudge the session's
+/// first 50 ms as active and hold the very first prompt for 4 ms. Active
+/// arm: `now − last < 50`; at/past the boundary the stream counts as idle.
+#[test]
+fn stream_active_truth_table() {
+    // None arm: never active, regardless of `now`.
+    assert!(!stream_active(None, 0));
+    assert!(!stream_active(None, 50));
+    assert!(!stream_active(None, 10_000));
+    // Inside the 50 ms window: active (zero elapsed included).
+    assert!(stream_active(Some(1_000), 1_000));
+    assert!(stream_active(Some(1_000), 1_049));
+    // At/past the 50 ms boundary: idle — the next small batch must flush
+    // immediately ("an idle stream's first batch is never held").
+    assert!(!stream_active(Some(1_000), 1_050));
+    assert!(!stream_active(Some(1_000), 2_000));
+}
+
+/// `hold_expired` truth table: the hold spends exactly at `now − first >= 4`.
+#[test]
+fn hold_expired_truth_table() {
+    // Fresh first byte / inside the window: keep holding.
+    assert!(!hold_expired(1_000, 1_000));
+    assert!(!hold_expired(1_000, 1_003));
+    // At/past 4 ms: the held batch must flush regardless of activity.
+    assert!(hold_expired(1_000, 1_004));
+    assert!(hold_expired(1_000, 1_100));
+}
+
 // ── T8 (PLAN_v11217 §3.4): flood byte-integrity regression ────────
 // Planned in PLAN_v1112 §7.2, first implemented here (fourth-round review
 // P1: no pre-existing fixture to reuse). NOT in CI (#[ignore], spawns real
@@ -261,6 +295,68 @@ async fn flood_read_batches_preserve_byte_stream() {
     assert!(
         max_queue_depth <= PTY_CHANNEL_CAP,
         "channel peak depth must stay within the bounded cap"
+    );
+}
+
+// ── T5' (PLAN_v11217 §3.7): slow-stream hold regression ──────────
+
+/// A child writes one short line every 10 ms × 100 lines through a REAL PTY
+/// (raw mode, no ONLCR mangling) — the exact seq shape that made T5'
+/// necessary: short writes trickling past `WouldBlock`, the stream staying
+/// active (10 ms gaps < the 50 ms window). NOT `#[ignore]` (review P3c):
+/// deterministic assertions, ~1 s cost, and the only automated guard against
+/// held-byte stranding/loss. The hold must reassemble every byte IN ORDER
+/// and the terminal flush must deliver any tail still held at child exit.
+///
+/// Disclosed discrimination limit (review P2b): this proves delivery
+/// completeness + terminal flush, NOT timer liveness — with a dead timer the
+/// bytes would still arrive via the soft-target / terminal flushes. Timer
+/// wiring is self-certified in the implementation report (select-arm
+/// walkthrough) and covered by the GUI acceptance run.
+#[tokio::test]
+async fn slow_stream_hold_preserves_all_bytes_in_order() {
+    const LINES: usize = 100;
+    let script = format!(
+        "stty raw -echo; i=0; while [ $i -lt {LINES} ]; do echo \"line $i\"; \
+         i=$((i+1)); sleep 0.01; done"
+    );
+    let mut pty = Pty::spawn_with_args(
+        "/bin/sh",
+        &["-c", script.as_str()],
+        (24, 80),
+        &[],
+        None,
+        new_flag(),
+        || {},
+    )
+    .expect("failed to spawn slow-stream fixture");
+
+    let mut received: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "slow-stream fixture did not finish in time"
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), pty.recv())
+            .await
+            .expect("recv stalled for 5s");
+        match event {
+            Some(PtyEvent::Output(data)) => received.extend_from_slice(&data),
+            Some(PtyEvent::Exit(result)) => {
+                assert_eq!(result, Ok(0), "slow-stream child must exit cleanly");
+                break;
+            }
+            None => panic!("PTY channel closed before Exit"),
+        }
+    }
+
+    let expected: Vec<u8> = (0..LINES)
+        .flat_map(|i| format!("line {i}\n").into_bytes())
+        .collect();
+    assert_eq!(
+        received, expected,
+        "every byte must arrive exactly once, in order"
     );
 }
 
