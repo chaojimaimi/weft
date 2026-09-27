@@ -118,15 +118,9 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
 #[test]
 fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
     let output = (0..12).map(|i| format!("stream-{i}\n")).collect::<String>();
-    // Formula path (no composed snapshot yet): cursor line =
-    // line_count - grid_rows + cursor_row (block_view_tui_cursor_anchor).
-    let grid_rows = 8;
-    let cursor_row = 5;
-    let cursor_line = output
-        .lines()
-        .count()
-        .saturating_sub(grid_rows)
-        .saturating_add(cursor_row);
+    // T16b formula fallback: the caret anchors the capture tail (the last
+    // live line) — the renderer no longer maps the grid cursor row.
+    let cursor_line = output.lines().count().saturating_sub(1);
     let live = InFlightBlock {
         command: "plain-output",
         cwd: None,
@@ -139,7 +133,7 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
-    let viewport_rows = grid_rows + 2;
+    let viewport_rows = 10;
     let input = LayoutPassInput {
         blocks: &[],
         live: Some(live),
@@ -171,8 +165,8 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
     });
     assert!(
         matched,
-        "B path: formula anchor {cursor_line} must match a live row \
-         (line_count {}, grid_rows {grid_rows}, cursor_row {cursor_row})",
+        "B path: formula anchor {cursor_line} (capture tail) must match a live row \
+         (line_count {})",
         output.lines().count()
     );
 }
@@ -363,24 +357,21 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
          would anchor the caret past the new live block"
     );
 
-    // Formula fallback (renderer.rs block_view_tui_cursor_anchor): map the grid
-    // cursor row into the new live block. The fixture streams whole lines, so
-    // the cursor parks one row past the live text — unmaterialized, and the
-    // anchor clamps to the last live line (col would be the end-of-line one).
+    // T16b formula fallback (renderer.rs block_view_tui_cursor None branch):
+    // anchor the capture tail — no grid-cursor mapping. The fixture streamed
+    // "hello\r\nworld\r\n", so the tail line is "world" and the caret sits at
+    // its end (display col 5).
     let live = terminal.block_tracker().in_flight().unwrap();
-    let (cursor_line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
-        live.output.lines().count(),
-        terminal.grid().num_rows,
-        terminal.grid().cursor.row,
+    let cursor_line = live.output.lines().count().saturating_sub(1);
+    let cursor_col = crate::paint::ui_helpers::tui_cursor_display_col(
+        live.output,
+        cursor_line,
+        terminal.grid().num_cols,
     );
-    assert!(
-        !materialized,
-        "whole-line streaming leaves the cursor on the trailing empty row"
-    );
-    assert!(
-        cursor_line < live.output.lines().count(),
-        "formula fallback must anchor in-bounds (line {cursor_line}, {} lines)",
-        live.output.lines().count()
+    assert_eq!(
+        (cursor_line, cursor_col),
+        (1, 5),
+        "caret anchors the tail line 'world' at its end"
     );
 
     // Drive the real layout pass over the real in-flight output and prove a
@@ -482,11 +473,14 @@ fn a_path_grid_preedit_conditions_hold_after_settle() {
     );
 }
 
-/// v1.11.14: a password reader that disables echo and emits its own
-/// newline parks the grid cursor on the empty row below the last live
-/// text line. The caret must anchor AFTER the prompt glyphs on that last
-/// line (its end column), never at column 0 — the historical symptom was
-/// the caret jumping to the very front of the prompt text.
+/// v1.11.14 (kept green under T16b): a password reader that disables echo
+/// and emits its own newline parks the grid cursor on the empty row below
+/// the last live text line — a state where the grid cursor carries no
+/// content column. The caret must anchor AFTER the prompt glyphs on that
+/// last line (its end column), never at column 0 — the historical symptom
+/// was the caret jumping to the very front of the prompt text. T16b: the
+/// caret anchors the capture tail unconditionally, so both phases compute
+/// the same (line, col) straight from the helper.
 #[test]
 fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     use weft_core::vt::Terminal;
@@ -494,25 +488,16 @@ fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
     terminal.process(b"Password: ");
     terminal.snapshot_primary_screen_output_for_caret();
-    // Typing phase: cursor on the materialized prompt row.
+    // Typing phase: cursor still on the prompt row.
     let _tracked = terminal.primary_screen_cursor_snapshot_line();
     let live = terminal.block_tracker().in_flight().unwrap();
-    let live_lines = live.output.lines().count();
-    let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
-    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
-        live_lines,
-        terminal.grid().num_rows,
-        row,
+    // T16b: mirrors renderer's None branch — tail line + display col.
+    let line = live.output.lines().count().saturating_sub(1);
+    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+        live.output,
+        line,
+        terminal.grid().num_cols,
     );
-    assert!(
-        materialized,
-        "typing phase: cursor on the prompt row is materialized"
-    );
-    let col = if materialized {
-        col
-    } else {
-        crate::block_component::block_view_line_end_col(live.output, line)
-    };
     assert_eq!(
         (line, col),
         (1, 10),
@@ -524,24 +509,23 @@ fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     terminal.snapshot_primary_screen_output_for_caret();
     let tracked = terminal.primary_screen_cursor_snapshot_line();
     let live = terminal.block_tracker().in_flight().unwrap();
-    let live_lines = live.output.lines().count();
     let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
     assert_eq!(
         (row, col),
         (2, 0),
-        "grid cursor on the empty row below the prompt"
+        "grid cursor on the empty row below the prompt — carries no content column"
     );
     assert!(
         tracked.is_none(),
         "non-TUI block never establishes the tracked anchor"
     );
-    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
-        live_lines,
-        terminal.grid().num_rows,
-        row,
+    // T16b: the tail anchor ignores the parked grid cursor entirely.
+    let line = live.output.lines().count().saturating_sub(1);
+    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+        live.output,
+        line,
+        terminal.grid().num_cols,
     );
-    assert!(!materialized, "cursor row has no live text line");
-    let col = crate::block_component::block_view_line_end_col(live.output, line);
     assert_eq!(
         (line, col),
         (1, 10),
@@ -549,24 +533,107 @@ fn pw_prompt_caret_anchors_after_prompt_when_cursor_row_unmaterialized() {
     );
 }
 
-/// v1.11.14: a failed attempt re-prompts — the new prompt row is
-/// materialized again and the caret follows the grid column exactly.
+/// v1.11.14 (kept green under T16b): a failed attempt re-prompts — the
+/// re-issued prompt line IS the capture tail, so the caret anchors there,
+/// right after its glyphs.
 #[test]
-fn pw_prompt_caret_rematerializes_on_retry_prompt() {
+fn pw_prompt_caret_anchors_on_retry_prompt() {
     use weft_core::vt::Terminal;
     let mut terminal = Terminal::new(10, 80);
     terminal.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07");
     terminal.process(b"Password: \r\nSorry, try again\r\nPassword: ");
     terminal.snapshot_primary_screen_output_for_caret();
     let live = terminal.block_tracker().in_flight().unwrap();
-    let live_lines = live.output.lines().count();
-    let (row, col) = (terminal.grid().cursor.row, terminal.grid().cursor.col);
-    let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
-        live_lines,
-        terminal.grid().num_rows,
-        row,
+    // T16b: mirrors renderer's None branch — tail line + display col.
+    let line = live.output.lines().count().saturating_sub(1);
+    let col = crate::paint::ui_helpers::tui_cursor_display_col(
+        live.output,
+        line,
+        terminal.grid().num_cols,
     );
-    assert!(materialized, "retry prompt row carries text");
     assert_eq!(col, 10);
     assert_eq!(line, 3, "caret on the re-issued prompt line");
+}
+
+/// T16b: after a shrink resize (cols 200→110) a 180-char line soft-wraps at
+/// the new width; the caret column must anchor the wrapped content end
+/// (0,180) under the paint modulo map — computed purely from the capture
+/// text, never from the (reflow-stale) grid cursor. NOTE: 133;B (not 133;C
+/// alone) starts the in-flight capture (`on_command_output_start` is a
+/// tracker no-op), so the fixture uses the same A+B+C sequence as the a-path
+/// test above.
+#[test]
+fn tui_caret_col_follows_wrapped_content_end_after_resize() {
+    use weft_core::vt::Terminal;
+    let mut t = Terminal::new(36, 200);
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    t.process(&[b'x'; 180]);
+    t.resize(36, 110);
+    let live = t.block_tracker().in_flight().unwrap();
+    // T16b: mirrors renderer's None branch — tail line + display col.
+    let line = live.output.lines().count().saturating_sub(1);
+    let col =
+        crate::paint::ui_helpers::tui_cursor_display_col(live.output, line, t.grid().num_cols);
+    assert_eq!((line, col), (0, 180), "caret at wrapped content end");
+}
+
+/// T16b regression (v1.12.21 GUI 实测): brew's DownloadQueue rewrites one
+/// progress line per tick and ends EVERY frame with cursor addressing that
+/// carries no content position — CHA 0 (`\x1b[0G`, exempted from
+/// cursor_ops by the col>1 carve-out) on single-line frames, CPL
+/// (`\x1b[1F`, not counted at all) on multi-line frames. The grid cursor
+/// parks at col 0 / rows above the content, so the pre-T16b formula read a
+/// meaningless physical column (red probe: (27,0) while the capture tail is
+/// line 30); the T16b fallback must anchor the capture tail (single-line
+/// rewrite compaction ⇒ tail == newest frame end). Frame byte shapes are
+/// the PTY capture (/tmp/brew_fetch_raw.log):
+/// `\x1b[?2026h…\x1b[K\x1b[0G\x1b[?2026l` per tick.
+#[test]
+fn brew_progress_caret_anchors_capture_tail_not_grid_cursor() {
+    use weft_core::vt::Terminal;
+    let mut t = Terminal::new(36, 200);
+    // in_flight needs A+B (133;C alone is a tracker no-op).
+    t.process(b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07");
+    let head: String = (0..30).map(|i| format!("brew line {i}\r\n")).collect();
+    t.process(head.as_bytes());
+    // 20 real tick frames — spinner + bar 2→40 + EL + CHA 0 tail.
+    for i in 0..20u32 {
+        let frame = format!(
+            "\x1b[?2026h\x1b[34m⠋\x1b[0m Cask cockpit-tools (1.3.60) {:<40} Downloading {}KB/111.2KB\x1b[K\x1b[0G\x1b[?2026l",
+            "█".repeat((2 + 2 * i) as usize),
+            5 * (i + 1)
+        );
+        t.process(frame.as_bytes());
+    }
+    // Three multi-line-block rewrites: text + EL + CPL (up one row).
+    for _ in 0..3 {
+        t.process("\x1b[?2026h\x1b[34m⠋\x1b[0m 上一行重写\x1b[K\x1b[1F\x1b[?2026l".as_bytes());
+    }
+    // Shrink the viewport: the pre-T16b code anchored the parked grid
+    // cursor (row 27 col 0) — wrong line, column 0.
+    t.resize(36, 110);
+
+    // ① Replicate the renderer's None-branch formula (T16b): the capture
+    //    tail line and its display column at the new width.
+    let live = t.block_tracker().in_flight().unwrap();
+    let line = live.output.lines().count().saturating_sub(1);
+    let col =
+        crate::paint::ui_helpers::tui_cursor_display_col(live.output, line, t.grid().num_cols);
+    assert_eq!(
+        line, 30,
+        "caret on the last live capture line (newest rewritten row)"
+    );
+    assert_eq!(
+        col, 12,
+        "caret after '⠋ 上一行重写' (1+1+5×2 cells), single chunk at 110 cols"
+    );
+    // ② Classification exemptions pinned: CHA col 1 and CPL must NOT feed
+    //    primary_screen_cursor_ops — a regression would flip brew into the
+    //    tracked/takeover branch and this whole fix would silently stop
+    //    applying (perform.rs G col>1 carve-out; F never counts).
+    assert!(t.show_block_view(), "brew stays a BlockView live command");
+    assert!(
+        t.primary_screen_cursor_snapshot_line().is_none(),
+        "non-TUI command never establishes the tracked caret anchor"
+    );
 }

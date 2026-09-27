@@ -8,6 +8,8 @@ use std::time::SystemTime;
 
 use weft_core::blocks::Block;
 
+use crate::paint::grid_cache::block_line_chunks;
+
 /// Whether a block matches the panel search query (empty query = match all).
 /// Shared by the renderer (list layout) and the app (selection clamping).
 ///
@@ -267,6 +269,38 @@ pub(crate) fn strip_prompt_prefix(command: &str) -> String {
     match best {
         Some(idx) => trimmed[idx..].trim().to_string(),
         None => trimmed.to_string(),
+    }
+}
+
+/// T16b: running-command caret column for the block-view formula-fallback path
+/// (renderer `block_view_tui_cursor`, `None` branch). The grid cursor is
+/// UNTRUSTWORTHY here: redraw-style progress lines (brew) end every tick with
+/// CHA 0 / CPL — PTY capture `0G`×12, `1F`×13, `C`×0, neither counted as
+/// cursor_ops — parking it at col 0 / the previous line's start, and the 1:1
+/// line map breaks on wrapped rows. So the grid cursor is never read: anchor
+/// the end of `line`'s content; the capture's rewrite compaction makes its
+/// tail == newest frame end == the caret position for every non-TUI command.
+/// Single row (incl. the Gauge clip band, ≤ cols + PROGRESS_GAUGE_CLIP_TOLERANCE
+/// wide): T16c — end == cols is legal, paint parks the caret at the grid's
+/// right edge; k > 1 still clamps to cols-1 (wrap_pending). Multi-row: `(k-1) * cols + last_chunk_width`
+/// hits the last chunk's last cell exactly under the modulo map (chunk_idx ==
+/// col / cols). Per-char width sum, exact for regular glyphs, same convention
+/// as `block_view_line_end_col` (VS16/emoji clustering ±1 cell). Perf: two O(n) passes per
+/// frame over the 1 MiB-capped capture. In ui_helpers (block_component.rs is at its ceiling).
+pub(crate) fn tui_cursor_display_col(output: &str, line: usize, cols: usize) -> usize {
+    let Some(text) = output.lines().nth(line) else {
+        return 0;
+    };
+    let w = |ch: char| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    let chunks: Vec<String> = block_line_chunks(text, cols).collect();
+    // Last-chunk width == whole-line width when k <= 1 (single chunk / empty line).
+    let last = match chunks.last() {
+        Some(c) => c.chars().map(w).sum::<usize>(),
+        None => 0,
+    };
+    match chunks.len() {
+        0 | 1 => last.min(cols),
+        k => (k - 1) * cols + last.min(cols.saturating_sub(1)),
     }
 }
 
@@ -720,5 +754,47 @@ mod tests {
                 "{size} block visible-window p95 {p95:.3}ms exceeds 8ms budget"
             );
         }
+    }
+
+    #[test]
+    fn tui_cursor_wrapped_row_anchors_last_chunk_end() {
+        assert_eq!(tui_cursor_display_col(&"x".repeat(180), 0, 110), 180);
+    }
+
+    #[test]
+    fn tui_cursor_exact_multiple_anchors_last_cell() {
+        assert_eq!(tui_cursor_display_col(&"x".repeat(220), 0, 110), 219);
+    }
+
+    #[test]
+    fn tui_cursor_gauge_clip_band_parks_at_right_edge() {
+        // bar+text mix → ProgressGauge (103 ≥ 4 block chars); 113 ≤ 110+3 → single chunk → parks at the right edge.
+        let out = format!("{} 42% 1m59s", "█".repeat(103));
+        assert_eq!(tui_cursor_display_col(&out, 0, 110), 110);
+    }
+
+    #[test]
+    fn tui_cursor_cjk_wrap_anchors_content_end() {
+        assert_eq!(tui_cursor_display_col(&"中".repeat(60), 0, 110), 120);
+    }
+
+    #[test]
+    fn tui_cursor_single_chunk_short_line_anchors_at_content_end() {
+        assert_eq!(tui_cursor_display_col("short line", 0, 80), 10);
+    }
+
+    #[test]
+    fn tui_cursor_full_line_parks_at_right_edge() {
+        assert_eq!(tui_cursor_display_col(&"x".repeat(80), 0, 80), 80);
+    }
+
+    #[test]
+    fn tui_cursor_empty_line_anchors_col_zero() {
+        assert_eq!(tui_cursor_display_col("a\n\nb", 1, 80), 0);
+    }
+
+    #[test]
+    fn tui_cursor_out_of_bounds_line_anchors_col_zero() {
+        assert_eq!(tui_cursor_display_col("abc", 5, 80), 0);
     }
 }

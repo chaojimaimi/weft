@@ -366,21 +366,20 @@ impl MetalRenderer {
             // v1.10.6: the precisely tracked snapshot line beats the formula.
             Some(line) => (line, grid.cursor.col),
             None => {
-                // v1.11.14: formula fallback. When the grid cursor row has
-                // no materialized live text line (password readers park it
-                // on a trailing empty row), anchor the caret at the END of
-                // the last live line — the raw grid column is 0 there and
-                // used to jump the caret to the front of the prompt text.
-                let (line, materialized) = crate::block_component::block_view_tui_cursor_anchor(
-                    live.output.lines().count(),
-                    terminal.grid().num_rows,
-                    grid.cursor.row,
+                // T16b: grid cursor is untrustworthy on this path — redraw-style
+                // progress lines (brew DownloadQueue, PTY-captured bytes) end every
+                // tick with CHA0/CPL, parking the grid cursor at col 0 / the previous
+                // line's start (0G×12, 1F×13, C×0 in one capture), and the formula
+                // line map breaks on wrapped visual rows. The capture's rewrite
+                // compaction makes its tail == the newest frame's end == the caret
+                // position for every non-TUI command (echo-input preedit anchors at
+                // the echo write head — correct too).
+                let line = live.output.lines().count().saturating_sub(1);
+                let col = crate::paint::ui_helpers::tui_cursor_display_col(
+                    live.output,
+                    line,
+                    grid.num_cols,
                 );
-                let col = if materialized {
-                    grid.cursor.col
-                } else {
-                    crate::block_component::block_view_line_end_col(live.output, line)
-                };
                 (line, col)
             }
         };

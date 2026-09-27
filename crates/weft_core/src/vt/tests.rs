@@ -5085,11 +5085,12 @@ fn settle_convergence_classic_and_noninteractive_byte_identical() {
 
 #[test]
 fn claude_caret_tracks_snapshot_line_matching_grid_cursor() {
-    // M3.1 caret: the renderer's BlockView caret is
-    // (snapshot-lines - grid-rows + grid-cursor-row, grid-cursor-col) —
-    // assert the tracked snapshot line matches that mapping so the caret
-    // sits on the exact materialized document row (renderer.rs:
-    // block_view_tui_cursor + block_component::block_view_tui_cursor_anchor).
+    // M3.1 caret: the renderer's tracked BlockView caret branch is
+    // (tracked_snapshot_line, grid-cursor-col) — assert the tracked snapshot
+    // line matches the grid cursor row so the caret sits on the exact
+    // materialized document row (renderer.rs: block_view_tui_cursor, tracked
+    // branch; the T16b formula fallback anchors the capture tail instead and
+    // never reads this mapping).
     let mut t = fixture(FixtureKind::Claude);
     t.set_tui_render_mode(TuiRenderMode::Noninteractive);
     // Type into the TUI so the document contains content rows.

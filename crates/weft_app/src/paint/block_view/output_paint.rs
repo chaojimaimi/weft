@@ -32,6 +32,18 @@ fn track_preedit_diag_span(
     }
 }
 
+/// T16c: caret x for the whole-line path. col == cols (满行 wrap_pending,
+/// 逻辑位置在右缘外一格)钳到网格右缘内侧 2px —— caret 贴在末字符右缘
+/// 而非压字(col==cols-1)或画出可视区。2.0 与 ime.rs block_view_tui_
+/// caret_geometry 的 [x, x+2.0] caret 宽度保持同步(注释级约定)。
+fn caret_x_for(whole_line: bool, chunk_col: usize, left: f32, cw: f32, cols: usize) -> f32 {
+    if whole_line && chunk_col >= cols {
+        left + cols as f32 * cw - 2.0
+    } else {
+        left + chunk_col as f32 * cw
+    }
+}
+
 /// Paint ONE visual output row. `text` is the row's own text; `line_text`
 /// is the full source line (semantic text + find range base). Whole-line
 /// rows (`text` spans `line_text`) keep the legacy single-chunk semantics:
@@ -166,7 +178,7 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
             } else {
                 cursor_col % ctx.cols
             };
-            let caret_x = ctx.left + chunk_col as f32 * ctx.cw;
+            let caret_x = caret_x_for(whole_line, chunk_col, ctx.left, ctx.cw, ctx.cols);
             let (caret_area, caret_quad) =
                 crate::ime::block_view_tui_caret_geometry(caret_x, y, ctx.cw, ctx.ch);
             renderer.block_view_tui_caret_area.set(Some(caret_area));
@@ -177,16 +189,20 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
                 // matched — the preedit was drawn on a
                 // live row (path = "B").
                 *ctx.caret_painted = true;
+                // T16c: at the col == cols edge the caret parks 2px inside the
+                // right edge, but the preedit anchor keeps the legacy cols-1
+                // clamp — pixel-identical at the boundary, identity below it.
+                let preedit_x = caret_x.min(ctx.left + ctx.cols.saturating_sub(1) as f32 * ctx.cw);
                 renderer.push_block_tui_preedit(
                     &mut *ctx.verts,
                     crate::paint::preedit::BlockTuiPreeditParams {
                         text: preedit,
                         cursor: preedit_cursor,
-                        x: caret_x,
+                        x: preedit_x,
                         y,
                         right: ctx.right,
                         cols: ctx.cols,
-                        cursor_col: chunk_col,
+                        cursor_col: chunk_col.min(ctx.cols.saturating_sub(1)),
                         bg_uv: ctx.bg_uv,
                         theme_bg: ctx.theme_bg,
                         accent: ctx.accent,
@@ -194,5 +210,44 @@ pub(super) fn paint_output_row(ctx: &mut RowPaintCtx<'_>, laid: &LaidRow<'_>, y:
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caret_x_for;
+
+    #[test]
+    fn caret_x_regular_column_is_unchanged() {
+        // whole_line path, col < cols: plain left + col * cw.
+        assert_eq!(caret_x_for(true, 5, 10.0, 8.0, 80), 50.0);
+    }
+
+    #[test]
+    fn caret_x_full_line_parks_inside_right_edge() {
+        // col == cols: the 2px caret hugs the grid's right edge from inside.
+        assert_eq!(caret_x_for(true, 80, 10.0, 8.0, 80), 648.0);
+    }
+
+    #[test]
+    fn caret_x_beyond_cols_is_defensively_clamped() {
+        assert_eq!(caret_x_for(true, 85, 10.0, 8.0, 80), 648.0);
+    }
+
+    #[test]
+    fn caret_x_multi_chunk_path_never_parks() {
+        // !whole_line: the modulo mapping keeps chunk_col <= cols-1 upstream.
+        assert_eq!(caret_x_for(false, 85, 10.0, 8.0, 80), 690.0);
+    }
+
+    #[test]
+    fn caret_x_edge_is_half_a_cell_right_of_last_cell_left() {
+        // Semantic lock: the parked caret sits at the last glyph's RIGHT edge
+        // (x + 2.0 == grid right edge), not at the last cell's left edge:
+        // edge_x - last_cell_x == cw - 2.0.
+        let (left, cw, cols) = (10.0, 8.0, 80);
+        let edge = caret_x_for(true, cols, left, cw, cols);
+        let last_cell = left + (cols - 1) as f32 * cw;
+        assert_eq!(edge - last_cell, cw - 2.0);
     }
 }
