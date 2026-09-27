@@ -643,6 +643,10 @@ impl App {
                 tui_preedit: None,
                 cursor_blink_on: false,
                 is_alt: terminal.is_alt_screen_active(),
+                // P1: hit-test is its own event, not the paint frame — no
+                // cross-event value sharing needed; only the label's shape
+                // matters here.
+                now: std::time::SystemTime::now(),
             }),
         )
     }

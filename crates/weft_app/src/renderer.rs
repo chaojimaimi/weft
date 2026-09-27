@@ -771,6 +771,7 @@ impl MetalRenderer {
                         tui_preedit: None,
                         cursor_blink_on: false,
                         is_alt: terminal.is_alt_screen_active(),
+                        now: std::time::SystemTime::now(),
                     },
                     selection,
                 )
@@ -826,6 +827,7 @@ impl MetalRenderer {
                         tui_preedit: tui_preedit.map(|p| (p.text, p.cursor)),
                         cursor_blink_on,
                         is_alt: terminal.is_alt_screen_active(),
+                        now: std::time::SystemTime::now(),
                     },
                     selection,
                 )

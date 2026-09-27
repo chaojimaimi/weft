@@ -1,6 +1,7 @@
 //! Immutable per-frame inputs for BlockView painting.
 
 use std::collections::HashMap;
+use std::time::SystemTime;
 
 use weft_core::blocks::{Block, BlockId, InFlightBlock};
 use weft_core::grid::Color;
@@ -68,4 +69,10 @@ pub(crate) struct BlockViewPaintModel<'a> {
     /// stale and would hide the caret permanently).
     #[allow(dead_code)]
     pub(crate) cursor_blink_on: bool,
+    /// P1: per-frame clock for the live elapsed label. Filled once per frame
+    /// at model construction; the paint and hit-test double build share the
+    /// same model, which self-proves the label can't diverge between the two
+    /// paths. Golden/bench fixtures pass fixed values so output stays
+    /// clock-independent.
+    pub(crate) now: SystemTime,
 }

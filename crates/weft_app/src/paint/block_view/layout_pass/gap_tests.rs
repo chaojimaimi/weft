@@ -71,6 +71,7 @@ fn scrolling_past_clear_keeps_older_output_visible() {
             resolve_styles: false,
             styled_lookup_counter: None,
             block_diagnose_state: &empty_map,
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         },
         &cache,
         &mut LiveLayoutCache::default(),
@@ -115,6 +116,7 @@ fn completed_layout_cols<'a>(
             resolve_styles: false,
             styled_lookup_counter: None,
             block_diagnose_state: &empty_map,
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         },
         cache,
         &mut LiveLayoutCache::default(),
@@ -231,6 +233,8 @@ fn live_layout<'a>(
                 styled_output: None,
                 version: 1,
                 screen_origin: false,
+                started_at: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_700_000_000),
                 min_write_offset: InFlightBlock::detached_watermark(),
             }),
             pane_session_id: 1,
@@ -247,6 +251,7 @@ fn live_layout<'a>(
             resolve_styles: false,
             styled_lookup_counter: None,
             block_diagnose_state: &empty_map,
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         },
         cache,
         &mut LiveLayoutCache::default(),
@@ -271,6 +276,8 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
             styled_output: None,
             version: 1,
             screen_origin: false,
+            started_at: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000),
             min_write_offset: InFlightBlock::detached_watermark(),
         };
         compute_block_layout_pass(
@@ -291,6 +298,8 @@ fn live_output_culls_offscreen_lines_but_keeps_positions() {
                 resolve_styles: false,
                 styled_lookup_counter: None,
                 block_diagnose_state: &std::collections::HashMap::new(),
+                now: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_700_000_000),
             },
             &cache,
             &mut LiveLayoutCache::default(),

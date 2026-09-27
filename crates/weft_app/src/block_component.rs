@@ -95,14 +95,6 @@ pub(crate) fn command_resume_hints(block: &Block) -> &'static [&'static str] {
     }
 }
 
-pub(crate) fn live_context_label(cwd: Option<&str>, git_branch: Option<&str>) -> Option<String> {
-    let cwd = cwd.map(abbreviate_path).filter(|cwd| !cwd.is_empty())?;
-    Some(match git_branch {
-        Some(branch) if !branch.is_empty() => format!("{cwd} git:({branch})"),
-        _ => cwd,
-    })
-}
-
 /// Prompt 高度只属于 shell 编辑器;运行中的全屏应用把 BlockView 画到视口底部。
 pub(crate) fn block_prompt_lines(terminal: &Terminal) -> Option<usize> {
     (terminal.effective_input_mode() == weft_core::input::InputMode::Editor)
@@ -615,10 +607,8 @@ mod tests {
         late_cwd.process(b"\x1b]7;file://localhost/Users/me/.hermes\x07");
         assert_eq!(block_content_metrics(&late_cwd, 80, 1).0, 3);
         assert_eq!(block_content_metrics(&running_terminal(true), 80, 1).0, 3);
-        assert_eq!(
-            live_context_label(Some("/Users/me/.hermes"), Some("main")),
-            Some("/Users/me/.hermes git:(main)".into())
-        );
+        // live_context_label 的形状断言迁往 paint/ui_helpers.rs(与
+        // block_duration_str 同域;P1 加 elapsed 参数后本文件超行数预算)。
     }
 
     #[test]

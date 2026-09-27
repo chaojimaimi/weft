@@ -4,6 +4,8 @@
 //! command-name matching, path abbreviation, duration formatting, and string
 //! truncation. None depend on `MetalRenderer` state.
 
+use std::time::SystemTime;
+
 use weft_core::blocks::Block;
 
 /// Whether a block matches the panel search query (empty query = match all).
@@ -156,6 +158,43 @@ pub(crate) fn block_duration_str(b: &Block) -> String {
     } else {
         format!("{}m", ms / 60_000)
     }
+}
+
+/// Whole-second elapsed label for a RUNNING command's live header (P1):
+/// `<1s → "0s"`, `<60s → "{s}s"`, `<1h → "{m}m{ss}s"`, else `"{h}h{mm}m"`.
+/// Truncates to whole seconds (a half-run command never shows "0m59s" as
+/// "59.5s"); a backwards-set clock (negative elapsed) saturates at `"0s"`
+/// instead of panicking on `Duration` underflow.
+pub(crate) fn live_elapsed_label(started_at: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(started_at).unwrap_or_default().as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// The live block's single header line: abbreviated cwd (+ git branch when
+/// present), with the running elapsed label appended after a `·` separator.
+/// `cwd: None` → `None` — the header line only exists when there is a cwd,
+/// so the elapsed label never renders standalone (P1).
+pub(crate) fn live_context_label(
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    elapsed: Option<&str>,
+) -> Option<String> {
+    let cwd = cwd.map(abbreviate_path).filter(|cwd| !cwd.is_empty())?;
+    let mut label = match git_branch {
+        Some(branch) if !branch.is_empty() => format!("{cwd} git:({branch})"),
+        _ => cwd,
+    };
+    if let Some(elapsed) = elapsed {
+        label.push_str(" · ");
+        label.push_str(elapsed);
+    }
+    Some(label)
 }
 
 /// Truncate `s` to `max` chars, appending an ellipsis if it was cut.
@@ -348,6 +387,65 @@ mod tests {
             abbreviate_path_with("/opt/weft-unrelated-dir", Some("/Users/me")),
             "/opt/weft-unrelated-dir"
         );
+    }
+
+    // ── live_elapsed_label (P1: running-command timer, whole-second) ──
+    // Boundary table with a fixed clock — no wall time in the assertions.
+    #[test]
+    fn live_elapsed_label_boundary_table() {
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        let at = |secs: u64| epoch + std::time::Duration::from_secs(secs);
+        assert_eq!(live_elapsed_label(epoch, at(0)), "0s");
+        // 999ms truncates to the whole second: "0s", not "0.9s".
+        assert_eq!(
+            live_elapsed_label(epoch, epoch + std::time::Duration::from_millis(999)),
+            "0s"
+        );
+        assert_eq!(live_elapsed_label(epoch, at(1)), "1s");
+        assert_eq!(live_elapsed_label(epoch, at(59)), "59s");
+        assert_eq!(live_elapsed_label(epoch, at(60)), "1m00s");
+        assert_eq!(live_elapsed_label(epoch, at(61)), "1m01s");
+        assert_eq!(live_elapsed_label(epoch, at(3599)), "59m59s");
+        assert_eq!(live_elapsed_label(epoch, at(3600)), "1h00m");
+        assert_eq!(live_elapsed_label(epoch, at(3661)), "1h01m");
+        // Clock set backwards while running → saturate at "0s" (no panic).
+        assert_eq!(live_elapsed_label(at(10), epoch), "0s");
+    }
+
+    // ── live_context_label (P1: cwd/branch/elapsed single header line) ──
+    #[test]
+    fn live_context_label_without_elapsed_keeps_legacy_shape() {
+        assert_eq!(
+            live_context_label(Some("/Users/me/.hermes"), Some("main"), None),
+            Some("/Users/me/.hermes git:(main)".into())
+        );
+        assert_eq!(
+            live_context_label(Some("/Users/me/.hermes"), None, None),
+            Some("/Users/me/.hermes".into())
+        );
+    }
+
+    #[test]
+    fn live_context_label_appends_elapsed_after_separator() {
+        assert_eq!(
+            live_context_label(Some("/tmp"), None, Some("42s")),
+            Some("/tmp · 42s".into())
+        );
+    }
+
+    #[test]
+    fn live_context_label_branch_plus_elapsed() {
+        assert_eq!(
+            live_context_label(Some("/tmp"), Some("main"), Some("1m01s")),
+            Some("/tmp git:(main) · 1m01s".into())
+        );
+    }
+
+    #[test]
+    fn live_context_label_without_cwd_is_none_even_with_elapsed() {
+        // No cwd → no header line at all; elapsed never renders standalone.
+        assert_eq!(live_context_label(None, Some("main"), Some("42s")), None);
+        assert_eq!(live_context_label(None, None, Some("42s")), None);
     }
 
     // ── block_matches_query (v0.9 round 5: command-name substring match) ──

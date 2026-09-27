@@ -59,6 +59,7 @@ impl MetalRenderer {
             tui_preedit,
             cursor_blink_on: _,
             is_alt,
+            now,
         } = model;
         let mut verts = Vec::new();
         let mut hit_regions: Vec<crate::overlay::HitRegion> = Vec::new();
@@ -169,12 +170,10 @@ impl MetalRenderer {
         let live_styled = live
             .as_ref()
             .and_then(|live| live.styled_output.map(std::sync::Arc::clone));
-        // v1.10.26: the live composed document for the selection source is
-        // extracted BEFORE the layout pass moves `live` (raw &str into the
-        // terminal's block storage; outlives the frame).
+        // v1.10.26: the live composed document (selection source) is extracted
+        // BEFORE the layout pass moves `live` (its &str outlives the frame).
         let live_output_for_source = live.as_ref().map(|live| live.output);
-        // M5-b: laid rows borrow from the cache (zero-copy row text) — the
-        // borrow lives until the last read of `row_data` (paint loop end).
+        // M5-b: laid rows borrow from the cache (zero-copy) until `row_data`'s last read.
         let cache = self.block_layout_cache.borrow();
         let layout_out = compute_block_layout_pass(
             LayoutPassInput {
@@ -194,6 +193,7 @@ impl MetalRenderer {
                 resolve_styles: true,
                 styled_lookup_counter: Some(&self.styled_lookup_counter),
                 block_diagnose_state,
+                now,
             },
             &cache,
             &mut self.live_layout_cache.borrow_mut(),

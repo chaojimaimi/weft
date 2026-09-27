@@ -116,6 +116,8 @@ fn s1_model<'a>(
             styled_output: None,
             version: 1,
             screen_origin: false,
+            started_at: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000),
             min_write_offset: InFlightBlock::detached_watermark(),
         }),
         block_scroll: 0.0,
@@ -133,6 +135,9 @@ fn s1_model<'a>(
         tui_preedit: None,
         cursor_blink_on: false,
         is_alt: false,
+        // Fixed clock: pairs with the fixtures' started_at (same constant),
+        // so the live elapsed label is deterministic ("0s").
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     }
 }
 
@@ -166,6 +171,9 @@ fn s2_model<'a>(
         tui_preedit: None,
         cursor_blink_on: false,
         is_alt: false,
+        // Fixed clock: pairs with the fixtures' started_at (same constant),
+        // so the live elapsed label is deterministic ("0s").
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     }
 }
 
@@ -188,6 +196,8 @@ fn s3_model<'a>(
             styled_output: None,
             version: 7,
             screen_origin: false,
+            started_at: std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_secs(1_700_000_000),
             min_write_offset: InFlightBlock::detached_watermark(),
         }),
         block_scroll: 0.0,
@@ -205,6 +215,9 @@ fn s3_model<'a>(
         tui_preedit: Some(("ni'hao", Some((0, 2)))),
         cursor_blink_on: false,
         is_alt: false,
+        // Fixed clock: pairs with the fixtures' started_at (same constant),
+        // so the live elapsed label is deterministic ("0s").
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     }
 }
 
@@ -240,6 +253,9 @@ fn s4_model<'a>(
         tui_preedit: None,
         cursor_blink_on: false,
         is_alt: false,
+        // Fixed clock: pairs with the fixtures' started_at (same constant),
+        // so the live elapsed label is deterministic ("0s").
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     }
 }
 

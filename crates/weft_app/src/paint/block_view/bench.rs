@@ -97,6 +97,8 @@ fn frame_model<'a>(
         tui_preedit: None,
         cursor_blink_on: false,
         is_alt: false,
+        // Fixed clock: golden/bench output must not depend on wall time.
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     }
 }
 
@@ -363,6 +365,8 @@ fn run_frame_banded(
             tui_preedit: None,
             cursor_blink_on: false,
             is_alt: false,
+            // Fixed clock: golden/bench output must not depend on wall time.
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         },
         &mut SelectionHandler::new(),
     );

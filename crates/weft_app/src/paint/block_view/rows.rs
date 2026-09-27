@@ -112,6 +112,7 @@ impl MetalRenderer {
             tui_preedit: _,
             cursor_blink_on: _,
             is_alt: _,
+            now,
         } = model;
 
         let cw = self.cell_width() as f32;
@@ -166,6 +167,7 @@ impl MetalRenderer {
                 resolve_styles: false,
                 styled_lookup_counter: None,
                 block_diagnose_state,
+                now,
             },
             &cache,
             &mut self.live_layout_cache.borrow_mut(),

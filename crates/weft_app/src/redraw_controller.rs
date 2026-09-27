@@ -796,17 +796,16 @@ impl App {
             self.window_runtime
                 .cursor_anim_active
                 .store(anim_active, Ordering::Relaxed);
-            // F3-2: keep the spinner timer running while a command is executing so the
-            // braille activity indicator animates even without PTY output. Gated on
-            // block view: the spinner is a block-view element only (block_view.rs:948);
-            // in grid mode (primary-screen TUI / alt-screen app owning the screen) there
-            // is nothing to animate, so firing the 80ms timer only triggers pointless
-            // full grid rebuilds (force_full_grid_redraw) — a major contributor to
-            // execution-period flicker. spinner_phase has no grid-mode consumer
-            // (tab_bar/status do not use it).
+            // F3-2 + P1: timer keeps running while a command executes, with no
+            // reduce-motion term — animation is suppressed downstream: the
+            // frame prep above pins renderer.spinner_phase to -1.0 under
+            // reduce_motion and row_paint's `>= 0.0` gate skips the glyph
+            // (spinner_char_for_phase's reduce branch is unreachable there).
+            // The wake instead refreshes the P1 elapsed label — information,
+            // not animation (per-second text; negligible cost, no second
+            // cadence). Grid view stays excluded: F3-2's flicker lesson.
             let spinner_active = terminal.block_tracker().phase() == ShellPhase::CommandExecuting
-                && terminal.show_block_view()
-                && !self.window_runtime.reduce_motion;
+                && terminal.show_block_view();
             self.window_runtime
                 .spinner_anim_active
                 .store(spinner_active, Ordering::Relaxed);

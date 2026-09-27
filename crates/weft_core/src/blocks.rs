@@ -167,6 +167,10 @@ pub struct InFlightBlock<'a> {
     /// since the last consumption". Public like the other fields (detached
     /// test/bench handles use [`InFlightBlock::detached_watermark`]).
     pub min_write_offset: &'a std::sync::atomic::AtomicUsize,
+    /// Start of the running command (`133;B` time) — the live elapsed label's
+    /// anchor. Continuation sessions surface the base block's start so the
+    /// header shows the whole session's age, not just the current command's.
+    pub started_at: SystemTime,
 }
 
 impl<'a> InFlightBlock<'a> {
@@ -512,6 +516,16 @@ impl BlockTracker {
                 .as_ref()
                 .and_then(|block| block.cwd.as_deref())
                 .or(self.pending_cwd.as_deref()),
+            // Base-first, mirroring `command`/`cwd` above: during the settle
+            // window `pending_started` was NOT taken (the base's `started_at`
+            // is authoritative), so a continuation session's live header shows
+            // the session start. `now` fallback matches continuation.rs's
+            // finalize (unreachable under the normal state machine).
+            started_at: self
+                .continuation_base
+                .as_ref()
+                .map(|block| block.started_at)
+                .unwrap_or_else(|| self.pending_started.unwrap_or_else(SystemTime::now)),
             output: self.output.as_str(),
             // FIX_LIVE_STYLED_OUTPUT: plain-path commands read the throttled
             // streaming snapshot; screen-owned commands keep reading the

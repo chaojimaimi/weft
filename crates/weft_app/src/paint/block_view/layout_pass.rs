@@ -22,7 +22,7 @@ mod bounds;
 #[path = "layout_pass/window_tests.rs"]
 mod window_tests;
 use crate::paint::live_cache::LiveLayoutCache;
-use crate::paint::ui_helpers::strip_prompt_prefix;
+use crate::paint::ui_helpers::{live_context_label, live_elapsed_label, strip_prompt_prefix};
 use bounds::{lower_bound_height, upper_bound_height};
 use weft_core::blocks::{Block, BlockId, InFlightBlock, StyledLine};
 
@@ -130,6 +130,9 @@ pub(super) struct LayoutPassInput<'a, 'b> {
     /// Separate lifetime `'b`: output does not borrow from this field.
     pub(super) block_diagnose_state:
         &'b std::collections::HashMap<BlockId, crate::app_state::BlockDiagnoseState>,
+    /// P1: frame clock for the live header's elapsed label (passed through
+    /// from `BlockViewPaintModel::now`, so paint and hit-test share one read).
+    pub(super) now: std::time::SystemTime,
 }
 
 /// Run the shared layout pass: walk blocks bottom-to-top, accumulate
@@ -163,6 +166,7 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
         resolve_styles,
         styled_lookup_counter,
         block_diagnose_state,
+        now,
     } = input;
 
     let mut rows: Vec<f32> = Vec::new();
@@ -263,8 +267,11 @@ pub(super) fn compute_block_layout_pass<'a, 'b>(
             command: live.command,
             chunks: live_cmd_chunks,
         });
-        if let Some(text) = crate::block_component::live_context_label(live.cwd.or(cwd), git_branch)
-        {
+        // P1: the live header gains the running elapsed label. `now` is the
+        // caller-injected frame clock, so the paint/hit-test double build of
+        // one model yields identical bytes.
+        let elapsed = live_elapsed_label(live.started_at, now);
+        if let Some(text) = live_context_label(live.cwd.or(cwd), git_branch, Some(&elapsed)) {
             cursor_dist += pitch;
             rows.push(cursor_dist);
             row_data.push(LaidRow::LiveHeader { text });
@@ -609,6 +616,7 @@ mod tests {
             resolve_styles: false,
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         };
         let cache = BlockLayoutCache::default();
         let mut live_cache = LiveLayoutCache::default();
@@ -632,6 +640,8 @@ mod tests {
                 styled_output: None,
                 version: 1,
                 screen_origin: false,
+                started_at: std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(1_700_000_000),
                 min_write_offset: InFlightBlock::detached_watermark(),
             }),
             pane_session_id: 1,
@@ -648,6 +658,7 @@ mod tests {
             resolve_styles: false,
             styled_lookup_counter: None,
             block_diagnose_state: &std::collections::HashMap::new(),
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
         };
         let cache = BlockLayoutCache::default();
         let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());

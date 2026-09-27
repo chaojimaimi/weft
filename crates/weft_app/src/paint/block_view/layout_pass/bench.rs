@@ -74,6 +74,8 @@ fn bench_layout_pass() {
                     resolve_styles: true,
                     styled_lookup_counter: None,
                     block_diagnose_state: &std::collections::HashMap::new(),
+                    now: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_700_000_000),
                 };
                 let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
                 black_box(out.expanded_block_count);
@@ -101,6 +103,8 @@ fn bench_layout_pass() {
                     resolve_styles: true,
                     styled_lookup_counter: None,
                     block_diagnose_state: &std::collections::HashMap::new(),
+                    now: std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(1_700_000_000),
                 };
                 let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
                 black_box(out.expanded_block_count);

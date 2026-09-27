@@ -57,6 +57,8 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
         styled_output: None,
         version: 1,
         screen_origin: true,
+        started_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000),
         min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
@@ -78,6 +80,7 @@ fn b_path_live_row_lands_on_composed_cursor_anchor() {
         resolve_styles: false,
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -131,6 +134,8 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        started_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000),
         min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
@@ -152,6 +157,7 @@ fn b_path_live_row_matches_formula_anchor_for_soft_wrapped_output() {
         resolve_styles: false,
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -186,6 +192,8 @@ fn b_path_anchor_never_falls_below_layout_window_base() {
         styled_output: None,
         version: 1,
         screen_origin: true,
+        started_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000),
         min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
@@ -207,6 +215,7 @@ fn b_path_anchor_never_falls_below_layout_window_base() {
         resolve_styles: false,
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -246,6 +255,8 @@ fn b_path_wrapped_row_caret_chunk_selection_is_consistent() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        started_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000),
         min_write_offset: InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
@@ -267,6 +278,7 @@ fn b_path_wrapped_row_caret_chunk_selection_is_consistent() {
         resolve_styles: false,
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());
@@ -381,6 +393,8 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
         styled_output: None,
         version: 1,
         screen_origin: false,
+        started_at: std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(1_700_000_000),
         min_write_offset: weft_core::blocks::InFlightBlock::detached_watermark(),
     };
     let pitch = 20.0;
@@ -402,6 +416,7 @@ fn b_path_matches_real_anchor_after_settle_and_new_command() {
         resolve_styles: false,
         styled_lookup_counter: None,
         block_diagnose_state: &std::collections::HashMap::new(),
+        now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
     };
     let cache = BlockLayoutCache::default();
     let out = compute_block_layout_pass(input, &cache, &mut LiveLayoutCache::default());

@@ -29,9 +29,11 @@ pub(crate) fn tab_title(index: usize, cwd: Option<&str>, command: Option<&str>) 
     };
     let command = command.map(str::trim).filter(|command| !command.is_empty());
     match command {
+        // P4-lite: "▶ " marks a tab with a command still running — both the
+        // compact strip label and the hover tooltip carry it.
         Some(command) => TabTitle {
-            compact: format!("{compact_cwd} • {command}"),
-            tooltip: format!("{full_cwd} • {command}"),
+            compact: format!("▶ {compact_cwd} • {command}"),
+            tooltip: format!("▶ {full_cwd} • {command}"),
         },
         None => TabTitle {
             compact: compact_cwd.to_string(),
@@ -594,11 +596,14 @@ mod tests {
             Some("/Users/andylee/McDull/OpenCode"),
             Some("opencode upgrade"),
         );
-        assert_eq!(title.compact, "OpenCode • opencode upgrade");
+        assert_eq!(title.compact, "▶ OpenCode • opencode upgrade");
         assert_eq!(weft_core::grid::terminal_char_width('•'), 1);
+        // P4-lite: the running marker is one terminal column (ambiguous-width
+        // triangle, same standardization as '•') — pin the width semantics.
+        assert_eq!(weft_core::grid::terminal_char_width('▶'), 1);
         assert_eq!(
             title.tooltip,
-            "/Users/andylee/McDull/OpenCode • opencode upgrade"
+            "▶ /Users/andylee/McDull/OpenCode • opencode upgrade"
         );
     }
 
@@ -609,10 +614,25 @@ mod tests {
             Some("/Users/andylee/McDull/Claude/projects/weft"),
             Some("cargo test --workspace"),
         );
-        assert_eq!(title.compact, "weft • cargo test --workspace");
+        assert_eq!(title.compact, "▶ weft • cargo test --workspace");
         assert!(title
             .tooltip
-            .starts_with("/Users/andylee/McDull/Claude/projects/weft • "));
+            .starts_with("▶ /Users/andylee/McDull/Claude/projects/weft • "));
+    }
+
+    #[test]
+    fn running_marker_only_when_a_command_is_running() {
+        // Running: both compact and tooltip carry the "▶ " prefix.
+        let running = tab_title(0, Some("/tmp"), Some("cargo build"));
+        assert!(running.compact.starts_with("▶ "));
+        assert!(running.tooltip.starts_with("▶ "));
+        // Idle: unchanged, no marker.
+        let idle = tab_title(0, Some("/tmp"), None);
+        assert_eq!(idle.compact, "/tmp");
+        assert_eq!(idle.tooltip, "/tmp");
+        // Blank/whitespace command counts as idle (same filter as the label).
+        let blank = tab_title(0, Some("/tmp"), Some("   "));
+        assert_eq!(blank.compact, "/tmp");
     }
 
     #[test]

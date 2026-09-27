@@ -477,7 +477,23 @@ pub(super) fn paint_live_command(
 
     if ctx.spinner_phase >= 0.0 {
         let spinner_char = spinner_char_for_phase(ctx.spinner_phase, renderer.reduce_motion);
-        let spinner_x = ctx.right - ctx.cw;
+        // P3-lite: the glyph follows the last command row's text (one blank
+        // column after it) instead of hugging the far right edge where it was
+        // easy to miss. The last row's origin matches the chunk loop above:
+        // a single-chunk command starts after "> " (`cmd_x`), continuation
+        // rows start flush-left. Display width (not char count) keeps CJK
+        // text overlap-free; overflow falls back to the legacy right edge.
+        let (last_row_x, avail_cols) = if chunks.len() == 1 {
+            (cmd_x, first_avail)
+        } else {
+            (ctx.left, ctx.cols)
+        };
+        let text_width = chunks
+            .last()
+            .map(|chunk| weft_core::grid::terminal_text_width(chunk))
+            .unwrap_or(0);
+        let spinner_x = spinner_x_after_command(last_row_x, text_width, ctx.cw, avail_cols)
+            .unwrap_or(ctx.right - ctx.cw);
         let ui = crate::ui_tokens::UiColors::from_theme(&renderer.theme)
             .with_increase_contrast(renderer.increase_contrast);
         let spinner_color = color_to_normalized(ui.focus);
@@ -491,6 +507,31 @@ pub(super) fn paint_live_command(
             1,
         );
     }
+}
+
+/// P3-lite: x for the spinner glyph that trails the live command's last
+/// visual row. `Some(x)` = one blank column after the command text (columns
+/// are terminal display columns, so CJK never overlaps); `None` = the glyph
+/// would overflow the row's column budget → the caller falls back to the
+/// legacy right-edge slot. A zero-width command (no chunks, or a blank last
+/// chunk) parks the glyph two columns past the row origin — the `"> "` prompt
+/// width — instead of flinging it to the right edge.
+fn spinner_x_after_command(
+    row_x: f32,
+    text_width_cols: usize,
+    cw: f32,
+    avail_cols: usize,
+) -> Option<f32> {
+    if text_width_cols == 0 {
+        return Some(row_x + 2.0 * cw);
+    }
+    let offset_cols = text_width_cols + 1;
+    // The glyph itself occupies one more column; both must fit in the row's
+    // budget or the caller falls back to the right edge.
+    if offset_cols >= avail_cols {
+        return None;
+    }
+    Some(row_x + offset_cols as f32 * cw)
 }
 
 /// `LaidRow::Blank` — spacer row for a completed `clear` band; paints
@@ -596,4 +637,46 @@ pub(super) fn push_header_segment(
     renderer.push_text(verts, *x, y, seg, color, *remaining);
     *x += w as f32 * cw;
     *remaining = remaining.saturating_sub(w);
+}
+
+#[cfg(test)]
+mod spinner_tests {
+    use super::*;
+
+    /// ASCII command (5 cols): glyph sits one blank column after the text,
+    /// not at the far right edge.
+    #[test]
+    fn ascii_command_glyph_sits_one_column_after_text() {
+        assert_eq!(spinner_x_after_command(100.0, 5, 10.0, 40), Some(160.0));
+    }
+
+    /// CJK "你好" = 4 display columns for 2 chars: a char-count offset (2+1)
+    /// would land the glyph on the second ideograph; the display-width offset
+    /// clears it.
+    #[test]
+    fn cjk_command_glyph_never_overlaps_wide_text() {
+        let width = weft_core::grid::terminal_text_width("你好");
+        assert_eq!(width, 4);
+        let x = spinner_x_after_command(0.0, width, 10.0, 40).unwrap();
+        assert!(
+            x >= 4.0 * 10.0,
+            "glyph must start past the 4-column text, got x={x}"
+        );
+        assert_eq!(x, 50.0);
+    }
+
+    /// Full row: text + blank + glyph would exceed the budget → `None`
+    /// (caller falls back to the right edge). Exactly-filling also falls back.
+    #[test]
+    fn overflow_row_falls_back_to_right_edge() {
+        assert_eq!(spinner_x_after_command(0.0, 39, 10.0, 40), None);
+        assert_eq!(spinner_x_after_command(0.0, 40, 10.0, 40), None);
+    }
+
+    /// Empty command: park the glyph two columns past the row origin (the
+    /// `"> "` prompt width).
+    #[test]
+    fn empty_command_parks_glyph_after_prompt() {
+        assert_eq!(spinner_x_after_command(20.0, 0, 10.0, 40), Some(40.0));
+    }
 }

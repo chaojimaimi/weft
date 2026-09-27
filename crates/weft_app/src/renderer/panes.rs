@@ -169,6 +169,7 @@ impl MetalRenderer {
                         tui_preedit: None,
                         cursor_blink_on: false,
                         is_alt: pane.terminal.is_alt_screen_active(),
+                        now: std::time::SystemTime::now(),
                     },
                     &mut selection,
                 );
