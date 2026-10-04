@@ -1,6 +1,10 @@
 //! Atlas coordinate helpers shared by prewarmed and dynamic glyph slots.
 
 /// UV rect for a glyph in the atlas texture.
+// v1.12.23 audit batch 2: allow retained — stripping it surfaced genuine
+// `dead_code` on the `advance`/`is_wide` fields in the bin target (they
+// are never read anywhere, construction-only); delete the fields in a later
+// batch rather than wiring readers.
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code)]
 pub struct GlyphInfo {

@@ -80,7 +80,14 @@ fn repeated_primary_screen_addressing_temporarily_owns_the_grid_view() {
     );
     t.process(b"\x1b[?1049l");
     assert!(t.primary_screen_app_active());
-    t.block_tracker_mut().reset_to_prompt();
+    // v1.12.23 audit batch 2: `BlockTracker::reset_to_prompt` was removed as
+    // dead code; drive the same Ctrl+C-flush semantics via the OSC 133
+    // boundary instead (finalize in-flight block + return to AtPrompt).
+    // Note: on a screen-owned session any `133;D` defers the finalization
+    // (200ms settle protocol), so the settle call below completes the
+    // transition that `reset_to_prompt` performed synchronously.
+    t.process(b"\x1b]133;D\x07");
+    t.settle_primary_screen_exit();
     assert!(!t.primary_screen_app_active());
     assert!(t.show_block_view());
 
@@ -514,7 +521,12 @@ fn primary_screen_tui_resize_is_dimension_only() {
         "absolute-positioned TUI rows must not reflow before SIGWINCH repaint"
     );
 
-    t.block_tracker_mut().reset_to_prompt();
+    // v1.12.23 audit batch 2: `BlockTracker::reset_to_prompt` was removed as
+    // dead code; drive the same Ctrl+C-flush exit via the OSC 133 boundary.
+    // No settle needed here: the app_active flip comes from the D handler
+    // resetting primary_screen_cursor_ops (perform.rs), matching the single
+    // phase assertion below.
+    t.process(b"\x1b]133;D\x07");
     assert!(!t.primary_screen_app_active());
 }
 
@@ -707,7 +719,7 @@ fn primary_screen_ownership_follows_rows_into_scrollback() {
     );
     let snapshot = terminal
         .grid()
-        .document_snapshot_from_position_with_ownership_masks(
+        .document_snapshot_from_position_with_ownership_masks_and_resolver(
             0,
             &terminal.capabilities.primary_screen_ownership.scrollback,
             terminal
@@ -716,6 +728,7 @@ fn primary_screen_ownership_follows_rows_into_scrollback() {
                 .viewport
                 .as_deref()
                 .unwrap(),
+            |_| None,
             DEFAULT_OUTPUT_CAP,
         )
         .0;

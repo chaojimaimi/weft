@@ -21,7 +21,7 @@ fn terminal_resize_queues_latest_size_without_desynchronizing_grid() {
     let mut tab = tab_with_terminal();
     tab.pending_pty_resize = Some((40, 120));
 
-    assert!(tab.resize_terminal_and_queue(22, 78));
+    assert!(tab.active_mut().resize_terminal_and_queue(22, 78));
     assert_eq!(tab.pending_pty_resize, Some((22, 78)));
     let grid = tab.terminal.as_ref().unwrap().grid();
     assert_eq!(

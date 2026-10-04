@@ -88,7 +88,6 @@ bitflags! {
     /// Tracks which top-level sections have been edited in the Settings UI
     /// so a save only writes the dirty sections back to the target
     /// (base or profile). Bit assignments are stable across releases.
-    #[allow(dead_code)] // v1.5.1: consumed by Settings profile save path
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct ConfigSectionMask: u32 {
         const FONT         = 1 << 0;

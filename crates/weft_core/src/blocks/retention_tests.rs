@@ -102,42 +102,24 @@ fn lowering_limit_enforces_immediately() {
 
 #[test]
 fn retention_removes_evicted_ids_from_side_sets() {
-    // dirty_blocks: collapse marks dirty; the id must leave the set when
-    // its block is evicted.
-    let mut t = BlockTracker::new();
-    t.set_retained_limit(1);
-    finish_cmd(&mut t, "first");
-    t.toggle_collapse(BlockId(1));
-    assert!(t.has_dirty_blocks());
-    t.take_dirty_blocks();
-    t.mark_block_dirty(BlockId(1));
-    finish_cmd(&mut t, "second"); // exceeds → pop block 1
-    t.take_dirty_blocks(); // contains id 2 from finalize
-    assert!(
-        !t.has_dirty_blocks(),
-        "evicted id 1 must not linger in dirty_blocks"
-    );
-
     // screen_owned_blocks: a screen-owned block evicted from the Vec
     // must leave the continuation scope set.
-    let mut t2 = BlockTracker::new();
-    t2.set_retained_limit(1);
-    t2.on_prompt_start();
-    t2.on_command_start("tui".to_string());
-    t2.begin_screen_owned_output(0);
-    t2.replace_screen_output("banner");
-    t2.on_command_end(0);
-    assert!(t2.blocks()[0].screen_origin);
-    finish_cmd(&mut t2, "next");
+    let mut t = BlockTracker::new();
+    t.set_retained_limit(1);
+    t.on_prompt_start();
+    t.on_command_start("tui".to_string());
+    t.begin_screen_owned_output(0);
+    t.replace_screen_output("banner");
+    t.on_command_end(0);
+    assert!(t.blocks()[0].screen_origin);
+    // Exceeds the limit → pop block 1.
+    finish_cmd(&mut t, "next");
     // Observable proof of the removal: id 1 appears ONLY through the
     // evicted-ids union, and a fresh screen continuation cannot pick it.
-    assert!(
-        t2.evicted_ids().contains(&1),
-        "screen-owned block 1 evicted"
-    );
-    let produced = t2.session_produced_block_ids();
+    assert!(t.evicted_ids().contains(&1), "screen-owned block 1 evicted");
+    let produced = t.session_produced_block_ids();
     assert!(produced.contains(&1));
-    assert_eq!(t2.blocks().len(), 1);
+    assert_eq!(t.blocks().len(), 1);
 }
 
 #[test]
@@ -211,7 +193,6 @@ fn load_older_to_front_prepends_in_time_order() {
     for i in 0..3 {
         finish_cmd(&mut t, &format!("c{i}"));
     }
-    t.take_dirty_blocks(); // clear finalize dirt
 
     // DB-shaped input: newest-first (older_than returns DESC).
     let older = vec![make_block(90, "mid-age", 30), make_block(91, "ancient", 90)];
@@ -223,9 +204,6 @@ fn load_older_to_front_prepends_in_time_order() {
         vec!["ancient", "mid-age", "c1", "c2"],
         "prepended ascending, time order preserved overall"
     );
-    // Loaded blocks marked dirty for vertex rebuild.
-    let dirty = t.take_dirty_blocks();
-    assert!(dirty.contains(&90) && dirty.contains(&91));
     // They count as LOADED, not session-produced...
     let produced = t.session_produced_block_ids();
     assert!(!produced.contains(&90) && !produced.contains(&91));
@@ -256,10 +234,8 @@ fn load_older_to_front_clears_evicted_marking() {
 fn load_older_to_front_empty_is_noop() {
     let mut t = BlockTracker::new();
     finish_cmd(&mut t, "only");
-    t.take_dirty_blocks(); // clear finalize dirt
     t.load_older_to_front(Vec::new());
     assert_eq!(t.blocks().len(), 1);
-    assert!(!t.has_dirty_blocks());
 }
 
 /// rust-reviewer v1.11.2 Minor-4 regression: blocks the user paged back in
@@ -275,7 +251,6 @@ fn retention_never_evicts_user_pinned_load_older_pages() {
     // Page two older blocks back in (they prepend and pin).
     let older = vec![make_block(90, "mid-age", 30), make_block(91, "ancient", 90)];
     t.load_older_to_front(older);
-    t.take_dirty_blocks();
 
     // Next finalize exceeds the limit: the pinned page survives and the
     // oldest session-produced blocks are evicted instead.

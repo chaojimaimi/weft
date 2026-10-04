@@ -398,12 +398,6 @@ impl Pty {
         self.event_rx.len()
     }
 
-    /// Check if the child process is still alive.
-    pub fn is_alive(&self) -> bool {
-        // Send signal 0 to check if process exists.
-        signal::kill(self.child_pid, None::<Signal>).is_ok()
-    }
-
     /// Get the child process PID.
     pub fn child_pid(&self) -> Pid {
         self.child_pid

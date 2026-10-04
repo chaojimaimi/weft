@@ -34,7 +34,6 @@ weft_core = { path = "../weft_core" }
 metal.workspace = true
 block.workspace = true
 objc2.workspace = true
-objc2-metal.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-user-notifications.workspace = true
@@ -60,9 +59,10 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync
 # v1.10.23: defer the crash-recovery prompt out of the winit handler (see
 # docs/FIX_RECOVERY_MODAL_SPIN.md). Zero transitive deps, MSRV 1.71.
 dispatch2.workspace = true
-# v1.6 AI integration: dependencies for `crates/weft_app/src/ai/`. The module
-# is scaffolding-only in v1.3 (not wired into the app shell, see ROADMAP DC-8
-# and `ai/mod.rs`). Kept on the v1.3 cut so v1.6 builds on a reviewed baseline.
+# v1.6 AI integration: dependencies for `crates/weft_app/src/ai/`. The
+# module has been fully wired into the app shell since v1.8 (Ollama-only
+# per ROADMAP DC-9/DC-10); v1.12.23 audit batch 2 fixed the stale
+# "scaffolding-only in v1.3" note.
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }

@@ -219,15 +219,6 @@ static HANDLES_REGISTERED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static GLOBAL_ZOOM_STATE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Degradation kill lever (E-5 risk 1): the injected IMP cannot be unloaded,
-/// so the degrade form (1.12.10 push-only) is one call away. Not wired to
-/// config this batch -- carried for the field-run A/B and degrade paths
-/// (E-5's "全局 feature 开关"); reads go through `pull_enabled`.
-#[allow(dead_code)]
-pub(crate) fn set_pull_enabled(enabled: bool) {
-    PULL_ENABLED.store(enabled, Ordering::Release);
-}
-
 pub(crate) fn pull_enabled() -> bool {
     PULL_ENABLED.load(Ordering::Acquire)
 }

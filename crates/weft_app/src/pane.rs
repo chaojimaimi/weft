@@ -211,7 +211,9 @@ impl Pane {
         }
     }
 
-    /// Empty pane (used when PTY spawn fails — terminal/pty stay None).
+    /// Empty pane — terminal/pty stay None. Production fallback when PTY
+    /// spawn fails (see `spawn`); also the base of the test-only
+    /// `Tab::empty` constructor.
     pub(crate) fn empty() -> Self {
         let (msg_tx, msg_rx) = crossbeam_channel::bounded(1024);
         Self {

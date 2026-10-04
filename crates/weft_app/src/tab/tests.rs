@@ -9,12 +9,6 @@
 use super::*;
 
 #[test]
-fn empty_tab_is_not_alive() {
-    let t = Tab::empty();
-    assert!(!t.is_alive());
-}
-
-#[test]
 fn empty_tab_has_no_terminal() {
     let t = Tab::empty();
     assert!(t.terminal.is_none());

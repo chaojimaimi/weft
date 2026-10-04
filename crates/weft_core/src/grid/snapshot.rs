@@ -151,34 +151,6 @@ impl Grid {
     /// the current application has never owned. Filtering is deliberately
     /// non-destructive: the live Grid keeps shell context needed by terminal
     /// emulation, while detached history sees only application output.
-    #[allow(dead_code)] // used in tests + kept for callers that don't need link capture
-    pub(crate) fn document_snapshot_from_position_with_ownership_masks(
-        &self,
-        document_start: u64,
-        scrollback_owned: &[bool],
-        viewport_owned: &[bool],
-        text_cap: usize,
-    ) -> (String, StyledOutput) {
-        let viewport_origin = self.scrollback.position();
-        let (scrollback_start, viewport_start) = if document_start <= viewport_origin {
-            (self.scrollback.index_since(document_start), 0)
-        } else {
-            (
-                self.scrollback.len(),
-                document_start.saturating_sub(viewport_origin) as usize,
-            )
-        };
-        self.document_snapshot_from_indices(
-            scrollback_start,
-            viewport_start,
-            Some(scrollback_owned),
-            Some(viewport_owned),
-            text_cap,
-        )
-    }
-
-    /// v1.6.1: Same as [`document_snapshot_from_position_with_ownership_masks`]
-    /// but resolves hyperlink ids to URLs via `url_resolver`.
     pub(crate) fn document_snapshot_from_position_with_ownership_masks_and_resolver<F>(
         &self,
         document_start: u64,
@@ -612,10 +584,11 @@ mod tests {
         let owned = [true, false, true, false, true];
 
         let snapshot = grid
-            .document_snapshot_from_position_with_ownership_masks(
+            .document_snapshot_from_position_with_ownership_masks_and_resolver(
                 0,
                 &[],
                 &owned,
+                |_| None,
                 DEFAULT_OUTPUT_CAP,
             )
             .0;
@@ -635,10 +608,11 @@ mod tests {
         grid.viewport[2] = row("owned prompt", 24);
 
         let snapshot = grid
-            .document_snapshot_from_position_with_ownership_masks(
+            .document_snapshot_from_position_with_ownership_masks_and_resolver(
                 0,
                 &[false, true],
                 &[true, false, true],
+                |_| None,
                 DEFAULT_OUTPUT_CAP,
             )
             .0;

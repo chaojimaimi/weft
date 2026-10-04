@@ -1,30 +1,6 @@
 use super::*;
 
 #[test]
-fn reset_to_prompt_finalizes_with_no_exit_code() {
-    // v1.0 fix: reset_to_prompt() (called after Ctrl+C flush) finalizes
-    // any in-flight block with no exit code, mirroring the 133;A interrupt
-    // path. This is a distinct code path from on_prompt_start().
-    let mut tracker = BlockTracker::new();
-    tracker.on_prompt_start();
-    tracker.on_command_start("long-running".to_string());
-    tracker.on_print('x', CapturedStyle::default());
-    tracker.on_print('y', CapturedStyle::default());
-    // Simulate Ctrl+C flush → reset_to_prompt (no 133;D, no 133;A).
-    tracker.reset_to_prompt();
-
-    assert_eq!(tracker.blocks().len(), 1);
-    let block = &tracker.blocks()[0];
-    assert_eq!(block.command, "long-running");
-    assert_eq!(block.output.as_ref(), "xy");
-    assert_eq!(
-        block.exit_code, None,
-        "reset_to_prompt finalizes with no exit code"
-    );
-    assert_eq!(tracker.phase(), ShellPhase::AtPrompt);
-}
-
-#[test]
 fn screen_owned_command_uses_final_snapshot_not_repaint_stream() {
     let mut tracker = BlockTracker::new();
     tracker.on_prompt_start();

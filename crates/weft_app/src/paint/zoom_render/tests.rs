@@ -305,12 +305,6 @@ fn pull_can_freshen_gate_combinations() {
     // Pull caught up: watermark == requested inner size -> release the gate.
     assert!(!pull_can_freshen(800.0, 600.0));
 
-    // Degradation lever: off closes the gate regardless of the watermark
-    // (E-5's degrade promise); restored afterwards.
-    set_pull_enabled(false);
-    assert!(!pull_can_freshen(900.0, 700.0));
-    set_pull_enabled(true);
-
     // Teardown: cleared cache closes the gate for good.
     teardown();
     assert!(!pull_can_freshen(900.0, 700.0));

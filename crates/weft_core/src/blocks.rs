@@ -298,8 +298,12 @@ pub struct BlockTracker {
     /// global history into the tab's `block_ids`, breaking per-tab isolation.
     loaded_ids: HashSet<u64>,
     /// v1.0 P0-b Layer 2: Block ids whose rendering-relevant state changed
-    /// (new block, collapse toggle) since the last [`take_dirty_blocks`].
-    /// The renderer can skip unchanged blocks when rebuilding vertices.
+    /// (new block, collapse toggle). v1.12.23 audit batch 2: the polling
+    /// accessors (`take_dirty_blocks`/`has_dirty_blocks`/`mark_block_dirty`)
+    /// were removed as dead code — the set is now maintained purely by the
+    /// inline insert protocol: every production mutation site inserts directly
+    /// (`toggle_collapse`/`load_blocks` here, continuation/screen-capture/
+    /// retention finalize paths), and retention pops remove ids on eviction.
     dirty_blocks: HashSet<u64>,
     /// v1.11.2 X4 (PLAN_v1112 §1.2): in-memory cap; 0 disables. See retention.rs.
     retained_limit: usize,
@@ -473,22 +477,6 @@ impl BlockTracker {
         }
     }
 
-    /// v1.0 P0-b Layer 2: Mark a block as needing vertex rebuild.
-    pub fn mark_block_dirty(&mut self, id: BlockId) {
-        self.dirty_blocks.insert(id.0);
-    }
-
-    /// v1.0 P0-b Layer 2: Drain the set of dirty block ids. The renderer calls
-    /// this after rebuilding vertices to reset the set for the next frame.
-    pub fn take_dirty_blocks(&mut self) -> HashSet<u64> {
-        std::mem::take(&mut self.dirty_blocks)
-    }
-
-    /// v1.0 P0-b Layer 2: Whether any block is dirty.
-    pub fn has_dirty_blocks(&self) -> bool {
-        !self.dirty_blocks.is_empty()
-    }
-
     /// The currently-running command (between `133;B` and `133;D`), for the
     /// renderer's live block during CommandExecuting (e.g. an interactive
     /// `sudo su`). `None` when nothing is in flight.
@@ -579,21 +567,6 @@ impl BlockTracker {
     /// finalize it with no exit code so it still appears in history.
     pub fn on_prompt_start(&mut self) {
         self.bootstrap_ready = true;
-        if self.phase == ShellPhase::CommandExecuting {
-            self.finalize(None);
-        }
-        self.phase = ShellPhase::AtPrompt;
-    }
-
-    /// v1.0 fix: Force-reset to AtPrompt after Ctrl+C flush.
-    ///
-    /// When `flush_pty_output()` discards stale PTY output, it may also
-    /// discard the OSC 133;A marker the shell emits after an interrupted
-    /// command. Without that marker, `phase` stays `CommandExecuting` and
-    /// the editor/input box never reappears. This method synthesizes the
-    /// `133;A` transition: finalize any in-flight block (no exit code) and
-    /// return to `AtPrompt`.
-    pub fn reset_to_prompt(&mut self) {
         if self.phase == ShellPhase::CommandExecuting {
             self.finalize(None);
         }

@@ -37,7 +37,6 @@ base64 = "=0.22.1"
 # macOS_notifications wrap `NSException` foreign unwinds in `objc2::exception::catch`.
 metal = "0.29"
 objc2 = { version = "0.5", features = ["exception"] }
-objc2-metal = "0.2"
 objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSGeometry", "NSString", "NSObject"] }
 # v1.11.13 (PLAN_v11113 §M1): +NSBezierPath/NSColor/NSGraphics — Dock
 # progress-bar synthesis path. objc2-app-kit 0.2.2 exposes NO CGImage
@@ -95,8 +94,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
 # v1.6 AI integration: HTTP client (rustls-tls to avoid OpenSSL on macOS).
-# Pulled in by `crates/weft_app/src/ai/`; the module is scaffolding-only in
-# v1.3 and not wired into the app shell (see ROADMAP DC-8).
+# Pulled in by `crates/weft_app/src/ai/`; the module has been fully wired
+# into the app since v1.8 (Ollama-only per ROADMAP DC-9/DC-10).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # v1.8 AI integration: StreamExt for driving reqwest's `bytes_stream()`.
 # Transitive dependency of reqwest 0.12 with the `stream` feature; declared

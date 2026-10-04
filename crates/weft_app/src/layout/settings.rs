@@ -22,9 +22,6 @@ pub struct SettingsLayout {
     /// F5: Sidebar area `[x0, y0, x1, y1]` where category list is rendered.
     /// In narrow drill-down content mode this is zero-sized (sidebar hidden).
     pub sidebar_rect: Rect,
-    /// F5: Width of the sidebar column (0 when sidebar hidden).
-    #[allow(dead_code)]
-    pub sidebar_width: f32,
     /// F5: Top of the first sidebar category row.
     pub sidebar_top: f32,
     /// F5: True when the sidebar is visible (wide mode, or narrow sidebar view).
@@ -207,11 +204,6 @@ pub fn layout_settings(
     Some(SettingsLayout {
         box_rect: [box_x0, box_y0, box_x1, box_y1],
         sidebar_rect,
-        sidebar_width: if show_sidebar {
-            sidebar_rect[2] - sidebar_rect[0]
-        } else {
-            0.0
-        },
         sidebar_top: area_top + ch * 0.5,
         show_sidebar,
         show_content,

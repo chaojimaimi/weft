@@ -280,10 +280,11 @@ mod tests {
         grid.viewport[2] = row("owned prompt", 40);
 
         let snapshot = grid
-            .document_snapshot_from_position_with_ownership_masks(
+            .document_snapshot_from_position_with_ownership_masks_and_resolver(
                 0,
                 &[false, true],
                 &[true, false, true],
+                |_| None,
                 DEFAULT_OUTPUT_CAP,
             )
             .0;

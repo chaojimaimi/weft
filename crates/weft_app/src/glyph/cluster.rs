@@ -59,10 +59,6 @@ use font_kit::loaders::core_text::Font;
 /// runs the full CoreText shaper, which is the same path TextKit uses — it
 /// handles all of these cases correctly without per-cluster special-casing.
 //
-// v1.6.0 step 4: dead_code allowed — this POC function is exercised by the
-// tests below and will be called from the paint path in step 5
-// ("接通 Grid、selection、copy、reflow、Block capture 和 Metal atlas").
-#[allow(dead_code)]
 pub(super) fn rasterize_cluster_alpha(
     font: &Font,
     cluster: &str,

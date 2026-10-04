@@ -371,17 +371,6 @@ pub(crate) fn focus_ring_alpha(increase_contrast: bool) -> f32 {
 /// Pure function; no global state. Inline-friendly — the compiler collapses
 /// this to a single `roundsd`/`vroundss` on x86/ARM.
 ///
-/// Kept as part of the documented v1.4 snap API even though current chrome
-/// call sites use `snap_physical_rect` (the two-edge variant). Single-
-/// coordinate snapping is the natural primitive for future callers that need
-/// to align a 1-D position (e.g. an x-only or y-only guide line) and is
-/// exercised by the unit tests below.
-#[allow(dead_code)]
-#[inline]
-pub(crate) fn snap_physical(value: f32) -> f32 {
-    value.round()
-}
-
 /// Snap both edges of a 1-D interval to integer physical-pixel boundaries.
 ///
 /// Returns `(start_rounded, end_rounded)`. The width may shrink or grow by
@@ -681,36 +670,6 @@ mod tests {
     }
 
     // ── v1.4.0: snap_physical helpers ─────────────────────────────────
-
-    #[test]
-    fn snap_physical_rounds_integers_unchanged() {
-        // Integers are already on pixel boundaries — snap must be identity.
-        assert_eq!(snap_physical(0.0), 0.0);
-        assert_eq!(snap_physical(1.0), 1.0);
-        assert_eq!(snap_physical(100.0), 100.0);
-        assert_eq!(snap_physical(-5.0), -5.0);
-    }
-
-    #[test]
-    fn snap_physical_rounds_positive_fractionals() {
-        // round() uses banker's rounding in Rust (round-half-to-even),
-        // but for typical layout inputs the values are not exactly at .5.
-        // 0.4 → 0, 0.6 → 1, 10.49 → 10, 10.51 → 11.
-        assert_eq!(snap_physical(0.4), 0.0);
-        assert_eq!(snap_physical(0.6), 1.0);
-        assert_eq!(snap_physical(10.49), 10.0);
-        assert_eq!(snap_physical(10.51), 11.0);
-    }
-
-    #[test]
-    fn snap_physical_rounds_negative_fractionals() {
-        // Negative coordinates (e.g. offscreen scissor bounds) must round
-        // toward the nearest integer, not toward zero.
-        assert_eq!(snap_physical(-0.4), 0.0);
-        assert_eq!(snap_physical(-0.6), -1.0);
-        assert_eq!(snap_physical(-10.49), -10.0);
-        assert_eq!(snap_physical(-10.51), -11.0);
-    }
 
     #[test]
     fn snap_physical_rect_returns_integer_edges() {

@@ -256,13 +256,11 @@ impl Tab {
 
     /// Borrow a specific pane by id. Returns `None` if the pane is not in
     /// this tab (closed or never created).
-    #[allow(dead_code)] // v1.3 Batch 4+: consumed by split/focus/close handlers
     pub(crate) fn pane(&self, id: PaneId) -> Option<&Pane> {
         self.panes.get(&id)
     }
 
     /// Mutably borrow a specific pane by id.
-    #[allow(dead_code)] // v1.3 Batch 4+: consumed by split/focus/close handlers
     pub(crate) fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.panes.get_mut(&id)
     }
@@ -296,13 +294,11 @@ impl Tab {
     }
 
     /// Id of the currently focused pane.
-    #[allow(dead_code)] // v1.3 Batch 4+: consumed by split/focus/close handlers
     pub(crate) fn active_pane_id(&self) -> PaneId {
         self.active_pane
     }
 
     /// Read-only view of the split tree (for layout / hit-testing).
-    #[allow(dead_code)] // v1.3 Batch 5+: consumed by multi-pane renderer
     pub(crate) fn split_tree(&self) -> &SplitTree {
         &self.split_tree
     }
@@ -552,11 +548,11 @@ impl Tab {
     /// v1.3.3: True iff the tab is currently in pane-zoom mode (one pane
     /// shown full-viewport, siblings hidden).
     ///
-    /// Not yet read by the render path — `split_tree().layout()` already
-    /// collapses to a single-pane vec when zoomed, so the redraw pipeline
-    /// gets the right geometry without an explicit branch. Kept on the API
-    /// for the upcoming status-bar / zoom-indicator UX.
-    #[allow(dead_code)]
+    /// `split_tree().layout()` already collapses to a single-pane vec when
+    /// zoomed, so the redraw pipeline gets the right geometry without an
+    /// explicit branch; v1.12.23 audit batch 2 doc fix — this is read by the
+    /// zoom toggle action (app/action.rs) to skip the toggle when already
+    /// zoomed, not only by a future status-bar UX.
     pub(crate) fn is_zoomed(&self) -> bool {
         self.split_tree.is_zoomed()
     }
@@ -579,8 +575,11 @@ impl Tab {
         Self::from_single_pane(pane)
     }
 
-    /// Empty tab (used when PTY spawn fails — terminal/pty stay None).
-    #[allow(dead_code)] // used by tests; production code goes through `Tab::new`
+    /// PTY-less test constructor — terminal/pty stay None. Production code
+    /// goes through `Tab::new` (a real PTY spawn); v1.12.23 audit batch 2
+    /// narrowed this to `#[cfg(test)]` since tests are its only callers
+    /// (the only way to build a Tab without spawning a PTY).
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self::from_single_pane(Pane::empty())
     }
@@ -632,19 +631,6 @@ impl Tab {
         self.active().input_seq
     }
 
-    /// Keep the in-memory Grid and the next PTY `TIOCSWINSZ` inseparable.
-    /// Overwriting (rather than preserving) an older pending size is required
-    /// when several window/font/sidebar changes coalesce before the throttle
-    /// flushes them, including for background panes.
-    //
-    // v1.3: covered by snapshot_tests but not yet driven by the production
-    // resize path (which uses `resize_all_panes_for_rect` for multi-pane).
-    // Keep the single-pane entry point live for the test and for v1.3 batch 7.
-    #[allow(dead_code)]
-    pub(crate) fn resize_terminal_and_queue(&mut self, rows: usize, cols: usize) -> bool {
-        self.active_mut().resize_terminal_and_queue(rows, cols)
-    }
-
     /// Grid dimensions of the active pane for the current split layout.
     /// Unlike the full content-area dimensions, this remains equal to the
     /// active Terminal grid after a split and is safe for redraw convergence.
@@ -681,11 +667,11 @@ impl Tab {
     /// computed rect. `content_rect` is the full content area (chrome already
     /// subtracted); `cell_w` / `cell_h` are physical-pixel cell dimensions.
     /// Each pane's (rows, cols) is derived from its rect size ÷ cell size.
-    /// Returns `true` if the active pane was resized (for logging parity with
-    /// `resize_terminal_and_queue`).
+    /// Returns `true` if the active pane was resized.
     ///
-    /// For single-pane tabs this is equivalent to `resize_terminal_and_queue`
-    /// — the split tree returns one rect equal to `content_rect`.
+    /// For single-pane tabs this is equivalent to the pane-level
+    /// `resize_terminal_and_queue` — the split tree returns one rect equal to
+    /// `content_rect`.
     pub(crate) fn resize_all_panes_for_rect(
         &mut self,
         content_rect: weft_core::pane_layout::Rect,
@@ -868,12 +854,6 @@ impl Tab {
             ))
         })?;
         pty.write_sync_reported(data)
-    }
-
-    /// Whether this tab's terminal + pty are initialized.
-    #[allow(dead_code)]
-    pub fn is_alive(&self) -> bool {
-        self.terminal.is_some() && self.pty.is_some()
     }
 
     /// Directory inherited by a newly-created sibling tab. Prefer live OSC 7

@@ -45,7 +45,6 @@ pub struct LayoutCtx {
     pub clip: Option<Rect>,
 }
 
-#[allow(dead_code)] // methods adopted incrementally as overlays migrate
 impl LayoutCtx {
     /// Build a top-level context (no clip) from the renderer's per-frame state.
     pub fn new(
@@ -146,6 +145,9 @@ impl LayoutCtx {
     }
 
     /// Map an absolute pixel X coordinate to a pane-local terminal column.
+    /// v1.12.23 audit batch 2: test-only for now (layout/tests.rs); drop the
+    /// gate when a production caller adopts it.
+    #[cfg(test)]
     #[inline]
     pub fn col_at_x(&self, x: f32) -> usize {
         ((x - self.left()) / self.cell_w).max(0.0) as usize
@@ -160,6 +162,9 @@ impl LayoutCtx {
     /// Return a child context clipped to `rect` (coordinates stay absolute;
     /// the child's `clip` is the intersection of the parent's clip and `rect`).
     /// Builders use `clip` to short-circuit quads outside the visible region.
+    /// v1.12.23 audit batch 2: test-only for now (layout/tests.rs); drop the
+    /// gate when a production caller adopts it.
+    #[cfg(test)]
     pub fn child(&self, rect: Rect) -> Self {
         let child_clip = match self.clip {
             Some(parent) => [
@@ -178,6 +183,9 @@ impl LayoutCtx {
 
     /// True if `rect` intersects the active clip (or the content area when
     /// no clip is set). Builders use this to skip fully occluded quads.
+    /// v1.12.23 audit batch 2: test-only for now (layout/tests.rs); drop the
+    /// gate when a production caller adopts it.
+    #[cfg(test)]
     pub fn is_visible(&self, rect: Rect) -> bool {
         let (x0, y0, x1, y1) = (rect[0], rect[1], rect[2], rect[3]);
         if x1 <= x0 || y1 <= y0 {

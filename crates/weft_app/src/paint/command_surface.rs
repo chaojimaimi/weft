@@ -20,7 +20,7 @@
 
 use crate::layout::Rect;
 use crate::paint::primitives::{push_quad, push_triangle};
-use crate::scene::{FocusId, FocusScope};
+use crate::scene::FocusId;
 use weft_core::input::{KeyCode, Modifiers};
 
 // ── Shell ──────────────────────────────────────────────────────────────
@@ -375,7 +375,6 @@ pub(crate) fn completion_surface_state(matches_len: usize) -> CommandSurfaceStat
 /// This guarantees Up/Down/PageUp/PageDown/Enter/Esc/Tab behave
 /// consistently across surfaces — the surface-specific differences live in
 /// the *effect* of each action, not in which keys produce which action.
-#[allow(dead_code)] // F4: formal protocol; controllers currently dispatch directly
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommandSurfaceKeyAction {
     /// Move selection up by one row.
@@ -506,78 +505,6 @@ pub(crate) fn save_focus_for_modal(
         Some(f) if f != opening => Some(f),
         _ => None,
     }
-}
-
-// ── F6: Focus scope stack ─────────────────────────────────────────────
-
-/// F6: Determine the current focus scope from the stack. Returns
-/// [`FocusScope::Terminal`] when the stack is empty (the default scope).
-///
-/// Pure function — the caller passes `&interaction.focus_stack`.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
-pub(crate) fn current_focus_scope(stack: &[FocusScope]) -> FocusScope {
-    stack.last().copied().unwrap_or(FocusScope::Terminal)
-}
-
-/// F6: Push a scope onto the focus stack when a modal opens. The previous
-/// scope remains underneath so closing the modal restores it.
-///
-/// Pure function — returns the new stack so the caller can assign it.
-/// In practice the caller uses `stack.push(scope)` directly; this function
-/// exists so the push/pop semantics are unit-testable without an `App`.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
-pub(crate) fn push_focus_scope(mut stack: Vec<FocusScope>, scope: FocusScope) -> Vec<FocusScope> {
-    stack.push(scope);
-    stack
-}
-
-/// F6: Pop a scope from the focus stack when a modal closes. Returns the
-/// popped scope, or `None` when the stack was already empty (defensive —
-/// the caller should only pop when a modal was pushed).
-///
-/// Pure function — returns `(popped, remaining_stack)`.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
-pub(crate) fn pop_focus_scope(mut stack: Vec<FocusScope>) -> (Option<FocusScope>, Vec<FocusScope>) {
-    let popped = stack.pop();
-    (popped, stack)
-}
-
-/// F6: Cycle focus within a list of focusable elements in the current scope.
-/// Returns the next (forward) or previous (backward) `FocusId`. Wraps around.
-/// Returns `None` when the list is empty. When the current focus is not in
-/// the list, returns the first element (forward) or the last (backward).
-///
-/// Pure function — the caller builds the candidates list from the current
-/// scope and modal state, then passes it here. This keeps the cycling logic
-/// testable without an `App` instance.
-#[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
-pub(crate) fn cycle_focus(
-    candidates: &[FocusId],
-    current: Option<FocusId>,
-    forward: bool,
-) -> Option<FocusId> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let idx = current
-        .and_then(|c| candidates.iter().position(|&f| f == c))
-        .map(|i| {
-            if forward {
-                (i + 1) % candidates.len()
-            } else {
-                (i + candidates.len() - 1) % candidates.len()
-            }
-        })
-        .unwrap_or_else(|| {
-            // Current focus not in the list — start from the first (forward)
-            // or the last (backward) so Tab always lands on a valid element.
-            if forward {
-                0
-            } else {
-                candidates.len() - 1
-            }
-        });
-    Some(candidates[idx])
 }
 
 #[cfg(test)]

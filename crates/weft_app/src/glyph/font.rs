@@ -290,7 +290,6 @@ fn variant_properties_match(
     true
 }
 
-#[allow(dead_code)]
 pub(super) fn is_emoji_char(ch: char) -> bool {
     matches!(ch,
         '\u{231A}'..='\u{231B}' | '\u{23E9}'..='\u{23EC}' | '\u{23F0}' | '\u{23F3}' |

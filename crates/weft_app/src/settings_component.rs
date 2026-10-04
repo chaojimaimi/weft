@@ -455,7 +455,6 @@ mod tests {
         SettingsLayout {
             box_rect: [200.0, 100.0, 1000.0, 700.0],
             sidebar_rect: [200.0, 140.0, 400.0, 660.0],
-            sidebar_width: 200.0,
             sidebar_top: 140.0,
             show_sidebar: true,
             show_content: true,

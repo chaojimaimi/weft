@@ -494,13 +494,6 @@ pub struct InteractionState {
     /// focus (visually / for accessibility) when the modal closes. `None`
     /// when no modal is open or the focus was already on the modal target.
     pub prev_focus: Option<crate::scene::FocusId>,
-    /// F6: Scope stack tracking which [`FocusScope`](crate::scene::FocusScope)
-    /// the keyboard focus currently belongs to. Pushed when a modal opens,
-    /// popped when it closes, so Tab/Shift+Tab cycles only within the active
-    /// scope. The last element is the current scope; an empty stack means
-    /// Terminal (the default scope).
-    #[allow(dead_code)] // F6: scaffolding; wired into the renderer in a follow-up
-    pub focus_stack: Vec<crate::scene::FocusScope>,
 }
 
 impl InteractionState {
@@ -530,7 +523,6 @@ impl InteractionState {
             selection_drag_pos: None,
             selection_autoscroll_carry: 0.0,
             prev_focus: None,
-            focus_stack: Vec::new(),
         }
     }
 }

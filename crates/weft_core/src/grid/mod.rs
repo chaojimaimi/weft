@@ -999,11 +999,6 @@ impl Grid {
         })
     }
 
-    /// v1.0 P0-b Layer 1: Whether ANY viewport row is dirty.
-    pub fn has_dirty(&self) -> bool {
-        self.viewport.iter().any(|r| r.dirty_occ > 0)
-    }
-
     /// v1.0 P0-c: Take and reset the pending viewport scroll delta.
     /// The renderer calls this to read how many rows the viewport shifted
     /// since the last frame, then shifts its per-row vertex cache

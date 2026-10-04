@@ -54,9 +54,6 @@ async fn spawn_and_echo() {
             panic!("child exited unexpectedly: {code:?}");
         }
     }
-
-    // Verify child is alive.
-    assert!(pty.is_alive());
 }
 
 /// Test that resize doesn't error.
@@ -141,7 +138,6 @@ async fn sync_write_works() {
     let pty = Pty::spawn("/bin/cat", (24, 80), || {}).expect("failed to spawn PTY");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     pty.write_sync(b"test\n").expect("sync write failed");
-    assert!(pty.is_alive());
 }
 
 /// Ctrl+C must remain a PTY byte for raw-mode consumers such as SSH and

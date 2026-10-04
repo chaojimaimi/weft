@@ -1395,7 +1395,6 @@ fn write_char_wrap_no_mark_outside_scroll_region() {
 fn dirty_rows_empty_on_fresh_grid() {
     let grid = Grid::new(5, 10);
     assert_eq!(grid.dirty_rows().count(), 0);
-    assert!(!grid.has_dirty());
 }
 
 #[test]
@@ -1404,7 +1403,6 @@ fn dirty_rows_after_cell_write() {
     grid.cell_mut(2, 3).character = 'X';
     let dirty: Vec<_> = grid.dirty_rows().collect();
     assert_eq!(dirty, vec![(2, 4)]);
-    assert!(grid.has_dirty());
 }
 
 #[test]
@@ -1430,9 +1428,7 @@ fn clear_all_dirty_resets_rows() {
     let mut grid = Grid::new(5, 10);
     grid.cell_mut(1, 2).character = 'A';
     grid.cell_mut(3, 4).character = 'B';
-    assert!(grid.has_dirty());
     grid.clear_all_dirty();
-    assert!(!grid.has_dirty());
     assert_eq!(grid.dirty_rows().count(), 0);
 }
 
@@ -1543,9 +1539,8 @@ fn full_viewport_scroll_still_uses_pending_scroll() {
 fn resize_marks_all_rows_dirty() {
     let mut grid = Grid::new(3, 5);
     grid.clear_all_dirty();
-    assert!(!grid.has_dirty());
+    assert_eq!(grid.dirty_rows().count(), 0);
     grid.resize(5, 8);
-    assert!(grid.has_dirty());
     assert_eq!(grid.dirty_rows().count(), 5);
 }
 
