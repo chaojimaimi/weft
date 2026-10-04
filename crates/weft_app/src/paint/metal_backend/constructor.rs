@@ -141,8 +141,15 @@ impl MetalRenderer {
         let library = device
             .new_library_with_source(source, &compile_opts)
             .expect("Failed to compile Metal shader");
-        let vertex_fn = library.get_function("text_vertex", None).unwrap();
-        let fragment_fn = library.get_function("text_fragment", None).unwrap();
+        // v1.12.23 audit batch 1: shader-fn lookups carry the fn name in the
+        // panic message (the 7 objectAt(0) unwraps are not shader fns and
+        // intentionally keep bare unwrap).
+        let vertex_fn = library
+            .get_function("text_vertex", None)
+            .expect("shader fn text_vertex");
+        let fragment_fn = library
+            .get_function("text_fragment", None)
+            .expect("shader fn text_fragment");
 
         let pipeline_desc = RenderPipelineDescriptor::new();
 
@@ -186,7 +193,9 @@ impl MetalRenderer {
         // from `vertex_id` and pulls per-cell data from the instance buffer
         // at slot 2. Reuses the same fragment shader (atlas sampling +
         // fg/bg blend) and color attachment config as the legacy pipeline.
-        let instanced_vertex_fn = library.get_function("text_vertex_instanced", None).unwrap();
+        let instanced_vertex_fn = library
+            .get_function("text_vertex_instanced", None)
+            .expect("shader fn text_vertex_instanced");
         let instanced_desc = RenderPipelineDescriptor::new();
         instanced_desc.set_vertex_function(Some(&instanced_vertex_fn));
         instanced_desc.set_fragment_function(Some(&fragment_fn));
@@ -208,8 +217,12 @@ impl MetalRenderer {
         // but uses `bg_vertex`/`bg_fragment` — no atlas sampling, just solid
         // color quads. 8-float instances (origin+size+bg = 32B). Drawn before
         // the glyph stream so text renders on top.
-        let bg_vertex_fn = library.get_function("bg_vertex", None).unwrap();
-        let bg_fragment_fn = library.get_function("bg_fragment", None).unwrap();
+        let bg_vertex_fn = library
+            .get_function("bg_vertex", None)
+            .expect("shader fn bg_vertex");
+        let bg_fragment_fn = library
+            .get_function("bg_fragment", None)
+            .expect("shader fn bg_fragment");
         let bg_desc = RenderPipelineDescriptor::new();
         bg_desc.set_vertex_function(Some(&bg_vertex_fn));
         bg_desc.set_fragment_function(Some(&bg_fragment_fn));

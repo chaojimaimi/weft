@@ -290,11 +290,13 @@ mod tests {
         // unbounded. Drain any wake still in flight: the assertion pins that
         // the waker carries the generation (gen-1 may legitimately be the
         // last RECEIVED wake when both results were already queued).
-        while let Ok(gen) = wake_rx.try_recv() {
-            wakes_seen.push(gen);
+        // v1.12.23 audit batch 1: `gen` is a reserved keyword in edition 2024 —
+        // renamed ahead of any future migration.
+        while let Ok(generation) = wake_rx.try_recv() {
+            wakes_seen.push(generation);
         }
         assert!(
-            wakes_seen.iter().any(|&gen| gen >= 2),
+            wakes_seen.iter().any(|&generation| generation >= 2),
             "a wake must carry the replaced request's generation (>= 2); saw {wakes_seen:?}"
         );
         assert_eq!(result.generation, generation);

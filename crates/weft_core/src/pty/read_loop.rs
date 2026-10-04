@@ -208,6 +208,39 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
 
     let mut buf = vec![0u8; BUF_SIZE];
 
+    // R1-4 (v1.12.23 audit batch 1): the WEFT_PTY_CAPTURE tee is resolved
+    // ONCE here, before the loop — it used to cost one env::var global-lock
+    // lookup plus one file open PER KERNEL READ. The file is opened 0600
+    // (and an existing file re-chmod'ed: the old create() inherited the
+    // umask), a failed open is no longer silently swallowed, and enabling
+    // the tee is announced at warn level because it records plaintext
+    // secrets. Disabled by default: with the env unset this is dead code.
+    let mut capture: Option<std::fs::File> = std::env::var("WEFT_PTY_CAPTURE")
+        .ok()
+        .and_then(|path| {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            match std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(f) => {
+                    let _ =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    tracing::warn!(
+                        path = %path,
+                        "PTY capture enabled: ALL terminal output (including secrets) is recorded in plaintext"
+                    );
+                    Some(f)
+                }
+                Err(e) => {
+                    tracing::warn!(%e, path = %path, "WEFT_PTY_CAPTURE set but unopenable");
+                    None
+                }
+            }
+        });
+
     // T5' (§3.7) hold state: a WouldBlock-truncated batch on an active
     // stream is carried here across the WouldBlock boundary — bytes plus
     // the arrival timestamp of the batch's FIRST byte (the hold anchor);
@@ -292,19 +325,16 @@ pub(super) async fn read_loop<W: Fn() + Send + 'static>(
             if mouse_scanner.feed(data) {
                 crate::input::set_suppressed(&suppress);
             }
-            // R1-4: env-gated capture tee for recording real PTY byte
-            // streams. Disabled by default (one env::var lookup per read);
-            // set WEFT_PTY_CAPTURE=/path/to/capture.bin to record. Fixtures
-            // committed to the repo use inline byte literals (see
-            // tests/replay_fixtures.rs), but this tee is the tool for
-            // discovering the exact byte shapes of new TUI apps.
-            if let Ok(path) = std::env::var("WEFT_PTY_CAPTURE") {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(&path)
-                {
-                    let _ = std::io::Write::write_all(&mut f, data);
+            // R1-4: capture tee write stays PER-READ (exact kernel read
+            // boundaries); set WEFT_PTY_CAPTURE=/path/to/capture.bin to
+            // record — the file is resolved once before the loop (see the
+            // startup block there). Fixtures committed to the repo use
+            // inline byte literals (see tests/replay_fixtures.rs), but this
+            // tee is the tool for discovering the exact byte shapes of new
+            // TUI apps.
+            if let Some(f) = capture.as_mut() {
+                if let Err(e) = std::io::Write::write_all(f, data) {
+                    tracing::debug!(?e, "capture tee write failed");
                 }
             }
             Ok(n)

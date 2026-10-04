@@ -380,7 +380,7 @@ impl App {
                         PaletteSubMode::SelectTheme { buffer, themes } => {
                             (buffer.clone(), themes.clone())
                         }
-                        _ => unreachable!(),
+                        _ => unreachable!("variant excluded by matches! above"), // v1.12.23 audit batch 1: message, not bare unreachable
                     };
                     let q = buffer.to_lowercase();
                     themes

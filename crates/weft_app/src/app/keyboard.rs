@@ -56,19 +56,34 @@ impl crate::App {
         // then via a dedicated fast path that bypasses every app-side
         // consumer (note editor / keybindings / overlays / editor box) —
         // a Cmd+V Release must never paste into the find bar.
-        let kitty_flags = self
-            .tab()
-            .terminal
-            .as_ref()
-            .map(|t| t.keyboard_protocol_flags())
-            .unwrap_or(0);
+        // v1.12.23 audit batch 1: `self.tab()` is a bare `sessions.active()`
+        // index — with every tab closed (last shell `exit`) any keystroke
+        // reaching here panicked. Empty tabs reads as "no negotiated terminal"
+        // (flags 0, identical to a tab without a terminal), so a Release still
+        // early-returns below while session-less actions (Cmd+T NewTab) keep
+        // routing through execute_action. Only the state READS are guarded —
+        // no whole-handler early return.
+        let has_sessions = !self.sessions.is_empty();
+        let kitty_flags = if has_sessions {
+            self.tab()
+                .terminal
+                .as_ref()
+                .map(|t| t.keyboard_protocol_flags())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if kind == weft_core::input::KittyEventKind::Release {
             if (kitty_flags & weft_core::input::kitty::FLAG_REPORT_EVENT_TYPES) == 0 {
                 return;
             }
-            if !self.tab().terminal.as_ref().is_some_and(|t| {
-                t.effective_input_mode() == weft_core::input::InputMode::Passthrough
-            }) {
+            // Defense in depth: with flags 0 above, a Release already returned
+            // at the gate — this only matters if that invariant ever changes.
+            if !has_sessions
+                || !self.tab().terminal.as_ref().is_some_and(|t| {
+                    t.effective_input_mode() == weft_core::input::InputMode::Passthrough
+                })
+            {
                 return;
             }
             self.forward_key_to_pty(
@@ -95,11 +110,7 @@ impl crate::App {
             .sessions
             .tab(self.sessions.active_idx())
             .is_some_and(|tab| tab.terminal.is_some());
-        match crate::input_router::route_keyboard_entry(
-            !self.sessions.is_empty(),
-            has_terminal,
-            bound_action,
-        ) {
+        match crate::input_router::route_keyboard_entry(has_sessions, has_terminal, bound_action) {
             crate::input_router::KeyboardEntryRoute::Action(action) => {
                 self.execute_action(action);
                 return;

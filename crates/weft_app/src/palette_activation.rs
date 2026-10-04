@@ -5,6 +5,14 @@ use super::*;
 impl App {
     /// Activate a palette entry: workflow → enter form mode, builtin → execute.
     pub(super) fn activate_palette_entry(&mut self, entry: PaletteEntry) {
+        // v1.12.23 audit batch 1: the palette can stay open after the last tab
+        // exits (no path closes it on tab teardown), and every arm below
+        // touches `sessions.active_mut()` — a bare index that panics with no
+        // tabs. An activation without a session has nothing to act on.
+        if self.sessions.is_empty() {
+            tracing::debug!("palette activation ignored: no sessions");
+            return;
+        }
         match entry {
             PaletteEntry::Workflow(wf) => {
                 let var_names = wf.all_var_names();
@@ -241,6 +249,15 @@ impl App {
     /// Execute a workflow: render variables → submit commands to PTY.
     pub(super) fn execute_workflow(&mut self, form: WorkflowForm) {
         self.reset_ime_context("workflow submitted");
+        // v1.12.23 audit batch 1: guard sits AFTER reset_ime_context — it is
+        // empty-tabs safe (iterates tabs_mut + window-level discard) and must
+        // still drop window-level native marked text — but BEFORE the bare
+        // `active_mut()` below. No session means no editor and no PTY: nothing
+        // to do.
+        if self.sessions.is_empty() {
+            tracing::debug!("workflow submit ignored: no sessions");
+            return;
+        }
         self.sessions.active_mut().arm_tui_scroll_window();
         let Some(store) = &self.palette.store else {
             return;

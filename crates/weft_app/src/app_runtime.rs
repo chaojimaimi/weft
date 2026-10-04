@@ -129,14 +129,22 @@ fn schedule_synchronized_output_watchdog(
     if pending.swap(true, Ordering::AcqRel) {
         return false;
     }
-    std::thread::Builder::new()
+    // v1.12.23 audit batch 1 (bespoke): failure must reset the armed flag or
+    // the watchdog stays latched; `pending` moves into the closure, so clone.
+    let rearm = pending.clone();
+    if let Err(e) = std::thread::Builder::new()
         .name(String::from("weft-timer"))
         .spawn(move || {
             std::thread::sleep(delay);
             pending.store(false, Ordering::Release);
             wake();
         })
-        .ok();
+    {
+        // Re-arm so a future request can retry; today's wake is lost but the
+        // watchdog is not permanently disabled (audit S-3).
+        rearm.store(false, Ordering::Release);
+        tracing::warn!(error = ?e, "weft-timer spawn failed");
+    }
     true
 }
 
@@ -155,13 +163,10 @@ fn schedule_primary_history_refresh_wakes(
         .flat_map(Tab::take_primary_history_refresh_wake_delays)
     {
         let proxy = proxy.clone();
-        std::thread::Builder::new()
-            .name(String::from("weft-tab-wake"))
-            .spawn(move || {
-                std::thread::sleep(delay);
-                let _ = proxy.send_event(AppEvent::Wake);
-            })
-            .ok();
+        spawn_named("weft-tab-wake", move || {
+            std::thread::sleep(delay);
+            let _ = proxy.send_event(AppEvent::Wake);
+        });
     }
 }
 
@@ -664,18 +669,15 @@ impl ApplicationHandler<AppEvent> for App {
         // avoids pointless full redraws that caused idle flicker.
         let blink_proxy = self.proxy.clone();
         let blink_flag = self.window_runtime.cursor_anim_active.clone();
-        std::thread::Builder::new()
-            .name(String::from("weft-cursor"))
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(530));
-                if !blink_flag.load(Ordering::Relaxed) {
-                    continue; // no cursor to animate — skip this wake
-                }
-                if blink_proxy.send_event(AppEvent::Wake).is_err() {
-                    break; // event loop exited
-                }
-            })
-            .ok();
+        spawn_named("weft-cursor", move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(530));
+            if !blink_flag.load(Ordering::Relaxed) {
+                continue; // no cursor to animate — skip this wake
+            }
+            if blink_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
 
         // F3-2: Spinner timer — wake the loop ~every 80ms while a command is
         // running so the braille activity indicator animates smoothly even
@@ -683,18 +685,15 @@ impl ApplicationHandler<AppEvent> for App {
         // sets `spinner_anim_active` after each redraw based on the shell phase.
         let spinner_proxy = self.proxy.clone();
         let spinner_flag = self.window_runtime.spinner_anim_active.clone();
-        std::thread::Builder::new()
-            .name(String::from("weft-spinner"))
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                if !spinner_flag.load(Ordering::Relaxed) {
-                    continue; // no running command — skip this wake
-                }
-                if spinner_proxy.send_event(AppEvent::Wake).is_err() {
-                    break; // event loop exited
-                }
-            })
-            .ok();
+        spawn_named("weft-spinner", move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            if !spinner_flag.load(Ordering::Relaxed) {
+                continue; // no running command — skip this wake
+            }
+            if spinner_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
 
         // Drag-selection autoscroll timer — wake the loop ~every 40ms while
         // a block-view drag selection is held past the content edge, so the
@@ -704,36 +703,30 @@ impl ApplicationHandler<AppEvent> for App {
         // (no edge-held drag) the timer skips the wake.
         let autoscroll_proxy = self.proxy.clone();
         let autoscroll_flag = self.window_runtime.selection_autoscroll_active.clone();
-        std::thread::Builder::new()
-            .name(String::from("weft-autoscroll"))
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(40));
-                if !autoscroll_flag.load(Ordering::Relaxed) {
-                    continue; // no edge-held drag — skip this wake
-                }
-                if autoscroll_proxy.send_event(AppEvent::Wake).is_err() {
-                    break; // event loop exited
-                }
-            })
-            .ok();
+        spawn_named("weft-autoscroll", move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if !autoscroll_flag.load(Ordering::Relaxed) {
+                continue; // no edge-held drag — skip this wake
+            }
+            if autoscroll_proxy.send_event(AppEvent::Wake).is_err() {
+                break; // event loop exited
+            }
+        });
 
         if self.performance_probe.enabled() {
             let probe_proxy = self.proxy.clone();
-            std::thread::Builder::new()
-                .name(String::from("weft-probe"))
-                .spawn(move || {
-                    // v1.4.0: honor WEFT_GUI_PROBE_*_SECS env overrides.
-                    std::thread::sleep(performance_probe::warmup_duration());
-                    if probe_proxy
-                        .send_event(AppEvent::PerformanceProbeStart)
-                        .is_err()
-                    {
-                        return;
-                    }
-                    std::thread::sleep(performance_probe::sample_duration());
-                    let _ = probe_proxy.send_event(AppEvent::PerformanceProbeFinish);
-                })
-                .ok();
+            spawn_named("weft-probe", move || {
+                // v1.4.0: honor WEFT_GUI_PROBE_*_SECS env overrides.
+                std::thread::sleep(performance_probe::warmup_duration());
+                if probe_proxy
+                    .send_event(AppEvent::PerformanceProbeStart)
+                    .is_err()
+                {
+                    return;
+                }
+                std::thread::sleep(performance_probe::sample_duration());
+                let _ = probe_proxy.send_event(AppEvent::PerformanceProbeFinish);
+            });
         }
 
         // Config file watcher: poll the config's mtime ~1/sec and reload live
@@ -741,22 +734,19 @@ impl ApplicationHandler<AppEvent> for App {
         // Zero dependencies — mtime polling is cheap for a single file.
         if let Some(path) = Config::config_path() {
             let reload_proxy = self.proxy.clone();
-            std::thread::Builder::new()
-                .name(String::from("weft-config"))
-                .spawn(move || {
-                    let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        let cur = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                        if cur != last {
-                            last = cur;
-                            if reload_proxy.send_event(AppEvent::ConfigReload).is_err() {
-                                break; // event loop exited
-                            }
+            spawn_named("weft-config", move || {
+                let mut last = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let cur = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                    if cur != last {
+                        last = cur;
+                        if reload_proxy.send_event(AppEvent::ConfigReload).is_err() {
+                            break; // event loop exited
                         }
                     }
-                })
-                .ok();
+                }
+            });
         }
 
         // D5: compare complete snapshots once per second so unmarked cwd or
@@ -766,15 +756,12 @@ impl ApplicationHandler<AppEvent> for App {
         // via AppEvent::TabsAutoSave (handled synchronously on the main
         // thread, which owns `&mut self`).
         let save_proxy = self.proxy.clone();
-        std::thread::Builder::new()
-            .name(String::from("weft-autosave"))
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                if save_proxy.send_event(AppEvent::TabsAutoSave).is_err() {
-                    break; // event loop exited
-                }
-            })
-            .ok();
+        spawn_named("weft-autosave", move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if save_proxy.send_event(AppEvent::TabsAutoSave).is_err() {
+                break; // event loop exited
+            }
+        });
 
         self.request_redraw();
     }
@@ -927,6 +914,19 @@ impl App {
                 );
             }
         }
+    }
+}
+
+/// Spawn a named background thread; a failed spawn is logged, never silent.
+/// (v1.12.23 audit batch 1: the eight `std::thread::Builder ... .ok()` sites
+/// silently dropped failures — autosave never running means a crash loses all
+/// session data.)
+fn spawn_named(name: &str, body: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new()
+        .name(String::from(name))
+        .spawn(body)
+    {
+        tracing::warn!(thread = name, error = ?e, "background thread spawn failed");
     }
 }
 

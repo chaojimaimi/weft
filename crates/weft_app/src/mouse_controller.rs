@@ -909,7 +909,9 @@ impl App {
                 for _ in 0..lines {
                     batch.extend_from_slice(&bytes);
                 }
-                let _ = self.sessions.active_mut().write_user_input(&batch);
+                if let Err(e) = self.sessions.active_mut().write_user_input(&batch) {
+                    tracing::debug!(?e, "tui wheel write failed"); // v1.12.23 batch 1: was silent `let _ =`
+                }
             }
             return;
         }

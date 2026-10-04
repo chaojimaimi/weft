@@ -1067,13 +1067,13 @@ impl MetalRenderer {
         // FindInGrid bar (v0.8 B3) — top banner with query + match count,
         // plus a yellow translucent highlight on the current match. Drawn
         // last so it composites above all other overlays.
-        if let Some(find) = &self.find_state.clone() {
+        if let Some(find) = self.find_state.as_ref() {
             vertices.extend_from_slice(&self.build_find_vertices(find));
         }
 
         // v1.7.3-C: Inline note editor — top-center card with "Note: [buffer|]".
         // Drawn after find so it composites above when both are open (rare).
-        if let Some(note) = &self.note_editor_state.clone() {
+        if let Some(note) = self.note_editor_state.as_ref() {
             vertices.extend_from_slice(&self.build_note_editor_vertices(note));
         }
 

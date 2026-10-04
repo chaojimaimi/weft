@@ -669,7 +669,12 @@ fn main() {
     let mut app = App::new(proxy);
     // A run-loop error falls through to the hard exit below as well -- the
     // old destructor-order stall is worse than a lost panic message here.
-    let _ = event_loop.run_app(&mut app);
+    // v1.12.23 audit batch 1: an error exit must not masquerade as success —
+    // exit 1 (still skipping the destructor long tail, see below).
+    if let Err(e) = event_loop.run_app(&mut app) {
+        tracing::error!(?e, "event loop terminated with error");
+        std::process::exit(1);
+    }
     // FIX (field run, v1.12.6): everything that matters (block persistence,
     // tab snapshots, the recovery snapshot, the clean-exit marker) was
     // already written by the teardown before the loop stopped, and every

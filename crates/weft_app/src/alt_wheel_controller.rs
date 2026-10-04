@@ -66,7 +66,10 @@ impl App {
                     for _ in 0..lines {
                         batch.extend_from_slice(&single);
                     }
-                    let _ = self.sessions.active_mut().write_user_input(&batch);
+                    // v1.12.23 audit batch 1: a dropped write was invisible — log it.
+                    if let Err(e) = self.sessions.active_mut().write_user_input(&batch) {
+                        tracing::debug!(?e, "tui wheel write failed");
+                    }
                 }
             }
             crate::alt_peek::AltWheelAction::EnterPeek => {

@@ -35,7 +35,12 @@ const MASK: &str = "••••••••";
 pub fn mask(text: &str) -> String {
     let mut out = text.to_string();
     for re in patterns() {
-        out = re.replace_all(&out, MASK).into_owned();
+        // v1.12.23 audit batch 1: a no-match round tripped as Cow::Borrowed and
+        // into_owned() still cloned the whole text — keep the borrowed view.
+        match re.replace_all(&out, MASK) {
+            std::borrow::Cow::Borrowed(_) => {}
+            std::borrow::Cow::Owned(s) => out = s,
+        }
     }
     out
 }
@@ -75,21 +80,26 @@ pub fn redact_for_ai(text: &str) -> String {
     for re in redaction_patterns() {
         // For URL userinfo we keep the host visible but mask the credentials.
         if re.as_str().contains("https?://") {
-            out = re
-                .replace_all(&out, |caps: &regex::Captures| {
-                    let full = &caps[0];
-                    // Replace the `user:pass@` part with `••••••••@`.
-                    if let Some(at_pos) = full.rfind('@') {
-                        let scheme_host = &full[..full.find("://").map(|i| i + 3).unwrap_or(0)];
-                        let _ = scheme_host;
-                        format!("••••••••@{}", &full[at_pos + 1..])
-                    } else {
-                        MASK.to_string()
-                    }
-                })
-                .into_owned();
+            // v1.12.23 audit batch 1: same Cow early-skip as `mask` — a
+            // no-match closure pass also cloned the whole text.
+            match re.replace_all(&out, |caps: &regex::Captures| {
+                let full = &caps[0];
+                // Replace the `user:pass@` part with `••••••••@`.
+                if let Some(at_pos) = full.rfind('@') {
+                    format!("••••••••@{}", &full[at_pos + 1..])
+                } else {
+                    MASK.to_string()
+                }
+            }) {
+                std::borrow::Cow::Borrowed(_) => {}
+                std::borrow::Cow::Owned(s) => out = s,
+            }
         } else {
-            out = re.replace_all(&out, MASK).into_owned();
+            // v1.12.23 audit batch 1: Cow early-skip (see `mask`).
+            match re.replace_all(&out, MASK) {
+                std::borrow::Cow::Borrowed(_) => {}
+                std::borrow::Cow::Owned(s) => out = s,
+            }
         }
     }
     out

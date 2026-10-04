@@ -275,7 +275,11 @@ impl OutputCapture {
 
         if replaced_len > 0 {
             let end = self.cursor + replaced_len;
-            self.text.replace_range(self.cursor..end, &c.to_string());
+            // v1.12.23 audit batch 1: encode_utf8 into a stack buffer —
+            // to_string() heap-allocated once per overwritten char.
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            self.text.replace_range(self.cursor..end, s);
         } else {
             self.text.insert(self.cursor, c);
         }
